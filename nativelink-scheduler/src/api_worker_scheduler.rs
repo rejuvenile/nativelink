@@ -2060,40 +2060,94 @@ impl ApiWorkerScheduler {
             .fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
+            let start = Instant::now();
+
+            // Preflight: batch check which blobs are already in the store.
+            // Blobs already in MemoryStore don't need warming — skip them
+            // to reduce churn on the 8GB cache.
+            let store_keys: Vec<StoreKey<'_>> = blobs
+                .iter()
+                .map(|(digest, _)| (*digest).into())
+                .collect();
+            let mut results = vec![None; store_keys.len()];
+            if cas_store
+                .has_with_results(&store_keys, &mut results)
+                .await
+                .is_err()
+            {
+                return; // store error, skip warming
+            }
+            // Keep only blobs that are NOT already present (has returned None).
+            // has_with_results on the full chain checks FilesystemStore too,
+            // so we can't distinguish MemoryStore-warm from disk-only. But
+            // blobs that don't exist at all are also filtered out.
+            let cold_blobs: Vec<(DigestInfo, u64)> = blobs
+                .into_iter()
+                .zip(results.iter())
+                .filter(|(_, has)| has.is_none())
+                .map(|(blob, _)| blob)
+                .collect();
+
+            if cold_blobs.is_empty() {
+                debug!(
+                    %operation_id,
+                    total = blob_count,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "server cache warm: all blobs already present, nothing to warm"
+                );
+                return;
+            }
+
+            let cold_count = cold_blobs.len();
             let semaphore = Arc::new(Semaphore::new(CACHE_WARM_CONCURRENCY));
             let warmed = Arc::new(AtomicU64::new(0));
-            let start = Instant::now();
+            let failed = Arc::new(AtomicU64::new(0));
 
             let mut join_set = tokio::task::JoinSet::new();
 
-            for (digest, _size) in blobs {
+            for (digest, _size) in cold_blobs {
                 let permit = match semaphore.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => break,
                 };
                 let store = cas_store.clone();
                 let warmed = warmed.clone();
+                let failed = failed.clone();
 
                 join_set.spawn(async move {
                     let _permit = permit;
-                    // get_part_unchunked traverses the full store chain.
-                    // If blob is in MemoryStore: ~1-5us (fast has + zero-copy read)
-                    // If blob is on disk: reads via io_uring, populates MemoryStore
                     let key: StoreKey<'_> = digest.into();
-                    drop(store.get_part_unchunked(key, 0, None).await);
-                    warmed.fetch_add(1, Ordering::Relaxed);
+                    match store.get_part_unchunked(key, 0, None).await {
+                        Ok(_) => {
+                            warmed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 });
             }
 
             while join_set.join_next().await.is_some() {}
 
+            let warmed_count = warmed.load(Ordering::Relaxed);
+            let failed_count = failed.load(Ordering::Relaxed);
             debug!(
                 %operation_id,
-                warmed = warmed.load(Ordering::Relaxed),
+                warmed = warmed_count,
+                failed = failed_count,
+                skipped = blob_count - cold_count,
                 total = blob_count,
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "server cache warm complete"
             );
+            if failed_count > 0 {
+                warn!(
+                    %operation_id,
+                    failed = failed_count,
+                    "server cache warm: some blobs failed to read"
+                );
+            }
         });
     }
 
