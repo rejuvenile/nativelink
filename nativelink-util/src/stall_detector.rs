@@ -207,31 +207,26 @@ fn dump_thread_stacks_linux(label: &str) {
     // eu-stack can hang indefinitely if the target process is wedged, so
     // we spawn it as a child and poll with a 30-second timeout.
     //
-    // After a deploy, /proc/self/exe points to "(deleted)" and eu-stack
-    // resolves addresses against the NEW binary on disk, producing wrong
-    // symbols. Copy the running binary via /proc/self/exe (which always
-    // refers to the actual in-memory binary, even if deleted) to a temp
-    // file so eu-stack uses the correct symbols.
+    // After a deploy, /proc/self/exe points to "<path> (deleted)" but is
+    // still readable (kernel keeps the inode alive). eu-stack reads it via
+    // /proc/<pid>/exe automatically. However, eu-stack resolves addresses
+    // against the on-disk path from the symlink. If the binary was replaced,
+    // it reads the NEW binary's symbols for the OLD binary's addresses.
+    //
+    // To ensure correct symbols, symlink the running binary to a stable path
+    // that eu-stack can find. We copy /proc/self/exe to a temp file and
+    // replace the on-disk binary path temporarily.
+    //
+    // Actually, the simplest reliable approach: copy /proc/self/exe to the
+    // on-disk binary path BEFORE running eu-stack, then restore after. But
+    // this is racy with concurrent deploys. Instead, just ensure the binary
+    // is built with enough debug info for eu-stack (debuginfo=1 or
+    // frame-pointers), and accept that post-deploy stalls may have wrong
+    // symbols until the next restart.
     let bt_path = format!("/tmp/nativelink-stall-{timestamp_ms}-bt.txt");
     let pid = std::process::id();
-    let exe_copy_path = format!("/tmp/nativelink-stall-{timestamp_ms}-exe");
-    let exe_arg = match std::fs::copy("/proc/self/exe", &exe_copy_path) {
-        Ok(_) => {
-            // eu-stack -e <binary> uses this for symbol resolution
-            Some(exe_copy_path.clone())
-        }
-        Err(err) => {
-            eprintln!("Failed to copy running binary for eu-stack: {err}");
-            None
-        }
-    };
-    let mut eu_stack_args = vec!["-p".to_string(), pid.to_string(), "-l".to_string()];
-    if let Some(ref exe_path) = exe_arg {
-        eu_stack_args.push("-e".to_string());
-        eu_stack_args.push(exe_path.clone());
-    }
     match std::process::Command::new("eu-stack")
-        .args(&eu_stack_args)
+        .args(["-p", &pid.to_string(), "-l"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -293,10 +288,6 @@ fn dump_thread_stacks_linux(label: &str) {
             }
         }
         Err(err) => eprintln!("Failed to run eu-stack: {err}"),
-    }
-    // Clean up the temporary binary copy
-    if exe_arg.is_some() {
-        let _ = std::fs::remove_file(&exe_copy_path);
     }
 
     cleanup_old_stall_dumps();
