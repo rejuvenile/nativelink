@@ -206,10 +206,32 @@ fn dump_thread_stacks_linux(label: &str) {
     // Capture userspace backtraces via eu-stack for full Rust call stacks.
     // eu-stack can hang indefinitely if the target process is wedged, so
     // we spawn it as a child and poll with a 30-second timeout.
+    //
+    // After a deploy, /proc/self/exe points to "(deleted)" and eu-stack
+    // resolves addresses against the NEW binary on disk, producing wrong
+    // symbols. Copy the running binary via /proc/self/exe (which always
+    // refers to the actual in-memory binary, even if deleted) to a temp
+    // file so eu-stack uses the correct symbols.
     let bt_path = format!("/tmp/nativelink-stall-{timestamp_ms}-bt.txt");
     let pid = std::process::id();
+    let exe_copy_path = format!("/tmp/nativelink-stall-{timestamp_ms}-exe");
+    let exe_arg = match std::fs::copy("/proc/self/exe", &exe_copy_path) {
+        Ok(_) => {
+            // eu-stack -e <binary> uses this for symbol resolution
+            Some(exe_copy_path.clone())
+        }
+        Err(err) => {
+            eprintln!("Failed to copy running binary for eu-stack: {err}");
+            None
+        }
+    };
+    let mut eu_stack_args = vec!["-p".to_string(), pid.to_string(), "-l".to_string()];
+    if let Some(ref exe_path) = exe_arg {
+        eu_stack_args.push("-e".to_string());
+        eu_stack_args.push(exe_path.clone());
+    }
     match std::process::Command::new("eu-stack")
-        .args(["-p", &pid.to_string(), "-l"])
+        .args(&eu_stack_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -271,6 +293,10 @@ fn dump_thread_stacks_linux(label: &str) {
             }
         }
         Err(err) => eprintln!("Failed to run eu-stack: {err}"),
+    }
+    // Clean up the temporary binary copy
+    if exe_arg.is_some() {
+        let _ = std::fs::remove_file(&exe_copy_path);
     }
 
     cleanup_old_stall_dumps();
