@@ -84,6 +84,8 @@ pub struct SchedulerMetrics {
     pub prefetch_blobs_already_present: AtomicU64,
     /// Total number of batch RPCs sent to workers during prefetch.
     pub prefetch_batches_sent: AtomicU64,
+    /// Total number of server cache warm tasks spawned.
+    pub cache_warm_spawned: AtomicU64,
 }
 
 /// Cached result of `score_and_generate_hints`: endpoint scores and peer hints.
@@ -1099,6 +1101,15 @@ const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(1800);
 /// When a negative cache map exceeds this many entries, sweep expired ones.
 const NEGATIVE_CACHE_SWEEP_THRESHOLD: usize = 1000;
 
+/// Maximum concurrent cache warm reads per dispatch.
+const CACHE_WARM_CONCURRENCY: usize = 64;
+
+/// Maximum total bytes to warm per dispatch (256MB).
+const CACHE_WARM_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Maximum number of blobs to warm per dispatch.
+const CACHE_WARM_MAX_BLOBS: usize = 4096;
+
 /// Computes exponential backoff for tree resolution failures.
 /// attempt 1 → base (60s), attempt 2 → 300s, attempt 3 → 1500s, attempt 4+ → 1800s (capped).
 fn backoff_for_attempt(base: Duration, attempts: u32) -> Duration {
@@ -1509,6 +1520,12 @@ impl ApiWorkerScheduler {
                     operation_id.to_string(),
                 );
             }
+        }
+
+        // ── Phase 5: warm server-side MemoryStore (AFTER write lock released) ──
+        // Pre-read all input blobs so the worker's demand fetch hits RAM.
+        if let Some(tree) = &resolved_tree {
+            self.spawn_server_cache_warm(&tree.file_digests, &operation_id.to_string());
         }
 
         result
@@ -1988,6 +2005,94 @@ impl ApiWorkerScheduler {
                 blobs_already_present,
                 elapsed_ms = elapsed.as_millis() as u64,
                 "prefetch: completed batched push to worker"
+            );
+        });
+    }
+
+    /// Spawns a background task that pre-reads input blobs into the server's
+    /// MemoryStore (fast store) so that when the worker's demand fetch arrives
+    /// ~50-100ms later, blobs are served from RAM instead of disk.
+    ///
+    /// `get_part_unchunked` traverses ExistenceCacheStore -> VerifyStore ->
+    /// FastSlowStore. For blobs already in MemoryStore, this returns in ~1-5us
+    /// (fast has + zero-copy read). For blobs on disk, it reads via io_uring
+    /// and populates MemoryStore automatically. This is idempotent and cheap.
+    ///
+    /// Best-effort: failures are silently ignored. The worker's normal demand
+    /// fetch handles anything that cache warming doesn't deliver.
+    fn spawn_server_cache_warm(
+        &self,
+        file_digests: &[(DigestInfo, u64)],
+        operation_id: &str,
+    ) {
+        let cas_store = match &self.cas_store {
+            Some(s) => s.clone(),
+            None => return,
+        };
+
+        // Sort by size ascending — warm small blobs first (more per unit time)
+        let mut blobs: Vec<(DigestInfo, u64)> = file_digests
+            .iter()
+            .filter(|(_, size)| *size > 0)
+            .copied()
+            .collect();
+        blobs.sort_by_key(|(_, size)| *size);
+        blobs.truncate(CACHE_WARM_MAX_BLOBS);
+
+        let mut total_bytes: u64 = 0;
+        blobs.retain(|(_, size)| {
+            if total_bytes + size > CACHE_WARM_MAX_BYTES {
+                return false;
+            }
+            total_bytes += size;
+            true
+        });
+
+        if blobs.is_empty() {
+            return;
+        }
+
+        let blob_count = blobs.len();
+        let operation_id = operation_id.to_string();
+
+        self.metrics
+            .cache_warm_spawned
+            .fetch_add(1, Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            let semaphore = Arc::new(Semaphore::new(CACHE_WARM_CONCURRENCY));
+            let warmed = Arc::new(AtomicU64::new(0));
+            let start = Instant::now();
+
+            let mut join_set = tokio::task::JoinSet::new();
+
+            for (digest, _size) in blobs {
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let store = cas_store.clone();
+                let warmed = warmed.clone();
+
+                join_set.spawn(async move {
+                    let _permit = permit;
+                    // get_part_unchunked traverses the full store chain.
+                    // If blob is in MemoryStore: ~1-5us (fast has + zero-copy read)
+                    // If blob is on disk: reads via io_uring, populates MemoryStore
+                    let key: StoreKey<'_> = digest.into();
+                    drop(store.get_part_unchunked(key, 0, None).await);
+                    warmed.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+
+            while join_set.join_next().await.is_some() {}
+
+            debug!(
+                %operation_id,
+                warmed = warmed.load(Ordering::Relaxed),
+                total = blob_count,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "server cache warm complete"
             );
         });
     }
