@@ -1021,71 +1021,57 @@ async fn inner_main(
             ));
             quic_server_config.transport_config(Arc::new(transport));
 
-            // Create multiple QUIC endpoints on the same port via
-            // SO_REUSEPORT. The kernel distributes incoming UDP packets
-            // across sockets by 4-tuple hash, parallelizing packet
-            // processing and eliminating the single-endpoint Connection
-            // mutex bottleneck on the server side.
-            let num_endpoints = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .min(64); // cap at 64 to avoid excessive sockets
-            let quic_server_config = Arc::new(quic_server_config);
-
-            let routes = tonic_services;
-            for i in 0..num_endpoints {
-                let udp_socket = {
-                    const QUIC_UDP_BUF: usize = 8 * 1024 * 1024;
-                    let sock = socket2::Socket::new(
-                        match socket_addr {
-                            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
-                            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
-                        },
-                        socket2::Type::DGRAM,
-                        Some(socket2::Protocol::UDP),
-                    )
-                    .map_err(|e| make_err!(Code::Internal, "QUIC UDP socket [{i}]: {e:?}"))?;
-                    sock.set_reuse_port(true)
-                        .map_err(|e| make_err!(Code::Internal, "QUIC SO_REUSEPORT [{i}]: {e:?}"))?;
-                    sock.set_nonblocking(true)
-                        .map_err(|e| make_err!(Code::Internal, "QUIC nonblocking [{i}]: {e:?}"))?;
-                    if let Err(err) = sock.set_send_buffer_size(QUIC_UDP_BUF) {
-                        warn!(?err, i, "Failed to set QUIC SO_SNDBUF");
-                    }
-                    if let Err(err) = sock.set_recv_buffer_size(QUIC_UDP_BUF) {
-                        warn!(?err, i, "Failed to set QUIC SO_RCVBUF");
-                    }
-                    sock.bind(&socket_addr.into())
-                        .map_err(|e| make_err!(Code::Internal, "QUIC UDP bind [{i}] on {socket_addr}: {e:?}"))?;
-                    std::net::UdpSocket::from(sock)
-                };
-
-                let quinn_endpoint = quinn::Endpoint::new(
-                    quinn::EndpointConfig::default(),
-                    Some(quinn::ServerConfig::clone(&quic_server_config)),
-                    udp_socket,
-                    quinn::default_runtime().ok_or_else(|| {
-                        make_err!(Code::Internal, "No async runtime for QUIC endpoint [{i}]")
-                    })?,
+            // Pre-create UDP socket with large buffers and SO_REUSEPORT.
+            // SO_REUSEPORT allows multiple sockets on the same port so the
+            // kernel distributes incoming packets across them in parallel.
+            let udp_socket = {
+                const QUIC_UDP_BUF: usize = 8 * 1024 * 1024;
+                let sock = socket2::Socket::new(
+                    match socket_addr {
+                        std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+                        std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+                    },
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
                 )
-                .map_err(|e| make_err!(Code::Internal, "QUIC endpoint [{i}]: {e:?}"))?;
+                .map_err(|e| make_err!(Code::Internal, "QUIC UDP socket: {e:?}"))?;
+                sock.set_reuse_port(true)
+                    .map_err(|e| make_err!(Code::Internal, "QUIC SO_REUSEPORT: {e:?}"))?;
+                sock.set_nonblocking(true)
+                    .map_err(|e| make_err!(Code::Internal, "QUIC nonblocking: {e:?}"))?;
+                if let Err(err) = sock.set_send_buffer_size(QUIC_UDP_BUF) {
+                    warn!(?err, "Failed to set QUIC SO_SNDBUF");
+                }
+                if let Err(err) = sock.set_recv_buffer_size(QUIC_UDP_BUF) {
+                    warn!(?err, "Failed to set QUIC SO_RCVBUF");
+                }
+                sock.bind(&socket_addr.into())
+                    .map_err(|e| make_err!(Code::Internal, "QUIC UDP bind on {socket_addr}: {e:?}"))?;
+                std::net::UdpSocket::from(sock)
+            };
 
-                let acceptor = tonic_h3::quinn::H3QuinnAcceptor::new(quinn_endpoint);
-                let h3_router = tonic_h3::server::H3Router::new(routes.clone());
+            let quinn_endpoint = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(quic_server_config),
+                udp_socket,
+                quinn::default_runtime().ok_or_else(|| {
+                    make_err!(Code::Internal, "No async runtime for QUIC endpoint")
+                })?,
+            )
+            .map_err(|e| make_err!(Code::Internal, "Failed to create QUIC endpoint: {e:?}"))?;
 
-                root_futures.push(Box::pin(async move {
-                    if let Err(err) = h3_router.serve(acceptor).await {
-                        error!(?err, i, "QUIC/HTTP3 server error");
-                    }
-                    Ok(())
-                }));
-            }
+            // Build tonic Routes from the same services.
+            let routes = tonic_services;
+            let acceptor = tonic_h3::quinn::H3QuinnAcceptor::new(quinn_endpoint.clone());
+            let h3_router = tonic_h3::server::H3Router::new(routes);
 
-            info!(
-                %socket_addr,
-                num_endpoints,
-                "Ready, listening on QUIC/HTTP3 ({num_endpoints} endpoints)",
-            );
+            info!("Ready, listening on {socket_addr} (QUIC/HTTP3)");
+            root_futures.push(Box::pin(async move {
+                if let Err(err) = h3_router.serve(acceptor).await {
+                    error!(?err, "QUIC/HTTP3 server error");
+                }
+                Ok(())
+            }));
         }
 
         #[cfg(not(feature = "quic"))]
