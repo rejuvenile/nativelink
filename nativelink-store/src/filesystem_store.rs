@@ -1492,14 +1492,6 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             None
         };
         let read_limit = length.unwrap_or(u64::MAX);
-        if offset > 0 {
-            warn!(
-                key = %owned_key.as_str(),
-                offset,
-                read_limit,
-                "FilesystemStore::get_part: non-zero offset read",
-            );
-        }
         let temp_file = entry.read_file_part(offset).or_else(|err| async move {
             // If the file is not found, we need to remove it from the eviction map.
             if err.code == Code::NotFound {

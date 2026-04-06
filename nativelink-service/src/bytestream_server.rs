@@ -49,8 +49,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::stall_detector::StallGuard;
 use nativelink_util::digest_hasher::{
-    DigestHasher, DigestHasherFunc, DigestHasherImpl, default_digest_hasher_func,
-    make_ctx_for_hash_func,
+    DigestHasherFunc, default_digest_hasher_func, make_ctx_for_hash_func,
 };
 use nativelink_util::proto_stream_utils::WriteRequestStreamWrapper;
 use nativelink_util::resource_info::ResourceInfo;
@@ -294,8 +293,6 @@ struct LoggingReadStream {
     expected_size: u64,
     bytes_sent: u64,
     completed: bool,
-    /// Incrementally hash every chunk sent to detect data corruption.
-    hasher: Option<DigestHasherImpl>,
 }
 
 impl LoggingReadStream {
@@ -307,30 +304,12 @@ impl LoggingReadStream {
             expected_size,
             bytes_sent: 0,
             completed: false,
-            hasher: Some(default_digest_hasher_func().hasher()),
         }
     }
 
-    fn log_completion(&mut self, status: &str) {
+    fn log_completion(&self, status: &str) {
         let elapsed = self.start_time.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
-
-        // Verify blake3 hash of all data sent matches the expected digest.
-        if let Some(mut hasher) = self.hasher.take() {
-            let computed = hasher.finalize_digest();
-            if self.bytes_sent > 0
-                && self.bytes_sent == self.expected_size
-                && computed.packed_hash() != self.digest.packed_hash()
-            {
-                error!(
-                    expected_hash = %self.digest.packed_hash(),
-                    actual_hash = %computed.packed_hash(),
-                    bytes_sent = self.bytes_sent,
-                    expected_size = self.expected_size,
-                    "INTEGRITY FAILURE: ByteStream::read sent data with wrong blake3 hash",
-                );
-            }
-        }
 
         info!(
             digest = %self.digest,
@@ -352,9 +331,6 @@ impl Stream for LoggingReadStream {
         match &result {
             Poll::Ready(Some(Ok(response))) => {
                 self.bytes_sent += response.data.len() as u64;
-                if let Some(hasher) = self.hasher.as_mut() {
-                    hasher.update(response.data.as_ref());
-                }
             }
             Poll::Ready(None) => {
                 self.completed = true;
@@ -829,16 +805,6 @@ impl ByteStreamServer {
             max_bytes_per_stream: instance.max_bytes_per_stream,
             maybe_get_part_result: None,
             get_part_fut: Box::pin(async move {
-                let actual_offset = u64::try_from(read_request.read_offset)
-                    .err_tip(|| "Could not convert read_offset to u64")?;
-                if actual_offset > 0 {
-                    warn!(
-                        %digest,
-                        actual_offset,
-                        read_limit = ?read_limit,
-                        "ByteStream::read: non-zero offset request",
-                    );
-                }
                 // Propagate the worker/non-worker distinction into the store
                 // layer so WorkerProxyStore can decide whether to proxy or
                 // redirect.
@@ -848,7 +814,8 @@ impl ByteStreamServer {
                             .get_part(
                                 digest,
                                 tx,
-                                actual_offset,
+                                u64::try_from(read_request.read_offset)
+                                    .err_tip(|| "Could not convert read_offset to u64")?,
                                 read_limit,
                             )
                             .await
