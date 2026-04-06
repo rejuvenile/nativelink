@@ -49,7 +49,8 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::stall_detector::StallGuard;
 use nativelink_util::digest_hasher::{
-    DigestHasherFunc, default_digest_hasher_func, make_ctx_for_hash_func,
+    DigestHasher, DigestHasherFunc, DigestHasherImpl, default_digest_hasher_func,
+    make_ctx_for_hash_func,
 };
 use nativelink_util::proto_stream_utils::WriteRequestStreamWrapper;
 use nativelink_util::resource_info::ResourceInfo;
@@ -293,6 +294,8 @@ struct LoggingReadStream {
     expected_size: u64,
     bytes_sent: u64,
     completed: bool,
+    /// Incrementally hash every chunk sent to detect data corruption.
+    hasher: Option<DigestHasherImpl>,
 }
 
 impl LoggingReadStream {
@@ -304,12 +307,31 @@ impl LoggingReadStream {
             expected_size,
             bytes_sent: 0,
             completed: false,
+            hasher: Some(default_digest_hasher_func().hasher()),
         }
     }
 
-    fn log_completion(&self, status: &str) {
+    fn log_completion(&mut self, status: &str) {
         let elapsed = self.start_time.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
+
+        // Verify blake3 hash of all data sent matches the expected digest.
+        if let Some(mut hasher) = self.hasher.take() {
+            let computed = hasher.finalize_digest();
+            if self.bytes_sent > 0
+                && self.bytes_sent == self.expected_size
+                && computed.packed_hash() != self.digest.packed_hash()
+            {
+                error!(
+                    expected_hash = %self.digest.packed_hash(),
+                    actual_hash = %computed.packed_hash(),
+                    bytes_sent = self.bytes_sent,
+                    expected_size = self.expected_size,
+                    "INTEGRITY FAILURE: ByteStream::read sent data with wrong blake3 hash",
+                );
+            }
+        }
+
         info!(
             digest = %self.digest,
             expected_size = self.expected_size,
@@ -330,6 +352,9 @@ impl Stream for LoggingReadStream {
         match &result {
             Poll::Ready(Some(Ok(response))) => {
                 self.bytes_sent += response.data.len() as u64;
+                if let Some(hasher) = self.hasher.as_mut() {
+                    hasher.update(response.data.as_ref());
+                }
             }
             Poll::Ready(None) => {
                 self.completed = true;
