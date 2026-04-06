@@ -1210,6 +1210,9 @@ impl GrpcStore {
                                 })?;
 
                             let mut bytes_received: u64 = 0;
+                            let mut fetch_hasher =
+                                nativelink_util::digest_hasher::default_digest_hasher_func()
+                                    .hasher();
                             loop {
                                 match stream.next().await {
                                     None => break,
@@ -1219,6 +1222,9 @@ impl GrpcStore {
                                         }
                                         bytes_received +=
                                             message.data.len() as u64;
+                                        fetch_hasher.update(
+                                            message.data.as_ref(),
+                                        );
                                         tx.send(message.data)
                                             .await
                                             .map_err(|_| {
@@ -1255,6 +1261,17 @@ impl GrpcStore {
                                 ));
                             }
 
+                            let fetch_digest =
+                                fetch_hasher.finalize_digest();
+                            warn!(
+                                idx,
+                                chunk_offset,
+                                chunk_length,
+                                bytes_received,
+                                fetch_hash = %fetch_digest.packed_hash(),
+                                "parallel read: fetch chunk complete",
+                            );
+
                             Ok(())
                         }
                     },
@@ -1274,20 +1291,30 @@ impl GrpcStore {
                     .hasher();
             for (ch_idx, mut rx) in receivers.into_iter().enumerate() {
                 let mut ch_bytes: u64 = 0;
+                let mut ch_hasher =
+                    nativelink_util::digest_hasher::default_digest_hasher_func()
+                        .hasher();
                 while let Some(data) = rx.recv().await {
                     total_bytes += data.len() as u64;
                     ch_bytes += data.len() as u64;
                     hasher.update(data.as_ref());
+                    ch_hasher.update(data.as_ref());
                     writer.send(data).await.err_tip(|| {
                         "while writing parallel chunk data"
                     })?;
                 }
-                trace!(
-                    ch_idx,
-                    ch_bytes,
-                    total_bytes,
-                    "parallel read: channel drained",
-                );
+                let ch_digest = ch_hasher.finalize_digest();
+                // Log first 8 bytes hash + size for each chunk so we can
+                // detect chunk reordering vs data corruption.
+                if ch_bytes > 0 {
+                    warn!(
+                        ch_idx,
+                        ch_bytes,
+                        total_bytes,
+                        ch_hash = %ch_digest.packed_hash(),
+                        "parallel read: chunk drained",
+                    );
+                }
             }
             let computed = hasher.finalize_digest();
             Result::<(u64, nativelink_util::common::DigestInfo), Error>::Ok(
