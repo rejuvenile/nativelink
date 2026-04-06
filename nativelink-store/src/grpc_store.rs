@@ -1213,12 +1213,20 @@ impl GrpcStore {
                             let mut fetch_hasher =
                                 nativelink_util::digest_hasher::default_digest_hasher_func()
                                     .hasher();
+                            let mut first_16_bytes = [0u8; 16];
+                            let mut first_16_len: usize = 0;
                             loop {
                                 match stream.next().await {
                                     None => break,
                                     Some(Ok(message)) => {
                                         if message.data.is_empty() {
                                             break;
+                                        }
+                                        if first_16_len < 16 {
+                                            let copy_len = (16 - first_16_len).min(message.data.len());
+                                            first_16_bytes[first_16_len..first_16_len + copy_len]
+                                                .copy_from_slice(&message.data[..copy_len]);
+                                            first_16_len += copy_len;
                                         }
                                         bytes_received +=
                                             message.data.len() as u64;
@@ -1269,6 +1277,7 @@ impl GrpcStore {
                                 chunk_length,
                                 bytes_received,
                                 fetch_hash = %fetch_digest.packed_hash(),
+                                first_bytes = %format!("{:02x?}", &first_16_bytes[..first_16_len]),
                                 "parallel read: fetch chunk complete",
                             );
 

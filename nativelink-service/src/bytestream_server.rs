@@ -829,6 +829,16 @@ impl ByteStreamServer {
             max_bytes_per_stream: instance.max_bytes_per_stream,
             maybe_get_part_result: None,
             get_part_fut: Box::pin(async move {
+                let actual_offset = u64::try_from(read_request.read_offset)
+                    .err_tip(|| "Could not convert read_offset to u64")?;
+                if actual_offset > 0 {
+                    warn!(
+                        %digest,
+                        actual_offset,
+                        read_limit = ?read_limit,
+                        "ByteStream::read: non-zero offset request",
+                    );
+                }
                 // Propagate the worker/non-worker distinction into the store
                 // layer so WorkerProxyStore can decide whether to proxy or
                 // redirect.
@@ -838,8 +848,7 @@ impl ByteStreamServer {
                             .get_part(
                                 digest,
                                 tx,
-                                u64::try_from(read_request.read_offset)
-                                    .err_tip(|| "Could not convert read_offset to u64")?,
+                                actual_offset,
                                 read_limit,
                             )
                             .await
