@@ -41,7 +41,7 @@ use nativelink_proto::google::bytestream::{
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::connection_manager::ConnectionManager;
-use nativelink_util::digest_hasher::{DigestHasherFunc, default_digest_hasher_func};
+use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::health_utils::HealthStatusIndicator;
 use nativelink_util::proto_stream_utils::{
     FirstStream, WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
@@ -1266,17 +1266,33 @@ impl GrpcStore {
         // Writer future: drains channels in chunk order → output.
         // When a sender drops (fetch done or errored), recv()
         // returns None and we advance to the next channel.
+        let resource_name_for_log = resource_name.to_string();
         let write_all = async {
             let mut total_bytes: u64 = 0;
-            for mut rx in receivers {
+            let mut hasher =
+                nativelink_util::digest_hasher::default_digest_hasher_func()
+                    .hasher();
+            for (ch_idx, mut rx) in receivers.into_iter().enumerate() {
+                let mut ch_bytes: u64 = 0;
                 while let Some(data) = rx.recv().await {
                     total_bytes += data.len() as u64;
+                    ch_bytes += data.len() as u64;
+                    hasher.update(data.as_ref());
                     writer.send(data).await.err_tip(|| {
                         "while writing parallel chunk data"
                     })?;
                 }
+                trace!(
+                    ch_idx,
+                    ch_bytes,
+                    total_bytes,
+                    "parallel read: channel drained",
+                );
             }
-            Result::<u64, Error>::Ok(total_bytes)
+            let computed = hasher.finalize_digest();
+            Result::<(u64, nativelink_util::common::DigestInfo), Error>::Ok(
+                (total_bytes, computed),
+            )
         };
 
         let (fetch_result, write_result) =
@@ -1286,8 +1302,35 @@ impl GrpcStore {
         // backpressure or client disconnect.
         fetch_result
             .err_tip(|| "in GrpcStore::get_part_parallel fetch")?;
-        let total_bytes = write_result
+        let (total_bytes, reassembled_digest) = write_result
             .err_tip(|| "in GrpcStore::get_part_parallel write")?;
+
+        // Verify the reassembled data hash matches the expected digest
+        // from the resource_name. Parse the digest from the resource_name
+        // format: "{instance}/blobs/{func}/{hash}/{size}"
+        {
+            let parts: Vec<&str> =
+                resource_name_for_log.split('/').collect();
+            if parts.len() >= 5 {
+                let expected_hash = parts[parts.len() - 2];
+                let actual_hash =
+                    format!("{}", reassembled_digest.packed_hash());
+                if actual_hash != expected_hash {
+                    error!(
+                        expected_hash,
+                        %actual_hash,
+                        total_bytes,
+                        total_length,
+                        chunks = actual_chunk_count,
+                        resource_name = %resource_name_for_log,
+                        "INTEGRITY FAILURE: parallel chunked read \
+                         reassembled data has wrong blake3 hash — \
+                         chunk ordering or data corruption in \
+                         get_part_parallel",
+                    );
+                }
+            }
+        }
 
         writer
             .send_eof()
