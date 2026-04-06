@@ -1260,7 +1260,10 @@ const fn default_connections_per_endpoint() -> usize {
 }
 
 fn default_parallel_chunk_read_threshold() -> u64 {
-    8 * 1024 * 1024
+    // Disabled: parallel chunked reads have a chunk ordering bug that
+    // corrupts reassembled data (correct size, wrong blake3 hash).
+    // See instrumentation in grpc_store::get_part_parallel.
+    0
 }
 
 fn default_parallel_chunk_count() -> u64 {
