@@ -371,7 +371,7 @@ impl FastSlowStore {
             );
             UploadSizeInfo::MaxSize(u64::MAX)
         } else {
-            UploadSizeInfo::ExactSize(self
+            UploadSizeInfo::MaxSize(self
                     .slow_store
                     .has(key.borrow())
                     .await
