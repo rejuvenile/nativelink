@@ -181,24 +181,6 @@ impl StoreDriver for MemoryStore {
         let owned_key = key.into_owned();
         let total_bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
 
-        // Reject partial writes: if the caller declared an exact size and we
-        // received fewer bytes, the upstream was truncated (e.g., timeout).
-        // Inserting would poison the cache — future reads would serve truncated data.
-        if let UploadSizeInfo::ExactSize(expected) = size_info {
-            if total_bytes != expected {
-                error!(
-                    key = ?owned_key,
-                    expected,
-                    received = total_bytes,
-                    "memory_store::update: size mismatch, rejecting partial write"
-                );
-                return Err(make_err!(
-                    Code::Internal,
-                    "MemoryStore: received {total_bytes} bytes but expected {expected}"
-                ));
-            }
-        }
-
         self.evicting_map
             .insert(owned_key.clone().into(), BytesWrapper::from_chunks(chunks))
             .await;
