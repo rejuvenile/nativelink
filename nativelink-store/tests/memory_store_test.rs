@@ -353,3 +353,85 @@ async fn list_test() -> Result<(), Error> {
 
     Ok(())
 }
+
+#[nativelink_test]
+async fn update_rejects_partial_write_with_exact_size() -> Result<(), Error> {
+    // Regression test: if update() receives fewer bytes than ExactSize
+    // declares, it must NOT insert the partial entry. A truncated upstream
+    // (e.g., Redis timeout dropping the channel) would otherwise poison
+    // the cache, causing all future reads to serve truncated data.
+    use nativelink_util::store_trait::UploadSizeInfo;
+
+    let store = std::sync::Arc::new(MemoryStore::new(&MemorySpec::default()));
+    let digest = DigestInfo::try_new(
+        "0123456789abcdef000000000000000000000000000000000123456789abcdef",
+        100_000,
+    )
+    .unwrap();
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let store_pin = Pin::new(store.as_ref());
+    let update_fut = store_pin.update(
+        StoreKey::from(digest),
+        rx,
+        UploadSizeInfo::ExactSize(100_000),
+    );
+    let send_fut = async {
+        tx.send(Bytes::from(vec![42u8; 1000])).await?;
+        tx.send_eof()?;
+        Ok::<_, Error>(())
+    };
+    let (update_res, send_res) = tokio::join!(update_fut, send_fut);
+    send_res?;
+
+    assert!(
+        update_res.is_err(),
+        "Expected update to reject partial write (1000 bytes vs 100000 declared)"
+    );
+
+    let has = Pin::new(store.as_ref())
+        .has(StoreKey::from(digest))
+        .await?;
+    assert!(
+        has.is_none(),
+        "Store should not contain partial entry after rejected write, but has() returned {has:?}"
+    );
+
+    Ok(())
+}
+
+#[nativelink_test]
+async fn update_accepts_correct_size_with_exact_size() -> Result<(), Error> {
+    use nativelink_util::store_trait::UploadSizeInfo;
+
+    let store = std::sync::Arc::new(MemoryStore::new(&MemorySpec::default()));
+    let data = vec![42u8; 5000];
+    let digest = DigestInfo::try_new(
+        "0123456789abcdef000000000000000000000000000000000123456789abcdef",
+        data.len() as u64,
+    )
+    .unwrap();
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let store_pin = Pin::new(store.as_ref());
+    let update_fut = store_pin.update(
+        StoreKey::from(digest),
+        rx,
+        UploadSizeInfo::ExactSize(data.len() as u64),
+    );
+    let send_fut = async {
+        tx.send(Bytes::from(data.clone())).await?;
+        tx.send_eof()?;
+        Ok::<_, Error>(())
+    };
+    let (update_res, send_res) = tokio::join!(update_fut, send_fut);
+    send_res?;
+    update_res?;
+
+    let result = Pin::new(store.as_ref())
+        .get_part_unchunked(digest, 0, None)
+        .await?;
+    assert_eq!(result.as_ref(), data.as_slice());
+
+    Ok(())
+}

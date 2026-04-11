@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::stores::MemorySpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::evicting_map::{LenEntry, ShardedEvictingMap};
@@ -160,7 +160,7 @@ impl StoreDriver for MemoryStore {
         self: Pin<&Self>,
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
-        _size_info: UploadSizeInfo,
+        size_info: UploadSizeInfo,
     ) -> Result<(), Error> {
         let update_start = std::time::Instant::now();
         debug!(key = ?key, "MemoryStore::update: start");
@@ -178,24 +178,27 @@ impl StoreDriver for MemoryStore {
             chunks.push(chunk);
         }
 
-        // Diagnostic: log if we received many tiny chunks for a non-tiny blob.
-        // This would indicate the upstream is fragmenting unnecessarily.
-        if chunks.len() > 2 {
-            let total: usize = chunks.iter().map(|c| c.len()).sum();
-            let avg = total / chunks.len();
-            if avg < 4096 && total > 4096 {
-                warn!(
-                    key = ?key,
-                    chunk_count = chunks.len(),
-                    total_bytes = total,
-                    avg_chunk_bytes = avg,
-                    "memory_store::update: received many small chunks for non-small blob",
+        let owned_key = key.into_owned();
+        let total_bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+
+        // Reject partial writes: if the caller declared an exact size and we
+        // received fewer bytes, the upstream was truncated (e.g., timeout).
+        // Inserting would poison the cache — future reads would serve truncated data.
+        if let UploadSizeInfo::ExactSize(expected) = size_info {
+            if total_bytes != expected {
+                error!(
+                    key = ?owned_key,
+                    expected,
+                    received = total_bytes,
+                    "memory_store::update: size mismatch, rejecting partial write"
                 );
+                return Err(make_err!(
+                    Code::Internal,
+                    "MemoryStore: received {total_bytes} bytes but expected {expected}"
+                ));
             }
         }
 
-        let owned_key = key.into_owned();
-        let total_bytes: usize = chunks.iter().map(|c| c.len()).sum();
         self.evicting_map
             .insert(owned_key.clone().into(), BytesWrapper::from_chunks(chunks))
             .await;
