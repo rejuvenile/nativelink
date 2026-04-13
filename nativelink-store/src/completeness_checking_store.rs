@@ -473,7 +473,79 @@ impl StoreDriver for CompletenessCheckingStore {
         reader: DropCloserReadHalf,
         size_info: UploadSizeInfo,
     ) -> Result<(), Error> {
+        // For streaming updates, we can't easily verify completeness
+        // before writing without buffering the entire entry. The
+        // update_oneshot path handles the common case (AC entries are
+        // small enough for oneshot). Pass through for streaming.
         self.ac_store.update(key, reader, size_info).await
+    }
+
+    async fn update_oneshot(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        data: Bytes,
+    ) -> Result<(), Error> {
+        // Verify CAS completeness before writing the AC entry.
+        // This prevents stale AC entries from being written when
+        // CAS blob uploads failed (e.g., connection reset mid-upload).
+        // The cas_store goes through WorkerProxyStore, so blobs on
+        // connected workers also count as present.
+        let action_result = ProtoActionResult::decode(data.clone())
+            .map_err(|e| {
+                make_err!(
+                    Code::InvalidArgument,
+                    "Failed to decode ActionResult in update_oneshot: {:?}",
+                    e
+                )
+            })?;
+
+        // Extract all CAS digests from the ActionResult.
+        let mut digest_keys: Vec<StoreKey<'static>> = Vec::new();
+        for file in &action_result.output_files {
+            if let Some(ref digest) = file.digest {
+                if let Ok(d) = DigestInfo::try_from(digest.clone()) {
+                    digest_keys.push(d.into());
+                }
+            }
+        }
+        // Also check stdout/stderr digests if present.
+        if let Some(ref digest) = action_result.stdout_digest {
+            if let Ok(d) = DigestInfo::try_from(digest.clone()) {
+                digest_keys.push(d.into());
+            }
+        }
+        if let Some(ref digest) = action_result.stderr_digest {
+            if let Ok(d) = DigestInfo::try_from(digest.clone()) {
+                digest_keys.push(d.into());
+            }
+        }
+
+        // Check CAS completeness.
+        if !digest_keys.is_empty() {
+            let mut results = vec![None; digest_keys.len()];
+            self.cas_store
+                .has_with_results(&digest_keys, &mut results)
+                .await
+                .err_tip(|| "CAS existence check failed in update_oneshot")?;
+
+            for (i, result) in results.iter().enumerate() {
+                if result.is_none() {
+                    warn!(
+                        ?key,
+                        missing_digest = ?digest_keys[i],
+                        "rejecting AC update: CAS blob missing"
+                    );
+                    return Err(make_err!(
+                        Code::FailedPrecondition,
+                        "Cannot write AC entry: CAS blob {:?} is missing",
+                        digest_keys[i]
+                    ));
+                }
+            }
+        }
+
+        // All CAS blobs present — write the AC entry.
+        self.ac_store.update_oneshot(key, data).await
     }
 
     async fn get_part(
