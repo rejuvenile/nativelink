@@ -1540,6 +1540,12 @@ impl ApiWorkerScheduler {
         // endpoints) and HashMap<Arc<str>, ...> that previously consumed
         // ~61% of scheduler CPU during active builds.
         let input_root_digest = action_info.inner.input_root_digest;
+        info!(
+            has_tree = resolved_tree.is_some(),
+            has_locality_map = self.locality_map.is_some(),
+            %input_root_digest,
+            "scoring: pre-match state"
+        );
         let scoring_result: Option<Arc<ScoringResult>> = match (&resolved_tree, &self.locality_map) {
             (Some(tree), Some(loc_map)) => {
                 // Check the scores cache first (lock briefly, no await while held).
@@ -2703,6 +2709,7 @@ fn score_and_generate_hints(
 
     let map = locality_map.read();
     let blobs = map.blobs_map();
+    let locality_blob_count = blobs.len();
     let mut scores: HashMap<Arc<str>, (u64, SystemTime)> = HashMap::new();
     let mut hint_candidates: Vec<(DigestInfo, u64, Vec<Arc<str>>)> = Vec::new();
 
@@ -2738,6 +2745,14 @@ fn score_and_generate_hints(
             peer_endpoints: peer_endpoints.iter().map(|e| e.to_string()).collect(),
         })
         .collect();
+
+    info!(
+        file_digests = file_digests.len(),
+        locality_blob_count,
+        peer_hints = peer_hints.len(),
+        endpoints = scores.len(),
+        "score_and_generate_hints"
+    );
 
     (scores, peer_hints)
 }

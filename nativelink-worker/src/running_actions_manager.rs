@@ -4659,6 +4659,11 @@ impl RunningActionsManager for RunningActionsManagerImpl {
             .wrap(async move {
                 // Extract peer hints BEFORE consuming start_execute.
                 let peer_hints = start_execute.peer_hints.clone();
+                info!(
+                    peer_hint_count = peer_hints.len(),
+                    has_locality_map = self.peer_locality_map.is_some(),
+                    "create_and_add_action: peer hints received"
+                );
                 if !peer_hints.is_empty() {
                     if let Some(ref locality_map) = self.peer_locality_map {
                         let mut map = locality_map.write();
