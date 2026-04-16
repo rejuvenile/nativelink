@@ -88,7 +88,8 @@ impl Drop for CallbackPauseGuard<'_> {
     fn drop(&mut self) {
         // Task was cancelled — decrement but don't drain callbacks.
         // The next successful finish() that reaches 0 will drain them.
-        self.callbacks.lock().0 = self.callbacks.lock().0.saturating_sub(1);
+        let mut locked = self.callbacks.lock();
+        locked.0 = locked.0.saturating_sub(1);
     }
 }
 
