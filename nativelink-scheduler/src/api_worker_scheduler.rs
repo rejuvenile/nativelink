@@ -991,7 +991,13 @@ impl ApiWorkerSchedulerImpl {
         is_disconnect: bool,
     ) -> Result<(), Error> {
         // Clear scores cache so stale endpoint scores don't persist.
-        self.scores_cache.lock().await.clear();
+        // Use try_lock to avoid blocking the scheduler write lock if a
+        // scoring operation currently holds the scores_cache. The cache
+        // is best-effort — stale scores only cause suboptimal worker
+        // selection for one scheduling cycle.
+        if let Ok(mut cache) = self.scores_cache.try_lock() {
+            cache.clear();
+        }
 
         let mut result = Ok(());
         if let Some(mut worker) = self.remove_worker(worker_id) {

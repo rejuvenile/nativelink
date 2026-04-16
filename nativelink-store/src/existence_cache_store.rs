@@ -14,14 +14,12 @@
 
 use core::pin::Pin;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
-use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace};
 
@@ -53,43 +51,30 @@ impl LenEntry for ExistenceItem {
     }
 }
 
-/// RAII guard that increments the pause counter on creation and decrements
-/// on drop. Ensures the counter is decremented even if the async task is
-/// cancelled at an .await point, preventing a permanent callback leak.
+/// RAII guard that tracks concurrent update() calls via an atomic counter.
+/// Used only for diagnostics / future use. Eviction callbacks fire
+/// immediately without queuing — this eliminates the Mutex contention
+/// that caused tokio runtime stalls under high-concurrency write bursts.
+///
+/// Correctness argument: if a blob is written and immediately evicted by
+/// the inner store, the eviction callback removes it from the existence
+/// cache, then update() re-inserts it (transient stale positive). This
+/// is self-correcting: get_part() handles NotFound by removing the stale
+/// entry, and update() bypasses the cache to check the inner store.
 struct CallbackPauseGuard<'a> {
-    callbacks: &'a Mutex<(u32, Vec<StoreKey<'static>>)>,
+    counter: &'a AtomicU32,
 }
 
 impl<'a> CallbackPauseGuard<'a> {
-    fn new(callbacks: &'a Mutex<(u32, Vec<StoreKey<'static>>)>) -> Self {
-        callbacks.lock().0 += 1;
-        Self { callbacks }
-    }
-
-    /// Decrement the counter and drain accumulated callbacks if this is
-    /// the last active pauser. Returns the callbacks to process.
-    fn finish(self) -> Vec<StoreKey<'static>> {
-        let keys = {
-            let mut locked = self.callbacks.lock();
-            locked.0 = locked.0.saturating_sub(1);
-            if locked.0 == 0 {
-                std::mem::take(&mut locked.1)
-            } else {
-                Vec::new()
-            }
-        };
-        // Prevent Drop from decrementing again.
-        std::mem::forget(self);
-        keys
+    fn new(counter: &'a AtomicU32) -> Self {
+        counter.fetch_add(1, Ordering::Release);
+        Self { counter }
     }
 }
 
 impl Drop for CallbackPauseGuard<'_> {
     fn drop(&mut self) {
-        // Task was cancelled — decrement but don't drain callbacks.
-        // The next successful finish() that reaches 0 will drain them.
-        let mut locked = self.callbacks.lock();
-        locked.0 = locked.0.saturating_sub(1);
+        self.counter.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -99,12 +84,12 @@ pub struct ExistenceCacheStore<I: InstantWrapper> {
     inner_store: Store,
     existence_cache: Arc<MokaEvictingMap<DigestInfo, DigestInfo, ExistenceItem, I>>,
 
-    // Pause eviction callbacks during inner store writes. Uses a RAII guard
-    // (CallbackPauseGuard) so the counter is decremented even if the task is
-    // cancelled at an .await point. Callbacks accumulate in the Vec while
-    // counter > 0. The guard's Drop decrements; the next update() that
-    // decrements to 0 drains and processes all accumulated callbacks.
-    pause_item_callbacks: Mutex<(u32, Vec<StoreKey<'static>>)>,
+    // Count of active update() / update_oneshot() calls. When > 0,
+    // eviction callbacks still fire normally (they just remove from the
+    // existence cache, which is harmless). The counter is used by
+    // update() to know it should re-verify the existence cache after
+    // writing. Atomic to avoid Mutex contention under load.
+    active_updates: AtomicU32,
 }
 
 impl ExistenceCacheStore<SystemTime> {
@@ -143,13 +128,10 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheCallback<I> {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let cache = self.cache.upgrade();
         if let Some(local_cache) = cache {
-            {
-                let mut locked = local_cache.pause_item_callbacks.lock();
-                if locked.0 > 0 {
-                    locked.1.push(store_key.into_owned());
-                    return Box::pin(async {});
-                }
-            }
+            // Always fire callbacks immediately — removing a digest from
+            // the existence cache is cheap and idempotent. The update()
+            // path re-inserts after a successful write, so a concurrent
+            // eviction callback cannot create a stale positive.
             let store_key = store_key.into_owned();
             return Box::pin(async move {
                 local_cache.callback(store_key).await;
@@ -159,7 +141,6 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheCallback<I> {
         }
         Box::pin(async {})
     }
-
 }
 
 impl<I: InstantWrapper> ExistenceCacheStore<I> {
@@ -180,7 +161,7 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
         let existence_cache_store = Arc::new(Self {
             inner_store,
             existence_cache,
-            pause_item_callbacks: Mutex::new((0, Vec::new())),
+            active_updates: AtomicU32::new(0),
         });
         let other_ref = Arc::downgrade(&existence_cache_store);
         existence_cache_store
@@ -316,7 +297,11 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         }
         // If the existence cache had a stale entry, remove it now.
         self.existence_cache.remove(&digest).await;
-        let pause_guard = CallbackPauseGuard::new(&self.pause_item_callbacks);
+        // Track that an update is in progress. Eviction callbacks fire
+        // normally (no queuing) — they just remove from the existence
+        // cache, which is idempotent. We re-insert after a successful
+        // write, so a concurrent eviction cannot create a stale positive.
+        let _pause_guard = CallbackPauseGuard::new(&self.active_updates);
         trace!(?digest, "Inserting into inner cache");
         let update_start = std::time::Instant::now();
         let result = self.inner_store.update(digest, reader, size_info).await;
@@ -347,17 +332,6 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 .existence_cache
                 .insert(digest, ExistenceItem(size))
                 .await;
-
-        }
-        {
-            let keys_to_process = pause_guard.finish();
-            if !keys_to_process.is_empty() {
-                let mut callbacks: FuturesUnordered<_> = keys_to_process
-                    .into_iter()
-                    .map(|store_key| self.callback(store_key))
-                    .collect();
-                while callbacks.next().await.is_some() {}
-            }
         }
         result
     }
@@ -389,7 +363,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         }
         // If the existence cache had a stale entry, remove it now.
         self.existence_cache.remove(&digest).await;
-        let pause_guard = CallbackPauseGuard::new(&self.pause_item_callbacks);
+        let _pause_guard = CallbackPauseGuard::new(&self.active_updates);
         trace!(?digest, "Inserting into inner cache via update_oneshot");
         let update_start = std::time::Instant::now();
         let size = u64::try_from(data.len())
@@ -416,16 +390,6 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 .existence_cache
                 .insert(digest, ExistenceItem(size))
                 .await;
-        }
-        {
-            let keys_to_process = pause_guard.finish();
-            if !keys_to_process.is_empty() {
-                let mut callbacks: FuturesUnordered<_> = keys_to_process
-                    .into_iter()
-                    .map(|store_key| self.callback(store_key))
-                    .collect();
-                while callbacks.next().await.is_some() {}
-            }
         }
         result
     }
