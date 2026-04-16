@@ -1830,14 +1830,17 @@ impl ApiWorkerScheduler {
         // Cache miss — resolve inline so the current action benefits from
         // locality scoring. Tree resolution is typically fast (MemoryStore
         // or local CAS) and the result is cached for future actions.
-        // A 200ms timeout prevents slow CAS lookups from blocking dispatch.
+        // A 500ms timeout prevents slow CAS lookups from blocking dispatch.
+        // GetTree with subtree caching resolves 1000-dir trees in 10-50ms
+        // when warm, but cold starts (first action for a new tree) need
+        // up to ~200ms for store fetches. 500ms covers p99 of warm+cold.
         let resolve_fut = resolve_tree_from_cas(
             cas_store,
             input_root_digest,
             &self.failed_directory_digests,
         );
         let resolve_result =
-            tokio::time::timeout(Duration::from_millis(200), resolve_fut).await;
+            tokio::time::timeout(Duration::from_millis(500), resolve_fut).await;
 
         // Always remove from in-progress set.
         self.tree_resolution_in_progress

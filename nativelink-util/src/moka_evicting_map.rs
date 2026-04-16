@@ -42,9 +42,11 @@ use crate::metrics_utils::{Counter, CounterWithTime};
 const PIN_CAP_FRACTION: f64 = 0.25;
 /// Seconds before a pin automatically expires.
 const PIN_TIMEOUT_SECS: u64 = 120;
-/// Bounded eviction channel capacity. Prevents unbounded memory growth
-/// during burst eviction. Items beyond this are cleaned up inline.
-const EVICTION_CHANNEL_SIZE: usize = 4096;
+// Eviction channel is unbounded (mpsc::unbounded_channel). Each EvictionEvent
+// is ~64 bytes (Arc<K> + T). At 1M entries that's ~64MB, well within budget.
+// Unbounded avoids blocking moka's internal lock during burst eviction
+// (bounded channels overflow under heavy load — 3,656 overflows in 10 min
+// with a 32K bounded channel).
 
 /// Entry stored in the pinned map, alongside metadata for timeout
 /// enforcement and size accounting.
@@ -85,11 +87,11 @@ pub struct MokaEvictingMap<
     /// Optional BTreeSet index for range queries. Shared with the
     /// eviction listener for cleanup on eviction.
     btree: Arc<RwLock<Option<BTreeSet<K>>>>,
-    /// Bounded channel for eviction events sent to the background drainer.
-    eviction_tx: mpsc::Sender<EvictionEvent<K, T>>,
+    /// Unbounded channel for eviction events sent to the background drainer.
+    eviction_tx: mpsc::UnboundedSender<EvictionEvent<K, T>>,
     /// Receiver held until `start_background_eviction` moves it into
     /// the drainer task.
-    eviction_rx: parking_lot::Mutex<Option<mpsc::Receiver<EvictionEvent<K, T>>>>,
+    eviction_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<EvictionEvent<K, T>>>>,
     /// Callbacks to invoke on item removal.
     callbacks: RwLock<Vec<C>>,
     /// Anchor time for timestamp conversion.
@@ -170,7 +172,7 @@ where
         let max_seconds = config.max_seconds;
         let evict_bytes = config.evict_bytes as u64;
 
-        let (eviction_tx, eviction_rx) = mpsc::channel(EVICTION_CHANNEL_SIZE);
+        let (eviction_tx, eviction_rx) = mpsc::unbounded_channel();
         let listener_tx = eviction_tx.clone();
 
         // Shared state captured by the eviction listener closure.
@@ -242,31 +244,12 @@ where
                 }
             }
 
-            // Send to background drainer. If the channel is full (burst
-            // eviction), spawn inline cleanup to avoid blocking moka's
-            // internal lock.
-            if let Err(mpsc::error::TrySendError::Full(event)) =
-                listener_tx.try_send(EvictionEvent {
-                    key: Arc::clone(&key),
-                    value,
-                })
-            {
-                // Channel full — spawn fire-and-forget cleanup.
-                // Note: ItemCallbacks are skipped here because the
-                // callback list lives on the struct, not in the closure.
-                // This is rare (only during burst eviction exceeding 4096
-                // buffered events) and the callbacks are best-effort.
-                warn!(
-                    "eviction channel full, spawning inline cleanup \
-                     (ItemCallbacks skipped for this entry)"
-                );
-                let evicted_key = event.key;
-                let evicted_value = event.value;
-                tokio::spawn(async move {
-                    evicted_value.unref().await;
-                    drop(evicted_key);
-                });
-            }
+            // Send to background drainer. Unbounded channel never blocks —
+            // send only fails if the receiver is dropped (shutdown).
+            let _ = listener_tx.send(EvictionEvent {
+                key: Arc::clone(&key),
+                value,
+            });
         });
 
         let cache = builder.build();
@@ -950,7 +933,7 @@ where
 
     async fn drain_evictions(
         self: &Arc<Self>,
-        mut rx: mpsc::Receiver<EvictionEvent<K, T>>,
+        mut rx: mpsc::UnboundedReceiver<EvictionEvent<K, T>>,
     ) {
         let mut pin_check_interval = tokio::time::interval(Duration::from_secs(10));
         pin_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

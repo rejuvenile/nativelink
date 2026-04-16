@@ -3566,7 +3566,6 @@ dependencies = [
  "hyper-util",
  "io-uring",
  "libc",
- "lru",
  "mock_instant",
  "moka",
  "nativelink-config",
