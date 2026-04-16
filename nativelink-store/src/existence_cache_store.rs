@@ -53,17 +53,57 @@ impl LenEntry for ExistenceItem {
     }
 }
 
+/// RAII guard that increments the pause counter on creation and decrements
+/// on drop. Ensures the counter is decremented even if the async task is
+/// cancelled at an .await point, preventing a permanent callback leak.
+struct CallbackPauseGuard<'a> {
+    callbacks: &'a Mutex<(u32, Vec<StoreKey<'static>>)>,
+}
+
+impl<'a> CallbackPauseGuard<'a> {
+    fn new(callbacks: &'a Mutex<(u32, Vec<StoreKey<'static>>)>) -> Self {
+        callbacks.lock().0 += 1;
+        Self { callbacks }
+    }
+
+    /// Decrement the counter and drain accumulated callbacks if this is
+    /// the last active pauser. Returns the callbacks to process.
+    fn finish(self) -> Vec<StoreKey<'static>> {
+        let keys = {
+            let mut locked = self.callbacks.lock();
+            locked.0 = locked.0.saturating_sub(1);
+            if locked.0 == 0 {
+                std::mem::take(&mut locked.1)
+            } else {
+                Vec::new()
+            }
+        };
+        // Prevent Drop from decrementing again.
+        std::mem::forget(self);
+        keys
+    }
+}
+
+impl Drop for CallbackPauseGuard<'_> {
+    fn drop(&mut self) {
+        // Task was cancelled — decrement but don't drain callbacks.
+        // The next successful finish() that reaches 0 will drain them.
+        self.callbacks.lock().0 = self.callbacks.lock().0.saturating_sub(1);
+    }
+}
+
 #[derive(Debug, MetricsComponent)]
 pub struct ExistenceCacheStore<I: InstantWrapper> {
     #[metric(group = "inner_store")]
     inner_store: Store,
     existence_cache: Arc<MokaEvictingMap<DigestInfo, DigestInfo, ExistenceItem, I>>,
 
-    // We need to pause them temporarily when inserting into the inner store
-    // as if it immediately expires them, we should only apply the remove callbacks
-    // afterwards. If this is None, we're not pausing; if it's Some it's the location to
-    // store them in temporarily
-    pause_item_callbacks: Mutex<Option<Vec<StoreKey<'static>>>>,
+    // Pause eviction callbacks during inner store writes. Uses a RAII guard
+    // (CallbackPauseGuard) so the counter is decremented even if the task is
+    // cancelled at an .await point. Callbacks accumulate in the Vec while
+    // counter > 0. The guard's Drop decrements; the next update() that
+    // decrements to 0 drains and processes all accumulated callbacks.
+    pause_item_callbacks: Mutex<(u32, Vec<StoreKey<'static>>)>,
 }
 
 impl ExistenceCacheStore<SystemTime> {
@@ -102,14 +142,17 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheCallback<I> {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         let cache = self.cache.upgrade();
         if let Some(local_cache) = cache {
-            if let Some(callbacks) = local_cache.pause_item_callbacks.lock().as_mut() {
-                callbacks.push(store_key.into_owned());
-            } else {
-                let store_key = store_key.into_owned();
-                return Box::pin(async move {
-                    local_cache.callback(store_key).await;
-                });
+            {
+                let mut locked = local_cache.pause_item_callbacks.lock();
+                if locked.0 > 0 {
+                    locked.1.push(store_key.into_owned());
+                    return Box::pin(async {});
+                }
             }
+            let store_key = store_key.into_owned();
+            return Box::pin(async move {
+                local_cache.callback(store_key).await;
+            });
         } else {
             debug!("ExistenceCacheStore: eviction callback skipped (cache dropped)");
         }
@@ -136,7 +179,7 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
         let existence_cache_store = Arc::new(Self {
             inner_store,
             existence_cache,
-            pause_item_callbacks: Mutex::new(None),
+            pause_item_callbacks: Mutex::new((0, Vec::new())),
         });
         let other_ref = Arc::downgrade(&existence_cache_store);
         existence_cache_store
@@ -272,12 +315,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         }
         // If the existence cache had a stale entry, remove it now.
         self.existence_cache.remove(&digest).await;
-        {
-            let mut locked_callbacks = self.pause_item_callbacks.lock();
-            if locked_callbacks.is_none() {
-                locked_callbacks.replace(vec![]);
-            }
-        }
+        let pause_guard = CallbackPauseGuard::new(&self.pause_item_callbacks);
         trace!(?digest, "Inserting into inner cache");
         let update_start = std::time::Instant::now();
         let result = self.inner_store.update(digest, reader, size_info).await;
@@ -311,9 +349,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
 
         }
         {
-            let maybe_keys = self.pause_item_callbacks.lock().take();
-            if let Some(keys) = maybe_keys {
-                let mut callbacks: FuturesUnordered<_> = keys
+            let keys_to_process = pause_guard.finish();
+            if !keys_to_process.is_empty() {
+                let mut callbacks: FuturesUnordered<_> = keys_to_process
                     .into_iter()
                     .map(|store_key| self.callback(store_key))
                     .collect();
@@ -350,12 +388,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         }
         // If the existence cache had a stale entry, remove it now.
         self.existence_cache.remove(&digest).await;
-        {
-            let mut locked_callbacks = self.pause_item_callbacks.lock();
-            if locked_callbacks.is_none() {
-                locked_callbacks.replace(vec![]);
-            }
-        }
+        let pause_guard = CallbackPauseGuard::new(&self.pause_item_callbacks);
         trace!(?digest, "Inserting into inner cache via update_oneshot");
         let update_start = std::time::Instant::now();
         let size = u64::try_from(data.len())
@@ -384,9 +417,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 .await;
         }
         {
-            let maybe_keys = self.pause_item_callbacks.lock().take();
-            if let Some(keys) = maybe_keys {
-                let mut callbacks: FuturesUnordered<_> = keys
+            let keys_to_process = pause_guard.finish();
+            if !keys_to_process.is_empty() {
+                let mut callbacks: FuturesUnordered<_> = keys_to_process
                     .into_iter()
                     .map(|store_key| self.callback(store_key))
                     .collect();

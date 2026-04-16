@@ -1664,9 +1664,32 @@ impl ByteStreamServer {
         // Direct update without channel overhead
         let store = instance_info.store.clone();
         store
-            .update_oneshot(digest, final_data)
+            .update_oneshot(digest, final_data.clone())
             .await
             .err_tip(|| "Error in update_oneshot")?;
+
+        // Register streaming blob for read-while-write AFTER the store write
+        // succeeds. Registering before the write would let readers see data
+        // that might not persist if the write fails. The oneshot path has the
+        // full blob in memory, so write it all at once and send EOF.
+        if instance_info.streaming_read_while_write {
+            if let Some((mut writer, _reader)) = instance_info
+                .in_flight_blobs
+                .register(digest, instance_info.max_streaming_blob_buffer_bytes)
+            {
+                let _ = writer.send(final_data).await;
+                let _ = writer.send_eof();
+            }
+            // Schedule deferred removal so the map doesn't fill up (128 max).
+            let in_flight_blobs = Arc::clone(&instance_info.in_flight_blobs);
+            let inner_arc = instance_info.in_flight_blobs.get_inner(&digest);
+            if let Some(inner_arc) = inner_arc {
+                nativelink_util::background_spawn!("streaming_blob_oneshot_removal", async move {
+                    sleep(Duration::from_secs(5)).await;
+                    in_flight_blobs.remove(&digest, &inner_arc);
+                });
+            }
+        }
 
         // Mirror to a random worker using the cloned data — no re-read needed.
         // Skip mirroring for worker uploads and mirror writes — workers already

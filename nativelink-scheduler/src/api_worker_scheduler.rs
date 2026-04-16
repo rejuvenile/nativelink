@@ -182,6 +182,10 @@ struct ApiWorkerSchedulerImpl {
     /// Whether the worker scheduler is shutting down.
     shutting_down: bool,
 
+    /// Shared ref to the outer scores cache — cleared on worker eviction
+    /// so stale endpoint scores don't persist.
+    scores_cache: Arc<tokio::sync::Mutex<LruCache<DigestInfo, Arc<ScoringResult>>>>,
+
     /// Index for fast worker capability lookup.
     /// Used to accelerate `find_worker_for_action` by filtering candidates
     /// based on properties before doing linear scan.
@@ -986,6 +990,9 @@ impl ApiWorkerSchedulerImpl {
         err: Error,
         is_disconnect: bool,
     ) -> Result<(), Error> {
+        // Clear scores cache so stale endpoint scores don't persist.
+        self.scores_cache.lock().await.clear();
+
         let mut result = Ok(());
         if let Some(mut worker) = self.remove_worker(worker_id) {
             // We don't care if we fail to send message to worker, this is only a best attempt.
@@ -1296,6 +1303,10 @@ impl ApiWorkerScheduler {
             );
         }
 
+        let scores_cache = Arc::new(tokio::sync::Mutex::new(LruCache::new(
+            NonZeroUsize::new(TREE_CACHE_CAPACITY).unwrap(),
+        )));
+
         Arc::new(Self {
             inner: RwLock::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
@@ -1306,6 +1317,7 @@ impl ApiWorkerScheduler {
                 shutting_down: false,
                 capability_index: WorkerCapabilityIndex::new(),
                 endpoint_to_worker: HashMap::new(),
+                scores_cache: scores_cache.clone(),
             }),
             platform_property_manager,
             worker_timeout_s,
@@ -1320,9 +1332,7 @@ impl ApiWorkerScheduler {
             tree_resolution_in_progress: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             tree_resolution_failures: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             failed_directory_digests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            scores_cache: Arc::new(tokio::sync::Mutex::new(LruCache::new(
-                NonZeroUsize::new(TREE_CACHE_CAPACITY).unwrap(),
-            ))),
+            scores_cache,
             prefetch_connections: ParkingMutex::new(HashMap::new()),
             prefetch_semaphores: ParkingMutex::new(HashMap::new()),
             memory_store_threshold,
@@ -2828,10 +2838,8 @@ impl WorkerScheduler for ApiWorkerScheduler {
         let now = UNIX_EPOCH + Duration::from_secs(worker_timestamp);
         self.worker_registry.register_worker(&worker_id, now).await;
 
-        // Scores cache is NOT cleared here. The LRU cache (1024 entries) will
-        // naturally evict stale entries. Slightly stale scores only produce
-        // suboptimal worker selection for one scheduling cycle, which is
-        // acceptable compared to losing the entire cache on every worker churn.
+        // Scores cache is cleared on worker removal (remove_worker) to avoid
+        // stale endpoint scores influencing locality decisions.
 
         self.metrics.workers_added.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -2868,7 +2876,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
     async fn remove_worker(&self, worker_id: &WorkerId) -> Result<(), Error> {
         self.worker_registry.remove_worker(worker_id).await;
 
-        // Scores cache is NOT cleared here — see add_worker comment.
+        // scores_cache is cleared by immediate_evict_worker on the inner struct.
 
         // Grab the worker's CAS endpoint before eviction so we can clean
         // up prefetch state after the lock is released.
@@ -3016,7 +3024,7 @@ impl WorkerScheduler for ApiWorkerScheduler {
             inner.worker_change_notify.notify_one();
         }
 
-        // Scores cache is NOT cleared on worker eviction — see add_worker comment.
+        // Scores cache is cleared by remove_worker (called after eviction).
 
         let mut result = Ok(());
         for worker_id in &worker_ids_to_remove {
