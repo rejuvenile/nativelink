@@ -14,7 +14,6 @@
 
 use core::pin::Pin;
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
@@ -51,45 +50,16 @@ impl LenEntry for ExistenceItem {
     }
 }
 
-/// RAII guard that tracks concurrent update() calls via an atomic counter.
-/// Used only for diagnostics / future use. Eviction callbacks fire
-/// immediately without queuing — this eliminates the Mutex contention
-/// that caused tokio runtime stalls under high-concurrency write bursts.
-///
-/// Correctness argument: if a blob is written and immediately evicted by
-/// the inner store, the eviction callback removes it from the existence
-/// cache, then update() re-inserts it (transient stale positive). This
-/// is self-correcting: get_part() handles NotFound by removing the stale
-/// entry, and update() bypasses the cache to check the inner store.
-struct CallbackPauseGuard<'a> {
-    counter: &'a AtomicU32,
-}
-
-impl<'a> CallbackPauseGuard<'a> {
-    fn new(counter: &'a AtomicU32) -> Self {
-        counter.fetch_add(1, Ordering::Release);
-        Self { counter }
-    }
-}
-
-impl Drop for CallbackPauseGuard<'_> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::Release);
-    }
-}
-
 #[derive(Debug, MetricsComponent)]
 pub struct ExistenceCacheStore<I: InstantWrapper> {
     #[metric(group = "inner_store")]
     inner_store: Store,
     existence_cache: Arc<MokaEvictingMap<DigestInfo, DigestInfo, ExistenceItem, I>>,
-
-    // Count of active update() / update_oneshot() calls. When > 0,
-    // eviction callbacks still fire normally (they just remove from the
-    // existence cache, which is harmless). The counter is used by
-    // update() to know it should re-verify the existence cache after
-    // writing. Atomic to avoid Mutex contention under load.
-    active_updates: AtomicU32,
+    // Eviction callbacks fire immediately (no queuing). If a blob is
+    // written and immediately evicted, the callback removes it from the
+    // existence cache, then update() re-inserts it. Any transient stale
+    // positive is self-correcting: get_part() removes on NotFound, and
+    // update() bypasses the cache to check the inner store.
 }
 
 impl ExistenceCacheStore<SystemTime> {
@@ -161,7 +131,6 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
         let existence_cache_store = Arc::new(Self {
             inner_store,
             existence_cache,
-            active_updates: AtomicU32::new(0),
         });
         let other_ref = Arc::downgrade(&existence_cache_store);
         existence_cache_store
@@ -301,7 +270,6 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         // normally (no queuing) — they just remove from the existence
         // cache, which is idempotent. We re-insert after a successful
         // write, so a concurrent eviction cannot create a stale positive.
-        let _pause_guard = CallbackPauseGuard::new(&self.active_updates);
         trace!(?digest, "Inserting into inner cache");
         let update_start = std::time::Instant::now();
         let result = self.inner_store.update(digest, reader, size_info).await;
@@ -363,7 +331,6 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         }
         // If the existence cache had a stale entry, remove it now.
         self.existence_cache.remove(&digest).await;
-        let _pause_guard = CallbackPauseGuard::new(&self.active_updates);
         trace!(?digest, "Inserting into inner cache via update_oneshot");
         let update_start = std::time::Instant::now();
         let size = u64::try_from(data.len())

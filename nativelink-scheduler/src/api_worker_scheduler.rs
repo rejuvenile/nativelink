@@ -991,12 +991,14 @@ impl ApiWorkerSchedulerImpl {
         is_disconnect: bool,
     ) -> Result<(), Error> {
         // Clear scores cache so stale endpoint scores don't persist.
-        // Use try_lock to avoid blocking the scheduler write lock if a
-        // scoring operation currently holds the scores_cache. The cache
-        // is best-effort — stale scores only cause suboptimal worker
-        // selection for one scheduling cycle.
+        // Use try_lock to break a potential ABBA deadlock:
+        // find_and_reserve_worker acquires scores_cache then inner write lock,
+        // while immediate_evict_worker holds the inner write lock and needs
+        // scores_cache. Skipping is safe — the LRU evicts stale entries naturally.
         if let Ok(mut cache) = self.scores_cache.try_lock() {
             cache.clear();
+        } else {
+            debug!(?worker_id, "scores_cache clear skipped (lock held), stale scores may persist briefly");
         }
 
         let mut result = Ok(());
