@@ -649,9 +649,11 @@ const BATCH_READ_CONCURRENCY: usize = 32;
 /// Batch-download small blobs via `BatchReadBlobs` and write them into the fast store.
 /// Returns the set of digests that were successfully fetched.
 ///
-/// If WorkerProxyStore is available, uses the locality map to route digests
-/// to peers that have them. Digests without a known peer go to the server.
-/// Any misses from peers or server are retried via `populate_fast_store_unchecked`.
+/// If WorkerProxyStore is available, races peer reads against server reads:
+/// all digests are sent to the server, and peer-matched digests are also
+/// sent to the peers that have them. First result wins per digest.
+/// Connections to peers are created lazily on first use.
+/// Any misses are retried via `populate_fast_store_unchecked`.
 async fn batch_read_small_blobs(
     cas_store: &FastSlowStore,
     small_digests: &[DigestInfo],
@@ -664,77 +666,83 @@ async fn batch_read_small_blobs(
     // so Store::downcast_ref (which walks inner_store()) would skip past
     // the WorkerProxyStore and never find it.
     if let Some(proxy) = slow_store.as_store_driver().as_any().downcast_ref::<WorkerProxyStore>() {
-        let peer_stores = proxy.peer_stores();
-        if !peer_stores.is_empty() {
-            // Assign digests to endpoints using the locality map.
-            let mut endpoint_digests: HashMap<Arc<str>, Vec<DigestInfo>> = HashMap::new();
-            let mut server_digests: Vec<DigestInfo> = Vec::new();
+        // Assign digests to peer endpoints using the locality map.
+        let mut endpoint_digests: HashMap<Arc<str>, Vec<DigestInfo>> = HashMap::new();
+        {
+            let locality = proxy.locality_map().read();
+            let mut round_robin_idx: usize = 0;
+            for &digest in small_digests {
+                let peers = locality.lookup_workers(&digest);
+                if !peers.is_empty() {
+                    let endpoint = peers[round_robin_idx % peers.len()].clone();
+                    round_robin_idx = round_robin_idx.wrapping_add(1);
+                    endpoint_digests
+                        .entry(endpoint)
+                        .or_default()
+                        .push(digest);
+                }
+            }
+        }
 
-            {
-                let locality = proxy.locality_map().read();
-                let mut round_robin_idx: usize = 0;
-                for &digest in small_digests {
-                    let peers = locality.lookup_workers(&digest);
-                    // Filter to connected peers only.
-                    let connected: Vec<&Arc<str>> = peers
-                        .iter()
-                        .filter(|ep| peer_stores.contains_key(ep.as_ref()))
-                        .collect();
-                    if connected.is_empty() {
-                        server_digests.push(digest);
-                    } else {
-                        // Round-robin among connected peers that have this blob.
-                        let endpoint = connected[round_robin_idx % connected.len()].clone();
-                        round_robin_idx = round_robin_idx.wrapping_add(1);
-                        endpoint_digests
-                            .entry(endpoint)
-                            .or_default()
-                            .push(digest);
-                    }
+        let peer_blob_count: usize = endpoint_digests.values().map(|v| v.len()).sum();
+
+        if peer_blob_count > 0 {
+            // Lazily create connections to peer endpoints.
+            let mut peer_connections: Vec<(Arc<str>, Store, Vec<DigestInfo>)> = Vec::new();
+            for (endpoint, digests) in endpoint_digests {
+                if let Some(store) = proxy.get_or_create_connection(&endpoint).await {
+                    peer_connections.push((endpoint, store, digests));
                 }
             }
 
-            let peer_blob_count: usize = endpoint_digests.values().map(|v| v.len()).sum();
+            let connected_peers = peer_connections.len();
+            let connected_blob_count: usize =
+                peer_connections.iter().map(|(_, _, d)| d.len()).sum();
+
             info!(
                 total = small_digests.len(),
-                to_peers = peer_blob_count,
-                to_server = server_digests.len(),
-                peer_endpoints = endpoint_digests.len(),
-                "BatchReadBlobs: locality-based routing"
+                to_peers = connected_blob_count,
+                to_server = small_digests.len(),
+                peer_endpoints = connected_peers,
+                "BatchReadBlobs: racing peers against server"
             );
 
-            // Collect ALL batch work items (peer + server) for parallel execution.
-            let mut all_batches: Vec<(&str, &GrpcStore, Vec<DigestInfo>)> = Vec::new();
+            // Build peer batch futures. Each peer connection is owned, so we
+            // spawn the batches inline and reference the store by borrow.
+            let mut race_futures: Vec<
+                std::pin::Pin<Box<dyn Future<Output = (&str, Result<Vec<DigestInfo>, Error>)> + Send + '_>>,
+            > = Vec::new();
 
-            for (endpoint, digests) in &endpoint_digests {
-                if let Some(store) = peer_stores.get(endpoint.as_ref()) {
-                    if let Some(grpc) = store.downcast_ref::<GrpcStore>(None) {
-                        for batch in partition_into_batches(digests) {
-                            all_batches.push((endpoint.as_ref(), grpc, batch));
-                        }
+            for (endpoint, store, digests) in &peer_connections {
+                if let Some(grpc) = store.downcast_ref::<GrpcStore>(None) {
+                    for batch in partition_into_batches(digests) {
+                        race_futures.push(Box::pin(async move {
+                            let result = execute_batch_read(grpc, cas_store, &batch).await;
+                            (endpoint.as_ref(), result)
+                        }));
                     }
                 }
             }
 
-            if let Some(grpc) = proxy.inner_store().downcast_ref::<GrpcStore>(None) {
-                for batch in partition_into_batches(&server_digests) {
-                    all_batches.push(("server", grpc, batch));
+            // Server gets ALL digests (races against peers — first result wins).
+            if let Some(server_grpc) = proxy.inner_store().downcast_ref::<GrpcStore>(None) {
+                for batch in partition_into_batches(small_digests) {
+                    race_futures.push(Box::pin(async move {
+                        let result = execute_batch_read(server_grpc, cas_store, &batch).await;
+                        ("server", result)
+                    }));
                 }
             }
 
-            // Execute ALL batches in parallel across all endpoints.
-            let results = futures::future::join_all(
-                all_batches.into_iter().map(|(ep, grpc, batch)| async move {
-                    let result = execute_batch_read(grpc, cas_store, &batch).await;
-                    (ep, result)
-                }),
-            )
-            .await;
+            // Execute all batches in parallel — peers and server race.
+            let results = futures::future::join_all(race_futures).await;
 
             let mut fetched = HashSet::new();
             for (ep, result) in results {
                 match result {
-                    Ok(completed) => fetched.extend(completed),
+                    Ok(completed) => {
+                        fetched.extend(completed.into_iter());
+                    }
                     Err(e) => info!(endpoint = ep, ?e, "BatchReadBlobs: batch failed"),
                 }
             }

@@ -165,7 +165,7 @@ impl WorkerProxyStore {
 
     /// Get or create a connection to a worker endpoint.
     /// Returns None if the connection could not be created.
-    async fn get_or_create_connection(&self, endpoint: &str) -> Option<Store> {
+    pub async fn get_or_create_connection(&self, endpoint: &str) -> Option<Store> {
         if let Some(store) = self.get_worker_connection(endpoint) {
             return Some(store);
         }
