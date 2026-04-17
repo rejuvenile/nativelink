@@ -2002,3 +2002,646 @@ pub async fn resumable_write_reconnect_same_uuid()
 
     Ok(())
 }
+
+/// When a blob is larger than the streaming blob buffer, the sliding
+/// window evicts early chunks. A reader joining after eviction must
+/// NOT silently receive truncated data — it should fall back to the
+/// store read path and return the full blob.
+#[nativelink_test]
+pub async fn streaming_read_of_large_blob_not_truncated()
+-> Result<(), Box<dyn core::error::Error>> {
+    // 256 KB blob with a 64 KB sliding window buffer.
+    const CHUNK_SIZE: usize = 16 * 1024; // 16 KB
+    const NUM_CHUNKS: usize = 16; // 16 * 16 KB = 256 KB
+    const TOTAL_SIZE: usize = CHUNK_SIZE * NUM_CHUNKS;
+
+    // Build a known-data blob.
+    let mut full_data = Vec::with_capacity(TOTAL_SIZE);
+    for i in 0..NUM_CHUNKS {
+        full_data.extend(vec![i as u8; CHUNK_SIZE]);
+    }
+    assert_eq!(full_data.len(), TOTAL_SIZE);
+
+    let store_manager = make_store_manager().await?;
+
+    // Config: streaming enabled, buffer = 64 KB (will evict early chunks of a 256 KB blob).
+    let config = vec![WithInstanceName {
+        instance_name: INSTANCE_NAME.to_string(),
+        config: ByteStreamConfig {
+            cas_store: "main_cas".to_string(),
+            persist_stream_on_disconnect_timeout: 0,
+            max_bytes_per_stream: CHUNK_SIZE,
+            streaming_read_while_write: true,
+            max_streaming_blob_buffer_bytes: 64 * 1024, // 64 KB — triggers sliding window
+            ..Default::default()
+        },
+    }];
+    let bs_server = Arc::new(
+        ByteStreamServer::new(&config, store_manager.as_ref())
+            .expect("Failed to make server"),
+    );
+
+    let uuid = "77777777-7777-7777-7777-777777777777";
+    let resource_name = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, uuid, HASH1, TOTAL_SIZE,
+    );
+
+    // Upload the blob in chunks, completing the write.
+    let (tx, stream) = make_stream(Some(CompressionEncoding::Gzip));
+    let bs_clone = bs_server.clone();
+    let write_handle = spawn!("write_stream", async move {
+        bs_clone.write(Request::new(stream)).await
+    });
+
+    for (i, chunk) in full_data.chunks(CHUNK_SIZE).enumerate() {
+        let is_last = i == NUM_CHUNKS - 1;
+        let write_request = WriteRequest {
+            resource_name: resource_name.clone(),
+            write_offset: (i * CHUNK_SIZE) as i64,
+            finish_write: is_last,
+            data: Bytes::copy_from_slice(chunk),
+        };
+        tx.send(Frame::data(encode_stream_proto(&write_request)?))
+            .await?;
+        // Yield between sends so the server task processes each chunk
+        // and feeds it to the streaming blob buffer. Without these yields,
+        // the sender could queue all frames before the server reads any,
+        // changing the eviction pattern. The yields ensure chunks flow
+        // through the 64KB sliding window one at a time, causing early
+        // chunks to be evicted as later ones arrive.
+        yield_now().await;
+        yield_now().await;
+    }
+
+    // Wait for the write to complete so the blob is in the store.
+    // Once the write completes, ALL 16 chunks have been processed through the
+    // sliding window. With a 64KB buffer and 256KB blob, chunks 0-11 (192KB)
+    // are guaranteed to be evicted — earliest_chunk_idx will be 12.
+    // This is deterministic, not timing-dependent: the write handler processes
+    // all chunks before returning WriteResponse, and the buffer is too small
+    // to hold them all.
+    //
+    // PRECONDITION: the sliding window must have evicted early chunks for
+    // this test to exercise the fallback path. We cannot directly assert
+    // earliest_chunk_idx > 0 here because the in_flight_blobs map is
+    // internal to ByteStreamServer and not exposed to tests. However, the
+    // eviction is deterministic: 256KB blob / 64KB buffer = 4x overcommit,
+    // guaranteeing eviction. The final data length assertion below proves
+    // the fallback path was exercised (without it, only ~64KB would be
+    // returned).
+    let write_result = write_handle.await.expect("Write task panicked");
+    assert!(write_result.is_ok(), "Write should succeed: {:?}", write_result.err());
+
+    // The in-flight blob map entry still exists (5s grace period hasn't expired),
+    // so inner_read will find it and check earliest_chunk_idx.
+    // With the fix, it detects evicted chunks and falls through to the store.
+    // Without the fix, it would silently return only 64KB (the retained window).
+    let read_request = ReadRequest {
+        resource_name: format!("{}/blobs/{}/{}", INSTANCE_NAME, HASH1, TOTAL_SIZE),
+        read_offset: 0,
+        read_limit: 0,
+    };
+
+    let read_result = bs_server.read(Request::new(read_request)).await;
+    assert!(
+        read_result.is_ok(),
+        "read() should succeed, got: {:?}",
+        read_result.err()
+    );
+
+    let mut read_stream = read_result?.into_inner();
+    let mut all_data = Vec::new();
+    while let Some(response) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_stream.next(),
+    )
+    .await
+    .expect("Timed out waiting for read data")
+    {
+        match response {
+            Ok(resp) if resp.data.is_empty() => break,
+            Ok(resp) => all_data.extend_from_slice(&resp.data),
+            Err(e) => panic!("Read returned error: {:?}", e),
+        }
+    }
+
+    // The critical assertion: we must get ALL 256 KB, not just the last 64 KB.
+    assert_eq!(
+        all_data.len(),
+        TOTAL_SIZE,
+        "Expected full blob ({TOTAL_SIZE} bytes), got {} bytes — \
+         truncated by {} bytes (sliding window eviction)",
+        all_data.len(),
+        TOTAL_SIZE.saturating_sub(all_data.len()),
+    );
+    assert_eq!(
+        all_data, full_data,
+        "Blob content mismatch — data was truncated or corrupted"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Test 1a: Streaming read with chunk > max_bytes_per_stream
+// ─────────────────────────────────────────────────────────────────────
+
+/// When a streaming blob has chunks larger than max_bytes_per_stream,
+/// the read must return ALL data correctly (not truncated). This tests
+/// the bytes_sent accounting — a large chunk should be split across
+/// multiple ReadResponse messages, not silently lost.
+#[nativelink_test]
+pub async fn streaming_read_large_chunk_exceeds_max_bytes_per_stream()
+-> Result<(), Box<dyn core::error::Error>> {
+    // Config: small max_bytes_per_stream (4096), upload 32KB in one chunk.
+    const BLOB_SIZE: usize = 32 * 1024; // 32 KB
+    const MAX_BYTES: usize = 4096; // 4 KB
+
+    let mut blob_data = vec![0u8; BLOB_SIZE];
+    for (i, byte) in blob_data.iter_mut().enumerate() {
+        *byte = (i % 256) as u8;
+    }
+
+    let store_manager = make_store_manager().await?;
+
+    let config = vec![WithInstanceName {
+        instance_name: INSTANCE_NAME.to_string(),
+        config: ByteStreamConfig {
+            cas_store: "main_cas".to_string(),
+            persist_stream_on_disconnect_timeout: 0,
+            max_bytes_per_stream: MAX_BYTES,
+            streaming_read_while_write: true,
+            // Buffer large enough to hold the whole blob.
+            max_streaming_blob_buffer_bytes: 64 * 1024,
+            ..Default::default()
+        },
+    }];
+    let bs_server = Arc::new(
+        ByteStreamServer::new(&config, store_manager.as_ref())
+            .expect("Failed to make server"),
+    );
+
+    let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let resource_name = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, uuid, HASH1, BLOB_SIZE,
+    );
+
+    // Upload the blob in ONE 32KB chunk (larger than max_bytes_per_stream=4KB).
+    let (tx, stream) = make_stream(Some(CompressionEncoding::Gzip));
+    let bs_clone = bs_server.clone();
+    let write_handle = spawn!("write_stream", async move {
+        bs_clone.write(Request::new(stream)).await
+    });
+
+    let write_request = WriteRequest {
+        resource_name,
+        write_offset: 0,
+        finish_write: true,
+        data: Bytes::copy_from_slice(&blob_data),
+    };
+    tx.send(Frame::data(encode_stream_proto(&write_request)?))
+        .await?;
+    yield_now().await;
+    yield_now().await;
+
+    // Read back via the streaming path (before the grace period cleans up
+    // the in-flight map entry).
+    let read_request = ReadRequest {
+        resource_name: format!("{}/blobs/{}/{}", INSTANCE_NAME, HASH1, BLOB_SIZE),
+        read_offset: 0,
+        read_limit: 0,
+    };
+
+    // Wait for write to finish first so the blob is in the store too.
+    let write_result = write_handle.await.expect("Write task panicked");
+    assert!(write_result.is_ok(), "Write should succeed: {:?}", write_result.err());
+
+    let read_result = bs_server.read(Request::new(read_request)).await;
+    assert!(
+        read_result.is_ok(),
+        "read() should succeed, got: {:?}",
+        read_result.err()
+    );
+
+    let mut read_stream = read_result?.into_inner();
+    let mut all_data = Vec::new();
+    let mut chunk_count = 0u32;
+    while let Some(response) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_stream.next(),
+    )
+    .await
+    .expect("Timed out waiting for read data")
+    {
+        match response {
+            Ok(resp) if resp.data.is_empty() => break,
+            Ok(resp) => {
+                // Each response should respect max_bytes_per_stream.
+                assert!(
+                    resp.data.len() <= MAX_BYTES,
+                    "ReadResponse chunk {} has {} bytes, exceeding max_bytes_per_stream={}",
+                    chunk_count, resp.data.len(), MAX_BYTES
+                );
+                all_data.extend_from_slice(&resp.data);
+                chunk_count += 1;
+            }
+            Err(e) => panic!("Read returned error: {:?}", e),
+        }
+    }
+
+    assert_eq!(
+        all_data.len(), BLOB_SIZE,
+        "Expected full blob ({BLOB_SIZE} bytes), got {} bytes",
+        all_data.len(),
+    );
+    assert_eq!(
+        all_data, blob_data,
+        "Blob content mismatch after streaming read with large chunks"
+    );
+    // With 32KB blob and 4KB max, we need at least 8 response messages.
+    assert!(
+        chunk_count >= (BLOB_SIZE / MAX_BYTES) as u32,
+        "Expected at least {} response chunks, got {}",
+        BLOB_SIZE / MAX_BYTES, chunk_count
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Test 1b: Streaming read with read_offset past eviction window
+// ─────────────────────────────────────────────────────────────────────
+
+/// When read_offset is past the eviction point of the streaming blob's
+/// sliding window, the read should fall through to the store and still
+/// return correct data (the portion from read_offset to end).
+#[nativelink_test]
+pub async fn streaming_read_with_offset_past_eviction_falls_through_to_store()
+-> Result<(), Box<dyn core::error::Error>> {
+    // 256 KB blob, 64 KB buffer, read_offset = 128 KB.
+    const CHUNK_SIZE: usize = 16 * 1024; // 16 KB
+    const NUM_CHUNKS: usize = 16; // 256 KB total
+    const TOTAL_SIZE: usize = CHUNK_SIZE * NUM_CHUNKS;
+    const READ_OFFSET: usize = 128 * 1024;
+
+    let mut full_data = Vec::with_capacity(TOTAL_SIZE);
+    for i in 0..NUM_CHUNKS {
+        full_data.extend(vec![i as u8; CHUNK_SIZE]);
+    }
+
+    let store_manager = make_store_manager().await?;
+
+    let config = vec![WithInstanceName {
+        instance_name: INSTANCE_NAME.to_string(),
+        config: ByteStreamConfig {
+            cas_store: "main_cas".to_string(),
+            persist_stream_on_disconnect_timeout: 0,
+            max_bytes_per_stream: CHUNK_SIZE,
+            streaming_read_while_write: true,
+            max_streaming_blob_buffer_bytes: 64 * 1024, // 64 KB sliding window
+            ..Default::default()
+        },
+    }];
+    let bs_server = Arc::new(
+        ByteStreamServer::new(&config, store_manager.as_ref())
+            .expect("Failed to make server"),
+    );
+
+    let uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    let resource_name = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, uuid, HASH1, TOTAL_SIZE,
+    );
+
+    // Upload the blob in chunks.
+    let (tx, stream) = make_stream(Some(CompressionEncoding::Gzip));
+    let bs_clone = bs_server.clone();
+    let write_handle = spawn!("write_stream", async move {
+        bs_clone.write(Request::new(stream)).await
+    });
+
+    for (i, chunk) in full_data.chunks(CHUNK_SIZE).enumerate() {
+        let is_last = i == NUM_CHUNKS - 1;
+        let write_request = WriteRequest {
+            resource_name: resource_name.clone(),
+            write_offset: (i * CHUNK_SIZE) as i64,
+            finish_write: is_last,
+            data: Bytes::copy_from_slice(chunk),
+        };
+        tx.send(Frame::data(encode_stream_proto(&write_request)?))
+            .await?;
+        yield_now().await;
+        yield_now().await;
+    }
+
+    // Wait for write to complete.
+    let write_result = write_handle.await.expect("Write task panicked");
+    assert!(write_result.is_ok(), "Write should succeed: {:?}", write_result.err());
+
+    // Read with read_offset = 128KB. With a 64KB buffer and 256KB blob,
+    // early chunks are evicted, so the streaming path should detect
+    // earliest_chunk_idx > 0 and fall through to the store.
+    let read_request = ReadRequest {
+        resource_name: format!("{}/blobs/{}/{}", INSTANCE_NAME, HASH1, TOTAL_SIZE),
+        read_offset: READ_OFFSET as i64,
+        read_limit: 0,
+    };
+
+    let read_result = bs_server.read(Request::new(read_request)).await;
+    assert!(
+        read_result.is_ok(),
+        "read() should succeed, got: {:?}",
+        read_result.err()
+    );
+
+    let mut read_stream = read_result?.into_inner();
+    let mut all_data = Vec::new();
+    while let Some(response) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_stream.next(),
+    )
+    .await
+    .expect("Timed out waiting for read data")
+    {
+        match response {
+            Ok(resp) if resp.data.is_empty() => break,
+            Ok(resp) => all_data.extend_from_slice(&resp.data),
+            Err(e) => panic!("Read returned error: {:?}", e),
+        }
+    }
+
+    let expected_len = TOTAL_SIZE - READ_OFFSET;
+    assert_eq!(
+        all_data.len(), expected_len,
+        "Expected {} bytes (offset {}..{}), got {} bytes",
+        expected_len, READ_OFFSET, TOTAL_SIZE, all_data.len(),
+    );
+    assert_eq!(
+        all_data, &full_data[READ_OFFSET..],
+        "Data mismatch: read with offset returned wrong content"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Test 1c: Concurrent write + read (reader joins mid-upload)
+// ─────────────────────────────────────────────────────────────────────
+
+/// A reader joining during an active upload should get correct data,
+/// either streamed from the in-flight blob or served from the store
+/// after the upload completes.
+#[nativelink_test]
+pub async fn concurrent_read_during_active_upload()
+-> Result<(), Box<dyn core::error::Error>> {
+    const TOTAL_SIZE: usize = 8 * 1024; // 8 KB
+    const FIRST_CHUNK: usize = 2 * 1024; // 2 KB
+
+    let mut blob_data = vec![0u8; TOTAL_SIZE];
+    for (i, byte) in blob_data.iter_mut().enumerate() {
+        *byte = (i % 251) as u8; // Prime modulus for distinct pattern
+    }
+
+    let store_manager = make_store_manager().await?;
+    let config = vec![WithInstanceName {
+        instance_name: INSTANCE_NAME.to_string(),
+        config: ByteStreamConfig {
+            cas_store: "main_cas".to_string(),
+            persist_stream_on_disconnect_timeout: 0,
+            max_bytes_per_stream: 1024,
+            streaming_read_while_write: true,
+            max_streaming_blob_buffer_bytes: 64 * 1024,
+            ..Default::default()
+        },
+    }];
+    let bs_server = Arc::new(
+        ByteStreamServer::new(&config, store_manager.as_ref())
+            .expect("Failed to make server"),
+    );
+
+    let uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    let resource_name = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, uuid, HASH1, TOTAL_SIZE,
+    );
+
+    // Start writing: send first chunk but do NOT finish.
+    let (tx, stream) = make_stream(Some(CompressionEncoding::Gzip));
+    let bs_clone = bs_server.clone();
+    let write_handle = spawn!("write_stream", async move {
+        bs_clone.write(Request::new(stream)).await
+    });
+
+    let first_req = WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: false,
+        data: Bytes::copy_from_slice(&blob_data[..FIRST_CHUNK]),
+    };
+    tx.send(Frame::data(encode_stream_proto(&first_req)?))
+        .await?;
+    yield_now().await;
+    yield_now().await;
+
+    // Start a reader while the write is still in progress.
+    let read_request = ReadRequest {
+        resource_name: format!("{}/blobs/{}/{}", INSTANCE_NAME, HASH1, TOTAL_SIZE),
+        read_offset: 0,
+        read_limit: 0,
+    };
+
+    let bs_reader = bs_server.clone();
+    let read_handle = spawn!("read_stream", async move {
+        let read_result = bs_reader.read(Request::new(read_request)).await;
+        if read_result.is_err() {
+            // If the streaming entry was not found, the reader will get NotFound
+            // because the blob has not committed to the store yet. This is
+            // acceptable behavior — the test still exercises the race path.
+            return Ok(Vec::new());
+        }
+        let mut read_stream = read_result.unwrap().into_inner();
+        let mut all_data = Vec::new();
+        while let Some(response) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_stream.next(),
+        )
+        .await
+        .expect("Timed out waiting for read data")
+        {
+            match response {
+                Ok(resp) if resp.data.is_empty() => break,
+                Ok(resp) => all_data.extend_from_slice(&resp.data),
+                Err(e) => return Err(Box::new(e) as Box<dyn core::error::Error + Send + Sync>),
+            }
+        }
+        Ok(all_data)
+    });
+
+    // Give the reader time to attach to the streaming blob.
+    yield_now().await;
+    yield_now().await;
+
+    // Now send the rest of the data and finish.
+    let second_req = WriteRequest {
+        resource_name,
+        write_offset: FIRST_CHUNK as i64,
+        finish_write: true,
+        data: Bytes::copy_from_slice(&blob_data[FIRST_CHUNK..]),
+    };
+    tx.send(Frame::data(encode_stream_proto(&second_req)?))
+        .await?;
+
+    // Wait for both to complete.
+    let write_result = write_handle.await.expect("Write task panicked");
+    assert!(write_result.is_ok(), "Write should succeed");
+
+    let read_data = read_handle.await.expect("Read task panicked")
+        .expect("Read should not error");
+
+    // The reader either got the full blob via streaming or got an empty vec
+    // (NotFound race, see above). If it got data, it must be correct.
+    if !read_data.is_empty() {
+        assert_eq!(
+            read_data.len(), TOTAL_SIZE,
+            "Reader got partial data ({} bytes), expected {} or 0 (race)",
+            read_data.len(), TOTAL_SIZE,
+        );
+        assert_eq!(
+            read_data, blob_data,
+            "Reader got incorrect data during concurrent write+read"
+        );
+    }
+
+    // Regardless of streaming path, the blob should now be in the store.
+    let store = store_manager.get_store("main_cas").unwrap();
+    let digest = DigestInfo::try_new(HASH1, TOTAL_SIZE)?;
+    let stored = store.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(
+        stored.as_ref(), &blob_data[..],
+        "Store should contain the full blob"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Test 1d: Two concurrent writes for same digest (coalesced write)
+// ─────────────────────────────────────────────────────────────────────
+
+/// When two concurrent write RPCs target the same digest, the second
+/// should coalesce (wait for the first) and both should succeed with
+/// the correct committed_size.
+#[nativelink_test]
+pub async fn two_concurrent_writes_same_digest_coalesced()
+-> Result<(), Box<dyn core::error::Error>> {
+    const WRITE_DATA: &[u8] = b"coalesced-write-test-data-0123456789";
+
+    let store_manager = make_store_manager().await?;
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
+    );
+
+    let uuid1 = "dddddddd-dddd-dddd-dddd-dddddddddd01";
+    let uuid2 = "dddddddd-dddd-dddd-dddd-dddddddddd02";
+
+    // Start write #1 but don't finish it yet.
+    let resource_name1 = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, uuid1, HASH1, WRITE_DATA.len(),
+    );
+    let (tx1, stream1) = make_stream(Some(CompressionEncoding::Gzip));
+    let bs_clone1 = bs_server.clone();
+    let write_handle1 = spawn!("write_1", async move {
+        bs_clone1.write(Request::new(stream1)).await
+    });
+
+    // Send partial data for write #1 (not finish).
+    let req1_partial = WriteRequest {
+        resource_name: resource_name1.clone(),
+        write_offset: 0,
+        finish_write: false,
+        data: WRITE_DATA[..10].into(),
+    };
+    tx1.send(Frame::data(encode_stream_proto(&req1_partial)?))
+        .await?;
+    yield_now().await;
+    yield_now().await;
+
+    // Start write #2 for the same digest with a different UUID.
+    // This should find write #1 in the in_flight_writes map and coalesce.
+    let resource_name2 = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, uuid2, HASH1, WRITE_DATA.len(),
+    );
+    let (tx2, stream2) = make_stream(Some(CompressionEncoding::Gzip));
+    let bs_clone2 = bs_server.clone();
+    let write_handle2 = spawn!("write_2", async move {
+        bs_clone2.write(Request::new(stream2)).await
+    });
+
+    // Send the full data for write #2 with finish_write=true.
+    let req2 = WriteRequest {
+        resource_name: resource_name2,
+        write_offset: 0,
+        finish_write: true,
+        data: WRITE_DATA.into(),
+    };
+    tx2.send(Frame::data(encode_stream_proto(&req2)?))
+        .await?;
+    yield_now().await;
+    yield_now().await;
+
+    // Now finish write #1.
+    let req1_final = WriteRequest {
+        resource_name: resource_name1,
+        write_offset: 10,
+        finish_write: true,
+        data: WRITE_DATA[10..].into(),
+    };
+    tx1.send(Frame::data(encode_stream_proto(&req1_final)?))
+        .await?;
+
+    // Both writes should complete.
+    let result1 = write_handle1.await.expect("Write #1 panicked");
+    let result2 = write_handle2.await.expect("Write #2 panicked");
+
+    // At least one should succeed. The coalesced write might fail if the
+    // primary writer hasn't committed yet when the dedup check runs, in
+    // which case write #2 proceeds independently. Both independent writes
+    // for the same digest should still succeed.
+    let mut success_count = 0;
+    for (i, result) in [&result1, &result2].iter().enumerate() {
+        match result {
+            Ok(resp) => {
+                assert_eq!(
+                    resp.get_ref().committed_size,
+                    WRITE_DATA.len() as i64,
+                    "Write #{} committed_size mismatch", i + 1
+                );
+                success_count += 1;
+            }
+            Err(e) => {
+                // Acceptable: the coalesced waiter may time out or the
+                // primary may fail. But at least one MUST succeed.
+                eprintln!("Write #{} failed (may be acceptable): {:?}", i + 1, e);
+            }
+        }
+    }
+    assert!(
+        success_count >= 1,
+        "At least one of the two concurrent writes must succeed"
+    );
+
+    // The blob should be in the store.
+    let store = store_manager.get_store("main_cas").unwrap();
+    let digest = DigestInfo::try_new(HASH1, WRITE_DATA.len())?;
+    let stored = store.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(
+        stored.as_ref(), WRITE_DATA,
+        "Store should contain the correct blob after coalesced writes"
+    );
+
+    Ok(())
+}

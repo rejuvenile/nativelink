@@ -989,6 +989,20 @@ impl ByteStreamServer {
                     if let Some(inner_arc) = instance.in_flight_blobs.get_inner(&digest) {
                         instance.in_flight_blobs.remove(&digest, &inner_arc);
                     }
+                } else if streaming_reader.inner().earliest_chunk_idx() > 0 {
+                    // Sliding window evicted early chunks — can't serve
+                    // a full blob read from the beginning.  Fall through
+                    // to the store read path.  Remove the entry so
+                    // subsequent readers go straight to the store instead
+                    // of hitting this branch and logging again.
+                    info!(
+                        %digest,
+                        earliest_chunk_idx = streaming_reader.inner().earliest_chunk_idx(),
+                        "inner_read: streaming blob window evicted early data, falling back to store"
+                    );
+                    if let Some(inner_arc) = instance.in_flight_blobs.get_inner(&digest) {
+                        instance.in_flight_blobs.remove(&digest, &inner_arc);
+                    }
                 } else {
                 info!(
                     %digest,
@@ -1005,9 +1019,47 @@ impl ByteStreamServer {
                     None
                 };
 
+                // State: (reader, bytes_sent, read_offset, read_limit, max_bytes, leftover)
+                // `leftover` carries the unconsumed tail of a chunk that was
+                // larger than max_bytes_per_stream, so we don't lose data
+                // when splitting large streaming chunks into gRPC responses.
                 let stream = unfold(
-                    (streaming_reader, 0u64, read_offset, read_limit, max_bytes),
-                    |(mut reader, mut bytes_sent, read_offset, read_limit, max_bytes)| async move {
+                    (streaming_reader, 0u64, read_offset, read_limit, max_bytes, Bytes::new()),
+                    |(mut reader, mut bytes_sent, read_offset, read_limit, max_bytes, mut leftover)| async move {
+                        // Helper: given a usable Bytes slice, apply read_limit
+                        // and max_bytes trimming, update bytes_sent, and return
+                        // the response plus any leftover.
+                        #[inline]
+                        fn emit(
+                            mut data: Bytes,
+                            bytes_sent: &mut u64,
+                            read_offset: u64,
+                            read_limit: Option<u64>,
+                            max_bytes: usize,
+                        ) -> (Bytes, Bytes) {
+                            // Trim to read_limit if needed.
+                            if let Some(limit) = read_limit {
+                                let new_effective =
+                                    (*bytes_sent + data.len() as u64) - read_offset;
+                                if new_effective > limit {
+                                    let overshoot = (new_effective - limit) as usize;
+                                    data = data.slice(..data.len() - overshoot);
+                                }
+                            }
+
+                            // Trim to max_bytes_per_stream, carrying leftover.
+                            let lo = if data.len() > max_bytes {
+                                let remainder = data.slice(max_bytes..);
+                                data = data.slice(..max_bytes);
+                                remainder
+                            } else {
+                                Bytes::new()
+                            };
+
+                            *bytes_sent += data.len() as u64;
+                            (data, lo)
+                        }
+
                         // Skip bytes before read_offset.
                         while bytes_sent < read_offset {
                             match reader.next_chunk().await {
@@ -1034,6 +1086,8 @@ impl ByteStreamServer {
                                                 if final_chunk.is_empty() {
                                                     return None;
                                                 }
+                                                // Re-adjust bytes_sent to match actual position.
+                                                bytes_sent = read_offset + final_chunk.len() as u64;
                                                 let resp = ReadResponse { data: final_chunk };
                                                 return Some((
                                                     Ok(resp),
@@ -1043,20 +1097,16 @@ impl ByteStreamServer {
                                                         read_offset,
                                                         read_limit,
                                                         max_bytes,
+                                                        Bytes::new(),
                                                     ),
                                                 ));
                                             }
                                         }
 
-                                        // Respect max_bytes_per_stream.
-                                        let data = if usable.len() > max_bytes {
-                                            // Re-adjust bytes_sent for the portion we actually send.
-                                            bytes_sent = read_offset
-                                                + (max_bytes as u64).min(usable.len() as u64);
-                                            usable.slice(..max_bytes)
-                                        } else {
-                                            usable
-                                        };
+                                        // Respect max_bytes_per_stream, carry leftover.
+                                        // Reset bytes_sent to accurate position before emit.
+                                        bytes_sent = read_offset;
+                                        let (data, lo) = emit(usable, &mut bytes_sent, read_offset, read_limit, max_bytes);
                                         let resp = ReadResponse { data };
                                         return Some((
                                             Ok(resp),
@@ -1066,6 +1116,7 @@ impl ByteStreamServer {
                                                 read_offset,
                                                 read_limit,
                                                 max_bytes,
+                                                lo,
                                             ),
                                         ));
                                     }
@@ -1075,7 +1126,7 @@ impl ByteStreamServer {
                                 Err(e) => {
                                     return Some((
                                         Err(e.into()),
-                                        (reader, bytes_sent, read_offset, read_limit, max_bytes),
+                                        (reader, bytes_sent, read_offset, read_limit, max_bytes, leftover),
                                     ));
                                 }
                             }
@@ -1089,37 +1140,33 @@ impl ByteStreamServer {
                             }
                         }
 
-                        // Normal read path.
-                        match reader.next_chunk().await {
-                            Ok(chunk) if chunk.is_empty() => None, // EOF
-                            Ok(chunk) => {
-                                let mut data = chunk;
-                                bytes_sent += data.len() as u64;
+                        // Use leftover from a previous oversized chunk before
+                        // reading the next chunk from the streaming blob.
+                        let chunk = if !leftover.is_empty() {
+                            let lo = core::mem::take(&mut leftover);
+                            Ok(lo)
+                        } else {
+                            reader.next_chunk().await
+                        };
 
-                                // Trim to read_limit if needed.
-                                if let Some(limit) = read_limit {
-                                    let new_effective = bytes_sent - read_offset;
-                                    if new_effective > limit {
-                                        let overshoot = (new_effective - limit) as usize;
-                                        data = data.slice(..data.len() - overshoot);
-                                        bytes_sent -= overshoot as u64;
-                                    }
-                                }
+                        match chunk {
+                            Ok(data) if data.is_empty() => None, // EOF
+                            Ok(data) => {
+                                let (data, lo) = emit(data, &mut bytes_sent, read_offset, read_limit, max_bytes);
 
-                                // Trim to max_bytes_per_stream.
-                                if data.len() > max_bytes {
-                                    data = data.slice(..max_bytes);
+                                if data.is_empty() {
+                                    return None;
                                 }
 
                                 let resp = ReadResponse { data };
                                 Some((
                                     Ok(resp),
-                                    (reader, bytes_sent, read_offset, read_limit, max_bytes),
+                                    (reader, bytes_sent, read_offset, read_limit, max_bytes, lo),
                                 ))
                             }
                             Err(e) => Some((
                                 Err(e.into()),
-                                (reader, bytes_sent, read_offset, read_limit, max_bytes),
+                                (reader, bytes_sent, read_offset, read_limit, max_bytes, leftover),
                             )),
                         }
                     },
@@ -1487,6 +1534,7 @@ impl ByteStreamServer {
         };
 
         let active_stream = active_stream_guard.stream_state.as_mut().unwrap();
+        let write_start = std::time::Instant::now();
         let write_result = try_join!(
             process_client_stream(
                 stream,
@@ -1499,6 +1547,27 @@ impl ByteStreamServer {
             (&mut active_stream.store_update_fut)
                 .map_err(|err| { err.append("Error updating inner store") })
         );
+
+        let bytes_received = active_stream_guard.bytes_received.load(Ordering::Relaxed);
+        let elapsed_ms = write_start.elapsed().as_millis() as u64;
+        if write_result.is_err() {
+            warn!(
+                %digest,
+                expected_size,
+                bytes_received,
+                elapsed_ms,
+                err = ?write_result.as_ref().err(),
+                "inner_write failed"
+            );
+        } else if elapsed_ms > 5000 {
+            info!(
+                %digest,
+                expected_size,
+                bytes_received,
+                elapsed_ms,
+                "inner_write slow (>5s)"
+            );
+        }
 
         // Propagate terminal state to the streaming blob.
         if let Some(mut sbw) = streaming_blob_writer {
@@ -1809,7 +1878,7 @@ impl ByteStreamServer {
 
         // Fast path: skip the write if the blob already exists.
         if store.has(digest).await.unwrap_or(None).is_some() {
-            debug!(
+            info!(
                 %digest,
                 size_bytes = expected_size,
                 "ByteStream::write: skipped, blob already exists",
@@ -1831,12 +1900,29 @@ impl ByteStreamServer {
                 let mut rx = rx.clone();
                 drop(guard);
                 // Another write is in progress — wait for the result.
-                let succeeded = loop {
-                    if let Some(ok) = *rx.borrow_and_update() {
-                        break ok;
+                // Apply WRITE_TIMEOUT so coalesced waiters don't hang forever
+                // if the primary writer stalls.
+                const COALESCE_TIMEOUT: Duration = Duration::from_secs(300);
+                let wait_fut = async {
+                    loop {
+                        if let Some(ok) = *rx.borrow_and_update() {
+                            return ok;
+                        }
+                        if rx.changed().await.is_err() {
+                            return false; // sender dropped = failure
+                        }
                     }
-                    if rx.changed().await.is_err() {
-                        break false; // sender dropped = failure
+                };
+                let succeeded = match tokio::time::timeout(COALESCE_TIMEOUT, wait_fut).await {
+                    Ok(ok) => ok,
+                    Err(_) => {
+                        warn!(
+                            %digest,
+                            expected_size,
+                            timeout_secs = COALESCE_TIMEOUT.as_secs(),
+                            "ByteStream::write: coalesced waiter timed out"
+                        );
+                        false
                     }
                 };
                 if succeeded {
@@ -1970,9 +2056,13 @@ impl ByteStreamServer {
         // removing from the map, so new RPCs arriving in between can still
         // find and subscribe to the existing entry.
         if let Some(tx) = in_flight_tx {
+            // We were the primary writer — signal result to coalesced waiters
+            // and clean up the in-flight entry.
             let _ = tx.send(Some(result.is_ok()));
+            instance.in_flight_writes.lock().remove(&digest);
         }
-        instance.in_flight_writes.lock().remove(&digest);
+        // Coalesced waiters that timed out and retried (in_flight_tx = None)
+        // must NOT remove the entry — the primary writer may still be running.
 
         // Track metrics
         #[allow(clippy::cast_possible_truncation)]

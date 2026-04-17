@@ -246,6 +246,8 @@ impl Drop for StreamingBlobWriter {
             if terminal.is_none() {
                 warn!(
                     digest = %self.inner.digest,
+                    bytes_written = self.inner.bytes_written.load(std::sync::atomic::Ordering::Relaxed),
+                    expected_size = self.inner.digest.size_bytes(),
                     "streaming blob writer dropped without eof"
                 );
                 *terminal = Some(Err(make_err!(
@@ -310,6 +312,18 @@ impl StreamingBlobReader {
     ///   empty `Bytes` (signals EOF to the caller).
     /// - If the writer sent an error, returns that error.
     pub async fn next_chunk(&mut self) -> Result<Bytes, Error> {
+        // Failpoint: simulate a chunk read failure in the streaming blob.
+        // Exercises the fallback path in FastSlowStore::get_part where a
+        // streaming populate reader error triggers a slow-store resume at
+        // the correct byte offset.
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("streaming_blob_next_chunk_fail", |_| {
+            Err(make_err!(
+                Code::Unavailable,
+                "failpoint: streaming blob chunk read failed"
+            ))
+        });
+
         loop {
             let earliest = self.inner.earliest_chunk_idx.load(Ordering::Acquire);
             if self.cursor_chunk_idx < earliest {

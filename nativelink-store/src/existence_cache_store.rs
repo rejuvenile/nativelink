@@ -271,6 +271,19 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         // cache, which is idempotent. We re-insert after a successful
         // write, so a concurrent eviction cannot create a stale positive.
         trace!(?digest, "Inserting into inner cache");
+
+        // Failpoint: simulate inner store write failure. Verifies that the
+        // existence cache is NOT populated on write failure (would cause a
+        // stale positive where has() returns true but get_part() returns
+        // NotFound).
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("existence_cache_inner_store_write_fail", |_| {
+            Err(nativelink_error::make_err!(
+                nativelink_error::Code::Internal,
+                "failpoint: inner store write failed"
+            ))
+        });
+
         let update_start = std::time::Instant::now();
         let result = self.inner_store.update(digest, reader, size_info).await;
         let elapsed_ms = update_start.elapsed().as_millis() as u64;
@@ -331,6 +344,17 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         }
         // If the existence cache had a stale entry, remove it now.
         self.existence_cache.remove(&digest).await;
+
+        // Failpoint: simulate inner store oneshot write failure. Verifies
+        // that the existence cache is NOT populated on write failure.
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("existence_cache_update_oneshot_fail", |_| {
+            Err(nativelink_error::make_err!(
+                nativelink_error::Code::Internal,
+                "failpoint: update_oneshot inner store write failed"
+            ))
+        });
+
         trace!(?digest, "Inserting into inner cache via update_oneshot");
         let update_start = std::time::Instant::now();
         let size = u64::try_from(data.len())
@@ -369,6 +393,19 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         length: Option<u64>,
     ) -> Result<(), Error> {
         let digest = key.into_digest();
+
+        // Failpoint: simulate inner store returning NotFound during read.
+        // Verifies that the existence cache removes stale entries when the
+        // inner store reports a blob as missing (blob evicted after cache
+        // recorded its existence).
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("existence_cache_get_part_not_found", |_| {
+            Err(nativelink_error::Error::new(
+                nativelink_error::Code::NotFound,
+                "failpoint: blob not found in inner store".to_string(),
+            ))
+        });
+
         let result = self
             .inner_store
             .get_part(digest, writer, offset, length)

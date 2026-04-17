@@ -1828,6 +1828,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fail"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5e43d0f78a42ad591453aedb1d7ae631ce7ee445c7643691055a9ed8d3b01c"
+dependencies = [
+ "log",
+ "once_cell",
+ "rand 0.8.5",
+]
+
+[[package]]
 name = "fastrand"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3430,7 +3441,9 @@ dependencies = [
  "async-lock",
  "async-trait",
  "axum",
+ "blake3",
  "bytes",
+ "fail",
  "futures",
  "hex",
  "http 1.4.0",
@@ -3487,6 +3500,7 @@ dependencies = [
  "bytes",
  "const_format",
  "dirs",
+ "fail",
  "flate2",
  "fs-set-times",
  "futures",
@@ -3554,6 +3568,7 @@ dependencies = [
  "bytes",
  "criterion",
  "dashmap",
+ "fail",
  "futures",
  "h3-quinn",
  "h3-util",

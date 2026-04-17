@@ -385,6 +385,17 @@ impl FastSlowStore {
         length: Option<u64>,
         mut streaming_writer: Option<StreamingBlobWriter>,
     ) -> Result<(), Error> {
+        // Failpoint: simulate slow store being unavailable during populate.
+        // Exercises the error propagation path when the slow store cannot
+        // be read during a cache-miss populate operation.
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("fast_slow_populate_slow_store_unavailable", |_| {
+            Err(make_err!(
+                Code::Unavailable,
+                "failpoint: slow store unavailable during populate"
+            ))
+        });
+
         let reader_stream_size = if self
             .slow_store
             .inner_store(Some(key.borrow()))
@@ -566,6 +577,186 @@ impl FastSlowStore {
         self.copy_slow_to_fast(key).await
     }
 
+    /// Stream a file's contents to a store via a buf_channel, reading from
+    /// an independently opened file descriptor. Used by the parallel
+    /// `update_with_whole_file` path to feed data to the store that does
+    /// NOT receive the file handle (the other store gets the file for its
+    /// move/hardlink optimization). Unlike the previous `read_file_to_vec`
+    /// approach, this streams chunks directly without buffering the entire
+    /// file in memory.
+    ///
+    /// The `path` must point to the file to read. A new fd is opened from
+    /// the path to avoid sharing seek position with the original FileSlot
+    /// (try_clone shares the kernel file description, causing races).
+    async fn stream_path_to_store(
+        path: std::path::PathBuf,
+        store: &Store,
+        key: StoreKey<'_>,
+        upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+        let write_fut = store.update(key.borrow(), rx, upload_size);
+
+        // Read in 256 KiB chunks — true streaming via an mpsc bridge.
+        // The blocking reader sends one chunk at a time through the bridge
+        // channel; blocking_send() applies backpressure so only a few
+        // chunks are in memory at once (channel capacity = 4).
+        const CHUNK_SIZE: usize = 256 * 1024;
+        let (bridge_tx, mut bridge_rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, Error>>(4);
+
+        let read_handle = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut file = match std::fs::File::open(&path) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = bridge_tx.blocking_send(Err(make_err!(
+                        Code::Internal,
+                        "Failed to open file for streaming: {:?}",
+                        e
+                    )));
+                    return;
+                }
+            };
+            loop {
+                let mut buf = vec![0u8; CHUNK_SIZE];
+                let mut filled = 0;
+                // Fill the buffer completely (or until EOF) to avoid
+                // sending many tiny trailing chunks.
+                while filled < CHUNK_SIZE {
+                    match file.read(&mut buf[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                            continue
+                        }
+                        Err(e) => {
+                            let err = make_err!(
+                                Code::Internal,
+                                "Failed to read file in stream_path_to_store: {:?}",
+                                e
+                            );
+                            // Best-effort send of error; receiver may be gone.
+                            let _ = bridge_tx.blocking_send(Err(err));
+                            return;
+                        }
+                    }
+                }
+                if filled == 0 {
+                    break; // EOF — drop bridge_tx to signal completion
+                }
+                buf.truncate(filled);
+                // blocking_send applies backpressure — blocks if the
+                // channel is full, keeping memory bounded.
+                if bridge_tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
+                    // Receiver dropped (e.g. store write failed); stop reading.
+                    return;
+                }
+            }
+            // bridge_tx is dropped here, closing the channel.
+        });
+
+        let forward_fut = async move {
+            while let Some(result) = bridge_rx.recv().await {
+                let chunk = result?;
+                tx.send(chunk).await.map_err(|e| {
+                    make_err!(
+                        Code::Internal,
+                        "Failed to send chunk in stream_path_to_store: {:?}",
+                        e
+                    )
+                })?;
+            }
+            tx.send_eof()
+                .err_tip(|| "Failed to send EOF in stream_path_to_store")?;
+            Result::<(), Error>::Ok(())
+        };
+
+        let (write_res, forward_res) = join!(write_fut, forward_fut);
+        // Join the blocking task to propagate panics.
+        read_handle
+            .await
+            .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
+        forward_res?;
+        write_res
+    }
+
+    /// Like [`stream_path_to_store`], but accepts an already-opened
+    /// [`std::fs::File`] instead of a path. Use this when the caller must
+    /// guarantee the fd is opened before a concurrent rename can move the
+    /// file (e.g. `FilesystemStore::emplace_file` background rename).
+    ///
+    /// On POSIX, an open fd survives the rename of its directory entry —
+    /// opening before the `join!()` eliminates the TOCTOU race.
+    async fn stream_file_to_store(
+        file: std::fs::File,
+        store: &Store,
+        key: StoreKey<'_>,
+        upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+        let write_fut = store.update(key.borrow(), rx, upload_size);
+
+        const CHUNK_SIZE: usize = 256 * 1024;
+        let (bridge_tx, mut bridge_rx) =
+            tokio::sync::mpsc::channel::<Result<Bytes, Error>>(4);
+
+        let read_handle = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut file = file;
+            loop {
+                let mut buf = vec![0u8; CHUNK_SIZE];
+                let mut filled = 0;
+                while filled < CHUNK_SIZE {
+                    match file.read(&mut buf[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            let err = make_err!(
+                                Code::Internal,
+                                "Failed to read file in stream_file_to_store: {:?}",
+                                e
+                            );
+                            let _ = bridge_tx.blocking_send(Err(err));
+                            return;
+                        }
+                    }
+                }
+                if filled == 0 {
+                    break;
+                }
+                buf.truncate(filled);
+                if bridge_tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let forward_fut = async move {
+            while let Some(result) = bridge_rx.recv().await {
+                let chunk = result?;
+                tx.send(chunk).await.map_err(|e| {
+                    make_err!(
+                        Code::Internal,
+                        "Failed to send chunk in stream_file_to_store: {:?}",
+                        e
+                    )
+                })?;
+            }
+            tx.send_eof()
+                .err_tip(|| "Failed to send EOF in stream_file_to_store")?;
+            Result::<(), Error>::Ok(())
+        };
+
+        let (write_res, forward_res) = join!(write_fut, forward_fut);
+        read_handle
+            .await
+            .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
+        forward_res?;
+        write_res
+    }
+
     /// Returns the range of bytes that should be sent given a slice bounds
     /// offset so the output range maps the `received_range.start` to 0.
     // TODO(palfrey) This should be put into utils, as this logic is used
@@ -745,6 +936,17 @@ impl StoreDriver for FastSlowStore {
         if ignore_fast {
             return self.slow_store.update(key, reader, size_info).await;
         }
+
+        // Failpoint: simulate a failure during the update path after
+        // bypass logic has passed. Tests that errors in the write path
+        // propagate correctly and the reader is not left hanging.
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("fast_slow_store_update_fail", |_| {
+            Err(make_err!(
+                Code::Internal,
+                "failpoint: update failed in fast_slow_store"
+            ))
+        });
 
         // Decoupled write: stream to fast store while accumulating data,
         // then spawn a background task for the slow store write.
@@ -1014,6 +1216,17 @@ impl StoreDriver for FastSlowStore {
             return self.slow_store.update_oneshot(key, data).await;
         }
 
+        // Failpoint: simulate a failure during the oneshot update path.
+        // Tests that errors propagate correctly and no partial data
+        // is left in the fast or slow store.
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("fast_slow_store_update_oneshot_fail", |_| {
+            Err(make_err!(
+                Code::Internal,
+                "failpoint: update_oneshot failed in fast_slow_store"
+            ))
+        });
+
         let data_len = data.len();
         debug!(
             ?key,
@@ -1137,6 +1350,11 @@ impl StoreDriver for FastSlowStore {
     /// Optimized variation to consume the file if one of the stores is a
     /// filesystem store. This makes the operation a move instead of a copy
     /// dramatically increasing performance for large files.
+    ///
+    /// When both stores need the data, the file is read into memory once and
+    /// then written to both stores in parallel. The store that supports
+    /// `FileUpdates` receives the original file handle (for move/hardlink),
+    /// while the other store receives the data via a streaming channel.
     async fn update_with_whole_file(
         self: Pin<&Self>,
         key: StoreKey<'_>,
@@ -1153,20 +1371,48 @@ impl StoreDriver for FastSlowStore {
             .fast_store
             .optimized_for(StoreOptimizations::FileUpdates)
         {
-            if !self
+            let need_slow = !self
                 .slow_store
                 .inner_store(Some(key.borrow()))
                 .optimized_for(StoreOptimizations::NoopUpdates)
                 && self.slow_direction != StoreDirection::ReadOnly
-                && self.slow_direction != StoreDirection::Get
-            {
-                // Intentionally write to slow store (remote CAS) synchronously
-                // before the fast store. This ensures the blob reaches the
-                // remote server before the action result is reported, avoiding
-                // the case where an AC entry references CAS digests that were
-                // never actually uploaded.
-                trace!("FastSlowStore::update_with_whole_file: uploading to slow_store");
-                let slow_start = std::time::Instant::now();
+                && self.slow_direction != StoreDirection::Get;
+            let need_fast = self.fast_direction != StoreDirection::ReadOnly
+                && self.fast_direction != StoreDirection::Get;
+
+            if need_slow && need_fast {
+                // Open a separate fd from the path for the slow store
+                // BEFORE starting the fast_fut. The fast store's
+                // update_with_whole_file (FilesystemStore) renames/moves
+                // the file out of its original location via emplace_file.
+                // On POSIX, an open fd survives a rename of its path, so
+                // opening before the rename races is safe. Opening after
+                // the join!() starts risks ENOENT if emplace_file's
+                // background rename completes first.
+                let slow_file = std::fs::File::open(std::path::Path::new(&path))
+                    .map_err(|e| make_err!(
+                        Code::Internal,
+                        "Failed to open file for slow store streaming: {:?}",
+                        e
+                    ))?;
+                let slow_fut = Self::stream_file_to_store(
+                    slow_file,
+                    &self.slow_store,
+                    key.borrow(),
+                    upload_size,
+                );
+                let fast_fut = self
+                    .fast_store
+                    .update_with_whole_file(key.borrow(), path, file, upload_size);
+
+                let (slow_res, fast_res) = join!(slow_fut, fast_fut);
+                slow_res.err_tip(|| "In FastSlowStore::update_with_whole_file slow_store")?;
+                return fast_res.err_tip(|| "In FastSlowStore::update_with_whole_file fast_store");
+            }
+
+            if need_slow {
+                // Fast store is read-only; only write to slow store.
+                trace!("FastSlowStore::update_with_whole_file: uploading to slow_store only");
                 file = slow_update_store_with_file(
                     self.slow_store.as_store_driver_pin(),
                     key.borrow(),
@@ -1175,14 +1421,10 @@ impl StoreDriver for FastSlowStore {
                 )
                 .await
                 .err_tip(|| "In FastSlowStore::update_with_whole_file slow_store")?;
-                trace!(
-                    elapsed_ms = slow_start.elapsed().as_millis(),
-                    "FastSlowStore::update_with_whole_file: slow_store upload completed",
-                );
+                return Ok(Some(file));
             }
-            if self.fast_direction == StoreDirection::ReadOnly
-                || self.fast_direction == StoreDirection::Get
-            {
+
+            if !need_fast {
                 return Ok(Some(file));
             }
             return self
@@ -1201,6 +1443,39 @@ impl StoreDriver for FastSlowStore {
                 .optimized_for(StoreOptimizations::NoopUpdates)
                 || self.fast_direction == StoreDirection::ReadOnly
                 || self.fast_direction == StoreDirection::Get;
+            let ignore_slow = self.slow_direction == StoreDirection::ReadOnly
+                || self.slow_direction == StoreDirection::Get;
+
+            if !ignore_fast && !ignore_slow {
+                // Open a separate fd from the path for the fast store
+                // BEFORE starting slow_fut. The slow store's
+                // update_with_whole_file (FilesystemStore) renames/moves
+                // the file out of its original location via emplace_file.
+                // On POSIX, an open fd survives a rename of its path, so
+                // opening before the rename races is safe. Opening after
+                // the join!() starts risks ENOENT if emplace_file's
+                // background rename completes first.
+                let fast_file = std::fs::File::open(std::path::Path::new(&path))
+                    .map_err(|e| make_err!(
+                        Code::Internal,
+                        "Failed to open file for fast store streaming: {:?}",
+                        e
+                    ))?;
+                let fast_fut = Self::stream_file_to_store(
+                    fast_file,
+                    &self.fast_store,
+                    key.borrow(),
+                    upload_size,
+                );
+                let slow_fut = self
+                    .slow_store
+                    .update_with_whole_file(key.borrow(), path, file, upload_size);
+
+                let (fast_res, slow_res) = join!(fast_fut, slow_fut);
+                fast_res.err_tip(|| "In FastSlowStore::update_with_whole_file fast_store")?;
+                return slow_res.err_tip(|| "In FastSlowStore::update_with_whole_file slow_store");
+            }
+
             if !ignore_fast {
                 file = slow_update_store_with_file(
                     self.fast_store.as_store_driver_pin(),
@@ -1211,8 +1486,6 @@ impl StoreDriver for FastSlowStore {
                 .await
                 .err_tip(|| "In FastSlowStore::update_with_whole_file fast_store")?;
             }
-            let ignore_slow = self.slow_direction == StoreDirection::ReadOnly
-                || self.slow_direction == StoreDirection::Get;
             if ignore_slow {
                 return Ok(Some(file));
             }
@@ -1261,6 +1534,14 @@ impl StoreDriver for FastSlowStore {
                 return Ok(());
             }
         }
+
+        // Failpoint: simulate fast store returning NotFound during get_part.
+        // Exercises the fallback from fast store to slow store populate path,
+        // which is critical for serving data when the local cache misses.
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!("fast_slow_get_part_fast_store_not_found", |_| {
+            Err(make_err!(Code::NotFound, "failpoint: fast store not found"))
+        });
 
         // Try the fast store directly — avoids the extra has() round-trip.
         // On NotFound (with no bytes written), fall through to slow store.
@@ -1444,13 +1725,22 @@ impl StoreDriver for FastSlowStore {
                     Err(err) => {
                         // Streaming buffer error (populate failed or cursor
                         // fell behind sliding window). Fall back to slow store.
+                        // We already wrote some bytes to `writer` from the
+                        // streaming read. Resume the slow store read from where
+                        // we left off to avoid sending duplicate data (which
+                        // would cause VerifyStore to report a size mismatch).
+                        let bytes_already_sent = writer.get_bytes_written();
+                        let new_offset = offset + bytes_already_sent;
+                        let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
                         warn!(
                             ?key,
                             %err,
+                            bytes_already_sent,
+                            new_offset,
                             "streaming populate reader error, falling back to slow store"
                         );
                         return self.slow_store
-                            .get_part(key.borrow(), &mut *writer, offset, length)
+                            .get_part(key.borrow(), &mut *writer, new_offset, new_length)
                             .await;
                     }
                 }

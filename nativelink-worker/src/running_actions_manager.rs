@@ -1850,6 +1850,8 @@ async fn upload_file(
     hasher: DigestHasherFunc,
     metadata: std::fs::Metadata,
     digest_uploaders: Arc<Mutex<HashMap<DigestInfo, DigestUploader>>>,
+    known_existing: Arc<Mutex<HashSet<DigestInfo>>>,
+    prehash_digest: Option<DigestInfo>,
 ) -> Result<FileInfo, Error> {
     let is_executable = is_executable(&metadata, &full_path);
     let file_size = metadata.len();
@@ -1857,11 +1859,17 @@ async fn upload_file(
         .await
         .err_tip(|| format!("Could not open file {full_path:?}"))?;
 
-    let (digest, mut file) = hasher
-        .hasher()
-        .digest_for_file(&full_path, file, Some(file_size))
-        .await
-        .err_tip(|| format!("Failed to hash file in digest_for_file failed for {full_path:?}"))?;
+    // Use the pre-computed digest from Phase 1 if available, avoiding
+    // a redundant full-file read + hash.
+    let (digest, mut file) = if let Some(digest) = prehash_digest {
+        (digest, file)
+    } else {
+        hasher
+            .hasher()
+            .digest_for_file(&full_path, file, Some(file_size))
+            .await
+            .err_tip(|| format!("Failed to hash file in digest_for_file failed for {full_path:?}"))?
+    };
 
     let digest_uploader = match digest_uploaders.lock().entry(digest) {
         std::collections::hash_map::Entry::Occupied(occupied_entry) => occupied_entry.get().clone(),
@@ -1874,8 +1882,18 @@ async fn upload_file(
     // times in the output with different names.
     digest_uploader
         .get_or_try_init(async || {
-            // Only upload if the digest doesn't already exist, this should be
-            // a much cheaper operation than an upload.
+            // Check the batch-populated known_existing set first to avoid
+            // an individual gRPC round-trip for each digest.
+            if known_existing.lock().contains(&digest) {
+                trace!(
+                    ?digest,
+                    "upload_file: digest already confirmed by batch has(), skipping upload",
+                );
+                return Ok(());
+            }
+
+            // Fall back to individual has() for digests not covered by the
+            // batch check (e.g. directory protos created during upload).
             let cas_store = cas_store.as_store_driver_pin();
             let store_key: StoreKey<'_> = digest.into();
             let has_start = std::time::Instant::now();
@@ -1889,6 +1907,7 @@ async fn upload_file(
                     has_elapsed_ms = has_start.elapsed().as_millis(),
                     "upload_file: digest already exists in CAS, skipping upload",
                 );
+                known_existing.lock().insert(digest);
                 return Ok(());
             }
             trace!(
@@ -2076,6 +2095,7 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
     full_work_directory: &'a str,
     hasher: DigestHasherFunc,
     digest_uploaders: Arc<Mutex<HashMap<DigestInfo, DigestUploader>>>,
+    known_existing: Arc<Mutex<HashSet<DigestInfo>>>,
 ) -> BoxFuture<'a, Result<(Directory, VecDeque<ProtoDirectory>), Error>> {
     Box::pin(async move {
         let file_futures = FuturesUnordered::new();
@@ -2100,6 +2120,7 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
                 let full_path = full_dir_path.as_ref().join(entry.path());
                 if file_type.is_dir() {
                     let full_dir_path = full_dir_path.clone();
+                    let known_existing = known_existing.clone();
                     dir_futures.push(
                         upload_directory(
                             cas_store,
@@ -2107,6 +2128,7 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
                             full_work_directory,
                             hasher,
                             digest_uploaders.clone(),
+                            known_existing,
                         )
                         .and_then(|(dir, all_dirs)| async move {
                             let directory_name = full_path
@@ -2141,11 +2163,12 @@ fn upload_directory<'a, P: AsRef<Path> + Debug + Send + Sync + Clone + 'a>(
                     );
                 } else if file_type.is_file() {
                     let digest_uploaders = digest_uploaders.clone();
+                    let known_existing = known_existing.clone();
                     file_futures.push(async move {
                         let metadata = fs::metadata(&full_path)
                             .await
                             .err_tip(|| format!("Could not open file {}", full_path.display()))?;
-                        upload_file(cas_store, &full_path, hasher, metadata, digest_uploaders)
+                        upload_file(cas_store, &full_path, hasher, metadata, digest_uploaders, known_existing, None)
                             .map_ok(TryInto::try_into)
                             .await?
                     });
@@ -3065,10 +3088,12 @@ impl RunningActionImpl {
                 state.execution_metadata.clone(),
             )
         };
-        // Upload outputs to the fast store (local FilesystemStore) only.
-        // The slow store (remote CAS) upload is deferred to the background
-        // after the execution result is reported, reducing latency.
-        let cas_store = self.running_actions_manager.cas_store.fast_store();
+        // Upload outputs through the FastSlowStore so the has() check in
+        // upload_file queries the slow store (remote CAS). This prevents
+        // skipping uploads for blobs that exist locally but were never
+        // persisted to the remote (e.g., prior background upload failed).
+        // FastSlowStore::update_with_whole_file writes to both stores.
+        let cas_store = &*self.running_actions_manager.cas_store;
         let hasher = self.action_info.unique_qualifier.digest_function();
 
         let mut output_path_futures = FuturesUnordered::new();
@@ -3079,6 +3104,94 @@ impl RunningActionImpl {
             output_paths.append(&mut command_proto.output_files);
             output_paths.append(&mut command_proto.output_directories);
         }
+        // Phase 1: Hash all top-level output files in parallel to collect
+        // their digests, then do a single batch has_with_results() call.
+        // This replaces N individual gRPC round-trips (1-5ms each) with one
+        // batch call, saving 20-100ms for typical actions with ~20 output files.
+        // The per-path digest results are cached in `prehash_digests` so
+        // Phase 2's upload_file can skip re-hashing.
+        let (known_existing, prehash_digests) = {
+            let hash_start = std::time::Instant::now();
+            let mut hash_futures = FuturesUnordered::new();
+            for entry in &output_paths {
+                let full_path = OsString::from(if command_proto.working_directory.is_empty() {
+                    format!("{}/{}", self.work_directory, entry)
+                } else {
+                    format!(
+                        "{}/{}/{}",
+                        self.work_directory, command_proto.working_directory, entry
+                    )
+                });
+                hash_futures.push(async move {
+                    let metadata = match fs::symlink_metadata(&full_path).await {
+                        Ok(m) if m.is_file() => m,
+                        // For symlinks that resolve to files, hash the target.
+                        Ok(m) if m.is_symlink() => {
+                            match fs::metadata(&full_path).await {
+                                Ok(rm) if rm.is_file() => rm,
+                                _ => return Ok(None),
+                            }
+                        }
+                        _ => return Ok(None),
+                    };
+                    let file_size = metadata.len();
+                    let file = fs::open_file(&full_path, 0).await
+                        .err_tip(|| format!("Could not open file {full_path:?} for pre-hash"))?;
+                    let (digest, _file) = hasher
+                        .hasher()
+                        .digest_for_file(&full_path, file, Some(file_size))
+                        .await
+                        .err_tip(|| format!("Failed to pre-hash {full_path:?}"))?;
+                    Result::<Option<(OsString, DigestInfo)>, Error>::Ok(
+                        Some((full_path, digest)),
+                    )
+                });
+            }
+
+            let mut all_digests = Vec::new();
+            let mut path_digests: HashMap<OsString, DigestInfo> = HashMap::new();
+            while let Some(result) = hash_futures.next().await {
+                if let Ok(Some((path, digest))) = result {
+                    all_digests.push(digest);
+                    path_digests.insert(path, digest);
+                }
+            }
+
+            // Deduplicate digests before the batch call.
+            all_digests.sort_unstable();
+            all_digests.dedup();
+
+            let mut existing = HashSet::new();
+            if !all_digests.is_empty() {
+                let store_keys: Vec<StoreKey<'_>> = all_digests.iter()
+                    .map(|d| StoreKey::from(*d))
+                    .collect();
+                let mut results = vec![None; store_keys.len()];
+                let batch_start = std::time::Instant::now();
+                if let Err(e) = cas_store.has_with_results(&store_keys, &mut results).await {
+                    warn!(
+                        ?e,
+                        "batch has_with_results failed, falling back to individual checks"
+                    );
+                } else {
+                    for (digest, result) in all_digests.iter().zip(results.iter()) {
+                        if result.is_some() {
+                            existing.insert(*digest);
+                        }
+                    }
+                    debug!(
+                        total_digests = all_digests.len(),
+                        already_existing = existing.len(),
+                        batch_ms = batch_start.elapsed().as_millis() as u64,
+                        hash_ms = hash_start.elapsed().as_millis() as u64,
+                        "upload_results: batch has() check completed"
+                    );
+                }
+            }
+
+            (Arc::new(Mutex::new(existing)), Arc::new(path_digests))
+        };
+
         let digest_uploaders = Arc::new(Mutex::new(HashMap::new()));
         for entry in output_paths {
             let full_path = OsString::from(if command_proto.working_directory.is_empty() {
@@ -3091,7 +3204,10 @@ impl RunningActionImpl {
             });
             let work_directory = &self.work_directory;
             let digest_uploaders = digest_uploaders.clone();
+            let known_existing = known_existing.clone();
+            let prehash_digests = prehash_digests.clone();
             output_path_futures.push(async move {
+                let cached_digest = prehash_digests.get(&full_path).copied();
                 let metadata = {
                     let metadata = match fs::symlink_metadata(&full_path).await {
                         Ok(file) => file,
@@ -3115,6 +3231,8 @@ impl RunningActionImpl {
                                 hasher,
                                 metadata,
                                 digest_uploaders,
+                                known_existing,
+                                cached_digest,
                             )
                             .await
                             .map(|mut file_info| {
@@ -3134,6 +3252,7 @@ impl RunningActionImpl {
                             work_directory,
                             hasher,
                             digest_uploaders,
+                            known_existing,
                         )
                         .and_then(|(root_dir, children)| async move {
                             let tree = ProtoTree {
@@ -3180,6 +3299,7 @@ impl RunningActionImpl {
                                             work_directory,
                                             hasher,
                                             digest_uploaders,
+                                            known_existing,
                                         )
                                         .and_then(|(root_dir, children)| async move {
                                             let tree = ProtoTree {
@@ -3210,6 +3330,8 @@ impl RunningActionImpl {
                                             hasher,
                                             resolved_meta,
                                             digest_uploaders,
+                                            known_existing,
+                                            cached_digest,
                                         )
                                         .await
                                         .map(|mut file_info| {

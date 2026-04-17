@@ -14,6 +14,8 @@ nativelink-proto = { path = "../nativelink-proto" }
 nativelink-redis-tester = { path = "../nativelink-redis-tester" }
 nativelink-util = { path = "../nativelink-util" }
 
+fail = { version = "0.5", optional = true }
+
 async-lock = { version = "3.4.0", features = ["std"], default-features = false }
 async-trait = { version = "0.1.88", default-features = false }
 aws-config = { version = "1.6.1", default-features = false, features = ["sso"] }
@@ -124,9 +126,11 @@ uuid = { version = "1.16.0", default-features = false, features = [
 [features]
 io-uring = ["nativelink-util/io-uring"]
 quic = ["nativelink-util/quic"]
+failpoints = ["dep:fail", "fail/failpoints", "nativelink-util/failpoints"]
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
+fail = { version = "0.5", features = ["failpoints"] }
 
 aws-sdk-s3 = { version = "1.82.0", features = [
   "http-1x",
