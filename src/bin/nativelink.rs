@@ -1250,11 +1250,15 @@ async fn inner_main(
         }
     }
 
-    // Graceful SIGTERM handler: stop accepting → drain connections →
-    // flush writes → shut down workers/schedulers → exit.
+    // Graceful SIGTERM handler: evict workers → stop accepting →
+    // drain connections → flush writes → shut down local workers → exit.
     #[cfg(target_family = "unix")]
     {
         let shutdown_tx_clone = shutdown_tx.clone();
+        // Clone schedulers so SIGTERM handler can evict workers before
+        // draining connections. This ensures ConnectWorker streams close
+        // promptly (no 30s timeout) and no new work is assigned during drain.
+        let schedulers_for_shutdown: Vec<_> = worker_schedulers.values().cloned().collect();
         #[expect(clippy::disallowed_methods, reason = "signal handler spawned in inner_main")]
         tokio::spawn(async move {
             signal(SignalKind::terminate())
@@ -1263,12 +1267,42 @@ async fn inner_main(
                 .await;
             warn!("SIGTERM received, starting graceful shutdown");
 
-            // Step 1: Stop accepting new connections. Each HTTP listener
+            // Step 1: Evict all remote workers from schedulers. This closes
+            // their ConnectWorker streams so port 50061 drains promptly,
+            // and prevents the scheduler from assigning new work during drain.
+            // Per-scheduler 10s timeout so a wedged backend can't stall SIGTERM.
+            if !schedulers_for_shutdown.is_empty() {
+                info!(
+                    count = schedulers_for_shutdown.len(),
+                    "evicting workers from schedulers"
+                );
+                let evict_start = std::time::Instant::now();
+                let evict_guard = shutdown_guard.clone();
+                for scheduler in &schedulers_for_shutdown {
+                    if tokio::time::timeout(
+                        Duration::from_secs(10),
+                        scheduler.shutdown(evict_guard.clone()),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        warn!("scheduler shutdown timed out after 10s, continuing");
+                    }
+                }
+                info!(
+                    elapsed_ms = u64::try_from(evict_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "all workers evicted from schedulers"
+                );
+            }
+
+            // Step 2: Stop accepting new connections. Each HTTP listener
             // sees this in its select! and starts draining via GOAWAY.
             let _ = accept_stop_tx.send(true);
 
-            // Step 2: Wait for all listeners to finish draining in-flight
+            // Step 3: Wait for all listeners to finish draining in-flight
             // connections. Each listener has its own 30s drain timeout.
+            // With workers already evicted, ConnectWorker streams should
+            // close quickly so this should complete well under 30s.
             info!(
                 listeners = drain_receivers.len(),
                 "waiting for listeners to drain"
@@ -1283,14 +1317,16 @@ async fn inner_main(
                 }
             }
 
-            // Step 3: Flush in-flight background slow writes. All RPCs
+            // Step 4: Flush in-flight background slow writes. All RPCs
             // have completed (or timed out), so all writes are queued.
             if let Some(sm) = STORE_MANAGER.get() {
                 info!("flushing in-flight slow writes before shutdown");
                 sm.flush_slow_writes(Duration::from_secs(30)).await;
             }
 
-            // Step 4: Shut down workers and schedulers (20s budget).
+            // Step 5: Shut down local workers (20s budget). Remote workers
+            // were already evicted in Step 1; this handles local workers
+            // and the ShutdownGuard coordination.
             drop(shutdown_tx_clone.send(shutdown_guard.clone()));
             tokio::select! {
                 result = async {
@@ -1312,11 +1348,11 @@ async fn inner_main(
     // Set up a shutdown handler for the worker schedulers.
     let mut shutdown_rx = shutdown_tx.subscribe();
     root_futures.push(Box::pin(async move {
-        if let Ok(shutdown_guard) = shutdown_rx.recv().await {
+        if shutdown_rx.recv().await.is_ok() {
+            // Remote workers were already evicted in SIGTERM Step 1.
+            // Signal Step 5 to proceed with ShutdownGuard coordination.
             let _ = scheduler_shutdown_tx.send(());
-            for (_name, scheduler) in worker_schedulers {
-                scheduler.shutdown(shutdown_guard.clone()).await;
-            }
+            drop(worker_schedulers);
         }
         Ok(())
     }));
