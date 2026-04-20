@@ -331,11 +331,32 @@ async fn filter_valid_subtree_hits(
                 }
             };
             let mut count: u32 = 0;
-            for entry in read_dir.flatten() {
-                if entry.file_name() == MERKLE_METADATA_FILENAME {
-                    continue;
+            let mut had_entry_error = false;
+            for entry_result in read_dir {
+                match entry_result {
+                    Ok(entry) => {
+                        if entry.file_name() == MERKLE_METADATA_FILENAME {
+                            continue;
+                        }
+                        count = count.saturating_add(1);
+                    }
+                    Err(e) => {
+                        // Fail closed: a directory iteration error means we
+                        // cannot trust the count. Treat as corruption.
+                        warn!(
+                            ?digest,
+                            path = %path.display(),
+                            ?e,
+                            "subtree validation: read_dir entry error, rejecting hit",
+                        );
+                        had_entry_error = true;
+                        break;
+                    }
                 }
-                count = count.saturating_add(1);
+            }
+            if had_entry_error {
+                rejected = rejected.saturating_add(1);
+                continue;
             }
             if count == expected {
                 valid.insert(digest, path);
@@ -923,17 +944,22 @@ impl DirectoryCache {
             }
 
             // Step 4: Store merkle tree metadata alongside the cache entry.
+            // The metadata file is required for startup re-population of
+            // subtree_index, and the validator excludes it by name when
+            // counting entries. A failed write would leave the entry
+            // un-reloadable after restart and silently inflate the on-disk
+            // count by zero, so we treat it as a fatal construction error.
             if let Some(tree) = &resolved_tree {
                 let merkle_meta = MerkleTreeMetadata::from_directory_tree(tree, &digest);
                 let merkle_path = temp_path.join(MERKLE_METADATA_FILENAME);
                 let serialized = merkle_meta.serialize();
-                if let Err(e) = fs::write(&merkle_path, serialized.as_bytes()).await {
-                    warn!(
-                        hash = %&digest.packed_hash().to_string()[..12],
-                        ?e,
-                        "DirectoryCache direct-use: failed to write merkle metadata",
-                    );
-                }
+                fs::write(&merkle_path, serialized.as_bytes())
+                    .await
+                    .err_tip(|| {
+                        format!(
+                            "DirectoryCache direct-use: failed to write merkle metadata for {digest}"
+                        )
+                    })?;
                 // Validate the on-disk tree before publishing. A construction
                 // that silently produced incomplete subdirectories must NOT
                 // reach the cache or it will poison every future hit.
@@ -1448,17 +1474,22 @@ impl DirectoryCache {
             }
 
             // Step 4: Store merkle tree metadata alongside the cache entry.
+            // The metadata file is required for startup re-population of
+            // subtree_index, and the validator excludes it by name when
+            // counting entries. A failed write would leave the entry
+            // un-reloadable after restart and silently inflate the on-disk
+            // count by zero, so we treat it as a fatal construction error.
             if let Some(tree) = &resolved_tree {
                 let merkle_meta = MerkleTreeMetadata::from_directory_tree(tree, &digest);
                 let merkle_path = temp_path.join(MERKLE_METADATA_FILENAME);
                 let serialized = merkle_meta.serialize();
-                if let Err(e) = fs::write(&merkle_path, serialized.as_bytes()).await {
-                    warn!(
-                        hash = %&digest.packed_hash().to_string()[..12],
-                        ?e,
-                        "DirectoryCache: failed to write merkle metadata, subtrees won't be indexed",
-                    );
-                }
+                fs::write(&merkle_path, serialized.as_bytes())
+                    .await
+                    .err_tip(|| {
+                        format!(
+                            "DirectoryCache: failed to write merkle metadata for {digest}"
+                        )
+                    })?;
                 // Validate the on-disk tree before publishing. A construction
                 // that silently produced incomplete subdirectories must NOT
                 // reach the cache or it will poison every future hit.
@@ -4546,6 +4577,86 @@ mod tests {
         let digest = make_digest(0xdd);
         let valid = filter_valid_subtree_hits(vec![(digest, dir, 5)]).await;
         assert!(valid.is_empty());
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_count_match_with_wrong_names() -> Result<(), Error> {
+        // Documented limitation of count-only validation: a directory with
+        // the same TOTAL count but different names (one extra unexpected
+        // file balancing one missing expected file) passes. Captures the
+        // current behavior so a future stricter validator (digest- or
+        // name-aware) intentionally breaks this test.
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("balanced");
+        fs::create_dir(&dir).await.unwrap();
+        fs::write(dir.join("expected_a"), b"").await.unwrap();
+        fs::write(dir.join("expected_b"), b"").await.unwrap();
+        fs::write(dir.join("unexpected_c"), b"").await.unwrap();
+        // The proto would expect [expected_a, expected_b, expected_d]; on
+        // disk we have [expected_a, expected_b, unexpected_c]. Count is 3
+        // either way — count-only validation accepts.
+
+        let digest = make_digest(0xee);
+        let valid =
+            filter_valid_subtree_hits(vec![(digest, dir.clone(), 3)]).await;
+        assert_eq!(
+            valid.len(),
+            1,
+            "count-only validation cannot detect name swaps; documented limit",
+        );
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_path_is_regular_file() -> Result<(), Error> {
+        // A subtree_index entry pointing at a regular file (e.g. a cache
+        // entry partially deleted then a same-named file written in its
+        // place) must be rejected, not crash.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("not_a_dir");
+        fs::write(&path, b"oops").await.unwrap();
+
+        let digest = make_digest(0xff);
+        let valid = filter_valid_subtree_hits(vec![(digest, path, 0)]).await;
+        assert!(
+            valid.is_empty(),
+            "regular file as subtree path must be rejected"
+        );
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_empty_dir_zero_expected() -> Result<(), Error> {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("empty");
+        fs::create_dir(&dir).await.unwrap();
+
+        let digest = make_digest(0x01);
+        let valid =
+            filter_valid_subtree_hits(vec![(digest, dir.clone(), 0)]).await;
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid.get(&digest), Some(&dir));
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_counts_symlinks() -> Result<(), Error> {
+        // Symlinks count toward the total; the proto would have one entry
+        // in `symlinks` for each.
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("with_symlinks");
+        fs::create_dir(&dir).await.unwrap();
+        fs::write(dir.join("real"), b"").await.unwrap();
+        #[cfg(unix)]
+        fs::symlink("real", dir.join("link")).await.unwrap();
+
+        let digest = make_digest(0x02);
+        // expect 2: one file + one symlink
+        let valid =
+            filter_valid_subtree_hits(vec![(digest, dir.clone(), 2)]).await;
+        #[cfg(unix)]
+        assert_eq!(valid.len(), 1, "symlink must be counted");
         Ok(())
     }
 
