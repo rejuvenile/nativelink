@@ -2504,10 +2504,15 @@ impl DirectoryCache {
                             .err_tip(|| format!("Failed to create symlink: {}", link_path.display()))?;
                     }
                 } else {
-                    warn!(
-                        digest = ?d,
-                        "DirectoryCache: directory not found in tree during failed subtree walk",
-                    );
+                    // resolve_directory_tree should have validated the tree
+                    // is structurally complete before we got here. If we
+                    // reach this branch we'd skip an entire subtree of the
+                    // construction silently, so fail loud instead — letting
+                    // the action retry against a fresh tree resolution.
+                    return Err(make_err!(
+                        Code::Internal,
+                        "DirectoryCache: directory {d:?} not found in resolved tree during failed-subtree fallback walk; refusing to publish incomplete cache entry",
+                    ));
                 }
             }
         }
