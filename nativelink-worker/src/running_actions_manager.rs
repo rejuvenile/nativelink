@@ -208,7 +208,7 @@ pub fn parse_get_tree_response(
             // 0 or >1 orphans: we cannot safely promote one to root_digest.
             // Caller will fall through to BFS rebuild, but make the silent
             // "tree without a usable root" path visible in logs.
-            tracing::warn!(
+            warn!(
                 expected_root = ?root_digest,
                 orphan_count = orphans.len(),
                 tree_size = tree.len(),
@@ -220,48 +220,78 @@ pub fn parse_get_tree_response(
     tree
 }
 
-/// Verify that a resolved directory tree is structurally complete: the root
-/// is present, and every directory referenced as a child by some entry is
-/// itself a key in the map. Any violation is a hard error — propagating an
-/// incomplete tree to the construction code would let it silently skip
-/// missing subdirectories.
+/// Verify that a resolved directory tree is structurally complete and acyclic:
+/// the root is present, every directory reachable from the root is a key in
+/// the map, and no directory transitively references itself. Any violation
+/// is a hard error — propagating an incomplete or cyclic tree to the
+/// construction code would let it silently skip missing subdirectories or
+/// loop forever in the materialization BFS.
 fn assert_tree_complete(
     tree: &HashMap<DigestInfo, ProtoDirectory>,
     root_digest: &DigestInfo,
     source: &'static str,
 ) -> Result<(), Error> {
-    if !tree.contains_key(root_digest) {
-        return Err(make_err!(
-            Code::Internal,
-            "{source}: resolved tree missing root digest {root_digest:?}",
-        ));
+    // Iterative DFS with explicit ancestor tracking. The ancestor set on the
+    // current path distinguishes a cycle (revisit of an ancestor) from a
+    // diamond (revisit of a fully-explored sibling subtree).
+    enum Frame {
+        Enter(DigestInfo),
+        Exit(DigestInfo),
     }
-    for (parent_digest, dir) in tree {
-        for node in &dir.directories {
-            let child_digest: DigestInfo = node
-                .digest
-                .as_ref()
-                .ok_or_else(|| {
+    let mut stack: Vec<Frame> = vec![Frame::Enter(*root_digest)];
+    let mut ancestors: HashSet<DigestInfo> = HashSet::new();
+    let mut finished: HashSet<DigestInfo> = HashSet::with_capacity(tree.len());
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Exit(digest) => {
+                ancestors.remove(&digest);
+                finished.insert(digest);
+            }
+            Frame::Enter(digest) => {
+                if finished.contains(&digest) {
+                    continue;
+                }
+                if !ancestors.insert(digest) {
+                    return Err(make_err!(
+                        Code::Internal,
+                        "{source}: directory cycle detected at {digest:?} — refusing to construct cyclic tree",
+                    ));
+                }
+                let dir = tree.get(&digest).ok_or_else(|| {
                     make_err!(
-                        Code::InvalidArgument,
-                        "{source}: directory node {} in parent {parent_digest:?} missing digest",
-                        node.name,
-                    )
-                })?
-                .try_into()
-                .map_err(|e| {
-                    make_err!(
-                        Code::InvalidArgument,
-                        "{source}: invalid digest for node {} in parent {parent_digest:?}: {e:?}",
-                        node.name,
+                        Code::Internal,
+                        "{source}: resolved tree missing reachable directory {digest:?}",
                     )
                 })?;
-            if !tree.contains_key(&child_digest) {
-                return Err(make_err!(
-                    Code::Internal,
-                    "{source}: resolved tree missing referenced child {child_digest:?} (referenced by {parent_digest:?} as {})",
-                    node.name,
-                ));
+                stack.push(Frame::Exit(digest));
+                for node in &dir.directories {
+                    let child_digest: DigestInfo = node
+                        .digest
+                        .as_ref()
+                        .ok_or_else(|| {
+                            make_err!(
+                                Code::InvalidArgument,
+                                "{source}: directory node {} in parent {digest:?} missing digest",
+                                node.name,
+                            )
+                        })?
+                        .try_into()
+                        .map_err(|e| {
+                            make_err!(
+                                Code::InvalidArgument,
+                                "{source}: invalid digest for node {} in parent {digest:?}: {e:?}",
+                                node.name,
+                            )
+                        })?;
+                    if !tree.contains_key(&child_digest) {
+                        return Err(make_err!(
+                            Code::Internal,
+                            "{source}: resolved tree missing referenced child {child_digest:?} (referenced by {digest:?} as {})",
+                            node.name,
+                        ));
+                    }
+                    stack.push(Frame::Enter(child_digest));
+                }
             }
         }
     }
