@@ -204,10 +204,68 @@ pub fn parse_get_tree_response(
             if let Some(root_dir) = tree.remove(&orphans[0]) {
                 tree.insert(*root_digest, root_dir);
             }
+        } else {
+            // 0 or >1 orphans: we cannot safely promote one to root_digest.
+            // Caller will fall through to BFS rebuild, but make the silent
+            // "tree without a usable root" path visible in logs.
+            tracing::warn!(
+                expected_root = ?root_digest,
+                orphan_count = orphans.len(),
+                tree_size = tree.len(),
+                "parse_get_tree_response: cannot identify root from orphans; root_digest absent from GetTree response",
+            );
         }
     }
 
     tree
+}
+
+/// Verify that a resolved directory tree is structurally complete: the root
+/// is present, and every directory referenced as a child by some entry is
+/// itself a key in the map. Any violation is a hard error — propagating an
+/// incomplete tree to the construction code would let it silently skip
+/// missing subdirectories.
+fn assert_tree_complete(
+    tree: &HashMap<DigestInfo, ProtoDirectory>,
+    root_digest: &DigestInfo,
+    source: &'static str,
+) -> Result<(), Error> {
+    if !tree.contains_key(root_digest) {
+        return Err(make_err!(
+            Code::Internal,
+            "{source}: resolved tree missing root digest {root_digest:?}",
+        ));
+    }
+    for (parent_digest, dir) in tree {
+        for node in &dir.directories {
+            let child_digest: DigestInfo = node
+                .digest
+                .as_ref()
+                .ok_or_else(|| {
+                    make_err!(
+                        Code::InvalidArgument,
+                        "{source}: directory node {} in parent {parent_digest:?} missing digest",
+                        node.name,
+                    )
+                })?
+                .try_into()
+                .map_err(|e| {
+                    make_err!(
+                        Code::InvalidArgument,
+                        "{source}: invalid digest for node {} in parent {parent_digest:?}: {e:?}",
+                        node.name,
+                    )
+                })?;
+            if !tree.contains_key(&child_digest) {
+                return Err(make_err!(
+                    Code::Internal,
+                    "{source}: resolved tree missing referenced child {child_digest:?} (referenced by {parent_digest:?} as {})",
+                    node.name,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Maximum size for a blob to be eligible for BatchReadBlobs (1 MiB).
@@ -325,6 +383,11 @@ pub async fn resolve_directory_tree(
                         );
                         let gap_start = std::time::Instant::now();
                         resolve_directory_tree_fill_gaps(cas_store, &mut tree).await?;
+                        assert_tree_complete(
+                            &tree,
+                            root_digest,
+                            "resolve_directory_tree GetTree+gap-fill",
+                        )?;
                         let gap_elapsed = gap_start.elapsed();
                         let total_bytes: u64 = tree.keys().map(|d| d.size_bytes()).sum();
                         let total_files: usize = tree.values().map(|d| d.files.len()).sum();
@@ -371,6 +434,7 @@ pub async fn resolve_directory_tree(
     // recursive DFS approach.
     let parallel_start = std::time::Instant::now();
     let tree = resolve_directory_tree_parallel(cas_store, root_digest).await?;
+    assert_tree_complete(&tree, root_digest, "resolve_directory_tree parallel BFS")?;
     let parallel_elapsed = parallel_start.elapsed();
     let total_elapsed = tree_start.elapsed();
     let total_bytes: u64 = tree.keys().map(|d| d.size_bytes()).sum();
@@ -1123,24 +1187,31 @@ pub fn download_to_directory<'a>(
             while !current_level.is_empty() {
                 let mut next_level = Vec::new();
                 for (dir_digest, dir_path) in &current_level {
-                    if let Some(directory) = tree.get(dir_digest) {
-                        debug!(
-                            depth = mkdir_depth,
-                            path = %dir_path,
-                            files = directory.files.len(),
-                            subdirs = directory.directories.len(),
-                            "download_to_directory: processing directory",
-                        );
-                        for subdir in &directory.directories {
-                            let child_digest: DigestInfo = subdir
-                                .digest
-                                .as_ref()
-                                .err_tip(|| "Expected Digest")?
-                                .try_into()
-                                .err_tip(|| "In Directory::directories::digest")?;
-                            let child_path = format!("{}/{}", dir_path, subdir.name);
-                            next_level.push((child_digest, child_path));
-                        }
+                    // Tree completeness is asserted by resolve_directory_tree;
+                    // a missing entry here would silently skip the directory
+                    // and everything below it. Fail loud instead.
+                    let directory = tree.get(dir_digest).ok_or_else(|| {
+                        make_err!(
+                            Code::Internal,
+                            "download_to_directory: directory {dir_digest:?} missing from resolved tree at depth {mkdir_depth} (path {dir_path}); refusing to materialize incomplete input tree",
+                        )
+                    })?;
+                    debug!(
+                        depth = mkdir_depth,
+                        path = %dir_path,
+                        files = directory.files.len(),
+                        subdirs = directory.directories.len(),
+                        "download_to_directory: processing directory",
+                    );
+                    for subdir in &directory.directories {
+                        let child_digest: DigestInfo = subdir
+                            .digest
+                            .as_ref()
+                            .err_tip(|| "Expected Digest")?
+                            .try_into()
+                            .err_tip(|| "In Directory::directories::digest")?;
+                        let child_path = format!("{}/{}", dir_path, subdir.name);
+                        next_level.push((child_digest, child_path));
                     }
                 }
                 if !next_level.is_empty() {

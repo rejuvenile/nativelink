@@ -2211,6 +2211,14 @@ impl DirectoryCache {
                 .await
                 .err_tip(|| format!("Failed to create symlink: {} -> {}", link_path.display(), target))?;
         }
+        #[cfg(not(target_family = "unix"))]
+        if !symlinks_to_create.is_empty() {
+            return Err(make_err!(
+                Code::Unimplemented,
+                "DirectoryCache: proto declares {} symlink(s) but symlinks are not supported on this platform; the cache entry would be silently incomplete",
+                symlinks_to_create.len(),
+            ));
+        }
 
         // Run subtree clones and file downloads concurrently.
         // Both write to non-overlapping paths, so they're safe to overlap.
@@ -2555,6 +2563,14 @@ impl DirectoryCache {
                             .await
                             .err_tip(|| format!("Failed to create symlink: {}", link_path.display()))?;
                     }
+                    #[cfg(not(target_family = "unix"))]
+                    if !dir.symlinks.is_empty() {
+                        return Err(make_err!(
+                            Code::Unimplemented,
+                            "DirectoryCache failed-subtree fallback: proto declares {} symlink(s) but symlinks are not supported on this platform",
+                            dir.symlinks.len(),
+                        ));
+                    }
                 } else {
                     // resolve_directory_tree should have validated the tree
                     // is structurally complete before we got here. If we
@@ -2707,6 +2723,14 @@ impl DirectoryCache {
             fs::symlink(target, link_path)
                 .await
                 .err_tip(|| format!("Failed to create symlink: {} -> {}", link_path.display(), target))?;
+        }
+        #[cfg(not(target_family = "unix"))]
+        if !proto_symlinks_to_create.is_empty() {
+            return Err(make_err!(
+                Code::Unimplemented,
+                "DirectoryCache direct-use: proto declares {} symlink(s) but symlinks are not supported on this platform",
+                proto_symlinks_to_create.len(),
+            ));
         }
 
         // Download files (same logic as construct_with_subtrees)
