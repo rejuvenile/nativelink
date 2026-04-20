@@ -770,6 +770,14 @@ where
             if self.max_bytes != 0 {
                 let current = self.pinned_bytes.load(Ordering::Relaxed);
                 if current.saturating_add(entry_size) > self.pin_cap {
+                    warn!(
+                        pinned_bytes = current,
+                        entry_size,
+                        pin_cap = self.pin_cap,
+                        attempted = keys.len(),
+                        pinned,
+                        "pin_keys: pin cap exceeded, leaving remaining keys unpinned",
+                    );
                     break;
                 }
             }

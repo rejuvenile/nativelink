@@ -2386,7 +2386,31 @@ impl DirectoryCache {
                             let _permit = sem.acquire().await;
                             let key: StoreKey<'_> = digest.into();
                             fss.populate_fast_store_unchecked(key).await
-                                .err_tip(|| format!("Failed to populate fast store for {digest:?}"))
+                                .err_tip(|| format!("Failed to populate fast store for {digest:?}"))?;
+                            // Pin immediately after populate succeeds. Without this,
+                            // a sibling populate later in the same batch can trigger
+                            // LRU eviction of an already-landed blob (the cache is
+                            // typically 19/20GB and 286 parallel populates exceed the
+                            // free headroom). Pinning moves the blob out of the LRU
+                            // pool so eviction picks the older 19GB instead.
+                            //
+                            // The pin protects the hardlink phase that immediately
+                            // follows this populate loop. Pins auto-expire after
+                            // PIN_TIMEOUT_SECS (120s); long-running actions (LTO,
+                            // big protobuf builds) may exceed that and re-expose
+                            // post-hardlink references to LRU eviction — acceptable
+                            // because by then the hardlinks are already in the
+                            // action sandbox and the CAS blob doesn't need to
+                            // outlive the cache slot.
+                            //
+                            // Pin cap is 25% of max_bytes (~5GB on a 20GB worker).
+                            // Actions whose working set exceeds that will leave
+                            // trailing digests unpinned — the verify-and-retry in
+                            // populate_fast_store_unchecked stays as the safety net
+                            // for those and a pin_keys warn fires when the cap is
+                            // hit so the degradation is visible.
+                            fss.fast_store().pin_digests(&[digest]);
+                            Ok::<(), Error>(())
                         });
                     }
                     while let Some(result) = join_set.join_next().await {
