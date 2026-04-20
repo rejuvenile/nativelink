@@ -289,6 +289,131 @@ pub struct PendingSubtreeChanges {
     pub removed: HashSet<DigestInfo>,
 }
 
+/// Filter cached subtree-hit candidates by verifying each on-disk directory
+/// has the expected entry count from its `Directory` proto. Defends against
+/// corrupted cache entries (e.g. a cached subtree missing files) poisoning
+/// every future action that shares that Directory digest.
+///
+/// The check is shallow per directory (one `read_dir` per candidate), counts
+/// entries excluding the merkle metadata file, and runs all candidates in a
+/// single `spawn_blocking` task to avoid per-directory async/thread overhead.
+/// Typical cost: a few microseconds per candidate on APFS/ext4.
+///
+/// Reasoning: `Directory.files + .directories + .symlinks` is exactly the set
+/// of names that should appear at that path. A mismatch means the on-disk
+/// state diverges from the proto — either a partial construction made it into
+/// the cache, an external process tampered with the directory, or (the case
+/// that motivated this) a previous broken version of NativeLink seeded a
+/// poisoned subtree that has been propagating via cache hits.
+async fn filter_valid_subtree_hits(
+    candidates: Vec<(DigestInfo, PathBuf, u32)>,
+) -> HashMap<DigestInfo, PathBuf> {
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = span.entered();
+        let mut valid = HashMap::with_capacity(candidates.len());
+        let mut rejected: u32 = 0;
+        for (digest, path, expected) in candidates {
+            let read_dir = match std::fs::read_dir(&path) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    trace!(
+                        ?digest,
+                        path = %path.display(),
+                        ?e,
+                        "subtree validation: read_dir failed, skipping hit",
+                    );
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                }
+            };
+            let mut count: u32 = 0;
+            for entry in read_dir.flatten() {
+                if entry.file_name() == MERKLE_METADATA_FILENAME {
+                    continue;
+                }
+                count = count.saturating_add(1);
+            }
+            if count == expected {
+                valid.insert(digest, path);
+            } else {
+                warn!(
+                    ?digest,
+                    path = %path.display(),
+                    on_disk = count,
+                    expected,
+                    "subtree validation: cached subtree entry count mismatch, rejecting hit",
+                );
+                rejected = rejected.saturating_add(1);
+            }
+        }
+        if rejected > 0 {
+            warn!(
+                rejected,
+                accepted = valid.len(),
+                "subtree validation: filtered out corrupt cached subtrees",
+            );
+        }
+        valid
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Compute the expected on-disk entry count (files + directories + symlinks)
+/// for a `Directory` proto. The merkle metadata file is excluded by the
+/// validator, so this matches the count the validator will see.
+#[inline]
+fn expected_entry_count(dir: &ProtoDirectory) -> u32 {
+    let total = dir.files.len() + dir.directories.len() + dir.symlinks.len();
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
+/// Validate every directory in a freshly-constructed cache entry against its
+/// proto, before the entry is published into `subtree_index`. Catches the case
+/// where construction succeeded by status (no error returned) but a download
+/// or symlink silently produced an incomplete subdirectory — exactly the
+/// failure mode that previously seeded poisoned cache entries.
+///
+/// `tree_root` is the on-disk root (`temp_path`, before atomic rename).
+async fn validate_constructed_tree(
+    tree_root: &Path,
+    tree: &HashMap<DigestInfo, ProtoDirectory>,
+    merkle_meta: &MerkleTreeMetadata,
+) -> Result<(), Error> {
+    let candidates: Vec<(DigestInfo, PathBuf, u32)> = merkle_meta
+        .digest_to_relpath
+        .iter()
+        .filter_map(|(d, relpath)| {
+            tree.get(d).map(|dir| {
+                let abs_path = if relpath.is_empty() {
+                    tree_root.to_path_buf()
+                } else {
+                    tree_root.join(relpath)
+                };
+                (*d, abs_path, expected_entry_count(dir))
+            })
+        })
+        .collect();
+    let total = candidates.len();
+    if total == 0 {
+        return Ok(());
+    }
+    let valid = filter_valid_subtree_hits(candidates).await;
+    if valid.len() == total {
+        return Ok(());
+    }
+    Err(make_err!(
+        Code::Internal,
+        "post-construction validation: {} of {} directories on disk do not match proto",
+        total - valid.len(),
+        total,
+    ))
+}
+
 impl DirectoryCache {
     /// Creates a new `DirectoryCache`.
     ///
@@ -712,19 +837,24 @@ impl DirectoryCache {
 
             // Step 2: Check for cached subtrees.
             let subtree_hits: HashMap<DigestInfo, PathBuf> = if let Some(tree) = &resolved_tree {
-                let index = self.subtree_index.read().await;
-                let mut hits = HashMap::new();
-                for dir_digest in tree.keys() {
-                    if *dir_digest == digest {
-                        continue;
-                    }
-                    if let Some(cached_path) = index.get(dir_digest) {
-                        if cached_path.exists() {
-                            hits.insert(*dir_digest, cached_path.clone());
+                let candidates = {
+                    let index = self.subtree_index.read().await;
+                    let mut c: Vec<(DigestInfo, PathBuf, u32)> = Vec::new();
+                    for (dir_digest, dir) in tree {
+                        if *dir_digest == digest {
+                            continue;
+                        }
+                        if let Some(cached_path) = index.get(dir_digest) {
+                            c.push((
+                                *dir_digest,
+                                cached_path.clone(),
+                                expected_entry_count(dir),
+                            ));
                         }
                     }
-                }
-                hits
+                    c
+                };
+                filter_valid_subtree_hits(candidates).await
             } else {
                 HashMap::new()
             };
@@ -804,6 +934,16 @@ impl DirectoryCache {
                         "DirectoryCache direct-use: failed to write merkle metadata",
                     );
                 }
+                // Validate the on-disk tree before publishing. A construction
+                // that silently produced incomplete subdirectories must NOT
+                // reach the cache or it will poison every future hit.
+                validate_constructed_tree(&temp_path, tree, &merkle_meta)
+                    .await
+                    .err_tip(|| {
+                        format!(
+                            "DirectoryCache direct-use: post-construction validation failed for {digest}"
+                        )
+                    })?;
             }
 
             // Calculate size. On macOS, cache dirs stay writable (0o755).
@@ -1213,22 +1353,32 @@ impl DirectoryCache {
             // A "subtree hit" means a directory node in the requested tree is
             // already materialized on disk from a different cached root. We can
             // symlink to it instead of downloading.
+            //
+            // We validate every candidate against its proto Directory's expected
+            // entry count before trusting it. A previous broken construction
+            // (or external tampering) can leave a cached subtree missing files;
+            // without this check, the corruption silently propagates to every
+            // future action that shares the same Directory digest.
             let subtree_hits: HashMap<DigestInfo, PathBuf> = if let Some(tree) = &resolved_tree {
-                let index = self.subtree_index.read().await;
-                let mut hits = HashMap::new();
-                for dir_digest in tree.keys() {
-                    // Don't count the root itself (that's a full cache hit, handled above)
-                    if *dir_digest == digest {
-                        continue;
-                    }
-                    if let Some(cached_path) = index.get(dir_digest) {
-                        // Verify the cached path still exists on disk
-                        if cached_path.exists() {
-                            hits.insert(*dir_digest, cached_path.clone());
+                let candidates = {
+                    let index = self.subtree_index.read().await;
+                    let mut c: Vec<(DigestInfo, PathBuf, u32)> = Vec::new();
+                    for (dir_digest, dir) in tree {
+                        // Don't count the root itself (that's a full cache hit, handled above)
+                        if *dir_digest == digest {
+                            continue;
+                        }
+                        if let Some(cached_path) = index.get(dir_digest) {
+                            c.push((
+                                *dir_digest,
+                                cached_path.clone(),
+                                expected_entry_count(dir),
+                            ));
                         }
                     }
-                }
-                hits
+                    c
+                };
+                filter_valid_subtree_hits(candidates).await
             } else {
                 HashMap::new()
             };
@@ -1309,6 +1459,16 @@ impl DirectoryCache {
                         "DirectoryCache: failed to write merkle metadata, subtrees won't be indexed",
                     );
                 }
+                // Validate the on-disk tree before publishing. A construction
+                // that silently produced incomplete subdirectories must NOT
+                // reach the cache or it will poison every future hit.
+                validate_constructed_tree(&temp_path, tree, &merkle_meta)
+                    .await
+                    .err_tip(|| {
+                        format!(
+                            "DirectoryCache: post-construction validation failed for {digest}"
+                        )
+                    })?;
             }
 
             // Calculate size. On macOS, cache dirs stay writable (0o755) because
@@ -1773,21 +1933,27 @@ impl DirectoryCache {
 
         // Gather all subtree hits: check every directory digest in the new tree
         // against the subtree index. The fuzzy match guarantees high overlap,
-        // so most will hit.
+        // so most will hit. Each candidate is then validated against its
+        // proto Directory's expected entry count to reject corrupt subtrees.
         let subtree_hits: HashMap<DigestInfo, PathBuf> = {
-            let index = self.subtree_index.read().await;
-            let mut hits = HashMap::new();
-            for dir_digest in new_tree.keys() {
-                if *dir_digest == *new_digest {
-                    continue;
-                }
-                if let Some(cached_path) = index.get(dir_digest) {
-                    if cached_path.exists() {
-                        hits.insert(*dir_digest, cached_path.clone());
+            let candidates = {
+                let index = self.subtree_index.read().await;
+                let mut c: Vec<(DigestInfo, PathBuf, u32)> = Vec::new();
+                for (dir_digest, dir) in new_tree {
+                    if *dir_digest == *new_digest {
+                        continue;
+                    }
+                    if let Some(cached_path) = index.get(dir_digest) {
+                        c.push((
+                            *dir_digest,
+                            cached_path.clone(),
+                            expected_entry_count(dir),
+                        ));
                     }
                 }
-            }
-            hits
+                c
+            };
+            filter_valid_subtree_hits(candidates).await
         };
 
         info!(
@@ -4304,5 +4470,210 @@ mod tests {
             }
         }
         count
+    }
+
+    fn make_digest(byte: u8) -> DigestInfo {
+        let hex: String = std::iter::repeat(format!("{byte:02x}")).take(32).collect();
+        DigestInfo::try_new(&hex, 100).unwrap()
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_accepts_correct_count() -> Result<(), Error> {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("good");
+        fs::create_dir(&dir).await.unwrap();
+        fs::write(dir.join("a"), b"x").await.unwrap();
+        fs::write(dir.join("b"), b"y").await.unwrap();
+        fs::write(dir.join("c"), b"z").await.unwrap();
+
+        let digest = make_digest(0xaa);
+        let valid =
+            filter_valid_subtree_hits(vec![(digest, dir.clone(), 3)]).await;
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid.get(&digest), Some(&dir));
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_rejects_missing_file() -> Result<(), Error> {
+        // Reproduces the apple/ corruption: directory expects 4 entries but
+        // only has 3 on disk → must be rejected.
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("partial");
+        fs::create_dir(&dir).await.unwrap();
+        fs::write(dir.join("freebsdlike"), b"").await.unwrap();
+        fs::write(dir.join("netbsdlike"), b"").await.unwrap();
+        fs::write(dir.join("mod.rs"), b"").await.unwrap();
+        // Note: apple/ is missing — this directory should fail validation.
+
+        let digest = make_digest(0xbb);
+        let valid =
+            filter_valid_subtree_hits(vec![(digest, dir.clone(), 4)]).await;
+        assert!(
+            valid.is_empty(),
+            "subtree with 3/4 entries must be rejected"
+        );
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_excludes_metadata_file() -> Result<(), Error> {
+        // The merkle metadata file lives at the root of cache entries; it
+        // must not be counted toward the proto's expected entry count.
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("with_meta");
+        fs::create_dir(&dir).await.unwrap();
+        fs::write(dir.join("file1"), b"").await.unwrap();
+        fs::write(dir.join("file2"), b"").await.unwrap();
+        fs::write(dir.join(MERKLE_METADATA_FILENAME), b"meta").await.unwrap();
+
+        let digest = make_digest(0xcc);
+        let valid =
+            filter_valid_subtree_hits(vec![(digest, dir.clone(), 2)]).await;
+        assert_eq!(
+            valid.len(),
+            1,
+            "metadata file must not count toward expected total"
+        );
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_rejects_missing_path() -> Result<(), Error> {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("does_not_exist");
+
+        let digest = make_digest(0xdd);
+        let valid = filter_valid_subtree_hits(vec![(digest, dir, 5)]).await;
+        assert!(valid.is_empty());
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_filter_valid_subtree_hits_partial_acceptance() -> Result<(), Error> {
+        // Mixed batch: one good, one corrupt. Only the good one should pass.
+        let temp = TempDir::new().unwrap();
+        let good = temp.path().join("good");
+        fs::create_dir(&good).await.unwrap();
+        fs::write(good.join("a"), b"").await.unwrap();
+        fs::write(good.join("b"), b"").await.unwrap();
+
+        let bad = temp.path().join("bad");
+        fs::create_dir(&bad).await.unwrap();
+        fs::write(bad.join("only_one"), b"").await.unwrap();
+
+        let good_digest = make_digest(0x11);
+        let bad_digest = make_digest(0x22);
+        let valid = filter_valid_subtree_hits(vec![
+            (good_digest, good.clone(), 2),
+            (bad_digest, bad, 4),
+        ])
+        .await;
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid.get(&good_digest), Some(&good));
+        assert!(valid.get(&bad_digest).is_none());
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_validate_constructed_tree_passes_when_complete() -> Result<(), Error> {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).await.unwrap();
+        fs::write(root.join("readme"), b"").await.unwrap();
+        let child = root.join("child");
+        fs::create_dir(&child).await.unwrap();
+        fs::write(child.join("file"), b"").await.unwrap();
+
+        let child_digest = make_digest(0x42);
+        let root_digest = make_digest(0x43);
+
+        let mut tree = HashMap::new();
+        tree.insert(
+            root_digest,
+            ProtoDirectory {
+                files: vec![FileNode {
+                    name: "readme".to_string(),
+                    ..Default::default()
+                }],
+                directories: vec![DirectoryNode {
+                    name: "child".to_string(),
+                    digest: Some(child_digest.into()),
+                }],
+                ..Default::default()
+            },
+        );
+        tree.insert(
+            child_digest,
+            ProtoDirectory {
+                files: vec![FileNode {
+                    name: "file".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let merkle = MerkleTreeMetadata::from_directory_tree(&tree, &root_digest);
+        validate_constructed_tree(&root, &tree, &merkle).await?;
+        Ok(())
+    }
+
+    #[nativelink_test]
+    async fn test_validate_constructed_tree_fails_on_missing_child_entry() -> Result<(), Error> {
+        // Reproduces the original failure mode: the proto says child/ has two
+        // entries (file + apple/) but only `file` was actually materialized.
+        // Without this validation the partial tree would have been published
+        // into subtree_index and poisoned every future hit.
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).await.unwrap();
+        fs::write(root.join("readme"), b"").await.unwrap();
+        let child = root.join("child");
+        fs::create_dir(&child).await.unwrap();
+        fs::write(child.join("file"), b"").await.unwrap();
+        // Note: child/apple is intentionally missing.
+
+        let grandchild_digest = make_digest(0x77);
+        let child_digest = make_digest(0x42);
+        let root_digest = make_digest(0x43);
+
+        let mut tree = HashMap::new();
+        tree.insert(
+            root_digest,
+            ProtoDirectory {
+                files: vec![FileNode {
+                    name: "readme".to_string(),
+                    ..Default::default()
+                }],
+                directories: vec![DirectoryNode {
+                    name: "child".to_string(),
+                    digest: Some(child_digest.into()),
+                }],
+                ..Default::default()
+            },
+        );
+        tree.insert(
+            child_digest,
+            ProtoDirectory {
+                files: vec![FileNode {
+                    name: "file".to_string(),
+                    ..Default::default()
+                }],
+                directories: vec![DirectoryNode {
+                    name: "apple".to_string(),
+                    digest: Some(grandchild_digest.into()),
+                }],
+                ..Default::default()
+            },
+        );
+        tree.insert(grandchild_digest, ProtoDirectory::default());
+
+        let merkle = MerkleTreeMetadata::from_directory_tree(&tree, &root_digest);
+        let err = validate_constructed_tree(&root, &tree, &merkle)
+            .await
+            .expect_err("validation should fail on incomplete tree");
+        assert_eq!(err.code, Code::Internal);
+        Ok(())
     }
 }
