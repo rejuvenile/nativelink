@@ -573,8 +573,47 @@ impl FastSlowStore {
     /// `has()` check on the fast store. Use this when the caller has already
     /// verified that the blob is missing from the fast store (e.g. via a prior
     /// batch `has_with_results` call) to avoid a redundant existence check.
+    ///
+    /// Verifies the blob is present after `copy_slow_to_fast` returns Ok and
+    /// retries once if not. This guards against the FilesystemStore's
+    /// silent-Ok-on-eviction race: when many parallel populates burst against
+    /// a near-full fast store, an emplace can be evicted before its rename
+    /// completes, the underlying `emplace_file` returns Ok (the data IS in
+    /// the cache via a replacement OR is gone via eviction — the caller can't
+    /// tell), and a downstream `get_file_entry_for_digest` then fails with
+    /// NotFound. The post-write `has()` distinguishes the two cases without
+    /// changing the underlying contract.
     pub async fn populate_fast_store_unchecked(&self, key: StoreKey<'_>) -> Result<(), Error> {
-        self.copy_slow_to_fast(key).await
+        self.copy_slow_to_fast(key.borrow()).await?;
+        // Confirm the blob actually landed. has() on the fast store is a
+        // single hashmap lookup on the EvictingMap — sub-microsecond.
+        if self
+            .fast_store
+            .has(key.borrow())
+            .await
+            .err_tip(|| "populate_fast_store_unchecked: post-write verify")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        warn!(
+            %key,
+            "populate_fast_store_unchecked: blob evicted between copy and verify, retrying once",
+        );
+        self.copy_slow_to_fast(key.borrow()).await?;
+        if self
+            .fast_store
+            .has(key.borrow())
+            .await
+            .err_tip(|| "populate_fast_store_unchecked: retry verify")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        Err(make_err!(
+            Code::Aborted,
+            "populate_fast_store_unchecked: blob {key} evicted twice between copy and verify; fast store is over-pressured for the in-flight populate batch",
+        ))
     }
 
     /// Stream a file's contents to a store via a buf_channel, reading from

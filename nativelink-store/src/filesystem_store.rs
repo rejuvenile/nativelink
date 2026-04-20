@@ -1155,6 +1155,11 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             // unref which deletes our temp file). Checking just the key
             // would pass if the replacement entry exists, but our temp file
             // would already be deleted → ENOENT on rename.
+            //
+            // NOTE: returning Ok here is a known partial-fix. If the entry
+            // was evicted (not replaced) the cache does NOT hold the key —
+            // callers that need to use the entry immediately afterwards
+            // must verify presence (see FastSlowStore::populate_fast_store_unchecked).
             let still_ours = match evicting_map.get(&key).await {
                 Some(map_entry) => Arc::ptr_eq(&map_entry, &entry),
                 None => false,
