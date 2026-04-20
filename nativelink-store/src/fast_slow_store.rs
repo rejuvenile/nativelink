@@ -610,9 +610,15 @@ impl FastSlowStore {
         {
             return Ok(());
         }
+        // Note: a single retry is intentional. Under sustained over-pressure
+        // (in-flight working set > free fast-store capacity), a second retry
+        // sees the same cache state and won't help. The Aborted return is
+        // the signal that the caller is over-batching — fix at that layer
+        // (bound by in-flight bytes, pre-evict, or pin the batch) rather
+        // than retrying harder here.
         Err(make_err!(
             Code::Aborted,
-            "populate_fast_store_unchecked: blob {key} evicted twice between copy and verify; fast store is over-pressured for the in-flight populate batch",
+            "populate_fast_store_unchecked: blob {key} not present after copy + retry; fast store is over-pressured for the in-flight populate batch",
         ))
     }
 

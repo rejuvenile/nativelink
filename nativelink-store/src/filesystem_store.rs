@@ -1156,10 +1156,17 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             // would pass if the replacement entry exists, but our temp file
             // would already be deleted → ENOENT on rename.
             //
-            // NOTE: returning Ok here is a known partial-fix. If the entry
-            // was evicted (not replaced) the cache does NOT hold the key —
-            // callers that need to use the entry immediately afterwards
-            // must verify presence (see FastSlowStore::populate_fast_store_unchecked).
+            // NOTE: returning Ok here is a known partial-fix. The Some/None
+            // result of evicting_map.get cannot distinguish between (a) a
+            // replacement Arc that holds equivalent content (data IS cached
+            // under a different Arc → Ok is correct) and (b) the key being
+            // gone entirely after eviction (data IS NOT cached → Ok is a
+            // lie). Returning Err here would surface the eviction case but
+            // also fail legitimate replacement cases AND breaks 3
+            // pre-existing tests that encode this contract. Callers that
+            // need to immediately use the entry must verify presence — see
+            // FastSlowStore::populate_fast_store_unchecked which does
+            // post-write has() + retry once.
             let still_ours = match evicting_map.get(&key).await {
                 Some(map_entry) => Arc::ptr_eq(&map_entry, &entry),
                 None => false,
