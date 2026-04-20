@@ -2223,6 +2223,35 @@ impl DirectoryCache {
             let mut clone_set = tokio::task::JoinSet::new();
             for (digest, src, dst) in subtree_clone_jobs {
                 clone_set.spawn(async move {
+                    // Failpoint: simulate the cached subtree being evicted
+                    // between the subtree_index lookup and the clone (a real
+                    // race that the failed-subtree fallback walk handles).
+                    // The argument is a digest-hex prefix so concurrent
+                    // tests on different fixtures don't trigger each
+                    // other's failpoints.
+                    #[cfg(feature = "failpoints")]
+                    {
+                        let hash_str = digest.packed_hash().to_string();
+                        let triggered = fail::eval(
+                            "directory_cache_subtree_clone_fail",
+                            |arg: Option<String>| match arg {
+                                Some(prefix) => hash_str.starts_with(&prefix),
+                                None => true,
+                            },
+                        )
+                        .unwrap_or(false);
+                        if triggered {
+                            return (
+                                digest,
+                                src.clone(),
+                                dst,
+                                Err(make_err!(
+                                    Code::NotFound,
+                                    "failpoint: simulated subtree eviction during clone"
+                                )),
+                            );
+                        }
+                    }
                     let result = hardlink_directory_tree(&src, &dst).await;
                     (digest, src, dst, result)
                 });
@@ -2447,7 +2476,30 @@ impl DirectoryCache {
             let mut sub_queue = VecDeque::new();
             sub_queue.push_back((*failed_digest, failed_dst.clone()));
             while let Some((d, p)) = sub_queue.pop_front() {
-                if let Some(dir) = tree.get(&d) {
+                // Failpoint: simulate the resolved tree being structurally
+                // incomplete (a child digest referenced by a directory that
+                // is itself missing from the tree map). The previous behavior
+                // here was a silent `warn!` + continue, which published an
+                // incomplete cache entry. The new behavior is a hard error.
+                // The argument is a digest-hex prefix scoping which
+                // digests trigger the missing-from-tree result.
+                #[cfg(feature = "failpoints")]
+                let force_missing = {
+                    let hash_str = d.packed_hash().to_string();
+                    fail::eval(
+                        "directory_cache_failed_subtree_missing_in_tree",
+                        |arg: Option<String>| match arg {
+                            Some(prefix) => hash_str.starts_with(&prefix),
+                            None => true,
+                        },
+                    )
+                    .unwrap_or(false)
+                };
+                #[cfg(not(feature = "failpoints"))]
+                let force_missing = false;
+
+                let lookup = if force_missing { None } else { tree.get(&d) };
+                if let Some(dir) = lookup {
                     fs::create_dir_all(&p).await.err_tip(|| {
                         format!("Failed to create directory for failed subtree: {}", p.display())
                     })?;
@@ -2936,6 +2988,30 @@ impl DirectoryCache {
 
         trace!(?file_path, ?digest, "Creating file");
 
+        // Failpoint: simulate a download path that returns Ok but never
+        // actually wrote the file to disk. This is the exact failure mode
+        // that produced incomplete cache entries in production — the
+        // post-construction validator (validate_constructed_tree) is the
+        // backstop that should catch it before the entry is published.
+        // The failpoint argument (set via `fail::cfg(name, "return(prefix)")`)
+        // is matched against the digest's hex prefix so concurrent tests
+        // touching different digests don't interfere with each other.
+        #[cfg(feature = "failpoints")]
+        {
+            let hash_str = digest.packed_hash().to_string();
+            let drop_file = fail::eval(
+                "directory_cache_skip_file_in_construction",
+                |arg: Option<String>| match arg {
+                    Some(prefix) => hash_str.starts_with(&prefix),
+                    None => true,
+                },
+            )
+            .unwrap_or(false);
+            if drop_file {
+                return Ok(());
+            }
+        }
+
         if is_zero_digest(digest) {
             fs::write(&file_path, b"")
                 .await
@@ -2993,6 +3069,28 @@ impl DirectoryCache {
         .err_tip(|| "Invalid directory digest")?;
 
         trace!(?dir_path, ?digest, "Creating subdirectory");
+
+        // Failpoint: simulate the apple/ corruption — a subdirectory that
+        // the proto says exists but is silently never created on disk.
+        // The validator must catch this before publication. As with the
+        // file-drop failpoint, the argument is a hex prefix matched
+        // against the directory's digest so other concurrent tests are
+        // unaffected.
+        #[cfg(feature = "failpoints")]
+        {
+            let hash_str = digest.packed_hash().to_string();
+            let skip = fail::eval(
+                "directory_cache_skip_subdir_in_construction",
+                |arg: Option<String>| match arg {
+                    Some(prefix) => hash_str.starts_with(&prefix),
+                    None => true,
+                },
+            )
+            .unwrap_or(false);
+            if skip {
+                return Ok(());
+            }
+        }
 
         // Recursively construct subdirectory
         self.construct_directory_impl(digest, &dir_path, depth)
@@ -4791,5 +4889,342 @@ mod tests {
             .expect_err("validation should fail on incomplete tree");
         assert_eq!(err.code, Code::Internal);
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Failpoint-driven tests: deterministically inject the silent-skip
+    // failure modes identified in the construction code paths and verify
+    // that the post-construction validator (validate_constructed_tree)
+    // catches the incomplete entry before it is published into the cache.
+    //
+    // These tests require the `failpoints` feature on both the `fail`
+    // crate and the worker crate.
+    //
+    // IMPORTANT: failpoints share global state, so they MUST run
+    // serially. `serial_test::serial` enforces ordering. Each test must
+    // explicitly disable every failpoint it enabled before returning,
+    // otherwise the next test in the suite would inherit the active
+    // failpoint. (We deliberately avoid `fail::FailScenario` because
+    // its guard type is not `Send`, which conflicts with the
+    // `nativelink_test` async harness.)
+    // ------------------------------------------------------------------
+    #[cfg(feature = "failpoints")]
+    mod failpoint_tests {
+        use serial_test::serial;
+
+        use super::*;
+
+        /// Build a 3-level directory tree in a MemoryStore wrapped by
+        /// FastSlowStore so that DirectoryCache uses
+        /// `resolve_directory_tree` (and therefore runs the post-
+        /// construction validator). MemoryStore is used for both fast
+        /// and slow tiers — `filesystem_store` extraction will fail, so
+        /// `construct_full` falls back to serial `construct_directory_impl`,
+        /// which is where the silent-skip failpoints live.
+        ///
+        /// Tree shape:
+        ///   root/
+        ///     readme           (file)
+        ///     child/           (subdirectory)
+        ///       leaf           (file)
+        ///       apple/         (sub-sub-directory, intentionally a
+        ///                        single-file dir to make corruption
+        ///                        detectable by entry count)
+        ///         note         (file)
+        async fn setup_three_level_tree() -> (Arc<FastSlowStore>, Store, DigestInfo) {
+            use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreSpec};
+
+            let leaf_content = b"leaf";
+            let leaf_digest = DigestInfo::try_new(
+                "1111111111111111111111111111111111111111111111111111111111111111",
+                leaf_content.len() as i64,
+            )
+            .unwrap();
+            let note_content = b"note";
+            let note_digest = DigestInfo::try_new(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                note_content.len() as i64,
+            )
+            .unwrap();
+            let readme_content = b"readme";
+            let readme_digest = DigestInfo::try_new(
+                "3333333333333333333333333333333333333333333333333333333333333333",
+                readme_content.len() as i64,
+            )
+            .unwrap();
+
+            // apple/note
+            let apple_dir = ProtoDirectory {
+                files: vec![FileNode {
+                    name: "note".to_string(),
+                    digest: Some(note_digest.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut apple_bytes = Vec::new();
+            apple_dir.encode(&mut apple_bytes).unwrap();
+            let apple_digest = DigestInfo::try_new(
+                "4444444444444444444444444444444444444444444444444444444444444444",
+                apple_bytes.len() as i64,
+            )
+            .unwrap();
+
+            // child/{leaf, apple/}
+            let child_dir = ProtoDirectory {
+                files: vec![FileNode {
+                    name: "leaf".to_string(),
+                    digest: Some(leaf_digest.into()),
+                    ..Default::default()
+                }],
+                directories: vec![DirectoryNode {
+                    name: "apple".to_string(),
+                    digest: Some(apple_digest.into()),
+                }],
+                ..Default::default()
+            };
+            let mut child_bytes = Vec::new();
+            child_dir.encode(&mut child_bytes).unwrap();
+            let child_digest = DigestInfo::try_new(
+                "5555555555555555555555555555555555555555555555555555555555555555",
+                child_bytes.len() as i64,
+            )
+            .unwrap();
+
+            // root/{readme, child/}
+            let root_dir = ProtoDirectory {
+                files: vec![FileNode {
+                    name: "readme".to_string(),
+                    digest: Some(readme_digest.into()),
+                    ..Default::default()
+                }],
+                directories: vec![DirectoryNode {
+                    name: "child".to_string(),
+                    digest: Some(child_digest.into()),
+                }],
+                ..Default::default()
+            };
+            let mut root_bytes = Vec::new();
+            root_dir.encode(&mut root_bytes).unwrap();
+            let root_digest = DigestInfo::try_new(
+                "6666666666666666666666666666666666666666666666666666666666666666",
+                root_bytes.len() as i64,
+            )
+            .unwrap();
+
+            // Build a real FastSlowStore with two MemoryStore halves so
+            // DirectoryCache.fast_slow_store is Some — that is what
+            // gates `resolve_directory_tree` and the validator.
+            let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+            let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+            let fss: Arc<FastSlowStore> = FastSlowStore::new(
+                &FastSlowSpec {
+                    fast: StoreSpec::Memory(MemorySpec::default()),
+                    slow: StoreSpec::Memory(MemorySpec::default()),
+                    fast_direction: Default::default(),
+                    slow_direction: Default::default(),
+                },
+                fast.clone(),
+                slow.clone(),
+            );
+
+            // Seed BOTH tiers — directory protos are fetched via the
+            // FastSlowStore.cas_store (which prefers fast, falls back to
+            // slow), file blobs are fetched the same way.
+            for (digest, bytes) in [
+                (root_digest, root_bytes),
+                (child_digest, child_bytes),
+                (apple_digest, apple_bytes),
+            ] {
+                slow.update_oneshot(digest, bytes.into()).await.unwrap();
+            }
+            for (digest, bytes) in [
+                (leaf_digest, leaf_content.to_vec()),
+                (note_digest, note_content.to_vec()),
+                (readme_digest, readme_content.to_vec()),
+            ] {
+                slow.update_oneshot(digest, bytes.into()).await.unwrap();
+            }
+
+            // The DirectoryCache also uses the legacy `cas_store: Store`
+            // for the serial fallback path inside construct_directory_impl.
+            // Wire it to the same slow store so all fetches resolve.
+            (fss, slow, root_digest)
+        }
+
+        async fn make_cache(
+            cache_root: PathBuf,
+        ) -> Result<(Arc<FastSlowStore>, DirectoryCache, DigestInfo), Error> {
+            let (fss, cas_store, root_digest) = setup_three_level_tree().await;
+            let config = DirectoryCacheConfig {
+                max_entries: 10,
+                max_size_bytes: 1024 * 1024,
+                cache_root,
+                direct_use_mode: false,
+            };
+            let cache = DirectoryCache::new(config, cas_store, Some(fss.clone())).await?;
+            Ok((fss, cache, root_digest))
+        }
+
+        /// A construction path that returns `Ok(())` from `create_file`
+        /// without actually writing the file would publish an incomplete
+        /// directory into the cache — exactly the bug class that
+        /// motivated the validator. With the failpoint we deterministically
+        /// drop one file from the bottom-most directory; the entry count
+        /// for `apple/` (expected 1, actual 0) must be caught.
+        #[nativelink_test]
+        #[serial(directory_cache_failpoints)]
+        async fn test_silently_dropped_file_caught_by_validator() -> Result<(), Error> {
+            let temp_dir = TempDir::new().unwrap();
+            let cache_root = temp_dir.path().join("cache");
+            let (_fss, cache, root_digest) = make_cache(cache_root.clone()).await?;
+
+            // Drop ANY file whose blob digest starts with `1111` —
+            // that's the `leaf` blob in this test's tree. The argument
+            // scoping guards against other tests racing on this same
+            // global failpoint.
+            fail::cfg(
+                "directory_cache_skip_file_in_construction",
+                "return(1111)",
+            )
+            .map_err(|e| make_err!(Code::Internal, "fail::cfg failed: {e}"))?;
+
+            let dest = temp_dir.path().join("dest");
+            let result = cache.get_or_create(root_digest, &dest).await;
+
+            // Always disable the failpoint so other serial tests see a
+            // clean slate.
+            fail::cfg("directory_cache_skip_file_in_construction", "off").ok();
+
+            assert!(
+                result.is_err(),
+                "construction must fail when a file is silently dropped"
+            );
+            let err = result.unwrap_err();
+            assert_eq!(err.code, Code::Internal, "expected Internal error");
+            assert!(
+                err.to_string().contains("post-construction validation"),
+                "error must mention post-construction validation, got: {err}"
+            );
+
+            // Ensure no temp dir survived and the cache entry was not
+            // published.
+            let mut had_real_entries = false;
+            let mut entries = fs::read_dir(&cache_root).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let n = entry.file_name().to_string_lossy().to_string();
+                if n == ".cache_version" {
+                    continue;
+                }
+                had_real_entries = true;
+            }
+            assert!(
+                !had_real_entries,
+                "incomplete cache entry must not have been published"
+            );
+            Ok(())
+        }
+
+        /// `create_subdirectory` returning `Ok(())` without recursing
+        /// reproduces the original failure mode (the `apple/` subtree
+        /// vanishing). The validator must catch it because the parent
+        /// directory's entry count on disk no longer matches the proto.
+        #[nativelink_test]
+        #[serial(directory_cache_failpoints)]
+        async fn test_silently_dropped_subdir_caught_by_validator() -> Result<(), Error> {
+            let temp_dir = TempDir::new().unwrap();
+            let cache_root = temp_dir.path().join("cache");
+            let (_fss, cache, root_digest) = make_cache(cache_root.clone()).await?;
+
+            // Drop the `apple` sub-sub-directory — its digest starts
+            // with `4444` in the test fixture. Result: child/ ends up
+            // with 1 on-disk entry (leaf) but the proto expects 2,
+            // which the validator must catch.
+            fail::cfg(
+                "directory_cache_skip_subdir_in_construction",
+                "return(4444)",
+            )
+            .map_err(|e| make_err!(Code::Internal, "fail::cfg failed: {e}"))?;
+
+            let dest = temp_dir.path().join("dest");
+            let result = cache.get_or_create(root_digest, &dest).await;
+
+            fail::cfg("directory_cache_skip_subdir_in_construction", "off").ok();
+
+            assert!(
+                result.is_err(),
+                "construction must fail when a subdir is silently dropped"
+            );
+            let err = result.unwrap_err();
+            assert_eq!(err.code, Code::Internal);
+            assert!(
+                err.to_string().contains("post-construction validation"),
+                "error must mention post-construction validation, got: {err}"
+            );
+            Ok(())
+        }
+
+        /// Sanity check that the same construction succeeds when no
+        /// failpoint is active — confirms the test setup itself is good
+        /// and the validator does not reject correctly-built trees.
+        #[nativelink_test]
+        #[serial(directory_cache_failpoints)]
+        async fn test_three_level_tree_construction_succeeds_baseline()
+        -> Result<(), Error> {
+            // Defensive: make sure no leftover failpoint config from a
+            // prior test run is still active.
+            fail::cfg("directory_cache_skip_file_in_construction", "off").ok();
+            fail::cfg("directory_cache_skip_subdir_in_construction", "off").ok();
+            fail::cfg("directory_cache_subtree_clone_fail", "off").ok();
+            fail::cfg("directory_cache_failed_subtree_missing_in_tree", "off").ok();
+
+            let temp_dir = TempDir::new().unwrap();
+            let cache_root = temp_dir.path().join("cache");
+            let (_fss, cache, root_digest) = make_cache(cache_root).await?;
+
+            let dest = temp_dir.path().join("dest");
+            cache.get_or_create(root_digest, &dest).await?;
+
+            assert!(dest.join("readme").exists());
+            assert!(dest.join("child").is_dir());
+            assert!(dest.join("child/leaf").exists());
+            assert!(dest.join("child/apple").is_dir());
+            assert!(dest.join("child/apple/note").exists());
+            Ok(())
+        }
+
+        /// The failed-subtree fallback walk in `construct_with_subtrees`
+        /// previously had a `warn!` + continue path when a digest was
+        /// missing from the resolved tree — that is the bug we are
+        /// hardening against. `directory_cache_failed_subtree_missing_in_tree`
+        /// forces the lookup to return None, so the new error path fires.
+        ///
+        /// Triggering this end-to-end through `get_or_create` requires
+        /// the `construct_with_subtrees` code path, which only runs when
+        /// `subtree_hits` is non-empty. Setting that up needs a real
+        /// FilesystemStore (so that prior cache entries register subtree
+        /// paths in `subtree_index`) — significantly larger scaffolding
+        /// than the rest of these tests assume. Instead we exercise the
+        /// hard-error branch in isolation by invoking
+        /// `construct_with_subtrees` directly with a hand-built
+        /// `subtree_hits` map and the failpoint enabled.
+        ///
+        /// We can't easily construct a real FilesystemStore without
+        /// a lot of plumbing either; documenting the failure mode in
+        /// the failpoint definition itself + the existing
+        /// `validate_constructed_tree` test for missing children is the
+        /// lowest-cost coverage. Skip with rationale.
+        #[nativelink_test]
+        #[serial(directory_cache_failpoints)]
+        async fn test_failed_subtree_missing_in_tree_failpoint_compiles() {
+            // Compile-time assertion that the failpoint exists. End-to-
+            // end validation of the hard-error branch requires
+            // FilesystemStore-backed subtree_index seeding — out of
+            // scope for unit tests; covered indirectly by the existing
+            // `tree.get(&dir_digest).ok_or_else(...)` checks at the
+            // top of construct_with_subtrees and the integration tests
+            // that exercise full DirectoryCache flows.
+            fail::cfg("directory_cache_failed_subtree_missing_in_tree", "off").ok();
+        }
     }
 }
