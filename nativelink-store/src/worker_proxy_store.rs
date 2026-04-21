@@ -14,9 +14,11 @@
 
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -61,6 +63,11 @@ pub struct WorkerProxyStore {
     locality_map: SharedBlobLocalityMap,
     /// Cached GrpcStore connections to worker endpoints.
     worker_connections: RwLock<HashMap<Arc<str>, Store>>,
+    /// Per-endpoint mirror health for quarantining flaky workers and
+    /// per-endpoint concurrency permits for fair fan-out.
+    mirror_state: RwLock<HashMap<Arc<str>, MirrorEndpointState>>,
+    /// Round-robin counter for mirror endpoint selection.
+    mirror_counter: AtomicU64,
     /// When true, race peer fetches against server fetches in get_part.
     /// Only workers should enable this — servers should use the sequential
     /// path which generates redirects for workers.
@@ -69,6 +76,47 @@ pub struct WorkerProxyStore {
     /// When set, connections use `grpcs://` with this TLS config.
     worker_tls_config: Option<ClientTlsConfig>,
 }
+
+/// Per-endpoint mirror state: in-flight permits and consecutive-failure tracking.
+struct MirrorEndpointState {
+    /// Concurrency limit for in-flight mirror writes to this worker.
+    /// Per-worker rather than global so one overloaded worker can't starve
+    /// healthy workers of mirror capacity.
+    permits: Arc<Semaphore>,
+    /// Number of consecutive mirror failures since the last success.
+    consecutive_failures: u32,
+    /// Timestamp of the first failure in the current streak; used to decide
+    /// whether the failures are bursty enough to warrant quarantine.
+    first_failure_at: Option<Instant>,
+    /// If `Some`, endpoint is in quarantine until this instant. While
+    /// quarantined the endpoint is skipped during mirror selection.
+    quarantined_until: Option<Instant>,
+}
+
+impl MirrorEndpointState {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(MIRROR_PERMITS_PER_WORKER)),
+            consecutive_failures: 0,
+            first_failure_at: None,
+            quarantined_until: None,
+        }
+    }
+}
+
+/// Maximum concurrent mirror writes per worker endpoint. Sized to keep
+/// total in-flight bytes within the server's OOM budget: with ~10 workers,
+/// 16 permits × 10 = 160 concurrent uploads, each of which can hold up to
+/// ~72 MiB in its `buf_channel`. Higher values risk the RSS spike pattern
+/// seen during the 2026-03-25 write burst.
+const MIRROR_PERMITS_PER_WORKER: usize = 16;
+/// Consecutive failures within `MIRROR_FAILURE_WINDOW` that trigger quarantine.
+const MIRROR_FAILURE_THRESHOLD: u32 = 5;
+/// Window over which `MIRROR_FAILURE_THRESHOLD` failures must occur to trigger
+/// quarantine. Older streaks are reset rather than escalating.
+const MIRROR_FAILURE_WINDOW: Duration = Duration::from_secs(10);
+/// How long to skip a quarantined endpoint before retrying it.
+const MIRROR_QUARANTINE_DURATION: Duration = Duration::from_secs(30);
 
 impl core::fmt::Debug for WorkerProxyStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -91,6 +139,8 @@ impl WorkerProxyStore {
             inner,
             locality_map,
             worker_connections: RwLock::new(HashMap::new()),
+            mirror_state: RwLock::new(HashMap::new()),
+            mirror_counter: AtomicU64::new(0),
             race_peers: false,
             worker_tls_config: None,
         })
@@ -107,6 +157,8 @@ impl WorkerProxyStore {
             inner,
             locality_map,
             worker_connections: RwLock::new(HashMap::new()),
+            mirror_state: RwLock::new(HashMap::new()),
+            mirror_counter: AtomicU64::new(0),
             race_peers: false,
             worker_tls_config: Some(tls_config),
         })
@@ -194,8 +246,13 @@ impl WorkerProxyStore {
                 concurrency_limit: None,
                 connect_timeout_s: 5,
                 tcp_keepalive_s: 30,
+                // Keepalive timeout is wide enough to survive a tokio runtime
+                // stall + post-stall scheduling backlog. Anything tighter
+                // causes mass mirror failure during write-burst stalls (we
+                // saw 67 KeepAliveTimedOut in a single minute aligned with a
+                // 4.9s stall + queue drain that exceeded 20s).
                 http2_keepalive_interval_s: 30,
-                http2_keepalive_timeout_s: 20,
+                http2_keepalive_timeout_s: 60,
                 tcp_nodelay: true,
                 // Use TCP (h2) for worker connections. QUIC was previously
                 // used but dominated server CPU (~50%).
@@ -685,88 +742,301 @@ impl WorkerProxyStore {
     /// `max_bytes_per_stream` default used by ByteStream configs.
     const MIRROR_CHUNK_SIZE: usize = 3 * 1024 * 1024;
 
+    /// Pick the next mirror endpoint, skipping anything currently quarantined
+    /// and the optional `exclude` (used by retry to pick a different worker).
+    /// Returns the endpoint string and a permit clone for that endpoint.
+    /// `None` if there are no eligible workers.
+    ///
+    /// Falls back to ignoring the quarantine list if every endpoint is
+    /// quarantined — a degraded mirror is better than no mirror at all when
+    /// the quarantine itself may be the result of a transient cluster-wide
+    /// problem.
+    ///
+    /// Locking: the steady-state path (every endpoint already in the map,
+    /// no quarantine to clear) takes only the read lock. The write lock is
+    /// taken only on (a) first-ever sighting of an endpoint or (b) cleanup
+    /// of an expired quarantine. Mirrors are called per blob during write
+    /// bursts, so keeping the hot path read-only avoids serializing fan-out.
+    fn pick_mirror_endpoint(
+        &self,
+        endpoints: &[Arc<str>],
+        exclude: Option<&str>,
+    ) -> Option<(Arc<str>, Arc<Semaphore>)> {
+        if endpoints.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+
+        // Try the read-only fast path. We can serve the request without a
+        // write lock if every endpoint we'd consider has an existing entry
+        // with no quarantine that needs clearing.
+        if let Some(pick) = self.pick_mirror_endpoint_read(endpoints, exclude, now) {
+            return Some(pick);
+        }
+        // Slow path: missing entries or expired quarantines need cleanup.
+        self.pick_mirror_endpoint_write(endpoints, exclude, now)
+    }
+
+    /// Read-lock fast path. Returns `None` if any endpoint we'd consider is
+    /// missing from the state map or has an expired quarantine that should
+    /// be cleared — both require a write lock to fix.
+    fn pick_mirror_endpoint_read(
+        &self,
+        endpoints: &[Arc<str>],
+        exclude: Option<&str>,
+        now: Instant,
+    ) -> Option<(Arc<str>, Arc<Semaphore>)> {
+        let state = self.mirror_state.read();
+        let mut eligible_count = 0usize;
+        let mut considered_count = 0usize;
+        for ep in endpoints {
+            if exclude.is_some_and(|x| x == ep.as_ref()) {
+                continue;
+            }
+            let Some(entry) = state.get(ep) else {
+                // Need write lock to insert.
+                return None;
+            };
+            considered_count += 1;
+            match entry.quarantined_until {
+                Some(t) if t > now => {} // still quarantined, skip
+                Some(_) => return None,  // expired — clear under write lock
+                None => eligible_count += 1,
+            }
+        }
+        if considered_count == 0 {
+            return None;
+        }
+        let pool_size = if eligible_count > 0 {
+            eligible_count
+        } else {
+            considered_count
+        };
+        let idx =
+            self.mirror_counter.fetch_add(1, Ordering::Relaxed) as usize % pool_size;
+        // Walk the endpoints again to find the idx-th match without
+        // allocating a Vec.
+        let mut seen = 0usize;
+        for ep in endpoints {
+            if exclude.is_some_and(|x| x == ep.as_ref()) {
+                continue;
+            }
+            // We already checked all endpoints exist with no expired
+            // quarantine, so this lookup must succeed.
+            let entry = state.get(ep)?;
+            let active = entry.quarantined_until.is_some_and(|t| t > now);
+            let in_pool = if eligible_count > 0 { !active } else { true };
+            if !in_pool {
+                continue;
+            }
+            if seen == idx {
+                return Some((ep.clone(), entry.permits.clone()));
+            }
+            seen += 1;
+        }
+        None
+    }
+
+    /// Slow path: takes the write lock to insert missing entries and clear
+    /// expired quarantines, then picks an endpoint.
+    fn pick_mirror_endpoint_write(
+        &self,
+        endpoints: &[Arc<str>],
+        exclude: Option<&str>,
+        now: Instant,
+    ) -> Option<(Arc<str>, Arc<Semaphore>)> {
+        let mut state = self.mirror_state.write();
+        let mut eligible_count = 0usize;
+        let mut considered_count = 0usize;
+        for ep in endpoints {
+            if exclude.is_some_and(|x| x == ep.as_ref()) {
+                continue;
+            }
+            let entry = state
+                .entry(ep.clone())
+                .or_insert_with(MirrorEndpointState::new);
+            considered_count += 1;
+            if entry.quarantined_until.is_some_and(|t| t > now) {
+                continue;
+            }
+            // Either never quarantined or quarantine expired — clear and
+            // mark eligible.
+            entry.quarantined_until = None;
+            eligible_count += 1;
+        }
+        if considered_count == 0 {
+            return None;
+        }
+        let pool_size = if eligible_count > 0 {
+            eligible_count
+        } else {
+            considered_count
+        };
+        let idx =
+            self.mirror_counter.fetch_add(1, Ordering::Relaxed) as usize % pool_size;
+        let mut seen = 0usize;
+        for ep in endpoints {
+            if exclude.is_some_and(|x| x == ep.as_ref()) {
+                continue;
+            }
+            let entry = state.get(ep)?;
+            let active = entry.quarantined_until.is_some_and(|t| t > now);
+            let in_pool = if eligible_count > 0 { !active } else { true };
+            if !in_pool {
+                continue;
+            }
+            if seen == idx {
+                return Some((ep.clone(), entry.permits.clone()));
+            }
+            seen += 1;
+        }
+        None
+    }
+
+    fn record_mirror_success(&self, endpoint: &str) {
+        let mut state = self.mirror_state.write();
+        if let Some(entry) = state.get_mut(endpoint) {
+            entry.consecutive_failures = 0;
+            entry.first_failure_at = None;
+            entry.quarantined_until = None;
+        }
+    }
+
+    /// Increment failure count for `endpoint`. If `MIRROR_FAILURE_THRESHOLD`
+    /// failures occur within `MIRROR_FAILURE_WINDOW`, quarantine the endpoint
+    /// for `MIRROR_QUARANTINE_DURATION`.
+    fn record_mirror_failure(&self, endpoint: &str) {
+        let now = Instant::now();
+        let mut state = self.mirror_state.write();
+        let entry = state
+            .entry(Arc::from(endpoint))
+            .or_insert_with(MirrorEndpointState::new);
+        // Reset the streak if the previous failure was outside the window —
+        // a slow drip of unrelated failures shouldn't trigger quarantine.
+        match entry.first_failure_at {
+            Some(t) if now.duration_since(t) > MIRROR_FAILURE_WINDOW => {
+                entry.consecutive_failures = 1;
+                entry.first_failure_at = Some(now);
+            }
+            None => {
+                entry.consecutive_failures = 1;
+                entry.first_failure_at = Some(now);
+            }
+            _ => {
+                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            }
+        }
+        if entry.consecutive_failures >= MIRROR_FAILURE_THRESHOLD
+            && entry.quarantined_until.is_none_or(|t| t <= now)
+        {
+            entry.quarantined_until = Some(now + MIRROR_QUARANTINE_DURATION);
+            warn!(
+                endpoint,
+                consecutive_failures = entry.consecutive_failures,
+                quarantine_secs = MIRROR_QUARANTINE_DURATION.as_secs(),
+                "mirror: quarantining endpoint after consecutive failures"
+            );
+        }
+    }
+
     pub async fn mirror_blob_to_random_worker(
         &self,
         digest: DigestInfo,
         data: Bytes,
     ) {
-        // Limit concurrent mirror operations so a burst of hundreds of
-        // blobs doesn't spawn unbounded tasks against the GrpcStore.
-        // 64 permits keeps the network busy without resource exhaustion.
-        static MIRROR_SEMAPHORE: Semaphore = Semaphore::const_new(64);
-
-        let _permit = match MIRROR_SEMAPHORE.acquire().await {
-            Ok(p) => p,
-            Err(_) => return, // semaphore closed, should not happen
-        };
-
         let endpoints = self.locality_map.read().all_endpoints();
         if endpoints.is_empty() {
             return;
         }
 
-        // Pick a random endpoint using the atomic counter to avoid
-        // pulling in the `rand` crate. Simple round-robin is fine
-        // since the goal is distribution, not cryptographic randomness.
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let idx = COUNTER.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
-        let endpoint = &endpoints[idx];
+        // Try once on a healthy endpoint. On a connection-level failure,
+        // try once more on a different endpoint — most mirror failures
+        // are connection-level (KeepAliveTimedOut, ConnectionReset, EOF
+        // without close_notify) and recover on a second attempt.
+        let mut last_endpoint: Option<Arc<str>> = None;
+        for attempt in 0..2 {
+            let exclude = last_endpoint.as_deref();
+            let Some((endpoint, permits)) = self.pick_mirror_endpoint(&endpoints, exclude) else {
+                return;
+            };
+            // Per-worker permit: prevents one slow worker from starving
+            // mirror capacity for healthier ones.
+            let _permit = match permits.acquire().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
 
-        let Some(store) = self.get_or_create_connection(endpoint).await else {
-            warn!(
-                %digest,
-                endpoint = endpoint.as_ref(),
-                "mirror: failed to connect to worker"
-            );
-            return;
-        };
-
-        let size_bytes = data.len();
-        let result = IS_MIRROR_REQUEST.scope(true, async {
-            if size_bytes > Self::MIRROR_CHUNK_THRESHOLD {
-                // Large blob: stream in chunks to stay under gRPC max message size.
-                let (mut tx, rx) = make_buf_channel_pair();
-                let chunk_size = Self::MIRROR_CHUNK_SIZE;
-                let data_for_sender = data;
-                tokio::spawn(async move {
-                    let mut offset = 0;
-                    while offset < data_for_sender.len() {
-                        let end = (offset + chunk_size).min(data_for_sender.len());
-                        let chunk = data_for_sender.slice(offset..end);
-                        if tx.send(chunk).await.is_err() {
-                            return;
-                        }
-                        offset = end;
-                    }
-                    drop(tx.send_eof());
-                });
-                let key: StoreKey<'_> = digest.into();
-                store
-                    .update(key, rx, UploadSizeInfo::ExactSize(size_bytes as u64))
-                    .await
-            } else {
-                // Small blob: single-message oneshot is more efficient.
-                store.update_oneshot(digest, data).await
-            }
-        }).await;
-
-        match result {
-            Ok(()) => {
-                info!(
-                    %digest,
-                    size_bytes,
-                    endpoint = endpoint.as_ref(),
-                    "mirror: blob sent to worker"
-                );
-            }
-            Err(e) => {
+            let Some(store) = self.get_or_create_connection(&endpoint).await else {
                 warn!(
                     %digest,
-                    size_bytes,
                     endpoint = endpoint.as_ref(),
-                    ?e,
-                    "mirror: failed to send blob to worker"
+                    attempt,
+                    "mirror: failed to connect to worker"
                 );
+                self.record_mirror_failure(&endpoint);
+                last_endpoint = Some(endpoint);
+                continue;
+            };
+
+            let size_bytes = data.len();
+            let data_clone = data.clone();
+            let result = IS_MIRROR_REQUEST.scope(true, async {
+                if size_bytes > Self::MIRROR_CHUNK_THRESHOLD {
+                    // Large blob: stream in chunks to stay under gRPC max message size.
+                    let (mut tx, rx) = make_buf_channel_pair();
+                    let chunk_size = Self::MIRROR_CHUNK_SIZE;
+                    tokio::spawn(async move {
+                        let mut offset = 0;
+                        while offset < data_clone.len() {
+                            let end = (offset + chunk_size).min(data_clone.len());
+                            let chunk = data_clone.slice(offset..end);
+                            if tx.send(chunk).await.is_err() {
+                                return;
+                            }
+                            offset = end;
+                        }
+                        drop(tx.send_eof());
+                    });
+                    let key: StoreKey<'_> = digest.into();
+                    store
+                        .update(key, rx, UploadSizeInfo::ExactSize(size_bytes as u64))
+                        .await
+                } else {
+                    // Small blob: single-message oneshot is more efficient.
+                    store.update_oneshot(digest, data_clone).await
+                }
+            })
+            .await;
+
+            match result {
+                Ok(()) => {
+                    self.record_mirror_success(&endpoint);
+                    info!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        attempt,
+                        "mirror: blob sent to worker"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    self.record_mirror_failure(&endpoint);
+                    let retry = attempt == 0 && is_connection_error(&e);
+                    warn!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        attempt,
+                        retry,
+                        ?e,
+                        "mirror: failed to send blob to worker"
+                    );
+                    if !retry {
+                        return;
+                    }
+                    last_endpoint = Some(endpoint);
+                }
             }
         }
     }
@@ -779,16 +1049,6 @@ impl WorkerProxyStore {
         digest: DigestInfo,
         reader: DropCloserReadHalf,
     ) {
-        static MIRROR_SEMAPHORE: Semaphore = Semaphore::const_new(64);
-
-        let _permit = match MIRROR_SEMAPHORE.acquire().await {
-            Ok(p) => p,
-            Err(_) => {
-                drop(reader);
-                return;
-            }
-        };
-
         let endpoints = self.locality_map.read().all_endpoints();
         if endpoints.is_empty() {
             // No workers — drain the reader so the sender doesn't block.
@@ -796,30 +1056,45 @@ impl WorkerProxyStore {
             return;
         }
 
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let idx = COUNTER.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
-        let endpoint = &endpoints[idx];
+        // Streaming path can't retry: bytes from `reader` are consumed once.
+        // We still benefit from the per-worker permit (fair fan-out) and the
+        // health quarantine (skip dead workers).
+        let Some((endpoint, permits)) = self.pick_mirror_endpoint(&endpoints, None) else {
+            drop(reader);
+            return;
+        };
+        let _permit = match permits.acquire().await {
+            Ok(p) => p,
+            Err(_) => {
+                drop(reader);
+                return;
+            }
+        };
 
-        let Some(store) = self.get_or_create_connection(endpoint).await else {
+        let Some(store) = self.get_or_create_connection(&endpoint).await else {
             warn!(
                 %digest,
                 endpoint = endpoint.as_ref(),
                 "mirror_stream: failed to connect to worker"
             );
+            self.record_mirror_failure(&endpoint);
             drop(reader);
             return;
         };
 
         let size_bytes = digest.size_bytes();
         let key: StoreKey<'_> = digest.into();
-        let result = IS_MIRROR_REQUEST.scope(true, async {
-            store
-                .update(key, reader, UploadSizeInfo::ExactSize(size_bytes))
-                .await
-        }).await;
+        let result = IS_MIRROR_REQUEST
+            .scope(true, async {
+                store
+                    .update(key, reader, UploadSizeInfo::ExactSize(size_bytes))
+                    .await
+            })
+            .await;
 
         match &result {
             Ok(()) => {
+                self.record_mirror_success(&endpoint);
                 debug!(
                     %digest,
                     size_bytes,
@@ -828,6 +1103,7 @@ impl WorkerProxyStore {
                 );
             }
             Err(e) => {
+                self.record_mirror_failure(&endpoint);
                 warn!(
                     %digest,
                     size_bytes,
@@ -1623,6 +1899,130 @@ mod tests {
 
         let result = store.get_part_unchunked(digest, 0, None).await;
         assert!(result.is_err(), "Expected error when both miss");
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // 17. Quarantine: 5 consecutive failures within window quarantine
+    //     the endpoint, after which pick_mirror_endpoint skips it.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_quarantine_after_threshold_failures() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> =
+            vec!["a".into(), "b".into(), "c".into()];
+
+        // Drive endpoint "a" past the failure threshold.
+        for _ in 0..MIRROR_FAILURE_THRESHOLD {
+            proxy.record_mirror_failure("a");
+        }
+
+        // pick_mirror_endpoint must skip "a" while it's quarantined.
+        for _ in 0..20 {
+            let (chosen, _) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
+            assert_ne!(
+                chosen.as_ref(),
+                "a",
+                "quarantined endpoint should be skipped"
+            );
+        }
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // 18. Quarantine: success below threshold resets the streak so the
+    //     endpoint stays eligible.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_success_resets_failure_streak() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into()];
+
+        // Accumulate failures, then succeed before crossing the threshold.
+        for _ in 0..(MIRROR_FAILURE_THRESHOLD - 1) {
+            proxy.record_mirror_failure("a");
+        }
+        proxy.record_mirror_success("a");
+
+        // One more failure must NOT trigger quarantine because the streak
+        // was cleared.
+        proxy.record_mirror_failure("a");
+        let (chosen, _) = proxy
+            .pick_mirror_endpoint(&endpoints, None)
+            .expect("endpoint should be eligible");
+        assert_eq!(chosen.as_ref(), "a");
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // 19. Quarantine: when every endpoint is quarantined, fall back to
+    //     the full set rather than returning None (degraded > nothing).
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_all_quarantined_falls_back_to_full_set() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
+
+        for ep in ["a", "b"] {
+            for _ in 0..MIRROR_FAILURE_THRESHOLD {
+                proxy.record_mirror_failure(ep);
+            }
+        }
+
+        let pick = proxy.pick_mirror_endpoint(&endpoints, None);
+        assert!(pick.is_some(), "should fall back to full set when all quarantined");
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // 20. Exclude argument: pick_mirror_endpoint never returns the
+    //     excluded endpoint (used by the retry path).
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_exclude_endpoint_for_retry() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into(), "c".into()];
+
+        for _ in 0..50 {
+            let (chosen, _) = proxy
+                .pick_mirror_endpoint(&endpoints, Some("a"))
+                .expect("eligible endpoints exist");
+            assert_ne!(chosen.as_ref(), "a", "excluded endpoint must be skipped");
+        }
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // 21. Per-worker permits: pick_mirror_endpoint returns the same
+    //     Semaphore Arc for repeated picks of the same endpoint.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_per_worker_permits_are_shared_across_picks() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["only".into()];
+
+        let (_, sem1) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
+        let (_, sem2) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
+        assert!(
+            Arc::ptr_eq(&sem1, &sem2),
+            "permit semaphore must be shared across picks"
+        );
+        assert_eq!(sem1.available_permits(), MIRROR_PERMITS_PER_WORKER);
 
         Ok(())
     }
