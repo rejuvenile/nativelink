@@ -78,7 +78,8 @@ pub struct WorkerProxyStore {
     /// holding the blob, the server synchronously confirms with that
     /// worker (`worker.has(digest)`) before short-circuiting the upload.
     /// The confirmation RPC also bumps the worker's LRU as a side effect.
-    /// Default false; opt-in until validated end-to-end.
+    /// Default true; the toggle exists so an operator can disable the fast
+    /// path at runtime if needed.
     consult_locality_in_has: AtomicBool,
     /// Optional TLS config for connecting to worker CAS endpoints.
     /// When set, connections use `grpcs://` with this TLS config.
@@ -150,7 +151,7 @@ impl WorkerProxyStore {
             mirror_state: RwLock::new(HashMap::new()),
             mirror_counter: AtomicU64::new(0),
             race_peers: AtomicBool::new(false),
-            consult_locality_in_has: AtomicBool::new(false),
+            consult_locality_in_has: AtomicBool::new(true),
             worker_tls_config: None,
         })
     }
@@ -169,7 +170,7 @@ impl WorkerProxyStore {
             mirror_state: RwLock::new(HashMap::new()),
             mirror_counter: AtomicU64::new(0),
             race_peers: AtomicBool::new(false),
-            consult_locality_in_has: AtomicBool::new(false),
+            consult_locality_in_has: AtomicBool::new(true),
             worker_tls_config: Some(tls_config),
         })
     }

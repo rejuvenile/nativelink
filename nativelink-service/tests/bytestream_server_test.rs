@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::task::Poll;
 use futures::{Future, poll};
@@ -27,6 +29,7 @@ use nativelink_config::cas_server::{ByteStreamConfig, HttpListener, WithInstance
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_macro::nativelink_test;
+use nativelink_metric::MetricsComponent;
 use nativelink_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use nativelink_proto::google::bytestream::byte_stream_server::ByteStream;
 use nativelink_proto::google::bytestream::{
@@ -34,10 +37,17 @@ use nativelink_proto::google::bytestream::{
 };
 use nativelink_service::bytestream_server::ByteStreamServer;
 use nativelink_store::default_store_factory::store_factory;
+use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
+use nativelink_store::worker_proxy_store::WorkerProxyStore;
+use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::channel_body_for_tests::ChannelBody;
 use nativelink_util::common::{DigestInfo, encode_stream_proto};
-use nativelink_util::store_trait::StoreLike;
+use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+use nativelink_util::store_trait::{
+    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+};
 use nativelink_util::task::JoinHandleDropGuard;
 use nativelink_util::{background_spawn, spawn};
 use pretty_assertions::assert_eq;
@@ -2641,6 +2651,350 @@ pub async fn two_concurrent_writes_same_digest_coalesced()
     assert_eq!(
         stored.as_ref(), WRITE_DATA,
         "Store should contain the correct blob after coalesced writes"
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// E' v2 locality short-circuit fast path
+//
+// Production code under test: bytestream_server.rs lines 1893-2013.
+// When Bazel uploads a blob the inner CAS doesn't have but the
+// WorkerProxyStore's locality_map claims a worker holds, the server
+// synchronously confirms with that worker via worker.has(digest)
+// (wrapped in a 50ms tokio::time::timeout). Three branches:
+//   - Ok(Some(_))  -> short-circuit: return WriteResponse without
+//                     ingesting; the inner store stays empty.
+//   - Ok(None)     -> stale locality entry: evict, fall through to
+//                     normal ingest path.
+//   - Timeout/err  -> fall through to normal ingest, do NOT evict.
+// Only fires when proxy.locality_in_has_enabled() is true and the
+// blob is >= 64 KiB (LOCALITY_MIN_BLOB_SIZE).
+// ─────────────────────────────────────────────────────────────────────
+
+/// 100 KiB is comfortably above the 64 KiB LOCALITY_MIN_BLOB_SIZE
+/// threshold, ensuring the locality-confirm fast path is exercised.
+const LOCALITY_TEST_BLOB_SIZE: usize = 100 * 1024;
+
+/// A peer-side StoreDriver that responds to `has()` only after a sleep.
+/// Used to exercise the timeout branch of the locality short-circuit:
+/// if the sleep exceeds the 50ms confirm timeout, the bytestream path
+/// must fall through to normal ingest and must NOT evict the locality
+/// entry.
+#[derive(Debug, MetricsComponent)]
+struct SleepingHasStore {
+    sleep_ms: u64,
+}
+
+default_health_status_indicator!(SleepingHasStore);
+
+#[async_trait]
+impl StoreDriver for SleepingHasStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        tokio::time::sleep(core::time::Duration::from_millis(self.sleep_ms)).await;
+        // Even after the sleep, we report "have it" — but the bytestream
+        // path will already have given up via the 50ms timeout.
+        for slot in results.iter_mut() {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Build a 100 KiB deterministic blob and its digest.
+fn make_locality_test_blob() -> (Bytes, DigestInfo) {
+    let data: Vec<u8> = (0..LOCALITY_TEST_BLOB_SIZE)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let digest = DigestInfo::try_new(HASH1, data.len()).expect("valid digest");
+    (Bytes::from(data), digest)
+}
+
+/// Build a `StoreManager` whose `main_cas` is a `WorkerProxyStore`
+/// wrapping an empty MemoryStore inner. Returns the manager, the
+/// proxy Arc (for inject/configure), and the inner Store handle (for
+/// asserting whether the bytestream write reached the inner CAS).
+async fn make_proxy_store_manager() -> (Arc<StoreManager>, Arc<WorkerProxyStore>, Store) {
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(inner.clone(), locality_map);
+    let store = Store::new(proxy_arc.clone());
+    let manager = Arc::new(StoreManager::new());
+    manager.add_store("main_cas", store);
+    (manager, proxy_arc, inner)
+}
+
+/// Build a ByteStreamServer with a generous max_bytes_per_stream so
+/// the 100 KiB blob isn't constrained by chunk-sizing logic.
+fn make_locality_test_server(store_manager: &StoreManager) -> Arc<ByteStreamServer> {
+    let config = vec![WithInstanceName {
+        instance_name: INSTANCE_NAME.to_string(),
+        config: ByteStreamConfig {
+            cas_store: "main_cas".to_string(),
+            persist_stream_on_disconnect_timeout: 0,
+            // Larger than our 100 KiB blob so reads (not exercised
+            // here, but defensive) wouldn't fragment unnecessarily.
+            max_bytes_per_stream: 256 * 1024,
+            ..Default::default()
+        },
+    }];
+    Arc::new(
+        ByteStreamServer::new(&config, store_manager).expect("Failed to make server"),
+    )
+}
+
+/// Drive a streaming bytestream write of `data` across two
+/// WriteRequests so `is_first_msg_complete()` returns false. This
+/// forces the upload through `inner_write` (the streaming path that
+/// contains the locality fast path), bypassing the `inner_write_oneshot`
+/// path which has no locality short-circuit.
+async fn drive_locality_test_write(
+    bs_server: Arc<ByteStreamServer>,
+    data: &Bytes,
+) -> Result<Response<WriteResponse>, tonic::Status> {
+    let (tx, join_handle) =
+        make_stream_and_writer_spawn(bs_server, Some(CompressionEncoding::Gzip));
+
+    let split = data.len() / 2;
+    let resource_name = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME,
+        "11111111-1111-1111-1111-111111111111",
+        HASH1,
+        data.len(),
+    );
+
+    // First chunk — note finish_write=false, which makes
+    // `is_first_msg_complete()` return false and forces the streaming
+    // (non-oneshot) path.
+    let first = WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: false,
+        data: data.slice(..split),
+    };
+    tx.send(Frame::data(encode_stream_proto(&first).expect("encode")))
+        .await
+        .expect("send first");
+
+    // Second chunk closes the stream.
+    let second = WriteRequest {
+        resource_name,
+        write_offset: split as i64,
+        finish_write: true,
+        data: data.slice(split..),
+    };
+    tx.send(Frame::data(encode_stream_proto(&second).expect("encode")))
+        .await
+        .expect("send second");
+
+    drop(tx);
+    join_handle.await.expect("join")
+}
+
+// -------------------------------------------------------------------
+// T1: locality short-circuit succeeds
+//     - Inner CAS is empty.
+//     - Locality map points at a peer that DOES have the blob.
+//     - Expect: WriteResponse { committed_size } AND inner CAS still
+//       does not contain the blob (short-circuited, bytes dropped).
+// -------------------------------------------------------------------
+#[nativelink_test]
+pub async fn locality_short_circuit_succeeds()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (data, digest) = make_locality_test_blob();
+    let (store_manager, proxy_arc, inner) = make_proxy_store_manager().await;
+
+    // Populate the peer with the blob.
+    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_store
+        .update_oneshot(digest, data.clone())
+        .await
+        .expect("populate peer");
+
+    // Inject the peer connection and register it as the holder.
+    let peer_endpoint = "grpc://peer:50071";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    proxy_arc
+        .locality_map()
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    // Opt into the locality fast path.
+    proxy_arc.enable_locality_in_has();
+
+    let bs_server = make_locality_test_server(store_manager.as_ref());
+    let response = drive_locality_test_write(bs_server, &data).await?;
+    assert_eq!(
+        response.into_inner(),
+        WriteResponse {
+            committed_size: data.len() as i64,
+        },
+        "fast path must report the full size as committed",
+    );
+
+    // Inner CAS must NOT have been touched — that is the entire point
+    // of the short-circuit.
+    assert_eq!(
+        inner.has(digest).await?,
+        None,
+        "inner CAS should remain empty after locality short-circuit",
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// T2: stale locality evicts and ingests
+//     - Inner CAS is empty.
+//     - Locality map points at a peer that does NOT have the blob.
+//     - Expect: WriteResponse, blob NOW present in inner CAS, and the
+//       stale (digest, endpoint) entry purged from the locality map.
+// -------------------------------------------------------------------
+#[nativelink_test]
+pub async fn locality_stale_evicts_and_ingests()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (data, digest) = make_locality_test_blob();
+    let (store_manager, proxy_arc, inner) = make_proxy_store_manager().await;
+
+    // Peer is empty — has() returns Ok(None).
+    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let peer_endpoint = "grpc://peer:50071";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    proxy_arc
+        .locality_map()
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    proxy_arc.enable_locality_in_has();
+
+    let bs_server = make_locality_test_server(store_manager.as_ref());
+    let response = drive_locality_test_write(bs_server, &data).await?;
+    assert_eq!(
+        response.into_inner(),
+        WriteResponse {
+            committed_size: data.len() as i64,
+        },
+        "stale locality must still ingest the upload successfully",
+    );
+
+    // The blob must now be in the inner CAS — the bytestream fell
+    // through to the normal ingest path after the peer reported NotFound.
+    let stored = inner.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(
+        stored, data,
+        "inner CAS must contain the freshly-ingested blob",
+    );
+
+    // The stale (digest, endpoint) tuple must have been evicted so
+    // that subsequent FindMissingBlobs / has_with_results don't keep
+    // returning a ghost hit.
+    let workers_after = proxy_arc.locality_map().read().lookup_workers(&digest);
+    assert!(
+        workers_after.is_empty(),
+        "stale locality entry should have been evicted, got {:?}",
+        workers_after,
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// T3: timeout falls through, no eviction
+//     - Inner CAS is empty.
+//     - Peer's has() sleeps longer than the 50ms confirm timeout.
+//     - Expect: WriteResponse, blob ingested into inner CAS, and the
+//       locality entry STILL contains the peer endpoint (timeouts are
+//       transient, eviction would be wrong).
+// -------------------------------------------------------------------
+#[nativelink_test]
+pub async fn locality_timeout_falls_through_without_eviction()
+-> Result<(), Box<dyn core::error::Error>> {
+    let (data, digest) = make_locality_test_blob();
+    let (store_manager, proxy_arc, inner) = make_proxy_store_manager().await;
+
+    // Peer that takes well over the 50ms confirm timeout to respond
+    // to has(). This forces the bytestream path's outer
+    // `tokio::time::timeout` to fire.
+    let peer_store = Store::new(Arc::new(SleepingHasStore { sleep_ms: 250 }));
+    let peer_endpoint = "grpc://peer:50071";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    proxy_arc
+        .locality_map()
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    proxy_arc.enable_locality_in_has();
+
+    let bs_server = make_locality_test_server(store_manager.as_ref());
+    let response = drive_locality_test_write(bs_server, &data).await?;
+    assert_eq!(
+        response.into_inner(),
+        WriteResponse {
+            committed_size: data.len() as i64,
+        },
+        "timed-out confirmation must still let the upload succeed via normal ingest",
+    );
+
+    // Blob landed in the inner CAS via the fall-through ingest path.
+    let stored = inner.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(
+        stored, data,
+        "inner CAS must contain the ingested blob after fall-through",
+    );
+
+    // Locality entry MUST still list the peer — a timeout is transient
+    // and must not be confused with NotFound.
+    let workers_after = proxy_arc.locality_map().read().lookup_workers(&digest);
+    let endpoints_after: Vec<String> =
+        workers_after.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        endpoints_after,
+        vec![peer_endpoint.to_string()],
+        "locality entry must survive a confirm-timeout",
     );
 
     Ok(())
