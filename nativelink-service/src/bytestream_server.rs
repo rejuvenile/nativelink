@@ -1892,6 +1892,37 @@ impl ByteStreamServer {
             }));
         }
 
+        // Instrumentation only (no behavior change): for Bazel writes that
+        // miss the server-side fast path, record whether at least one
+        // worker reports holding the blob per the locality map. Used to
+        // size the E' v2 optimization (accept + bump worker LRU instead of
+        // ingesting). Sample log line; no per-blob hot-path side effects
+        // beyond a read-lock on locality_map.
+        if !is_worker && !is_mirror {
+            if let Some(proxy) = store
+                .as_store_driver()
+                .as_any()
+                .downcast_ref::<WorkerProxyStore>()
+            {
+                let worker_count =
+                    proxy.locality_map().read().lookup_workers(&digest).len();
+                if worker_count > 0 {
+                    info!(
+                        %digest,
+                        size_bytes = expected_size,
+                        worker_count,
+                        "ByteStream::write: locality_hit (server miss, worker has)"
+                    );
+                } else {
+                    info!(
+                        %digest,
+                        size_bytes = expected_size,
+                        "ByteStream::write: locality_miss (server miss, no worker has)"
+                    );
+                }
+            }
+        }
+
         // Dedup in-flight writes: if another RPC is already writing this
         // exact digest, wait for it instead of writing again.
         let in_flight_tx = {
