@@ -1892,33 +1892,122 @@ impl ByteStreamServer {
             }));
         }
 
-        // Instrumentation only (no behavior change): for Bazel writes that
-        // miss the server-side fast path, record whether at least one
-        // worker reports holding the blob per the locality map. Used to
-        // size the E' v2 optimization (accept + bump worker LRU instead of
-        // ingesting). Sample log line; no per-blob hot-path side effects
-        // beyond a read-lock on locality_map.
-        if !is_worker && !is_mirror {
+        // E' v2 fast path: if Bazel is uploading a blob the server CAS
+        // doesn't have but a worker reports holding (per the locality map),
+        // synchronously confirm with that worker via `worker.has(digest)`.
+        // The confirmation RPC also bumps the worker's moka LRU as a side
+        // effect (`cache.get` always promotes). On confirmation, the upload
+        // is short-circuited and Bazel's bytes are dropped (gRPC closes the
+        // request stream when we return the response).
+        //
+        // Pre-conditions:
+        //   - writer is Bazel (not a worker, not a mirror),
+        //   - downcast to WorkerProxyStore succeeds,
+        //   - `locality_in_has_enabled()` is on,
+        //   - blob is at least `LOCALITY_MIN_BLOB_SIZE` bytes (smaller blobs
+        //     don't repay the RTT cost).
+        //
+        // The confirmation is wrapped in `tokio::spawn` so the bytestream
+        // task isn't paying tonic's destructor cost (the in-flight H2
+        // future drops on the spawned task's runtime worker, not ours).
+        // Either way the H2 stream's RST_STREAM is sent on drop — but
+        // moving the destructor off our task keeps the ingest path snappy
+        // when timeouts fire under load. Cap on stuck streams: GrpcStore's
+        // `rpc_timeout_s` (15s, set in `worker_proxy_store.rs`).
+        //
+        // On `Some(true)`  -> short-circuit; LRU bumped as a side effect
+        //                     of the worker's `cache.get()`.
+        // On `Some(false)` -> evict the (likely stale) locality entry and
+        //                     fall through to normal ingest. This is racy
+        //                     against a fresher BlobsAvailable insert
+        //                     between our lookup and the worker reply; in
+        //                     that case the eviction is wrong and Bazel
+        //                     re-uploads on the next FindMissingBlobs.
+        //                     Acceptable.
+        // On timeout/error -> fall through to normal ingest. Don't evict
+        //                     (transient signal — could be slow worker,
+        //                     not a missing blob).
+        const LOCALITY_MIN_BLOB_SIZE: u64 = 64 * 1024;
+        const LOCALITY_CONFIRM_TIMEOUT: Duration = Duration::from_millis(50);
+        if !is_worker
+            && !is_mirror
+            && expected_size >= LOCALITY_MIN_BLOB_SIZE
+        {
             if let Some(proxy) = store
                 .as_store_driver()
                 .as_any()
                 .downcast_ref::<WorkerProxyStore>()
             {
-                let worker_count =
-                    proxy.locality_map().read().lookup_workers(&digest).len();
-                if worker_count > 0 {
-                    info!(
-                        %digest,
-                        size_bytes = expected_size,
-                        worker_count,
-                        "ByteStream::write: locality_hit (server miss, worker has)"
-                    );
-                } else {
-                    info!(
-                        %digest,
-                        size_bytes = expected_size,
-                        "ByteStream::write: locality_miss (server miss, no worker has)"
-                    );
+                if proxy.locality_in_has_enabled() {
+                    let endpoint_opt = proxy
+                        .locality_map()
+                        .read()
+                        .lookup_workers_with_timestamps(&digest)
+                        .into_iter()
+                        .max_by_key(|(_, ts)| *ts)
+                        .map(|(ep, _)| ep);
+                    if let Some(endpoint) = endpoint_opt {
+                        if let Some(worker_store) =
+                            proxy.get_or_create_connection(&endpoint).await
+                        {
+                            // Spawn so timeout drop releases the H2 stream.
+                            let confirm_digest = digest;
+                            let join = tokio::spawn(async move {
+                                worker_store.has(confirm_digest).await
+                            });
+                            let confirmed = match tokio::time::timeout(
+                                LOCALITY_CONFIRM_TIMEOUT,
+                                join,
+                            )
+                            .await
+                            {
+                                Ok(Ok(Ok(Some(_)))) => Some(true),
+                                Ok(Ok(Ok(None))) => Some(false),
+                                _ => None, // join error, RPC error, or timeout
+                            };
+                            match confirmed {
+                                Some(true) => {
+                                    info!(
+                                        %digest,
+                                        size_bytes = expected_size,
+                                        endpoint = endpoint.as_ref(),
+                                        "ByteStream::write: skipped, worker confirmed"
+                                    );
+                                    instance
+                                        .metrics
+                                        .write_requests_success
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    return Ok(Response::new(WriteResponse {
+                                        committed_size: expected_size as i64,
+                                    }));
+                                }
+                                Some(false) => {
+                                    // Worker no longer has it — evict the
+                                    // stale locality entry; fall through to
+                                    // normal ingest path.
+                                    proxy
+                                        .locality_map()
+                                        .write()
+                                        .evict_blobs(&endpoint, &[digest]);
+                                    info!(
+                                        %digest,
+                                        size_bytes = expected_size,
+                                        endpoint = endpoint.as_ref(),
+                                        "ByteStream::write: locality stale, ingesting"
+                                    );
+                                }
+                                None => {
+                                    // Timeout / error — fall through to
+                                    // normal ingest. Don't evict (transient).
+                                    debug!(
+                                        %digest,
+                                        endpoint = endpoint.as_ref(),
+                                        "ByteStream::write: locality confirm timed out"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

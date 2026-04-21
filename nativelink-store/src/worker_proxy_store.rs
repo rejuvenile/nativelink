@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -70,8 +70,16 @@ pub struct WorkerProxyStore {
     mirror_counter: AtomicU64,
     /// When true, race peer fetches against server fetches in get_part.
     /// Only workers should enable this — servers should use the sequential
-    /// path which generates redirects for workers.
-    race_peers: bool,
+    /// path which generates redirects for workers. AtomicBool so the toggle
+    /// can be flipped after the proxy is wrapped in Arc.
+    race_peers: AtomicBool,
+    /// When true, the bytestream_write fast path consults the locality map
+    /// after the inner-store check fails: if any worker is reported as
+    /// holding the blob, the server synchronously confirms with that
+    /// worker (`worker.has(digest)`) before short-circuiting the upload.
+    /// The confirmation RPC also bumps the worker's LRU as a side effect.
+    /// Default false; opt-in until validated end-to-end.
+    consult_locality_in_has: AtomicBool,
     /// Optional TLS config for connecting to worker CAS endpoints.
     /// When set, connections use `grpcs://` with this TLS config.
     worker_tls_config: Option<ClientTlsConfig>,
@@ -141,7 +149,8 @@ impl WorkerProxyStore {
             worker_connections: RwLock::new(HashMap::new()),
             mirror_state: RwLock::new(HashMap::new()),
             mirror_counter: AtomicU64::new(0),
-            race_peers: false,
+            race_peers: AtomicBool::new(false),
+            consult_locality_in_has: AtomicBool::new(false),
             worker_tls_config: None,
         })
     }
@@ -159,15 +168,30 @@ impl WorkerProxyStore {
             worker_connections: RwLock::new(HashMap::new()),
             mirror_state: RwLock::new(HashMap::new()),
             mirror_counter: AtomicU64::new(0),
-            race_peers: false,
+            race_peers: AtomicBool::new(false),
+            consult_locality_in_has: AtomicBool::new(false),
             worker_tls_config: Some(tls_config),
         })
     }
 
     /// Enable racing peer fetches against server fetches.
     /// Only workers should call this — servers should leave it disabled.
-    pub fn enable_race_peers(&mut self) {
-        self.race_peers = true;
+    pub fn enable_race_peers(&self) {
+        self.race_peers.store(true, Ordering::Relaxed);
+    }
+
+    /// Enable the locality-aware fast paths in `has_with_results` and the
+    /// bytestream_write fast-path. Off by default. Pre-condition: the
+    /// worker-side LRU refresh heartbeat must be deployed first, otherwise
+    /// stale locality entries will cascade NotFounds.
+    pub fn enable_locality_in_has(&self) {
+        self.consult_locality_in_has.store(true, Ordering::Relaxed);
+    }
+
+    /// Inspector for the bytestream fast-path; returns whether locality
+    /// consultation is enabled.
+    pub fn locality_in_has_enabled(&self) -> bool {
+        self.consult_locality_in_has.load(Ordering::Relaxed)
     }
 
     /// Add a worker endpoint to the connection pool.
@@ -262,7 +286,13 @@ impl WorkerProxyStore {
             retry: Retry::default(),
             max_concurrent_requests: 0,
             connections_per_endpoint: 64,
-            rpc_timeout_s: 120,
+            // 15s, not the default 120s. The bytestream fast path wraps
+            // worker.has() in a 50ms `tokio::time::timeout`; if the
+            // outer timeout fires, dropping the future signals tonic to
+            // RST_STREAM but the H2 stream slot stays accounted until the
+            // peer ACKs. A tighter rpc_timeout caps the worst case so
+            // zombie streams can't pile up against a wedged worker.
+            rpc_timeout_s: 15,
             batch_update_threshold_bytes: 1_048_576, // 1MB: small blobs use BatchUpdateBlobs
             max_concurrent_batch_rpcs: 32,
             parallel_chunk_read_threshold: 8 * 1024 * 1024,
@@ -314,6 +344,14 @@ impl WorkerProxyStore {
                 Err(e) => {
                     if is_connection_error(&e) {
                         self.remove_worker_endpoint(endpoint);
+                    } else if e.code == Code::NotFound {
+                        // Worker said it doesn't have this blob — the
+                        // locality map's claim is stale. Evict so the
+                        // next has_with_results / FindMissingBlobs
+                        // doesn't keep returning a ghost hit.
+                        self.locality_map
+                            .write()
+                            .evict_blobs(endpoint, &[digest]);
                     }
                     warn!(
                         ?digest,
@@ -385,6 +423,16 @@ impl WorkerProxyStore {
                 Err(e) => {
                     if is_connection_error(&e) {
                         self.remove_worker_endpoint(endpoint);
+                    } else if e.code == Code::NotFound {
+                        // Worker said it doesn't have this blob — the
+                        // locality map's claim is stale. Evict so the
+                        // next has_with_results / FindMissingBlobs
+                        // doesn't keep returning a ghost hit. Safe to do
+                        // here even mid-loop because remaining peers
+                        // are looked up from the original `workers` snapshot.
+                        self.locality_map
+                            .write()
+                            .evict_blobs(endpoint, &[digest]);
                     }
                     let bytes_written_total =
                         writer.get_bytes_written() - bytes_before_proxy;
@@ -1123,23 +1171,16 @@ impl StoreDriver for WorkerProxyStore {
         digests: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
-        // Only check the inner store — do NOT consult the locality map.
-        //
-        // The locality map tracks blobs that workers reported via
-        // BlobsAvailable, but those blobs may be evicted from the
-        // worker at any time. Reporting them as "present" here causes
-        // FindMissingBlobs to tell Bazel the blob exists, so Bazel
-        // skips uploading it. When the blob is later needed (GetTree,
-        // BatchReadBlobs, resolve_tree_from_cas), neither the server's
-        // CAS nor the worker has it — causing NotFound errors and
-        // 13-19s fallback to recursive directory fetch.
-        //
-        // The locality map is still used in get_part() for read
-        // optimization: if a blob is missing from the inner store but
-        // a worker has it, get_part() can proxy the read. This is safe
-        // because get_part() handles NotFound gracefully, whereas
-        // has_with_results() drives upload decisions that cannot be
-        // retried.
+        // Inner store only. The locality map is intentionally NOT
+        // consulted here — `has_with_results` drives FindMissingBlobs,
+        // which is on the per-action critical path. A stale-Some answer
+        // would cause Bazel to skip an upload that is then NotFound on
+        // the next read; a sync-confirmation alternative would add up to
+        // tens of ms tail latency to every FMB. The bytestream_write
+        // fast path uses a separate sync-confirmed locality check that
+        // is ONLY on the upload path (already adds ms anyway), so a
+        // server-CAS miss + worker-has hit is short-circuited there
+        // without affecting FMB.
         self.inner.has_with_results(digests, results).await
     }
 
@@ -1176,7 +1217,7 @@ impl StoreDriver for WorkerProxyStore {
         // WorkerProxyStore uses the sequential path which generates
         // redirects for workers and proxies for non-worker callers.
         let digest = key.borrow().into_digest();
-        let peers = if self.race_peers {
+        let peers = if self.race_peers.load(Ordering::Relaxed) {
             self.locality_map.read().lookup_workers(&digest)
         } else {
             Vec::new()
@@ -1816,7 +1857,7 @@ mod tests {
         let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
         let locality_map = new_shared_blob_locality_map();
         let mut proxy = WorkerProxyStore::new(inner.clone(), locality_map.clone());
-        Arc::get_mut(&mut proxy).unwrap().enable_race_peers();
+        proxy.enable_race_peers();
         let store = Store::new(proxy.clone());
 
         let value = b"race test data";
@@ -1853,7 +1894,7 @@ mod tests {
         let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
         let locality_map = new_shared_blob_locality_map();
         let mut proxy = WorkerProxyStore::new(inner, locality_map.clone());
-        Arc::get_mut(&mut proxy).unwrap().enable_race_peers();
+        proxy.enable_race_peers();
         let store = Store::new(proxy.clone());
 
         let value = b"peer only data";
@@ -1884,7 +1925,7 @@ mod tests {
         let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
         let locality_map = new_shared_blob_locality_map();
         let mut proxy = WorkerProxyStore::new(inner, locality_map.clone());
-        Arc::get_mut(&mut proxy).unwrap().enable_race_peers();
+        proxy.enable_race_peers();
         let store = Store::new(proxy.clone());
 
         let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
