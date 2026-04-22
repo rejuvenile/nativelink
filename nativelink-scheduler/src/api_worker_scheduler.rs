@@ -40,6 +40,7 @@ use nativelink_store::grpc_store::GrpcStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
 use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::action_messages::{OperationId, WorkerId};
+use nativelink_util::background_spawn;
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::metrics_utils::CounterWithTime;
@@ -3764,6 +3765,175 @@ mod tests {
         assert!(
             Arc::ptr_eq(&arc2, &arc3),
             "Expected resolve_input_tree to return the same Arc on cache hit (pointer equality)"
+        );
+    }
+
+    /// Verifies that `TreeResolutionGuard` removes the digest from the
+    /// in-progress set on Drop. This is the core invariant: if the guard's
+    /// Drop fires, the leak is impossible. Combined with the fact that the
+    /// guard is bound to the `resolve_input_tree` future (or the spawned
+    /// background task), Rust's drop semantics guarantee the entry is
+    /// released on every exit path including async cancellation.
+    #[tokio::test]
+    async fn test_tree_resolution_guard_releases_on_drop() {
+        let in_progress: Arc<tokio::sync::Mutex<HashSet<DigestInfo>>> =
+            Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let digest = DigestInfo::new([0xab; 32], 42);
+
+        // Insert the digest as if we were starting a resolution.
+        in_progress.lock().await.insert(digest);
+        assert!(
+            in_progress.lock().await.contains(&digest),
+            "precondition: digest should be in_progress"
+        );
+
+        // Construct and immediately drop a guard for this digest.
+        {
+            let _guard = TreeResolutionGuard {
+                digest,
+                in_progress: in_progress.clone(),
+            };
+        }
+
+        // The guard's Drop spawns an async removal. Yield repeatedly so
+        // the spawned task gets a chance to run and acquire the lock.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if !in_progress.lock().await.contains(&digest) {
+                break;
+            }
+        }
+
+        assert!(
+            !in_progress.lock().await.contains(&digest),
+            "TreeResolutionGuard::drop should have removed the digest from in_progress"
+        );
+    }
+
+    /// Verifies that the in-progress set does not retain a stale entry
+    /// after `resolve_input_tree` returns, exercising the guard wired
+    /// against the scheduler's actual shared map. Covers both the
+    /// inline-error path (the directory blob is missing from the store)
+    /// and the cancellation path (where the inserter never executes
+    /// the matching remove on its own).
+    #[tokio::test]
+    async fn test_resolve_input_tree_no_in_progress_leak() {
+        use nativelink_config::schedulers::WorkerAllocationStrategy;
+        use crate::platform_property_manager::PlatformPropertyManager;
+        use crate::worker_registry::WorkerRegistry;
+
+        #[derive(Debug)]
+        struct NoopWorkerStateManager;
+
+        impl MetricsComponent for NoopWorkerStateManager {
+            fn publish(
+                &self,
+                _kind: MetricKind,
+                _field_metadata: MetricFieldData,
+            ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+                Ok(MetricPublishKnownKindData::Component)
+            }
+        }
+
+        #[tonic::async_trait]
+        impl WorkerStateManager for NoopWorkerStateManager {
+            async fn update_operation(
+                &self,
+                _operation_id: &OperationId,
+                _worker_id: &WorkerId,
+                _update: UpdateOperationType,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let dir = Directory {
+            files: vec![make_file_node("test.txt", 0xaa, 1000)],
+            directories: vec![],
+            ..Default::default()
+        };
+        let (_dir_bytes, dir_digest) = encode_directory(&dir);
+        // Note: we deliberately do NOT insert the directory into the store,
+        // so the resolution will fail with NotFound — exercising the
+        // Ok(Err(_)) branch's guard release on the actual shared map.
+
+        let scheduler = ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWorkerStateManager),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some(store),
+            None,
+        );
+
+        // First, verify guard wiring against the real shared map. Pre-insert
+        // the digest, drop the guard, and confirm cleanup happens against
+        // the scheduler's own `tree_resolution_in_progress`.
+        scheduler
+            .tree_resolution_in_progress
+            .lock()
+            .await
+            .insert(dir_digest);
+        {
+            let _guard = TreeResolutionGuard {
+                digest: dir_digest,
+                in_progress: scheduler.tree_resolution_in_progress.clone(),
+            };
+        }
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if scheduler
+                .tree_resolution_in_progress
+                .lock()
+                .await
+                .is_empty()
+            {
+                break;
+            }
+        }
+        assert!(
+            scheduler
+                .tree_resolution_in_progress
+                .lock()
+                .await
+                .is_empty(),
+            "guard should have cleared the in-progress entry against the scheduler's actual map"
+        );
+
+        // Now run a real resolve_input_tree call (which will hit NotFound
+        // and exercise the Ok(Err) branch's guard drop). After it returns,
+        // the in-progress set must not retain the digest.
+        let _result = scheduler.resolve_input_tree(dir_digest).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !scheduler
+                .tree_resolution_in_progress
+                .lock()
+                .await
+                .contains(&dir_digest),
+            "tree_resolution_in_progress must not retain digest after resolve_input_tree returns"
+        );
+
+        // Clear failure cache so the next call isn't short-circuited by the
+        // negative cache. Confirm no in-progress entry leaks across calls.
+        scheduler.tree_resolution_failures.lock().await.clear();
+        let _result2 = scheduler.resolve_input_tree(dir_digest).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !scheduler
+                .tree_resolution_in_progress
+                .lock()
+                .await
+                .contains(&dir_digest),
+            "tree_resolution_in_progress must not retain digest after second resolve_input_tree call"
         );
     }
 }
