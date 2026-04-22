@@ -1587,7 +1587,6 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         writer
             .send_eof()
             .err_tip(|| "Filed to send EOF in filesystem store get_part")?;
-
         Ok(())
     }
 

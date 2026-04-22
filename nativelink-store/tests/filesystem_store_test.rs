@@ -35,7 +35,7 @@ use nativelink_store::filesystem_store::{
     DIGEST_FOLDER, EncodedFilePath, FileEntry, FileEntryImpl, FileType, FilesystemStore,
     STR_FOLDER, digest_content_path, key_from_file,
 };
-use nativelink_util::buf_channel::make_buf_channel_pair;
+use nativelink_util::buf_channel::{make_buf_channel_pair, make_buf_channel_pair_with_size};
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike, UploadSizeInfo};
@@ -166,6 +166,7 @@ impl<Hooks: FileEntryHooks + 'static + Sync + Send> LenEntry for TestFileEntry<H
 
 impl<Hooks: FileEntryHooks + 'static + Sync + Send> Drop for TestFileEntry<Hooks> {
     fn drop(&mut self) {
+        eprintln!("TestFileEntry::drop called");
         let mut inner = self.inner.take().unwrap();
         let shared_context = inner.get_shared_context_for_test();
         let current_context = Context::current();
@@ -455,9 +456,11 @@ async fn file_continues_to_stream_on_content_replace_test() -> Result<(), Error>
     }
 
     // Use a large value so the producer is still blocked mid-stream when we
-    // check the temp directory. With read_buffer_size=1 and channel capacity 64,
-    // the producer sends 1-byte chunks. It needs well over 64 bytes to ensure
-    // it can't finish before the test inspects temp_path.
+    // check the temp directory. With read_buffer_size=1 and channel
+    // capacity 64 (set explicitly below), the producer sends 1-byte chunks
+    // and blocks once 64+8 bytes have flowed. The 100-byte payload exceeds
+    // that, ensuring the producer is mid-stream and still holds an Arc to
+    // the FileEntry when the test inspects temp_path.
     let large_value1: String = "abcdefghij".repeat(10); // 100 bytes
     let large_value2: String = "ABCDEFGHIJ".repeat(10); // 100 bytes
     let digest1 = DigestInfo::try_new(HASH1, large_value1.len())?;
@@ -484,7 +487,11 @@ async fn file_continues_to_stream_on_content_replace_test() -> Result<(), Error>
         .update_oneshot(digest1, large_value1.clone().into())
         .await?;
 
-    let (writer, mut reader) = make_buf_channel_pair();
+    // Explicit small channel so the producer backpressures before draining
+    // the file. Default capacity (1024) is large enough to hold the entire
+    // 100-byte payload, which would let the producer task complete and
+    // drop its Arc before the test can inspect temp_path.
+    let (writer, mut reader) = make_buf_channel_pair_with_size(64);
     let store_clone = store.clone();
     let digest1_clone = digest1;
     background_spawn!(
