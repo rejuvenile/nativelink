@@ -66,7 +66,8 @@ use nativelink_util::zero_copy_codec::{
 };
 use opentelemetry::context::FutureExt;
 use parking_lot::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::time::sleep;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{Instrument, Level, debug, error, error_span, info, instrument, trace, warn};
 
@@ -126,6 +127,14 @@ pub struct ByteStreamMetrics {
     pub partial_write_bytes: AtomicU64,
     /// Number of idle streams evicted due to memory pressure
     pub idle_stream_evictions_memory: AtomicU64,
+    /// Number of mirror tee chunks dropped because the mirror channel was full.
+    /// Increments per dropped chunk; many drops on the same blob are still counted
+    /// individually so we can see backpressure rate, not just affected blob count.
+    pub mirror_chunks_dropped_backpressure: AtomicU64,
+    /// Number of blobs whose mirror tee was incomplete due to one or more dropped
+    /// chunks. Increments at most once per blob. Useful for sizing the impact on
+    /// locality cache freshness.
+    pub mirror_blobs_incomplete: AtomicU64,
 }
 
 impl MetricsComponent for ByteStreamMetrics {
@@ -237,6 +246,18 @@ impl MetricsComponent for ByteStreamMetrics {
             &self.idle_stream_evictions_memory,
             MetricKind::Counter,
             "Idle streams evicted due to memory pressure"
+        );
+        publish!(
+            "mirror_chunks_dropped_backpressure",
+            &self.mirror_chunks_dropped_backpressure,
+            MetricKind::Counter,
+            "Mirror tee chunks dropped because the mirror channel was full"
+        );
+        publish!(
+            "mirror_blobs_incomplete",
+            &self.mirror_blobs_incomplete,
+            MetricKind::Counter,
+            "Blobs whose mirror tee was incomplete due to dropped chunks"
         );
 
         Ok(MetricPublishKnownKindData::Component)
@@ -1334,6 +1355,8 @@ impl ByteStreamServer {
             >,
             tx: &mut DropCloserWriteHalf,
             mirror_tx: &mut Option<DropCloserWriteHalf>,
+            mirror_dropped_any: &mut bool,
+            metrics: &ByteStreamMetrics,
             streaming_blob_writer: &Option<StreamingBlobWriter>,
             outer_bytes_received: &Arc<AtomicU64>,
             expected_size: u64,
@@ -1401,21 +1424,35 @@ impl ByteStreamServer {
 
                 // Do not process EOF or weird stuff will happen.
                 if !data.is_empty() {
-                    // Tee: clone the chunk to the mirror channel (O(1) Bytes refcount bump).
-                    // Mirror errors are non-fatal — drop the mirror writer to stop mirroring.
-                    // Use a short timeout to avoid blocking the store write path when
-                    // the mirror consumer is slow or disconnected.
+                    // Tee: best-effort, non-blocking enqueue to the mirror channel
+                    // (O(1) Bytes refcount bump). Use try_send so a slow mirror
+                    // consumer never adds latency to the store-write hot path —
+                    // and so a single full slot doesn't permanently disable the
+                    // mirror for the rest of this blob (which the prior 100 ms
+                    // timeout did). On Full we drop just this chunk and keep the
+                    // writer alive; the mirror will end up incomplete, that's
+                    // accepted (workers can re-fetch on demand).
                     if let Some(mtx) = mirror_tx {
-                        match timeout(Duration::from_millis(100), mtx.send(data.clone())).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => {
+                        match mtx.try_send(data.clone()) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                metrics
+                                    .mirror_chunks_dropped_backpressure
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if !*mirror_dropped_any {
+                                    *mirror_dropped_any = true;
+                                    metrics
+                                        .mirror_blobs_incomplete
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                debug!(
+                                    chunk_len = data.len(),
+                                    "mirror tee channel full; dropping chunk"
+                                );
+                            }
+                            Err(TrySendError::Closed(_)) => {
                                 // Worker disconnected mid-stream; stop mirroring.
                                 warn!("mirror channel closed, dropping mirror");
-                                *mirror_tx = None;
-                            }
-                            Err(_) => {
-                                // Mirror send timed out (consumer too slow); stop mirroring.
-                                warn!("mirror send timed out after 100ms, dropping mirror");
                                 *mirror_tx = None;
                             }
                         }
@@ -1454,10 +1491,16 @@ impl ByteStreamServer {
                             tx.get_bytes_written()
                         ));
                     }
-                    // Send EOF to mirror (non-fatal, synchronous).
+                    // Send EOF to mirror (non-fatal, synchronous). Skip when we
+                    // dropped any chunks: the byte count won't match expected_size
+                    // and the receiver would either error on size mismatch or,
+                    // worse, accept a corrupt blob. Letting the writer drop
+                    // signals the receiver to abort cleanly.
                     if let Some(mtx) = mirror_tx {
-                        if let Err(_err) = mtx.send_eof() {
-                            warn!("mirror EOF send failed, dropping mirror");
+                        if !*mirror_dropped_any {
+                            if let Err(_err) = mtx.send_eof() {
+                                warn!("mirror EOF send failed, dropping mirror");
+                            }
                         }
                     }
                     // Gracefully close our store stream.
@@ -1535,11 +1578,14 @@ impl ByteStreamServer {
 
         let active_stream = active_stream_guard.stream_state.as_mut().unwrap();
         let write_start = std::time::Instant::now();
+        let mut mirror_dropped_any = false;
         let write_result = try_join!(
             process_client_stream(
                 stream,
                 &mut active_stream.tx,
                 &mut mirror_tx_opt,
+                &mut mirror_dropped_any,
+                &instance_info.metrics,
                 &streaming_blob_writer,
                 &active_stream_guard.bytes_received,
                 expected_size
@@ -1547,6 +1593,16 @@ impl ByteStreamServer {
             (&mut active_stream.store_update_fut)
                 .map_err(|err| { err.append("Error updating inner store") })
         );
+        if mirror_dropped_any {
+            // Single per-blob summary so we can correlate mirror gaps to specific
+            // digests without spamming once per chunk. The chunk-level counter
+            // mirror_chunks_dropped_backpressure tells us how many chunks were lost.
+            warn!(
+                %digest,
+                expected_size,
+                "mirror tee incomplete: one or more chunks dropped due to backpressure"
+            );
+        }
 
         let bytes_received = active_stream_guard.bytes_received.load(Ordering::Relaxed);
         let elapsed_ms = write_start.elapsed().as_millis() as u64;

@@ -18,8 +18,9 @@ use bytes::{Bytes, BytesMut};
 use futures::poll;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
-use nativelink_util::buf_channel::make_buf_channel_pair;
+use nativelink_util::buf_channel::{make_buf_channel_pair, make_buf_channel_pair_with_size};
 use pretty_assertions::assert_eq;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::try_join;
 
 const DATA1: &str = "foo";
@@ -341,4 +342,84 @@ async fn set_max_recent_data_size_no_eof_then_retry_test() -> Result<(), Error> 
         );
     }
     Ok(())
+}
+
+// -------------------------------------------------------------------
+// try_send: non-blocking, best-effort enqueue used by the bytestream
+// mirror tee. Replaces the old `tokio::time::timeout(100ms, send())`
+// pattern that permanently disabled the mirror on a single slow chunk.
+// -------------------------------------------------------------------
+
+#[nativelink_test]
+async fn try_send_succeeds_when_capacity_available() -> Result<(), Error> {
+    let (mut tx, mut rx) = make_buf_channel_pair_with_size(2);
+    tx.try_send(Bytes::from(DATA1)).expect("first try_send");
+    tx.try_send(Bytes::from(DATA2)).expect("second try_send");
+    assert_eq!(tx.get_bytes_written(), (DATA1.len() + DATA2.len()) as u64);
+    assert_eq!(rx.recv().await?, Bytes::from(DATA1));
+    assert_eq!(rx.recv().await?, Bytes::from(DATA2));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn try_send_returns_full_when_channel_saturated_and_writer_stays_alive() {
+    // Capacity 1: the second try_send must fail with Full, the writer
+    // must remain usable, and after the receiver drains a slot the
+    // third try_send must succeed. This is the regression case for
+    // the bytestream mirror "permanent disable on one slow chunk" bug.
+    let (mut tx, mut rx) = make_buf_channel_pair_with_size(1);
+    tx.try_send(Bytes::from(DATA1)).expect("first slot");
+    let dropped_chunk = Bytes::from(DATA2);
+    match tx.try_send(dropped_chunk.clone()) {
+        Err(TrySendError::Full(returned)) => {
+            // Caller must regain ownership of the chunk on Full.
+            assert_eq!(returned, dropped_chunk);
+        }
+        other => panic!("expected Full, got {other:?}"),
+    }
+    // bytes_written must NOT have advanced for the dropped chunk.
+    assert_eq!(
+        tx.get_bytes_written(),
+        DATA1.len() as u64,
+        "bytes_written must not count dropped chunks",
+    );
+    // Writer must still be usable.
+    assert!(!tx.is_pipe_broken());
+    // Drain a slot, then the next try_send must succeed.
+    assert_eq!(rx.recv().await.unwrap(), Bytes::from(DATA1));
+    tx.try_send(Bytes::from(DATA3))
+        .expect("third try_send after drain");
+    assert_eq!(rx.recv().await.unwrap(), Bytes::from(DATA3));
+}
+
+#[nativelink_test]
+async fn try_send_returns_closed_when_receiver_dropped() {
+    let (mut tx, rx) = make_buf_channel_pair_with_size(4);
+    drop(rx);
+    let chunk = Bytes::from(DATA1);
+    match tx.try_send(chunk.clone()) {
+        Err(TrySendError::Closed(returned)) => {
+            assert_eq!(returned, chunk);
+        }
+        other => panic!("expected Closed, got {other:?}"),
+    }
+    // After Closed, the writer must short-circuit subsequent sends.
+    assert!(tx.is_pipe_broken());
+    match tx.try_send(Bytes::from(DATA2)) {
+        Err(TrySendError::Closed(_)) => {}
+        other => panic!("expected Closed on second send, got {other:?}"),
+    }
+}
+
+#[nativelink_test]
+async fn try_send_rejects_zero_length_buf_as_closed() {
+    // EOF must go through send_eof; try_send of an empty Bytes is
+    // rejected as Closed (mirrors the behavior of the async send()).
+    let (mut tx, _rx) = make_buf_channel_pair_with_size(4);
+    match tx.try_send(Bytes::new()) {
+        Err(TrySendError::Closed(_)) => {}
+        other => panic!("expected Closed for empty buf, got {other:?}"),
+    }
+    // Counter must remain unchanged.
+    assert_eq!(tx.get_bytes_written(), 0);
 }

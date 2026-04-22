@@ -24,6 +24,7 @@ use futures::task::Context;
 use futures::{Future, Stream, TryFutureExt};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::warn;
 
 const ZERO_DATA: Bytes = Bytes::new();
@@ -139,6 +140,43 @@ impl DropCloserWriteHalf {
         }
         self.bytes_written += buf_len;
         Ok(())
+    }
+
+    /// Non-blocking send. Returns immediately with one of:
+    /// - `Ok(())` if the chunk was queued.
+    /// - `Err(TrySendError::Full(buf))` if the channel is full; the caller still
+    ///   owns the buffer and the writer remains usable for future sends.
+    /// - `Err(TrySendError::Closed(buf))` if the receiver has been dropped; the
+    ///   writer is closed (`tx` cleared) so subsequent sends return
+    ///   `TrySendError::Closed` immediately.
+    ///
+    /// Useful on best-effort fan-out paths (e.g., the bytestream tee mirror)
+    /// where the producer must never block on a slow consumer. Avoids the
+    /// timer-wheel cost of `tokio::time::timeout(...)` per chunk.
+    pub fn try_send(&mut self, buf: Bytes) -> Result<(), TrySendError<Bytes>> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(TrySendError::Closed(buf));
+        };
+        let Ok(buf_len) = u64::try_from(buf.len()) else {
+            // Mirror the behavior of `send`: refuse oversized chunks.
+            return Err(TrySendError::Closed(buf));
+        };
+        if buf_len == 0 {
+            // EOF must go through `send_eof`.
+            return Err(TrySendError::Closed(buf));
+        }
+        match tx.try_send(buf) {
+            Ok(()) => {
+                self.bytes_written += buf_len;
+                Ok(())
+            }
+            Err(TrySendError::Full(buf)) => Err(TrySendError::Full(buf)),
+            Err(TrySendError::Closed(buf)) => {
+                // Receiver gone — close our side so future sends short-circuit.
+                self.tx = None;
+                Err(TrySendError::Closed(buf))
+            }
+        }
     }
 
     /// Binds a reader and a writer together. This will send all the data from the reader
