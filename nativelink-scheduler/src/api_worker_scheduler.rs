@@ -1075,7 +1075,9 @@ pub struct ApiWorkerScheduler {
 
     /// Cached GrpcStore connections to worker CAS endpoints for prefetch.
     /// Protected by a sync Mutex since we only hold it briefly to clone a Store.
-    prefetch_connections: ParkingMutex<HashMap<Arc<str>, Store>>,
+    /// `Arc` so the spawned prefetch task can insert into the cache after
+    /// creating a fresh connection.
+    prefetch_connections: Arc<ParkingMutex<HashMap<Arc<str>, Store>>>,
 
     /// Per-worker semaphore limiting concurrent prefetch streams.
     /// Key is the worker CAS endpoint.
@@ -1336,7 +1338,7 @@ impl ApiWorkerScheduler {
             tree_resolution_failures: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             failed_directory_digests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             scores_cache,
-            prefetch_connections: ParkingMutex::new(HashMap::new()),
+            prefetch_connections: Arc::new(ParkingMutex::new(HashMap::new())),
             prefetch_semaphores: ParkingMutex::new(HashMap::new()),
             memory_store_threshold,
             worker_tls_config,
@@ -2068,6 +2070,7 @@ impl ApiWorkerScheduler {
         let endpoint_str = worker_endpoint.clone();
         let semaphore = self.get_prefetch_semaphore(&worker_endpoint);
         let worker_tls_config = self.worker_tls_config.clone();
+        let prefetch_connections = self.prefetch_connections.clone();
 
         // Snapshot the cached connection under a brief sync lock. The
         // actual TCP connect (if needed) happens inside the spawned task.
@@ -2096,18 +2099,30 @@ impl ApiWorkerScheduler {
             let worker_store = if let Some(store) = cached_connection {
                 store
             } else {
-                match create_worker_cas_connection(&endpoint_str, worker_tls_config).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        warn!(
-                            %operation_id,
-                            worker_endpoint = %endpoint_str,
-                            ?e,
-                            "prefetch: failed to connect to worker CAS"
-                        );
-                        return;
-                    }
-                }
+                let store =
+                    match create_worker_cas_connection(&endpoint_str, worker_tls_config).await {
+                        Ok(store) => store,
+                        Err(e) => {
+                            warn!(
+                                %operation_id,
+                                worker_endpoint = %endpoint_str,
+                                ?e,
+                                "prefetch: failed to connect to worker CAS"
+                            );
+                            return;
+                        }
+                    };
+                // Insert into the cache so subsequent prefetches reuse it
+                // instead of opening another N (`connections_per_endpoint`)
+                // TCP connections per call. Without this insert the cache
+                // is effectively dead (read-only) and TCP connections
+                // accumulate without bound under burst.
+                let endpoint_key: Arc<str> = Arc::from(endpoint_str.as_ref());
+                prefetch_connections
+                    .lock()
+                    .entry(endpoint_key)
+                    .or_insert_with(|| store.clone());
+                store
             };
 
             // Skip the redundant has() check against the worker's CAS.
