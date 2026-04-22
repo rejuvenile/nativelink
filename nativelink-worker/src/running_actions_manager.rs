@@ -2658,12 +2658,16 @@ impl RunningActionImpl {
                 }
                 // Now the work directory has been created (or will be via symlink).
                 self.did_cleanup.store(false, Ordering::Release);
-                // Cap input fetch at 60s so a silent-stall in get_part_parallel
-                // (chunk truncation -> orphan-dropped streaming_writer ->
-                // construction_lock waiter never wakes) bubbles up as a real
-                // action failure instead of leaving the action stuck in
-                // Executing forever (which Bazel sees as a 100min hang).
-                let prepare_fut = self.metrics()
+                // The 60s outer timeout that previously wrapped this call
+                // (commit `49bf70fb`) was a symptom mitigation for waiters
+                // wedged on a stalled `directory_cache::construction_lock`
+                // when the leader's upstream read truncated. The
+                // construction_lock has since been migrated to
+                // `nativelink_util::coalesce::with_construction_lock`,
+                // which fans the leader's error (or a 120s leader
+                // `DeadlineExceeded`) to all waiters via a watch channel —
+                // making the outer timeout redundant.
+                self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
                         &self.running_actions_manager.directory_cache,
@@ -2673,15 +2677,8 @@ impl RunningActionImpl {
                         &self.work_directory,
                         pre_resolved_tree,
                         server_missing_digests,
-                    ));
-                match tokio::time::timeout(Duration::from_secs(60), prepare_fut).await {
-                    Ok(res) => res,
-                    Err(_) => Err(make_err!(
-                        Code::DeadlineExceeded,
-                        "prepare_action_inputs timed out after 60s \
-                            -- likely a chunked read deadlock"
-                    )),
-                }
+                    ))
+                    .await
             })
             .await?;
             // Store direct-use digest if active, for cleanup ref-count release.
