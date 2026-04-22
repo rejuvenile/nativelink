@@ -1319,9 +1319,50 @@ async fn inner_main(
 
             // Step 4: Flush in-flight background slow writes. All RPCs
             // have completed (or timed out), so all writes are queued.
+            //
+            // CRITICAL: skipping this step causes production
+            // "Lost inputs no longer available remotely" Bazel failures.
+            // The fast tier of cas_FAST_SLOW_STORE is a MemoryStore that
+            // dies with the process. AC entries get written to Redis the
+            // moment the fast write succeeds — if we exit before the
+            // background slow write durably persists the blob to the
+            // FilesystemStore, AC references a blob that no longer exists
+            // anywhere. Bazel asks for the action result, the CAS doesn't
+            // have it, and the build dies across many crates.
+            //
+            // We wrap with a wall-clock timeout so a wedged backend cannot
+            // stall SIGTERM forever. The inner flush_slow_writes already
+            // honors the same budget; this outer guard is belt-and-braces.
             if let Some(sm) = STORE_MANAGER.get() {
-                info!("flushing in-flight slow writes before shutdown");
-                sm.flush_slow_writes(Duration::from_secs(30)).await;
+                let flush_budget = Duration::from_secs(30);
+                let flush_start = std::time::Instant::now();
+                info!(
+                    timeout_secs = flush_budget.as_secs(),
+                    "flushing in-flight slow writes before shutdown",
+                );
+                match tokio::time::timeout(
+                    flush_budget + Duration::from_secs(2),
+                    sm.flush_slow_writes(flush_budget),
+                )
+                .await
+                {
+                    Ok(()) => info!(
+                        elapsed_ms = u64::try_from(flush_start.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "slow-write flush returned",
+                    ),
+                    Err(_) => warn!(
+                        elapsed_ms = u64::try_from(flush_start.elapsed().as_millis())
+                            .unwrap_or(u64::MAX),
+                        "slow-write flush wall-clock timeout fired; \
+                         continuing with shutdown",
+                    ),
+                }
+            } else {
+                warn!(
+                    "STORE_MANAGER not initialized at shutdown; \
+                     skipping slow-write flush",
+                );
             }
 
             // Step 5: Shut down local workers (20s budget). Remote workers

@@ -19,6 +19,12 @@ use nativelink_util::store_trait::Store;
 use parking_lot::RwLock;
 use tracing::{info, warn};
 
+/// Period for the progress log emitted while the shutdown drain is waiting.
+/// Operators see "still draining N writes after Ms" so they know the
+/// process hasn't wedged silently between SIGTERM and process::exit.
+const FLUSH_PROGRESS_LOG_INTERVAL: core::time::Duration =
+    core::time::Duration::from_secs(2);
+
 #[derive(Debug, Default, MetricsComponent)]
 pub struct StoreManager {
     #[metric]
@@ -45,10 +51,22 @@ impl StoreManager {
         None
     }
 
-    /// Flush all in-flight background slow writes across all FastSlowStores.
-    /// Called during graceful shutdown to ensure blobs are persisted before exit.
-    /// Walks the wrapper chain (ExistenceCacheStore → VerifyStore → etc.)
-    /// to find nested FastSlowStores.
+    /// Flush all in-flight background slow writes across every registered
+    /// `FastSlowStore`, returning once they all complete or `timeout` elapses.
+    ///
+    /// **Why this exists:** during graceful shutdown the fast tier of
+    /// `cas_FAST_SLOW_STORE` is a `MemoryStore` that vanishes with the
+    /// process. Action results in Redis (AC) reference those blob digests
+    /// the moment a fast-store write succeeds. If we exit before the
+    /// fire-and-forget background slow write reaches the `FilesystemStore`,
+    /// the AC entry survives but the blob does not — manifesting in
+    /// production as Bazel "Lost inputs no longer available remotely"
+    /// failures across many crates after a restart.
+    ///
+    /// `timeout` is the **wall-clock budget for the whole drain**, not a
+    /// per-store budget — operators reason about a single SIGTERM-to-exit
+    /// deadline, not N×deadline. Stores are flushed concurrently so a
+    /// single backend that takes its full budget does not starve the others.
     pub async fn flush_slow_writes(&self, timeout: core::time::Duration) {
         use crate::existence_cache_store::ExistenceCacheStore;
         use crate::fast_slow_store::FastSlowStore;
@@ -94,29 +112,168 @@ impl StoreManager {
             guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
 
-        for (name, store) in &stores {
-            let driver: &dyn StoreDriver = store.inner_store(Option::<nativelink_util::store_trait::StoreKey<'_>>::None);
-            let Some(fss) = find_fast_slow(driver) else {
-                continue;
-            };
-            let count = fss.in_flight_slow_write_count();
-            if count > 0 {
-                info!(
-                    store = %name,
-                    count,
-                    "flushing in-flight slow writes before shutdown"
+        // Build the (name, FastSlowStore, initial_count) work list up front so
+        // the operator log shows the total drain workload before we start
+        // waiting. We collect Arc clones via the wrapping `Store` so the
+        // FastSlowStore stays alive for the duration of the flush even if
+        // some other path drops its handle.
+        let mut targets: Vec<(String, Store, usize)> = Vec::new();
+        let mut total_pending: usize = 0;
+        for (name, store) in stores {
+            let initial = {
+                let driver: &dyn StoreDriver = store.inner_store(
+                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
                 );
+                find_fast_slow(driver).map(FastSlowStore::in_flight_slow_write_count)
+            };
+            if let Some(count) = initial {
+                total_pending += count;
+                targets.push((name, store, count));
+            }
+        }
+
+        if targets.is_empty() {
+            // No FastSlowStore registered — nothing to flush. Logging at
+            // info so operators can confirm shutdown went through this path.
+            info!("flush_slow_writes: no FastSlowStore registered; skipping");
+            return;
+        }
+
+        info!(
+            stores = targets.len(),
+            total_pending,
+            timeout_secs = timeout.as_secs(),
+            "flush_slow_writes: starting drain of background slow writes",
+        );
+
+        let started = std::time::Instant::now();
+
+        // Drive every store's flush concurrently under a single global
+        // deadline. Each per-store flush already loops on a Notify and
+        // honors its own timeout, so concurrency just lets them overlap.
+        let mut joins: Vec<tokio::task::JoinHandle<(String, usize, core::time::Duration)>> =
+            Vec::with_capacity(targets.len());
+        for (name, store, _) in &targets {
+            let name_owned = name.clone();
+            let store_clone = store.clone();
+            joins.push(tokio::spawn(async move {
+                // Re-resolve the FastSlowStore from the cloned wrapper so
+                // we do not borrow across the spawn boundary.
+                let driver: &dyn StoreDriver = store_clone.inner_store(
+                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+                );
+                let Some(fss) = find_fast_slow(driver) else {
+                    return (name_owned, 0, core::time::Duration::ZERO);
+                };
+                let store_started = std::time::Instant::now();
                 let remaining = fss.flush_slow_writes(timeout).await;
-                if remaining > 0 {
-                    warn!(
-                        store = %name,
-                        remaining,
-                        "some slow writes did not complete before shutdown timeout"
-                    );
-                } else {
-                    info!(store = %name, "all slow writes flushed");
+                (name_owned, remaining, store_started.elapsed())
+            }));
+        }
+
+        // Periodically log progress while we wait. Operators see this in the
+        // SIGTERM-to-exit window and know the process is making progress
+        // rather than wedged. We poll counters via `targets` (not via
+        // joins.len()) because joins finish in any order.
+        let drain_all = async move {
+            let mut results: Vec<(String, usize, core::time::Duration)> =
+                Vec::with_capacity(joins.len());
+            for join in joins {
+                match join.await {
+                    Ok(tuple) => results.push(tuple),
+                    Err(e) => warn!(error = ?e, "flush_slow_writes: drain task panicked"),
                 }
             }
+            results
+        };
+
+        let mut progress_ticker = tokio::time::interval(FLUSH_PROGRESS_LOG_INTERVAL);
+        progress_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // First tick fires immediately; consume it so we don't double-log
+        // alongside the "starting drain" line above.
+        progress_ticker.tick().await;
+
+        let drain_with_progress = async {
+            tokio::pin!(drain_all);
+            loop {
+                tokio::select! {
+                    res = &mut drain_all => return res,
+                    _ = progress_ticker.tick() => {
+                        let snapshot: usize = targets.iter()
+                            .filter_map(|(_, store, _)| {
+                                let driver: &dyn StoreDriver = store.inner_store(
+                                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+                                );
+                                find_fast_slow(driver)
+                                    .map(FastSlowStore::in_flight_slow_write_count)
+                            })
+                            .sum();
+                        warn!(
+                            still_pending = snapshot,
+                            elapsed_ms = u64::try_from(started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            "flush_slow_writes: still draining slow writes",
+                        );
+                    }
+                }
+            }
+        };
+
+        // Outer wall-clock guard: even if a per-store flush misbehaves, we
+        // refuse to block shutdown longer than `timeout`. The per-store
+        // flush already honors its own timeout, so this is belt-and-braces.
+        let results = match tokio::time::timeout(timeout, drain_with_progress).await {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "flush_slow_writes: outer wall-clock timeout fired; \
+                     some slow writes will be lost",
+                );
+                Vec::new()
+            }
+        };
+
+        let total_remaining: usize = results.iter().map(|(_, r, _)| *r).sum();
+        let elapsed_ms =
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        for (name, remaining, dur) in &results {
+            let store_ms =
+                u64::try_from(dur.as_millis()).unwrap_or(u64::MAX);
+            if *remaining > 0 {
+                warn!(
+                    store = %name,
+                    remaining,
+                    store_ms,
+                    "flush_slow_writes: store did not fully drain",
+                );
+            } else {
+                info!(
+                    store = %name,
+                    store_ms,
+                    "flush_slow_writes: store drained",
+                );
+            }
+        }
+
+        if total_remaining > 0 {
+            // Loud, single-line summary: this is the line ops will grep for
+            // when investigating "Lost inputs" reports after a restart.
+            warn!(
+                total_pending,
+                total_remaining,
+                elapsed_ms,
+                "flush_slow_writes: COMPLETED WITH UNFLUSHED WRITES — \
+                 AC entries may now reference blobs that are not durable",
+            );
+        } else {
+            info!(
+                total_pending,
+                elapsed_ms,
+                "flush_slow_writes: all background slow writes drained",
+            );
         }
     }
 }
