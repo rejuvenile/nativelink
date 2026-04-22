@@ -65,7 +65,10 @@ pub struct ConnectWorkerRequest {
     #[prost(string, tag = "5")]
     pub cas_endpoint: ::prost::alloc::string::String,
 }
-/// / Per-digest info including LRU access time for cache eviction heuristics.
+/// / Per-digest info reported by workers in BlobsAvailableNotification.
+/// / The previous `last_access_timestamp` field has been retired now that the
+/// / scheduler trusts the locality map until explicit eviction; the tag is
+/// / reserved so old workers stay wire-compatible.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BlobDigestInfo {
     /// / The digest of the blob.
@@ -73,11 +76,6 @@ pub struct BlobDigestInfo {
     pub digest: ::core::option::Option<
         super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
     >,
-    /// / The last time this blob was accessed in the worker's local cache.
-    /// / Seconds since UNIX epoch. The scheduler can use this to estimate
-    /// / how close a blob is to eviction (lower = more likely to be evicted).
-    #[prost(int64, tag = "2")]
-    pub last_access_timestamp: i64,
 }
 /// / Notification that blobs are available on a worker for peer serving.
 #[derive(Clone, PartialEq, ::prost::Message)]

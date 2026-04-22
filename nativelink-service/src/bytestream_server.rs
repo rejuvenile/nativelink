@@ -1939,13 +1939,17 @@ impl ByteStreamServer {
                 .downcast_ref::<WorkerProxyStore>()
             {
                 if proxy.locality_in_has_enabled() {
+                    // Pick first endpoint that reports holding the blob.
+                    // Timestamps were dropped from EndpointList (entries
+                    // persist until explicit eviction), so any reported
+                    // worker is equally valid; the worker's own has() in
+                    // the sync-confirm below is the real tiebreaker.
                     let endpoint_opt = proxy
                         .locality_map()
                         .read()
-                        .lookup_workers_with_timestamps(&digest)
+                        .lookup_workers(&digest)
                         .into_iter()
-                        .max_by_key(|(_, ts)| *ts)
-                        .map(|(ep, _)| ep);
+                        .next();
                     if let Some(endpoint) = endpoint_opt {
                         if let Some(worker_store) =
                             proxy.get_or_create_connection(&endpoint).await

@@ -46,4 +46,9 @@ where
         let store_key: &StoreKey<'_> = Borrow::<StoreKey<'_>>::borrow(store_key);
         self.callback.on_insert(store_key.borrow().into_owned(), size);
     }
+
+    fn on_get(&self, store_key: &Q) {
+        let store_key: &StoreKey<'_> = Borrow::<StoreKey<'_>>::borrow(store_key);
+        self.callback.on_get(store_key.borrow().into_owned());
+    }
 }

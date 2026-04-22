@@ -182,11 +182,17 @@ impl WorkerProxyStore {
     }
 
     /// Enable the locality-aware fast paths in `has_with_results` and the
-    /// bytestream_write fast-path. Off by default. Pre-condition: the
-    /// worker-side LRU refresh heartbeat must be deployed first, otherwise
-    /// stale locality entries will cascade NotFounds.
+    /// bytestream_write fast-path. On by default; this is the kill-switch
+    /// re-arm.
     pub fn enable_locality_in_has(&self) {
         self.consult_locality_in_has.store(true, Ordering::Relaxed);
+    }
+
+    /// Disable the locality-aware fast paths. Operator kill-switch — flips
+    /// `has_with_results` back to inner-store-only and disables the
+    /// bytestream_write sync-confirm fast path.
+    pub fn disable_locality_in_has(&self) {
+        self.consult_locality_in_has.store(false, Ordering::Relaxed);
     }
 
     /// Inspector for the bytestream fast-path; returns whether locality
@@ -1172,17 +1178,55 @@ impl StoreDriver for WorkerProxyStore {
         digests: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
-        // Inner store only. The locality map is intentionally NOT
-        // consulted here — `has_with_results` drives FindMissingBlobs,
-        // which is on the per-action critical path. A stale-Some answer
-        // would cause Bazel to skip an upload that is then NotFound on
-        // the next read; a sync-confirmation alternative would add up to
-        // tens of ms tail latency to every FMB. The bytestream_write
-        // fast path uses a separate sync-confirmed locality check that
-        // is ONLY on the upload path (already adds ms anyway), so a
-        // server-CAS miss + worker-has hit is short-circuited there
-        // without affecting FMB.
-        self.inner.has_with_results(digests, results).await
+        // Inner store first.
+        self.inner.has_with_results(digests, results).await?;
+
+        // For digests still missing from the server CAS, consult the
+        // locality_map and report `Some` if any worker reports holding
+        // the blob. This is what makes the bytestream sync-confirm
+        // optimization coherent end-to-end: that path returns success
+        // to Bazel without storing on the server (the blob is only on
+        // the worker), and Bazel's next FindMissingBlobs would otherwise
+        // see "missing" and re-upload, defeating the optimization.
+        //
+        // Stale-Some safety. Workers send explicit
+        // `BlobsAvailable.evicted_digests` on every eviction; worker
+        // disconnect triggers `remove_endpoint` cleanup at
+        // worker_api_server.rs:407 within ~5s; `try_read_from_worker`
+        // self-heal evicts the locality entry on per-digest NotFound;
+        // and the bytestream fast-path's `worker.has(digest)` is the
+        // last-mile sync verification before we drop Bazel's bytes.
+        // The worst-case stale-Some manifests as a single proxy-fetch
+        // attempt that NotFounds and self-heals — same risk class as
+        // server CAS evicting between FMB and Read (which we already
+        // accept).
+        if !self.consult_locality_in_has.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut missing: Vec<(usize, DigestInfo)> = Vec::new();
+        for (idx, (key, slot)) in digests.iter().zip(results.iter()).enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            if let StoreKey::Digest(d) = key.borrow() {
+                missing.push((idx, d));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let only_digests: Vec<DigestInfo> = missing.iter().map(|(_, d)| *d).collect();
+        let lookups = self.locality_map.read().lookup_many(&only_digests);
+        for ((idx, digest), endpoints) in missing.iter().zip(lookups.iter()) {
+            if endpoints.is_empty() {
+                continue;
+            }
+            // Any endpoint is equally valid — timestamps are gone from
+            // EndpointList, and the worker's own moka cache is the real
+            // tiebreaker on the read path.
+            results[*idx] = Some(digest.size_bytes());
+        }
+        Ok(())
     }
 
     async fn update(
@@ -1546,49 +1590,40 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // 4. has_with_results: inner store only, no locality map.
+    // 4. has_with_results: locality fallback ON (default) reports
+    //     worker-only blobs as present (canonical size from digest).
+    //     Required for bytestream sync-confirm coherence: that path
+    //     returns success without storing on the server, so the next
+    //     FMB must agree the blob is present or Bazel re-uploads.
     // ---------------------------------------------------------------
     #[nativelink_test]
-    async fn test_has_with_results_does_not_use_locality_map() -> Result<(), Error> {
-        let (store, locality_map) = make_proxy_store();
+    async fn test_has_with_results_locality_fallback_when_enabled() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner.clone(), locality_map.clone());
+        proxy.enable_locality_in_has();
+        let store = Store::new(proxy);
 
-        let value = b"test data";
-        let d1 = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
-        let d2 = DigestInfo::try_new(VALID_HASH2, 999)?;
+        let d_inner = DigestInfo::try_new(VALID_HASH1, 9)?;
+        let d_worker_only = DigestInfo::try_new(VALID_HASH2, 999)?;
 
-        // Only d1 is in the inner store.
         store
-            .update_oneshot(d1, Bytes::from_static(value))
+            .update_oneshot(d_inner, Bytes::from_static(b"test data"))
             .await?;
-
-        // Register d2 on a worker — has() must NOT report it as present.
-        // The locality map is only for read optimization (get_part), not
-        // for existence checks that drive upload decisions. Reporting
-        // worker-only blobs as "present" in has_with_results causes
-        // FindMissingBlobs to tell clients the blob exists, so they
-        // skip uploading it. When the blob is later needed, neither
-        // the server's CAS nor the worker may have it.
         locality_map
             .write()
-            .register_blobs("worker-a:50081", &[d2]);
+            .register_blobs("worker-a:50081", &[d_worker_only]);
 
-        let keys: Vec<StoreKey<'_>> = vec![d1.into(), d2.into()];
+        let keys: Vec<StoreKey<'_>> = vec![d_inner.into(), d_worker_only.into()];
         let mut results = vec![None; 2];
         store.has_with_results(&keys, &mut results).await?;
 
-        // d1 should be found with correct size from inner store.
-        assert_eq!(
-            results[0],
-            Some(value.len() as u64),
-            "d1 should be present in inner store"
-        );
-        // d2 should NOT be found — locality map is not consulted.
+        assert_eq!(results[0], Some(9));
         assert_eq!(
             results[1],
-            None,
-            "d2 should not be found (locality map not used in has_with_results)"
+            Some(999),
+            "locality fallback should report worker-only blob as present with canonical size"
         );
-
         Ok(())
     }
 

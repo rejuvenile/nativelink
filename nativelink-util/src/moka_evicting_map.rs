@@ -18,7 +18,7 @@ use core::hash::Hash;
 use core::ops::RangeBounds;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -65,10 +65,12 @@ struct EvictionEvent<K, T> {
 }
 
 /// A cache backed by `moka::sync::Cache` with an API that mirrors
-/// the previous LRU-based `EvictingMap`. Moka handles eviction
-/// internally using a TinyLFU admission + LRU eviction policy, so
-/// there is no need for manual eviction loops. Pinning is handled
-/// via a side `DashMap` that keeps entries alive outside the moka cache.
+/// the previous LRU-based `EvictingMap`. Moka is configured with the
+/// pure LRU eviction policy (no TinyLFU admission filter) so that
+/// every insert is admitted unconditionally — required for a CAS where
+/// silently dropping freshly-written blobs is unacceptable. Pinning is
+/// handled via a side `DashMap` that keeps entries alive outside the
+/// moka cache.
 pub struct MokaEvictingMap<
     K: Ord + Hash + Eq + Clone + Debug + Send + Borrow<Q>,
     Q: Ord + Hash + Eq + Debug,
@@ -87,13 +89,30 @@ pub struct MokaEvictingMap<
     /// Optional BTreeSet index for range queries. Shared with the
     /// eviction listener for cleanup on eviction.
     btree: Arc<RwLock<Option<BTreeSet<K>>>>,
-    /// Unbounded channel for eviction events sent to the background drainer.
-    eviction_tx: mpsc::UnboundedSender<EvictionEvent<K, T>>,
+    /// Side queue of eviction events produced by the moka listener.
+    /// Drained synchronously by `insert()` so that the insert's evicted
+    /// items are `unref()`d before the caller continues (matching the
+    /// original `EvictingMap` contract). Also drained by the background
+    /// task for evictions triggered outside an `insert()` call (e.g. TTL
+    /// expiry, explicit `remove()`). Each event is taken at most once.
+    pending_evictions: Arc<parking_lot::Mutex<VecDeque<EvictionEvent<K, T>>>>,
+    /// Wake signal for the background drainer. Listener sends `()` after
+    /// pushing an event to `pending_evictions`. The actual event payload
+    /// lives in `pending_evictions`, not the channel — a `()` on the
+    /// channel means "there may be work to do in the side queue".
+    eviction_tx: mpsc::UnboundedSender<()>,
     /// Receiver held until `start_background_eviction` moves it into
     /// the drainer task.
-    eviction_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<EvictionEvent<K, T>>>>,
+    eviction_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<()>>>,
     /// Callbacks to invoke on item removal.
     callbacks: RwLock<Vec<C>>,
+    /// Fast-path flag to avoid taking the `callbacks` RwLock on hot
+    /// read paths (`get`, `get_many`) when no callbacks are registered.
+    /// Set to `true` (with `Release` ordering) by `add_item_callback`
+    /// after the callback is appended; loaded with `Relaxed` on the
+    /// hot path. Once set to true it is never cleared (callbacks are
+    /// append-only on this type).
+    has_callbacks_flag: AtomicBool,
     /// Anchor time for timestamp conversion.
     anchor_time: I,
     /// Configured max_bytes (used for pin cap and diagnostics).
@@ -172,7 +191,7 @@ where
         let max_seconds = config.max_seconds;
         let evict_bytes = config.evict_bytes as u64;
 
-        let (eviction_tx, eviction_rx) = mpsc::unbounded_channel();
+        let (eviction_tx, eviction_rx) = mpsc::unbounded_channel::<()>();
         let listener_tx = eviction_tx.clone();
 
         // Shared state captured by the eviction listener closure.
@@ -180,15 +199,34 @@ where
         let listener_pinned = Arc::clone(&pinned);
         let btree: Arc<RwLock<Option<BTreeSet<K>>>> = Arc::new(RwLock::new(None));
         let listener_btree = Arc::clone(&btree);
+        let pending_evictions: Arc<parking_lot::Mutex<VecDeque<EvictionEvent<K, T>>>> =
+            Arc::new(parking_lot::Mutex::new(VecDeque::new()));
+        let listener_pending = Arc::clone(&pending_evictions);
 
         let mut builder = Cache::builder();
 
-        // TinyLFU (default): admission filter prevents cache pollution
-        // from one-time blob scans. New entries enter the window (1% of
-        // capacity) unconditionally, then face the frequency filter when
-        // moving to main. Single-access blobs survive in the window long
-        // enough for concurrent slow-store writes to complete via separate
-        // data streams (FastSlowStore tees, not reads-from-fast).
+        // LRU eviction policy. We deliberately do NOT use moka's default
+        // TinyLFU admission filter — TinyLFU compares the candidate's
+        // frequency estimate against the victim's and REJECTS the new
+        // entry on a tie. For a content-addressed store where every
+        // upload must be cached, that silently drops freshly-written
+        // blobs:
+        //
+        //   1. update_oneshot writes the new blob to a temp file.
+        //   2. emplace_file calls evicting_map.insert(new_key, new_arc).
+        //   3. moka's TinyLFU sees both old and new entries with similar
+        //      frequency estimates and EVICTS THE NEW ENTRY (cause=Size).
+        //   4. emplace_file's still_ours check fails → returns Ok without
+        //      renaming the temp file into the content path.
+        //   5. The temp file is cleaned up by Drop. The new blob is gone,
+        //      yet update_oneshot returned Ok. A subsequent get() on the
+        //      same digest returns NotFound — silent data loss.
+        //
+        // LRU has no admission filter: a new insert always succeeds and
+        // displaces the least-recently-used entry. That matches the
+        // contract of the previous (parking_lot LRU) EvictingMap and is
+        // the only safe behavior for a CAS slow-tier.
+        builder = builder.eviction_policy(moka::policy::EvictionPolicy::lru());
 
         // Capacity: use max_bytes with low-watermark from evict_bytes.
         // Setting capacity to (max_bytes - evict_bytes) ensures moka
@@ -197,8 +235,15 @@ where
             // Moka's weigher returns u32 but we track bytes as u64.
             // Scale capacity and weights to KB granularity so items up
             // to 4TB fit in u32. A 1-byte item weighs 1 (minimum).
+            //
+            // Floor the effective capacity at 1: a 0-capacity cache
+            // immediately evicts every insert, which silently loses
+            // just-written blobs. This matters for tests that configure
+            // very small max_bytes (e.g. 5) and for production corner
+            // cases where `evict_bytes >= max_bytes`.
             const SCALE: u64 = 1024;
-            let effective_capacity = max_bytes.saturating_sub(evict_bytes) / SCALE;
+            let effective_capacity =
+                (max_bytes.saturating_sub(evict_bytes) / SCALE).max(1);
             builder = builder
                 .max_capacity(effective_capacity)
                 .weigher(|_key: &K, value: &T| -> u32 {
@@ -244,12 +289,18 @@ where
                 }
             }
 
-            // Send to background drainer. Unbounded channel never blocks —
-            // send only fails if the receiver is dropped (shutdown).
-            let _ = listener_tx.send(EvictionEvent {
+            // Push the event onto the sync side queue, then wake the
+            // background drainer via a `()` signal. `insert()` drains the
+            // same queue synchronously after `run_pending_tasks()` so the
+            // evicted item's `unref()` completes before the caller returns
+            // — this is the contract the original `EvictingMap` exposed.
+            listener_pending.lock().push_back(EvictionEvent {
                 key: Arc::clone(&key),
                 value,
             });
+            // Unbounded channel never blocks — send only fails if the
+            // receiver is dropped (shutdown).
+            let _ = listener_tx.send(());
         });
 
         let cache = builder.build();
@@ -261,9 +312,11 @@ where
             pinned_bytes: AtomicU64::new(0),
             pin_cap,
             btree,
+            pending_evictions,
             eviction_tx,
             eviction_rx: parking_lot::Mutex::new(Some(eviction_rx)),
             callbacks: RwLock::new(Vec::new()),
+            has_callbacks_flag: AtomicBool::new(false),
             anchor_time,
             max_bytes,
             max_count,
@@ -289,12 +342,19 @@ where
 
     pub async fn get(&self, key: &Q) -> Option<T> {
         // Atomic fast-path: skip DashMap probe when nothing is pinned.
+        // Pinned-hit reads do NOT fire `on_get` — pinned entries are a
+        // worker-side staging concept (a blob in flight to a sandbox)
+        // and the locality_map already knows about pins.
         if self.has_pinned() {
             if let Some(entry) = self.pinned.get(key) {
                 return Some(entry.data.clone());
             }
         }
-        self.cache.get(key)
+        let result = self.cache.get(key);
+        if result.is_some() {
+            self.fire_on_get(key);
+        }
+        result
     }
 
     /// Retrieve multiple values by key. Sequential iteration is intentional:
@@ -309,12 +369,17 @@ where
         let check_pinned = self.has_pinned();
         keys.into_iter()
             .map(|key| {
+                // Pinned-hit reads do NOT fire `on_get` (see `get`).
                 if check_pinned {
                     if let Some(entry) = self.pinned.get(key) {
                         return Some(entry.data.clone());
                     }
                 }
-                self.cache.get(key)
+                let result = self.cache.get(key);
+                if result.is_some() {
+                    self.fire_on_get(key);
+                }
+                result
             })
             .collect()
     }
@@ -334,7 +399,27 @@ where
         if let Some(ref value) = old {
             value.unref().await;
         }
+        // Drain any eviction events this insert triggered and unref them
+        // synchronously (before returning to the caller). The original
+        // LRU `EvictingMap` unref'd evicted items inside `insert`, and
+        // code / tests in FilesystemStore depend on that ordering
+        // (e.g. `on_unref` hooks observed immediately after insert).
+        self.drain_pending_evictions().await;
         old
+    }
+
+    /// Drain `pending_evictions` inline and fire `process_eviction_event`
+    /// on each. Concurrency: the queue is a `parking_lot::Mutex` so we
+    /// take items one at a time (not a bulk drain) to avoid holding the
+    /// lock across awaits.
+    async fn drain_pending_evictions(&self) {
+        loop {
+            let event = self.pending_evictions.lock().pop_front();
+            match event {
+                Some(ev) => self.process_eviction_event(ev).await,
+                None => break,
+            }
+        }
     }
 
     pub async fn insert_with_time(
@@ -346,40 +431,11 @@ where
         // Startup path: files are inserted oldest-first (sorted by atime).
         //
         // The `seconds_since_anchor` parameter is intentionally ignored.
-        // Moka's `Expiry` trait (expire_after_create) was investigated as
-        // a way to give older files shorter remaining TTL, but it does NOT
-        // help with size-based eviction ordering. Moka has two independent
-        // eviction mechanisms:
-        //
-        //   1. Time-based expiration (timer wheel + deque scanning):
-        //      Removes entries whose TTL/TTI has elapsed. The `Expiry`
-        //      trait only controls this — a shorter TTL makes an entry
-        //      expire sooner in wall-clock time, but has zero effect on
-        //      which entry gets evicted when the cache is over capacity.
-        //
-        //   2. Size-based eviction (TinyLFU admission + LRU probation):
-        //      When the cache exceeds max_capacity, entries are evicted
-        //      from the front of the MainProbation deque (LRU position).
-        //      Candidates must beat victims' aggregated frequency to be
-        //      admitted. TTL plays no role here.
-        //
-        // Current mitigation (sufficient for startup ordering):
-        //   - `insert_startup()` skips the frequency bump (no extra get()),
-        //     so all startup entries have freq=0 in the frequency sketch.
-        //   - `insert_startup()` defers `run_pending_tasks()` to the caller,
-        //     so WriteOps are batched. When processed, entries are pushed to
-        //     the back of the MainProbation deque in insertion order (FIFO).
-        //   - Since files are inserted oldest-atime-first, the oldest files
-        //     sit at the front (LRU position) of probation and are evicted
-        //     first during size pressure. This preserves atime ordering.
-        //   - After startup, runtime accesses bump freq>0 naturally, so
-        //     actively-used entries survive TinyLFU admission.
-        //
-        // What would be needed for true atime-proportional eviction:
-        //   - A custom eviction policy (not available in moka 0.12), or
-        //   - Maintaining a separate age-ordered structure and manually
-        //     invalidating entries. The complexity isn't justified given
-        //     that FIFO-ordered probation already approximates atime order.
+        // Under the LRU policy moka pushes new entries to the MRU end of
+        // the deque in insertion order, so the oldest-inserted entries
+        // (i.e. files with the oldest atime) sit at the LRU position and
+        // are evicted first under size pressure — preserving atime
+        // ordering without needing a custom expiration policy.
         let old = self.insert_startup(key, data);
         if let Some(ref value) = old {
             value.unref().await;
@@ -432,13 +488,10 @@ where
         // cleanup here.
         let existing = self.cache.get(key.borrow());
         self.cache.insert(key.clone(), data);
-        // Bump frequency counter so TinyLFU doesn't reject this entry
-        // from main space admission. Without this, single-access entries
-        // (freq=1) tie with victims (freq=1) and lose the strictly-greater
-        // admission check, getting evicted to disk on the next read.
-        // The extra get() is a ~100ns hash lookup — negligible vs the
-        // insert cost, and guarantees the entry survives in main.
-        drop(self.cache.get(key.borrow()));
+        // Process pending tasks so any size-driven eviction triggered by
+        // this insert fires its listener before we return. The caller
+        // (emplace_file) relies on the eviction event being queued before
+        // its `still_ours` check.
         self.cache.run_pending_tasks();
 
         // Enforce max_count if both max_bytes and max_count are set.
@@ -495,6 +548,27 @@ where
         }
     }
 
+    /// Fire `on_get` callbacks for a public-read cache hit. Hot path:
+    /// the AtomicBool fast path avoids touching the `callbacks` RwLock
+    /// when no callbacks are registered (the common case for unit
+    /// tests and stores configured without a tracker). `Relaxed` load
+    /// pairs with the `Release` store in `add_item_callback`.
+    ///
+    /// Takes `&Q` (the borrowed key form) because the call sites in
+    /// `get` / `get_many` already work in `&Q` and the callback trait
+    /// itself is parameterized over `Q`. Using `&K` would force the
+    /// caller to materialize an owned `K`, defeating the fast path.
+    #[inline]
+    fn fire_on_get(&self, key: &Q) {
+        if !self.has_callbacks_flag.load(Ordering::Relaxed) {
+            return;
+        }
+        let callbacks = self.callbacks.read();
+        for cb in callbacks.iter() {
+            cb.on_get(key);
+        }
+    }
+
     pub async fn insert_many<It>(&self, inserts: It) -> Vec<T>
     where
         It: IntoIterator<Item = (K, T)> + Send,
@@ -512,6 +586,9 @@ where
             }
         }
         self.cache.run_pending_tasks();
+        // Synchronously process any evictions triggered by the batch so
+        // unref()/callbacks complete before returning.
+        self.drain_pending_evictions().await;
         replaced
     }
 
@@ -559,8 +636,7 @@ where
 
         let existing = self.cache.get(key.borrow());
         self.cache.insert(key.clone(), data);
-        // Frequency bump (same as insert_inner) but NO run_pending_tasks.
-        drop(self.cache.get(key.borrow()));
+        // No run_pending_tasks — caller batches.
         self.fire_on_insert_callbacks(&key, size);
         if existing.is_some() {
             self.replaced_bytes.add(size);
@@ -665,10 +741,17 @@ where
 
     /// Note: the `peek` parameter is accepted for API compatibility but
     /// ignored. Moka has no non-promoting peek — `cache.get()` always
-    /// updates the access time and frequency counter. For ExistenceCacheStore
-    /// this is benign (TinyLFU frequency tracking is actually better than
-    /// LRU peek for existence checks). For FilesystemStore has() checks,
-    /// the promotion is also acceptable.
+    /// updates the access time. For both ExistenceCacheStore and
+    /// FilesystemStore has() checks, the LRU promotion is acceptable
+    /// (and actually desirable for keeping hot blobs warm).
+    ///
+    /// IMPORTANT: this path intentionally does NOT fire `on_get`
+    /// callbacks. `sizes_for_keys` is the existence-check entrypoint
+    /// used by `FastSlowStore::has()` and `ExistenceCacheStore::update()`,
+    /// each of which probes large key batches per request. Firing
+    /// `on_get` here would explode the worker-side "recently read" set
+    /// and overwhelm the locality_map broadcast on the server. Logical
+    /// reads come exclusively from `get` / `get_many`.
     pub async fn sizes_for_keys<It, R>(
         &self,
         keys: It,
@@ -806,10 +889,9 @@ where
         if let Some((owned_key, entry)) = self.pinned.remove(key) {
             self.pinned_bytes
                 .fetch_sub(entry.size, Ordering::Relaxed);
-            // Move back into moka cache with frequency bump so TinyLFU
-            // doesn't immediately reject the re-inserted item.
-            self.cache.insert(owned_key.clone(), entry.data);
-            drop(self.cache.get(owned_key.borrow()));
+            // Move back into moka cache. Under LRU there is no admission
+            // filter to fight, so a bare insert is sufficient.
+            self.cache.insert(owned_key, entry.data);
         }
     }
 
@@ -885,6 +967,15 @@ where
 
     pub fn add_item_callback(&self, callback: C) {
         self.callbacks.write().push(callback);
+        // Publish with Release so the hot read path (which loads with
+        // Relaxed) cannot observe `has_callbacks_flag == true` before it
+        // would observe the appended callback under the RwLock. The
+        // RwLock release inherent in `write()` already establishes the
+        // necessary happens-before for the Vec contents; the AtomicBool
+        // store is a separate signal whose Release ordering pairs with
+        // the Acquire implicit in the subsequent RwLock `read()` in
+        // `fire_on_get` / `fire_on_insert_callbacks`.
+        self.has_callbacks_flag.store(true, Ordering::Release);
     }
 
     // ---------------------------------------------------------------
@@ -941,20 +1032,19 @@ where
 
     async fn drain_evictions(
         self: &Arc<Self>,
-        mut rx: mpsc::UnboundedReceiver<EvictionEvent<K, T>>,
+        mut rx: mpsc::UnboundedReceiver<()>,
     ) {
         let mut pin_check_interval = tokio::time::interval(Duration::from_secs(10));
         pin_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
-                Some(event) = rx.recv() => {
-                    self.process_eviction_event(event).await;
-
-                    // Drain any additional pending events without waiting.
-                    while let Ok(event) = rx.try_recv() {
-                        self.process_eviction_event(event).await;
-                    }
+                Some(()) = rx.recv() => {
+                    // Coalesce additional wake signals — we'll drain the
+                    // entire side queue below regardless of how many
+                    // signals we got.
+                    while rx.try_recv().is_ok() {}
+                    self.drain_pending_evictions().await;
                 }
                 _ = pin_check_interval.tick() => {
                     self.expire_stale_pins().await;
@@ -979,6 +1069,7 @@ where
             let mut futs: FuturesUnordered<_> = callbacks.into_iter().collect();
             while futs.next().await.is_some() {}
         }
+        drop(event);
     }
 
     async fn expire_stale_pins(&self) {
@@ -1000,8 +1091,405 @@ where
                 );
                 self.pinned_bytes.fetch_sub(size, Ordering::Relaxed);
                 // Put back into cache so it can be evicted normally.
-                self.cache.insert(key, entry.data);
+                //
+                // NOTE: this is NOT an eviction — the blob is still
+                // resident in this `MokaEvictingMap`, just no longer
+                // pinned. We deliberately do NOT route through
+                // `process_eviction_event` (which would increment
+                // `evicted_bytes` / `evicted_items` and fire the
+                // removal `callback`). A previous code-review flagged
+                // a counter double-count risk if pin-expiry was
+                // accounted as eviction.
+                //
+                // We DO want listeners (e.g. BlobChangeTracker, which
+                // feeds the server's locality_map via BlobsAvailable)
+                // to re-acknowledge the blob now that it has crossed
+                // back into the regular LRU pool. Fire `on_insert` so
+                // the next BlobsAvailable broadcast carries a fresh
+                // entry for it.
+                self.cache.insert(key.clone(), entry.data);
+                self.fire_on_insert_callbacks(&key, size);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Inline coverage for the `on_get` hook added on top of the
+    //! existing `tests/moka_evicting_map_test.rs` integration tests.
+    //! These tests are colocated with the implementation because they
+    //! exercise the AtomicBool fast-path field which is not part of
+    //! the public surface.
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use std::time::Instant;
+
+    use nativelink_config::stores::EvictionPolicy;
+
+    use super::{MokaEvictingMap, PinnedEntry, PIN_TIMEOUT_SECS};
+    use crate::evicting_map::{ItemCallback, LenEntry};
+
+    // ---------------------------------------------------------------
+    // Test helpers (mirrors `tests/moka_evicting_map_test.rs` so the
+    // inline tests are self-contained — the integration tests cannot
+    // be reused here because they live in a separate crate target).
+    // ---------------------------------------------------------------
+
+    #[derive(Debug, Clone)]
+    struct BytesEntry(u64);
+
+    impl LenEntry for BytesEntry {
+        fn len(&self) -> u64 {
+            self.0
+        }
+        fn is_empty(&self) -> bool {
+            self.0 == 0
+        }
+    }
+
+    fn policy(max_bytes: usize, max_count: u64) -> EvictionPolicy {
+        EvictionPolicy {
+            max_bytes,
+            evict_bytes: 0,
+            max_seconds: 0,
+            max_count,
+        }
+    }
+
+    /// Callback that increments a counter for each hook invocation.
+    /// Records the last key seen on each hook for assertion granularity.
+    #[derive(Debug, Clone)]
+    struct CountingCallback {
+        get_count: Arc<AtomicU64>,
+        insert_count: Arc<AtomicU64>,
+        removal_count: Arc<AtomicU64>,
+    }
+
+    impl CountingCallback {
+        fn new() -> Self {
+            Self {
+                get_count: Arc::new(AtomicU64::new(0)),
+                insert_count: Arc::new(AtomicU64::new(0)),
+                removal_count: Arc::new(AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl ItemCallback<u64> for CountingCallback {
+        fn callback(
+            &self,
+            _key: &u64,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            self.removal_count.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {})
+        }
+
+        fn on_insert(&self, _key: &u64, _size: u64) {
+            self.insert_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_get(&self, _key: &u64) {
+            self.get_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    type TestMapCb =
+        MokaEvictingMap<u64, u64, BytesEntry, SystemTime, CountingCallback>;
+
+    fn make_map_cb(cfg: &EvictionPolicy) -> TestMapCb {
+        MokaEvictingMap::with_anchor(cfg, SystemTime::now())
+    }
+
+    // ---------------------------------------------------------------
+    // 1. on_get fires on cache.get hit
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_get_fires_on_cache_get_hit() {
+        let cfg = policy(0, 100);
+        let map = make_map_cb(&cfg);
+        let cb = CountingCallback::new();
+        let get_count = Arc::clone(&cb.get_count);
+        map.add_item_callback(cb);
+
+        map.insert(1, BytesEntry(10)).await;
+        // `insert` does not fire `on_get`.
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            0,
+            "insert must not fire on_get"
+        );
+
+        // First read — must fire on_get exactly once.
+        let v = map.get(&1).await;
+        assert!(v.is_some(), "key should be present");
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            1,
+            "on_get should fire once on cache hit"
+        );
+
+        // Second read — fires again.
+        let _ = map.get(&1).await;
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            2,
+            "on_get should fire on every cache-hit read"
+        );
+
+        // get_many: hit two keys, miss one — only the two hits should fire.
+        map.insert(2, BytesEntry(20)).await;
+        let results = map.get_many(&[1u64, 2, 99]).await;
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_some());
+        assert!(results[1].is_some());
+        assert!(results[2].is_none());
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            2 + 2,
+            "get_many should fire on_get once per cache hit, not on misses"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 2. on_get does NOT fire on cache.get miss
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_get_does_not_fire_on_miss() {
+        let cfg = policy(0, 100);
+        let map = make_map_cb(&cfg);
+        let cb = CountingCallback::new();
+        let get_count = Arc::clone(&cb.get_count);
+        map.add_item_callback(cb);
+
+        // No inserts — every get is a miss.
+        for k in 0..10u64 {
+            let v = map.get(&k).await;
+            assert!(v.is_none());
+        }
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            0,
+            "on_get must not fire on cache miss"
+        );
+
+        // get_many of all-missing keys.
+        let results = map.get_many(&[100u64, 101, 102]).await;
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(Option::is_none));
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            0,
+            "get_many must not fire on_get for any miss"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 3. on_get does NOT fire from sizes_for_keys
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_get_does_not_fire_from_sizes_for_keys() {
+        let cfg = policy(0, 100);
+        let map = make_map_cb(&cfg);
+        let cb = CountingCallback::new();
+        let get_count = Arc::clone(&cb.get_count);
+        let insert_count = Arc::clone(&cb.insert_count);
+        map.add_item_callback(cb);
+
+        // Populate three keys (fires on_insert thrice, never on_get).
+        for k in 0..3u64 {
+            map.insert(k, BytesEntry((k + 1) * 100)).await;
+        }
+        assert_eq!(insert_count.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            0,
+            "insert must not fire on_get"
+        );
+
+        // sizes_for_keys: pure existence-check path. Must NOT fire on_get
+        // even for present keys (FastSlowStore::has() / ExistenceCacheStore
+        // would otherwise explode the touched set).
+        let keys = [0u64, 1, 2, 99];
+        let mut sizes = [None; 4];
+        map.sizes_for_keys(keys.iter(), &mut sizes, false).await;
+        assert_eq!(sizes[0], Some(100));
+        assert_eq!(sizes[1], Some(200));
+        assert_eq!(sizes[2], Some(300));
+        assert_eq!(sizes[3], None);
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            0,
+            "sizes_for_keys must not fire on_get"
+        );
+
+        // Also confirm size_for_key does not fire (single-key existence path).
+        let _ = map.size_for_key(&0).await;
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            0,
+            "size_for_key must not fire on_get"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 4. on_get fast path: no fire when no callbacks registered
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_get_fast_path_no_callbacks() {
+        // No callback added — `has_callbacks_flag` stays false and the
+        // fire_on_get fast path returns immediately. We cannot
+        // directly observe "no RwLock taken" without instrumentation,
+        // but we can observe (a) the flag remains false and (b) reads
+        // succeed. A sentinel callback added afterwards must then
+        // start firing.
+        let cfg = policy(0, 100);
+        let map: MokaEvictingMap<
+            u64,
+            u64,
+            BytesEntry,
+            SystemTime,
+            CountingCallback,
+        > = MokaEvictingMap::with_anchor(&cfg, SystemTime::now());
+
+        // Initial state: flag is false.
+        assert!(
+            !map.has_callbacks_flag.load(Ordering::Relaxed),
+            "flag should start false (no callbacks registered)"
+        );
+
+        map.insert(1, BytesEntry(10)).await;
+
+        // Many reads with no callbacks — flag must remain false.
+        for _ in 0..50 {
+            let v = map.get(&1).await;
+            assert!(v.is_some());
+        }
+        assert!(
+            !map.has_callbacks_flag.load(Ordering::Relaxed),
+            "flag must remain false until add_item_callback is called"
+        );
+
+        // Now register a callback — flag must flip to true and reads
+        // must fire on_get.
+        let cb = CountingCallback::new();
+        let get_count = Arc::clone(&cb.get_count);
+        map.add_item_callback(cb);
+        assert!(
+            map.has_callbacks_flag.load(Ordering::Relaxed),
+            "add_item_callback must publish has_callbacks_flag=true"
+        );
+
+        let _ = map.get(&1).await;
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            1,
+            "on_get should fire once a callback is registered"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 5. on_get is NOT fired from a pinned-hit read
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_get_does_not_fire_for_pinned_hit() {
+        // Pinned entries are a worker-side staging concept — they
+        // already broadcast as pinned to the locality_map. Double-firing
+        // on_get for pinned reads would be redundant churn.
+        let cfg = policy(100 * 1024, 0);
+        let map = make_map_cb(&cfg);
+        let cb = CountingCallback::new();
+        let get_count = Arc::clone(&cb.get_count);
+        map.add_item_callback(cb);
+
+        map.insert(1, BytesEntry(2048)).await;
+        assert!(map.pin_key(1), "pin should succeed");
+
+        // Read while pinned.
+        let v = map.get(&1).await;
+        assert!(v.is_some(), "pinned key should still be readable");
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            0,
+            "pinned-hit reads must not fire on_get"
+        );
+
+        // get_many path — same expectation for pinned hits.
+        drop(map.get_many(&[1u64]).await);
+        assert_eq!(
+            get_count.load(Ordering::Relaxed),
+            0,
+            "pinned-hit reads must not fire on_get from get_many either"
+        );
+
+        // Cleanup so eviction-listener side-effects don't fire under teardown.
+        map.unpin_key(&1);
+    }
+
+    // ---------------------------------------------------------------
+    // 6. expire_stale_pins fires on_insert (NOT eviction callbacks).
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn expire_stale_pins_fires_on_insert_not_eviction() {
+        let cfg = policy(100 * 1024, 0);
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let insert_count = Arc::clone(&cb.insert_count);
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+
+        // Insert + pin.
+        map.insert(1, BytesEntry(2048)).await;
+        assert!(map.pin_key(1), "pin should succeed");
+        let baseline_inserts = insert_count.load(Ordering::Relaxed);
+
+        // Force a stale pin by rewinding pinned_at past PIN_TIMEOUT_SECS.
+        // We bypass the public API — directly mutate the DashMap entry.
+        {
+            let mut entry = map
+                .pinned
+                .get_mut(&1u64)
+                .expect("key 1 should be pinned");
+            // Roll back pinned_at by enough to exceed the timeout.
+            entry.pinned_at = Instant::now()
+                - core::time::Duration::from_secs(PIN_TIMEOUT_SECS + 1);
+            // Sanity: ensure we built a valid PinnedEntry with the same
+            // size we put in (sanity-checks the test setup, not the SUT).
+            let _: &PinnedEntry<BytesEntry> = &*entry;
+        }
+
+        // Run the expiry sweep directly — no need to wait 10s for the
+        // background ticker.
+        map.expire_stale_pins().await;
+
+        // The blob should now be back in the cache (not in pinned map).
+        assert_eq!(map.pinned_bytes(), 0, "pin should be cleared");
+        assert!(
+            map.get(&1).await.is_some(),
+            "blob should still be reachable from cache after pin-expiry"
+        );
+
+        // expire_stale_pins must fire on_insert exactly once for the
+        // re-announced blob, and must NOT fire the removal callback
+        // (pin-expiry is not an eviction).
+        assert_eq!(
+            insert_count.load(Ordering::Relaxed),
+            baseline_inserts + 1,
+            "pin-expiry should fire on_insert once for the re-announced blob"
+        );
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "pin-expiry must NOT fire the removal callback",
+        );
     }
 }

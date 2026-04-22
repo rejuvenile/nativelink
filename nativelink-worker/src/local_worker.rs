@@ -515,17 +515,28 @@ fn start_worker_quic_server(
 }
 
 /// Accumulated blob changes between BlobsAvailable ticks.
+///
+/// `added` and `touched` are reported in the same outgoing
+/// `digest_infos` slice (the server's locality_map upserts both as
+/// "present"); separating them lets the tracker maintain the invariant
+/// that no digest is in more than one set at a time.
+///
+/// `touched` (cache hits via on_get) flow into the same slice as
+/// `added` so the server's existing per-broadcast backfill check
+/// (`request_missing_blob_uploads`) can pull hot blobs back into the
+/// server CAS even if it had previously evicted them — without this,
+/// hot-read-cold-write blobs silently age out of the server CAS.
 #[derive(Debug, Default)]
 pub struct BlobChanges {
-    /// digest → last_access_timestamp (unix seconds).
-    pub added: HashMap<DigestInfo, i64>,
+    pub added: HashSet<DigestInfo>,
     pub evicted: HashSet<DigestInfo>,
+    pub touched: HashSet<DigestInfo>,
 }
 
-/// Tracks inserts and evictions from the FilesystemStore between ticks.
+/// Tracks inserts, evictions, and reads of the FilesystemStore between ticks.
 /// Registered as a callback on the FilesystemStore's evicting map.
 ///
-/// Contains a `Notify` that is signalled on every insert or eviction so
+/// Contains a `Notify` that is signalled on every state transition so
 /// the BlobsAvailable send loop can wake immediately instead of polling
 /// on a fixed interval.
 #[derive(Debug)]
@@ -552,7 +563,7 @@ impl BlobChangeTracker {
 }
 
 impl ItemCallback for BlobChangeTracker {
-    // On evict: add to evicted, remove from added (cancel out insert+evict).
+    // On evict: add to evicted, remove from added/touched.
     fn callback<'a>(
         &'a self,
         store_key: StoreKey<'a>,
@@ -560,23 +571,40 @@ impl ItemCallback for BlobChangeTracker {
         if let StoreKey::Digest(digest) = store_key {
             let mut pending = self.pending.lock();
             pending.added.remove(&digest);
+            pending.touched.remove(&digest);
             pending.evicted.insert(digest);
             self.notify.notify_one();
         }
         Box::pin(core::future::ready(()))
     }
 
-    // On insert: add to added, remove from evicted (cancel out evict+reinsert).
+    // On insert: add to added, remove from evicted/touched.
     fn on_insert(&self, store_key: StoreKey<'_>, _size: u64) {
         if let StoreKey::Digest(digest) = store_key {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
             let mut pending = self.pending.lock();
             pending.evicted.remove(&digest);
-            pending.added.insert(digest, ts);
+            pending.touched.remove(&digest);
+            pending.added.insert(digest);
             self.notify.notify_one();
+        }
+    }
+
+    // On read (cache hit): record in touched IF the digest isn't already
+    // accounted for in this window's added or evicted sets. This
+    // surfaces blobs the worker is actively reading so the server's
+    // backfill picks them up if its CAS evicted them.
+    fn on_get(&self, store_key: StoreKey<'_>) {
+        if let StoreKey::Digest(digest) = store_key {
+            let mut pending = self.pending.lock();
+            if pending.added.contains(&digest) || pending.evicted.contains(&digest) {
+                return;
+            }
+            // Only wake the broadcast loop when this is a NEW touched
+            // entry — repeat-read on the same digest between swaps would
+            // otherwise pointlessly wake the loop.
+            if pending.touched.insert(digest) {
+                self.notify.notify_one();
+            }
         }
     }
 }
@@ -885,27 +913,26 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
             let infos: Vec<BlobDigestInfo> = all
                 .iter()
-                .map(|(digest, ts)| BlobDigestInfo {
+                .map(|(digest, _ts)| BlobDigestInfo {
                     digest: Some((*digest).into()),
-                    last_access_timestamp: *ts,
                 })
                 .collect();
 
             (infos, Vec::new())
         } else {
-            // Delta: swap out accumulated changes.
+            // Delta: swap out accumulated changes. Touched digests (from
+            // on_get cache hits) are merged with `added` so the server's
+            // backfill check sees them; the proto carries no timestamps,
+            // entries persist in the locality map until explicit eviction.
             let changes = state.tracker.swap();
-            if changes.added.is_empty() && changes.evicted.is_empty() {
-                // Even if no blob changes, we may have subtree changes to report.
-                // We'll check below and skip only if both are empty.
-            }
+            let mut all_present: HashSet<DigestInfo> =
+                changes.added.into_iter().collect();
+            all_present.extend(changes.touched.into_iter());
 
-            let infos: Vec<BlobDigestInfo> = changes
-                .added
+            let infos: Vec<BlobDigestInfo> = all_present
                 .iter()
-                .map(|(digest, &ts)| BlobDigestInfo {
+                .map(|digest| BlobDigestInfo {
                     digest: Some((*digest).into()),
-                    last_access_timestamp: ts,
                 })
                 .collect();
             let evicted_protos = changes.evicted.iter().map(|d| (*d).into()).collect();
@@ -2366,22 +2393,15 @@ mod tests {
         let d1 = DigestInfo::new([1u8; 32], 100);
         let d2 = DigestInfo::new([2u8; 32], 200);
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-
         tracker.on_insert(StoreKey::Digest(d1), 100);
         tracker.on_insert(StoreKey::Digest(d2), 200);
 
         let changes = tracker.swap();
         assert_eq!(changes.added.len(), 2, "Expected 2 added digests");
-        // Timestamps should be approximately "now" (within 2 seconds).
-        let ts1 = *changes.added.get(&d1).unwrap();
-        let ts2 = *changes.added.get(&d2).unwrap();
-        assert!((ts1 - now).abs() < 2, "d1 timestamp {ts1} too far from now {now}");
-        assert!((ts2 - now).abs() < 2, "d2 timestamp {ts2} too far from now {now}");
+        assert!(changes.added.contains(&d1));
+        assert!(changes.added.contains(&d2));
         assert!(changes.evicted.is_empty());
+        assert!(changes.touched.is_empty());
     }
 
     #[test]
@@ -2400,7 +2420,7 @@ mod tests {
         // First swap returns the accumulated changes.
         let changes = tracker.swap();
         assert_eq!(changes.added.len(), 1);
-        assert!(changes.added.contains_key(&d1));
+        assert!(changes.added.contains(&d1));
         assert_eq!(changes.evicted.len(), 1);
         assert!(changes.evicted.contains(&d2));
 
@@ -2428,7 +2448,7 @@ mod tests {
         // It should be removed from `added` (no longer available) and
         // appear in `evicted` so the server is notified.
         assert!(
-            !changes.added.contains_key(&d1),
+            !changes.added.contains(&d1),
             "Expected d1 to NOT be in added after insert+evict"
         );
         assert!(
@@ -2451,7 +2471,7 @@ mod tests {
 
         let changes = tracker.swap();
         assert!(
-            changes.added.contains_key(&d1),
+            changes.added.contains(&d1),
             "Expected d1 in added after evict+reinsert"
         );
         assert!(
@@ -2489,12 +2509,17 @@ mod tests {
         }
 
         let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
 
         rt.block_on(async {
-            // Create a MokaEvictingMap with max_bytes = 100.
-            let evicting_map = MokaEvictingMap::<
+            // Create a MokaEvictingMap with max_count = 2 so the third
+            // insert deterministically evicts the LRU. We avoid max_bytes
+            // here because moka divides by an internal SCALE factor and
+            // sub-1KB budgets are unstable across moka versions; max_count
+            // is the predictable knob for unit tests.
+            let evicting_map = std::sync::Arc::new(MokaEvictingMap::<
                 StoreKeyBorrow,
                 StoreKey<'static>,
                 TestValue,
@@ -2502,13 +2527,16 @@ mod tests {
                 ItemCallbackHolder,
             >::with_anchor(
                 &EvictionPolicy {
-                    max_count: 0,
+                    max_count: 2,
                     max_seconds: 0,
-                    max_bytes: 100,
+                    max_bytes: 0,
                     evict_bytes: 0,
                 },
                 SystemTime::now(),
-            );
+            ));
+            // Drain pending eviction events on a background task so the
+            // tracker actually sees the eviction callback for d1 below.
+            evicting_map.start_background_eviction();
 
             // Create a BlobChangeTracker and register it.
             let tracker = BlobChangeTracker::new(Arc::new(Notify::new()));
@@ -2518,7 +2546,7 @@ mod tests {
             let d1 = DigestInfo::new([1u8; 32], 30);
             let d2 = DigestInfo::new([2u8; 32], 40);
 
-            // Insert two items (total 70 bytes, under 100 limit).
+            // Insert two items at capacity for max_count=2.
             let key1: StoreKeyBorrow = StoreKey::Digest(d1).into();
             let key2: StoreKeyBorrow = StoreKey::Digest(d2).into();
             evicting_map.insert(key1, TestValue(30)).await;
@@ -2532,11 +2560,11 @@ mod tests {
                 "Expected 2 added digests after initial inserts"
             );
             assert!(
-                changes.added.contains_key(&d1),
+                changes.added.contains(&d1),
                 "Expected d1 in added set"
             );
             assert!(
-                changes.added.contains_key(&d2),
+                changes.added.contains(&d2),
                 "Expected d2 in added set"
             );
             assert!(
@@ -2544,29 +2572,36 @@ mod tests {
                 "Expected no evictions yet"
             );
 
-            // Now insert a third item (50 bytes) — total would be 120 bytes,
-            // which exceeds max_bytes=100. This should trigger eviction of
-            // the least recently used item (d1, 30 bytes).
+            // Now insert a third item — exceeds max_count=2 so the LRU
+            // entry (d1) must be evicted. Promote d2 explicitly via get
+            // so LRU order makes d1 the eviction victim.
+            let d2_key = StoreKey::Digest(d2);
+            let _ = evicting_map.get(&d2_key).await;
             let d3 = DigestInfo::new([3u8; 32], 50);
             let key3: StoreKeyBorrow = StoreKey::Digest(d3).into();
             evicting_map.insert(key3, TestValue(50)).await;
 
-            // Allow background tasks to run (eviction callbacks are fire-and-forget).
-            tokio::task::yield_now().await;
+            // Wait for the background drainer to fire the eviction
+            // callback. start_background_eviction owns the drain task; a
+            // few yields are usually enough but give it generous slack
+            // since current_thread runtime serializes.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
 
             let changes = tracker.swap();
             assert!(
-                changes.added.contains_key(&d3),
+                changes.added.contains(&d3),
                 "Expected d3 in added set after third insert"
             );
             assert!(
                 changes.evicted.contains(&d1),
                 "Expected d1 in evicted set (LRU eviction)"
             );
-            // d2 should NOT have been evicted (total after eviction: 40 + 50 = 90 <= 100).
             assert!(
                 !changes.evicted.contains(&d2),
-                "Expected d2 to NOT be evicted"
+                "Expected d2 to NOT be evicted (most recently used)"
             );
         });
     }

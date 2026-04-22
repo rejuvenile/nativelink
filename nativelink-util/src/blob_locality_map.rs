@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::common::DigestInfo;
 use parking_lot::RwLock;
@@ -89,30 +89,33 @@ impl BuildHasher for DigestBuildHasher {
 /// - Cache-friendly sequential memory access
 /// - No bucket array overhead (HashMap has 50%+ empty slots)
 /// - Fewer allocations (one Vec vs HashMap's bucket array + entries)
+///
+/// Per-entry timestamps were dropped: with TTL filtering removed, a
+/// "freshest worker" tiebreaker is theatre — any worker carrying the digest
+/// is equally good and the bytestream sync-confirm path's own `has()` is the
+/// real correctness check.
 #[derive(Debug, Clone, Default)]
 pub struct EndpointList {
-    entries: Vec<(Arc<str>, SystemTime)>,
+    entries: Vec<Arc<str>>,
 }
 
 impl EndpointList {
-    /// Insert or update an endpoint's timestamp. Returns true if the endpoint
-    /// was newly inserted (not just updated).
+    /// Insert an endpoint if not already present. Returns true if newly added.
     #[inline]
-    fn upsert(&mut self, endpoint: &Arc<str>, ts: SystemTime) -> bool {
-        for entry in &mut self.entries {
-            if Arc::ptr_eq(&entry.0, endpoint) || *entry.0 == **endpoint {
-                entry.1 = ts;
+    fn insert(&mut self, endpoint: &Arc<str>) -> bool {
+        for existing in &self.entries {
+            if Arc::ptr_eq(existing, endpoint) || **existing == **endpoint {
                 return false;
             }
         }
-        self.entries.push((endpoint.clone(), ts));
+        self.entries.push(endpoint.clone());
         true
     }
 
     /// Remove an endpoint. Returns true if it was present.
     #[inline]
     fn remove(&mut self, endpoint: &str) -> bool {
-        if let Some(pos) = self.entries.iter().position(|(e, _)| &**e == endpoint) {
+        if let Some(pos) = self.entries.iter().position(|e| &**e == endpoint) {
             self.entries.swap_remove(pos);
             true
         } else {
@@ -127,17 +130,17 @@ impl EndpointList {
 
     #[inline]
     pub fn keys(&self) -> impl Iterator<Item = &Arc<str>> {
-        self.entries.iter().map(|(e, _)| e)
+        self.entries.iter()
     }
 
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &SystemTime)> {
-        self.entries.iter().map(|(e, ts)| (e, ts))
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.entries.iter()
     }
 
     #[inline]
     pub fn contains_key(&self, key: &str) -> bool {
-        self.entries.iter().any(|(e, _)| &**e == key)
+        self.entries.iter().any(|e| &**e == key)
     }
 
     #[inline]
@@ -145,23 +148,20 @@ impl EndpointList {
         self.entries.len()
     }
 
-    /// Get the timestamp for a specific endpoint.
+    /// Returns true if the given endpoint is in the list.
     #[inline]
-    pub fn get(&self, key: &str) -> Option<&SystemTime> {
-        self.entries.iter().find(|(e, _)| &**e == key).map(|(_, ts)| ts)
+    pub fn get(&self, key: &str) -> Option<&Arc<str>> {
+        self.entries.iter().find(|e| &***e == key)
     }
 }
 
 impl<'a> IntoIterator for &'a EndpointList {
-    type Item = (&'a Arc<str>, &'a SystemTime);
-    type IntoIter = std::iter::Map<
-        std::slice::Iter<'a, (Arc<str>, SystemTime)>,
-        fn(&'a (Arc<str>, SystemTime)) -> (&'a Arc<str>, &'a SystemTime),
-    >;
+    type Item = &'a Arc<str>;
+    type IntoIter = std::slice::Iter<'a, Arc<str>>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        self.entries.iter().map(|(e, ts)| (e, ts))
+        self.entries.iter()
     }
 }
 
@@ -172,7 +172,7 @@ type DigestSet = HashSet<DigestInfo, DigestBuildHasher>;
 /// blob fetching between workers.
 ///
 /// The map is bidirectional:
-/// - `blobs`: digest → { endpoint → last_registered_timestamp }
+/// - `blobs`: digest → set of endpoints that hold the blob
 /// - `endpoint_blobs`: endpoint → set of digests (for fast cleanup on disconnect)
 ///
 /// Performance notes:
@@ -181,19 +181,17 @@ type DigestSet = HashSet<DigestInfo, DigestBuildHasher>;
 /// - Per-digest endpoint lists use Vec with linear scan instead of HashMap
 ///   (only ~10 workers, so cache-friendly linear scan beats hashing).
 ///
-/// Entries older than this without a refresh are considered stale and skipped
-/// during lookup. Workers refresh timestamps on every BlobsAvailable update
-/// (typically every ~500ms), so 120s means the worker has missed ~240 updates
-/// — almost certainly disconnected or the blob was evicted before the
-/// notification reached us.
-const LOCALITY_TTL: Duration = Duration::from_secs(120);
+/// The locality map is trusted-until-explicit-eviction: entries persist
+/// until a worker disconnects, sends an eviction notification, or sends a
+/// full snapshot. There is no per-entry staleness filter at lookup time.
+#[deprecated(note = "Lookups no longer filter by age; entries persist until explicit eviction.")]
+pub const LOCALITY_TTL: Duration = Duration::from_secs(120);
 
 /// Cleanup relies on explicit eviction notifications, worker disconnect,
-/// and a TTL check at lookup time. Entries older than `LOCALITY_TTL` without
-/// a refresh are skipped during `lookup_workers`.
+/// and full-snapshot replacement. Lookups never apply a staleness filter.
 #[derive(Debug)]
 pub struct BlobLocalityMap {
-    /// digest → endpoint list with timestamps
+    /// digest → endpoint list
     blobs: DigestMap<EndpointList>,
     /// endpoint → set of digests (for fast cleanup on disconnect)
     endpoint_blobs: HashMap<Arc<str>, DigestSet>,
@@ -208,27 +206,14 @@ impl BlobLocalityMap {
     }
 
     /// Register that the given digests are available on the given endpoint.
-    pub fn register_blobs(&mut self, endpoint: &str, digests: &[DigestInfo]) {
-        let now = SystemTime::now();
-        self.register_blobs_with_timestamps(
-            endpoint,
-            &digests.iter().map(|d| (*d, now)).collect::<Vec<_>>(),
-        );
-    }
-
-    /// Register digests with explicit timestamps (e.g. from BlobDigestInfo).
     ///
     /// Performance: Each digest requires one lookup in `blobs` (passthrough hash
     /// of first 8 SHA-256 bytes) plus a linear scan of <=10 endpoint entries.
     /// The `endpoint_blobs` reverse index also uses the passthrough hasher.
     /// Arc<str> cloning is avoided for existing endpoints (only atomic refcount
     /// on first insert per endpoint).
-    pub fn register_blobs_with_timestamps(
-        &mut self,
-        endpoint: &str,
-        digests_with_ts: &[(DigestInfo, SystemTime)],
-    ) {
-        // Allocate the endpoint Arc<str> once; the EndpointList.upsert() only
+    pub fn register_blobs(&mut self, endpoint: &str, digests: &[DigestInfo]) {
+        // Allocate the endpoint Arc<str> once; the EndpointList.insert() only
         // clones it when the endpoint is genuinely new for that digest.
         let ep: Arc<str> = endpoint.into();
         let digest_set = self
@@ -236,12 +221,12 @@ impl BlobLocalityMap {
             .entry(ep.clone())
             .or_insert_with(|| HashSet::with_hasher(DigestBuildHasher));
 
-        for &(digest, ts) in digests_with_ts {
+        for &digest in digests {
             digest_set.insert(digest);
             self.blobs
                 .entry(digest)
                 .or_default()
-                .upsert(&ep, ts);
+                .insert(&ep);
         }
     }
 
@@ -277,58 +262,40 @@ impl BlobLocalityMap {
         }
     }
 
-    /// Returns true if any worker endpoint has the given digest with a
-    /// non-stale timestamp (within `LOCALITY_TTL`).
+    /// Returns true if any worker endpoint has the given digest.
     pub fn has_digest(&self, digest: &DigestInfo) -> bool {
-        let Some(endpoints) = self.blobs.get(digest) else {
-            return false;
-        };
-        let now = SystemTime::now();
-        endpoints.iter().any(|(_, ts)| {
-            now.duration_since(*ts)
-                .map_or(true, |age| age < LOCALITY_TTL)
-        })
+        self.blobs
+            .get(digest)
+            .map_or(false, |endpoints| !endpoints.is_empty())
     }
 
     /// Look up which worker endpoints have the given digest.
-    /// Returns endpoints whose timestamp is within `LOCALITY_TTL` of now.
     ///
-    /// Workers refresh their timestamps on every BlobsAvailable update
-    /// (typically every ~500ms). Entries older than 120s without a refresh
-    /// are likely stale (blob evicted before the eviction notification
-    /// reached us) and are filtered out.
+    /// Returns every endpoint currently registered for the digest. Entries
+    /// persist until explicit eviction (per-blob notification, full snapshot,
+    /// or worker disconnect), so no staleness filter is applied here.
     pub fn lookup_workers(&self, digest: &DigestInfo) -> Vec<Arc<str>> {
         let Some(endpoints) = self.blobs.get(digest) else {
             return Vec::new();
         };
-
-        let now = SystemTime::now();
-        endpoints
-            .iter()
-            .filter(|(_, ts)| {
-                now.duration_since(**ts)
-                    .map_or(true, |age| age < LOCALITY_TTL)
-            })
-            .map(|(ep, _)| ep.clone())
-            .collect()
+        endpoints.iter().cloned().collect()
     }
 
-    /// Look up which worker endpoints have the given digest, including the
-    /// timestamp of when the blob was last registered/refreshed on each endpoint.
-    /// Filters out entries older than `LOCALITY_TTL`, same as `lookup_workers`.
-    pub fn lookup_workers_with_timestamps(&self, digest: &DigestInfo) -> Vec<(Arc<str>, SystemTime)> {
-        let Some(endpoints) = self.blobs.get(digest) else {
-            return Vec::new();
-        };
-
-        let now = SystemTime::now();
-        endpoints
+    /// Batched variant of `lookup_workers`: processes the whole slice under a
+    /// single map borrow, returning one `Vec<Arc<str>>` per input digest in
+    /// input order. An empty inner vec means no worker reported that digest.
+    ///
+    /// Hot path: a FindMissingBlobs RPC from Bazel can carry hundreds to
+    /// thousands of digests; calling the per-digest variant in a loop would
+    /// re-take the outer read lock once per digest. Here we walk the slice
+    /// with a single borrow.
+    pub fn lookup_many(&self, digests: &[DigestInfo]) -> Vec<Vec<Arc<str>>> {
+        digests
             .iter()
-            .filter(|(_, ts)| {
-                now.duration_since(**ts)
-                    .map_or(true, |age| age < LOCALITY_TTL)
+            .map(|digest| match self.blobs.get(digest) {
+                Some(endpoints) => endpoints.iter().cloned().collect(),
+                None => Vec::new(),
             })
-            .map(|(endpoint, ts)| (endpoint.clone(), *ts))
             .collect()
     }
 
@@ -456,37 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn test_re_registration_updates_timestamp() {
+    fn test_re_registration_is_idempotent() {
         let mut map = BlobLocalityMap::new();
         let d1 = DigestInfo::new([1u8; 32], 100);
 
         map.register_blobs("worker-a", &[d1]);
-        let ts1 = *map
-            .blobs_map()
-            .get(&d1)
-            .unwrap()
-            .get("worker-a")
-            .unwrap();
-
-        // Spin until the clock advances (SystemTime resolution varies by OS).
-        loop {
-            if SystemTime::now() > ts1 {
-                break;
-            }
-        }
-
         map.register_blobs("worker-a", &[d1]);
-        let ts2 = *map
-            .blobs_map()
-            .get(&d1)
-            .unwrap()
-            .get("worker-a")
-            .unwrap();
 
-        assert!(
-            ts2 > ts1,
-            "Expected re-registration to update timestamp: ts1={ts1:?}, ts2={ts2:?}"
-        );
+        // Re-registering an existing (digest, endpoint) pair should not
+        // duplicate the endpoint entry.
+        let endpoints = map.blobs_map().get(&d1).unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert!(endpoints.contains_key("worker-a"));
     }
 
     #[test]
@@ -630,48 +578,44 @@ mod tests {
     }
 
     #[test]
-    fn test_lookup_workers_with_timestamps() {
+    fn test_lookup_many() {
         let mut map = BlobLocalityMap::new();
         let d1 = DigestInfo::new([1u8; 32], 100);
+        let d2 = DigestInfo::new([2u8; 32], 200);
+        let d3 = DigestInfo::new([3u8; 32], 300);
 
-        map.register_blobs("worker-a:50081", &[d1]);
-        map.register_blobs("worker-b:50081", &[d1]);
+        map.register_blobs("worker-a:50081", &[d1, d2]);
+        map.register_blobs("worker-b:50081", &[d2]);
 
-        let workers_with_ts = map.lookup_workers_with_timestamps(&d1);
-        assert_eq!(
-            workers_with_ts.len(),
-            2,
-            "Expected 2 endpoints with timestamps"
-        );
+        let results = map.lookup_many(&[d1, d2, d3]);
+        assert_eq!(results.len(), 3);
 
-        // Both timestamps should be non-UNIX_EPOCH (i.e., set to SystemTime::now()).
-        for (endpoint, ts) in &workers_with_ts {
-            assert!(
-                *ts > std::time::UNIX_EPOCH,
-                "Expected valid timestamp for {endpoint}, got {ts:?}"
-            );
-        }
+        // d1 → just worker-a
+        assert_eq!(results[0].len(), 1);
+        assert!(results[0].contains(&Arc::from("worker-a:50081")));
 
-        // Verify endpoint names match.
-        let endpoints: Vec<&str> = workers_with_ts.iter().map(|(e, _)| &**e).collect();
-        assert!(
-            endpoints.contains(&"worker-a:50081"),
-            "Expected worker-a:50081 in results"
-        );
-        assert!(
-            endpoints.contains(&"worker-b:50081"),
-            "Expected worker-b:50081 in results"
-        );
+        // d2 → both workers
+        assert_eq!(results[1].len(), 2);
+        assert!(results[1].contains(&Arc::from("worker-a:50081")));
+        assert!(results[1].contains(&Arc::from("worker-b:50081")));
+
+        // d3 → unknown, empty
+        assert!(results[2].is_empty());
     }
 
     #[test]
-    fn test_lookup_workers_with_timestamps_unknown_digest() {
-        let map = BlobLocalityMap::new();
+    fn test_has_digest() {
+        let mut map = BlobLocalityMap::new();
         let d1 = DigestInfo::new([1u8; 32], 100);
-        let result = map.lookup_workers_with_timestamps(&d1);
-        assert!(
-            result.is_empty(),
-            "Expected empty result for unknown digest"
-        );
+        let d2 = DigestInfo::new([2u8; 32], 200);
+
+        map.register_blobs("worker-a:50081", &[d1]);
+
+        assert!(map.has_digest(&d1));
+        assert!(!map.has_digest(&d2));
+
+        // After eviction, no longer present.
+        map.evict_blobs("worker-a:50081", &[d1]);
+        assert!(!map.has_digest(&d1));
     }
 }

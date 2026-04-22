@@ -300,8 +300,21 @@ impl DigestHasher for DigestHasherImpl {
                 // Use rayon::spawn + oneshot instead of spawn_blocking so we
                 // don't hold a tokio blocking thread while rayon's thread pool
                 // does the parallel hashing work.
+                //
+                // CRITICAL: Capture the current tokio runtime handle and enter
+                // it inside the rayon worker thread. Without this, any code
+                // path inside the closure (or any Drop running on the rayon
+                // worker thread, e.g. on `result` if `tx.send` fails) that
+                // touches a tokio API panics with "there is no reactor
+                // running". This was a fleet-wide worker crash bug: rayon
+                // catches the panic and aborts the whole process. Entering
+                // the runtime is cheap (a thread-local set/restore) and only
+                // affects calls made from this rayon worker for the duration
+                // of `_runtime_guard`'s scope.
+                let runtime_handle = tokio::runtime::Handle::current();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 rayon::spawn(move || {
+                    let _runtime_guard = runtime_handle.enter();
                     let result = match hasher.update_mmap_rayon(file_path) {
                         Ok(_) => Ok((
                             DigestInfo::new(hasher.finalize().into(), hasher.count()),

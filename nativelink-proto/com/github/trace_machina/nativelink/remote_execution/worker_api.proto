@@ -93,14 +93,15 @@ message ConnectWorkerRequest {
     reserved 6;
 }
 
-/// Per-digest info including LRU access time for cache eviction heuristics.
+/// Per-digest info reported by workers in BlobsAvailableNotification.
+/// The previous `last_access_timestamp` field has been retired now that the
+/// scheduler trusts the locality map until explicit eviction; the tag is
+/// reserved so old workers stay wire-compatible.
 message BlobDigestInfo {
     /// The digest of the blob.
     build.bazel.remote.execution.v2.Digest digest = 1;
-    /// The last time this blob was accessed in the worker's local cache.
-    /// Seconds since UNIX epoch. The scheduler can use this to estimate
-    /// how close a blob is to eviction (lower = more likely to be evicted).
-    int64 last_access_timestamp = 2;
+    reserved 2;
+    reserved "last_access_timestamp";
 }
 
 /// Notification that blobs are available on a worker for peer serving.

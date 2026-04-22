@@ -453,40 +453,37 @@ impl WorkerConnection {
         let Some(ref action_result) = execute_response.result else {
             return;
         };
-        let now = SystemTime::now();
         let mut digests = Vec::new();
         for file in &action_result.output_files {
             if let Some(ref d) = file.digest {
                 if let Ok(di) = DigestInfo::try_from(d.clone()) {
-                    digests.push((di, now));
+                    digests.push(di);
                 }
             }
         }
         for dir in &action_result.output_directories {
             if let Some(ref d) = dir.tree_digest {
                 if let Ok(di) = DigestInfo::try_from(d.clone()) {
-                    digests.push((di, now));
+                    digests.push(di);
                 }
             }
         }
         if let Some(ref d) = action_result.stdout_digest {
             if d.size_bytes > 0 {
                 if let Ok(di) = DigestInfo::try_from(d.clone()) {
-                    digests.push((di, now));
+                    digests.push(di);
                 }
             }
         }
         if let Some(ref d) = action_result.stderr_digest {
             if d.size_bytes > 0 {
                 if let Ok(di) = DigestInfo::try_from(d.clone()) {
-                    digests.push((di, now));
+                    digests.push(di);
                 }
             }
         }
         if !digests.is_empty() {
-            locality_map
-                .write()
-                .register_blobs_with_timestamps(endpoint, &digests);
+            locality_map.write().register_blobs(endpoint, &digests);
         }
     }
 
@@ -657,28 +654,21 @@ impl WorkerConnection {
             .filter_map(|d| d.try_into().ok())
             .collect();
 
-        // Collect digests with timestamps from digest_infos (preferred).
-        let mut digests_with_ts: Vec<(DigestInfo, SystemTime)> = notification
+        // Collect digests from digest_infos (preferred) and legacy digests.
+        // The proto used to carry per-blob last_access_timestamp; that field
+        // is now reserved (see worker_api.proto) — locality entries persist
+        // until an explicit eviction signal, so timestamps are no longer
+        // needed for filtering.
+        let mut digests: Vec<DigestInfo> = notification
             .digest_infos
             .into_iter()
-            .filter_map(|info| {
-                let digest = info.digest.and_then(|d| DigestInfo::try_from(d).ok())?;
-                let ts = if info.last_access_timestamp > 0 {
-                    UNIX_EPOCH + Duration::from_secs(info.last_access_timestamp as u64)
-                } else {
-                    SystemTime::now()
-                };
-                Some((digest, ts))
-            })
+            .filter_map(|info| info.digest.and_then(|d| DigestInfo::try_from(d).ok()))
             .collect();
-        // Also include plain digests for backward compatibility / simple notifications.
-        let now = SystemTime::now();
-        digests_with_ts.extend(
+        digests.extend(
             notification
                 .digests
                 .into_iter()
-                .filter_map(|d| DigestInfo::try_from(d).ok())
-                .map(|d| (d, now)),
+                .filter_map(|d| DigestInfo::try_from(d).ok()),
         );
 
         // Acquire the write lock once for all mutations to avoid repeated
@@ -705,15 +695,15 @@ impl WorkerConnection {
             map.evict_blobs(endpoint, &evicted);
         }
 
-        if !digests_with_ts.is_empty() {
+        if !digests.is_empty() {
             debug!(
                 worker_id=?self.worker_id,
                 endpoint,
-                count=digests_with_ts.len(),
+                count=digests.len(),
                 is_full_snapshot,
                 "Registering blobs available from worker"
             );
-            map.register_blobs_with_timestamps(endpoint, &digests_with_ts);
+            map.register_blobs(endpoint, &digests);
         }
 
         // After updating the locality map, check which of the newly reported
@@ -723,7 +713,7 @@ impl WorkerConnection {
         //
         // Rate-limited by a per-worker cooldown to avoid excessive
         // has_with_results calls when many workers report every 100ms.
-        if !digests_with_ts.is_empty() {
+        if !digests.is_empty() {
             if let Some(ref cas_store) = self.cas_store {
                 let now_secs = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -735,8 +725,7 @@ impl WorkerConnection {
                         last, now_secs, Ordering::Relaxed, Ordering::Relaxed,
                     ).is_ok()
                 {
-                    let all_digests: Vec<DigestInfo> =
-                        digests_with_ts.iter().map(|(d, _)| *d).collect();
+                    let all_digests: Vec<DigestInfo> = digests.clone();
                     let cas = cas_store.clone();
                     let tx = self.worker_tx.clone();
                     let worker_id = self.worker_id.clone();

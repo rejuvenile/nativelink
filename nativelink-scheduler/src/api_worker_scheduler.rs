@@ -93,8 +93,9 @@ pub struct SchedulerMetrics {
     pub cache_warm_spawned: CounterWithTime,
 }
 
-/// Cached result of `score_and_generate_hints`: endpoint scores and peer hints.
-type ScoringResult = (HashMap<Arc<str>, (u64, SystemTime)>, Vec<PeerHint>);
+/// Cached result of `score_and_generate_hints`: endpoint scores (cached
+/// bytes per endpoint) and peer hints.
+type ScoringResult = (HashMap<Arc<str>, u64>, Vec<PeerHint>);
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::worker::{
@@ -503,7 +504,7 @@ impl ApiWorkerSchedulerImpl {
         operation_id: &OperationId,
         action_info: &ActionInfoWithProps,
         full_worker_logging: bool,
-        endpoint_scores: Option<&HashMap<Arc<str>, (u64, SystemTime)>>,
+        endpoint_scores: Option<&HashMap<Arc<str>, u64>>,
         peer_hints: &[PeerHint],
         resolved_tree: Option<&ResolvedTree>,
         pre_computed_tree: Option<(Vec<Directory>, Vec<Digest>)>,
@@ -710,44 +711,38 @@ impl ApiWorkerSchedulerImpl {
                 &candidates,
             );
             if !scores.is_empty() {
-                // Sort workers by score descending, then by timestamp
-                // descending as a tiebreaker. Workers within 10% of the
-                // top score are considered tied and the most recently
-                // refreshed one wins.
+                // Sort workers by cached-bytes descending; tiebreak by
+                // effective load score. Per-blob freshness timestamps were
+                // dropped from the locality_map (entries persist until
+                // explicit eviction), so the prior ts-based tiebreaker is
+                // gone — load score is the new tiebreaker within 10%.
                 let mut sorted: Vec<_> = scores.into_iter().collect();
-                // Look up effective load score for tiebreaking within 10% score range.
                 let load_score_for_worker = |wid: &WorkerId| -> u64 {
                     self.workers.0.peek(wid)
                         .map(|w| effective_load_score(w.p_core_load_pct, w.e_core_load_pct, w.cpu_load_pct))
                         .unwrap_or(u64::MAX)
                 };
                 sorted.sort_by(|a, b| {
-                    let (score_a, ts_a) = a.1;
-                    let (score_b, ts_b) = b.1;
+                    let score_a = a.1;
+                    let score_b = b.1;
                     let max_score = score_a.max(score_b);
-                    // Within 10% of each other? Use load score, then timestamp.
                     let threshold = max_score / 10; // 10% of the larger score
                     if score_a.abs_diff(score_b) <= threshold {
-                        // Scores are similar — prefer lower load score.
+                        // Scores similar — prefer lower load score.
                         let load_a = load_score_for_worker(&a.0);
                         let load_b = load_score_for_worker(&b.0);
-                        if load_a != load_b {
-                            load_a.cmp(&load_b)
-                        } else {
-                            // Same load or both unknown — prefer more recent timestamp.
-                            ts_b.cmp(&ts_a)
-                        }
+                        load_a.cmp(&load_b)
                     } else {
-                        // Scores differ significantly, prefer higher score.
+                        // Scores differ — prefer higher.
                         score_b.cmp(&score_a)
                     }
                 });
 
-                let best = sorted.first().map(|(_, (s, _))| *s).unwrap_or(0);
+                let best = sorted.first().map(|(_, s)| *s).unwrap_or(0);
                 if best > 0 {
                     sorted.into_iter()
-                        .find(|(wid, (score, _))| *score > 0 && worker_is_viable(wid))
-                        .map(|(wid, (score, _))| {
+                        .find(|(wid, score)| *score > 0 && worker_is_viable(wid))
+                        .map(|(wid, score)| {
                             debug!(
                                 ?wid,
                                 score,
@@ -1622,7 +1617,7 @@ impl ApiWorkerScheduler {
         let mut inner = self.inner.write().await;
         let worker_count = inner.workers.len() as u64;
         let (endpoint_scores, peer_hints_slice): (
-            Option<&HashMap<Arc<str>, (u64, SystemTime)>>,
+            Option<&HashMap<Arc<str>, u64>>,
             &[PeerHint],
         ) = match scoring_result.as_deref() {
             Some((scores, hints)) => (Some(scores), hints.as_slice()),
@@ -2709,8 +2704,9 @@ async fn resolve_tree_from_cas(
 /// acquiring the locality map read lock only once.
 ///
 /// Returns:
-/// - `HashMap<Arc<str>, (u64, SystemTime)>`: endpoint scores (total cached
-///   bytes, most recent blob timestamp)
+/// - `HashMap<Arc<str>, u64>`: endpoint scores (total cached bytes per
+///   endpoint). Per-blob freshness timestamps were dropped from the
+///   locality_map (entries persist until explicit eviction signal).
 /// - `Vec<PeerHint>`: peer hints sorted by file size descending, truncated
 ///   to MAX_PEER_HINTS
 ///
@@ -2720,7 +2716,7 @@ async fn resolve_tree_from_cas(
 fn score_and_generate_hints(
     file_digests: &[(DigestInfo, u64)],
     locality_map: &SharedBlobLocalityMap,
-) -> (HashMap<Arc<str>, (u64, SystemTime)>, Vec<PeerHint>) {
+) -> (HashMap<Arc<str>, u64>, Vec<PeerHint>) {
     /// Maximum number of peer hints to include in a StartExecute message
     /// to avoid oversized messages.
     const MAX_PEER_HINTS: usize = 16384;
@@ -2728,25 +2724,20 @@ fn score_and_generate_hints(
     let map = locality_map.read();
     let blobs = map.blobs_map();
     let locality_blob_count = blobs.len();
-    let mut scores: HashMap<Arc<str>, (u64, SystemTime)> = HashMap::new();
+    let mut scores: HashMap<Arc<str>, u64> = HashMap::new();
     let mut hint_candidates: Vec<(DigestInfo, u64, Vec<Arc<str>>)> = Vec::new();
 
     for &(digest, size) in file_digests {
         if let Some(endpoints) = blobs.get(&digest) {
-            // Accumulate endpoint scores.
-            for (endpoint, ts) in endpoints {
-                let entry = scores
-                    .entry(endpoint.clone())
-                    .or_insert((0, UNIX_EPOCH));
-                entry.0 += size;
-                if *ts > entry.1 {
-                    entry.1 = *ts;
-                }
+            // Accumulate endpoint byte scores. Timestamps were dropped from
+            // EndpointList — locality entries persist until explicit eviction
+            // signal, so freshness ranking is no longer meaningful.
+            for endpoint in endpoints {
+                *scores.entry(endpoint.clone()).or_insert(0) += size;
             }
             // Collect hint candidate if this digest has peer locations.
             if !endpoints.is_empty() {
-                let peer_eps: Vec<Arc<str>> =
-                    endpoints.keys().cloned().collect();
+                let peer_eps: Vec<Arc<str>> = endpoints.keys().cloned().collect();
                 hint_candidates.push((digest, size, peer_eps));
             }
         }
@@ -2778,25 +2769,17 @@ fn score_and_generate_hints(
 /// Converts endpoint scores to worker scores using the endpoint-to-worker
 /// mapping, filtering to the given candidate set.
 ///
-/// Returns `HashMap<WorkerId, (u64, SystemTime)>` where the tuple is
-/// (total cached bytes, most recent blob timestamp across all endpoints
-/// belonging to this worker).
+/// Returns `HashMap<WorkerId, u64>` of total cached bytes per worker.
 fn endpoint_scores_to_worker_scores(
-    endpoint_scores: &HashMap<Arc<str>, (u64, SystemTime)>,
+    endpoint_scores: &HashMap<Arc<str>, u64>,
     endpoint_to_worker: &HashMap<Arc<str>, WorkerId>,
     candidates: &HashSet<WorkerId>,
-) -> HashMap<WorkerId, (u64, SystemTime)> {
-    let mut worker_scores: HashMap<WorkerId, (u64, SystemTime)> = HashMap::new();
-    for (endpoint, &(score, ts)) in endpoint_scores {
+) -> HashMap<WorkerId, u64> {
+    let mut worker_scores: HashMap<WorkerId, u64> = HashMap::new();
+    for (endpoint, &score) in endpoint_scores {
         if let Some(worker_id) = endpoint_to_worker.get(endpoint) {
             if candidates.contains(worker_id) {
-                let entry = worker_scores
-                    .entry(worker_id.clone())
-                    .or_insert((0, UNIX_EPOCH));
-                entry.0 += score;
-                if ts > entry.1 {
-                    entry.1 = ts;
-                }
+                *worker_scores.entry(worker_id.clone()).or_insert(0) += score;
             }
         }
     }
@@ -2805,7 +2788,6 @@ fn endpoint_scores_to_worker_scores(
 
 /// Backward-compatible wrapper used by existing tests. Scores candidate
 /// workers by the total bytes of input blobs they have cached.
-/// Returns only the byte score (drops the timestamp) for simpler assertions.
 #[cfg(test)]
 fn score_workers(
     candidates: &HashSet<WorkerId>,
@@ -2814,8 +2796,7 @@ fn score_workers(
     endpoint_to_worker: &HashMap<Arc<str>, WorkerId>,
 ) -> HashMap<WorkerId, u64> {
     let (endpoint_scores, _hints) = score_and_generate_hints(file_digests, locality_map);
-    let full_scores = endpoint_scores_to_worker_scores(&endpoint_scores, endpoint_to_worker, candidates);
-    full_scores.into_iter().map(|(wid, (score, _))| (wid, score)).collect()
+    endpoint_scores_to_worker_scores(&endpoint_scores, endpoint_to_worker, candidates)
 }
 
 #[async_trait]

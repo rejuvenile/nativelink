@@ -69,6 +69,13 @@ pub trait ItemCallback<Q>: Debug + Send + Sync {
     /// Called synchronously when a new item is inserted.
     /// Default is a no-op.
     fn on_insert(&self, _store_key: &Q, _size: u64) {}
+
+    /// Fired when a key is read (cache hit) via the public `get` /
+    /// `get_many` paths of the evicting map. Intentionally NOT fired
+    /// from existence-check paths such as `sizes_for_keys`, nor from
+    /// the internal `cache.get` used to capture replaced values inside
+    /// `insert_inner`. Default is a no-op.
+    fn on_get(&self, _store_key: &Q) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -80,4 +87,6 @@ impl<Q> ItemCallback<Q> for NoopCallback {
     }
 
     fn on_insert(&self, _store_key: &Q, _size: u64) {}
+
+    fn on_get(&self, _store_key: &Q) {}
 }

@@ -981,6 +981,14 @@ pub trait ItemCallback: Debug + Send + Sync {
 
     /// Called synchronously when a new item is inserted.
     fn on_insert(&self, _store_key: StoreKey<'_>, _size: u64) {}
+
+    /// Fired when a key is read (cache hit) via the public `get` /
+    /// `get_many` paths. Intentionally NOT fired from `sizes_for_keys`
+    /// (existence checks) or from internal cache.get calls used to
+    /// capture replaced values inside `insert_inner`. Use this to track
+    /// recent read activity per digest (worker-side LRU heat signal that
+    /// flows back to the server's locality_map via BlobsAvailable).
+    fn on_get(&self, _store_key: StoreKey<'_>) {}
 }
 
 /// The instructions on how to decode a value from a Bytes & version into
