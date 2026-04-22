@@ -1252,6 +1252,40 @@ const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(1800);
 /// When a negative cache map exceeds this many entries, sweep expired ones.
 const NEGATIVE_CACHE_SWEEP_THRESHOLD: usize = 1000;
 
+/// Hard upper bound on a background tree resolution attempt. A hung CAS
+/// connection without this limit could leave the digest marked as
+/// in-progress forever, blocking all future locality lookups for that
+/// input root. Combined with the RAII `TreeResolutionGuard`, this ensures
+/// `tree_resolution_in_progress` cannot leak entries even under
+/// pathological CAS failures.
+const TREE_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// RAII guard that removes a digest from `tree_resolution_in_progress` when
+/// dropped. Ensures that even if the future driving `resolve_input_tree` is
+/// cancelled mid-resolution (RPC client disconnect, request timeout,
+/// `find_and_reserve_worker` future replaced), the in-progress flag is
+/// released so future locality lookups for this digest are not silently
+/// skipped forever.
+///
+/// The Drop body schedules an async removal via `background_spawn!`. If the
+/// runtime is already gone (e.g. shutdown), the spawn is effectively a
+/// no-op and the entry would remain — but at that point the scheduler is
+/// terminating, so any leak is moot.
+struct TreeResolutionGuard {
+    digest: DigestInfo,
+    in_progress: Arc<tokio::sync::Mutex<HashSet<DigestInfo>>>,
+}
+
+impl Drop for TreeResolutionGuard {
+    fn drop(&mut self) {
+        let in_progress = self.in_progress.clone();
+        let digest = self.digest;
+        background_spawn!("tree_resolution_guard_drop", async move {
+            in_progress.lock().await.remove(&digest);
+        });
+    }
+}
+
 /// Computes exponential backoff for tree resolution failures.
 /// attempt 1 → base (60s), attempt 2 → 300s, attempt 3 → 1500s, attempt 4+ → 1800s (capped).
 fn backoff_for_attempt(base: Duration, attempts: u32) -> Duration {
@@ -1840,13 +1874,21 @@ impl ApiWorkerScheduler {
         }
 
         // Atomically check and mark as in-progress to avoid TOCTOU race.
+        // The guard removes the entry on Drop, including the case where
+        // this future is cancelled (RPC client disconnect, request timeout,
+        // outer future replaced) — preventing permanent leaks of the
+        // in-progress flag that would silently disable locality scoring
+        // for this digest forever.
         {
             let mut in_progress = self.tree_resolution_in_progress.lock().await;
-            if in_progress.contains(&input_root_digest) {
+            if !in_progress.insert(input_root_digest) {
                 return None;
             }
-            in_progress.insert(input_root_digest);
         }
+        let resolution_guard = TreeResolutionGuard {
+            digest: input_root_digest,
+            in_progress: self.tree_resolution_in_progress.clone(),
+        };
 
         // Cache miss — resolve inline so the current action benefits from
         // locality scoring. Tree resolution is typically fast (MemoryStore
@@ -1863,14 +1905,10 @@ impl ApiWorkerScheduler {
         let resolve_result =
             tokio::time::timeout(Duration::from_millis(500), resolve_fut).await;
 
-        // Always remove from in-progress set.
-        self.tree_resolution_in_progress
-            .lock()
-            .await
-            .remove(&input_root_digest);
-
         match resolve_result {
             Ok(Ok(resolved)) => {
+                // resolution_guard fires here, releasing the in-progress flag.
+                drop(resolution_guard);
                 let entry_bytes = resolved.estimated_heap_bytes();
                 info!(
                     %input_root_digest,
@@ -1900,6 +1938,8 @@ impl ApiWorkerScheduler {
                 Some(arc)
             }
             Ok(Err(err)) => {
+                // resolution_guard fires here, releasing the in-progress flag.
+                drop(resolution_guard);
                 // Resolution failed — record in negative cache with backoff.
                 let mut failures = self.tree_resolution_failures.lock().await;
                 let attempts = failures
@@ -1921,20 +1961,25 @@ impl ApiWorkerScheduler {
             Err(_elapsed) => {
                 // Resolution timed out — fall back to load-based scoring.
                 // Spawn background task to finish resolution for next time.
+                // Move the resolution_guard into the spawned task so the
+                // in-progress flag stays asserted while the background work
+                // continues, and is released exactly once on completion or
+                // task drop. We also bound the background work with
+                // TREE_RESOLUTION_TIMEOUT so a hung CAS connection cannot
+                // hold the slot forever.
                 let tree_cache = self.tree_cache.clone();
-                let in_progress_ref = self.tree_resolution_in_progress.clone();
                 let failures_ref = self.tree_resolution_failures.clone();
                 let failed_dirs_ref = self.failed_directory_digests.clone();
                 let store = cas_store.clone();
                 let digest = input_root_digest;
-                // Mark in-progress again for the background task.
-                self.tree_resolution_in_progress
-                    .lock()
-                    .await
-                    .insert(digest);
                 tokio::spawn(async move {
-                    match resolve_tree_from_cas(&store, digest, &failed_dirs_ref).await {
-                        Ok(resolved) => {
+                    // Bind the guard to this task's lifetime. It fires on
+                    // any exit path (success, error, timeout, cancellation).
+                    let _resolution_guard = resolution_guard;
+                    let bg_fut =
+                        resolve_tree_from_cas(&store, digest, &failed_dirs_ref);
+                    match tokio::time::timeout(TREE_RESOLUTION_TIMEOUT, bg_fut).await {
+                        Ok(Ok(resolved)) => {
                             let entry_bytes = resolved.estimated_heap_bytes();
                             info!(
                                 %digest,
@@ -1947,7 +1992,7 @@ impl ApiWorkerScheduler {
                             cache.put(digest, Arc::new(resolved));
                             failures_ref.lock().await.remove(&digest);
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             let mut failures = failures_ref.lock().await;
                             let attempts = failures
                                 .get(&digest)
@@ -1964,8 +2009,20 @@ impl ApiWorkerScheduler {
                             );
                             failures.insert(digest, (Instant::now(), attempts));
                         }
+                        Err(_elapsed) => {
+                            // Hard timeout — do not record as a regular
+                            // failure (don't penalize this digest forever
+                            // due to a transient CAS hang), but log loudly
+                            // so operators see the issue.
+                            warn!(
+                                %digest,
+                                timeout_secs = TREE_RESOLUTION_TIMEOUT.as_secs(),
+                                "background tree resolution timed out, abandoning"
+                            );
+                        }
                     }
-                    in_progress_ref.lock().await.remove(&digest);
+                    // _resolution_guard drops here, releasing the
+                    // in-progress flag on every exit path.
                 });
                 info!(
                     %input_root_digest,
