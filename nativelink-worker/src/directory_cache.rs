@@ -2371,44 +2371,69 @@ impl DirectoryCache {
                     .collect();
 
                 if !missing.is_empty() {
+                    // Byte-bounded in-flight populate budget. Caps the total
+                    // bytes of populates in flight so the parallel batch can't
+                    // exceed the fast-store's free headroom — without this,
+                    // a single 44 MiB blob plus 21 sibling populates can
+                    // overrun a near-full 20 GB worker cache and trigger the
+                    // self-cannibalization race that produces "fast store is
+                    // over-pressured" Aborted errors (observed on worker-07
+                    // at 17:09 UTC, 101 events / 22 digests / 44 s).
+                    //
+                    // 512 MiB chosen as a conservative cap that leaves room
+                    // for the existing pinned-set (25% of cache = ~5 GB on a
+                    // 20 GB worker), the long-tail of older entries the LRU
+                    // needs to keep, and concurrent populates from other
+                    // actions on the same worker. Any single blob larger than
+                    // the cap monopolizes the semaphore until done — that's
+                    // acceptable because (a) such blobs are rare and (b)
+                    // serializing them is far better than the eviction race.
+                    const POPULATE_BYTE_BUDGET: usize = 512 * 1024 * 1024;
+                    // Per-task permit cost is capped at POPULATE_BYTE_BUDGET
+                    // so single oversize blobs don't deadlock acquire_many.
+                    let total_missing_bytes: u64 = missing
+                        .iter()
+                        .map(|d| u64::try_from(d.size_bytes()).unwrap_or(0))
+                        .sum();
                     info!(
                         hash = %&root_digest.packed_hash().to_string()[..12],
                         missing = missing.len(),
+                        total_missing_bytes,
+                        budget = POPULATE_BYTE_BUDGET,
                         "DirectoryCache: fetching missing blobs for uncached files",
                     );
-                    let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+                    let semaphore = Arc::new(tokio::sync::Semaphore::new(POPULATE_BYTE_BUDGET));
                     let mut join_set = tokio::task::JoinSet::new();
                     for d in missing {
                         let sem = semaphore.clone();
                         let fss = fss.clone();
                         let digest = *d;
+                        let permits = usize::try_from(digest.size_bytes())
+                            .unwrap_or(POPULATE_BYTE_BUDGET)
+                            .min(POPULATE_BYTE_BUDGET)
+                            .max(1);
+                        let permits_u32 = u32::try_from(permits).unwrap_or(u32::MAX);
                         join_set.spawn(async move {
-                            let _permit = sem.acquire().await;
+                            let _permit = sem.acquire_many(permits_u32).await;
                             let key: StoreKey<'_> = digest.into();
                             fss.populate_fast_store_unchecked(key).await
                                 .err_tip(|| format!("Failed to populate fast store for {digest:?}"))?;
-                            // Pin immediately after populate succeeds. Without this,
-                            // a sibling populate later in the same batch can trigger
-                            // LRU eviction of an already-landed blob (the cache is
-                            // typically 19/20GB and 286 parallel populates exceed the
-                            // free headroom). Pinning moves the blob out of the LRU
-                            // pool so eviction picks the older 19GB instead.
+                            // Pin immediately after populate succeeds. The
+                            // byte-bounded semaphore above narrows the
+                            // self-cannibalization window; the pin closes it
+                            // for the hardlink phase that follows. Pins
+                            // auto-expire after PIN_TIMEOUT_SECS (120s); long
+                            // actions (LTO, protobuf) may exceed that and
+                            // re-expose post-hardlink references to LRU
+                            // eviction — acceptable because by then the
+                            // hardlinks are in the sandbox and the CAS blob
+                            // doesn't need to outlive the cache slot.
                             //
-                            // The pin protects the hardlink phase that immediately
-                            // follows this populate loop. Pins auto-expire after
-                            // PIN_TIMEOUT_SECS (120s); long-running actions (LTO,
-                            // big protobuf builds) may exceed that and re-expose
-                            // post-hardlink references to LRU eviction — acceptable
-                            // because by then the hardlinks are already in the
-                            // action sandbox and the CAS blob doesn't need to
-                            // outlive the cache slot.
-                            //
-                            // Pin cap is 25% of max_bytes (~5GB on a 20GB worker).
-                            // Actions whose working set exceeds that will leave
-                            // trailing digests unpinned — the verify-and-retry in
-                            // populate_fast_store_unchecked stays as the safety net
-                            // for those and a pin_keys warn fires when the cap is
-                            // hit so the degradation is visible.
+                            // Pin cap is 25% of max_bytes (~5GB on a 20GB
+                            // worker). Actions whose working set exceeds
+                            // that will leave trailing digests unpinned — the
+                            // verify-and-retry in populate_fast_store_unchecked
+                            // stays as the safety net for those.
                             fss.fast_store().pin_digests(&[digest]);
                             Ok::<(), Error>(())
                         });
