@@ -183,6 +183,22 @@ impl FastSlowStore {
         self.in_flight_slow_writes.lock().len()
     }
 
+    /// Returns the streaming-blob inner for an in-flight populate, if one
+    /// exists for `key`. Diagnostic / test helper: lets callers (and
+    /// regression tests) inspect terminal state and verify that errors
+    /// propagated via `send_error` BEFORE the writer was dropped, rather
+    /// than the writer's `Drop` impl setting a generic Internal error.
+    pub fn populating_streaming_inner(
+        &self,
+        key: StoreKey<'_>,
+    ) -> Option<Arc<StreamingBlobInner>> {
+        let owned = key.into_owned();
+        self.populating_digests
+            .lock()
+            .get(&owned)
+            .map(|(_, inner)| Arc::clone(inner))
+    }
+
     /// Fence out new background slow writes and wait for all existing
     /// ones to complete, with a timeout. Returns the number of writes
     /// still pending when the timeout expired (0 = all flushed).
@@ -396,19 +412,28 @@ impl FastSlowStore {
             ))
         });
 
-        let reader_stream_size = if self
-            .slow_store
-            .inner_store(Some(key.borrow()))
-            .optimized_for(StoreOptimizations::LazyExistenceOnSync)
-        {
-            trace!(
-                %key,
-                store_name = %self.slow_store.inner_store(Some(key.borrow())).get_name(),
-                "Skipping .has() check due to LazyExistenceOnSync optimization"
-            );
-            UploadSizeInfo::MaxSize(u64::MAX)
-        } else {
-            UploadSizeInfo::ExactSize(self
+        // The two `?` paths below (slow_store.has() RPC error + NotFound) run
+        // BEFORE `streaming_writer` is moved into `data_stream_fut`. Without
+        // forwarding the error to the writer first, an early return drops the
+        // writer un-EOF'd → readers waiting on `streaming_inner` see the
+        // generic "writer dropped without sending EOF" instead of the actual
+        // upstream error. Sibling fix to commit 49bf70fb (which covered the
+        // inner data_stream_fut). Wrap in an `async {...}.await` block so
+        // both `?` paths route through the single send_error site below.
+        let head_result: Result<UploadSizeInfo, Error> = async {
+            if self
+                .slow_store
+                .inner_store(Some(key.borrow()))
+                .optimized_for(StoreOptimizations::LazyExistenceOnSync)
+            {
+                trace!(
+                    %key,
+                    store_name = %self.slow_store.inner_store(Some(key.borrow())).get_name(),
+                    "Skipping .has() check due to LazyExistenceOnSync optimization"
+                );
+                Ok(UploadSizeInfo::MaxSize(u64::MAX))
+            } else {
+                let size = self
                     .slow_store
                     .has(key.borrow())
                     .await
@@ -425,8 +450,19 @@ impl FastSlowStore {
                                 If using multiple workers, ensure all workers share the same CAS storage path.",
                             key.as_str()
                         )
-                    })?
-            )
+                    })?;
+                Ok(UploadSizeInfo::ExactSize(size))
+            }
+        }
+        .await;
+        let reader_stream_size = match head_result {
+            Ok(size) => size,
+            Err(err) => {
+                if let Some(mut sw) = streaming_writer.take() {
+                    sw.send_error(err.clone());
+                }
+                return Err(err);
+            }
         };
 
         let send_range = offset..length.map_or(u64::MAX, |length| length + offset);

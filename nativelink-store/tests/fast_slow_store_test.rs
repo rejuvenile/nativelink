@@ -1337,3 +1337,203 @@ async fn concurrent_get_part_same_digest_both_return_correct_data() -> Result<()
 
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Regression: orphan-drop in populate_and_maybe_stream early-? paths
+// ─────────────────────────────────────────────────────────────────────
+
+/// Sibling regression to commit `49bf70fb` (which covered the inner
+/// `data_stream_fut`). Prior to this fix, the two `?` paths in
+/// `populate_and_maybe_stream` that run BEFORE `streaming_writer` is
+/// moved into `data_stream_fut` (the slow-store `has()` RPC error and
+/// the slow-store NotFound branch) would unwind the function frame,
+/// dropping the in-scope `StreamingBlobWriter` un-EOF'd. Drop's
+/// fallback then set the streaming buffer's terminal state to
+/// `Code::Internal "writer dropped without sending EOF"`, masking the
+/// real upstream cause for any concurrent waiters reading the buffer.
+///
+/// This test forces a populator to enter `populate_and_maybe_stream`,
+/// captures the streaming buffer Arc via the public diagnostic
+/// accessor, then releases the slow store's `has()` to return None
+/// (NotFound). After the populator finishes, we read the streaming
+/// buffer's terminal state via a `StreamingBlobReader` and assert
+/// the error code is `Code::NotFound` — proving `send_error` ran
+/// before the writer was dropped.
+#[nativelink_test]
+async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_util::streaming_blob::StreamingBlob;
+    use tokio::sync::Notify;
+
+    /// Slow store whose `has()` blocks until `release` is notified, then
+    /// returns Ok(None). All other operations defer to a backing
+    /// `MemoryStore`.
+    #[derive(MetricsComponent)]
+    struct GatedHasStore {
+        inner: Arc<MemoryStore>,
+        gate: Arc<Notify>,
+        has_entered: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl StoreDriver for GatedHasStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            self.has_entered.notify_waiters();
+            self.gate.notified().await;
+            // Always report missing — exercises the NotFound `?` path.
+            for r in results.iter_mut().take(digests.len()) {
+                *r = None;
+            }
+            Ok(())
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            digest: StoreKey<'_>,
+            reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .update(digest, reader, size_info)
+                .await
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .get_part(key, writer, offset, length)
+                .await
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    default_health_status_indicator!(GatedHasStore);
+
+    let gate = Arc::new(Notify::new());
+    let has_entered = Arc::new(Notify::new());
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(Arc::new(GatedHasStore {
+        inner: MemoryStore::new(&MemorySpec::default()),
+        gate: Arc::clone(&gate),
+        has_entered: Arc::clone(&has_entered),
+    }));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+
+    // Pre-register a `notified()` for `has_entered` so we don't miss
+    // the wake-up if the populator races us.
+    let entered_wait = has_entered.notified();
+
+    // Spawn the populator. It will block in `slow_store.has()` until
+    // we release the gate.
+    let fss_for_pop = Arc::clone(&fast_slow_store);
+    let pop_handle = tokio::spawn(async move {
+        // Bound the entire operation so a hang fails the test rather
+        // than wedging.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fss_for_pop.get_part_unchunked(digest, 0, None),
+        )
+        .await
+    });
+
+    // Wait until the populator is parked inside `slow_store.has()`.
+    entered_wait.await;
+
+    // Capture the streaming buffer Arc via the diagnostic accessor.
+    // The populator's LoaderGuard holds the matching loader, so the
+    // entry is live in `populating_digests`.
+    let streaming_inner = fast_slow_store
+        .populating_streaming_inner(digest.into())
+        .expect(
+            "populator should have registered a streaming buffer in \
+             populating_digests before awaiting slow_store.has()",
+        );
+
+    // Release the gate so `slow_store.has()` returns None → the
+    // populator's `?` returns NotFound.
+    gate.notify_waiters();
+
+    // Populator should complete with NotFound, well within the bound.
+    let pop_res = pop_handle
+        .await
+        .map_err(|e| make_err!(Code::Internal, "populator join: {:?}", e))?
+        .map_err(|_| make_err!(Code::DeadlineExceeded, "populator timed out"))?;
+
+    let pop_err = pop_res
+        .err()
+        .expect("populator must return an error when slow store has no blob");
+    assert_eq!(
+        pop_err.code,
+        Code::NotFound,
+        "populator should see structured NotFound, got: {pop_err:?}"
+    );
+
+    // Now the load-bearing assertion: the streaming buffer's terminal
+    // state must be the structured NotFound, NOT Drop's generic
+    // `Code::Internal "writer dropped without sending EOF"`. Without
+    // the fix, the writer in `populate_and_maybe_stream` was dropped
+    // un-EOF'd by the early `?`, and Drop set the Internal terminal
+    // state — a waiter reading the buffer would observe that, not the
+    // upstream NotFound.
+    let mut reader = StreamingBlob::new_reader(&streaming_inner);
+    let read_res = tokio::time::timeout(Duration::from_secs(5), reader.next_chunk())
+        .await
+        .map_err(|_| make_err!(Code::DeadlineExceeded, "streaming reader hung"))?;
+    let read_err = read_res
+        .err()
+        .expect("streaming buffer terminal state should be an error");
+    assert_eq!(
+        read_err.code,
+        Code::NotFound,
+        "streaming buffer terminal must carry the structured upstream \
+         NotFound (proving send_error ran before drop). Got: {read_err:?}"
+    );
+    assert!(
+        !read_err
+            .messages
+            .iter()
+            .any(|m| m.contains("dropped without sending EOF")),
+        "streaming buffer terminal must NOT be Drop's fallback \
+         'writer dropped without sending EOF' — got: {:?}",
+        read_err.messages
+    );
+
+    Ok(())
+}
