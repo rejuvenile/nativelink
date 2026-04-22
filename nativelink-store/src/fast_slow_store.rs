@@ -615,7 +615,14 @@ impl FastSlowStore {
     }
 
     pub async fn populate_fast_store_unchecked(&self, key: StoreKey<'_>) -> Result<(), Error> {
-        self.copy_slow_to_fast(key.borrow()).await?;
+        if let Err(err) = self.copy_slow_to_fast(key.borrow()).await {
+            error!(
+                %key,
+                ?err,
+                "populate_fast_store_unchecked: copy_slow_to_fast failed",
+            );
+            return Err(err);
+        }
         // Confirm the blob actually landed. has() on the fast store is a
         // single hashmap lookup on the EvictingMap — sub-microsecond.
         if Self::verify_present_with_failpoint(
@@ -632,7 +639,14 @@ impl FastSlowStore {
             %key,
             "populate_fast_store_unchecked: blob evicted between copy and verify, retrying once",
         );
-        self.copy_slow_to_fast(key.borrow()).await?;
+        if let Err(err) = self.copy_slow_to_fast(key.borrow()).await {
+            error!(
+                %key,
+                ?err,
+                "populate_fast_store_unchecked: copy_slow_to_fast retry failed",
+            );
+            return Err(err);
+        }
         if Self::verify_present_with_failpoint(
             &self.fast_store,
             key.borrow(),
@@ -649,6 +663,10 @@ impl FastSlowStore {
         // the signal that the caller is over-batching — fix at that layer
         // (bound by in-flight bytes, pre-evict, or pin the batch) rather
         // than retrying harder here.
+        error!(
+            %key,
+            "populate_fast_store_unchecked: blob not present after copy + retry — over-pressure or upstream lost the blob",
+        );
         Err(make_err!(
             Code::Aborted,
             "populate_fast_store_unchecked: blob {key} not present after copy + retry; fast store is over-pressured for the in-flight populate batch",

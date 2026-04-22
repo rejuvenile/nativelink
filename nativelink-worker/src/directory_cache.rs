@@ -39,7 +39,7 @@ use nativelink_util::fs_util::set_readonly_and_calculate_size;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Bound on how long a single coalesced directory-cache construction may
 /// run before the leader's compute future is aborted with
@@ -2406,8 +2406,14 @@ impl DirectoryCache {
                         join_set.spawn(async move {
                             let _permit = sem.acquire_many(permits_u32).await;
                             let key: StoreKey<'_> = digest.into();
-                            fss.populate_fast_store_unchecked(key).await
-                                .err_tip(|| format!("Failed to populate fast store for {digest:?}"))?;
+                            if let Err(err) = fss
+                                .populate_fast_store_unchecked(key)
+                                .await
+                                .err_tip(|| format!("Failed to populate fast store for {digest:?}"))
+                            {
+                                error!(?digest, ?err, "directory_cache populate task failed");
+                                return Err(err);
+                            }
                             // Pin immediately after populate succeeds. The
                             // byte-bounded semaphore above narrows the
                             // self-cannibalization window; the pin closes it
@@ -2821,8 +2827,15 @@ impl DirectoryCache {
                         join_set.spawn(async move {
                             let _permit = sem.acquire().await;
                             let key: StoreKey<'_> = digest.into();
-                            fss.populate_fast_store_unchecked(key).await
+                            if let Err(err) = fss
+                                .populate_fast_store_unchecked(key)
+                                .await
                                 .err_tip(|| format!("Failed to populate fast store for {digest:?}"))
+                            {
+                                error!(?digest, ?err, "directory_cache populate task failed");
+                                return Err(err);
+                            }
+                            Ok::<(), Error>(())
                         });
                     }
                     while let Some(result) = join_set.join_next().await {
