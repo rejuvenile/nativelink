@@ -188,6 +188,7 @@ impl FastSlowStore {
     /// regression tests) inspect terminal state and verify that errors
     /// propagated via `send_error` BEFORE the writer was dropped, rather
     /// than the writer's `Drop` impl setting a generic Internal error.
+    #[doc(hidden)]
     pub fn populating_streaming_inner(
         &self,
         key: StoreKey<'_>,
@@ -401,26 +402,29 @@ impl FastSlowStore {
         length: Option<u64>,
         mut streaming_writer: Option<StreamingBlobWriter>,
     ) -> Result<(), Error> {
-        // Failpoint: simulate slow store being unavailable during populate.
-        // Exercises the error propagation path when the slow store cannot
-        // be read during a cache-miss populate operation.
-        #[cfg(feature = "failpoints")]
-        fail::fail_point!("fast_slow_populate_slow_store_unavailable", |_| {
-            Err(make_err!(
-                Code::Unavailable,
-                "failpoint: slow store unavailable during populate"
-            ))
-        });
-
-        // The two `?` paths below (slow_store.has() RPC error + NotFound) run
-        // BEFORE `streaming_writer` is moved into `data_stream_fut`. Without
+        // The `?` paths below (slow_store.has() RPC error + NotFound) — and
+        // the `failpoints`-gated early-return — all run BEFORE
+        // `streaming_writer` is moved into `data_stream_fut`. Without
         // forwarding the error to the writer first, an early return drops the
         // writer un-EOF'd → readers waiting on `streaming_inner` see the
         // generic "writer dropped without sending EOF" instead of the actual
         // upstream error. Sibling fix to commit 49bf70fb (which covered the
         // inner data_stream_fut). Wrap in an `async {...}.await` block so
-        // both `?` paths route through the single send_error site below.
+        // every error path routes through the single send_error site below.
+        // The failpoint sits inside the block so its `return` exits the
+        // async block (yielding `Err` to the match), not the function.
         let head_result: Result<UploadSizeInfo, Error> = async {
+            // failpoint: simulate slow store being unavailable during populate.
+            // exercises the error propagation path when the slow store cannot
+            // be read during a cache-miss populate operation.
+            #[cfg(feature = "failpoints")]
+            fail::fail_point!("fast_slow_populate_slow_store_unavailable", |_| {
+                Err(make_err!(
+                    Code::Unavailable,
+                    "failpoint: slow store unavailable during populate"
+                ))
+            });
+
             if self
                 .slow_store
                 .inner_store(Some(key.borrow()))

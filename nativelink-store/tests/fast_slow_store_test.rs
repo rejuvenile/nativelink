@@ -1338,27 +1338,10 @@ async fn concurrent_get_part_same_digest_both_return_correct_data() -> Result<()
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Regression: orphan-drop in populate_and_maybe_stream early-? paths
-// ─────────────────────────────────────────────────────────────────────
-
-/// Sibling regression to commit `49bf70fb` (which covered the inner
-/// `data_stream_fut`). Prior to this fix, the two `?` paths in
-/// `populate_and_maybe_stream` that run BEFORE `streaming_writer` is
-/// moved into `data_stream_fut` (the slow-store `has()` RPC error and
-/// the slow-store NotFound branch) would unwind the function frame,
-/// dropping the in-scope `StreamingBlobWriter` un-EOF'd. Drop's
-/// fallback then set the streaming buffer's terminal state to
-/// `Code::Internal "writer dropped without sending EOF"`, masking the
-/// real upstream cause for any concurrent waiters reading the buffer.
-///
-/// This test forces a populator to enter `populate_and_maybe_stream`,
-/// captures the streaming buffer Arc via the public diagnostic
-/// accessor, then releases the slow store's `has()` to return None
-/// (NotFound). After the populator finishes, we read the streaming
-/// buffer's terminal state via a `StreamingBlobReader` and assert
-/// the error code is `Code::NotFound` — proving `send_error` ran
-/// before the writer was dropped.
+/// Regression for the orphan-drop in `populate_and_maybe_stream`'s early
+/// `?` paths (sibling to commit `49bf70fb`): the streaming buffer's
+/// terminal state must carry the structured upstream NotFound, not Drop's
+/// generic "writer dropped without sending EOF" fallback.
 #[nativelink_test]
 async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Error> {
     use core::time::Duration;
