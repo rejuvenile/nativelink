@@ -583,16 +583,37 @@ impl FastSlowStore {
     /// tell), and a downstream `get_file_entry_for_digest` then fails with
     /// NotFound. The post-write `has()` distinguishes the two cases without
     /// changing the underlying contract.
+    /// Verify that `key` is present on `fast_store`. Wrapped in a helper so
+    /// the post-copy verify in [`populate_fast_store_unchecked`] can be
+    /// deterministically forced to report `Ok(false)` from a failpoint
+    /// without faking the underlying store's behavior. Without the
+    /// failpoint compiled in this is just a single `has()` call.
+    async fn verify_present_with_failpoint(
+        fast_store: &Store,
+        key: StoreKey<'_>,
+        _failpoint_name: &'static str,
+        err_tip: &'static str,
+    ) -> Result<bool, Error> {
+        #[cfg(feature = "failpoints")]
+        fail::fail_point!(_failpoint_name, |_| { Ok(false) });
+        Ok(fast_store
+            .has(key)
+            .await
+            .err_tip(|| err_tip)?
+            .is_some())
+    }
+
     pub async fn populate_fast_store_unchecked(&self, key: StoreKey<'_>) -> Result<(), Error> {
         self.copy_slow_to_fast(key.borrow()).await?;
         // Confirm the blob actually landed. has() on the fast store is a
         // single hashmap lookup on the EvictingMap — sub-microsecond.
-        if self
-            .fast_store
-            .has(key.borrow())
-            .await
-            .err_tip(|| "populate_fast_store_unchecked: post-write verify")?
-            .is_some()
+        if Self::verify_present_with_failpoint(
+            &self.fast_store,
+            key.borrow(),
+            "fast_slow_populate_unchecked_force_evict_first",
+            "populate_fast_store_unchecked: post-write verify",
+        )
+        .await?
         {
             return Ok(());
         }
@@ -601,12 +622,13 @@ impl FastSlowStore {
             "populate_fast_store_unchecked: blob evicted between copy and verify, retrying once",
         );
         self.copy_slow_to_fast(key.borrow()).await?;
-        if self
-            .fast_store
-            .has(key.borrow())
-            .await
-            .err_tip(|| "populate_fast_store_unchecked: retry verify")?
-            .is_some()
+        if Self::verify_present_with_failpoint(
+            &self.fast_store,
+            key.borrow(),
+            "fast_slow_populate_unchecked_force_evict_second",
+            "populate_fast_store_unchecked: retry verify",
+        )
+        .await?
         {
             return Ok(());
         }

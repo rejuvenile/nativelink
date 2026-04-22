@@ -18,8 +18,15 @@
 //!
 //! These tests require the `failpoints` feature on the `fail` crate (always
 //! enabled in dev-dependencies).
+//!
+//! Every test in this file manipulates the process-wide `fail` crate
+//! registry, so all tests are serialized via a single `#[serial]` group.
+//! Without serialization, a failpoint enabled in one test races with
+//! another test that expects it to be disabled and causes sporadic
+//! failures.
 
 use bytes::Bytes;
+use serial_test::serial;
 use nativelink_config::stores::{
     ExistenceCacheSpec, FastSlowSpec, MemorySpec, NoopSpec, StoreDirection, StoreSpec,
 };
@@ -57,6 +64,7 @@ fn make_fast_slow_stores() -> (Store, Store, Store) {
 // populate_and_maybe_stream(). If the slow store fails, the error must
 // propagate cleanly to the caller.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn fast_slow_populate_slow_store_unavailable_returns_error() -> Result<(), Error> {
     let (_fast_slow_store, fast_store, slow_store) = make_fast_slow_stores();
@@ -114,6 +122,7 @@ async fn fast_slow_populate_slow_store_unavailable_returns_error() -> Result<(),
 // store write completes, the error must propagate to the caller and
 // no partial data should be visible.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn fast_slow_update_fail_propagates_error() -> Result<(), Error> {
     let (fast_slow_store, fast_store, _slow_store) = make_fast_slow_stores();
@@ -169,6 +178,7 @@ async fn fast_slow_update_fail_propagates_error() -> Result<(), Error> {
 // normal reads should work (the blob is served from the slow store
 // via the populate path).
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn fast_slow_get_part_not_found_propagates_then_recovers() -> Result<(), Error> {
     let (fast_slow_store, _fast_store, slow_store) = make_fast_slow_stores();
@@ -220,6 +230,7 @@ async fn fast_slow_get_part_not_found_propagates_then_recovers() -> Result<(), E
 // NOT record the blob as existing. This prevents stale positives where
 // has() returns true but get_part() returns NotFound.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn existence_cache_write_fail_does_not_cache() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
@@ -283,6 +294,7 @@ async fn existence_cache_write_fail_does_not_cache() -> Result<(), Error> {
 // Same as test 4, but for the update_oneshot code path. Both paths
 // must be consistent in their cache behavior on failure.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn existence_cache_update_oneshot_fail_does_not_cache() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
@@ -336,6 +348,7 @@ async fn existence_cache_update_oneshot_fail_does_not_cache() -> Result<(), Erro
 // removed. This test pre-populates the cache, then triggers a NotFound
 // via failpoint, and verifies the stale entry is cleaned.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn existence_cache_get_part_not_found_cleans_cache() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
@@ -425,6 +438,7 @@ async fn existence_cache_get_part_not_found_cleans_cache() -> Result<(), Error> 
 // falling behind the sliding window), the caller must handle the
 // error gracefully.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn streaming_blob_reader_failpoint_returns_error() -> Result<(), Error> {
     use nativelink_util::streaming_blob::StreamingBlob;
@@ -480,6 +494,7 @@ async fn streaming_blob_reader_failpoint_returns_error() -> Result<(), Error> {
 // (offset + length) is requested, the populate+fallback path returns
 // the correct byte range even after a transient failure.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn fast_slow_populate_unavailable_then_partial_read() -> Result<(), Error> {
     let (fast_slow_store, _fast_store, slow_store) = make_fast_slow_stores();
@@ -521,6 +536,7 @@ async fn fast_slow_populate_unavailable_then_partial_read() -> Result<(), Error>
 // This tests that failpoints don't cause cross-contamination between
 // independent operations.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn existence_cache_concurrent_write_one_fails() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
@@ -584,6 +600,7 @@ async fn existence_cache_concurrent_write_one_fails() -> Result<(), Error> {
 // due to a failpoint, the original data must remain intact and
 // readable.
 // -------------------------------------------------------------------------
+#[serial(failpoints)]
 #[nativelink_test]
 async fn fast_slow_update_fail_preserves_existing_data() -> Result<(), Error> {
     let (fast_slow_store, _fast_store, slow_store) = make_fast_slow_stores();
@@ -626,5 +643,162 @@ async fn fast_slow_update_fail_preserves_existing_data() -> Result<(), Error> {
         "original data should be preserved after failed update"
     );
 
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// 11. populate_fast_store_unchecked: eviction-between-copy-and-verify (a)
+//
+// Force the first verify to report missing (simulating LRU eviction
+// between the copy and the verify). The retry should fire, the second
+// copy should land, the second verify should succeed, and the function
+// should return Ok with no spurious error.
+//
+// `#[serial]` because the failpoint name is process-wide; tests 11/12/13
+// share `fast_slow_populate_unchecked_force_evict_first/second`.
+// -------------------------------------------------------------------------
+#[serial(failpoints)]
+#[nativelink_test]
+async fn populate_unchecked_evict_between_copy_and_verify_retries_ok() -> Result<(), Error> {
+    use std::sync::Arc;
+    let fast_store_inner = MemoryStore::new(&MemorySpec::default());
+    let slow_store_inner = MemoryStore::new(&MemorySpec::default());
+    let fast_store = Store::new(fast_store_inner.clone());
+    let slow_store = Store::new(slow_store_inner.clone());
+    let fss: Arc<FastSlowStore> = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store.clone(),
+        slow_store.clone(),
+    );
+
+    let data = Bytes::from(vec![0x77; 256]);
+    let digest = DigestInfo::try_new(VALID_HASH, 256).unwrap();
+    slow_store.update_oneshot(digest, data.clone()).await?;
+
+    // Activate first-verify miss exactly once. Second verify proceeds
+    // normally, so the retry copy + retry verify should pass.
+    fail::cfg(
+        "fast_slow_populate_unchecked_force_evict_first",
+        "1*return->off",
+    )
+    .unwrap();
+
+    let res = fss.populate_fast_store_unchecked(digest.into()).await;
+    fail::cfg("fast_slow_populate_unchecked_force_evict_first", "off").unwrap();
+
+    assert!(
+        res.is_ok(),
+        "retry should succeed and return Ok, got: {res:?}"
+    );
+    assert!(
+        fast_store.has(digest).await?.is_some(),
+        "blob should be present in fast store after retry"
+    );
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// 12. populate_fast_store_unchecked: double-eviction returns Aborted (b)
+//
+// Both verifies are forced to report missing. The function should give
+// up after the single retry and return Code::Aborted with the
+// over-pressure message.
+// -------------------------------------------------------------------------
+#[serial(failpoints)]
+#[nativelink_test]
+async fn populate_unchecked_double_evict_returns_aborted() -> Result<(), Error> {
+    use std::sync::Arc;
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss: Arc<FastSlowStore> = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store.clone(),
+    );
+
+    let data = Bytes::from(vec![0x88; 128]);
+    let digest = DigestInfo::try_new(VALID_HASH, 128).unwrap();
+    slow_store.update_oneshot(digest, data.clone()).await?;
+
+    fail::cfg(
+        "fast_slow_populate_unchecked_force_evict_first",
+        "return",
+    )
+    .unwrap();
+    fail::cfg(
+        "fast_slow_populate_unchecked_force_evict_second",
+        "return",
+    )
+    .unwrap();
+
+    let res = fss.populate_fast_store_unchecked(digest.into()).await;
+
+    fail::cfg("fast_slow_populate_unchecked_force_evict_first", "off").unwrap();
+    fail::cfg("fast_slow_populate_unchecked_force_evict_second", "off").unwrap();
+
+    let err = res.expect_err("expected Aborted on double-evict");
+    assert_eq!(
+        err.code,
+        Code::Aborted,
+        "expected Code::Aborted, got {:?}: {}",
+        err.code,
+        err.messages.join(" / ")
+    );
+    let combined = err.messages.join(" ");
+    assert!(
+        combined.contains("over-pressured")
+            || combined.contains("not present after copy + retry"),
+        "expected over-pressure message, got: {combined}"
+    );
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// 13. populate_fast_store_unchecked: replacement-not-eviction (c)
+//
+// In the no-failpoint (normal) path, the blob actually lands and the
+// post-copy verify sees Some. No retry, no warn, Ok returned.
+// -------------------------------------------------------------------------
+#[serial(failpoints)]
+#[nativelink_test]
+async fn populate_unchecked_replacement_not_eviction_no_retry() -> Result<(), Error> {
+    use std::sync::Arc;
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss: Arc<FastSlowStore> = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store.clone(),
+        slow_store.clone(),
+    );
+
+    let data = Bytes::from(vec![0x99; 64]);
+    let digest = DigestInfo::try_new(VALID_HASH, 64).unwrap();
+    slow_store.update_oneshot(digest, data.clone()).await?;
+
+    // No failpoints active. The post-copy verify will see Some — even if
+    // a parallel writer for the same key has written into the same slot,
+    // has() still returns Some. The replacement is invisible to the
+    // verify path; this test asserts that case is NOT a retry trigger.
+    fail::cfg("fast_slow_populate_unchecked_force_evict_first", "off").unwrap();
+    fail::cfg("fast_slow_populate_unchecked_force_evict_second", "off").unwrap();
+
+    let res = fss.populate_fast_store_unchecked(digest.into()).await;
+    assert!(res.is_ok(), "verify should see Some, no retry; got: {res:?}");
+    assert!(fast_store.has(digest).await?.is_some());
     Ok(())
 }
