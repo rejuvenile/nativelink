@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -133,6 +134,19 @@ pub struct GrpcStore {
     /// indefinitely (current behavior); used by WorkerProxyStore at 3s
     /// to fast-fail mirror writes to dead workers.
     connection_acquire_timeout_ms: Option<u64>,
+    /// Per-chunk retry outcome counters for `get_part_parallel`.
+    /// `succeeded` means a chunk that needed at least one retry
+    /// eventually returned its bytes; `failed` means the retrier
+    /// exhausted attempts (or hit a non-retryable error after at
+    /// least one retry). First-try successes do not increment either
+    /// counter. Operators should watch these for sustained growth —
+    /// rising rates indicate the per-chunk retry is band-aiding a
+    /// real upstream problem (server flapping, h2 RST_STREAM bursts,
+    /// etc.) rather than recovering rare transient glitches.
+    #[metric(help = "Per-chunk retries in get_part_parallel that eventually succeeded")]
+    parallel_chunk_retries_succeeded: AtomicU64,
+    #[metric(help = "Per-chunk retries in get_part_parallel that exhausted retries and failed")]
+    parallel_chunk_retries_failed: AtomicU64,
 }
 
 impl GrpcStore {
@@ -252,6 +266,8 @@ impl GrpcStore {
             parallel_chunk_count: spec.parallel_chunk_count.max(1),
             zstd_compression: spec.zstd_compression,
             connection_acquire_timeout_ms: spec.connection_acquire_timeout_ms,
+            parallel_chunk_retries_succeeded: AtomicU64::new(0),
+            parallel_chunk_retries_failed: AtomicU64::new(0),
         });
 
         if let Some(rx) = batch_rx {
@@ -1478,16 +1494,35 @@ impl GrpcStore {
                                 bytes_received: 0,
                                 attempt: 0,
                             };
+                            // Mirror `state.attempt` outside the
+                            // unfold so the outer code can classify
+                            // the per-chunk retry outcome
+                            // (succeeded / failed) for the
+                            // `parallel_chunk_retries_*` metrics.
+                            // We can't read `state` after retrier
+                            // completion because the unfold consumes
+                            // it.
+                            let attempt_counter =
+                                Arc::new(AtomicU32::new(0));
+                            let attempt_counter_inner =
+                                attempt_counter.clone();
 
-                            self.retrier
+                            let result = self.retrier
                                 .retry(unfold(
                                     initial_state,
                                     |mut state| {
                                         let resource_name =
                                             resource_name.clone();
                                         let tx = tx.clone();
+                                        let attempt_counter =
+                                            attempt_counter_inner
+                                                .clone();
                                         async move {
                                             state.attempt += 1;
+                                            attempt_counter.store(
+                                                state.attempt,
+                                                Ordering::Relaxed,
+                                            );
                                             let resume_offset =
                                                 chunk_offset
                                                     + state
@@ -1650,7 +1685,32 @@ impl GrpcStore {
                                     format!(
                                         "in GrpcStore::get_part_parallel chunk {idx}"
                                     )
-                                })
+                                });
+
+                            // Classify the per-chunk retry outcome
+                            // for the `parallel_chunk_retries_*`
+                            // counters. We only count chunks where
+                            // at least one retry attempt happened
+                            // (`final_attempts > 1`); a first-try
+                            // success or first-try permanent error
+                            // (no retry attempted) does not bump
+                            // either counter. `succeeded` means the
+                            // retry recovered the chunk; `failed`
+                            // means the retrier exhausted attempts
+                            // (or the next attempt hit a
+                            // non-retryable error).
+                            let final_attempts = attempt_counter
+                                .load(Ordering::Relaxed);
+                            if final_attempts > 1 {
+                                if result.is_ok() {
+                                    self.parallel_chunk_retries_succeeded
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    self.parallel_chunk_retries_failed
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            result
                         }
                     },
                 )
