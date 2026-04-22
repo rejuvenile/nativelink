@@ -277,6 +277,11 @@ impl GrpcStore {
     /// connection backlog while reconnect attempts run on 1s backoff.
     /// Reads are intentionally NOT wrapped: cluster-start latency on the
     /// critical path should wait, not error.
+    ///
+    /// The "ConnectionRefused" prefix produced on timeout (see
+    /// `ConnectionManager::connection_with_timeout`) is matched by
+    /// `worker_proxy_store::is_definitive_unreachable` to fast-quarantine
+    /// the dead worker.
     async fn acquire_write_channel(
         &self,
         cm: &ConnectionManager,
@@ -284,23 +289,8 @@ impl GrpcStore {
     ) -> Result<nativelink_util::connection_manager::Connection, Error> {
         match self.connection_acquire_timeout_ms {
             Some(ms) => {
-                match tokio::time::timeout(
-                    Duration::from_millis(ms),
-                    cm.connection(ctx.into()),
-                )
-                .await
-                {
-                    Ok(Ok(ch)) => Ok(ch),
-                    Ok(Err(e)) => Err(e),
-                    // The "ConnectionRefused" prefix is intentionally
-                    // matched by `worker_proxy_store::is_definitive_unreachable`
-                    // so this timeout fast-quarantines the dead worker.
-                    // Do not change the prefix without updating that helper.
-                    Err(_) => Err(make_err!(
-                        Code::Unavailable,
-                        "ConnectionRefused: connection acquire timed out after {ms}ms (ctx={ctx})"
-                    )),
-                }
+                cm.connection_with_timeout(ctx.into(), Duration::from_millis(ms))
+                    .await
             }
             None => cm.connection(ctx.into()).await,
         }
@@ -1455,81 +1445,212 @@ impl GrpcStore {
                     |(idx, ((chunk_offset, chunk_length), tx))| {
                         let resource_name = resource_name.to_string();
                         async move {
-                            let request = ReadRequest {
-                                resource_name,
-                                read_offset: i64::try_from(
-                                    chunk_offset,
-                                )
-                                .err_tip(|| {
-                                    "Could not convert chunk offset \
-                                     to i64"
-                                })?,
-                                read_limit: i64::try_from(
-                                    chunk_length,
-                                )
-                                .err_tip(|| {
-                                    "Could not convert chunk length \
-                                     to i64"
-                                })?,
+                            // Per-chunk early-EOF retry: when the
+                            // server's stream yields `None` (or an
+                            // empty message) before delivering the
+                            // full `chunk_length`, retry the residual
+                            // range
+                            // `[chunk_offset + bytes_received,
+                            //   chunk_offset + chunk_length)` through
+                            // `self.retrier`. This mirrors the
+                            // resilience that `get_part_single_stream`
+                            // provides for non-parallel reads, and
+                            // converts a one-shot `DataLoss` into a
+                            // transient, recoverable condition.
+                            // Without this retry, a single network
+                            // glitch (h2 RST_STREAM, server-side `tx`
+                            // drop without a Status frame, or
+                            // transient store hiccup) caused the
+                            // entire `get_part_parallel` call to fail,
+                            // which the upstream worker's
+                            // `prepare_action_inputs` cannot recover
+                            // from mid-tree-walk.
+                            //
+                            // Production symptom (worker logs):
+                            //   parallel read chunk N: expected X
+                            //   bytes but got 0 :
+                            //   Sender dropped before sending EOF
+                            struct ChunkState {
+                                bytes_received: u64,
+                                attempt: u32,
+                            }
+                            let initial_state = ChunkState {
+                                bytes_received: 0,
+                                attempt: 0,
                             };
-                            let mut stream = self
-                                .read_internal(request, true)
+
+                            self.retrier
+                                .retry(unfold(
+                                    initial_state,
+                                    |mut state| {
+                                        let resource_name =
+                                            resource_name.clone();
+                                        let tx = tx.clone();
+                                        async move {
+                                            state.attempt += 1;
+                                            let resume_offset =
+                                                chunk_offset
+                                                    + state
+                                                        .bytes_received;
+                                            let resume_limit =
+                                                chunk_length
+                                                    - state
+                                                        .bytes_received;
+                                            let read_offset_i64 =
+                                                match i64::try_from(
+                                                    resume_offset,
+                                                ) {
+                                                    Ok(v) => v,
+                                                    Err(_) => {
+                                                        return Some((
+                                                            RetryResult::Err(make_err!(
+                                                                Code::InvalidArgument,
+                                                                "chunk {idx}: could not convert resume offset {resume_offset} to i64"
+                                                            )),
+                                                            state,
+                                                        ));
+                                                    }
+                                                };
+                                            let read_limit_i64 =
+                                                match i64::try_from(
+                                                    resume_limit,
+                                                ) {
+                                                    Ok(v) => v,
+                                                    Err(_) => {
+                                                        return Some((
+                                                            RetryResult::Err(make_err!(
+                                                                Code::InvalidArgument,
+                                                                "chunk {idx}: could not convert resume limit {resume_limit} to i64"
+                                                            )),
+                                                            state,
+                                                        ));
+                                                    }
+                                                };
+                                            let request = ReadRequest {
+                                                resource_name,
+                                                read_offset: read_offset_i64,
+                                                read_limit: read_limit_i64,
+                                            };
+                                            let mut stream = match self
+                                                .read_internal(
+                                                    request, true,
+                                                )
+                                                .await
+                                            {
+                                                Ok(s) => s,
+                                                Err(err) => {
+                                                    return Some((
+                                                        RetryResult::Retry(err.append(format!(
+                                                            "in GrpcStore::get_part_parallel chunk {idx} (attempt {})",
+                                                            state.attempt
+                                                        ))),
+                                                        state,
+                                                    ));
+                                                }
+                                            };
+
+                                            // Per-attempt counter: if
+                                            // this attempt produced no
+                                            // bytes, the next retry
+                                            // requests the same range
+                                            // again (state untouched);
+                                            // if it produced some
+                                            // bytes, the next retry
+                                            // resumes at the new
+                                            // offset.
+                                            let mut bytes_this_attempt: u64 = 0;
+                                            loop {
+                                                match stream.next().await {
+                                                    None => break,
+                                                    Some(Ok(message)) => {
+                                                        if message.data.is_empty() {
+                                                            break;
+                                                        }
+                                                        let n = message.data.len() as u64;
+                                                        bytes_this_attempt += n;
+                                                        state.bytes_received += n;
+                                                        if tx.send(message.data).await.is_err() {
+                                                            // Writer
+                                                            // (output) dropped — terminal,
+                                                            // do not retry.
+                                                            return Some((
+                                                                RetryResult::Err(make_err!(
+                                                                    Code::Internal,
+                                                                    "parallel read chunk {idx}: writer dropped receiver"
+                                                                )),
+                                                                state,
+                                                            ));
+                                                        }
+                                                    }
+                                                    Some(Err(status)) => {
+                                                        // Network /
+                                                        // server-side
+                                                        // error — let
+                                                        // the retrier
+                                                        // decide based
+                                                        // on the gRPC
+                                                        // status code.
+                                                        let err = Into::<Error>::into(status).append(format!(
+                                                            "chunk {idx} at offset {resume_offset} (attempt {})",
+                                                            state.attempt
+                                                        ));
+                                                        return Some((
+                                                            RetryResult::Retry(err),
+                                                            state,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+
+                                            if state.bytes_received == chunk_length {
+                                                return Some((
+                                                    RetryResult::Ok(()),
+                                                    state,
+                                                ));
+                                            }
+
+                                            // Stream ended early.
+                                            // Retry the residual
+                                            // range. The most common
+                                            // production trigger is
+                                            // the server's `tx`
+                                            // channel dropped without
+                                            // an EOF (e.g.
+                                            // FastSlowStore's
+                                            // data_stream_fut canceled
+                                            // mid-flight), which
+                                            // surfaces here as
+                                            // `bytes_received == 0`
+                                            // and no Status frame.
+                                            warn!(
+                                                chunk_idx = idx,
+                                                resume_offset,
+                                                resume_limit,
+                                                bytes_this_attempt,
+                                                bytes_received_total = state.bytes_received,
+                                                expected = chunk_length,
+                                                attempt = state.attempt,
+                                                "parallel read chunk: stream ended early, will retry residual range"
+                                            );
+                                            Some((
+                                                RetryResult::Retry(make_err!(
+                                                    Code::DataLoss,
+                                                    "parallel read chunk {idx}: stream ended early on attempt {} \
+                                                     (got {bytes_this_attempt} this attempt, {} of {chunk_length} total)",
+                                                    state.attempt,
+                                                    state.bytes_received
+                                                )),
+                                                state,
+                                            ))
+                                        }
+                                    },
+                                ))
                                 .await
                                 .err_tip(|| {
                                     format!(
-                                        "in \
-                                         GrpcStore::get_part_parallel \
-                                         chunk {idx}"
+                                        "in GrpcStore::get_part_parallel chunk {idx}"
                                     )
-                                })?;
-
-                            let mut bytes_received: u64 = 0;
-                            loop {
-                                match stream.next().await {
-                                    None => break,
-                                    Some(Ok(message)) => {
-                                        if message.data.is_empty() {
-                                            break;
-                                        }
-                                        bytes_received +=
-                                            message.data.len() as u64;
-                                        tx.send(message.data)
-                                            .await
-                                            .map_err(|_| {
-                                                make_err!(
-                                                    Code::Internal,
-                                                    "parallel read \
-                                                     chunk {idx}: \
-                                                     writer dropped \
-                                                     receiver"
-                                                )
-                                            })?;
-                                    }
-                                    Some(Err(status)) => {
-                                        return Err(
-                                            Into::<Error>::into(
-                                                status,
-                                            )
-                                            .append(format!(
-                                                "chunk {idx} at \
-                                                 offset \
-                                                 {chunk_offset}"
-                                            )),
-                                        );
-                                    }
-                                }
-                            }
-
-                            if bytes_received != chunk_length {
-                                return Err(make_err!(
-                                    Code::DataLoss,
-                                    "parallel read chunk {idx}: \
-                                     expected {chunk_length} bytes \
-                                     but got {bytes_received}"
-                                ));
-                            }
-
-                            Ok(())
+                                })
                         }
                     },
                 )

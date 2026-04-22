@@ -173,6 +173,32 @@ impl ConnectionManager {
         rx.await
             .map_err(|err| make_err!(Code::Unavailable, "Waiting for a new connection: {err:?}"))
     }
+
+    /// Like [`Self::connection`] but fast-fails with `Code::Unavailable` when
+    /// the worker doesn't deliver a channel within `timeout`. Use this on call
+    /// sites that must not stall indefinitely when the connection pool is
+    /// exhausted (e.g. all upstream channels are stuck in long-running RPCs
+    /// or in transport reconnect backoff).
+    ///
+    /// The error message is prefixed with `"ConnectionRefused"` so callers
+    /// like `worker_proxy_store::is_definitive_unreachable` can fast-quarantine
+    /// the unreachable peer. Do NOT change the prefix without updating those
+    /// classifiers.
+    pub async fn connection_with_timeout(
+        &self,
+        reason: String,
+        timeout: Duration,
+    ) -> Result<Connection, Error> {
+        match tokio::time::timeout(timeout, self.connection(reason)).await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(make_err!(
+                Code::Unavailable,
+                "ConnectionRefused: connection acquire timed out after {}ms",
+                timeout.as_millis(),
+            )),
+        }
+    }
 }
 
 impl ConnectionManagerWorker {
@@ -504,5 +530,56 @@ impl Future for ResponseFuture {
             );
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nativelink_config::stores::Retry;
+    use nativelink_error::Code;
+    use tonic::transport::Endpoint;
+
+    use super::ConnectionManager;
+
+    /// When the pool has no available channels (here: a single endpoint that
+    /// will never connect within the test window), `connection_with_timeout`
+    /// must fast-fail with `Code::Unavailable` and a "ConnectionRefused"
+    /// prefix that downstream classifiers (e.g.
+    /// `worker_proxy_store::is_definitive_unreachable`) match on.
+    #[tokio::test]
+    async fn connection_with_timeout_returns_unavailable_when_pool_drained() {
+        // RFC 5737 TEST-NET-1 (192.0.2.0/24): unroutable, so the background
+        // connect attempt cannot succeed within the test's 100ms window —
+        // the OS connect either hangs or returns EHOSTUNREACH and the
+        // retrier sleeps 1s before retrying. Either way no channel is
+        // delivered; the request stays queued in `waiting_connections`
+        // and our `connection_with_timeout` timer fires.
+        let endpoint = Endpoint::from_static("http://192.0.2.1:1");
+        let cm = ConnectionManager::new(
+            std::iter::once(endpoint),
+            /* connections_per_endpoint */ 1,
+            /* max_concurrent_requests */ 1,
+            Retry::default(),
+            Arc::new(|d| d),
+        );
+
+        let err = cm
+            .connection_with_timeout(
+                "test".to_string(),
+                core::time::Duration::from_millis(100),
+            )
+            .await
+            .expect_err("expected timeout error when no channel is available");
+
+        assert_eq!(err.code, Code::Unavailable, "wrong code: {err:?}");
+        assert!(
+            err.messages
+                .iter()
+                .any(|m| m.starts_with("ConnectionRefused")),
+            "expected message to start with 'ConnectionRefused', got: {:?}",
+            err.messages
+        );
     }
 }
