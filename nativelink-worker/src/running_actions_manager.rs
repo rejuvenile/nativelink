@@ -2658,9 +2658,12 @@ impl RunningActionImpl {
                 }
                 // Now the work directory has been created (or will be via symlink).
                 self.did_cleanup.store(false, Ordering::Release);
-                // Download the input files/folder and place them into the temp directory.
-                // Use directory cache if available for better performance.
-                self.metrics()
+                // Cap input fetch at 60s so a silent-stall in get_part_parallel
+                // (chunk truncation -> orphan-dropped streaming_writer ->
+                // construction_lock waiter never wakes) bubbles up as a real
+                // action failure instead of leaving the action stuck in
+                // Executing forever (which Bazel sees as a 100min hang).
+                let prepare_fut = self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
                         &self.running_actions_manager.directory_cache,
@@ -2670,8 +2673,15 @@ impl RunningActionImpl {
                         &self.work_directory,
                         pre_resolved_tree,
                         server_missing_digests,
-                    ))
-                    .await
+                    ));
+                match tokio::time::timeout(Duration::from_secs(60), prepare_fut).await {
+                    Ok(res) => res,
+                    Err(_) => Err(make_err!(
+                        Code::DeadlineExceeded,
+                        "prepare_action_inputs timed out after 60s \
+                            -- likely a chunked read deadlock"
+                    )),
+                }
             })
             .await?;
             // Store direct-use digest if active, for cleanup ref-count release.

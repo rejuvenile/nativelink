@@ -439,57 +439,68 @@ impl FastSlowStore {
         let (slow_tx, mut slow_rx) = make_buf_channel_pair_with_size(128);
         let data_stream_fut = async move {
             let mut maybe_writer_pin = maybe_writer.map(Pin::new);
-            loop {
-                let output_buf = slow_rx
-                    .recv()
-                    .await
-                    .err_tip(|| "Failed to read data data buffer from slow store")?;
-                if output_buf.is_empty() {
-                    // Write out our EOF.
-                    // We are dropped as soon as we send_eof to writer_pin, so
-                    // we wait until we've finished all of our joins to do that.
-                    let fast_res = fast_tx.send_eof();
-                    // Signal EOF to streaming waiters.
-                    if let Some(ref mut sw) = streaming_writer {
-                        let _ = sw.send_eof();
+            // Inner loop returns errors; outer block forwards them to
+            // `streaming_writer` BEFORE drop. Without this, a silent-truncation
+            // error from get_part_parallel propagates via `?`, drops the
+            // writer, and downstream waiters on construction_lock get a
+            // generic "writer dropped without eof" instead of the real cause.
+            let result: Result<(Result<(), Error>, _), Error> = async {
+                loop {
+                    let output_buf = slow_rx
+                        .recv()
+                        .await
+                        .err_tip(|| "Failed to read data data buffer from slow store")?;
+                    if output_buf.is_empty() {
+                        let fast_res = fast_tx.send_eof();
+                        if let Some(ref mut sw) = streaming_writer {
+                            let _ = sw.send_eof();
+                        }
+                        return Ok((fast_res, maybe_writer_pin));
                     }
-                    return Ok::<_, Error>((fast_res, maybe_writer_pin));
-                }
 
-                if !counted_hit {
+                    if !counted_hit {
+                        self.metrics
+                            .slow_store_hit_count
+                            .fetch_add(1, Ordering::Acquire);
+                        counted_hit = true;
+                    }
+
+                    let output_buf_len = u64::try_from(output_buf.len())
+                        .err_tip(|| "Could not output_buf.len() to u64")?;
                     self.metrics
-                        .slow_store_hit_count
-                        .fetch_add(1, Ordering::Acquire);
-                    counted_hit = true;
+                        .slow_store_downloaded_bytes
+                        .fetch_add(output_buf_len, Ordering::Acquire);
+
+                    let writer_fut = Self::calculate_range(
+                        &(bytes_received..bytes_received + output_buf_len),
+                        &send_range,
+                    )?
+                    .zip(maybe_writer_pin.as_mut())
+                    .map_or_else(
+                        || futures::future::ready(Ok(())).left_future(),
+                        |(range, writer_pin)| writer_pin.send(output_buf.slice(range)).right_future(),
+                    );
+
+                    bytes_received += output_buf_len;
+
+                    if let Some(ref sw) = streaming_writer {
+                        let _ = sw.send(output_buf.clone()).await;
+                    }
+
+                    let (fast_tx_res, writer_res) = join!(fast_tx.send(output_buf), writer_fut);
+                    fast_tx_res.err_tip(|| "Failed to write to fast store in fast_slow store")?;
+                    writer_res.err_tip(|| "Failed to write result to writer in fast_slow store")?;
                 }
+            }.await;
 
-                let output_buf_len = u64::try_from(output_buf.len())
-                    .err_tip(|| "Could not output_buf.len() to u64")?;
-                self.metrics
-                    .slow_store_downloaded_bytes
-                    .fetch_add(output_buf_len, Ordering::Acquire);
-
-                let writer_fut = Self::calculate_range(
-                    &(bytes_received..bytes_received + output_buf_len),
-                    &send_range,
-                )?
-                .zip(maybe_writer_pin.as_mut())
-                .map_or_else(
-                    || futures::future::ready(Ok(())).left_future(),
-                    |(range, writer_pin)| writer_pin.send(output_buf.slice(range)).right_future(),
-                );
-
-                bytes_received += output_buf_len;
-
-                // Tee data to the streaming buffer so waiters can read
-                // concurrently instead of blocking until populate completes.
-                if let Some(ref sw) = streaming_writer {
-                    let _ = sw.send(output_buf.clone()).await;
+            match result {
+                Ok(ok) => Ok::<_, Error>(ok),
+                Err(err) => {
+                    if let Some(ref mut sw) = streaming_writer {
+                        sw.send_error(err.clone());
+                    }
+                    Err(err)
                 }
-
-                let (fast_tx_res, writer_res) = join!(fast_tx.send(output_buf), writer_fut);
-                fast_tx_res.err_tip(|| "Failed to write to fast store in fast_slow store")?;
-                writer_res.err_tip(|| "Failed to write result to writer in fast_slow store")?;
             }
         };
 
