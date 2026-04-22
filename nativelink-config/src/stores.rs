@@ -1414,6 +1414,22 @@ pub struct GrpcSpec {
     /// Default: false
     #[serde(default)]
     pub zstd_compression: bool,
+
+    /// Cap on `ConnectionManager::connection().await` for write-side RPCs
+    /// (currently `bytestream_write` for both Tcp and Dual transports).
+    /// `None` preserves the default behavior of waiting indefinitely until
+    /// the connection_manager produces a channel — appropriate for general
+    /// GrpcStore consumers where reads are on the critical path.
+    ///
+    /// `Some(ms)` is used by `WorkerProxyStore::create_worker_connection`
+    /// (set to 3000) so that mirror writes to a dead worker fast-fail
+    /// instead of queuing against the 256-slot connection backlog and
+    /// holding per-worker mirror permits while waiting for a 1s reconnect
+    /// backoff to retry.
+    ///
+    /// Default: None
+    #[serde(default)]
+    pub connection_acquire_timeout_ms: Option<u64>,
 }
 
 /// The possible error codes that might occur on an upstream request.

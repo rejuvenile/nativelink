@@ -1416,6 +1416,37 @@ fn dump_thread_stacks() {
     nativelink_util::stall_detector::dump_thread_stacks("runtime-watchdog");
 }
 
+/// Write one line to the watchdog heartbeat file in /dev/shm.
+/// Errors are ignored — the heartbeat is a best-effort forensic signal.
+fn write_heartbeat(
+    file: Option<&mut std::fs::File>,
+    tick: u64,
+    uptime_secs: u64,
+    stall_count: u64,
+    counter: u64,
+    stall_event: Option<(&str, f64)>,
+) {
+    let Some(file) = file else { return };
+    use std::io::Write;
+    let wall_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let result = match stall_event {
+        Some((state, secs)) => writeln!(
+            file,
+            "ts={wall_ts} tick={tick} uptime_secs={uptime_secs} stall_count={stall_count} counter={counter} stall={state} stall_secs={secs:.1}"
+        ),
+        None => writeln!(
+            file,
+            "ts={wall_ts} tick={tick} uptime_secs={uptime_secs} stall_count={stall_count} counter={counter}"
+        ),
+    };
+    if result.is_ok() {
+        let _ = file.flush();
+    }
+}
+
 /// Sets the current thread's QoS class to USER_INITIATED on macOS so the
 /// kernel prefers scheduling on performance cores instead of efficiency cores.
 #[cfg(target_os = "macos")]
@@ -1454,6 +1485,15 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         .max_blocking_threads(1024)
         .enable_all()
         .build()?;
+
+    // Initialize the global rayon pool with a tokio handle bridge. This
+    // must run before any rayon::spawn or blake3 mmap call so every rayon
+    // worker thread carries the tokio runtime and any code (or Drop) that
+    // touches a tokio API does not panic-abort the process.
+    if let Err(e) = nativelink_util::rayon_pool::init_rayon_pool(runtime.handle().clone()) {
+        eprintln!("failed to initialize rayon global pool: {e:?}");
+        return Err(Box::new(e));
+    }
 
     // Parse config before tracing init so we can read disable_otlp.
     let mut cfg = get_config()?;
@@ -1548,11 +1588,46 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         .spawn(move || {
             let stall_threshold = Duration::from_secs(2);
             let check_interval = Duration::from_secs(1);
+            // Heartbeat written to /dev/shm bypasses tracing-appender,
+            // systemd-journald, and stdio. During a journald-pressure event
+            // (e.g. a co-tenant filling the journal socket) the in-band
+            // logs go silent for minutes; this file's mtime + last line
+            // tell post-mortem whether the runtime itself was alive:
+            // - heartbeat updating, app logs missing -> appender blocked
+            // - heartbeat frozen too -> OS thread starvation / process
+            //   reclaim / mimalloc lockup
+            const HEARTBEAT_FILE: &str = "/dev/shm/nativelink-heartbeat";
+            let mut heartbeat_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(HEARTBEAT_FILE)
+                .map_err(|e| {
+                    eprintln!("watchdog: failed to open {HEARTBEAT_FILE}: {e}");
+                    e
+                })
+                .ok();
+            let watchdog_start = std::time::Instant::now();
+            let heartbeat_interval = Duration::from_secs(30);
+            let mut last_heartbeat = std::time::Instant::now();
+            let mut heartbeat_tick: u64 = 0;
+            let mut stall_count: u64 = 0;
+            // Emit an immediate baseline tick so post-mortems can confirm
+            // the heartbeat was wired up at startup.
+            write_heartbeat(
+                heartbeat_file.as_mut(),
+                0,
+                0,
+                0,
+                heartbeat_counter.load(Ordering::Relaxed),
+                None,
+            );
             loop {
                 let before = heartbeat_counter.load(Ordering::Relaxed);
                 std::thread::sleep(check_interval);
                 let after = heartbeat_counter.load(Ordering::Relaxed);
                 if before == after {
+                    stall_count = stall_count.saturating_add(1);
                     let stall_start = std::time::Instant::now();
                     let mut stall_logged = false;
                     // Confirmed stall — wait until it resolves to measure duration.
@@ -1561,9 +1636,18 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
                         let now = heartbeat_counter.load(Ordering::Relaxed);
                         if now != after {
                             let stall_duration = stall_start.elapsed();
+                            let total_secs = stall_duration.as_secs_f64()
+                                + check_interval.as_secs_f64();
                             eprintln!(
-                                "RUNTIME STALL RESOLVED: tokio runtime was unresponsive for {:.1}s (heartbeat stuck at {after})",
-                                stall_duration.as_secs_f64() + check_interval.as_secs_f64(),
+                                "RUNTIME STALL RESOLVED: tokio runtime was unresponsive for {total_secs:.1}s (heartbeat stuck at {after})",
+                            );
+                            write_heartbeat(
+                                heartbeat_file.as_mut(),
+                                heartbeat_tick,
+                                watchdog_start.elapsed().as_secs(),
+                                stall_count,
+                                now,
+                                Some(("RESOLVED", total_secs)),
                             );
                             break;
                         }
@@ -1574,9 +1658,29 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
                             eprintln!(
                                 "RUNTIME STALL IN PROGRESS: tokio runtime unresponsive for >{total:.1}s (heartbeat stuck at {after})",
                             );
+                            write_heartbeat(
+                                heartbeat_file.as_mut(),
+                                heartbeat_tick,
+                                watchdog_start.elapsed().as_secs(),
+                                stall_count,
+                                after,
+                                Some(("IN_PROGRESS", total)),
+                            );
                             dump_thread_stacks();
                         }
                     }
+                }
+                if last_heartbeat.elapsed() >= heartbeat_interval {
+                    heartbeat_tick = heartbeat_tick.saturating_add(1);
+                    last_heartbeat = std::time::Instant::now();
+                    write_heartbeat(
+                        heartbeat_file.as_mut(),
+                        heartbeat_tick,
+                        watchdog_start.elapsed().as_secs(),
+                        stall_count,
+                        after,
+                        None,
+                    );
                 }
             }
         })

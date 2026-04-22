@@ -435,6 +435,13 @@ impl Store {
         self.inner.pin_digests(digests);
     }
 
+    /// Pin digests and report per-digest success.
+    /// Delegates to the inner [`StoreDriver::pin_digests_with_results`].
+    #[inline]
+    pub fn pin_digests_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        self.inner.pin_digests_with_results(digests)
+    }
+
     /// Drain digests whose background slow-store write failed.
     /// Delegates to the inner [`StoreDriver::drain_failed_digests`].
     #[inline]
@@ -963,6 +970,18 @@ pub trait StoreDriver:
     /// support pinning (e.g., `FilesystemStore`) override this to call
     /// `MokaEvictingMap::pin_key()`. The default is a no-op.
     fn pin_digests(&self, _digests: &[DigestInfo]) {}
+
+    /// Like `pin_digests` but reports per-digest success. The returned
+    /// vec has one entry per input digest, in order: `true` if the digest
+    /// was present in the store and is now pinned, `false` if it was
+    /// absent (e.g. already evicted) and so could not be pinned.
+    /// Default implementation calls `pin_digests` and reports `true` for
+    /// every input — stores that don't support pinning still appear to
+    /// succeed (existing semantics preserved).
+    fn pin_digests_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        self.pin_digests(digests);
+        vec![true; digests.len()]
+    }
 
     /// Drain digests whose background slow-store write failed.
     /// Used by the worker to retry uploads on reconnect. Wrapper stores

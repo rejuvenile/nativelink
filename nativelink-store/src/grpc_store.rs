@@ -129,6 +129,10 @@ pub struct GrpcStore {
     parallel_chunk_count: u64,
     /// Enable zstd compression at the tonic transport level.
     zstd_compression: bool,
+    /// Cap on `cm.connection()` for write-side RPCs. None = wait
+    /// indefinitely (current behavior); used by WorkerProxyStore at 3s
+    /// to fast-fail mirror writes to dead workers.
+    connection_acquire_timeout_ms: Option<u64>,
 }
 
 impl GrpcStore {
@@ -247,6 +251,7 @@ impl GrpcStore {
             parallel_chunk_read_threshold: spec.parallel_chunk_read_threshold,
             parallel_chunk_count: spec.parallel_chunk_count.max(1),
             zstd_compression: spec.zstd_compression,
+            connection_acquire_timeout_ms: spec.connection_acquire_timeout_ms,
         });
 
         if let Some(rx) = batch_rx {
@@ -262,6 +267,43 @@ impl GrpcStore {
         }
 
         Ok(store)
+    }
+
+    /// Acquire a TCP channel for a write-side RPC. When
+    /// `connection_acquire_timeout_ms` is set, fast-fails with
+    /// `Code::Unavailable` if the connection_manager doesn't deliver a
+    /// channel within that window — used by WorkerProxyStore to prevent
+    /// mirror writes to a dead worker from queueing against the 256-slot
+    /// connection backlog while reconnect attempts run on 1s backoff.
+    /// Reads are intentionally NOT wrapped: cluster-start latency on the
+    /// critical path should wait, not error.
+    async fn acquire_write_channel(
+        &self,
+        cm: &ConnectionManager,
+        ctx: &'static str,
+    ) -> Result<nativelink_util::connection_manager::Connection, Error> {
+        match self.connection_acquire_timeout_ms {
+            Some(ms) => {
+                match tokio::time::timeout(
+                    Duration::from_millis(ms),
+                    cm.connection(ctx.into()),
+                )
+                .await
+                {
+                    Ok(Ok(ch)) => Ok(ch),
+                    Ok(Err(e)) => Err(e),
+                    // The "ConnectionRefused" prefix is intentionally
+                    // matched by `worker_proxy_store::is_definitive_unreachable`
+                    // so this timeout fast-quarantines the dead worker.
+                    // Do not change the prefix without updating that helper.
+                    Err(_) => Err(make_err!(
+                        Code::Unavailable,
+                        "ConnectionRefused: connection acquire timed out after {ms}ms (ctx={ctx})"
+                    )),
+                }
+            }
+            None => cm.connection(ctx.into()).await,
+        }
     }
 
     /// Creates a CAS client with zstd compression configured if enabled.
@@ -871,8 +913,8 @@ impl GrpcStore {
                     let rpc_fut = async {
                         match &self.transport {
                             Transport::Tcp(cm) => {
-                                let channel = cm
-                                    .connection("bytestream_write".into())
+                                let channel = self
+                                    .acquire_write_channel(cm, "bytestream_write")
                                     .await
                                     .err_tip(|| "in GrpcStore::write")?;
                                 let conn_elapsed_ms = u64::try_from(
@@ -923,8 +965,8 @@ impl GrpcStore {
                             #[cfg(feature = "quic")]
                             Transport::Dual { tcp, .. } => {
                                 // Large streaming writes: prefer TCP (1.1x faster)
-                                let channel = tcp
-                                    .connection("bytestream_write".into())
+                                let channel = self
+                                    .acquire_write_channel(tcp, "bytestream_write")
                                     .await
                                     .err_tip(|| "in GrpcStore::write (dual/tcp)")?;
                                 let conn_elapsed_ms = u64::try_from(

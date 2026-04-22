@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use core::default::Default;
+use core::time::Duration;
 use std::env;
 use std::sync::OnceLock;
 
@@ -36,7 +37,7 @@ use opentelemetry_semantic_conventions::attribute::ENDUSER_ID;
 use prost::Message;
 use tracing::debug;
 use tracing::metadata::LevelFilter;
-use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::non_blocking::{ErrorCounter, WorkerGuard};
 use tracing_opentelemetry::{MetricsLayer, layer};
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
@@ -82,6 +83,13 @@ fn otlp_filter() -> EnvFilter {
 /// lifetime of the process.
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
+/// Static handle to the non-blocking writer's drop counter. Populated when
+/// the tracing-appender writer is created in nonblocking mode. Used by the
+/// periodic drop-counter reporter task to surface dropped log lines via
+/// INFO logs (and also to distinguish appender-pipeline backpressure from
+/// runtime-wide hangs in post-mortems).
+static APPENDER_DROP_COUNTER: OnceLock<ErrorCounter> = OnceLock::new();
+
 // Create a tracing layer intended for stdout printing.
 //
 // The output of this layer is configurable via the `NL_LOG` environment
@@ -95,7 +103,17 @@ fn tracing_stdout_layer(nonblocking: bool) -> impl Layer<Registry> {
     let stdout_filter = otlp_filter();
 
     if nonblocking {
-        let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stdout());
+        // 4 M-line buffer (default is 128 k). Sized to survive multi-minute
+        // journald pressure events from co-tenants on this host (e.g. crow-agent
+        // reconnect spikes that contend systemd-journald's UNIX socket). At
+        // ~800 lines/sec sustained burst, 4 M ~= 85 minutes of headroom; max
+        // memory ~= 4 M × 500 B average line ~= 2 GiB.
+        let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .buffered_lines_limit(4_000_000)
+            .finish(std::io::stdout());
+        APPENDER_DROP_COUNTER
+            .set(non_blocking.error_counter())
+            .ok();
         LOG_GUARD.set(guard).ok();
 
         match nl_log_fmt.as_str() {
@@ -139,6 +157,39 @@ fn tracing_stdout_layer(nonblocking: bool) -> impl Layer<Registry> {
     }
 }
 
+/// Spawn a periodic task that emits the tracing-appender drop counter.
+///
+/// The non-blocking log writer drops log lines on overflow (lossy mode is
+/// the default). Without periodic visibility, dropped lines are invisible
+/// — leading to confusion when a hang produces no output but the runtime
+/// is fine. Every 30s this task reports the cumulative drop count and the
+/// delta since the last emission. The emission itself goes through the
+/// same lossy appender, so during a sustained pipeline jam this report
+/// may be dropped — but the next post-jam emission will show a giant
+/// delta, surfacing what was lost.
+fn spawn_appender_drop_reporter() {
+    let Some(counter) = APPENDER_DROP_COUNTER.get().cloned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        let mut last_total: u64 = counter.dropped_lines() as u64;
+        loop {
+            ticker.tick().await;
+            let total = counter.dropped_lines() as u64;
+            let delta = total.saturating_sub(last_total);
+            last_total = total;
+            tracing::info!(
+                dropped_total = total,
+                dropped_in_last_30s = delta,
+                "tracing_appender: log line drop counter",
+            );
+        }
+    });
+}
+
 /// Initialize tracing with OpenTelemetry support.
 ///
 /// When `disable_otlp` is `true`, only the stdout fmt layer is registered
@@ -180,6 +231,8 @@ pub fn init_tracing(disable_otlp: bool, nonblocking_log: bool) -> Result<(), nat
             nonblocking = nonblocking_log,
             "OTLP exporters disabled, stdout-only logging active"
         );
+
+        spawn_appender_drop_reporter();
 
         return Ok(());
     }
@@ -263,6 +316,8 @@ pub fn init_tracing(disable_otlp: bool, nonblocking_log: bool) -> Result<(), nat
     INITIALIZED.set(()).unwrap_or(());
 
     tracing::info!(nonblocking = nonblocking_log, "OTLP exporters enabled");
+
+    spawn_appender_drop_reporter();
 
     Ok(())
 }

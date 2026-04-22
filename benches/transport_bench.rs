@@ -223,6 +223,8 @@ async fn make_tcp_client(port: u16, certs: &TlsCerts) -> Arc<GrpcStore> {
         parallel_chunk_read_threshold: 8 * 1024 * 1024,
         parallel_chunk_count: 64,
         dual_transport: false,
+        zstd_compression: false,
+        connection_acquire_timeout_ms: None,
     };
     GrpcStore::new(&spec)
         .await
@@ -365,6 +367,8 @@ async fn make_quic_client(port: u16) -> Arc<GrpcStore> {
         parallel_chunk_read_threshold: 8 * 1024 * 1024,
         parallel_chunk_count: 64,
         dual_transport: false,
+        zstd_compression: false,
+        connection_acquire_timeout_ms: None,
     };
     GrpcStore::new(&spec)
         .await

@@ -38,6 +38,7 @@ pub mod platform_properties;
 #[cfg(feature = "pprof")]
 pub mod pprof_server;
 pub mod proto_stream_utils;
+pub mod rayon_pool;
 pub mod resource_info;
 pub mod retry;
 pub mod shutdown_guard;

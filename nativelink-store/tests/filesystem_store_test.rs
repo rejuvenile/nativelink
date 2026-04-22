@@ -1642,3 +1642,47 @@ async fn test_get_file_entries_batch_zero_digest_returns_none() -> Result<(), Er
 
     Ok(())
 }
+
+#[nativelink_test]
+async fn pin_digest_with_result_reports_eviction_race() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+
+    let fs_store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path,
+        temp_path,
+        eviction_policy: None,
+        block_size: 1,
+        ..Default::default()
+    })
+    .await?;
+
+    let present_digest = DigestInfo::try_new(HASH1, VALUE1.len())?;
+    let absent_digest = DigestInfo::try_new(HASH2, VALUE2.len())?;
+
+    Store::new(fs_store.clone())
+        .update_oneshot(present_digest, VALUE1.into())
+        .await?;
+
+    // Present digest pins successfully.
+    assert!(
+        fs_store.pin_digest_with_result(&present_digest),
+        "pin should succeed for a digest that is in the store"
+    );
+
+    // Absent digest reports the failure (the eviction-race signal we
+    // need at the worker upload site to fall back to slow-store recovery).
+    assert!(
+        !fs_store.pin_digest_with_result(&absent_digest),
+        "pin should report false for a digest that is not in the store"
+    );
+
+    // Batch variant returns one bool per input in order.
+    let mut results = Vec::new();
+    for d in [present_digest, absent_digest, present_digest] {
+        results.push(fs_store.pin_digest_with_result(&d));
+    }
+    assert_eq!(results, vec![true, false, true]);
+
+    Ok(())
+}

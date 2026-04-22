@@ -39,6 +39,7 @@ fn make_test_spec() -> GrpcSpec {
         parallel_chunk_count: 0,
         dual_transport: false,
         zstd_compression: false,
+        connection_acquire_timeout_ms: None,
     }
 }
 

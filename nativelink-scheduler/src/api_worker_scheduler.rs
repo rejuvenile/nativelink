@@ -2521,6 +2521,7 @@ async fn create_worker_cas_connection(
         parallel_chunk_count: 4,
         dual_transport: false,
         zstd_compression: false,
+        connection_acquire_timeout_ms: None,
     };
     let store = GrpcStore::new(&spec)
         .await

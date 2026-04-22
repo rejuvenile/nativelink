@@ -972,6 +972,15 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.pin_key(StoreKeyBorrow::from(key));
     }
 
+    /// Pin a digest and report whether the pin succeeded.
+    /// Returns `false` when the blob was not in the eviction map at the
+    /// moment of pinning (typically already evicted) — callers can use
+    /// this to detect eviction races.
+    pub fn pin_digest_with_result(&self, digest: &DigestInfo) -> bool {
+        let key: StoreKey<'static> = (*digest).into();
+        self.evicting_map.pin_key(StoreKeyBorrow::from(key))
+    }
+
     /// Unpin a digest, allowing eviction again.
     pub fn unpin_digest(&self, digest: &DigestInfo) {
         let key: StoreKey<'static> = (*digest).into();
@@ -1681,6 +1690,20 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             .map(|d| StoreKeyBorrow::from(StoreKey::from(*d)))
             .collect();
         self.evicting_map.pin_keys(&keys);
+    }
+
+    fn pin_digests_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        // Per-key pin so we can report individual failures. The batched
+        // pin_keys path collapses run_pending_tasks() across the batch
+        // and breaks early on cap exhaustion, neither of which gives the
+        // per-digest visibility callers need to detect eviction races.
+        digests
+            .iter()
+            .map(|d| {
+                let key: StoreKey<'static> = (*d).into();
+                self.evicting_map.pin_key(StoreKeyBorrow::from(key))
+            })
+            .collect()
     }
 }
 

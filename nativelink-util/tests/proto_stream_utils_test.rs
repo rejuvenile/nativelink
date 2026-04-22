@@ -86,3 +86,111 @@ async fn ensure_no_errors_if_only_first_message_has_resource_name_set() -> Resul
 
     Ok(())
 }
+
+// Regression test: a resumed/replayed upload (Bazel client retry, or
+// GrpcStore::write Retrier replaying WriteState::cached_messages after a
+// transport error) starts a fresh wrapper with bytes_received=0 but the
+// cached WriteRequests carry their original write_offset. The high-watermark
+// accumulator must tolerate the replayed prefix without spuriously rejecting
+// the upload as oversize.
+#[nativelink_test]
+async fn replayed_prefix_does_not_trip_overrun_check() -> Result<(), Error> {
+    // 100-byte logical upload split into two 50-byte chunks, then the same
+    // two chunks replayed at their original offsets.
+    const TOTAL_LEN: usize = 100;
+    const DIGEST: DigestInfo = DigestInfo::new([0u8; 32], TOTAL_LEN as u64);
+    let payload = vec![0u8; TOTAL_LEN];
+
+    let resource_name = format!(
+        "{INSTANCE_NAME}/uploads/some-uuid/blobs/{}/{}",
+        DIGEST.packed_hash(),
+        DIGEST.size_bytes()
+    );
+
+    let make_chunk = |offset: i64, range: core::ops::Range<usize>, finish: bool| WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: offset,
+        finish_write: finish,
+        data: Bytes::copy_from_slice(&payload[range]),
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(make_chunk(0, 0..50, false))).unwrap();
+    tx.send(Ok(make_chunk(50, 50..100, false))).unwrap();
+    // Replayed prefix - overlaps fully with what was already received.
+    tx.send(Ok(make_chunk(0, 0..50, false))).unwrap();
+    tx.send(Ok(make_chunk(50, 50..100, true))).unwrap();
+    drop(tx);
+
+    let mut wrapper =
+        WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?;
+
+    // All four messages must be yielded without an overrun error.
+    for _ in 0..4 {
+        let next = wrapper.next().await.expect("expected a message");
+        next.expect("replayed prefix must not be rejected as overrun");
+    }
+    // Stream EOF; bytes_received should equal expected_size since the last
+    // chunk's high-watermark covered the full range.
+    assert!(wrapper.next().await.is_none());
+    assert_eq!(wrapper.bytes_received, TOTAL_LEN);
+
+    Ok(())
+}
+
+// Control: a genuine overrun (chunks whose combined coverage exceeds the
+// declared size) must still be rejected.
+#[nativelink_test]
+async fn genuine_overrun_is_still_rejected() -> Result<(), Error> {
+    const EXPECTED_LEN: usize = 100;
+    const OVERRUN_LEN: usize = 120;
+    const DIGEST: DigestInfo = DigestInfo::new([0u8; 32], EXPECTED_LEN as u64);
+    let payload = vec![0u8; OVERRUN_LEN];
+
+    let resource_name = format!(
+        "{INSTANCE_NAME}/uploads/some-uuid/blobs/{}/{}",
+        DIGEST.packed_hash(),
+        DIGEST.size_bytes()
+    );
+
+    let make_chunk = |offset: i64, range: core::ops::Range<usize>, finish: bool| WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: offset,
+        finish_write: finish,
+        data: Bytes::copy_from_slice(&payload[range]),
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(make_chunk(0, 0..60, false))).unwrap();
+    tx.send(Ok(make_chunk(60, 60..120, true))).unwrap();
+    drop(tx);
+
+    let mut wrapper =
+        WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?;
+
+    // First chunk fits within the declared size.
+    let first = wrapper.next().await.expect("expected first message");
+    first.expect("first chunk must not be rejected");
+
+    // Second chunk pushes the high-watermark to 120, beyond the 100-byte
+    // declared size, and must be rejected.
+    let second = wrapper.next().await.expect("expected second message");
+    let err = second.expect_err("genuine overrun must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("sent too much data"),
+        "expected overrun error, got: {msg}"
+    );
+    assert!(msg.contains("expected=100"), "missing expected= field: {msg}");
+    assert!(
+        msg.contains("write_offset=60"),
+        "missing write_offset= field: {msg}"
+    );
+    assert!(msg.contains("chunk_len=60"), "missing chunk_len= field: {msg}");
+    assert!(
+        msg.contains("bytes_received=120"),
+        "missing bytes_received= field: {msg}"
+    );
+
+    Ok(())
+}

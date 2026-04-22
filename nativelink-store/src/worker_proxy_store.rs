@@ -29,7 +29,9 @@ use tracing::{debug, info, trace, warn};
 
 use nativelink_config::stores::{ClientTlsConfig, GrpcEndpoint, GrpcSpec, Retry, StoreType};
 use nativelink_error::{Code, Error, ResultExt, make_err};
-use nativelink_metric::MetricsComponent;
+use nativelink_metric::{
+    MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, group, publish,
+};
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
@@ -55,9 +57,7 @@ use crate::grpc_store::GrpcStore;
 ///   uploaded to the server CAS, so a locality entry implies the blob is
 ///   retrievable (either from the worker or already in the server CAS).
 /// - `update()`: Pass through to inner store.
-#[derive(MetricsComponent)]
 pub struct WorkerProxyStore {
-    #[metric(group = "inner_store")]
     inner: Store,
     /// Blob locality map — digest → worker endpoints.
     locality_map: SharedBlobLocalityMap,
@@ -84,6 +84,16 @@ pub struct WorkerProxyStore {
     /// Optional TLS config for connecting to worker CAS endpoints.
     /// When set, connections use `grpcs://` with this TLS config.
     worker_tls_config: Option<ClientTlsConfig>,
+    /// Total mirror attempts (any path).
+    mirror_total_attempted: AtomicU64,
+    /// Mirror attempts that completed without error.
+    mirror_total_succeeded: AtomicU64,
+    /// Mirror attempts skipped because no permit was available within the
+    /// path's deadline (small-blob 50 ms timeout, streaming try_acquire).
+    mirror_dropped_no_permit: AtomicU64,
+    /// Mirror attempts skipped because no eligible (non-quarantined)
+    /// endpoint could be selected.
+    mirror_dropped_quarantined: AtomicU64,
 }
 
 /// Per-endpoint mirror state: in-flight permits and consecutive-failure tracking.
@@ -136,10 +146,117 @@ impl core::fmt::Debug for WorkerProxyStore {
     }
 }
 
+// Manual `MetricsComponent` impl rather than `derive` because per-endpoint
+// gauges have variable cardinality — they need to be enumerated under the
+// `mirror_state` lock at publish time. Snapshot-then-release so the read
+// lock is held for the minimum window.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "complexity arises from publish! macro expansion"
+)]
+impl MetricsComponent for WorkerProxyStore {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        // Inner store under its own group, mirroring the previous derive layout.
+        {
+            let _enter = group!("inner_store").entered();
+            self.inner.publish(MetricKind::Component, MetricFieldData::default())?;
+        }
+
+        publish!(
+            "mirror_total_attempted",
+            &self.mirror_total_attempted,
+            MetricKind::Counter,
+            "Total mirror attempts across all paths"
+        );
+        publish!(
+            "mirror_total_succeeded",
+            &self.mirror_total_succeeded,
+            MetricKind::Counter,
+            "Mirror attempts that completed without error"
+        );
+        publish!(
+            "mirror_dropped_no_permit",
+            &self.mirror_dropped_no_permit,
+            MetricKind::Counter,
+            "Mirrors skipped because no per-worker permit was available"
+        );
+        publish!(
+            "mirror_dropped_quarantined",
+            &self.mirror_dropped_quarantined,
+            MetricKind::Counter,
+            "Mirrors skipped because no eligible endpoint could be selected"
+        );
+
+        // Snapshot per-endpoint state under a brief read lock, then publish
+        // outside the lock so we never hold it across the macro's tracing
+        // events.
+        let snapshot: Vec<(Arc<str>, usize, u32, bool)> = {
+            let state = self.mirror_state.read();
+            state
+                .iter()
+                .map(|(ep, st)| {
+                    let quarantined = st
+                        .quarantined_until
+                        .is_some_and(|t| t > Instant::now());
+                    (
+                        ep.clone(),
+                        st.permits.available_permits(),
+                        st.consecutive_failures,
+                        quarantined,
+                    )
+                })
+                .collect()
+        };
+        for (endpoint, available, failures, quarantined) in snapshot {
+            let _enter = group!(endpoint.as_ref()).entered();
+            publish!(
+                "mirror_available_permits",
+                &(available as u64),
+                MetricKind::Counter,
+                "Per-endpoint mirror permits available right now"
+            );
+            publish!(
+                "mirror_consecutive_failures",
+                &(u64::from(failures)),
+                MetricKind::Counter,
+                "Per-endpoint consecutive mirror failures"
+            );
+            publish!(
+                "mirror_quarantined",
+                &(u64::from(quarantined)),
+                MetricKind::Counter,
+                "Per-endpoint quarantine flag (1 if currently quarantined)"
+            );
+        }
+
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
 /// Returns true if the error code indicates a connection-level failure,
 /// meaning the cached connection should be removed.
 fn is_connection_error(e: &Error) -> bool {
     matches!(e.code, Code::Unavailable | Code::Unknown)
+}
+
+/// Returns true for transport-level errors that prove the peer is gone:
+/// `ConnectionRefused` (no listener), `NetworkUnreachable`, `HostUnreachable`.
+/// Distinct from generic `Code::Unavailable` (which also covers transients
+/// like `KeepAliveTimedOut`, `EOF without close_notify`, `RST_STREAM` —
+/// those legitimately recover on retry and must NOT fast-quarantine).
+fn is_definitive_unreachable(e: &Error) -> bool {
+    if e.code != Code::Unavailable {
+        return false;
+    }
+    e.messages.iter().any(|m| {
+        m.contains("ConnectionRefused")
+            || m.contains("NetworkUnreachable")
+            || m.contains("HostUnreachable")
+    })
 }
 
 impl WorkerProxyStore {
@@ -153,6 +270,10 @@ impl WorkerProxyStore {
             race_peers: AtomicBool::new(false),
             consult_locality_in_has: AtomicBool::new(true),
             worker_tls_config: None,
+            mirror_total_attempted: AtomicU64::new(0),
+            mirror_total_succeeded: AtomicU64::new(0),
+            mirror_dropped_no_permit: AtomicU64::new(0),
+            mirror_dropped_quarantined: AtomicU64::new(0),
         })
     }
 
@@ -172,6 +293,10 @@ impl WorkerProxyStore {
             race_peers: AtomicBool::new(false),
             consult_locality_in_has: AtomicBool::new(true),
             worker_tls_config: Some(tls_config),
+            mirror_total_attempted: AtomicU64::new(0),
+            mirror_total_succeeded: AtomicU64::new(0),
+            mirror_dropped_no_permit: AtomicU64::new(0),
+            mirror_dropped_quarantined: AtomicU64::new(0),
         })
     }
 
@@ -306,6 +431,14 @@ impl WorkerProxyStore {
             parallel_chunk_count: 8,
             dual_transport: false,
             zstd_compression: false,
+            // 3s cap on `cm.connection()` for mirror writes to a worker.
+            // Without this, a dead worker queues writes against the 256-slot
+            // connection backlog while reconnect attempts run on 1s backoff,
+            // pinning per-worker mirror permits and 3 MiB Bytes per chunk.
+            // 3s is wide enough to cover the post-stall reconnect tail
+            // observed during write bursts; tighter would false-positive
+            // healthy-but-busy workers (cf. perf review on Proposal 3).
+            connection_acquire_timeout_ms: Some(3000),
         };
         let store = GrpcStore::new(&spec)
             .await
@@ -957,28 +1090,41 @@ impl WorkerProxyStore {
         }
     }
 
-    /// Increment failure count for `endpoint`. If `MIRROR_FAILURE_THRESHOLD`
-    /// failures occur within `MIRROR_FAILURE_WINDOW`, quarantine the endpoint
-    /// for `MIRROR_QUARANTINE_DURATION`.
-    fn record_mirror_failure(&self, endpoint: &str) {
+    /// Increment failure count for `endpoint`. With `definitive=false`,
+    /// quarantine fires only after `MIRROR_FAILURE_THRESHOLD` failures
+    /// inside `MIRROR_FAILURE_WINDOW`. With `definitive=true`, quarantine
+    /// fires immediately on the first failure — `MIRROR_FAILURE_WINDOW` is
+    /// bypassed because a transport-level `ConnectionRefused` /
+    /// `NetworkUnreachable` / `HostUnreachable` is sufficient evidence
+    /// that the peer is gone, and we want to stop round-robin routing to
+    /// the dead worker for the ~1s it would take to accumulate 5 failures.
+    /// In both cases the quarantine itself lasts `MIRROR_QUARANTINE_DURATION`.
+    fn record_mirror_failure(&self, endpoint: &str, definitive: bool) {
         let now = Instant::now();
         let mut state = self.mirror_state.write();
         let entry = state
             .entry(Arc::from(endpoint))
             .or_insert_with(MirrorEndpointState::new);
-        // Reset the streak if the previous failure was outside the window —
-        // a slow drip of unrelated failures shouldn't trigger quarantine.
-        match entry.first_failure_at {
-            Some(t) if now.duration_since(t) > MIRROR_FAILURE_WINDOW => {
-                entry.consecutive_failures = 1;
+        if definitive {
+            entry.consecutive_failures = MIRROR_FAILURE_THRESHOLD;
+            if entry.first_failure_at.is_none() {
                 entry.first_failure_at = Some(now);
             }
-            None => {
-                entry.consecutive_failures = 1;
-                entry.first_failure_at = Some(now);
-            }
-            _ => {
-                entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        } else {
+            // Reset the streak if the previous failure was outside the window —
+            // a slow drip of unrelated failures shouldn't trigger quarantine.
+            match entry.first_failure_at {
+                Some(t) if now.duration_since(t) > MIRROR_FAILURE_WINDOW => {
+                    entry.consecutive_failures = 1;
+                    entry.first_failure_at = Some(now);
+                }
+                None => {
+                    entry.consecutive_failures = 1;
+                    entry.first_failure_at = Some(now);
+                }
+                _ => {
+                    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                }
             }
         }
         if entry.consecutive_failures >= MIRROR_FAILURE_THRESHOLD
@@ -989,6 +1135,7 @@ impl WorkerProxyStore {
                 endpoint,
                 consecutive_failures = entry.consecutive_failures,
                 quarantine_secs = MIRROR_QUARANTINE_DURATION.as_secs(),
+                definitive,
                 "mirror: quarantining endpoint after consecutive failures"
             );
         }
@@ -1004,6 +1151,8 @@ impl WorkerProxyStore {
             return;
         }
 
+        self.mirror_total_attempted.fetch_add(1, Ordering::Relaxed);
+
         // Try once on a healthy endpoint. On a connection-level failure,
         // try once more on a different endpoint — most mirror failures
         // are connection-level (KeepAliveTimedOut, ConnectionReset, EOF
@@ -1012,13 +1161,33 @@ impl WorkerProxyStore {
         for attempt in 0..2 {
             let exclude = last_endpoint.as_deref();
             let Some((endpoint, permits)) = self.pick_mirror_endpoint(&endpoints, exclude) else {
+                self.mirror_dropped_quarantined.fetch_add(1, Ordering::Relaxed);
                 return;
             };
             // Per-worker permit: prevents one slow worker from starving
-            // mirror capacity for healthier ones.
-            let _permit = match permits.acquire().await {
-                Ok(p) => p,
-                Err(_) => return,
+            // mirror capacity for healthier ones. 50ms cap so a saturated
+            // worker doesn't queue up cloned `Bytes` (each waiter pins
+            // ~size_bytes of memory until the permit drops). On timeout
+            // we move to the next endpoint instead of giving up — that
+            // preserves the dual-endpoint resilience of this path.
+            let _permit = match tokio::time::timeout(
+                Duration::from_millis(50),
+                permits.acquire(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) | Err(_) => {
+                    self.mirror_dropped_no_permit.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        %digest,
+                        endpoint = endpoint.as_ref(),
+                        attempt,
+                        "mirror: permit busy, trying next endpoint"
+                    );
+                    last_endpoint = Some(endpoint);
+                    continue;
+                }
             };
 
             let Some(store) = self.get_or_create_connection(&endpoint).await else {
@@ -1028,7 +1197,7 @@ impl WorkerProxyStore {
                     attempt,
                     "mirror: failed to connect to worker"
                 );
-                self.record_mirror_failure(&endpoint);
+                self.record_mirror_failure(&endpoint, true);
                 last_endpoint = Some(endpoint);
                 continue;
             };
@@ -1066,6 +1235,7 @@ impl WorkerProxyStore {
             match result {
                 Ok(()) => {
                     self.record_mirror_success(&endpoint);
+                    self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
                     info!(
                         %digest,
                         size_bytes,
@@ -1076,7 +1246,7 @@ impl WorkerProxyStore {
                     return;
                 }
                 Err(e) => {
-                    self.record_mirror_failure(&endpoint);
+                    self.record_mirror_failure(&endpoint, is_definitive_unreachable(&e));
                     let retry = attempt == 0 && is_connection_error(&e);
                     warn!(
                         %digest,
@@ -1111,16 +1281,29 @@ impl WorkerProxyStore {
             return;
         }
 
+        self.mirror_total_attempted.fetch_add(1, Ordering::Relaxed);
+
         // Streaming path can't retry: bytes from `reader` are consumed once.
         // We still benefit from the per-worker permit (fair fan-out) and the
         // health quarantine (skip dead workers).
         let Some((endpoint, permits)) = self.pick_mirror_endpoint(&endpoints, None) else {
+            self.mirror_dropped_quarantined.fetch_add(1, Ordering::Relaxed);
             drop(reader);
             return;
         };
-        let _permit = match permits.acquire().await {
+        // Streaming path can't wait on permits: the reader is already
+        // buffering up to 72 MiB of producer chunks (3 MiB × 24 slots) so
+        // pinning that memory while we queue is the worst case for OOM.
+        // Drop instead — the streaming mirror has no retry semantic anyway.
+        let _permit = match permits.try_acquire() {
             Ok(p) => p,
             Err(_) => {
+                self.mirror_dropped_no_permit.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    %digest,
+                    endpoint = endpoint.as_ref(),
+                    "mirror_stream: skipped, all permits busy"
+                );
                 drop(reader);
                 return;
             }
@@ -1132,7 +1315,7 @@ impl WorkerProxyStore {
                 endpoint = endpoint.as_ref(),
                 "mirror_stream: failed to connect to worker"
             );
-            self.record_mirror_failure(&endpoint);
+            self.record_mirror_failure(&endpoint, true);
             drop(reader);
             return;
         };
@@ -1150,6 +1333,7 @@ impl WorkerProxyStore {
         match &result {
             Ok(()) => {
                 self.record_mirror_success(&endpoint);
+                self.mirror_total_succeeded.fetch_add(1, Ordering::Relaxed);
                 debug!(
                     %digest,
                     size_bytes,
@@ -1158,7 +1342,7 @@ impl WorkerProxyStore {
                 );
             }
             Err(e) => {
-                self.record_mirror_failure(&endpoint);
+                self.record_mirror_failure(&endpoint, is_definitive_unreachable(&e));
                 warn!(
                     %digest,
                     size_bytes,
@@ -1500,6 +1684,43 @@ mod tests {
         let locality_map = new_shared_blob_locality_map();
         let proxy = WorkerProxyStore::new(inner, locality_map.clone());
         (Store::new(proxy), locality_map)
+    }
+
+    #[test]
+    fn test_is_definitive_unreachable_classifies_only_definitive_strings() {
+        // ConnectionRefused / NetworkUnreachable / HostUnreachable on
+        // Code::Unavailable must trigger fast quarantine.
+        for msg in [
+            "tcp connect error: ConnectionRefused (os error 111)",
+            "NetworkUnreachable: no route to host",
+            "HostUnreachable: target down",
+        ] {
+            let e = make_err!(Code::Unavailable, "{msg}");
+            assert!(
+                is_definitive_unreachable(&e),
+                "expected definitive: {msg}"
+            );
+        }
+
+        // Bare Code::Unavailable / Unknown / KeepAliveTimedOut /
+        // close_notify / RST_STREAM must NOT fast-quarantine — those
+        // legitimately recover on retry.
+        for msg in [
+            "transient unavailable",
+            "KeepAliveTimedOut",
+            "EOF without close_notify",
+            "RST_STREAM received",
+        ] {
+            let e = make_err!(Code::Unavailable, "{msg}");
+            assert!(
+                !is_definitive_unreachable(&e),
+                "did not expect definitive: {msg}"
+            );
+        }
+
+        // Wrong code class must not match even with definitive substring.
+        let e = make_err!(Code::NotFound, "ConnectionRefused but wrong code");
+        assert!(!is_definitive_unreachable(&e));
     }
 
     // ---------------------------------------------------------------
@@ -1994,7 +2215,7 @@ mod tests {
 
         // Drive endpoint "a" past the failure threshold.
         for _ in 0..MIRROR_FAILURE_THRESHOLD {
-            proxy.record_mirror_failure("a");
+            proxy.record_mirror_failure("a", false);
         }
 
         // pick_mirror_endpoint must skip "a" while it's quarantined.
@@ -2023,13 +2244,13 @@ mod tests {
 
         // Accumulate failures, then succeed before crossing the threshold.
         for _ in 0..(MIRROR_FAILURE_THRESHOLD - 1) {
-            proxy.record_mirror_failure("a");
+            proxy.record_mirror_failure("a", false);
         }
         proxy.record_mirror_success("a");
 
         // One more failure must NOT trigger quarantine because the streak
         // was cleared.
-        proxy.record_mirror_failure("a");
+        proxy.record_mirror_failure("a", false);
         let (chosen, _) = proxy
             .pick_mirror_endpoint(&endpoints, None)
             .expect("endpoint should be eligible");
@@ -2051,7 +2272,7 @@ mod tests {
 
         for ep in ["a", "b"] {
             for _ in 0..MIRROR_FAILURE_THRESHOLD {
-                proxy.record_mirror_failure(ep);
+                proxy.record_mirror_failure(ep, false);
             }
         }
 

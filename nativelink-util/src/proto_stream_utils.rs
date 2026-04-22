@@ -130,13 +130,28 @@ where
         // message meta data.
         Poll::Ready(Some(maybe_message.and_then(|message| {
             self.write_finished = message.finish_write;
-            self.bytes_received += message.data.len();
+            // High-watermark accumulator: a resumed/replayed upload (Bazel
+            // client retry, or our own GrpcStore Retrier replaying
+            // WriteState::cached_messages) starts a fresh wrapper with
+            // bytes_received=0 but the WriteRequests carry their original
+            // write_offset. Summing data.len() per chunk would double-count
+            // the replayed prefix and spuriously trip the overrun check
+            // below before bytestream_server's downstream dedup at
+            // bytestream_server.rs:1370 ever sees the offset. Saturating
+            // arithmetic keeps malformed input (negative offset, oversized
+            // chunk_end) from wrapping; the overrun check still catches it.
+            let chunk_offset =
+                usize::try_from(message.write_offset).unwrap_or(usize::MAX);
+            let chunk_end = chunk_offset.saturating_add(message.data.len());
+            self.bytes_received = self.bytes_received.max(chunk_end);
 
             // Check that we haven't read past the expected end.
             if self.bytes_received > self.resource_info.expected_size {
                 Err(make_input_err!(
-                    "Sent too much data. Expected {}, but so far received {}",
+                    "sent too much data: expected={}, write_offset={}, chunk_len={}, bytes_received={}",
                     self.resource_info.expected_size,
+                    message.write_offset,
+                    message.data.len(),
                     self.bytes_received
                 ))
             } else {

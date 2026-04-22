@@ -3609,21 +3609,35 @@ impl RunningActionImpl {
         // defense-in-depth idempotent re-pin (refreshes pinned_at).
         {
             let filesystem_store = &self.running_actions_manager.filesystem_store;
+            let warn_pin_miss = |digest: &DigestInfo| {
+                warn!(
+                    %digest,
+                    "pin_digest: blob not in fast store at pin time, eviction race likely"
+                );
+            };
             for file in &output_files {
-                if file.digest.size_bytes() > 0 {
-                    filesystem_store.pin_digest(&file.digest);
+                if file.digest.size_bytes() > 0
+                    && !filesystem_store.pin_digest_with_result(&file.digest)
+                {
+                    warn_pin_miss(&file.digest);
                 }
             }
             for folder in &output_folders {
-                if folder.tree_digest.size_bytes() > 0 {
-                    filesystem_store.pin_digest(&folder.tree_digest);
+                if folder.tree_digest.size_bytes() > 0
+                    && !filesystem_store.pin_digest_with_result(&folder.tree_digest)
+                {
+                    warn_pin_miss(&folder.tree_digest);
                 }
             }
-            if stdout_digest.size_bytes() > 0 {
-                filesystem_store.pin_digest(&stdout_digest);
+            if stdout_digest.size_bytes() > 0
+                && !filesystem_store.pin_digest_with_result(&stdout_digest)
+            {
+                warn_pin_miss(&stdout_digest);
             }
-            if stderr_digest.size_bytes() > 0 {
-                filesystem_store.pin_digest(&stderr_digest);
+            if stderr_digest.size_bytes() > 0
+                && !filesystem_store.pin_digest_with_result(&stderr_digest)
+            {
+                warn_pin_miss(&stderr_digest);
             }
         }
 
@@ -4475,7 +4489,6 @@ impl RunningActionsManagerImpl {
 
         let cas_store = self.cas_store.clone();
         tokio::spawn(async move {
-            let fast_store = cas_store.fast_store();
             let slow_store = cas_store.slow_store();
             let start = std::time::Instant::now();
 
@@ -4495,13 +4508,16 @@ impl RunningActionsManagerImpl {
                 HashMap::with_capacity(digests.len());
 
             // Pre-read initial small digests (stdout, stderr, tree blobs,
-            // small output files).
+            // small output files). Read through cas_store so an eviction
+            // race between action completion and this background task
+            // self-heals via FastSlowStore's slow-store fallback.
+            let cas_store_ref = cas_store.as_ref();
             let preread_futures: FuturesUnordered<_> = digests
                 .iter()
                 .filter(|d| d.size_bytes() <= BATCH_THRESHOLD)
                 .copied()
                 .map(|digest| async move {
-                    let result = fast_store.get_part_unchunked(digest, 0, None).await;
+                    let result = cas_store_ref.get_part_unchunked(digest, 0, None).await;
                     (digest, result)
                 })
                 .collect();
@@ -4523,12 +4539,16 @@ impl RunningActionsManagerImpl {
 
             // Extract file digests from output directory trees. Use
             // pre-read data if available (avoids re-reading from store).
+            // Fallback path reads through cas_store so the same eviction-
+            // race self-heal applies (slow-store fallback) — using
+            // fast_store directly would silently lose the tree if the
+            // pin race fired between completion and this task.
             for tree_digest in &tree_digests {
                 let tree_result = if let Some(data) = preread_data.get(tree_digest) {
                     ProtoTree::decode(data.clone())
                         .map_err(|e| make_err!(Code::Internal, "Failed to decode Tree proto: {e}"))
                 } else {
-                    get_and_decode_digest::<ProtoTree>(fast_store, (*tree_digest).into()).await
+                    get_and_decode_digest::<ProtoTree>(cas_store_ref, (*tree_digest).into()).await
                 };
                 match tree_result {
                     Ok(tree) => {
@@ -4546,6 +4566,8 @@ impl RunningActionsManagerImpl {
                             "upload_to_remote: extracted file digests from output directory tree",
                         );
                         // Pre-read any newly-discovered small file digests.
+                        // Use cas_store so an eviction during the pre-read
+                        // window self-heals via the slow-store fallback.
                         let new_preread_futures: FuturesUnordered<_> = file_digests
                             .iter()
                             .filter(|d| {
@@ -4555,7 +4577,7 @@ impl RunningActionsManagerImpl {
                             .copied()
                             .map(|digest| async move {
                                 let result =
-                                    fast_store.get_part_unchunked(digest, 0, None).await;
+                                    cas_store_ref.get_part_unchunked(digest, 0, None).await;
                                 (digest, result)
                             })
                             .collect();
@@ -4623,14 +4645,18 @@ impl RunningActionsManagerImpl {
                             slow_store.update_oneshot(digest, data.clone()).await
                         } else if digest.size_bytes() <= BATCH_THRESHOLD {
                             // Small blob that wasn't pre-read (e.g. pre-read
-                            // failed). Try reading from the store as fallback.
-                            match fast_store.get_part_unchunked(digest, 0, None).await {
+                            // failed). Read through cas_store so an eviction
+                            // race self-heals via the slow-store fallback in
+                            // FastSlowStore::get_part.
+                            match cas_store_ref.get_part_unchunked(digest, 0, None).await {
                                 Ok(data) => slow_store.update_oneshot(digest, data).await,
                                 Err(e) => Err(e),
                             }
                         } else {
                             let (tx, rx) = make_buf_channel_pair();
-                            let read_fut = fast_store.get(digest, tx);
+                            // Read via cas_store so the self-healing fallback
+                            // applies on eviction during streaming uploads too.
+                            let read_fut = cas_store_ref.get(digest, tx);
                             let write_fut = slow_store.update(
                                 digest,
                                 rx,

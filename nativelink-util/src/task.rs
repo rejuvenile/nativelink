@@ -19,9 +19,12 @@ use futures::Future;
 use hyper::rt::Executor;
 use hyper_util::rt::tokio::TokioExecutor;
 use opentelemetry::context::{Context, FutureExt};
+use tokio::runtime::Handle;
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 pub use tracing::error_span as __error_span;
 use tracing::{Instrument, Span};
+
+use crate::rayon_pool::fallback_handle;
 
 pub fn __spawn_with_span_and_context<F, T>(f: F, span: Span, ctx: Option<Context>) -> JoinHandle<T>
 where
@@ -35,6 +38,27 @@ where
         future.with_current_context()
     };
 
+    // Foreign threads (e.g. rayon workers spawned before init_rayon_pool,
+    // or std::thread spawns from third-party libs) have no tokio context,
+    // so `tokio::spawn` would panic. Fall back to the global handle
+    // captured at startup. This is defense-in-depth: init_rayon_pool's
+    // spawn_handler entered tokio on every rayon worker, so this branch
+    // should be unreachable in production.
+    if let Ok(handle) = Handle::try_current() {
+        #[expect(clippy::disallowed_methods, reason = "purpose of the method")]
+        return handle.spawn(future);
+    }
+    if let Some(handle) = fallback_handle() {
+        // Direct stderr — if we're here the appender thread may also have
+        // no runtime context, and `tracing::error!` could lose the message.
+        eprintln!("spawn invoked from non-tokio thread, using fallback handle");
+        return handle.spawn(future);
+    }
+    // Last resort: no runtime exists at all. This will still panic, but
+    // the panic now has a clear log line preceding it instead of a bare
+    // rayon abort. Use eprintln so the message survives even if tracing's
+    // appender thread is itself unavailable.
+    eprintln!("spawn invoked with no tokio runtime available, panic imminent");
     #[expect(clippy::disallowed_methods, reason = "purpose of the method")]
     tokio::spawn(future)
 }
