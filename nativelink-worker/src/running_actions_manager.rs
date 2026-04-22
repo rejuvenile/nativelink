@@ -226,7 +226,7 @@ pub fn parse_get_tree_response(
 /// is a hard error — propagating an incomplete or cyclic tree to the
 /// construction code would let it silently skip missing subdirectories or
 /// loop forever in the materialization BFS.
-fn assert_tree_complete(
+pub(crate) fn assert_tree_complete(
     tree: &HashMap<DigestInfo, ProtoDirectory>,
     root_digest: &DigestInfo,
     source: &'static str,
@@ -3591,6 +3591,42 @@ impl RunningActionImpl {
         output_directory_symlinks.sort_unstable_by(|a, b| a.name_or_path.cmp(&b.name_or_path));
         let num_output_files = output_files.len();
         let num_output_folders = output_folders.len();
+
+        // Pin all known output digests in the FilesystemStore IMMEDIATELY
+        // after upload_results finishes writing them. The blobs were just
+        // written via cas_store.update_oneshot(...) (stdout/stderr) and
+        // upload_file/serialize_and_upload_message (output files + tree
+        // protos) above. Under load — e.g. the post-restart queue surge
+        // where many actions complete in quick succession — the EvictingMap
+        // can evict these small fresh blobs before spawn_upload_to_remote
+        // gets a chance to pin them, producing the symptom
+        //   "upload_to_remote: failed to pre-read small blob from fast store ... NotFound".
+        // Pinning here closes that eviction window: from "upload completed"
+        // to "background upload task running" the blobs are now protected.
+        // (Tree-children file digests are still pinned later inside
+        // spawn_upload_to_remote, since they require decoding the tree.)
+        // The pin call inside spawn_upload_to_remote is preserved as a
+        // defense-in-depth idempotent re-pin (refreshes pinned_at).
+        {
+            let filesystem_store = &self.running_actions_manager.filesystem_store;
+            for file in &output_files {
+                if file.digest.size_bytes() > 0 {
+                    filesystem_store.pin_digest(&file.digest);
+                }
+            }
+            for folder in &output_folders {
+                if folder.tree_digest.size_bytes() > 0 {
+                    filesystem_store.pin_digest(&folder.tree_digest);
+                }
+            }
+            if stdout_digest.size_bytes() > 0 {
+                filesystem_store.pin_digest(&stdout_digest);
+            }
+            if stderr_digest.size_bytes() > 0 {
+                filesystem_store.pin_digest(&stderr_digest);
+            }
+        }
+
         {
             let mut state = self.state.lock();
             execution_metadata.worker_completed_timestamp =
@@ -5178,4 +5214,239 @@ pub struct Metrics {
     upload_stderr: AsyncCounterWrapper,
     #[metric(help = "Total number of task timeouts.")]
     task_timeouts: CounterWithTime,
+}
+
+#[cfg(test)]
+mod assert_tree_complete_tests {
+    //! Tests for [`assert_tree_complete`] structural validation. The
+    //! function is the last line of defense between [`resolve_directory_tree`]
+    //! and [`DirectoryCache::get_or_construct`] — an incomplete or cyclic
+    //! tree slipped past here would either drop subdirectories silently or
+    //! loop forever in the materialization BFS.
+
+    use std::collections::HashMap;
+
+    use nativelink_error::Code;
+    use nativelink_proto::build::bazel::remote::execution::v2::{
+        Digest as ProtoDigest, Directory as ProtoDirectory, DirectoryNode,
+    };
+    use nativelink_util::common::DigestInfo;
+
+    use super::assert_tree_complete;
+
+    /// Build a `DigestInfo` from a single-byte hash pattern. The hash is
+    /// deterministic by `tag`, which makes failure messages readable.
+    fn digest(tag: u8, size: u64) -> DigestInfo {
+        let hex: String = (0..32).map(|_| format!("{tag:02x}")).collect();
+        DigestInfo::try_new(&hex, size).unwrap()
+    }
+
+    /// Proto digest that points to the same content as `DigestInfo::digest(tag, size)`.
+    fn proto_digest(tag: u8, size: u64) -> ProtoDigest {
+        let hex: String = (0..32).map(|_| format!("{tag:02x}")).collect();
+        ProtoDigest {
+            hash: hex,
+            size_bytes: size as i64,
+        }
+    }
+
+    /// Construct a directory node (child reference) with the given name/digest.
+    fn dir_node(name: &str, d: ProtoDigest) -> DirectoryNode {
+        DirectoryNode {
+            name: name.to_string(),
+            digest: Some(d),
+        }
+    }
+
+    // (f) happy path: root -> child, both digests present in the tree, no
+    // cycles. Must succeed.
+    #[test]
+    fn happy_path_two_node_tree_ok() {
+        let root = digest(1, 100);
+        let child = digest(2, 200);
+        let mut tree = HashMap::new();
+        tree.insert(
+            root,
+            ProtoDirectory {
+                directories: vec![dir_node("subdir", proto_digest(2, 200))],
+                ..Default::default()
+            },
+        );
+        tree.insert(child, ProtoDirectory::default());
+        assert!(
+            assert_tree_complete(&tree, &root, "test: happy").is_ok(),
+            "two-node acyclic tree should validate",
+        );
+    }
+
+    // (g) missing root: resolved map does not contain root_digest. Must
+    // return Internal error with the "missing reachable directory" message.
+    #[test]
+    fn missing_root_returns_internal_error() {
+        let root = digest(1, 100);
+        let tree: HashMap<DigestInfo, ProtoDirectory> = HashMap::new();
+        let err = assert_tree_complete(&tree, &root, "test: missing-root")
+            .expect_err("missing root must error");
+        assert_eq!(err.code, Code::Internal, "got {err:?}");
+        assert!(
+            err.messages.iter().any(|m| m.contains("missing reachable directory")),
+            "got {:?}",
+            err.messages,
+        );
+    }
+
+    // (h) missing child: root references a child digest that is not in
+    // the tree map. Must return Internal with "missing referenced child".
+    #[test]
+    fn missing_child_returns_internal_error() {
+        let root = digest(1, 100);
+        let mut tree = HashMap::new();
+        tree.insert(
+            root,
+            ProtoDirectory {
+                directories: vec![dir_node("dangling", proto_digest(2, 200))],
+                ..Default::default()
+            },
+        );
+        // Note: digest(2, 200) intentionally NOT inserted.
+        let err = assert_tree_complete(&tree, &root, "test: missing-child")
+            .expect_err("missing child must error");
+        assert_eq!(err.code, Code::Internal, "got {err:?}");
+        assert!(
+            err.messages.iter().any(|m| m.contains("missing referenced child")),
+            "got {:?}",
+            err.messages,
+        );
+    }
+
+    // (i) malformed child digest: node has no digest set at all. Must
+    // return InvalidArgument with "missing digest".
+    #[test]
+    fn malformed_child_digest_returns_invalid_argument() {
+        let root = digest(1, 100);
+        let mut tree = HashMap::new();
+        tree.insert(
+            root,
+            ProtoDirectory {
+                directories: vec![DirectoryNode {
+                    name: "missing-digest".to_string(),
+                    digest: None, // intentionally malformed
+                }],
+                ..Default::default()
+            },
+        );
+        let err = assert_tree_complete(&tree, &root, "test: malformed")
+            .expect_err("missing digest must error");
+        assert_eq!(err.code, Code::InvalidArgument, "got {err:?}");
+        assert!(
+            err.messages.iter().any(|m| m.contains("missing digest")),
+            "got {:?}",
+            err.messages,
+        );
+    }
+
+    // (j) self-loop: root directory references itself as a child. Must
+    // detect cycle, return Internal with "directory cycle detected".
+    #[test]
+    fn self_loop_returns_cycle_error() {
+        let root = digest(1, 100);
+        let mut tree = HashMap::new();
+        tree.insert(
+            root,
+            ProtoDirectory {
+                directories: vec![dir_node("me", proto_digest(1, 100))],
+                ..Default::default()
+            },
+        );
+        let err = assert_tree_complete(&tree, &root, "test: self-loop")
+            .expect_err("self-loop must error");
+        assert_eq!(err.code, Code::Internal, "got {err:?}");
+        assert!(
+            err.messages.iter().any(|m| m.contains("directory cycle detected")),
+            "got {:?}",
+            err.messages,
+        );
+    }
+
+    // (k) multi-node cycle: A -> B -> C -> A. The DFS ancestor tracking
+    // must detect the back-edge on entering A from C's child list.
+    #[test]
+    fn multi_node_cycle_returns_cycle_error() {
+        let a = digest(1, 100);
+        let b = digest(2, 200);
+        let c = digest(3, 300);
+        let mut tree = HashMap::new();
+        tree.insert(
+            a,
+            ProtoDirectory {
+                directories: vec![dir_node("b", proto_digest(2, 200))],
+                ..Default::default()
+            },
+        );
+        tree.insert(
+            b,
+            ProtoDirectory {
+                directories: vec![dir_node("c", proto_digest(3, 300))],
+                ..Default::default()
+            },
+        );
+        tree.insert(
+            c,
+            ProtoDirectory {
+                directories: vec![dir_node("a", proto_digest(1, 100))],
+                ..Default::default()
+            },
+        );
+        let err = assert_tree_complete(&tree, &a, "test: 3-cycle")
+            .expect_err("3-node cycle must error");
+        assert_eq!(err.code, Code::Internal, "got {err:?}");
+        assert!(
+            err.messages.iter().any(|m| m.contains("directory cycle detected")),
+            "got {:?}",
+            err.messages,
+        );
+    }
+
+    // (l) diamond DAG: root -> {left, right}, both -> leaf. Leaf is
+    // reached twice from root but is NOT a cycle (no path from leaf back
+    // to any ancestor). Must succeed — this is the critical distinction
+    // between finished-set revisit (diamond, OK) and ancestor-set revisit
+    // (cycle, error).
+    #[test]
+    fn diamond_dag_is_not_a_cycle() {
+        let root = digest(1, 100);
+        let left = digest(2, 200);
+        let right = digest(3, 300);
+        let leaf = digest(4, 400);
+        let mut tree = HashMap::new();
+        tree.insert(
+            root,
+            ProtoDirectory {
+                directories: vec![
+                    dir_node("left", proto_digest(2, 200)),
+                    dir_node("right", proto_digest(3, 300)),
+                ],
+                ..Default::default()
+            },
+        );
+        tree.insert(
+            left,
+            ProtoDirectory {
+                directories: vec![dir_node("leaf", proto_digest(4, 400))],
+                ..Default::default()
+            },
+        );
+        tree.insert(
+            right,
+            ProtoDirectory {
+                directories: vec![dir_node("leaf", proto_digest(4, 400))],
+                ..Default::default()
+            },
+        );
+        tree.insert(leaf, ProtoDirectory::default());
+        assert!(
+            assert_tree_complete(&tree, &root, "test: diamond").is_ok(),
+            "diamond DAG is not a cycle and must validate",
+        );
+    }
 }
