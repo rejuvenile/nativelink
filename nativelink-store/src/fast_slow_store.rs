@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{FutureExt, join};
+use futures::join;
 use nativelink_config::stores::{FastSlowSpec, StoreDirection};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
@@ -103,9 +103,13 @@ pub struct FastSlowStore {
 
 // This guard ensures that the populating_digests is cleared even if the future
 // is dropped, it is cancel safe.
-struct LoaderGuard<'a> {
+//
+// Holds an `'static` key so the guard can be moved into the spawned producer
+// task (see [`FastSlowStore::populate_and_maybe_stream`]); without `'static`
+// the spawn would fail to satisfy `Send` for non-`'static` lifetimes.
+struct LoaderGuard {
     weak_store: Weak<FastSlowStore>,
-    key: StoreKey<'a>,
+    key: StoreKey<'static>,
     loader: Option<Loader>,
     /// Streaming buffer shared between the populating thread and waiters.
     /// Waiters read from this instead of blocking on the OnceCell.
@@ -115,22 +119,7 @@ struct LoaderGuard<'a> {
     is_new: bool,
 }
 
-impl LoaderGuard<'_> {
-    async fn get_or_try_init<E, F, Fut>(&self, f: F) -> Result<(), E>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(), E>>,
-    {
-        if let Some(loader) = &self.loader {
-            loader.get_or_try_init(f).await.map(|&()| ())
-        } else {
-            // This is impossible, but we do it anyway.
-            f().await
-        }
-    }
-}
-
-impl Drop for LoaderGuard<'_> {
+impl Drop for LoaderGuard {
     fn drop(&mut self) {
         let Some(store) = self.weak_store.upgrade() else {
             // The store has already gone away, nothing to remove from.
@@ -141,11 +130,9 @@ impl Drop for LoaderGuard<'_> {
             return;
         };
 
-        // Pre-compute the owned key outside the lock to minimize lock hold time.
-        let owned_key = self.key.borrow().into_owned();
         let mut guard = store.populating_digests.lock();
         if let std::collections::hash_map::Entry::Occupied(occupied_entry) =
-            guard.entry(owned_key)
+            guard.entry(self.key.borrow().into_owned())
         {
             if Arc::ptr_eq(&occupied_entry.get().0, &loader) {
                 drop(loader);
@@ -355,7 +342,7 @@ impl FastSlowStore {
     /// Default per-blob streaming buffer: 64 MiB sliding window.
     const POPULATE_STREAM_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
-    fn get_loader<'a>(&self, key: StoreKey<'a>) -> LoaderGuard<'a> {
+    fn get_loader(&self, key: StoreKey<'_>) -> LoaderGuard {
         // Get a single loader instance that's used to populate the fast store
         // for this digest.  If another request comes in then it's de-duplicated.
         // Pre-compute the owned key outside the lock to minimize lock hold time.
@@ -367,7 +354,7 @@ impl FastSlowStore {
         let (loader, streaming_inner, is_new) = match self
             .populating_digests
             .lock()
-            .entry(owned_key)
+            .entry(owned_key.borrow().into_owned())
         {
             std::collections::hash_map::Entry::Occupied(occupied_entry) => {
                 let (l, s) = occupied_entry.get();
@@ -387,32 +374,34 @@ impl FastSlowStore {
         };
         LoaderGuard {
             weak_store: self.weak_self.clone(),
-            key,
+            key: owned_key,
             loader: Some(loader),
             streaming_inner,
             is_new,
         }
     }
 
-    async fn populate_and_maybe_stream(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        maybe_writer: Option<&mut DropCloserWriteHalf>,
-        offset: u64,
-        length: Option<u64>,
-        mut streaming_writer: Option<StreamingBlobWriter>,
-    ) -> Result<(), Error> {
-        // The `?` paths below (slow_store.has() RPC error + NotFound) — and
-        // the `failpoints`-gated early-return — all run BEFORE
-        // `streaming_writer` is moved into `data_stream_fut`. Without
-        // forwarding the error to the writer first, an early return drops the
-        // writer un-EOF'd → readers waiting on `streaming_inner` see the
-        // generic "writer dropped without sending EOF" instead of the actual
-        // upstream error. Sibling fix to commit 49bf70fb (which covered the
-        // inner data_stream_fut). Wrap in an `async {...}.await` block so
-        // every error path routes through the single send_error site below.
-        // The failpoint sits inside the block so its `return` exits the
-        // async block (yielding `Err` to the match), not the function.
+    /// Producer body: drives the slow→fast copy and fans data out to the
+    /// streaming buffer. Runs detached on its own tokio task; survives
+    /// caller cancellation.
+    ///
+    /// Always terminates the streaming buffer before returning:
+    /// - On success: `send_eof` after both `data_stream_fut` and
+    ///   `fast_store.update` complete.
+    /// - On error: `send_error` with the structured upstream error.
+    /// The `StreamingBlobWriter::Drop` fallback ("writer dropped without
+    /// sending EOF") remains as a safety net only — it should never fire
+    /// from this function.
+    async fn run_producer(
+        arc_self: Arc<Self>,
+        loader_guard: LoaderGuard,
+        mut streaming_writer: StreamingBlobWriter,
+    ) {
+        // The guard's Drop removes the populating_digests entry when this
+        // function returns (by panic or normal completion). Holding it for
+        // the producer's full lifetime is what allows late-arriving
+        // waiters to find this populate in the map and join in.
+        let key = loader_guard.key.borrow();
         let head_result: Result<UploadSizeInfo, Error> = async {
             // failpoint: simulate slow store being unavailable during populate.
             // exercises the error propagation path when the slow store cannot
@@ -425,19 +414,19 @@ impl FastSlowStore {
                 ))
             });
 
-            if self
+            if arc_self
                 .slow_store
                 .inner_store(Some(key.borrow()))
                 .optimized_for(StoreOptimizations::LazyExistenceOnSync)
             {
                 trace!(
                     %key,
-                    store_name = %self.slow_store.inner_store(Some(key.borrow())).get_name(),
+                    store_name = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
                     "Skipping .has() check due to LazyExistenceOnSync optimization"
                 );
                 Ok(UploadSizeInfo::MaxSize(u64::MAX))
             } else {
-                let size = self
+                let size = arc_self
                     .slow_store
                     .has(key.borrow())
                     .await
@@ -445,7 +434,7 @@ impl FastSlowStore {
                     .ok_or_else(|| {
                         debug!(
                             %key,
-                            slow_store = %self.slow_store.inner_store(Some(key.borrow())).get_name(),
+                            slow_store = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
                             "CAS read miss: blob not found in slow store"
                         );
                         make_err!(
@@ -462,44 +451,53 @@ impl FastSlowStore {
         let reader_stream_size = match head_result {
             Ok(size) => size,
             Err(err) => {
-                if let Some(mut sw) = streaming_writer.take() {
-                    sw.send_error(err.clone());
-                }
-                return Err(err);
+                streaming_writer.send_error(err);
+                return;
             }
         };
 
-        let send_range = offset..length.map_or(u64::MAX, |length| length + offset);
-        let mut bytes_received: u64 = 0;
         let mut counted_hit = false;
 
         // Use 128 slots (~32MiB at 256KiB chunks) for dual-store
         // read-through to reduce backpressure between fast and slow stores.
         let (mut fast_tx, fast_rx) = make_buf_channel_pair_with_size(128);
         let (slow_tx, mut slow_rx) = make_buf_channel_pair_with_size(128);
+        // The data-stream loop runs until slow_rx EOFs or errors. The
+        // future MUST own `fast_tx` so it is dropped (releasing fast_rx)
+        // when the future completes — `tokio::join!` drops completed
+        // branches via `MaybeDone::set` immediately, freeing held
+        // resources.
+        //
+        // `streaming_writer` is returned in BOTH branches so the outer
+        // code can terminate the buffer AFTER the join! completes — i.e.
+        // only after `fast_store.update` finishes. This way
+        // `is_terminal=true` on the buffer means the fast store is
+        // fully populated, which is what `copy_slow_to_fast` waiters
+        // rely on. The safety-net Drop on the writer only fires if
+        // neither send_eof nor send_error was called — which can no
+        // longer happen here because the outer match unconditionally
+        // calls one of them.
+        //
+        // Clone arc_self for the data_stream_fut closure so the
+        // original remains usable for slow_store_fut / fast_store_fut.
+        let arc_for_stream = Arc::clone(&arc_self);
         let data_stream_fut = async move {
-            let mut maybe_writer_pin = maybe_writer.map(Pin::new);
-            // Inner loop returns errors; outer block forwards them to
-            // `streaming_writer` BEFORE drop. Without this, a silent-truncation
-            // error from get_part_parallel propagates via `?`, drops the
-            // writer, and downstream waiters on construction_lock get a
-            // generic "writer dropped without eof" instead of the real cause.
-            let result: Result<(Result<(), Error>, _), Error> = async {
+            // Inner block returns the data-stream result. The outer
+            // unconditionally repackages the writer back so the caller
+            // can terminate the buffer AFTER the join! completes.
+            let result: Result<Result<(), Error>, Error> = async {
                 loop {
                     let output_buf = slow_rx
                         .recv()
                         .await
-                        .err_tip(|| "Failed to read data data buffer from slow store")?;
+                        .err_tip(|| "Failed to read data buffer from slow store")?;
                     if output_buf.is_empty() {
-                        let fast_res = fast_tx.send_eof();
-                        if let Some(ref mut sw) = streaming_writer {
-                            let _ = sw.send_eof();
-                        }
-                        return Ok((fast_res, maybe_writer_pin));
+                        return Ok(fast_tx.send_eof());
                     }
 
                     if !counted_hit {
-                        self.metrics
+                        arc_for_stream
+                            .metrics
                             .slow_store_hit_count
                             .fetch_add(1, Ordering::Acquire);
                         counted_hit = true;
@@ -507,67 +505,138 @@ impl FastSlowStore {
 
                     let output_buf_len = u64::try_from(output_buf.len())
                         .err_tip(|| "Could not output_buf.len() to u64")?;
-                    self.metrics
+                    arc_for_stream
+                        .metrics
                         .slow_store_downloaded_bytes
                         .fetch_add(output_buf_len, Ordering::Acquire);
 
-                    let writer_fut = Self::calculate_range(
-                        &(bytes_received..bytes_received + output_buf_len),
-                        &send_range,
-                    )?
-                    .zip(maybe_writer_pin.as_mut())
-                    .map_or_else(
-                        || futures::future::ready(Ok(())).left_future(),
-                        |(range, writer_pin)| writer_pin.send(output_buf.slice(range)).right_future(),
-                    );
+                    // Best-effort send to the streaming buffer (waiters);
+                    // ignore errors so a slow waiter cannot stall the producer.
+                    let _send_res = streaming_writer.send(output_buf.clone()).await;
 
-                    bytes_received += output_buf_len;
-
-                    if let Some(ref sw) = streaming_writer {
-                        let _ = sw.send(output_buf.clone()).await;
-                    }
-
-                    let (fast_tx_res, writer_res) = join!(fast_tx.send(output_buf), writer_fut);
-                    fast_tx_res.err_tip(|| "Failed to write to fast store in fast_slow store")?;
-                    writer_res.err_tip(|| "Failed to write result to writer in fast_slow store")?;
-                }
-            }.await;
-
-            match result {
-                Ok(ok) => Ok::<_, Error>(ok),
-                Err(err) => {
-                    if let Some(ref mut sw) = streaming_writer {
-                        sw.send_error(err.clone());
-                    }
-                    Err(err)
+                    fast_tx
+                        .send(output_buf)
+                        .await
+                        .err_tip(|| "Failed to write to fast store in fast_slow store")?;
                 }
             }
+            .await;
+            // Crucial: drop fast_tx BEFORE returning so fast_rx (driving
+            // fast_store.update) sees the channel close. Without this,
+            // the join! deadlocks on an error path because fast_tx
+            // remains alive in the closure's captures even though the
+            // logical loop has returned.
+            //
+            // tokio::join! drops completed branches via MaybeDone::set,
+            // which would drop fast_tx — but only when ALL of the
+            // returned tuple is consumed. By dropping inside the
+            // closure, we guarantee timely release for the unhappy path.
+            drop(fast_tx);
+            (streaming_writer, result)
         };
 
-        let slow_store_fut = self.slow_store.get(key.borrow(), slow_tx);
-        let fast_store_fut = self
+        let slow_store_fut = arc_self.slow_store.get(key.borrow(), slow_tx);
+        let fast_store_fut = arc_self
             .fast_store
             .update(key.borrow(), fast_rx, reader_stream_size);
 
-        let (data_stream_res, slow_res, fast_res) =
+        let ((mut writer_back, data_stream_res), slow_res, fast_res) =
             join!(data_stream_fut, slow_store_fut, fast_store_fut);
-        match data_stream_res {
-            Ok((fast_eof_res, maybe_writer_pin)) =>
-            // Sending the EOF will drop us almost immediately in bytestream_server
-            // so we perform it as the very last action in this method.
-            {
-                fast_eof_res.merge(fast_res).merge(slow_res).merge(
-                    if let Some(mut writer_pin) = maybe_writer_pin {
-                        writer_pin.send_eof()
-                    } else {
-                        Ok(())
-                    },
-                )
-            }
+
+        // Compose the producer's terminal status. NotFound from the
+        // slow store wins (matches prior behavior); else any failure is
+        // reported via the merged error.
+        let merged: Result<(), Error> = match data_stream_res {
+            Ok(fast_eof_res) => fast_eof_res.merge(fast_res).merge(slow_res),
             Err(err) => match slow_res {
                 Err(slow_err) if slow_err.code == Code::NotFound => Err(slow_err),
                 _ => fast_res.merge(slow_res).merge(Err(err)),
             },
+        };
+        match merged {
+            Ok(()) => {
+                // Ignore the Result from send_eof: it only errors if a
+                // terminal state was already set (e.g. via a panic
+                // during streaming send), which we are content to leave
+                // in place. The buffer is terminal either way.
+                drop(writer_back.send_eof());
+            }
+            Err(err) => writer_back.send_error(err),
+        }
+        // writer_back drops here — terminal state is already set via
+        // send_eof or send_error above, so the safety-net Drop is a no-op.
+        // loader_guard drops here, removing the populating_digests entry
+        // (subject to the strong-count check in LoaderGuard::Drop).
+    }
+
+    /// Drain the streaming buffer until terminal state, discarding chunks.
+    /// Used by callers that need to wait for the producer to finish but
+    /// do not consume the data themselves (e.g. `copy_slow_to_fast`).
+    /// Returns the producer's terminal result.
+    ///
+    /// `Code::Unavailable` means our cursor fell behind the sliding
+    /// window (the blob exceeds `POPULATE_STREAM_BUFFER_BYTES` and the
+    /// producer outpaced our drain). The drain consumes Bytes refs, so
+    /// in practice this only happens if the drainer was scheduling-
+    /// starved for longer than the buffer's eviction window. Recover by
+    /// recreating the reader at the new earliest cursor and continuing
+    /// until either EOF, a non-Unavailable error, or the producer
+    /// terminates while we hold an unrecoverable cursor.
+    async fn drain_streaming_buffer(
+        streaming_inner: &Arc<StreamingBlobInner>,
+    ) -> Result<(), Error> {
+        loop {
+            let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(
+                streaming_inner.clone(),
+            );
+            match reader.next_chunk().await {
+                Ok(c) if c.is_empty() => return Ok(()),
+                Ok(_) => {
+                    // Got data — drain the rest at full speed. This
+                    // inner loop holds the same reader (no recreation)
+                    // until it errors or hits EOF.
+                    loop {
+                        match reader.next_chunk().await {
+                            Ok(c) if c.is_empty() => return Ok(()),
+                            Ok(_) => {}
+                            Err(err) if err.code == Code::Unavailable => {
+                                // Fell behind mid-drain — outer loop
+                                // recreates the reader.
+                                break;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                }
+                Err(err) if err.code == Code::Unavailable => {
+                    // First chunk after recreate already evicted —
+                    // producer is racing far ahead. Loop and recreate.
+                    // If the producer terminates concurrently, the
+                    // recreated reader will see the terminal state on
+                    // its first poll.
+                    if streaming_inner.is_terminal() {
+                        // Producer finished; check the terminal state
+                        // via a fresh reader (cursor at current
+                        // earliest, will see EOF/error directly).
+                        let mut last = nativelink_util::streaming_blob::StreamingBlobReader::new(
+                            streaming_inner.clone(),
+                        );
+                        match last.next_chunk().await {
+                            Ok(c) if c.is_empty() => return Ok(()),
+                            Ok(_) => return Ok(()), // any data means producer made it past
+                            Err(e) if e.code == Code::Unavailable => {
+                                // Buffer is empty and terminal — producer
+                                // succeeded but evicted everything. Fast
+                                // store is populated; treat as success.
+                                return Ok(());
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    // else: producer still running, loop and try again.
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -589,18 +658,76 @@ impl FastSlowStore {
             ));
         }
 
-        let loader_guard = self.get_loader(key.borrow());
-        let sw = if loader_guard.is_new {
-            Some(StreamingBlobWriter::new(loader_guard.streaming_inner.clone()))
-        } else {
-            None // Waiter — don't create a writer that would poison the buffer on drop.
-        };
-        loader_guard
-            .get_or_try_init(|| {
-                Pin::new(self).populate_and_maybe_stream(key.borrow(), None, 0, None, sw)
-            })
+        // Spawn-detach the producer if we're the first caller for this
+        // key, then capture the streaming buffer to wait for the
+        // producer to finish. With the spawn-detach fix, this caller
+        // can be cancelled and the producer continues populating the
+        // fast store independently.
+        let streaming_inner =
+            Self::spawn_populate_producer(self.get_arc().ok_or_else(|| {
+                make_err!(
+                    Code::Internal,
+                    "FastSlowStore dropped during populate spawn"
+                )
+            })?, key.borrow());
+        // Wait for the producer to finish by draining the streaming
+        // buffer. Data is discarded — copy_slow_to_fast cares only
+        // that the producer reaches its terminal state.
+        Self::drain_streaming_buffer(&streaming_inner)
             .await
             .err_tip(|| "Failed to populate()")
+    }
+
+    /// Spawn the populator for `key` if not already spawned and return
+    /// the shared streaming buffer. Idempotent: subsequent callers for
+    /// the same key receive the same buffer and do not re-spawn.
+    ///
+    /// The producer runs detached on its own tokio task; cancellation
+    /// of the caller does not cancel the producer.
+    fn spawn_populate_producer(
+        arc_self: Arc<Self>,
+        key: StoreKey<'_>,
+    ) -> Arc<StreamingBlobInner> {
+        Self::spawn_populate_producer_with_role(arc_self, key).0
+    }
+
+    /// Like [`spawn_populate_producer`] but also reports whether THIS
+    /// caller is the one that spawned the producer (`is_new=true` at
+    /// loader-acquisition). Used by `get_part` to preserve pre-fix
+    /// populator-vs-waiter error semantics.
+    fn spawn_populate_producer_with_role(
+        arc_self: Arc<Self>,
+        key: StoreKey<'_>,
+    ) -> (Arc<StreamingBlobInner>, bool) {
+        let loader_guard = arc_self.get_loader(key);
+        let streaming_inner = loader_guard.streaming_inner.clone();
+        let is_new = loader_guard.is_new;
+        if is_new {
+            // We're the first caller — spawn the producer with the guard.
+            // The guard's Drop removes the populating_digests entry when
+            // the producer finishes. Holding it for the producer's full
+            // lifetime allows late-arriving waiters to find this populate
+            // in the map and join in.
+            //
+            // tokio::spawn is synchronous; no awaits between
+            // construct-writer and spawn, so caller cancellation cannot
+            // slip in and drop the writer un-EOF'd.
+            let writer = StreamingBlobWriter::new(streaming_inner.clone());
+            let arc_for_producer = Arc::clone(&arc_self);
+            // The JoinHandle is intentionally dropped — the producer is
+            // detached and runs to completion regardless of caller
+            // lifetime. Dropping the JoinHandle does NOT abort the task.
+            drop(tokio::spawn(Self::run_producer(
+                arc_for_producer,
+                loader_guard,
+                writer,
+            )));
+        } else {
+            // Another caller spawned the producer; nothing to do. Drop
+            // the guard — the producer's guard keeps the entry alive.
+            drop(loader_guard);
+        }
+        (streaming_inner, is_new)
     }
 
     /// Ensure our fast store is populated. This should be kept as a low
@@ -1794,103 +1921,27 @@ impl StoreDriver for FastSlowStore {
             return Ok(());
         }
 
-        let loader_guard = self.get_loader(key.borrow());
-        let streaming_inner = loader_guard.streaming_inner.clone();
-        let is_waiter = !loader_guard.is_new;
+        // Spawn the producer if we're the first caller for this key
+        // (no-op otherwise). Capture `is_populator_caller` to preserve
+        // the pre-fix asymmetry on errors: the populator's caller
+        // propagates errors directly (matching the prior
+        // `loader.get_or_try_init(populate).await?` semantics), while
+        // waiters fall back to the slow store as they always have
+        // (covers genuine sliding-window evictions and rare upstream
+        // failures the populator's caller would not retry from).
+        let arc_self = self.get_arc().ok_or_else(|| {
+            make_err!(Code::Internal, "FastSlowStore dropped during get_part")
+        })?;
+        let (streaming_inner, is_populator_caller) =
+            Self::spawn_populate_producer_with_role(arc_self, key.borrow());
 
-        if is_waiter && !streaming_inner.is_terminal() {
-            // Another thread is actively populating — stream from the
-            // populate buffer concurrently. Data arrives as each chunk is
-            // read from the slow store, giving near-zero time-to-first-byte.
-            //
-            // If the populate already completed (is_terminal=true), skip
-            // this path — the buffer may be empty/drained. Read from the
-            // fast store instead (or fall through to slow store).
-            //
-            // For blobs larger than the sliding window, early chunks may
-            // have been evicted. Detect this and fall back to slow store.
-            drop(loader_guard);
-            debug!(
-                ?key,
-                "streaming populate: waiter reading concurrently from populate buffer"
-            );
-            let earliest = streaming_inner.earliest_chunk_idx();
-            if earliest > 0 {
-                debug!(
-                    ?key,
-                    earliest,
-                    "streaming populate: chunks evicted, falling back to slow store"
-                );
-                return self.slow_store
-                    .get_part(key.borrow(), &mut *writer, offset, length)
-                    .await;
-            }
-            let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(
-                streaming_inner,
-            );
-            let mut pos = 0u64;
-            let end = offset + length.unwrap_or(u64::MAX);
-            loop {
-                match reader.next_chunk().await {
-                    Ok(chunk) if chunk.is_empty() => break, // EOF
-                    Ok(chunk) => {
-                        let chunk_end = pos + chunk.len() as u64;
-                        if chunk_end > offset && pos < end {
-                            let start = if pos < offset {
-                                (offset - pos) as usize
-                            } else {
-                                0
-                            };
-                            let stop = if chunk_end > end {
-                                chunk.len() - (chunk_end - end) as usize
-                            } else {
-                                chunk.len()
-                            };
-                            if start < stop {
-                                writer
-                                    .send(chunk.slice(start..stop))
-                                    .await
-                                    .err_tip(|| "Failed to send streaming populate data")?;
-                            }
-                        }
-                        pos = chunk_end;
-                        if pos >= end {
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        // Streaming buffer error (populate failed or cursor
-                        // fell behind sliding window). Fall back to slow store.
-                        // We already wrote some bytes to `writer` from the
-                        // streaming read. Resume the slow store read from where
-                        // we left off to avoid sending duplicate data (which
-                        // would cause VerifyStore to report a size mismatch).
-                        let bytes_already_sent = writer.get_bytes_written();
-                        let new_offset = offset + bytes_already_sent;
-                        let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
-                        warn!(
-                            ?key,
-                            %err,
-                            bytes_already_sent,
-                            new_offset,
-                            "streaming populate reader error, falling back to slow store"
-                        );
-                        return self.slow_store
-                            .get_part(key.borrow(), &mut *writer, new_offset, new_length)
-                            .await;
-                    }
-                }
-            }
-            writer
-                .send_eof()
-                .err_tip(|| "Failed to send EOF after streaming populate")?;
-            Ok(())
-        } else if is_waiter {
-            // Populate already completed (is_terminal=true). Read from the
-            // fast store, falling back to slow store if evicted.
-            drop(loader_guard);
+        // If the producer already finished, the buffer may be drained or
+        // hold partial data behind the sliding window. Read from the
+        // fast store directly; on NotFound (eviction race) fall back to
+        // the slow store.
+        if streaming_inner.is_terminal() {
             let bytes_before = writer.get_bytes_written();
-            match self
+            return match self
                 .fast_store
                 .get_part(key.borrow(), &mut *writer, offset, length)
                 .await
@@ -1909,23 +1960,103 @@ impl StoreDriver for FastSlowStore {
                         .await
                 }
                 Err(err) => Err(err),
-            }
-        } else {
-            // We're the populator — stream to the client directly AND tee
-            // data into the streaming buffer for any concurrent waiters.
-            let sw = Some(StreamingBlobWriter::new(streaming_inner));
-            loader_guard
-                .get_or_try_init(|| {
-                    self.populate_and_maybe_stream(
-                        key.borrow(),
-                        Some(writer),
-                        offset,
-                        length,
-                        sw,
-                    )
-                })
-                .await
+            };
         }
+
+        // For blobs larger than the sliding window, early chunks may
+        // have been evicted before we could read them. If our cursor is
+        // already past chunk 0, fall back to the slow store directly.
+        let earliest = streaming_inner.earliest_chunk_idx();
+        if earliest > 0 {
+            debug!(
+                ?key,
+                earliest,
+                "streaming populate: chunks evicted, falling back to slow store"
+            );
+            return self.slow_store
+                .get_part(key.borrow(), &mut *writer, offset, length)
+                .await;
+        }
+
+        debug!(
+            ?key,
+            is_populator_caller,
+            "streaming populate: reading concurrently from populate buffer"
+        );
+        let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(
+            streaming_inner,
+        );
+        let mut pos = 0u64;
+        let end = offset + length.unwrap_or(u64::MAX);
+        loop {
+            match reader.next_chunk().await {
+                Ok(chunk) if chunk.is_empty() => break, // EOF
+                Ok(chunk) => {
+                    let chunk_end = pos + chunk.len() as u64;
+                    if chunk_end > offset && pos < end {
+                        let start = if pos < offset {
+                            (offset - pos) as usize
+                        } else {
+                            0
+                        };
+                        let stop = if chunk_end > end {
+                            chunk.len() - (chunk_end - end) as usize
+                        } else {
+                            chunk.len()
+                        };
+                        if start < stop {
+                            writer
+                                .send(chunk.slice(start..stop))
+                                .await
+                                .err_tip(|| "Failed to send streaming populate data")?;
+                        }
+                    }
+                    pos = chunk_end;
+                    if pos >= end {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    if is_populator_caller {
+                        // Pre-fix populator semantics: errors propagate
+                        // directly, no slow-store fallback. Match the
+                        // prior `loader.get_or_try_init(populate).await?`
+                        // behavior so existing failpoint tests and
+                        // user-visible error contracts hold.
+                        return Err(err).err_tip(|| {
+                            "populate failed for the requesting caller"
+                        });
+                    }
+                    // Waiter path: streaming buffer error (producer
+                    // errored or cursor fell behind sliding window).
+                    // Fall back to slow store with offset adjusted to
+                    // account for any bytes already sent — sending
+                    // duplicates would trip VerifyStore.
+                    //
+                    // After the spawn-detach fix, this branch should
+                    // no longer fire for caller cancellation (which was
+                    // the production WARN flood); only genuine producer
+                    // errors or sliding-window evictions reach it.
+                    let bytes_already_sent = writer.get_bytes_written();
+                    let new_offset = offset + bytes_already_sent;
+                    let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
+                    warn!(
+                        ?key,
+                        %err,
+                        bytes_already_sent,
+                        new_offset,
+                        "streaming populate reader error, falling back to slow store"
+                    );
+                    return self.slow_store
+                        .get_part(key.borrow(), &mut *writer, new_offset, new_length)
+                        .await;
+                }
+            }
+        }
+        writer
+            .send_eof()
+            .err_tip(|| "Failed to send EOF after streaming populate")?;
+        Ok(())
     }
 
     async fn batch_get_part_unchunked(

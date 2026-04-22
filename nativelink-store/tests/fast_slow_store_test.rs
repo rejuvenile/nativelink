@@ -1520,3 +1520,374 @@ async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Erro
 
     Ok(())
 }
+
+/// Regression for the orphan-drop in `populate_and_maybe_stream` caused by
+/// the original requester's future being cancelled mid-populate. Before the
+/// spawn-detach fix, dropping the requester dropped the populate future,
+/// which dropped the StreamingBlobWriter un-EOF'd → all waiters observed
+/// `Code::Internal "writer dropped without sending EOF"` and fell back to
+/// the slow store directly (the production symptom: floods of
+/// "streaming populate reader error, falling back to slow store" warns).
+/// The fix detaches the producer onto its own task so cancellation of the
+/// requester does not cancel the populate.
+///
+/// Observable signal: the streaming buffer's terminal state. Pre-fix, it
+/// is the Drop fallback (`Code::Internal "writer dropped without sending
+/// EOF"`). Post-fix, the producer runs to completion and terminates the
+/// buffer with `Ok` (success EOF).
+#[nativelink_test]
+async fn populate_survives_caller_cancellation() -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_util::streaming_blob::StreamingBlob;
+    use tokio::sync::Notify;
+
+    /// Slow store whose `get_part` releases a notify on entry then waits
+    /// for the test to release it. All other operations defer to a
+    /// backing MemoryStore.
+    #[derive(MetricsComponent)]
+    struct StallSlowStore {
+        inner: Arc<MemoryStore>,
+        get_entered: Arc<Notify>,
+        release_get: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl StoreDriver for StallSlowStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .has_with_results(digests, results)
+                .await
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            digest: StoreKey<'_>,
+            reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .update(digest, reader, size_info)
+                .await
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            // Signal entry so the test can cancel the requester before
+            // any bytes are delivered.
+            self.get_entered.notify_waiters();
+            self.release_get.notified().await;
+            Pin::new(self.inner.as_ref())
+                .get_part(key, writer, offset, length)
+                .await
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    default_health_status_indicator!(StallSlowStore);
+
+    let original_data = make_random_data(64 * 1024);
+    let digest = DigestInfo::try_new(VALID_HASH, original_data.len() as u64).unwrap();
+
+    let inner_slow = MemoryStore::new(&MemorySpec::default());
+    Pin::new(inner_slow.as_ref())
+        .update_oneshot(digest.into(), original_data.clone().into())
+        .await?;
+
+    let get_entered = Arc::new(Notify::new());
+    let release_get = Arc::new(Notify::new());
+    let stall_store = Arc::new(StallSlowStore {
+        inner: inner_slow,
+        get_entered: Arc::clone(&get_entered),
+        release_get: Arc::clone(&release_get),
+    });
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(stall_store);
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Caller A: pre-register a `notified()` for `get_entered` before
+    // launching, so we don't miss the wake-up.
+    let entered_wait = get_entered.notified();
+    let fss_a = Arc::clone(&fast_slow_store);
+    let caller_a = tokio::spawn(async move {
+        fss_a.get_part_unchunked(digest, 0, None).await
+    });
+
+    // Wait until caller A's populate has entered slow_store.get_part().
+    tokio::time::timeout(Duration::from_secs(5), entered_wait)
+        .await
+        .map_err(|_| make_err!(Code::DeadlineExceeded, "caller A never entered slow get_part"))?;
+
+    // Capture the streaming buffer Arc BEFORE cancelling A, while the
+    // populating_digests entry is live.
+    let streaming_inner = fast_slow_store
+        .populating_streaming_inner(digest.into())
+        .expect(
+            "populator should have registered a streaming buffer in \
+             populating_digests before awaiting slow_store.get_part()",
+        );
+
+    // CANCEL caller A. Pre-fix: this drops the populate future → drops
+    // the StreamingBlobWriter un-EOF'd → terminal becomes Drop's
+    // generic Internal error.
+    caller_a.abort();
+    // Drain the JoinHandle to ensure the cancelled task is fully torn
+    // down before proceeding (the result is a JoinError from the abort).
+    drop(caller_a.await);
+
+    // Release the slow store so the populate can proceed (post-fix:
+    // the spawned producer is parked here; pre-fix: nobody is parked
+    // because the slow_store.get_part future was cancelled).
+    release_get.notify_waiters();
+
+    // Read from the streaming buffer to drive the terminal state. With
+    // the fix, the producer continues, sends all chunks, sends EOF.
+    // Without the fix, the buffer is already terminated with the Drop
+    // fallback error.
+    let mut reader = StreamingBlob::new_reader(&streaming_inner);
+    let mut collected: Vec<u8> = Vec::new();
+    let read_outcome: Result<(), Error> = async {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), reader.next_chunk()).await {
+                Ok(Ok(c)) if c.is_empty() => return Ok(()),
+                Ok(Ok(c)) => collected.extend_from_slice(&c),
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(make_err!(
+                        Code::DeadlineExceeded,
+                        "streaming reader hung (producer never resumed after caller cancel)"
+                    ));
+                }
+            }
+        }
+    }
+    .await;
+
+    let read_err = read_outcome.err();
+    assert!(
+        read_err.is_none(),
+        "streaming buffer must terminate with EOF after producer completes — \
+         pre-fix Drop fallback would surface here. Got: {read_err:?}"
+    );
+    assert_eq!(
+        collected.as_slice(),
+        original_data.as_slice(),
+        "waiter must receive full populate data even when populator's caller cancels"
+    );
+
+    Ok(())
+}
+
+/// Regression for the producer error path: when the slow store fails
+/// mid-stream, waiters must receive the typed upstream error via the
+/// streaming buffer's terminal state, NOT the generic Drop fallback.
+/// This ensures `send_error` is reached on every error path including
+/// the spawn-detached producer's error path.
+#[nativelink_test]
+async fn populate_producer_error_propagates_to_waiters() -> Result<(), Error> {
+    use core::sync::atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrd};
+    use core::time::Duration;
+    use nativelink_util::streaming_blob::StreamingBlob;
+    use tokio::sync::Notify;
+
+    /// Slow store whose first `get_part` parks until `release_get` is
+    /// notified then returns Unavailable. Subsequent calls return
+    /// Unavailable immediately so `get_part`'s slow-store fallback path
+    /// terminates promptly. The gate gives the test a deterministic
+    /// window to capture the streaming buffer Arc before the producer
+    /// completes.
+    #[derive(MetricsComponent)]
+    struct GatedErrorSlowStore {
+        inner: Arc<MemoryStore>,
+        get_entered: Arc<Notify>,
+        release_get: Arc<Notify>,
+        first_call_done: TestAtomicBool,
+    }
+
+    #[async_trait]
+    impl StoreDriver for GatedErrorSlowStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .has_with_results(digests, results)
+                .await
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            digest: StoreKey<'_>,
+            reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .update(digest, reader, size_info)
+                .await
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            _key: StoreKey<'_>,
+            _writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> Result<(), Error> {
+            // First call: signal entry and wait for the test to release
+            // the gate. Later calls (e.g. slow-store fallback path)
+            // fail immediately without parking.
+            if !self.first_call_done.swap(true, TestOrd::AcqRel) {
+                self.get_entered.notify_waiters();
+                self.release_get.notified().await;
+            }
+            Err(make_err!(
+                Code::Unavailable,
+                "synthetic slow-store get_part failure for test"
+            ))
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    default_health_status_indicator!(GatedErrorSlowStore);
+
+    let digest = DigestInfo::try_new(VALID_HASH, 1024).unwrap();
+    let inner_slow = MemoryStore::new(&MemorySpec::default());
+    // Register a placeholder so `has()` returns Some — only `get_part`
+    // errors. This forces the populator past the head_result match into
+    // the data_stream_fut path.
+    Pin::new(inner_slow.as_ref())
+        .update_oneshot(digest.into(), Bytes::from(vec![0u8; 1024]))
+        .await?;
+
+    let get_entered = Arc::new(Notify::new());
+    let release_get = Arc::new(Notify::new());
+    let err_store = Arc::new(GatedErrorSlowStore {
+        inner: inner_slow,
+        get_entered: Arc::clone(&get_entered),
+        release_get: Arc::clone(&release_get),
+        first_call_done: TestAtomicBool::new(false),
+    });
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(err_store);
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+
+    let entered_wait = get_entered.notified();
+    let fss = Arc::clone(&fast_slow_store);
+    let caller = tokio::spawn(async move {
+        fss.get_part_unchunked(digest, 0, None).await
+    });
+
+    // Wait until the producer has entered slow_store.get_part() and is
+    // parked on the gate.
+    tokio::time::timeout(Duration::from_secs(5), entered_wait)
+        .await
+        .map_err(|_| make_err!(Code::DeadlineExceeded, "producer never entered slow get_part"))?;
+
+    // Capture the streaming buffer Arc while the producer is parked.
+    let streaming_inner = fast_slow_store
+        .populating_streaming_inner(digest.into())
+        .expect(
+            "producer should have registered a streaming buffer before \
+             entering slow_store.get_part()",
+        );
+
+    // Release the gate so the producer fails with Unavailable.
+    release_get.notify_waiters();
+
+    // Wait for the caller to complete (with an error).
+    let caller_res = tokio::time::timeout(Duration::from_secs(5), caller)
+        .await
+        .map_err(|_| make_err!(Code::DeadlineExceeded, "caller hung on producer error"))?
+        .map_err(|e| make_err!(Code::Internal, "caller join: {:?}", e))?;
+    assert!(
+        caller_res.is_err(),
+        "caller must observe an error when slow store fails mid-stream"
+    );
+
+    // The streaming buffer's terminal state must carry a structured
+    // error message that reflects the upstream failure, NOT the Drop
+    // fallback "writer dropped without sending EOF".
+    let mut reader = StreamingBlob::new_reader(&streaming_inner);
+    let read_err = tokio::time::timeout(Duration::from_secs(5), reader.next_chunk())
+        .await
+        .map_err(|_| make_err!(Code::DeadlineExceeded, "streaming reader hung"))?
+        .err()
+        .expect("streaming buffer terminal must be an error after producer fails");
+    assert!(
+        !read_err
+            .messages
+            .iter()
+            .any(|m| m.contains("dropped without sending EOF")),
+        "streaming buffer terminal must NOT be Drop's fallback — \
+         send_error must be reached on every producer error path. \
+         Got: {:?}",
+        read_err.messages
+    );
+
+    Ok(())
+}
