@@ -22,12 +22,63 @@ use futures::Future;
 use futures::stream::{FuturesUnordered, StreamExt, unfold};
 use nativelink_config::stores::Retry;
 use nativelink_error::{Code, Error, make_err};
+use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::{Channel, Endpoint, channel};
 use tracing::{debug, error, warn};
 
 use crate::background_spawn;
 use crate::retry::{self, Retrier, RetryResult};
+
+/// Per-endpoint exponential backoff state for the gap between successive
+/// `Retrier` invocations on the same endpoint. The inner `Retrier` already
+/// applies its own backoff during a single connection attempt cycle; this
+/// state controls the wait *between* outer cycles when an endpoint is fully
+/// unreachable (e.g. server is down for restart).
+///
+/// **Why this exists:** with a flat 1s sleep, a fleet of 10 workers × 32
+/// `connections_per_endpoint` would emit ~320 reconnect attempts/sec
+/// indefinitely after a server restart, flooding logs and burning CPU on
+/// both sides. Exponential backoff caps that at ~1 attempt every 30s per
+/// connection (~10/sec across the fleet) once the upper bound is reached,
+/// while still recovering quickly (1s) on the first reconnect after a
+/// successful link. Jitter (±25%) prevents thundering-herd alignment when
+/// many workers retry simultaneously.
+#[derive(Debug)]
+struct ReconnectBackoff {
+    current: Duration,
+    max: Duration,
+}
+
+impl ReconnectBackoff {
+    const INITIAL: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(30);
+
+    const fn new() -> Self {
+        Self {
+            current: Self::INITIAL,
+            max: Self::MAX,
+        }
+    }
+
+    /// Return the next delay (jittered) and advance the schedule. The
+    /// returned value is the *current* base scaled by ±25%, then `current`
+    /// doubles for next time (capped at `max`).
+    fn next_delay(&mut self) -> Duration {
+        let base = self.current;
+        let jitter_factor = 0.75 + rand::rng().random::<f64>() * 0.5;
+        let jittered = Duration::from_secs_f64(base.as_secs_f64() * jitter_factor);
+        self.current = self.current.saturating_mul(2).min(self.max);
+        jittered
+    }
+
+    /// Reset the schedule back to the initial 1s delay. Called after a
+    /// successful connection so the next failure starts fresh rather than
+    /// at the saturated 30s cap.
+    fn reset(&mut self) {
+        self.current = Self::INITIAL;
+    }
+}
 
 /// A helper utility that enables management of a suite of connections to an
 /// upstream gRPC endpoint using Tonic.
@@ -91,8 +142,9 @@ struct EstablishedChannel {
 /// given endpoint.
 struct ConnectionManagerWorker {
     /// The endpoints to establish Channels and the identifier of the last
-    /// connection attempt to that endpoint.
-    endpoints: Vec<(ConnectionIndex, Endpoint)>,
+    /// connection attempt to that endpoint, paired with per-endpoint
+    /// reconnect backoff state.
+    endpoints: Vec<(ConnectionIndex, Endpoint, ReconnectBackoff)>,
     /// The channel used to communicate between a Connection and the worker.
     connection_tx: mpsc::UnboundedSender<ConnectionRequest>,
     /// The number of connections that are currently allowed to be made.
@@ -131,7 +183,7 @@ impl ConnectionManager {
         let (connection_tx, connection_rx) = mpsc::unbounded_channel();
         let endpoints = endpoints
             .into_iter()
-            .map(|endpoint| (0, endpoint))
+            .map(|endpoint| (0, endpoint, ReconnectBackoff::new()))
             .collect();
 
         if max_concurrent_requests == 0 {
@@ -259,6 +311,16 @@ impl ConnectionManagerWorker {
     fn handle_connected(&mut self, connection_result: IndexedChannel) {
         match connection_result {
             Ok(established_channel) => {
+                // Reset the per-endpoint backoff on success so the next
+                // failure starts again at 1s rather than at the saturated
+                // 30s cap. Without this, an endpoint that flaps would stay
+                // permanently slow to recover.
+                if let Some((_, _, backoff)) = self
+                    .endpoints
+                    .get_mut(established_channel.identifier.endpoint_index)
+                {
+                    backoff.reset();
+                }
                 self.available_channels.push_back(established_channel);
                 self.maybe_available_connection();
             }
@@ -272,7 +334,8 @@ impl ConnectionManagerWorker {
     }
 
     fn connect_endpoint(&mut self, endpoint_index: usize, connection_index: Option<usize>) {
-        let Some((current_connection_index, endpoint)) = self.endpoints.get_mut(endpoint_index)
+        let Some((current_connection_index, endpoint, backoff)) =
+            self.endpoints.get_mut(endpoint_index)
         else {
             // Unknown endpoint, this should never happen.
             error!(?endpoint_index, "Connection to unknown endpoint requested");
@@ -283,10 +346,19 @@ impl ConnectionManagerWorker {
             *current_connection_index += 1;
             *current_connection_index
         });
+        // Compute the inter-cycle backoff delay BEFORE spawning the retry
+        // future. We must mutate the per-endpoint state under `&mut self`
+        // here; the spawned future only owns the resulting `Duration`.
+        // Without exponential backoff, a fleet of N workers × M
+        // `connections_per_endpoint` (e.g. 10×32 = 320) generated 320
+        // reconnects/sec after a server restart, flooding logs and the
+        // network. See `ReconnectBackoff` doc for the rationale.
+        let reconnect_delay = is_backoff.then(|| backoff.next_delay());
         if is_backoff {
             warn!(
                 ?connection_index,
                 endpoint = ?endpoint.uri(),
+                ?reconnect_delay,
                 "Connection failed, reconnecting"
             );
         } else {
@@ -320,10 +392,12 @@ impl ConnectionManagerWorker {
         });
         let retrier = self.retrier.clone();
         self.connecting_channels.push(Box::pin(async move {
-            if is_backoff {
-                // Just in case the retry config is 0, then we need to
-                // introduce some delay so we aren't in a hard loop.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(delay) = reconnect_delay {
+                // Sleep before retrying so we aren't in a hard loop and so
+                // a fleet of workers doesn't synchronize-and-stampede an
+                // endpoint that just came back online (see jitter in
+                // `ReconnectBackoff::next_delay`).
+                tokio::time::sleep(delay).await;
             }
             retrier.retry(connection_stream).await.map_or_else(
                 |err| Err((identifier, err)),
@@ -535,13 +609,58 @@ impl Future for ResponseFuture {
 
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
     use std::sync::Arc;
 
     use nativelink_config::stores::Retry;
     use nativelink_error::Code;
     use tonic::transport::Endpoint;
 
-    use super::ConnectionManager;
+    use super::{ConnectionManager, ReconnectBackoff};
+
+    /// Assert `actual` falls within `±25%` of `expected_base`. The jittered
+    /// delay is `base * uniform(0.75, 1.25)`, so the bounds are [0.75x, 1.25x].
+    #[track_caller]
+    fn assert_within_jitter(actual: Duration, expected_base: Duration) {
+        let lower = expected_base.mul_f64(0.75);
+        let upper = expected_base.mul_f64(1.25);
+        assert!(
+            actual >= lower && actual <= upper,
+            "delay {actual:?} not within jitter window [{lower:?}, {upper:?}] of base {expected_base:?}"
+        );
+    }
+
+    /// `ReconnectBackoff` doubles the base from 1s through 16s, saturates
+    /// at 30s, and stays at 30s thereafter. Each returned delay is jittered
+    /// ±25% of the *current base*.
+    #[test]
+    fn reconnect_backoff_doubles_until_saturation() {
+        let mut b = ReconnectBackoff::new();
+        // Bases: 1, 2, 4, 8, 16. Next would be 32 → clamped to 30.
+        for base_secs in [1u64, 2, 4, 8, 16] {
+            assert_within_jitter(b.next_delay(), Duration::from_secs(base_secs));
+        }
+        // Saturated at 30s for all subsequent calls.
+        for _ in 0..5 {
+            assert_within_jitter(b.next_delay(), Duration::from_secs(30));
+        }
+    }
+
+    /// After `reset()`, the next delay is back near 1s regardless of how
+    /// far the schedule had advanced. This is the SUCCESS path: the next
+    /// failure should not pick up where the saturated schedule left off.
+    #[test]
+    fn reconnect_backoff_reset_returns_to_initial() {
+        let mut b = ReconnectBackoff::new();
+        // Advance well past the cap.
+        for _ in 0..20 {
+            let _ = b.next_delay();
+        }
+        b.reset();
+        assert_within_jitter(b.next_delay(), Duration::from_secs(1));
+        // And it climbs again from 1s.
+        assert_within_jitter(b.next_delay(), Duration::from_secs(2));
+    }
 
     /// When the pool has no available channels (here: a single endpoint that
     /// will never connect within the test window), `connection_with_timeout`
