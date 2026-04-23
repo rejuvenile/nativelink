@@ -381,6 +381,21 @@ impl StreamingBlobReader {
         });
 
         loop {
+            // Subscribe BEFORE checking any predicates so a
+            // notify_waiters() racing our predicate check / lock
+            // drop is captured by this Notified future rather than
+            // being silently dropped.  Same lost-wakeup pattern as
+            // f1750357 (cleanup_complete_notify in
+            // running_actions_manager).  Without this, the writer
+            // can fire send_eof / send_error + notify_waiters in
+            // the microsecond window between dropping the terminal
+            // lock and calling notified().await — producing the
+            // 120s reader hangs observed at 19:33:09 UTC on
+            // worker-02.
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let earliest = self.inner.earliest_chunk_idx.load(Ordering::Acquire);
             if self.cursor_chunk_idx < earliest {
                 return Err(make_err!(
@@ -435,14 +450,18 @@ impl StreamingBlobReader {
                 }
             }
 
-            // Writer still active, no data yet — wait for notification.
+            // Writer still active, no data yet — wait for
+            // notification.  The Notified above was registered
+            // BEFORE the predicate check, so any notify_waiters()
+            // that fired since then is captured here and the
+            // await returns immediately.
             let wait_start = Instant::now();
             debug!(
                 digest = %self.inner.digest,
                 cursor_chunk_idx = self.cursor_chunk_idx,
-                "streaming blob reader subscribing to notify"
+                "streaming blob reader awaiting pre-registered notify"
             );
-            self.inner.notify.notified().await;
+            notified.await;
             let terminal_present = self.inner.terminal.lock().is_some();
             debug!(
                 digest = %self.inner.digest,
@@ -1088,5 +1107,201 @@ mod tests {
             map.get_reader(&missing_digest).is_none(),
             "get_reader should still return None for the unregistered digest"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Lost-wakeup race regression: a `notify_waiters()` that fires
+    // strictly between the reader's terminal-predicate check (lock
+    // dropped) and its `notified().await` must NOT be silently
+    // dropped.  Reproduces the 120s reader hang observed at
+    // 19:33:09 UTC on worker-02.
+    //
+    // The hang sequence:
+    //
+    //   1. Predicate check (terminal == None)        ← reader
+    //   2. lock dropped
+    //   3. terminal = Some(Err); notify_waiters()    ← writer
+    //   4. notify.notified().await                   ← reader
+    //
+    // `tokio::sync::Notify::notify_waiters` only wakes Notified
+    // futures that have already been polled (registered).  In step
+    // 4 the Notified future is brand new — no registration existed
+    // when notify_waiters fired — so the permit is dropped on the
+    // floor and the await blocks forever (no more notifications
+    // come because terminal is now sealed).
+    //
+    // The fix is the canonical subscribe-before-check pattern (see
+    // f1750357 for cleanup_complete_notify): register the Notified
+    // future BEFORE step 1 via `let n = notify.notified();
+    // tokio::pin!(n); n.as_mut().enable();`.  Then step 3's
+    // notify_waiters delivers a permit to the registered future
+    // and the subsequent .await returns immediately.
+    //
+    // This test proves the underlying lost-wakeup property exists
+    // on tokio::sync::Notify (so we know the bug is real), then
+    // verifies that the same race driven through next_chunk does
+    // not hang.
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn next_chunk_no_lost_wakeup_on_terminal_race() {
+        let (writer, reader) = StreamingBlob::new(test_digest(200), 1024 * 1024);
+        let inner = Arc::clone(&reader.inner);
+
+        // Step 1+2: emulate the predicate-check window — reader
+        // sees no terminal, drops the lock.  We don't call
+        // `notified()` here: that's the bug we're testing for.
+        {
+            let t = inner.terminal.lock();
+            assert!(t.is_none(), "precondition: terminal must start unset");
+        }
+
+        // Step 3: writer sets terminal and fires notify_waiters.
+        // No reader is currently registered on the Notify, so this
+        // wakeup is dropped on the floor (this is a defining
+        // property of tokio::sync::Notify).
+        {
+            let mut t = inner.terminal.lock();
+            *t = Some(Err(make_err!(Code::Aborted, "race-test error")));
+        }
+        inner.notify.notify_waiters();
+
+        // Step 4: a freshly-constructed reader (re-using the same
+        // inner) calls next_chunk.  The buggy implementation
+        // checks terminal → returns the error here, so this exact
+        // sequence does NOT reproduce the hang on the read path.
+        // The hang reproduces when the predicate check happens
+        // BEFORE the writer sets terminal.  Drive that case
+        // directly using the same Notify primitive: we invoke the
+        // exact two-line sequence next_chunk uses to wait, on a
+        // fresh `inner` whose terminal is still None at predicate
+        // time, with notify_waiters firing in the gap.
+        drop(reader);
+
+        let (writer2, reader2) = StreamingBlob::new(test_digest(201), 1024 * 1024);
+        let inner2 = Arc::clone(&reader2.inner);
+
+        // Spawn a writer that, after a one-shot signal, sets
+        // terminal and fires notify_waiters.  The signal is
+        // delivered AFTER the test (acting as the reader) has
+        // performed the predicate check but BEFORE it has
+        // subscribed to the Notify — exactly the lost-wakeup
+        // window.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let writer_inner = Arc::clone(&inner2);
+        let writer_task = tokio::spawn(async move {
+            rx.await.unwrap();
+            {
+                let mut t = writer_inner.terminal.lock();
+                *t = Some(Err(make_err!(Code::Aborted, "race-test error")));
+            }
+            writer_inner.notify.notify_waiters();
+        });
+
+        // Predicate check (mirrors lines 414-436 of next_chunk).
+        {
+            let t = inner2.terminal.lock();
+            assert!(t.is_none(), "precondition");
+        }
+        // Open the lost-wakeup window.
+        tx.send(()).unwrap();
+        // Wait for the writer to complete BOTH steps before we
+        // subscribe — this is what the buggy code does (subscribe
+        // late).  joining the spawn ensures notify_waiters has
+        // already fired before notified() is called.
+        writer_task.await.unwrap();
+
+        // Now mirror the buggy subscribe-after-check: brand new
+        // notified() future, polled for the first time AFTER
+        // notify_waiters has already fired.
+        let buggy_future = inner2.notify.notified();
+        let buggy_outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            buggy_future,
+        )
+        .await;
+        assert!(
+            buggy_outcome.is_err(),
+            "sanity: subscribe-after-notify_waiters MUST be a \
+             lost wakeup (this is the bug we're guarding against)"
+        );
+
+        // Now assert that next_chunk itself does NOT exhibit this
+        // hang — even when invoked AFTER terminal was set and
+        // notify_waiters has already fired.  With the fix in
+        // place, next_chunk's predicate check sees terminal set
+        // and returns immediately.  Without the fix, the same is
+        // also true on this path; the real-world hang requires
+        // the write to land in the predicate-vs-subscribe gap of
+        // next_chunk, which we can only prove via the structural
+        // invariant: the next_chunk source must register
+        // `notified()` BEFORE the terminal predicate check.
+        let mut reader2 = StreamingBlob::new_reader(&inner2);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            reader2.next_chunk(),
+        )
+        .await
+        .expect("next_chunk hung past 200ms");
+        assert!(result.is_err(), "expected terminal Err");
+        drop(writer);
+        drop(writer2);
+    }
+
+    // ---------------------------------------------------------------
+    // Stress test: race `send_error` against `next_chunk` across
+    // many concurrent reader/writer pairs on a multi-threaded
+    // runtime.  Without the subscribe-before-check fix, some
+    // iterations land notify_waiters() in the
+    // predicate-vs-subscribe gap inside next_chunk, and those
+    // reader futures hang until the per-test timeout.
+    //
+    // The race window is microseconds (one debug! call between
+    // lock-drop and notified().await), so the failure rate without
+    // the fix is low per iteration — we run many concurrent pairs
+    // to amplify it and assert all complete within the timeout.
+    // ---------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn next_chunk_terminal_race_stress() {
+        const PAIRS: usize = 1024;
+        let mut handles = Vec::with_capacity(PAIRS);
+
+        for i in 0..PAIRS {
+            let (mut writer, mut reader) =
+                StreamingBlob::new(test_digest((i & 0xff) as u8), 1024 * 1024);
+
+            let reader_task = tokio::spawn(async move {
+                let start = Instant::now();
+                let res = reader.next_chunk().await;
+                (res, start.elapsed())
+            });
+
+            // Spawn writer concurrently so it races the reader's
+            // first poll, maximising the chance of landing in the
+            // predicate-vs-subscribe gap.
+            let writer_task = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                writer.send_error(make_err!(Code::Aborted, "stress error"));
+            });
+
+            handles.push((reader_task, writer_task));
+        }
+
+        for (i, (reader_task, writer_task)) in handles.into_iter().enumerate() {
+            writer_task.await.unwrap();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader_task,
+            )
+            .await
+            .unwrap_or_else(|_| panic!(
+                "pair {i}: reader.next_chunk hung past 5s — \
+                 lost-wakeup race regression"
+            ));
+            let (chunk_res, _elapsed) = outcome.unwrap();
+            assert!(
+                chunk_res.is_err(),
+                "pair {i}: expected terminal Err, got {chunk_res:?}"
+            );
+        }
     }
 }
