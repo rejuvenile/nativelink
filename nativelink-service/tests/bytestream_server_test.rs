@@ -27,7 +27,7 @@ use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use nativelink_config::cas_server::{ByteStreamConfig, HttpListener, WithInstanceName};
 use nativelink_config::stores::{MemorySpec, StoreSpec};
-use nativelink_error::{Code, Error, ResultExt};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -2997,5 +2997,114 @@ pub async fn locality_timeout_falls_through_without_eviction()
         "locality entry must survive a confirm-timeout",
     );
 
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// T4: locality fast-path interpret_locality_confirmation
+//
+// Bug shape: pre-fix the bytestream write fast-path matched `worker.has()`
+// outcomes via:
+//   Ok(Ok(Ok(Some(_)))) => Some(true),
+//   Ok(Ok(Ok(None)))    => Some(false),
+//   _                   => None,    // join/RPC error or timeout
+//
+// The catch-all `_` swallowed `Ok(Ok(Err(e)))` — including peer-side
+// Err(Code::NotFound). On `None` the locality entry is preserved and
+// the upload falls through. That's correct for transient errors but
+// WRONG for a structured NotFound: the peer's has() RPC returned
+// successfully and explicitly said "I don't have this digest". The
+// locality map was lying and must be evicted.
+//
+// We test the interpretation function directly because the integration
+// path is wrapped inside the bytestream write streaming pipeline; testing
+// the interpretation in isolation pins the fix to its behavioral contract.
+// -------------------------------------------------------------------
+#[nativelink_test]
+pub async fn locality_confirmation_some_present_returns_true()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_service::bytestream_server::interpret_locality_confirmation;
+    let result: Result<
+        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    > = Ok(Ok(Ok(Some(123))));
+    assert_eq!(interpret_locality_confirmation(result), Some(true));
+    Ok(())
+}
+
+#[nativelink_test]
+pub async fn locality_confirmation_ok_none_returns_false()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_service::bytestream_server::interpret_locality_confirmation;
+    let result: Result<
+        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    > = Ok(Ok(Ok(None)));
+    assert_eq!(interpret_locality_confirmation(result), Some(false));
+    Ok(())
+}
+
+#[nativelink_test]
+pub async fn locality_confirmation_err_not_found_returns_false()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_service::bytestream_server::interpret_locality_confirmation;
+    // Pre-fix this fell into `_ => None` — the locality entry was kept.
+    // Post-fix: structured NotFound must be Some(false) so the caller
+    // evicts the locality entry.
+    let err = make_err!(Code::NotFound, "peer worker reports NotFound");
+    let result: Result<
+        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    > = Ok(Ok(Err(err)));
+    assert_eq!(
+        interpret_locality_confirmation(result),
+        Some(false),
+        "structured NotFound from peer must evict, not be treated as transient"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+pub async fn locality_confirmation_err_other_returns_none()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_service::bytestream_server::interpret_locality_confirmation;
+    // Non-NotFound errors (Unavailable, DeadlineExceeded, Internal, etc.)
+    // are treated as transient: fall through without evicting.
+    for code in [
+        Code::Unavailable,
+        Code::DeadlineExceeded,
+        Code::Internal,
+        Code::Cancelled,
+    ] {
+        let err = make_err!(code, "peer worker {:?}", code);
+        let result: Result<
+            Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
+            tokio::time::error::Elapsed,
+        > = Ok(Ok(Err(err)));
+        assert_eq!(
+            interpret_locality_confirmation(result),
+            None,
+            "{code:?} must be treated as transient (None — preserve locality)"
+        );
+    }
+    Ok(())
+}
+
+#[nativelink_test]
+pub async fn locality_confirmation_timeout_returns_none()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_service::bytestream_server::interpret_locality_confirmation;
+    // Build a real Elapsed by triggering an actual timeout.
+    let elapsed = tokio::time::timeout(
+        core::time::Duration::from_nanos(1),
+        tokio::time::sleep(core::time::Duration::from_secs(60)),
+    )
+    .await
+    .expect_err("must time out");
+    let result: Result<
+        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    > = Err(elapsed);
+    assert_eq!(interpret_locality_confirmation(result), None);
     Ok(())
 }

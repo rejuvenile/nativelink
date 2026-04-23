@@ -302,6 +302,54 @@ fn parse_uuid_to_key(uuid_str: &str) -> UuidKey {
     }
 }
 
+/// Interpret the result of `tokio::time::timeout(_, tokio::spawn(worker.has(_)))`
+/// for the bytestream locality fast-path:
+///
+/// - `Some(true)`  — peer confirmed it has the blob (short-circuit upload)
+/// - `Some(false)` — peer confirmed it does NOT have the blob (evict locality,
+///                   ingest normally). Includes both `Ok(None)` AND the
+///                   structured `Err(Code::NotFound)` shape that a peer's
+///                   own inner store can bubble up; treating the latter as
+///                   a transient fall-through (the pre-fix behavior) leaves
+///                   the locality entry lying forever.
+/// - `None`        — transient (timeout, RPC error, join error, or any other
+///                   non-`NotFound` error). Fall through without evicting.
+///
+/// Bug shape pre-fix: the catch-all `_ => None` swallowed `Ok(Ok(Err(_)))`,
+/// including peer-side `Err(Code::NotFound)` — a structured "I don't have
+/// this blob" reply. The locality entry was preserved on every subsequent
+/// FindMissingBlobs / has_with_results, so Bazel kept getting the upload
+/// short-circuited and downstream readers got NOT_FOUND because the blob
+/// was never actually stored anywhere.
+pub fn interpret_locality_confirmation(
+    result: Result<
+        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> Option<bool> {
+    match result {
+        // Peer affirmed presence with a known size — fast-path skip is safe.
+        Ok(Ok(Ok(Some(_)))) => Some(true),
+        // Peer affirmed absence (`Ok(None)`) — locality entry is stale;
+        // caller evicts and falls through to normal ingest.
+        Ok(Ok(Ok(None))) => Some(false),
+        // Peer's inner store bubbled up a structured `NotFound` — the RPC
+        // succeeded and explicitly said "I don't have this digest". This is
+        // semantically identical to `Ok(None)`: the locality entry is a
+        // lie and must be evicted, otherwise every subsequent
+        // `FindMissingBlobs` keeps trusting it and Bazel's re-upload gets
+        // short-circuited indefinitely (the zombie-NotFound loop seen in
+        // production for digest 1e08eefa…-183).
+        Ok(Ok(Err(e))) if e.code == Code::NotFound => Some(false),
+        // Any other error (`Unavailable`, `DeadlineExceeded`, `Internal`,
+        // join error, `Cancelled`, etc.) is treated as transient: don't
+        // evict and don't fast-path — fall through to the normal ingest
+        // path. Re-evicting on every connectivity blip would force
+        // re-uploads and defeat the locality fast-path's purpose.
+        Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => None,
+    }
+}
+
 pub struct InstanceInfo {
     store: Store,
     // Max number of bytes to send on each grpc stream chunk.
@@ -2015,16 +2063,9 @@ impl ByteStreamServer {
                             let join = tokio::spawn(async move {
                                 worker_store.has(confirm_digest).await
                             });
-                            let confirmed = match tokio::time::timeout(
-                                LOCALITY_CONFIRM_TIMEOUT,
-                                join,
-                            )
-                            .await
-                            {
-                                Ok(Ok(Ok(Some(_)))) => Some(true),
-                                Ok(Ok(Ok(None))) => Some(false),
-                                _ => None, // join error, RPC error, or timeout
-                            };
+                            let confirmed = interpret_locality_confirmation(
+                                tokio::time::timeout(LOCALITY_CONFIRM_TIMEOUT, join).await,
+                            );
                             match confirmed {
                                 Some(true) => {
                                     info!(
