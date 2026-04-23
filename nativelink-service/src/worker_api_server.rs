@@ -671,6 +671,34 @@ impl WorkerConnection {
                 .filter_map(|d| DigestInfo::try_from(d).ok()),
         );
 
+        // Pinned mirror digests: blobs the worker is holding *only* in
+        // memory because the server pushed them as a mirror. The worker is
+        // the durable holder until we ack via BlobsInStableStorage. We:
+        //   1. Register them in the locality map alongside normal digests so
+        //      reads from this worker can find them, AND
+        //   2. Always check existence and request `UploadMissingBlobs` for
+        //      any that aren't stably stored on the server. We deliberately
+        //      bypass the per-worker BACKFILL_COOLDOWN here — these are the
+        //      *only* copies; latency to durability matters more than the
+        //      tiny extra existence check load.
+        let pinned_mirror: Vec<DigestInfo> = notification
+            .pinned_mirror_digests
+            .into_iter()
+            .filter_map(|d| DigestInfo::try_from(d).ok())
+            .collect();
+        if !pinned_mirror.is_empty() {
+            debug!(
+                worker_id=?self.worker_id,
+                count=pinned_mirror.len(),
+                "BlobsAvailable received pinned mirror digests"
+            );
+        }
+        // Merge into `digests` so the locality registration below covers
+        // them. Cloning into a separate Vec for the pull pipeline keeps
+        // the existence-check scope explicit (we *only* pull mirror digests
+        // bypassing cooldown, not the much larger generic digests set).
+        digests.extend(pinned_mirror.iter().copied());
+
         // Acquire the write lock once for all mutations to avoid repeated
         // lock acquisition and eliminate inconsistency windows.
         //
@@ -704,6 +732,35 @@ impl WorkerConnection {
                 "Registering blobs available from worker"
             );
             map.register_blobs(endpoint, &digests);
+        }
+
+        // Mirror-pull pipeline: any digest the worker is holding pinned in
+        // memory MUST be pulled into the server's stable storage promptly,
+        // since the worker is the only durable holder. We bypass the
+        // BACKFILL_COOLDOWN throttle here — the cost of one extra existence
+        // check per worker per tick is negligible compared to the durability
+        // window we close. Once the upload lands in the server's slow store,
+        // the FastSlowStore push to `stable_digests` triggers the broadcast
+        // loop in `nativelink.rs` which sends `BlobsInStableStorage` back to
+        // the worker, dropping the pin.
+        if !pinned_mirror.is_empty() {
+            if let Some(ref cas_store) = self.cas_store {
+                let pinned = pinned_mirror.clone();
+                let cas = cas_store.clone();
+                let tx = self.worker_tx.clone();
+                let worker_id = self.worker_id.clone();
+                let inflight = self.backfill_inflight.clone();
+                background_spawn!("pull_pinned_mirror_blobs", async move {
+                    Self::request_missing_blob_uploads(
+                        &cas,
+                        &tx,
+                        &worker_id,
+                        &pinned,
+                        &inflight,
+                    )
+                    .await;
+                });
+            }
         }
 
         // After updating the locality map, check which of the newly reported

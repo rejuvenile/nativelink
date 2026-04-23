@@ -143,6 +143,16 @@ pub struct BlobsAvailableNotification {
     /// / 0 means unknown. 100 when no E-cores exist (P-core-only CPU).
     #[prost(uint32, tag = "12")]
     pub e_core_load_pct: u32,
+    /// / Digests of blobs the worker is holding pinned in memory as a server
+    /// / mirror (received via x-nativelink-mirror writes). The worker has no
+    /// / disk copy and the server may not have a stable copy yet — the worker
+    /// / is the only durable holder. The server must register these in the
+    /// / locality map AND request `UploadMissingBlobs` for any not yet stably
+    /// / stored. The pin is dropped only when `BlobsInStableStorage` arrives.
+    #[prost(message, repeated, tag = "13")]
+    pub pinned_mirror_digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
 }
 /// / Notification that blobs have been evicted from a worker.
 #[derive(Clone, PartialEq, ::prost::Message)]

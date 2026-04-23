@@ -149,6 +149,22 @@ message BlobsAvailableNotification {
     /// Efficiency-core CPU utilization percentage (0-100).
     /// 0 means unknown. 100 when no E-cores exist (P-core-only CPU).
     uint32 e_core_load_pct = 12;
+
+    /// Digests of blobs the worker is holding pinned in memory as a server
+    /// mirror (received via x-nativelink-mirror writes). The worker has no
+    /// disk copy and the server may not have a stable copy yet — the worker
+    /// is the only durable holder.
+    ///
+    /// On receiving these, the server MUST:
+    ///   1. Register them in the locality map (so reads can find them),
+    ///   2. For digests it does not already have stably stored, request an
+    ///      `UploadMissingBlobs` so the worker uploads the bytes back to the
+    ///      server's slow store.
+    /// Once the server has stably stored a digest it will broadcast a
+    /// `BlobsInStableStorage` for it; only that signal causes the worker to
+    /// drop the pin. This protects mirror blobs across server restarts —
+    /// the worker holds the only copy until the server is ready to receive.
+    repeated build.bazel.remote.execution.v2.Digest pinned_mirror_digests = 13;
 }
 
 /// Notification that blobs have been evicted from a worker.

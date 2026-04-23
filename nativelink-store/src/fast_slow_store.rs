@@ -98,13 +98,33 @@ pub struct FastSlowStore {
     /// worker can retry uploads on reconnect.
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
     /// Blobs received via server-side mirror that are held in memory only.
-    /// The server has already persisted these blobs — we hold them so peers
-    /// and local actions can read them without disk I/O. Cleaned up when
-    /// `BlobsInStableStorage` arrives or after a TTL expiry.
+    /// These are pinned on the worker indefinitely until the server confirms
+    /// the blob is in stable storage via `BlobsInStableStorage`. Per the
+    /// mirror-durability invariant: if the server is down or restarting and
+    /// has lost the blob, the worker is the *only* durable holder — dropping
+    /// the pin on a TTL would lose data. The 2 GiB cap (see
+    /// `MIRROR_BLOBS_MAX_BYTES`) is the only bound; the server is expected to
+    /// reclaim entries promptly via stable-storage acks.
     mirror_blobs: Mutex<HashMap<DigestInfo, (Bytes, Instant)>>,
     /// Total bytes currently held in `mirror_blobs`. Tracked separately to
     /// enforce `MIRROR_BLOBS_MAX_BYTES` without iterating the map.
     mirror_blobs_total_bytes: AtomicU64,
+    /// Tracks added/removed mirror digests since the last `drain_mirror_changes`
+    /// call so the worker's `BlobsAvailable` loop can send incremental updates
+    /// without re-snapshotting the whole map.
+    mirror_changes: Mutex<MirrorChanges>,
+    /// Notified on every mirror-blob insert/remove so the worker's
+    /// `BlobsAvailable` loop can wake immediately.
+    mirror_changes_notify: Arc<Notify>,
+}
+
+/// Pending mirror-blob deltas. `added` and `removed` are mutually exclusive
+/// per digest within the window (an insert + remove cancels out, and vice
+/// versa) so the worker never advertises a digest it has already dropped.
+#[derive(Debug, Default)]
+pub struct MirrorChanges {
+    pub added: HashSet<DigestInfo>,
+    pub removed: HashSet<DigestInfo>,
 }
 
 // This guard ensures that the populating_digests is cleared even if the future
@@ -177,6 +197,8 @@ impl FastSlowStore {
             failed_slow_writes: Arc::new(Mutex::new(HashSet::new())),
             mirror_blobs: Mutex::new(HashMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
+            mirror_changes: Mutex::new(MirrorChanges::default()),
+            mirror_changes_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -323,46 +345,106 @@ impl FastSlowStore {
             failed_slow_writes: shared,
             mirror_blobs: Mutex::new(HashMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
+            mirror_changes: Mutex::new(MirrorChanges::default()),
+            mirror_changes_notify: Arc::new(Notify::new()),
         })
     }
 
     /// Remove mirror blobs that the server has confirmed are in stable storage.
+    /// Records each removed digest in the mirror change tracker so the worker
+    /// emits a corresponding `evicted_digests` entry on its next BlobsAvailable.
     pub fn remove_mirror_blobs(&self, digests: &[DigestInfo]) {
         let mut guard = self.mirror_blobs.lock();
         let mut freed = 0u64;
+        let mut removed = Vec::with_capacity(digests.len());
         for digest in digests {
             if let Some((data, _)) = guard.remove(digest) {
                 freed += data.len() as u64;
+                removed.push(*digest);
             }
         }
+        drop(guard);
         if freed > 0 {
             self.mirror_blobs_total_bytes.fetch_sub(freed, Ordering::Relaxed);
         }
-    }
-
-    /// Remove mirror blobs older than the given duration. Returns the number
-    /// of blobs expired.
-    pub fn expire_mirror_blobs(&self, max_age: Duration) -> usize {
-        let mut guard = self.mirror_blobs.lock();
-        let before = guard.len();
-        let mut freed = 0u64;
-        guard.retain(|_, (data, inserted_at)| {
-            if inserted_at.elapsed() < max_age {
-                true
-            } else {
-                freed += data.len() as u64;
-                false
+        if !removed.is_empty() {
+            let mut changes = self.mirror_changes.lock();
+            for d in &removed {
+                changes.added.remove(d);
+                changes.removed.insert(*d);
             }
-        });
-        if freed > 0 {
-            self.mirror_blobs_total_bytes.fetch_sub(freed, Ordering::Relaxed);
+            drop(changes);
+            self.mirror_changes_notify.notify_one();
         }
-        before - guard.len()
     }
 
     /// Current number of mirror blobs held in memory.
     pub fn mirror_blob_count(&self) -> usize {
         self.mirror_blobs.lock().len()
+    }
+
+    /// Snapshot of all mirror-blob digests currently held. Used by the
+    /// worker's full `BlobsAvailable` snapshot path.
+    pub fn mirror_blob_digests(&self) -> Vec<DigestInfo> {
+        let guard = self.mirror_blobs.lock();
+        guard.keys().copied().collect()
+    }
+
+    /// Atomically swap out and return the accumulated mirror-blob deltas
+    /// since the last call. The internal state is replaced with empty sets.
+    pub fn drain_mirror_changes(&self) -> MirrorChanges {
+        let mut guard = self.mirror_changes.lock();
+        core::mem::take(&mut *guard)
+    }
+
+    /// Wakes when mirror-blob inserts or removes happen. Used by the
+    /// worker's BlobsAvailable loop.
+    pub fn mirror_changes_notify(&self) -> Arc<Notify> {
+        self.mirror_changes_notify.clone()
+    }
+
+    /// Insert a mirror blob, updating bookkeeping (total bytes + change
+    /// tracker). Returns false if the cap was exceeded and the blob was
+    /// dropped. Internal helper used by the mirror-write paths in
+    /// `update`/`update_oneshot` so accounting stays in one place.
+    fn insert_mirror_blob(&self, digest: DigestInfo, data: Bytes) -> bool {
+        let data_len = data.len() as u64;
+        let now = Instant::now();
+        let mut guard = self.mirror_blobs.lock();
+        let current = self.mirror_blobs_total_bytes.load(Ordering::Relaxed);
+        if current + data_len > MIRROR_BLOBS_MAX_BYTES {
+            drop(guard);
+            // warn (not debug) — silent drops here mean the cap is being
+            // exercised under real load; we want this in operator logs.
+            // Rate-limited via the per-digest tracker: we only log once per
+            // digest per drain window.
+            warn!(
+                %digest,
+                data_len,
+                current_total = current,
+                cap = MIRROR_BLOBS_MAX_BYTES,
+                "mirror blob dropped — memory cap exceeded; server will need to re-upload"
+            );
+            return false;
+        }
+        if let Some((old_data, _)) = guard.insert(digest, (data, now)) {
+            let old_len = old_data.len() as u64;
+            if data_len >= old_len {
+                self.mirror_blobs_total_bytes.fetch_add(data_len - old_len, Ordering::Relaxed);
+            } else {
+                self.mirror_blobs_total_bytes.fetch_sub(old_len - data_len, Ordering::Relaxed);
+            }
+        } else {
+            self.mirror_blobs_total_bytes.fetch_add(data_len, Ordering::Relaxed);
+        }
+        drop(guard);
+        // Record in change tracker (insert wins over a pending removal).
+        let mut changes = self.mirror_changes.lock();
+        changes.removed.remove(&digest);
+        changes.added.insert(digest);
+        drop(changes);
+        self.mirror_changes_notify.notify_one();
+        true
     }
 
     /// Default per-blob streaming buffer: 64 MiB sliding window.
@@ -1369,31 +1451,7 @@ impl StoreDriver for FastSlowStore {
                 chunks.extend_from_slice(&chunk);
             }
             let data = chunks.freeze();
-            let data_len = data.len() as u64;
-            {
-                let mut guard = self.mirror_blobs.lock();
-                let current = self.mirror_blobs_total_bytes.load(Ordering::Relaxed);
-                if current + data_len > MIRROR_BLOBS_MAX_BYTES {
-                    debug!(
-                        %digest,
-                        data_len,
-                        current_total = current,
-                        "mirror blob dropped — memory cap exceeded"
-                    );
-                    return Ok(());
-                }
-                if let Some((old_data, _)) = guard.insert(digest, (data, Instant::now())) {
-                    // Replacing existing entry — adjust by net difference.
-                    let old_len = old_data.len() as u64;
-                    if data_len >= old_len {
-                        self.mirror_blobs_total_bytes.fetch_add(data_len - old_len, Ordering::Relaxed);
-                    } else {
-                        self.mirror_blobs_total_bytes.fetch_sub(old_len - data_len, Ordering::Relaxed);
-                    }
-                } else {
-                    self.mirror_blobs_total_bytes.fetch_add(data_len, Ordering::Relaxed);
-                }
-            }
+            self.insert_mirror_blob(digest, data);
             return Ok(());
         }
 
@@ -1660,30 +1718,7 @@ impl StoreDriver for FastSlowStore {
         let is_mirror = IS_MIRROR_REQUEST.try_with(|v| *v).unwrap_or(false);
         if is_mirror {
             let digest = key.borrow().into_digest();
-            let data_len = data.len() as u64;
-            {
-                let mut guard = self.mirror_blobs.lock();
-                let current = self.mirror_blobs_total_bytes.load(Ordering::Relaxed);
-                if current + data_len > MIRROR_BLOBS_MAX_BYTES {
-                    debug!(
-                        %digest,
-                        data_len,
-                        current_total = current,
-                        "mirror blob dropped — memory cap exceeded"
-                    );
-                    return Ok(());
-                }
-                if let Some((old_data, _)) = guard.insert(digest, (data, Instant::now())) {
-                    let old_len = old_data.len() as u64;
-                    if data_len >= old_len {
-                        self.mirror_blobs_total_bytes.fetch_add(data_len - old_len, Ordering::Relaxed);
-                    } else {
-                        self.mirror_blobs_total_bytes.fetch_sub(old_len - data_len, Ordering::Relaxed);
-                    }
-                } else {
-                    self.mirror_blobs_total_bytes.fetch_add(data_len, Ordering::Relaxed);
-                }
-            }
+            self.insert_mirror_blob(digest, data);
             return Ok(());
         }
 

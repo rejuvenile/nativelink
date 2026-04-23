@@ -752,7 +752,6 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             warn!("UploadMissingBlobs: no CAS store available, ignoring");
             return;
         };
-        let fast_store = cas_store.fast_store();
         let slow_store = cas_store.slow_store();
         if slow_store
             .inner_store(None::<StoreKey<'_>>)
@@ -760,14 +759,21 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         {
             return;
         }
+        // Use the FastSlowStore wrapper (not just `fast_store()`) so reads
+        // transparently see mirror_blobs entries — the worker may hold a
+        // pinned mirror copy that never landed on disk, and that is the
+        // very copy the server is asking us to upload back.
+        let cas_store_wrapped: Store = Store::new(cas_store.clone());
 
-        // Check which blobs we actually have locally before uploading.
+        // Check which blobs we actually have locally (disk OR mirror) before
+        // uploading. FastSlowStore::has_with_results checks fast_store, the
+        // in_flight_slow_writes map, and mirror_blobs.
         let keys: Vec<StoreKey<'_>> = digests
             .iter()
             .map(|d| StoreKey::from(*d))
             .collect();
         let mut results = vec![None; keys.len()];
-        if let Err(err) = fast_store.has_with_results(&keys, &mut results).await {
+        if let Err(err) = cas_store_wrapped.has_with_results(&keys, &mut results).await {
             warn!(?err, "UploadMissingBlobs: failed to check local store");
             return;
         }
@@ -798,7 +804,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let mut uploads: FuturesUnordered<_> = present
             .iter()
             .map(|&digest| {
-                let fast_store = fast_store.clone();
+                let cas_store_wrapped = cas_store_wrapped.clone();
                 let slow_store = slow_store.clone();
                 let semaphore = semaphore.clone();
                 async move {
@@ -807,16 +813,18 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         .await
                         .expect("semaphore should not be closed");
                     // Use in-memory transfer for small blobs, streaming for
-                    // large ones to avoid OOM on multi-GB blobs.
+                    // large ones to avoid OOM on multi-GB blobs. Reads go
+                    // through the FastSlowStore wrapper so mirror_blobs
+                    // entries are visible.
                     const STREAMING_THRESHOLD: u64 = 1024 * 1024; // 1 MiB
                     let result = if digest.size_bytes() <= STREAMING_THRESHOLD {
-                        match fast_store.get_part_unchunked(digest, 0, None).await {
+                        match cas_store_wrapped.get_part_unchunked(digest, 0, None).await {
                             Ok(data) => slow_store.update_oneshot(digest, data).await,
                             Err(err) => Err(err),
                         }
                     } else {
                         let (tx, rx) = make_buf_channel_pair();
-                        let read_fut = fast_store.get(digest, tx);
+                        let read_fut = cas_store_wrapped.get(digest, tx);
                         let write_fut = slow_store.update(
                             digest,
                             rx,
@@ -905,7 +913,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         running_actions_manager: &Arc<U>,
         is_first: bool,
     ) -> Result<(), Error> {
-        let (digest_infos, evicted_digests) = if is_first {
+        let (digest_infos, mut evicted_digests, pinned_mirror_digests) = if is_first {
             // Full snapshot: scan everything once.
             let all = state.fs_store.get_all_digests_with_timestamps();
             // Drain any changes that accumulated during startup.
@@ -918,7 +926,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 })
                 .collect();
 
-            (infos, Vec::new())
+            // Mirror digests: full snapshot of currently-pinned mirror blobs.
+            // Drain the change tracker so subsequent deltas start fresh.
+            let mirror_digests = if let Some(ref fss) = state.cas_server_fss {
+                let snap = fss.mirror_blob_digests();
+                drop(fss.drain_mirror_changes());
+                snap.into_iter().map(|d| d.into()).collect()
+            } else {
+                Vec::new()
+            };
+
+            (infos, Vec::new(), mirror_digests)
         } else {
             // Delta: swap out accumulated changes. Touched digests (from
             // on_get cache hits) are merged with `added` so the server's
@@ -935,10 +953,25 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     digest: Some((*digest).into()),
                 })
                 .collect();
-            let evicted_protos = changes.evicted.iter().map(|d| (*d).into()).collect();
+            let mut evicted_protos: Vec<_> =
+                changes.evicted.iter().map(|d| (*d).into()).collect();
 
-            (infos, evicted_protos)
+            // Mirror delta: send currently-added pins and merge removed pins
+            // into evicted_digests so the server cleans up locality entries.
+            let mirror_added_protos: Vec<_> =
+                if let Some(ref fss) = state.cas_server_fss {
+                    let mc = fss.drain_mirror_changes();
+                    for d in mc.removed {
+                        evicted_protos.push(d.into());
+                    }
+                    mc.added.into_iter().map(|d| d.into()).collect()
+                } else {
+                    Vec::new()
+                };
+
+            (infos, evicted_protos, mirror_added_protos)
         };
+        let _ = &mut evicted_digests;
 
         // Collect subtree delta or full snapshot.
         let (cached_directory_digests, added_subtree_digests, removed_subtree_digests, is_full_subtree_snapshot) = if is_first {
@@ -961,6 +994,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let cached_dir_count = cached_directory_digests.len();
         let added_subtree_count = added_subtree_digests.len();
         let removed_subtree_count = removed_subtree_digests.len();
+        let pinned_mirror_count = pinned_mirror_digests.len();
 
         // Skip sending if there are truly no changes at all.
         if !is_first
@@ -968,6 +1002,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             && evicted_count == 0
             && added_subtree_count == 0
             && removed_subtree_count == 0
+            && pinned_mirror_count == 0
         {
             trace!("BlobsAvailable: no changes since last tick, skipping");
             return Ok(());
@@ -990,6 +1025,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             is_full_subtree_snapshot,
             p_core_load_pct: p_load,
             e_core_load_pct: e_load,
+            pinned_mirror_digests,
         };
 
         if let Err(err) = grpc_client.blobs_available(notification).await {
@@ -1000,6 +1036,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 cached_dir_count,
                 added_subtree_count,
                 removed_subtree_count,
+                pinned_mirror_count,
                 is_first,
                 "Failed to send periodic BlobsAvailable"
             );
@@ -1014,6 +1051,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 cached_dir_count,
                 added_subtree_count,
                 removed_subtree_count,
+                pinned_mirror_count,
                 is_first,
                 "Sent periodic BlobsAvailable"
             );
@@ -1049,9 +1087,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         if let Some(ref state) = self.blobs_available_state {
             let mut grpc_client = self.grpc_client.clone();
             let state = state.clone();
-            // Extract mirror cleanup reference before state is moved into
-            // the BlobsAvailable loop.
-            let mirror_cleanup_fss = state.cas_server_fss.clone();
+            // Pull a notify handle for mirror-blob inserts/removes so the
+            // BlobsAvailable loop wakes promptly when the server pushes a
+            // mirror copy to us. Pre-fix the loop only woke on FilesystemStore
+            // changes — mirror writes were invisible until the next backstop
+            // tick, and the mirror-TTL sweeper would sometimes drop the only
+            // copy of a blob if the server was slow to ack stable storage.
+            let mirror_notify =
+                state.cas_server_fss.as_ref().map(|f| f.mirror_changes_notify());
             let ram = self.running_actions_manager.clone();
             futures.push(
                 async move {
@@ -1065,12 +1108,21 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     )
                     .await?;
                     loop {
-                        // Wait for either:
-                        // 1. A blob insert/eviction notification (immediate wake), or
-                        // 2. The backstop interval (catches subtree-only changes).
-                        tokio::select! {
-                            () = state.notify.notified() => {}
-                            () = sleep(state.max_interval) => {}
+                        // Wait for any of:
+                        // 1. A FilesystemStore blob insert/eviction (immediate wake)
+                        // 2. A mirror-blob insert/remove (immediate wake)
+                        // 3. The backstop interval (catches subtree-only changes)
+                        if let Some(ref mn) = mirror_notify {
+                            tokio::select! {
+                                () = state.notify.notified() => {}
+                                () = mn.notified() => {}
+                                () = sleep(state.max_interval) => {}
+                            }
+                        } else {
+                            tokio::select! {
+                                () = state.notify.notified() => {}
+                                () = sleep(state.max_interval) => {}
+                            }
                         }
                         Self::send_periodic_blobs_available(
                             &mut grpc_client,
@@ -1084,30 +1136,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 .boxed(),
             );
 
-            // Periodic cleanup of stale mirror blobs. If the server never sends
-            // BlobsInStableStorage for a digest (e.g., because the server
-            // restarted), mirror blobs would leak memory. This task expires
-            // blobs older than 120s every 30s.
-            if let Some(cas_fss_for_cleanup) = mirror_cleanup_fss {
-                futures.push(
-                    async move {
-                        const MIRROR_TTL: Duration = Duration::from_secs(120);
-                        const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
-                        loop {
-                            sleep(CLEANUP_INTERVAL).await;
-                            let expired = cas_fss_for_cleanup.expire_mirror_blobs(MIRROR_TTL);
-                            if expired > 0 {
-                                warn!(
-                                    expired,
-                                    remaining = cas_fss_for_cleanup.mirror_blob_count(),
-                                    "expired stale mirror blobs (no BlobsInStableStorage received)"
-                                );
-                            }
-                        }
-                    }
-                    .boxed(),
-                );
-            }
+            // NOTE: The mirror-TTL sweeper that previously expired pinned
+            // mirror blobs after 120s has been REMOVED. Mirror blobs are
+            // pinned indefinitely and only released when the server sends
+            // `BlobsInStableStorage` for the digest. During a server
+            // restart the worker holds the only durable copy; an aggressive
+            // TTL would drop that copy and lose data. The 2 GiB
+            // `MIRROR_BLOBS_MAX_BYTES` cap is the only bound, and silent
+            // drops at the cap are now logged at warn! level.
         }
 
         // On (re)connect, retry any failed background slow-store writes
@@ -1492,6 +1528,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             is_full_subtree_snapshot: false,
                                                             p_core_load_pct: p_load,
                                                             e_core_load_pct: e_load,
+                                                            pinned_mirror_digests: Vec::new(),
                                                         }
                                                     ).await {
                                                         warn!(?err, "Failed to send blobs_available notification");
