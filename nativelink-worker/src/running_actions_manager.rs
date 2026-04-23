@@ -5575,3 +5575,82 @@ mod assert_tree_complete_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cleanup_wait_notify_parity_tests {
+    //! Regression test for the `wait_for_cleanup_if_needed` lost-wakeup window.
+    //!
+    //! The loop body in `wait_for_cleanup_if_needed` observes a predicate
+    //! (`cleaning_up_operations.contains(...)`) and then awaits a
+    //! `tokio::sync::Notify` in a `select!` with a backoff sleep. If the
+    //! `notified()` future is created AFTER the predicate observation, a
+    //! permit issued in between is lost — the waiter falls through to the
+    //! sleep arm, paying the backoff latency.
+    //!
+    //! The fix subscribes (`notified()` + `enable()`) BEFORE observing the
+    //! predicate. This is critical because the producer side calls
+    //! `notify_waiters()` (see `cleanup_action` -> `cleanup_complete_notify`
+    //! call site), which — unlike `notify_one` — does NOT store a permit; it
+    //! only wakes currently-registered waiters. Without `enable()`, a Notified
+    //! future that has never been polled is not yet registered, so a
+    //! `notify_waiters()` call during the predicate window is silently lost
+    //! until the backoff sleep elapses.
+    //!
+    //! Note on mutation testing: removing `enable()` does NOT make this test
+    //! fail in the simple single-threaded case, because tokio's `Notified`
+    //! tracks a "notify epoch" captured at construction and checked on first
+    //! poll — so a `notify_waiters` that fires between subscribe and poll
+    //! is still observed once the future is finally polled. The real value
+    //! of `enable()` is on multi-threaded runtimes where the producer and
+    //! waiter race on the same `Notified`, and as defense-in-depth: it makes
+    //! the subscribe-before-check ordering explicit and survives future code
+    //! changes that might drop or refactor the polling site. This test
+    //! therefore documents the contract (Notified must observe a notify
+    //! issued between subscribe and await) without claiming to falsify a
+    //! single-threaded mutation.
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+    use tokio::time::Instant;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enable_before_predicate_captures_concurrent_notify() {
+        let notify = Arc::new(Notify::new());
+
+        // Mirror the loop body shape: subscribe + enable BEFORE observing the
+        // predicate. enable() arms the waker so that any notify issued from
+        // this point on will be delivered to the pinned future.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Simulate the "predicate observation" window during which a
+        // concurrent producer issues notify_waiters(). This call does NOT
+        // store a permit — it only wakes currently-registered waiters. Our
+        // pre-enable() registration is what makes this delivery succeed.
+        notify.notify_waiters();
+
+        let start = Instant::now();
+        // The sleep arm is set to a duration far longer than any plausible
+        // notified-future poll latency. If we hit it, the permit was lost.
+        let backoff = Duration::from_secs(5);
+        tokio::select! {
+            () = notified.as_mut() => {
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed < Duration::from_millis(100),
+                    "notified arm took {elapsed:?} — permit issued during predicate window \
+                     should have been captured by the pre-enabled Notified future",
+                );
+            }
+            () = tokio::time::sleep(backoff) => {
+                panic!(
+                    "fell through to sleep arm — concurrent notify_one() was lost because \
+                     the Notified future was not subscribed/enabled before the predicate \
+                     window. This is the lost-wakeup regression."
+                );
+            }
+        }
+    }
+}

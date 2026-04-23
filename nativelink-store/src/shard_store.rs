@@ -26,6 +26,7 @@ use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status
 use nativelink_util::store_trait::{
     ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
+use tracing::warn;
 
 #[derive(Debug, MetricsComponent)]
 struct StoreAndWeight {
@@ -245,8 +246,24 @@ impl StoreDriver for ShardStore {
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
-        for store in &self.weights_and_stores {
-            store.store.register_item_callback(callback.clone())?;
+        // Composite registration is not atomic — see FastSlowStore for the
+        // contract notes. If a register fails partway through the shard list,
+        // earlier shards retain the callback while later ones don't. The
+        // StoreDriver trait has no `unregister_item_callback`, so we cannot
+        // roll back. Warn loudly so the operator can detect the asymmetry.
+        let total = self.weights_and_stores.len();
+        for (idx, store) in self.weights_and_stores.iter().enumerate() {
+            if let Err(err) = store.store.register_item_callback(callback.clone()) {
+                warn!(
+                    ?err,
+                    succeeded = idx,
+                    total,
+                    "ShardStore: register_item_callback failed at shard index {idx} of \
+                     {total} — earlier shards have the callback, this and later shards \
+                     do not. Trait has no unregister API; restart to recover.",
+                );
+                return Err(err);
+            }
         }
         Ok(())
     }

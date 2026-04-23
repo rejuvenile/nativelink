@@ -26,6 +26,7 @@ use nativelink_util::store_trait::{
     ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use tokio::join;
+use tracing::warn;
 
 #[derive(Debug, MetricsComponent)]
 pub struct SizePartitioningStore {
@@ -238,9 +239,22 @@ impl StoreDriver for SizePartitioningStore {
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
+        // Composite registration is not atomic — if the second register fails
+        // after the first succeeds, the inner stores are asymmetric. The
+        // StoreDriver trait has no `unregister_item_callback`; we cannot roll
+        // back. Most impls are infallible, so this rarely fires; if it does,
+        // log loudly so the operator can detect the asymmetry.
         self.lower_store
             .register_item_callback(callback.clone())?;
-        self.upper_store.register_item_callback(callback)?;
+        if let Err(err) = self.upper_store.register_item_callback(callback) {
+            warn!(
+                ?err,
+                "SizePartitioningStore: upper_store register_item_callback failed AFTER \
+                 lower_store succeeded — composite is in an asymmetric state. Trait has \
+                 no unregister API; restart to recover."
+            );
+            return Err(err);
+        }
         Ok(())
     }
 }
