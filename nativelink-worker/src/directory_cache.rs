@@ -823,13 +823,23 @@ impl DirectoryCache {
         // ad-hoc per-digest Mutex pattern that left waiters wedged when
         // get_part_parallel silently truncated a chunked read (commit
         // `49bf70fb`).
-        with_construction_lock(
+        info!(
+            ?digest,
+            "directory_cache(direct): about to acquire construction lock",
+        );
+        let lock_result = with_construction_lock(
             &self.construction_locks,
             digest,
             CoalesceOptions::leader_only(CONSTRUCTION_LEADER_TIMEOUT),
             || self.construct_direct_inner(digest, overall_start),
         )
-        .await?;
+        .await;
+        info!(
+            ?digest,
+            ok = lock_result.is_ok(),
+            "directory_cache(direct): construction lock released",
+        );
+        lock_result?;
 
         // After construction (by us or another leader), the entry is in
         // the cache. Symlink to our own dest_path via the same fast-path
@@ -857,14 +867,26 @@ impl DirectoryCache {
         digest: DigestInfo,
         overall_start: Instant,
     ) -> Result<(), Error> {
+        info!(
+            ?digest,
+            "directory_cache(direct): leader compute entered",
+        );
         // Double-check after winning leadership — another task may have
         // just constructed it before we acquired the slot. We only check
         // the cache map directly here (no per-call symlink work), since
         // each caller (leader and waiters) does its own dest_path symlink
         // after this closure returns.
         if self.cache.read().await.contains_key(&digest) {
+            info!(
+                ?digest,
+                "directory_cache(direct): leader saw cache hit on double-check",
+            );
             return Ok(());
         }
+        info!(
+            ?digest,
+            "directory_cache(direct): leader resolving directory tree",
+        );
 
         // Construct in a temp path, rename to final path on success.
         let cache_path = self.get_cache_path(&digest);
@@ -884,7 +906,15 @@ impl DirectoryCache {
 
             // Step 1: Resolve the merkle tree if we have a FastSlowStore.
             let resolved_tree = if let Some(fss) = &self.fast_slow_store {
-                match crate::running_actions_manager::resolve_directory_tree(fss, &digest).await {
+                let t0 = Instant::now();
+                let res = crate::running_actions_manager::resolve_directory_tree(fss, &digest).await;
+                info!(
+                    ?digest,
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    ok = res.is_ok(),
+                    "directory_cache(direct): resolve_directory_tree returned",
+                );
+                match res {
                     Ok(tree) => Some(tree),
                     Err(e) => {
                         warn!(
@@ -944,14 +974,22 @@ impl DirectoryCache {
             // as a template, patching in only the differences.
             if let Some(tree) = &resolved_tree {
                 if !subtree_hits.is_empty() {
-                    self.construct_with_subtrees_direct(
-                        &digest,
-                        tree,
-                        &subtree_hits,
-                        &temp_path,
-                    )
-                    .await
-                    .err_tip(|| "Failed subtree-aware direct-use construction")?;
+                    info!(
+                        ?digest,
+                        subtree_hits = subtree_hits.len(),
+                        "directory_cache(direct): leader entering construct_with_subtrees_direct",
+                    );
+                    let t0 = Instant::now();
+                    let res = self
+                        .construct_with_subtrees_direct(&digest, tree, &subtree_hits, &temp_path)
+                        .await;
+                    info!(
+                        ?digest,
+                        elapsed_ms = t0.elapsed().as_millis() as u64,
+                        ok = res.is_ok(),
+                        "directory_cache(direct): construct_with_subtrees_direct returned",
+                    );
+                    res.err_tip(|| "Failed subtree-aware direct-use construction")?;
                 } else {
                     // No direct subtree hits -- try fuzzy matching.
                     let tree_digests: HashSet<DigestInfo> = tree.keys().copied().collect();
@@ -968,22 +1006,51 @@ impl DirectoryCache {
                             "DirectoryCache direct-use: FUZZY MATCH found, patching from best match",
                         );
                         self.fuzzy_match_count.fetch_add(1, Ordering::Relaxed);
-                        self.construct_from_fuzzy_match(
-                            &digest,
-                            tree,
-                            &best_root,
-                            &temp_path,
-                        )
-                        .await
-                        .err_tip(|| "Failed fuzzy-match construction in direct-use mode")?;
+                        info!(
+                            ?digest,
+                            "directory_cache(direct): leader entering construct_from_fuzzy_match",
+                        );
+                        let t0 = Instant::now();
+                        let res = self
+                            .construct_from_fuzzy_match(&digest, tree, &best_root, &temp_path)
+                            .await;
+                        info!(
+                            ?digest,
+                            elapsed_ms = t0.elapsed().as_millis() as u64,
+                            ok = res.is_ok(),
+                            "directory_cache(direct): construct_from_fuzzy_match returned",
+                        );
+                        res.err_tip(|| "Failed fuzzy-match construction in direct-use mode")?;
                     } else {
-                        self.construct_full(&digest, &temp_path).await
-                            .err_tip(|| "Failed full construction in direct-use mode")?;
+                        info!(
+                            ?digest,
+                            "directory_cache(direct): leader entering construct_full (no fuzzy match)",
+                        );
+                        let t0 = Instant::now();
+                        let res = self.construct_full(&digest, &temp_path).await;
+                        info!(
+                            ?digest,
+                            elapsed_ms = t0.elapsed().as_millis() as u64,
+                            ok = res.is_ok(),
+                            "directory_cache(direct): construct_full returned (no fuzzy)",
+                        );
+                        res.err_tip(|| "Failed full construction in direct-use mode")?;
                     }
                 }
             } else {
-                self.construct_full(&digest, &temp_path).await
-                    .err_tip(|| "Failed full construction in direct-use mode (no resolved tree)")?;
+                info!(
+                    ?digest,
+                    "directory_cache(direct): leader entering construct_full (no resolved tree)",
+                );
+                let t0 = Instant::now();
+                let res = self.construct_full(&digest, &temp_path).await;
+                info!(
+                    ?digest,
+                    elapsed_ms = t0.elapsed().as_millis() as u64,
+                    ok = res.is_ok(),
+                    "directory_cache(direct): construct_full returned (no tree)",
+                );
+                res.err_tip(|| "Failed full construction in direct-use mode (no resolved tree)")?;
             }
 
             // Step 4: Store merkle tree metadata alongside the cache entry.
@@ -1339,13 +1406,23 @@ impl DirectoryCache {
         // ad-hoc per-digest Mutex pattern that left waiters wedged when
         // get_part_parallel silently truncated a chunked read (commit
         // `49bf70fb`).
-        with_construction_lock(
+        info!(
+            ?digest,
+            "directory_cache(hardlink): about to acquire construction lock",
+        );
+        let lock_result = with_construction_lock(
             &self.construction_locks,
             digest,
             CoalesceOptions::leader_only(CONSTRUCTION_LEADER_TIMEOUT),
             || self.construct_inner(digest, overall_start),
         )
-        .await?;
+        .await;
+        info!(
+            ?digest,
+            ok = lock_result.is_ok(),
+            "directory_cache(hardlink): construction lock released",
+        );
+        lock_result?;
 
         // After construction (by us or another leader), the entry is in
         // the cache. Hardlink to our dest_path via the same fast-path

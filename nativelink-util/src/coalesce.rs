@@ -47,6 +47,7 @@
 //! ```
 
 use core::future::Future;
+use core::fmt::Debug;
 use core::hash::Hash;
 use core::time::Duration;
 use std::collections::HashMap;
@@ -55,7 +56,6 @@ use std::sync::Arc;
 use nativelink_error::{Code, Error, make_err};
 use parking_lot::Mutex;
 use tokio::sync::watch;
-use tracing::warn;
 
 /// Per-key in-flight map. The value channel fans out the leader's result
 /// to all waiters. The receiver lives in the leader's task; on drop
@@ -186,7 +186,7 @@ pub async fn with_construction_lock<K, V, F, Fut>(
     compute: F,
 ) -> Result<V, Error>
 where
-    K: Eq + Hash + Clone + Send + 'static,
+    K: Eq + Hash + Clone + Debug + Send + 'static,
     V: Clone + Send + 'static,
     F: FnOnce() -> Fut + Send,
     Fut: Future<Output = Result<V, Error>> + Send,
@@ -208,7 +208,7 @@ where
 
     match role {
         Role::Leader(sender) => run_as_leader(in_flight, key, options, sender, compute).await,
-        Role::Waiter(receiver) => run_as_waiter(options, receiver).await,
+        Role::Waiter(receiver) => run_as_waiter(key, options, receiver).await,
     }
 }
 
@@ -225,7 +225,7 @@ async fn run_as_leader<K, V, F, Fut>(
     compute: F,
 ) -> Result<V, Error>
 where
-    K: Eq + Hash + Clone + Send + 'static,
+    K: Eq + Hash + Clone + Debug + Send + 'static,
     V: Clone + Send + 'static,
     F: FnOnce() -> Fut + Send,
     Fut: Future<Output = Result<V, Error>> + Send,
@@ -235,6 +235,7 @@ where
     // The guard takes ownership of the Sender; we subscribe a local
     // Receiver so we can observe sends but don't have to share the
     // Sender across the await point.
+    let key_for_log = key.clone();
     let guard = LeaderGuard {
         in_flight: Arc::clone(in_flight),
         key: Some(key),
@@ -246,13 +247,14 @@ where
         match tokio::time::timeout(timeout, compute()).await {
             Ok(result) => result,
             Err(_) => {
-                warn!(
+                tracing::error!(
+                    key = ?key_for_log,
                     timeout_ms = timeout.as_millis() as u64,
                     "coalesce: leader compute exceeded deadline",
                 );
                 Err(make_err!(
                     Code::DeadlineExceeded,
-                    "coalesce: leader compute exceeded {}ms",
+                    "coalesce: leader compute for {key_for_log:?} exceeded {}ms",
                     timeout.as_millis()
                 ))
             }
@@ -280,11 +282,13 @@ where
     compute_result
 }
 
-async fn run_as_waiter<V>(
+async fn run_as_waiter<K, V>(
+    key: K,
     options: CoalesceOptions,
     mut receiver: watch::Receiver<Option<Result<V, Error>>>,
 ) -> Result<V, Error>
 where
+    K: Debug,
     V: Clone + Send + 'static,
 {
     // Fast path: the leader may already have published a value before
@@ -299,9 +303,14 @@ where
         match tokio::time::timeout(timeout, changed_fut).await {
             Ok(inner) => inner,
             Err(_) => {
+                tracing::error!(
+                    key = ?key,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "coalesce: waiter timed out waiting for leader",
+                );
                 return Err(make_err!(
                     Code::DeadlineExceeded,
-                    "coalesce: waiter timed out after {}ms waiting for leader",
+                    "coalesce: waiter for {key:?} timed out after {}ms waiting for leader",
                     timeout.as_millis()
                 ));
             }

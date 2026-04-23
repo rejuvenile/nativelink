@@ -532,19 +532,23 @@ impl WorkerProxyStore {
         length: Option<u64>,
     ) -> Result<bool, Error> {
         let digest = key.borrow().into_digest();
-        debug!(?digest, "try_read_from_worker: locality lookup entered");
+        info!(?digest, "try_read_from_worker: locality lookup entered");
         let workers = self.locality_map.read().lookup_workers(&digest);
-        debug!(
+        info!(
             ?digest,
             worker_count = workers.len(),
             "try_read_from_worker: locality lookup returned"
         );
 
         if workers.is_empty() {
+            info!(
+                ?digest,
+                "try_read_from_worker: no peers in locality map (server-only fetch path)",
+            );
             return Ok(false);
         }
 
-        debug!(
+        info!(
             ?digest,
             worker_count = workers.len(),
             "WorkerProxyStore: attempting to proxy blob from workers"
@@ -557,9 +561,9 @@ impl WorkerProxyStore {
         let mut remaining_length = length;
 
         for endpoint in &workers {
-            debug!(?digest, endpoint = %endpoint, "try_read_from_worker: peer attempt entered");
+            info!(?digest, endpoint = %endpoint, "worker_proxy: peer attempt entered");
             let Some(store) = self.get_or_create_connection(endpoint).await else {
-                debug!(?digest, endpoint = %endpoint, "try_read_from_worker: peer attempt skipped (no connection)");
+                info!(?digest, endpoint = %endpoint, "worker_proxy: peer attempt skipped (no connection)");
                 continue;
             };
 
@@ -569,11 +573,11 @@ impl WorkerProxyStore {
             let attempt_res = self
                 .get_part_and_cache(&store, key.borrow(), &mut *writer, current_offset, remaining_length)
                 .await;
-            debug!(
+            info!(
                 ?digest,
                 endpoint = %endpoint,
                 ok = attempt_res.is_ok(),
-                "try_read_from_worker: peer attempt complete"
+                "worker_proxy: peer attempt complete"
             );
             match attempt_res {
                 Ok(()) => {
