@@ -49,6 +49,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
     Action, ActionResult as ProtoActionResult, BatchReadBlobsRequest, Command as ProtoCommand,
     Directory as ProtoDirectory, Directory, DirectoryNode, ExecuteResponse, FileNode,
     GetTreeRequest, SymlinkNode, Tree as ProtoTree, UpdateActionResultRequest,
+    batch_read_blobs_response,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     HistoricalExecuteResponse, StartExecute,
@@ -918,6 +919,56 @@ fn partition_into_batches(digests: &[DigestInfo]) -> Vec<Vec<DigestInfo>> {
     batches
 }
 
+/// Validate `BatchReadBlobsResponse.responses` and return only entries
+/// whose `data.len() == digest.size_bytes()` and whose `status.code` is OK.
+///
+/// The worker fast store is a `FilesystemStore` with NO `VerifyStore` in
+/// front of it (server-side verification is the trust boundary for
+/// content-addressed reads — verifying again on the worker is wasted CPU).
+/// That makes this batch-read parser the worker's trust boundary: any
+/// response whose payload length disagrees with the advertised digest
+/// length is corruption (truncation or padding) and MUST be dropped, not
+/// committed under a wrong `ExactSize` (which would silently propagate
+/// corrupt-length blobs through subsequent reads that trust the cached
+/// length).
+///
+/// Bug shape pre-fix: `data_len = data.len() as u64` was passed to
+/// `UploadSizeInfo::ExactSize(data_len)`, so a truncated response was
+/// committed under the correct hash key but with a wrong recorded length.
+/// Subsequent reads through `FilesystemStore` returned the truncated
+/// payload and trusted its length, producing data corruption with no signal.
+///
+/// Dropped digests fall into the retry path and are fetched again from
+/// the server store chain (which has its own `VerifyStore`).
+pub fn validate_batch_read_responses(
+    responses: Vec<batch_read_blobs_response::Response>,
+) -> Vec<(DigestInfo, Bytes)> {
+    responses
+        .into_iter()
+        .filter_map(|blob_resp| {
+            let status_code = blob_resp.status.as_ref().map_or(0, |s| s.code);
+            if status_code != 0 {
+                return None;
+            }
+            let proto_digest = blob_resp.digest?;
+            let digest = DigestInfo::try_from(proto_digest).ok()?;
+            let advertised = digest.size_bytes();
+            let data_len = blob_resp.data.len() as u64;
+            if data_len != advertised {
+                warn!(
+                    ?digest,
+                    advertised,
+                    actual = data_len,
+                    "execute_batch_read: dropping response with mismatched length \
+                     (peer returned wrong number of bytes for advertised digest)"
+                );
+                return None;
+            }
+            Some((digest, Bytes::from(blob_resp.data)))
+        })
+        .collect()
+}
+
 /// Execute a single BatchReadBlobs request and write results to fast store.
 async fn execute_batch_read(
     grpc_store: &GrpcStore,
@@ -944,19 +995,9 @@ async fn execute_batch_read(
     let fast_store = cas_store.fast_store();
 
     // Parse all valid responses first, then write to fast store concurrently.
-    let valid_blobs: Vec<(DigestInfo, Bytes)> = response
-        .responses
-        .into_iter()
-        .filter_map(|blob_resp| {
-            let status_code = blob_resp.status.as_ref().map_or(0, |s| s.code);
-            if status_code != 0 {
-                return None;
-            }
-            let proto_digest = blob_resp.digest?;
-            let digest = DigestInfo::try_from(proto_digest).ok()?;
-            Some((digest, Bytes::from(blob_resp.data)))
-        })
-        .collect();
+    // Length-mismatched responses are dropped here; they fall into the retry
+    // path and get fetched from the server store chain (which has VerifyStore).
+    let valid_blobs: Vec<(DigestInfo, Bytes)> = validate_batch_read_responses(response.responses);
 
     // Write all blobs to fast store concurrently.
     let write_futures: FuturesUnordered<_> = valid_blobs
