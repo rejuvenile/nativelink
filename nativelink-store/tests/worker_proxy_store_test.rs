@@ -844,3 +844,249 @@ async fn optimized_for_other_delegates_to_inner() -> Result<(), Error> {
 
     Ok(())
 }
+
+// ===================================================================
+// Gap 5: Cancellation-survives-requester / structured-error-preference
+// (Sibling to populate_and_maybe_stream cancellation-drop fix in
+// fast_slow_store.rs, commits 8674bc19 + 01b68015.)
+// ===================================================================
+
+/// A peer-store wrapper that writes a configurable number of bytes,
+/// then drops the writer (without sending EOF) and returns a structured
+/// upstream `Error` with a caller-chosen `Code` and message. This mimics
+/// the production-observed pattern where a peer's `get_part` errors
+/// mid-stream — closing its writer half without EOF — and the cache-tee
+/// proxy in `WorkerProxyStore::get_part_and_cache` would surface the
+/// generic `Code::Internal "Sender dropped before sending EOF"` instead
+/// of the structured upstream code.
+#[derive(Debug, MetricsComponent)]
+struct StructuredFailStore {
+    inner: Store,
+    /// Bytes to write before erroring.
+    fail_after_bytes: u64,
+    /// Code to return after writing `fail_after_bytes`.
+    err_code: Code,
+    /// Sentinel substring that must appear in the surfaced error.
+    err_marker: String,
+}
+
+default_health_status_indicator!(StructuredFailStore);
+
+#[async_trait]
+impl StoreDriver for StructuredFailStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.inner.has_with_results(digests, results).await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        reader: DropCloserReadHalf,
+        upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        self.inner.update(key, reader, upload_size).await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        let data = self
+            .inner
+            .get_part_unchunked(key.borrow(), offset, length)
+            .await?;
+        let write_len = core::cmp::min(data.len() as u64, self.fail_after_bytes) as usize;
+        if write_len > 0 {
+            writer
+                .send(data.slice(..write_len))
+                .await
+                .map_err(|e| make_err!(Code::Internal, "StructuredFailStore send: {e:?}"))?;
+        }
+        // Return a structured error WITHOUT calling `writer.send_eof()`.
+        // The caller's `proxy_rx.recv()` will see "Sender dropped before
+        // sending EOF" — but the *true* failure cause is this Err which
+        // must not be masked.
+        Err(make_err!(self.err_code, "{}", self.err_marker))
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+// -------------------------------------------------------------------
+// 25. Mid-stream peer Code::Unavailable triggers connection drop
+//
+// When the peer's get_part errors mid-stream with `Code::Unavailable`,
+// `WorkerProxyStore::try_read_from_worker` MUST classify it as a
+// connection error and call `remove_worker_endpoint`. Before the fix,
+// `get_part_and_cache` returned the generic `Code::Internal "Sender
+// dropped before sending EOF"` from the forward path, which masked
+// the upstream code and caused the connection drop check to miss.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn peer_unavailable_mid_stream_drops_cached_connection() -> Result<(), Error> {
+    let (proxy_arc, _inner, locality_map) = make_proxy_store_with_arc();
+    let proxy = Store::new(proxy_arc.clone());
+
+    // 16-byte blob, large enough to engage the cache-tee path
+    // (offset=0, length=None, size <= 64MiB).
+    let value = b"0123456789abcdef";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    // Single peer that writes 4 bytes, then errors with Code::Unavailable.
+    let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_inner
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+    let peer_store = Store::new(Arc::new(StructuredFailStore {
+        inner: peer_inner,
+        fail_after_bytes: 4,
+        err_code: Code::Unavailable,
+        err_marker: "STRUCTURED_PEER_UNAVAILABLE".to_string(),
+    }));
+    let peer_endpoint = "grpc://flaky-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    // Sanity: connection is in the pool before the call.
+    assert!(
+        proxy_arc.peer_stores().contains_key(&Arc::from(peer_endpoint)),
+        "Expected injected connection to be present before fetch"
+    );
+
+    // The proxy should: try the only peer, get 4 bytes, see an
+    // upstream Code::Unavailable, classify as connection error, remove
+    // the cached connection. Final outer error is "cannot retry inner
+    // store" because partial bytes were forwarded — that's expected
+    // and unrelated to the structured-error-preference fix.
+    let result = proxy.get_part_unchunked(digest, 0, None).await;
+    assert!(result.is_err(), "Expected error after the only peer failed");
+
+    // Connection MUST have been removed because the surfaced error
+    // code was Code::Unavailable. With the pre-fix forward-first
+    // ordering, the surfaced code would have been Code::Internal
+    // ("Sender dropped before sending EOF") and the connection would
+    // have remained cached.
+    assert!(
+        !proxy_arc.peer_stores().contains_key(&Arc::from(peer_endpoint)),
+        "Expected cached connection to be removed after upstream Unavailable; \
+         peer_stores={:?}",
+        proxy_arc.peer_stores().keys().collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 26. Mid-stream peer Code::DataLoss does NOT drop the connection
+//
+// The structured peer error must be visible to the locality eviction
+// code path so it can decide to evict locality entries (always) but
+// only drop the cached connection on Unavailable | Unknown. Before
+// the fix, ALL peer errors were masked as Code::Internal so the
+// connection-drop discrimination was impossible.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn peer_dataloss_mid_stream_keeps_cached_connection() -> Result<(), Error> {
+    let (proxy_arc, _inner, locality_map) = make_proxy_store_with_arc();
+    let proxy = Store::new(proxy_arc.clone());
+
+    let value = b"0123456789abcdef";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_inner
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+    let peer_store = Store::new(Arc::new(StructuredFailStore {
+        inner: peer_inner,
+        fail_after_bytes: 4,
+        err_code: Code::DataLoss,
+        err_marker: "STRUCTURED_PEER_DATALOSS".to_string(),
+    }));
+    let peer_endpoint = "grpc://lossy-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    let _unused = proxy.get_part_unchunked(digest, 0, None).await;
+
+    // DataLoss is NOT a connection error, so the cached connection
+    // remains. Locality entry IS evicted (always-on under 2fe4b1cb),
+    // but the connection pool entry must persist.
+    assert!(
+        proxy_arc.peer_stores().contains_key(&Arc::from(peer_endpoint)),
+        "Expected cached connection to remain after non-connection upstream error"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 27. Pre-EOF peer error (no bytes written) surfaces structured code
+//
+// When the peer's get_part errors before writing any bytes, no data
+// reaches the caller's writer. With no bytes written, the outer
+// "cannot retry inner store" guard does not trigger and the inner
+// store retry path runs. The locality map and connection pool MUST
+// reflect the structured peer code, not the generic forward artifact.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn peer_unavailable_pre_eof_drops_cached_connection() -> Result<(), Error> {
+    let (proxy_arc, _inner, locality_map) = make_proxy_store_with_arc();
+    let proxy = Store::new(proxy_arc.clone());
+
+    let value = b"0123456789abcdef";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_inner
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+    let peer_store = Store::new(Arc::new(StructuredFailStore {
+        inner: peer_inner,
+        fail_after_bytes: 0, // no data forwarded before the error
+        err_code: Code::Unavailable,
+        err_marker: "STRUCTURED_PEER_PRE_EOF".to_string(),
+    }));
+    let peer_endpoint = "grpc://prefail-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    let _unused = proxy.get_part_unchunked(digest, 0, None).await;
+
+    assert!(
+        !proxy_arc.peer_stores().contains_key(&Arc::from(peer_endpoint)),
+        "Expected cached connection to be removed after pre-EOF Unavailable"
+    );
+
+    Ok(())
+}

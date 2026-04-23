@@ -757,10 +757,31 @@ impl WorkerProxyStore {
         let (get_part_result, forward_result, cache_result) =
             tokio::join!(get_part_fut, forward_fut, cache_write_fut);
 
-        // If forwarding failed, propagate that error.
+        // Error preference: surface the structured upstream code from the
+        // peer's get_part BEFORE the forward path's "Sender dropped before
+        // sending EOF" artifact. When the peer errors mid-stream it drops
+        // its writer (proxy_tx) without EOF, which makes `forward_fut`
+        // observe a generic `Code::Internal` from `proxy_rx.recv()` —
+        // masking the structured code (NotFound, Unavailable, DataLoss,
+        // etc.) that callers up the chain need for connection-pool /
+        // locality / retry decisions. Sibling fix to commit 8674bc19 (the
+        // populate path) and 01b68015 (the spawn-detach producer path):
+        // the producer is the source of truth, the forward channel error
+        // is a secondary symptom.
+        //
+        // Cancellation note: if the outer caller is dropped, all three
+        // futures here drop together via `tokio::join!`. There is no
+        // observer for any of the results, so the ordering is irrelevant
+        // for cancellation; this only changes behavior when the join!
+        // completes naturally with at least one Err.
+        if let Err(get_err) = get_part_result {
+            // Peer's get_part errored — surface that. forward/cache
+            // results are derivative and would only confuse the caller.
+            return Err(get_err);
+        }
+        // Peer's get_part returned Ok. If forwarding failed (e.g.
+        // caller's writer broken), propagate that error.
         forward_result?;
-        // If the peer's get_part failed, propagate that error.
-        get_part_result?;
 
         // Log cache write result (non-fatal).
         match cache_result {
