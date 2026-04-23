@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, trace};
 
 use nativelink_config::stores::{EvictionPolicy, ExistenceCacheSpec};
-use nativelink_error::{Error, ResultExt, error_if};
+use nativelink_error::{Code, Error, ResultExt, error_if};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
@@ -34,6 +34,28 @@ use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::store_trait::{
     ItemCallback, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
 };
+
+/// Returns `true` for error codes that indicate the inner store cannot
+/// recover this blob (the cached "exists" claim is now a lie).
+///
+/// - `NotFound`   — blob was evicted from inner store
+/// - `DataLoss`   — VerifyStore caught a hash/length mismatch (corruption)
+/// - `Internal`   — storage fault (inner store can't read its own data)
+/// - `OutOfRange` — requested range exceeds blob length (truncation)
+///
+/// Transient codes (`Unavailable`, `DeadlineExceeded`, `ResourceExhausted`,
+/// etc.) are NOT included — re-evicting on every connectivity blip would
+/// force re-uploads and defeat the cache's purpose. We err on the side of
+/// over-evicting for permanent-looking errors and under-evicting for
+/// transient ones; an over-eviction triggers at most one extra has() RPC,
+/// while an under-eviction (false positive in the cache) can hide a
+/// missing blob through repeated FindMissingBlobs cycles.
+fn is_unrecoverable_read_error(code: Code) -> bool {
+    matches!(
+        code,
+        Code::NotFound | Code::DataLoss | Code::Internal | Code::OutOfRange
+    )
+}
 
 #[derive(Clone, Debug)]
 struct ExistenceItem(u64);
@@ -417,10 +439,14 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                     .insert(digest, ExistenceItem(digest.size_bytes()))
                     .await;
             }
-            Err(err) if err.code == nativelink_error::Code::NotFound => {
-                // Blob was evicted from the inner store — remove the stale
-                // existence cache entry so subsequent has() calls get an
-                // accurate result.
+            Err(err) if is_unrecoverable_read_error(err.code) => {
+                // Blob is unrecoverable from the inner store — remove
+                // the stale existence cache entry so subsequent has()
+                // calls get an accurate result. Covers NotFound (evicted),
+                // DataLoss (verifier caught corruption), Internal (storage
+                // fault), and OutOfRange (truncation). Transient codes
+                // (Unavailable, DeadlineExceeded, etc.) leave the cache
+                // alone — re-evicting on every blip would force re-uploads.
                 self.existence_cache.remove(&digest).await;
             }
             Err(_) => {}
@@ -445,7 +471,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         for (digest, result) in digests.iter().zip(results.iter()) {
             match result {
                 Ok(_) => inserts.push((*digest, ExistenceItem(digest.size_bytes()))),
-                Err(err) if err.code == nativelink_error::Code::NotFound => {
+                Err(err) if is_unrecoverable_read_error(err.code) => {
+                    // Same eviction policy as get_part: widen beyond just
+                    // NotFound to include DataLoss / Internal / OutOfRange.
                     removals.push(*digest);
                 }
                 Err(_) => {}
