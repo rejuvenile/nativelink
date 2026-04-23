@@ -1041,6 +1041,14 @@ impl ByteStreamServer {
         read_request: ReadRequest,
         is_worker: bool,
     ) -> Result<ReadStream, Error> {
+        info!(
+            %digest,
+            read_offset = read_request.read_offset,
+            read_limit = read_request.read_limit,
+            resource_name = %read_request.resource_name,
+            is_worker,
+            "ByteStream::inner_read entry",
+        );
         // Check InFlightBlobMap first: if the blob is currently being
         // written, stream from the in-memory buffer instead of waiting
         // for the store commit. Skip errored entries — they represent

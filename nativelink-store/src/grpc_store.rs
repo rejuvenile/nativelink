@@ -1335,6 +1335,13 @@ impl GrpcStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        let entry_at = std::time::Instant::now();
+        info!(
+            %resource_name,
+            offset,
+            ?length,
+            "GrpcStore::get_part_single_stream entry",
+        );
         struct LocalState<'a> {
             resource_name: String,
             writer: &'a mut DropCloserWriteHalf,
@@ -1343,6 +1350,12 @@ impl GrpcStore {
             /// Bytes received in the current stream attempt, reset on each
             /// retry. Used to detect empty responses from stale workers.
             bytes_received_this_stream: i64,
+            /// Diagnostic: timestamp of the most recent stream frame
+            /// (Some(message) or None). Used to log frames that took
+            /// >100ms to arrive — surfaces gRPC stalls inside a single
+            /// stream attempt without per-chunk noise.
+            last_frame_at: std::time::Instant,
+            attempt: u32,
         }
 
         let local_state = LocalState {
@@ -1353,10 +1366,20 @@ impl GrpcStore {
             read_limit: i64::try_from(length.unwrap_or(0))
                 .err_tip(|| "Could not convert length to i64")?,
             bytes_received_this_stream: 0,
+            last_frame_at: std::time::Instant::now(),
+            attempt: 0,
         };
 
-        self.retrier
+        let result = self.retrier
             .retry(unfold(local_state, move |mut local_state| async move {
+                local_state.attempt += 1;
+                let attempt_start = std::time::Instant::now();
+                info!(
+                    resource_name = %local_state.resource_name,
+                    attempt = local_state.attempt,
+                    read_offset = local_state.read_offset,
+                    "GrpcStore::get_part_single_stream attempt entry",
+                );
                 let request = ReadRequest {
                     resource_name: local_state.resource_name.clone(),
                     read_offset: local_state.read_offset,
@@ -1369,6 +1392,13 @@ impl GrpcStore {
                 {
                     Ok(stream) => stream,
                     Err(err) => {
+                        info!(
+                            resource_name = %local_state.resource_name,
+                            attempt = local_state.attempt,
+                            attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64,
+                            code = ?err.code,
+                            "GrpcStore::get_part_single_stream read_internal failed",
+                        );
                         return Some((RetryResult::Retry(err), local_state))
                     }
                 };
@@ -1376,8 +1406,10 @@ impl GrpcStore {
                 // Reset per-stream counter so we detect empty responses even
                 // when retrying at a non-zero read_offset.
                 local_state.bytes_received_this_stream = 0;
+                local_state.last_frame_at = std::time::Instant::now();
 
                 loop {
+                    let frame_wait_start = std::time::Instant::now();
                     let data = match stream.next().await {
                         None => Bytes::new(),
                         Some(Ok(message)) => message.data,
@@ -1393,6 +1425,17 @@ impl GrpcStore {
                             ));
                         }
                     };
+                    let frame_wait_ms = frame_wait_start.elapsed().as_millis() as u64;
+                    if frame_wait_ms > 100 {
+                        warn!(
+                            resource_name = %local_state.resource_name,
+                            attempt = local_state.attempt,
+                            frame_wait_ms,
+                            bytes_received_this_stream = local_state.bytes_received_this_stream,
+                            "GrpcStore::get_part_single_stream slow frame",
+                        );
+                    }
+                    local_state.last_frame_at = std::time::Instant::now();
                     let length = data.len() as i64;
                     if length == 0 {
                         // BUG NOTE: 0-byte successful responses from workers
@@ -1445,7 +1488,20 @@ impl GrpcStore {
                     local_state.bytes_received_this_stream += length;
                 }
             }))
-            .await
+            .await;
+        let elapsed_ms = entry_at.elapsed().as_millis() as u64;
+        match &result {
+            Ok(()) => info!(
+                elapsed_ms,
+                "GrpcStore::get_part_single_stream exit Ok",
+            ),
+            Err(err) => info!(
+                elapsed_ms,
+                code = ?err.code,
+                "GrpcStore::get_part_single_stream exit Err",
+            ),
+        }
+        result
     }
 
     /// Per-chunk channel capacity for streaming parallel reads.
@@ -1471,6 +1527,13 @@ impl GrpcStore {
         let base_chunk_size = total_length / chunk_count;
         let remainder = total_length % chunk_count;
         let read_start = std::time::Instant::now();
+        info!(
+            %resource_name,
+            offset,
+            total_length,
+            chunk_count,
+            "GrpcStore::get_part_parallel entry",
+        );
 
         // Build chunk descriptors: (chunk_offset, chunk_length).
         let mut chunks: Vec<(u64, u64)> =

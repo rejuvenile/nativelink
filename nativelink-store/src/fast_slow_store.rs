@@ -42,7 +42,7 @@ use nativelink_util::store_trait::{
 use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // TODO(palfrey) This store needs to be evaluated for more efficient memory usage,
 // there are many copies happening internally.
@@ -441,6 +441,12 @@ impl FastSlowStore {
         // the producer's full lifetime is what allows late-arriving
         // waiters to find this populate in the map and join in.
         let key = loader_guard.key.borrow();
+        let producer_start = Instant::now();
+        info!(
+            %key,
+            slow_store = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
+            "populate run_producer entry",
+        );
         let head_result: Result<UploadSizeInfo, Error> = async {
             // failpoint: simulate slow store being unavailable during populate.
             // exercises the error propagation path when the slow store cannot
@@ -488,10 +494,32 @@ impl FastSlowStore {
         }
         .await;
         let head_was_ok = head_result.is_ok();
+        let head_elapsed_ms = producer_start.elapsed().as_millis() as u64;
+        match &head_result {
+            Ok(size) => info!(
+                %key,
+                head_elapsed_ms,
+                ?size,
+                "populate head_result Ok",
+            ),
+            Err(err) => info!(
+                %key,
+                head_elapsed_ms,
+                code = ?err.code,
+                "populate head_result Err",
+            ),
+        }
         let reader_stream_size = match head_result {
             Ok(size) => size,
             Err(err) => {
                 let returned = err.clone();
+                let elapsed_ms = producer_start.elapsed().as_millis() as u64;
+                info!(
+                    %key,
+                    elapsed_ms,
+                    code = ?returned.code,
+                    "populate sending streaming_writer.send_error after head failure",
+                );
                 streaming_writer.send_error(err);
                 return Err(returned);
             }
@@ -522,7 +550,18 @@ impl FastSlowStore {
         // Clone arc_self for the data_stream_fut closure so the
         // original remains usable for slow_store_fut / fast_store_fut.
         let arc_for_stream = Arc::clone(&arc_self);
+        let key_for_stream = key.borrow().into_owned();
+        let key_for_slow = key.borrow().into_owned();
+        let key_for_fast = key.borrow().into_owned();
         let data_stream_fut = async move {
+            let stream_start = Instant::now();
+            info!(
+                key = %key_for_stream,
+                "populate data_stream branch entry",
+            );
+            let mut first_chunk_ms: Option<u64> = None;
+            let mut chunks: u64 = 0;
+            let mut total_bytes: u64 = 0;
             // Inner block returns the data-stream result. The outer
             // unconditionally repackages the writer back so the caller
             // can terminate the buffer AFTER the join! completes.
@@ -535,6 +574,11 @@ impl FastSlowStore {
                     if output_buf.is_empty() {
                         return Ok(fast_tx.send_eof());
                     }
+                    if first_chunk_ms.is_none() {
+                        first_chunk_ms = Some(stream_start.elapsed().as_millis() as u64);
+                    }
+                    chunks += 1;
+                    total_bytes += output_buf.len() as u64;
 
                     if !counted_hit {
                         arc_for_stream
@@ -568,6 +612,26 @@ impl FastSlowStore {
                 }
             }
             .await;
+            let elapsed_ms = stream_start.elapsed().as_millis() as u64;
+            match &result {
+                Ok(_) => info!(
+                    key = %key_for_stream,
+                    elapsed_ms,
+                    first_chunk_ms = ?first_chunk_ms,
+                    chunks,
+                    total_bytes,
+                    "populate data_stream branch Ok",
+                ),
+                Err(err) => info!(
+                    key = %key_for_stream,
+                    elapsed_ms,
+                    first_chunk_ms = ?first_chunk_ms,
+                    chunks,
+                    total_bytes,
+                    code = ?err.code,
+                    "populate data_stream branch Err",
+                ),
+            }
             // Crucial: drop fast_tx BEFORE returning so fast_rx (driving
             // fast_store.update) sees the channel close. Without this,
             // the join! deadlocks on an error path because fast_tx
@@ -582,13 +646,70 @@ impl FastSlowStore {
             (streaming_writer, result)
         };
 
-        let slow_store_fut = arc_self.slow_store.get(key.borrow(), slow_tx);
-        let fast_store_fut = arc_self
-            .fast_store
-            .update(key.borrow(), fast_rx, reader_stream_size);
+        let slow_store_fut = {
+            let arc_for_slow = Arc::clone(&arc_self);
+            async move {
+                let t0 = Instant::now();
+                info!(
+                    key = %key_for_slow,
+                    "populate slow_store.get branch entry",
+                );
+                let res = arc_for_slow.slow_store.get(key_for_slow.borrow(), slow_tx).await;
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                match &res {
+                    Ok(()) => info!(
+                        key = %key_for_slow,
+                        elapsed_ms,
+                        "populate slow_store.get branch Ok",
+                    ),
+                    Err(err) => info!(
+                        key = %key_for_slow,
+                        elapsed_ms,
+                        code = ?err.code,
+                        "populate slow_store.get branch Err",
+                    ),
+                }
+                res
+            }
+        };
+        let fast_store_fut = {
+            let arc_for_fast = Arc::clone(&arc_self);
+            async move {
+                let t0 = Instant::now();
+                info!(
+                    key = %key_for_fast,
+                    "populate fast_store.update branch entry",
+                );
+                let res = arc_for_fast
+                    .fast_store
+                    .update(key_for_fast.borrow(), fast_rx, reader_stream_size)
+                    .await;
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                match &res {
+                    Ok(()) => info!(
+                        key = %key_for_fast,
+                        elapsed_ms,
+                        "populate fast_store.update branch Ok",
+                    ),
+                    Err(err) => info!(
+                        key = %key_for_fast,
+                        elapsed_ms,
+                        code = ?err.code,
+                        "populate fast_store.update branch Err",
+                    ),
+                }
+                res
+            }
+        };
 
         let ((mut writer_back, data_stream_res), slow_res, fast_res) =
             join!(data_stream_fut, slow_store_fut, fast_store_fut);
+        let join_elapsed_ms = producer_start.elapsed().as_millis() as u64;
+        info!(
+            %key,
+            join_elapsed_ms,
+            "populate join3 returned",
+        );
 
         // Compose the producer's terminal status. NotFound from the
         // slow store wins (matches prior behavior); else any failure is
@@ -622,13 +743,42 @@ impl FastSlowStore {
         };
         match merged {
             Ok(()) => {
+                let elapsed_ms = producer_start.elapsed().as_millis() as u64;
+                info!(
+                    %key,
+                    elapsed_ms,
+                    "populate calling streaming_writer.send_eof",
+                );
                 // Ignore the Result from send_eof: it only errors if a
                 // terminal state was already set (e.g. via a panic
                 // during streaming send), which we are content to leave
                 // in place. The buffer is terminal either way.
                 drop(writer_back.send_eof());
             }
-            Err(err) => writer_back.send_error(err),
+            Err(err) => {
+                let elapsed_ms = producer_start.elapsed().as_millis() as u64;
+                info!(
+                    %key,
+                    elapsed_ms,
+                    code = ?err.code,
+                    "populate calling streaming_writer.send_error",
+                );
+                writer_back.send_error(err);
+            }
+        }
+        let total_elapsed_ms = producer_start.elapsed().as_millis() as u64;
+        match &returned {
+            Ok(()) => info!(
+                %key,
+                total_elapsed_ms,
+                "populate run_producer exit Ok",
+            ),
+            Err(err) => info!(
+                %key,
+                total_elapsed_ms,
+                code = ?err.code,
+                "populate run_producer exit Err",
+            ),
         }
         // writer_back drops here — terminal state is already set via
         // send_eof or send_error above, so the safety-net Drop is a no-op.

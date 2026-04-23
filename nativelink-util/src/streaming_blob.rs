@@ -21,12 +21,13 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::common::DigestInfo;
 
@@ -64,6 +65,10 @@ pub struct StreamingBlobInner {
     /// Index of the earliest chunk still retained in the deque.
     /// Chunks before this index have been evicted.
     earliest_chunk_idx: AtomicU64,
+
+    /// Construction timestamp — used by debug logs to report
+    /// elapsed-since-creation for any state transition. Pure observability.
+    created_at: Instant,
 }
 
 impl fmt::Debug for StreamingBlobInner {
@@ -93,7 +98,13 @@ impl StreamingBlobInner {
             digest,
             max_buffer_bytes,
             earliest_chunk_idx: AtomicU64::new(0),
+            created_at: Instant::now(),
         }
+    }
+
+    /// Elapsed since construction (for diagnostic logging).
+    pub fn age_ms(&self) -> u64 {
+        self.created_at.elapsed().as_millis() as u64
     }
 
     /// Returns true if the terminal state has been set (EOF or error).
@@ -229,10 +240,11 @@ impl StreamingBlobWriter {
         self.eof_sent = true;
         drop(terminal);
 
-        debug!(
+        info!(
             digest = %self.inner.digest,
             bytes_written = %self.inner.bytes_written.load(Ordering::Relaxed),
-            "streaming blob writer sent eof"
+            age_ms = self.inner.age_ms(),
+            "streaming blob writer sent eof, notify_waiters firing"
         );
 
         self.inner.notify.notify_waiters();
@@ -247,8 +259,9 @@ impl StreamingBlobWriter {
         }
         warn!(
             digest = %self.inner.digest,
+            age_ms = self.inner.age_ms(),
             ?err,
-            "streaming blob writer error"
+            "streaming blob writer error, notify_waiters firing"
         );
         *terminal = Some(Err(err));
         self.eof_sent = true;
@@ -267,7 +280,8 @@ impl Drop for StreamingBlobWriter {
                     digest = %self.inner.digest,
                     bytes_written = self.inner.bytes_written.load(std::sync::atomic::Ordering::Relaxed),
                     expected_size = self.inner.digest.size_bytes(),
-                    "streaming blob writer dropped without eof"
+                    age_ms = self.inner.age_ms(),
+                    "streaming blob writer dropped without eof, notify_waiters firing"
                 );
                 *terminal = Some(Err(make_err!(
                     Code::Internal,
@@ -293,6 +307,26 @@ pub struct StreamingBlobReader {
     /// partial-chunk reads; currently always 0).
     #[allow(dead_code)]
     cursor_byte_offset: u64,
+    /// Diagnostic-only: number of chunks read out via `next_chunk` since
+    /// reader construction. Used by Drop logging to surface premature
+    /// reader teardown.
+    chunks_consumed: u64,
+    /// Diagnostic-only: whether `next_chunk` has observed terminal state.
+    terminal_seen: bool,
+    /// Diagnostic-only: reader construction timestamp for elapsed logging.
+    created_at: Instant,
+}
+
+impl Drop for StreamingBlobReader {
+    fn drop(&mut self) {
+        debug!(
+            digest = %self.inner.digest,
+            chunks_consumed = self.chunks_consumed,
+            terminal_seen = self.terminal_seen,
+            age_ms = self.created_at.elapsed().as_millis() as u64,
+            "streaming blob reader dropped"
+        );
+    }
 }
 
 impl fmt::Debug for StreamingBlobReader {
@@ -312,6 +346,9 @@ impl StreamingBlobReader {
             inner,
             cursor_chunk_idx: earliest,
             cursor_byte_offset: 0,
+            chunks_consumed: 0,
+            terminal_seen: false,
+            created_at: Instant::now(),
         }
     }
 
@@ -365,6 +402,7 @@ impl StreamingBlobReader {
                     let data = chunk.clone();
                     self.cursor_chunk_idx += 1;
                     self.cursor_byte_offset = 0;
+                    self.chunks_consumed += 1;
                     return Ok(data);
                 }
                 // earliest_chunk_idx advanced between our load and the
@@ -383,6 +421,13 @@ impl StreamingBlobReader {
                         drop(terminal);
                         continue;
                     }
+                    self.terminal_seen = true;
+                    debug!(
+                        digest = %self.inner.digest,
+                        chunks_consumed = self.chunks_consumed,
+                        kind = if result.is_ok() { "ok" } else { "err" },
+                        "streaming blob reader observed terminal"
+                    );
                     return match result {
                         Ok(()) => Ok(Bytes::new()),
                         Err(e) => Err(e.clone()),
@@ -391,7 +436,20 @@ impl StreamingBlobReader {
             }
 
             // Writer still active, no data yet — wait for notification.
+            let wait_start = Instant::now();
+            debug!(
+                digest = %self.inner.digest,
+                cursor_chunk_idx = self.cursor_chunk_idx,
+                "streaming blob reader subscribing to notify"
+            );
             self.inner.notify.notified().await;
+            let terminal_present = self.inner.terminal.lock().is_some();
+            debug!(
+                digest = %self.inner.digest,
+                wait_ms = wait_start.elapsed().as_millis() as u64,
+                terminal_present,
+                "streaming blob reader notify wakeup"
+            );
         }
     }
 }
