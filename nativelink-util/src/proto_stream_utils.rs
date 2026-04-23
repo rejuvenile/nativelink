@@ -13,16 +13,19 @@
 // limitations under the License.
 
 use core::fmt::Debug;
+use core::future::Future;
 use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use core::time::Duration;
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
-use nativelink_error::{Error, ResultExt, error_if, make_input_err};
+use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
 use nativelink_proto::google::bytestream::{ReadResponse, WriteRequest};
 use parking_lot::Mutex;
+use tokio::time::Sleep;
 use tonic::{Status, Streaming};
 
 use crate::resource_info::ResourceInfo;
@@ -231,6 +234,16 @@ where
     resume_queue: [Option<WriteRequest>; 2],
     // An optimisation to avoid having to manage resume_queue when it's empty.
     is_resumed: bool,
+    // Per-chunk no-progress timeout. Zero disables the timer. Reset to
+    // `Instant::now() + duration` on each successful chunk; if it elapses
+    // while waiting on the inner stream, `read_stream_error` is set to
+    // DeadlineExceeded and the wrapper ends, aborting the gRPC RPC.
+    //
+    // Lives here (not in `WriteStateWrapper`) so it survives across the
+    // retry loop's repeated wrapper construction and is uncontended under
+    // the existing Mutex.
+    progress_timeout: Duration,
+    progress_deadline: Option<Pin<Box<Sleep>>>,
 }
 
 impl<T, E> WriteState<T, E>
@@ -239,6 +252,16 @@ where
     E: Into<Error> + 'static,
 {
     pub const fn new(instance_name: String, read_stream: WriteRequestStreamWrapper<T>) -> Self {
+        Self::with_progress_timeout(instance_name, read_stream, Duration::ZERO)
+    }
+
+    /// Construct a `WriteState` with a per-chunk no-progress timeout. A
+    /// zero duration disables the timer (equivalent to `new`).
+    pub const fn with_progress_timeout(
+        instance_name: String,
+        read_stream: WriteRequestStreamWrapper<T>,
+        progress_timeout: Duration,
+    ) -> Self {
         Self {
             instance_name,
             read_stream_error: None,
@@ -246,6 +269,8 @@ where
             cached_messages: [None, None],
             resume_queue: [None, None],
             is_resumed: false,
+            progress_timeout,
+            progress_deadline: None,
         }
     }
 
@@ -324,41 +349,82 @@ where
             return Poll::Ready(cached_message);
         }
         // Read a new write request from the downstream.
-        let Poll::Ready(maybe_message) = Pin::new(&mut local_state.read_stream).poll_next(cx)
-        else {
-            return Poll::Pending;
-        };
-        // Update the instance name in the write request and forward it on.
-        let result = match maybe_message {
-            Some(Ok(mut message)) => {
-                if !message.resource_name.is_empty() {
-                    // Replace the instance name in the resource name if it is
-                    // different from the instance name in the write state.
-                    match ResourceInfo::new(&message.resource_name, IS_UPLOAD_TRUE) {
-                        Ok(mut resource_name) => {
-                            if resource_name.instance_name != local_state.instance_name {
-                                resource_name.instance_name =
-                                    Cow::Borrowed(&local_state.instance_name);
-                                message.resource_name = resource_name.to_string(IS_UPLOAD_TRUE);
+        match Pin::new(&mut local_state.read_stream).poll_next(cx) {
+            Poll::Ready(maybe_message) => {
+                // Make progress: arm the no-progress timer for the NEXT
+                // chunk. The current chunk's wait time is bounded by the
+                // arrival just observed, so we reset rather than carry a
+                // partially-elapsed deadline.
+                if !local_state.progress_timeout.is_zero() {
+                    let timeout = local_state.progress_timeout;
+                    local_state.progress_deadline =
+                        Some(Box::pin(tokio::time::sleep(timeout)));
+                }
+                // Update the instance name in the write request and forward it on.
+                let result = match maybe_message {
+                    Some(Ok(mut message)) => {
+                        if !message.resource_name.is_empty() {
+                            // Replace the instance name in the resource name if it is
+                            // different from the instance name in the write state.
+                            match ResourceInfo::new(&message.resource_name, IS_UPLOAD_TRUE) {
+                                Ok(mut resource_name) => {
+                                    if resource_name.instance_name
+                                        != local_state.instance_name
+                                    {
+                                        resource_name.instance_name =
+                                            Cow::Borrowed(&local_state.instance_name);
+                                        message.resource_name =
+                                            resource_name.to_string(IS_UPLOAD_TRUE);
+                                    }
+                                }
+                                Err(err) => {
+                                    local_state.read_stream_error = Some(err);
+                                    return Poll::Ready(None);
+                                }
                             }
                         }
-                        Err(err) => {
-                            local_state.read_stream_error = Some(err);
-                            return Poll::Ready(None);
-                        }
+                        // Cache the last request in case there is an error to allow
+                        // the upload to be resumed.
+                        local_state.push_message(message.clone());
+                        Some(message)
+                    }
+                    Some(Err(err)) => {
+                        local_state.read_stream_error = Some(err);
+                        None
+                    }
+                    None => None,
+                };
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                // Inner stream not ready — check the per-chunk no-progress
+                // timer if enabled. We treat each Pending->Ready transition
+                // as the moment we "made progress"; while still Pending we
+                // race the configured timeout against further pollings.
+                if local_state.progress_timeout.is_zero() {
+                    return Poll::Pending;
+                }
+                let timeout = local_state.progress_timeout;
+                if local_state.progress_deadline.is_none() {
+                    local_state.progress_deadline =
+                        Some(Box::pin(tokio::time::sleep(timeout)));
+                }
+                let secs = timeout.as_secs();
+                let deadline = local_state
+                    .progress_deadline
+                    .as_mut()
+                    .expect("initialized above");
+                match deadline.as_mut().poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(()) => {
+                        local_state.read_stream_error = Some(make_err!(
+                            Code::DeadlineExceeded,
+                            "GrpcStore::write made no progress for {secs}s",
+                        ));
+                        Poll::Ready(None)
                     }
                 }
-                // Cache the last request in case there is an error to allow
-                // the upload to be resumed.
-                local_state.push_message(message.clone());
-                Some(message)
             }
-            Some(Err(err)) => {
-                local_state.read_stream_error = Some(err);
-                None
-            }
-            None => None,
-        };
-        Poll::Ready(result)
+        }
     }
 }

@@ -1318,15 +1318,26 @@ pub struct GrpcSpec {
     #[serde(default = "default_connections_per_endpoint", deserialize_with = "convert_numeric_with_shellexpand")]
     pub connections_per_endpoint: usize,
 
-    /// Maximum time (seconds) allowed for a single RPC request (e.g. a
-    /// ByteStream.Write call) before it is cancelled.
+    /// Per-chunk no-progress timeout (seconds) for `ByteStream.Write`.
     ///
-    /// A value of 0 (the default) disables the per-RPC timeout. Dead
+    /// The timer is reset each time a `WriteRequest` chunk is delivered
+    /// from the upstream producer to the gRPC client. If no chunk arrives
+    /// within this duration, the RPC is aborted with `DeadlineExceeded`.
+    ///
+    /// This is **not** a whole-RPC deadline. A slow-but-progressing
+    /// producer (e.g. a 50 MB mirror upload streaming through a slow
+    /// Bazel client at 2 MB/s, taking 25s end-to-end) will not be
+    /// killed, only stuck transports are. The previous whole-RPC
+    /// deadline broke the >=2-replica durability invariant for
+    /// in-flight mirror writes.
+    ///
+    /// A value of 0 (the default) disables the per-chunk timer. Dead
     /// connections are still detected by the HTTP/2 and TCP keepalive
     /// mechanisms configured on each endpoint.
     ///
-    /// For large uploads (multi-GB), either leave this at 0 or set it
-    /// large enough to accommodate the full transfer time.
+    /// Only the streaming `write()` path honours this field; non-
+    /// streaming RPCs (`has`, `get_part`, `batch_*`, `get_tree`,
+    /// `*_action_result`, `query_write_status`) have no per-RPC deadline.
     ///
     /// Default: 0 (disabled)
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]

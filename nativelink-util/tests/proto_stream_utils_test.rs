@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::time::Duration;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use nativelink_error::Error;
+use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::google::bytestream::WriteRequest;
 use nativelink_util::common::DigestInfo;
@@ -192,5 +193,173 @@ async fn genuine_overrun_is_still_rejected() -> Result<(), Error> {
         "missing bytes_received= field: {msg}"
     );
 
+    Ok(())
+}
+
+// Per-chunk progress timeout tests for WriteStateWrapper.
+//
+// The whole-RPC `tokio::time::timeout` previously wrapped GrpcStore::write
+// killed slow-but-progressing mirror writes. The replacement is a
+// per-chunk no-progress timer enforced inside WriteStateWrapper, configured
+// via WriteState::with_progress_timeout.
+
+const HASH_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn chunk(
+    offset: i64,
+    data: &'static [u8],
+    finish: bool,
+    expected_size: Option<usize>,
+) -> WriteRequest {
+    let resource_name = if let Some(size) = expected_size {
+        format!("{INSTANCE_NAME}/uploads/some-uuid/blobs/{HASH_HEX}/{size}")
+    } else {
+        String::new()
+    };
+    WriteRequest {
+        resource_name,
+        write_offset: offset,
+        finish_write: finish,
+        data: Bytes::from_static(data),
+    }
+}
+
+async fn make_state(
+    rx: tokio::sync::mpsc::UnboundedReceiver<Result<WriteRequest, Error>>,
+    progress_timeout: Duration,
+) -> Result<Arc<Mutex<WriteState<UnboundedReceiverStream<Result<WriteRequest, Error>>, Error>>>, Error>
+{
+    let wrapper = WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?;
+    Ok(Arc::new(Mutex::new(WriteState::with_progress_timeout(
+        INSTANCE_NAME.to_string(),
+        wrapper,
+        progress_timeout,
+    ))))
+}
+
+/// Slow-but-progressing producer: chunks arrive every 5s for 30s total
+/// (6 chunks). Per-chunk progress timeout of 15s must NOT fire — the
+/// transport is making forward progress, just slowly. This is the exact
+/// mirror-write scenario the whole-RPC 15s deadline was killing on
+/// 2026-04-23.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn write_state_progress_timeout_allows_slow_but_progressing_producer()
+-> Result<(), Error> {
+    // 6 chunks × 4 bytes = 24 bytes total payload.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    // Send the first chunk synchronously so WriteRequestStreamWrapper::from
+    // can extract resource_info without blocking on time advancement.
+    tx.send(Ok(chunk(0, b"data", false, Some(24)))).unwrap();
+    let state = make_state(rx, Duration::from_secs(15)).await?;
+    let mut wrapper = WriteStateWrapper::new(state.clone());
+
+    // Spawn a producer that emits the remaining 5 chunks at 5s intervals.
+    let producer = tokio::spawn(async move {
+        for i in 1..6 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let finish = i == 5;
+            tx.send(Ok(chunk(i64::from(i) * 4, b"data", finish, None)))
+                .unwrap();
+        }
+        drop(tx);
+    });
+
+    let mut received = 0;
+    while let Some(msg) = wrapper.next().await {
+        received += 1;
+        if msg.finish_write {
+            break;
+        }
+    }
+    producer.await.unwrap();
+
+    // Drain the EOF after finish_write.
+    assert_eq!(wrapper.next().await, None);
+    assert_eq!(received, 6, "expected 6 chunks delivered without timeout");
+    assert!(
+        state.lock().take_read_stream_error().is_none(),
+        "no progress timeout should have fired",
+    );
+    Ok(())
+}
+
+/// Stuck producer: emits chunks then stops sending for >15s. The per-chunk
+/// progress timer must fire, the wrapper must end the stream (signalling
+/// EOF to the gRPC client), and `take_read_stream_error` must return the
+/// DeadlineExceeded error so the retry loop sees the right cause.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn write_state_progress_timeout_fires_when_producer_stalls() -> Result<(), Error> {
+    // 2 chunks delivered + 1 stuck = expected 12 bytes; the stall fires
+    // before the third chunk arrives, so the wrapper never reaches EOF
+    // and the size check never runs (it only triggers on write_finished).
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"data", false, Some(12)))).unwrap();
+    tx.send(Ok(chunk(4, b"data", false, None))).unwrap();
+    let state = make_state(rx, Duration::from_secs(15)).await?;
+    let mut wrapper = WriteStateWrapper::new(state.clone());
+
+    // Drain the two pre-sent chunks.
+    let first = wrapper.next().await.expect("first chunk");
+    assert_eq!(first.write_offset, 0);
+    let second = wrapper.next().await.expect("second chunk");
+    assert_eq!(second.write_offset, 4);
+
+    // tx is held by the channel (never closed) — only the timer can end
+    // the stream. Wrapper should yield None after 15s of silence.
+    let next = wrapper.next().await;
+    assert_eq!(next, None, "wrapper must end on no-progress timeout");
+
+    let err = state
+        .lock()
+        .take_read_stream_error()
+        .expect("DeadlineExceeded must be recorded");
+    assert_eq!(err.code, Code::DeadlineExceeded, "wrong code: {err:?}");
+    assert!(
+        err.messages.iter().any(|m| m.contains("no progress")),
+        "expected 'no progress' wording, got: {:?}",
+        err.messages
+    );
+
+    drop(tx);
+    Ok(())
+}
+
+/// Each delivered chunk resets the timer — a producer pacing chunks 14s
+/// apart (just under the 15s budget) must succeed across multiple chunks.
+/// Guards against an off-by-one where the timer is armed once and never
+/// reset.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn write_state_progress_timeout_resets_on_each_chunk() -> Result<(), Error> {
+    // 4 chunks × 4 bytes = 16 bytes total payload.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"data", false, Some(16)))).unwrap();
+    let state = make_state(rx, Duration::from_secs(15)).await?;
+    let mut wrapper = WriteStateWrapper::new(state.clone());
+
+    let producer = tokio::spawn(async move {
+        for i in 1..4 {
+            tokio::time::sleep(Duration::from_secs(14)).await;
+            let finish = i == 3;
+            tx.send(Ok(chunk(i64::from(i) * 4, b"data", finish, None)))
+                .unwrap();
+        }
+        drop(tx);
+    });
+
+    let mut received = 0;
+    while let Some(msg) = wrapper.next().await {
+        received += 1;
+        if msg.finish_write {
+            break;
+        }
+    }
+    producer.await.unwrap();
+
+    assert_eq!(wrapper.next().await, None);
+    assert_eq!(received, 4, "expected 4 chunks delivered (timer reset each chunk)");
+    assert!(
+        state.lock().take_read_stream_error().is_none(),
+        "timer must reset per chunk; no error expected",
+    );
     Ok(())
 }
