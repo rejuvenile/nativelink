@@ -4840,6 +4840,15 @@ impl RunningActionsManagerImpl {
         let mut has_waited = false;
 
         loop {
+            // Subscribe to the Notify BEFORE observing `cleaning_up_operations`
+            // so any wake-up that fires after the predicate but before we await
+            // is still delivered. `enable()` registers the waker eagerly so the
+            // Notified future will accept a permit issued from this point on.
+            // The sleep-arm in the select! below remains as belt-and-suspenders.
+            let notified = self.cleanup_complete_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let should_wait = {
                 let cleaning = self.cleaning_up_operations.lock();
                 cleaning.contains(operation_id)
@@ -4935,7 +4944,7 @@ impl RunningActionsManagerImpl {
             );
 
             tokio::select! {
-                () = self.cleanup_complete_notify.notified() => {},
+                () = notified.as_mut() => {},
                 () = tokio::time::sleep(backoff) => {
                     // Exponential backoff
                     backoff = (backoff * 2).min(Self::MAX_BACKOFF);
