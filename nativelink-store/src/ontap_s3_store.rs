@@ -48,6 +48,7 @@ use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{ItemCallback, StoreDriver, StoreKey, UploadSizeInfo};
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::CertificateDer;
@@ -92,7 +93,16 @@ pub struct OntapS3Store<NowFn> {
     #[metric(help = "The number of concurrent uploads allowed for multipart uploads")]
     multipart_max_concurrent_uploads: usize,
 
-    item_callbacks: Mutex<Vec<ItemCb>>,
+    /// `ItemCallback`s notified on observed expirations. Stored as an
+    /// `ArcSwap<Vec<...>>` so the eviction firer does a single lock-free
+    /// atomic load to snapshot the current list (no clone gap), and
+    /// registrations swap a new Vec RCU-style. Avoids the snapshot/iterate
+    /// race where a callback registered between `.lock().clone()` and the
+    /// fan-out would miss a single eviction event.
+    item_callbacks: ArcSwap<Vec<ItemCb>>,
+    /// Serializes RCU updates to `item_callbacks` so concurrent registrations
+    /// don't lose entries via a read-modify-write race.
+    item_callbacks_register_lock: Mutex<()>,
 }
 
 pub fn load_custom_certs(cert_path: &str) -> Result<Arc<ClientConfig>, Error> {
@@ -216,7 +226,8 @@ where
                 .common
                 .multipart_max_concurrent_uploads
                 .unwrap_or(DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS),
-            item_callbacks: Mutex::new(vec![]),
+            item_callbacks: ArcSwap::new(Arc::new(Vec::new())),
+            item_callbacks_register_lock: Mutex::new(()),
         }))
     }
 
@@ -245,12 +256,14 @@ where
                                     let now_s = (self.now_fn)().unix_timestamp() as i64;
                                     if last_modified.secs() + self.consider_expired_after_s <= now_s
                                     {
-                                        let item_callbacks = self.item_callbacks.lock().clone();
+                                        // Single atomic load — see ArcSwap field doc.
+                                        let item_callbacks = self.item_callbacks.load();
                                         let mut callbacks: FuturesUnordered<_> = item_callbacks
-                                            .into_iter()
+                                            .iter()
                                             .map(|callback| {
                                                 let store_key = local_digest.borrow();
-                                                async move { callback.callback(store_key).await }
+                                                let cb = callback.clone();
+                                                async move { cb.callback(store_key).await }
                                             })
                                             .collect();
                                         while callbacks.next().await.is_some() {}
@@ -771,7 +784,15 @@ where
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
-        self.item_callbacks.lock().push(callback);
+        // RCU: copy current Vec, append, swap. The register lock serializes
+        // concurrent registrations so we don't lose entries via a read-modify-
+        // write race. Eviction-firer reads use the lock-free `load()` path.
+        let _guard = self.item_callbacks_register_lock.lock();
+        let current = self.item_callbacks.load();
+        let mut next = Vec::with_capacity(current.len() + 1);
+        next.extend(current.iter().cloned());
+        next.push(callback);
+        self.item_callbacks.store(Arc::new(next));
         Ok(())
     }
 }
