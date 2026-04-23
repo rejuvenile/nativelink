@@ -27,7 +27,7 @@ use nativelink_util::digest_hasher::DigestHasher;
 use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::store_trait::{StoreKey, StoreLike};
 use prost::Message;
-use tracing::info;
+use tracing::{debug, info};
 
 // NOTE(aaronmondal) From some local testing it looks like action cache items are rarely greater than
 // 1.2k. Giving a bit more just in case to reduce allocs.
@@ -54,6 +54,7 @@ pub async fn get_size_and_decode_digest<T: Message + Default + 'static>(
     key: impl Into<StoreKey<'_>>,
 ) -> Result<(T, u64), Error> {
     let key = key.into();
+    debug!(?key, "get_size_and_decode_digest: entering get_part_unchunked");
     // Note: For unknown reasons we appear to be hitting:
     // https://github.com/rust-lang/rust/issues/92096
     // or a smiliar issue if we try to use the non-store driver function, so we
@@ -62,6 +63,12 @@ pub async fn get_size_and_decode_digest<T: Message + Default + 'static>(
         .as_store_driver_pin()
         .get_part_unchunked(key.borrow(), 0, Some(MAX_ACTION_MSG_SIZE as u64))
         .await;
+    debug!(
+        ?key,
+        ok = store_data_resp.is_ok(),
+        code = ?store_data_resp.as_ref().err().map(|e| e.code),
+        "get_size_and_decode_digest: get_part_unchunked returned"
+    );
     if let Err(err) = &mut store_data_resp {
         if err.code == Code::NotFound {
             // Trim the error code. Not Found is quite common and we don't want to send a large

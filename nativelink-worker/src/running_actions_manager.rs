@@ -1909,15 +1909,22 @@ pub async fn prepare_action_inputs(
     pre_resolved_tree: Option<HashMap<DigestInfo, ProtoDirectory>>,
     server_missing_digests: Option<HashSet<DigestInfo>>,
 ) -> Result<Option<DigestInfo>, Error> {
+    info!(?digest, work_directory, "prepare_action_inputs: entered");
     // Try cache first if available
     if let Some(cache) = directory_cache {
         if cache.is_direct_use_mode() {
             // Direct-use mode: symlink work_directory -> cache_path.
             // The work directory must NOT exist yet (it becomes the symlink).
-            match cache
+            info!(?digest, "prepare_action_inputs: calling directory_cache.get_or_create_direct");
+            let res = cache
                 .get_or_create_direct(*digest, Path::new(work_directory))
-                .await
-            {
+                .await;
+            info!(
+                ?digest,
+                ok = res.is_ok(),
+                "prepare_action_inputs: directory_cache.get_or_create_direct returned"
+            );
+            match res {
                 Ok((_cache_path, _was_hit)) => {
                     info!(
                         ?digest,
@@ -1943,10 +1950,16 @@ pub async fn prepare_action_inputs(
             }
         } else {
             // Normal hardlink mode
-            match cache
+            info!(?digest, "prepare_action_inputs: calling directory_cache.get_or_create");
+            let res = cache
                 .get_or_create(*digest, Path::new(work_directory))
-                .await
-            {
+                .await;
+            info!(
+                ?digest,
+                ok = res.is_ok(),
+                "prepare_action_inputs: directory_cache.get_or_create returned"
+            );
+            match res {
                 Ok(cache_hit) => {
                     trace!(
                         ?digest,
@@ -1967,7 +1980,14 @@ pub async fn prepare_action_inputs(
     }
 
     // Traditional path (cache disabled or failed)
-    download_to_directory(cas_store, filesystem_store, digest, work_directory, pre_resolved_tree, server_missing_digests).await?;
+    info!(?digest, work_directory, "prepare_action_inputs: falling back to download_to_directory");
+    let res = download_to_directory(cas_store, filesystem_store, digest, work_directory, pre_resolved_tree, server_missing_digests).await;
+    info!(
+        ?digest,
+        ok = res.is_ok(),
+        "prepare_action_inputs: fallback download_to_directory returned"
+    );
+    res?;
     Ok(None)
 }
 
@@ -2666,20 +2686,32 @@ impl RunningActionImpl {
     /// up to the stores to rate limit if needed.
     fn inner_prepare_action(self: Arc<Self>) -> BoxFuture<'static, Result<Arc<Self>, Error>> {
         Box::pin(async move {
+        let operation_id = self.operation_id.clone();
+        info!(%operation_id, "inner_prepare_action: entered");
         {
             let mut state = self.state.lock();
             state.execution_metadata.input_fetch_start_timestamp =
                 (self.running_actions_manager.callbacks.now_fn)();
         }
         let command = {
+            let command_digest = self.action_info.command_digest;
+            let op_id_for_cmd = operation_id.clone();
             // Download and build out our input files/folders. Also fetch and decode our Command.
             let command_fut = self.metrics().get_proto_command_from_store.wrap(async {
-                get_and_decode_digest::<ProtoCommand>(
+                info!(%op_id_for_cmd, ?command_digest, "inner_prepare_action: command_fut entered");
+                let res = get_and_decode_digest::<ProtoCommand>(
                     self.running_actions_manager.cas_store.as_ref(),
-                    self.action_info.command_digest.into(),
+                    command_digest.into(),
                 )
                 .await
-                .err_tip(|| "Converting command_digest to Command")
+                .err_tip(|| "Converting command_digest to Command");
+                info!(
+                    %op_id_for_cmd,
+                    ?command_digest,
+                    ok = res.is_ok(),
+                    "inner_prepare_action: command_fut complete"
+                );
+                res
             });
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
@@ -2690,7 +2722,10 @@ impl RunningActionImpl {
             let pre_resolved_tree = self.pre_resolved_tree.lock().take();
             // Take the server-provided missing digest hints (if any).
             let server_missing_digests = self.server_missing_digests.lock().take();
+            let op_id_for_inputs = operation_id.clone();
+            info!(%operation_id, "inner_prepare_action: about to try_join(command_fut, prepare_action_inputs)");
             let (command, direct_use_digest) = try_join(command_fut, async {
+                info!(%op_id_for_inputs, "inner_prepare_action: prepare_action_inputs branch entered");
                 if !is_direct_use {
                     // Normal mode: create work directory first, then populate it.
                     fs::create_dir(&self.work_directory)
@@ -2708,7 +2743,7 @@ impl RunningActionImpl {
                 // which fans the leader's error (or a 120s leader
                 // `DeadlineExceeded`) to all waiters via a watch channel —
                 // making the outer timeout redundant.
-                self.metrics()
+                let res = self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
                         &self.running_actions_manager.directory_cache,
@@ -2719,9 +2754,16 @@ impl RunningActionImpl {
                         pre_resolved_tree,
                         server_missing_digests,
                     ))
-                    .await
+                    .await;
+                info!(
+                    %op_id_for_inputs,
+                    ok = res.is_ok(),
+                    "inner_prepare_action: prepare_action_inputs branch complete"
+                );
+                res
             })
             .await?;
+            info!(%operation_id, "inner_prepare_action: try_join complete");
             // Store direct-use digest if active, for cleanup ref-count release.
             if let Some(digest) = direct_use_digest {
                 let mut state = self.state.lock();

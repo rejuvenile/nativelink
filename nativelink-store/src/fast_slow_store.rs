@@ -487,6 +487,7 @@ impl FastSlowStore {
             }
         }
         .await;
+        let head_was_ok = head_result.is_ok();
         let reader_stream_size = match head_result {
             Ok(size) => size,
             Err(err) => {
@@ -599,6 +600,22 @@ impl FastSlowStore {
                 _ => fast_res.merge(slow_res).merge(Err(err)),
             },
         };
+        // Phantom-blob signal: slow_store.has() said the blob was present,
+        // but the populate path (data stream / slow_store.get) reported
+        // NotFound. This indicates a race or corruption between has() and
+        // get() — the blob disappeared from the slow store between checks.
+        if head_was_ok {
+            if let Err(err) = &merged {
+                if err.code == Code::NotFound {
+                    error!(
+                        %key,
+                        slow_store = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
+                        ?err,
+                        "PHANTOM BLOB: slow_store.has() returned Some, but populate path returned NotFound"
+                    );
+                }
+            }
+        }
         let returned = match &merged {
             Ok(()) => Ok(()),
             Err(err) => Err(err.clone()),

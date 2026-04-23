@@ -532,7 +532,13 @@ impl WorkerProxyStore {
         length: Option<u64>,
     ) -> Result<bool, Error> {
         let digest = key.borrow().into_digest();
+        debug!(?digest, "try_read_from_worker: locality lookup entered");
         let workers = self.locality_map.read().lookup_workers(&digest);
+        debug!(
+            ?digest,
+            worker_count = workers.len(),
+            "try_read_from_worker: locality lookup returned"
+        );
 
         if workers.is_empty() {
             return Ok(false);
@@ -551,17 +557,25 @@ impl WorkerProxyStore {
         let mut remaining_length = length;
 
         for endpoint in &workers {
+            debug!(?digest, endpoint = %endpoint, "try_read_from_worker: peer attempt entered");
             let Some(store) = self.get_or_create_connection(endpoint).await else {
+                debug!(?digest, endpoint = %endpoint, "try_read_from_worker: peer attempt skipped (no connection)");
                 continue;
             };
 
             // Stream from the peer, caching in the inner store when possible.
             // On failure, compute how many bytes were written and resume
             // from the next peer at the correct offset.
-            match self
+            let attempt_res = self
                 .get_part_and_cache(&store, key.borrow(), &mut *writer, current_offset, remaining_length)
-                .await
-            {
+                .await;
+            debug!(
+                ?digest,
+                endpoint = %endpoint,
+                ok = attempt_res.is_ok(),
+                "try_read_from_worker: peer attempt complete"
+            );
+            match attempt_res {
                 Ok(()) => {
                     info!(
                         ?digest,
