@@ -41,13 +41,19 @@ use nativelink_util::store_trait::{
 };
 use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
 use parking_lot::Mutex;
-use tokio::sync::{Notify, OnceCell};
+use tokio::sync::Notify;
 use tracing::{debug, error, trace, warn};
 
 // TODO(palfrey) This store needs to be evaluated for more efficient memory usage,
 // there are many copies happening internally.
 
-type Loader = Arc<OnceCell<()>>;
+// Per-key loader handle. Used only as a unique allocation whose
+// `Arc::ptr_eq` distinguishes loader generations during cleanup —
+// `LoaderGuard::Drop` removes the populating_digests entry only when
+// the stored Arc ptr-equals its own. `Arc<()>` is sufficient (the
+// previous `Arc<OnceCell<()>>` was a vestige from before the
+// spawn-detach refactor removed `OnceCell::get_or_try_init`).
+type Loader = Arc<()>;
 
 /// Maximum aggregate bytes held in `mirror_blobs`. When exceeded, new mirror
 /// blobs are silently dropped (the server already persisted them).
@@ -105,14 +111,15 @@ pub struct FastSlowStore {
 // is dropped, it is cancel safe.
 //
 // Holds an `'static` key so the guard can be moved into the spawned producer
-// task (see [`FastSlowStore::populate_and_maybe_stream`]); without `'static`
-// the spawn would fail to satisfy `Send` for non-`'static` lifetimes.
+// task (see [`FastSlowStore::run_producer`]); without `'static` the spawn
+// would fail to satisfy `Send` for non-`'static` lifetimes.
 struct LoaderGuard {
     weak_store: Weak<FastSlowStore>,
     key: StoreKey<'static>,
     loader: Option<Loader>,
     /// Streaming buffer shared between the populating thread and waiters.
-    /// Waiters read from this instead of blocking on the OnceCell.
+    /// Waiters read from this to observe the producer's chunks and
+    /// terminal state.
     streaming_inner: Arc<StreamingBlobInner>,
     /// True if this guard created a new entry (we're the populator).
     /// False if another thread is already populating (we're a waiter).
@@ -364,21 +371,18 @@ impl FastSlowStore {
     fn get_loader(&self, key: StoreKey<'_>) -> LoaderGuard {
         // Get a single loader instance that's used to populate the fast store
         // for this digest.  If another request comes in then it's de-duplicated.
-        // Pre-compute the owned key outside the lock to minimize lock hold time.
-        // The earlier `key.borrow().into_owned()` did a redundant `borrow`
-        // before the clone — `key.into_owned()` is the direct equivalent.
+        // Pre-compute owned keys outside the lock to minimize lock hold time.
+        // One for the hashmap key, one to keep inside the LoaderGuard.
+        let owned_key = key.borrow().into_owned();
+        let key_for_guard = owned_key.clone();
         let digest = match key.borrow() {
             StoreKey::Digest(d) => d,
             _ => DigestInfo::zero_digest(),
         };
-        let owned_key = key.into_owned();
         // Use `get` first so the Occupied (waiter) hot path avoids the
-        // extra `owned_key` clone the `entry()` API would force at the
-        // call site. The Vacant (populator) path still clones once for
-        // the HashMap key, but the original `owned_key` is reused for
-        // `LoaderGuard.key` so the populator path stays at one extra
-        // allocation total — same as before, just without the wasted
-        // clone on hits.
+        // extra clone the `entry()` API would force. The Vacant (populator)
+        // path still inserts once. The Loader is `Arc<()>` (vestige from
+        // 01b68015's spawn-detach refactor — no OnceCell needed).
         let mut guard = self.populating_digests.lock();
         let (loader, streaming_inner, is_new) =
             if let Some((l, s)) = guard.get(&owned_key) {
@@ -388,9 +392,9 @@ impl FastSlowStore {
                     digest,
                     Self::POPULATE_STREAM_BUFFER_BYTES,
                 ));
-                let loader = Arc::new(OnceCell::new());
+                let loader: Loader = Arc::new(());
                 guard.insert(
-                    owned_key.borrow().into_owned(),
+                    owned_key,
                     (Arc::clone(&loader), Arc::clone(&inner)),
                 );
                 (loader, inner, true)
@@ -398,7 +402,7 @@ impl FastSlowStore {
         drop(guard);
         LoaderGuard {
             weak_store: self.weak_self.clone(),
-            key: owned_key,
+            key: key_for_guard,
             loader: Some(loader),
             streaming_inner,
             is_new,
@@ -546,8 +550,14 @@ impl FastSlowStore {
                         .slow_store_downloaded_bytes
                         .fetch_add(output_buf_len, Ordering::Acquire);
 
-                    // Best-effort send to the streaming buffer (waiters);
-                    // ignore errors so a slow waiter cannot stall the producer.
+                    // Push into the streaming buffer for waiters. The
+                    // only failure mode is `is_terminal()` already set
+                    // (e.g. an out-of-band cancel-poison) — readers have
+                    // already moved on, so we ignore the result and keep
+                    // pushing into `fast_tx` to populate the fast store.
+                    // `send()` itself does not wait on any waiter; waiter
+                    // backpressure is handled by the sliding-window
+                    // eviction inside `StreamingBlobWriter::send`.
                     let _send_res = streaming_writer.send(output_buf.clone()).await;
 
                     fast_tx
@@ -615,68 +625,51 @@ impl FastSlowStore {
     /// do not consume the data themselves (e.g. `copy_slow_to_fast`).
     /// Returns the producer's terminal result.
     ///
-    /// `Code::Unavailable` means our cursor fell behind the sliding
-    /// window (the blob exceeds `POPULATE_STREAM_BUFFER_BYTES` and the
-    /// producer outpaced our drain). The drain consumes Bytes refs, so
-    /// in practice this only happens if the drainer was scheduling-
-    /// starved for longer than the buffer's eviction window. Recover by
-    /// recreating the reader at the new earliest cursor and continuing
-    /// until either EOF, a non-Unavailable error, or the producer
-    /// terminates while we hold an unrecoverable cursor.
-    async fn drain_streaming_buffer(
+    /// Terminal state is the source of truth: the outer loop checks
+    /// `terminal_result()` BEFORE creating a reader. If the producer
+    /// finished, we return its actual outcome regardless of how much
+    /// sliding-window data still happens to be readable — buffered
+    /// chunks alone do NOT prove the producer succeeded (nit #6 from
+    /// `01b68015`'s code review).
+    ///
+    /// `Code::Unavailable` from the inner reader means our cursor fell
+    /// behind the sliding window (the blob exceeds
+    /// `POPULATE_STREAM_BUFFER_BYTES` and the producer outpaced our
+    /// drain). Break out and let the outer loop re-check terminal state
+    /// or recreate the reader at the new earliest cursor.
+    ///
+    /// `#[doc(hidden)] pub` so the regression tests
+    /// `drain_streaming_buffer_propagates_terminal_error_over_buffered_data`
+    /// and `drain_streaming_buffer_eviction_race_propagates_error`
+    /// can drive the function directly with a hand-built
+    /// `StreamingBlobInner`. Internal helper otherwise.
+    #[doc(hidden)]
+    pub async fn drain_streaming_buffer(
         streaming_inner: &Arc<StreamingBlobInner>,
     ) -> Result<(), Error> {
         loop {
+            // Producer's terminal state wins over buffered chunks. This
+            // both eliminates the prior buggy "data means success"
+            // recovery branch and short-circuits the common case where
+            // the producer already finished by the time the drain runs.
+            if let Some(terminal) = streaming_inner.terminal_result() {
+                return terminal;
+            }
             let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(
                 streaming_inner.clone(),
             );
-            match reader.next_chunk().await {
-                Ok(c) if c.is_empty() => return Ok(()),
-                Ok(_) => {
-                    // Got data — drain the rest at full speed. This
-                    // inner loop holds the same reader (no recreation)
-                    // until it errors or hits EOF.
-                    loop {
-                        match reader.next_chunk().await {
-                            Ok(c) if c.is_empty() => return Ok(()),
-                            Ok(_) => {}
-                            Err(err) if err.code == Code::Unavailable => {
-                                // Fell behind mid-drain — outer loop
-                                // recreates the reader.
-                                break;
-                            }
-                            Err(err) => return Err(err),
-                        }
+            loop {
+                match reader.next_chunk().await {
+                    Ok(c) if c.is_empty() => return Ok(()),
+                    Ok(_) => {}
+                    Err(err) if err.code == Code::Unavailable => {
+                        // Cursor fell behind the sliding window. Bounce
+                        // back to the outer loop, which re-checks
+                        // terminal first (no second-class data path).
+                        break;
                     }
+                    Err(err) => return Err(err),
                 }
-                Err(err) if err.code == Code::Unavailable => {
-                    // First chunk after recreate already evicted —
-                    // producer is racing far ahead. Loop and recreate.
-                    // If the producer terminates concurrently, the
-                    // recreated reader will see the terminal state on
-                    // its first poll.
-                    if streaming_inner.is_terminal() {
-                        // Producer finished; check the terminal state
-                        // via a fresh reader (cursor at current
-                        // earliest, will see EOF/error directly).
-                        let mut last = nativelink_util::streaming_blob::StreamingBlobReader::new(
-                            streaming_inner.clone(),
-                        );
-                        match last.next_chunk().await {
-                            Ok(c) if c.is_empty() => return Ok(()),
-                            Ok(_) => return Ok(()), // any data means producer made it past
-                            Err(e) if e.code == Code::Unavailable => {
-                                // Buffer is empty and terminal — producer
-                                // succeeded but evicted everything. Fast
-                                // store is populated; treat as success.
-                                return Ok(());
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    // else: producer still running, loop and try again.
-                }
-                Err(err) => return Err(err),
             }
         }
     }
@@ -2007,6 +2000,15 @@ impl StoreDriver for FastSlowStore {
         // waiters fall back to the slow store as they always have
         // (covers genuine sliding-window evictions and rare upstream
         // failures the populator's caller would not retry from).
+        //
+        // TODO(fast_slow_asymmetry): Consider unifying the two paths
+        // and always falling through to the slow store on streaming
+        // buffer errors (post-fix the spawn-detach guarantees the
+        // streaming buffer terminates with the producer's structured
+        // error rather than Drop's generic Internal, so the populator
+        // caller would also get a usable error from the slow-store
+        // fallback). Requires updating the failpoint test suite that
+        // currently asserts populator-vs-waiter error semantics.
         let arc_self = self.get_arc().ok_or_else(|| {
             make_err!(Code::Internal, "FastSlowStore dropped during get_part")
         })?;

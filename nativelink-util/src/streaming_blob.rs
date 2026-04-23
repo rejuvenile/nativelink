@@ -111,6 +111,25 @@ impl StreamingBlobInner {
             .is_some_and(|r| r.is_err())
     }
 
+    /// Returns the producer's terminal result, if it has been set.
+    ///
+    /// `Some(Ok(()))`  — writer sent EOF (success)
+    /// `Some(Err(_))`  — writer errored or dropped un-EOF'd
+    /// `None`          — writer still active
+    ///
+    /// The terminal state is the source of truth for whether the
+    /// streaming write succeeded; buffered chunks alone do NOT prove
+    /// success. Drain-style consumers that don't need the data should
+    /// query this directly to avoid the race where chunks remain in the
+    /// sliding window after the producer errored. The returned `Error`
+    /// is cloned so the inner state can be re-queried by other waiters.
+    pub fn terminal_result(&self) -> Option<Result<(), Error>> {
+        self.terminal.lock().as_ref().map(|r| match r {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.clone()),
+        })
+    }
+
     /// Returns true if the buffer currently holds any chunks.
     pub fn has_data(&self) -> bool {
         !self.chunks.read().is_empty()
@@ -952,6 +971,38 @@ mod tests {
         assert!(map.is_empty());
         assert!(map.get_reader(&digest).is_none());
         assert!(map.get_inner(&digest).is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // 14b. terminal_result returns the actual producer outcome
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn terminal_result_reflects_writer_outcome() {
+        // Active writer: terminal_result is None.
+        let (mut writer, _reader) = StreamingBlob::new(test_digest(20), 1024);
+        assert!(
+            writer.inner.terminal_result().is_none(),
+            "fresh writer must have None terminal_result"
+        );
+
+        // EOF: terminal_result is Some(Ok(())).
+        writer.send_eof().unwrap();
+        assert!(
+            matches!(writer.inner.terminal_result(), Some(Ok(()))),
+            "send_eof must surface Some(Ok(())) via terminal_result"
+        );
+
+        // Error: terminal_result returns the cloned upstream error.
+        let (mut writer2, _reader2) = StreamingBlob::new(test_digest(21), 1024);
+        writer2.send_error(make_err!(Code::Unavailable, "synthetic upstream"));
+        match writer2.inner.terminal_result() {
+            Some(Err(err)) => assert_eq!(err.code, Code::Unavailable),
+            other => panic!("expected Some(Err(Unavailable)), got {other:?}"),
+        }
+
+        // Cloned: subsequent calls return their own clone (callers can
+        // re-query without exhausting the state).
+        assert!(matches!(writer2.inner.terminal_result(), Some(Err(_))));
     }
 
     // ---------------------------------------------------------------

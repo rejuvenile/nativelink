@@ -1977,3 +1977,95 @@ async fn populate_inline_does_not_spawn() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Contract test for the refactored `drain_streaming_buffer`: terminal
+/// state is the source of truth. With the new structure, the drain
+/// checks `terminal_result()` BEFORE reading any chunks; if terminal=Err
+/// the drain returns the error even when buffered data is still
+/// readable. This prevents the prior race where the recovery path could
+/// observe a chunk and return Ok despite the producer terminating with
+/// an error (nit #6 from `01b68015`'s code review).
+///
+/// Setup: hand-build a `StreamingBlobInner` with a 10-byte budget, write
+/// 5 chunks of 10 bytes each (forcing eviction so only the last chunk
+/// remains), then `send_error`. The drain MUST surface the structured
+/// error code, not the buffered data.
+#[nativelink_test]
+async fn drain_streaming_buffer_propagates_terminal_error_over_buffered_data()
+-> Result<(), Error> {
+    use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
+
+    let digest = DigestInfo::try_new(VALID_HASH, 50).unwrap();
+    let inner = Arc::new(StreamingBlobInner::new(digest, 10));
+
+    let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+    for i in 0..5u8 {
+        writer.send(Bytes::from(vec![i; 10])).await?;
+    }
+    writer.send_error(make_err!(Code::DataLoss, "synthetic producer mid-stream failure"));
+    drop(writer);
+
+    assert!(inner.is_terminal(), "writer.send_error should mark terminal");
+    assert!(
+        inner.earliest_chunk_idx() > 0,
+        "test setup: writes must trigger eviction (earliest > 0)",
+    );
+
+    let err = FastSlowStore::drain_streaming_buffer(&inner)
+        .await
+        .expect_err(
+            "drain MUST propagate the producer's terminal error — pre-fix \
+             the drain's recovery branch could read buffered data and \
+             return Ok despite terminal=Err, silently swallowing the \
+             upstream error in copy_slow_to_fast's caller path",
+        );
+    assert_eq!(err.code, Code::DataLoss);
+    Ok(())
+}
+
+/// Stress regression for nit #6: the genuine race between drain and a
+/// fast producer that errors mid-stream. Spawns a writer task that
+/// hammers chunks into a tiny sliding window and then `send_error`s,
+/// while the drain runs concurrently. Pre-fix, drain could observe a
+/// chunk in the recovery path's fresh reader and return Ok(()) despite
+/// terminal=Err. Post-fix, drain checks terminal state directly.
+///
+/// Run 50 iterations to maximize the chance the race window is hit.
+/// Pre-fix this would intermittently return Ok; post-fix it always
+/// returns Err.
+#[nativelink_test]
+async fn drain_streaming_buffer_eviction_race_propagates_error() -> Result<(), Error> {
+    use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
+
+    let digest = DigestInfo::try_new(VALID_HASH, 1000).unwrap();
+    for iter in 0..50 {
+        let inner = Arc::new(StreamingBlobInner::new(digest, 10));
+        let inner_writer = Arc::clone(&inner);
+        // Writer task: hammers chunks (each forces eviction) then
+        // terminates with an error.
+        let writer_task = tokio::spawn(async move {
+            let mut writer = StreamingBlobWriter::new(inner_writer);
+            for i in 0..100u8 {
+                let _send_res = writer.send(Bytes::from(vec![i; 10])).await;
+            }
+            writer.send_error(make_err!(
+                Code::DataLoss,
+                "synthetic mid-stream producer failure"
+            ));
+        });
+        // Drain runs concurrently. With the producer error, drain must
+        // ALWAYS return Err — never Ok regardless of which inner branch
+        // it traversed.
+        let drain_res = FastSlowStore::drain_streaming_buffer(&inner).await;
+        writer_task
+            .await
+            .map_err(|e| make_err!(Code::Internal, "writer task panic: {e:?}"))?;
+        assert!(
+            drain_res.is_err(),
+            "iter {iter}: drain must return Err (producer terminated with \
+             send_error), got {drain_res:?}. Pre-fix the recovery branch \
+             could observe buffered data and return Ok.",
+        );
+    }
+    Ok(())
+}
