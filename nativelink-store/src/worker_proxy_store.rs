@@ -243,6 +243,30 @@ fn is_connection_error(e: &Error) -> bool {
     matches!(e.code, Code::Unavailable | Code::Unknown)
 }
 
+/// Locality-eviction policy: should this peer-fetch failure cause us to drop
+/// the locality entry mapping `digest -> endpoint`?
+///
+/// We evict ONLY on signals that the peer genuinely no longer holds (or
+/// cannot deliver) the bytes for this specific digest:
+///   * `Code::NotFound`  — peer evicted the blob from its local cache.
+///   * `Code::DataLoss`  — peer delivered corrupt or truncated bytes (the
+///                         stored copy is unusable).
+///
+/// All other failures are treated as TRANSIENT for the locality entry. A
+/// `DeadlineExceeded`, `Unavailable`, `Internal`, `Aborted`, or transport
+/// blip does not prove the peer has lost the blob — only that this specific
+/// fetch attempt failed. Evicting on transients permanently destroys
+/// locality for blobs only one peer has, after a single network hiccup,
+/// which then forces every subsequent FindMissingBlobs to miss the fast
+/// path even though the peer still holds the data.
+///
+/// Worker-level health bookkeeping (quarantine, connection drop) is handled
+/// separately by `is_connection_error` / `is_definitive_unreachable` and is
+/// orthogonal to this digest-level policy.
+fn should_evict_locality_on_peer_error(e: &Error) -> bool {
+    matches!(e.code, Code::NotFound | Code::DataLoss)
+}
+
 /// Returns true for transport-level errors that prove the peer is gone:
 /// `ConnectionRefused` (no listener), `NetworkUnreachable`, `HostUnreachable`.
 /// Distinct from generic `Code::Unavailable` (which also covers transients
@@ -483,25 +507,27 @@ impl WorkerProxyStore {
                 }
                 Err(e) => {
                     // Same locality-eviction policy as `try_read_from_worker`:
-                    // hard-evict on any peer failure that isn't a transport
-                    // connection error (the latter also drops the cached
-                    // connection). The locality map is a hint, not a
-                    // contract, and a peer that failed to deliver the digest
-                    // shouldn't keep claiming to have it.
+                    // see `should_evict_locality_on_peer_error` — narrow to
+                    // NotFound / DataLoss only, so a transient blip doesn't
+                    // permanently destroy the locality entry.
                     let is_conn_err = is_connection_error(&e);
                     if is_conn_err {
                         self.remove_worker_endpoint(endpoint);
                     }
-                    self.locality_map
-                        .write()
-                        .evict_blobs(endpoint, &[digest]);
+                    let evict = should_evict_locality_on_peer_error(&e);
+                    if evict {
+                        self.locality_map
+                            .write()
+                            .evict_blobs(endpoint, &[digest]);
+                    }
                     error!(
                         ?digest,
                         endpoint = endpoint.as_str(),
                         code = ?e.code,
                         connection_error = is_conn_err,
+                        evicted_locality = evict,
                         ?e,
-                        "WorkerProxyStore: redirected peer fetch failed, evicting locality entry"
+                        "WorkerProxyStore: redirected peer fetch failed"
                     );
                     warn!(
                         ?digest,
@@ -589,40 +615,27 @@ impl WorkerProxyStore {
                     return Ok(true);
                 }
                 Err(e) => {
-                    // Hard-evict the locality entry on ANY peer failure that
-                    // isn't a transport-level connection error (the latter is
-                    // already handled by `remove_worker_endpoint`, which drops
-                    // the cached connection so a future fetch reconnects).
-                    //
-                    // The locality map is a HINT, not a contract. A peer that
-                    // failed to deliver this digest — `NotFound` (peer evicted
-                    // it), `DataLoss` (genuine truncation), `Internal` (peer
-                    // bug), `DeadlineExceeded` (peer hung), etc. — has lost
-                    // claim to this digest. Continuing to trust the entry on
-                    // the next has_with_results / FindMissingBlobs causes the
-                    // bytestream upload-skip fast path to drop legitimate
-                    // re-uploads, producing the infinite zombie NOT_FOUND loop
-                    // that affected digest 1e08eefa…-183 in production.
-                    //
-                    // Forensic context: before this widening, the eviction
-                    // branch only matched `Code::NotFound`. When Bug B in
-                    // grpc_store::get_part_parallel misclassified clean-EOF
-                    // as DataLoss, the locality entry was preserved forever
-                    // and Bazel saw infinite NOT_FOUND retries.
+                    // Locality-eviction policy: see
+                    // `should_evict_locality_on_peer_error` doc — narrow to
+                    // NotFound / DataLoss only.
                     let is_conn_err = is_connection_error(&e);
                     if is_conn_err {
                         self.remove_worker_endpoint(endpoint);
                     }
-                    self.locality_map
-                        .write()
-                        .evict_blobs(endpoint, &[digest]);
+                    let evict = should_evict_locality_on_peer_error(&e);
+                    if evict {
+                        self.locality_map
+                            .write()
+                            .evict_blobs(endpoint, &[digest]);
+                    }
                     error!(
                         ?digest,
                         endpoint = %endpoint,
                         code = ?e.code,
                         connection_error = is_conn_err,
+                        evicted_locality = evict,
                         ?e,
-                        "WorkerProxyStore: peer fetch failed, evicting locality entry"
+                        "WorkerProxyStore: peer fetch failed"
                     );
                     let bytes_written_total =
                         writer.get_bytes_written() - bytes_before_proxy;
@@ -1843,6 +1856,144 @@ mod tests {
         let locality_map = new_shared_blob_locality_map();
         let proxy = WorkerProxyStore::new(inner, locality_map.clone());
         (Store::new(proxy), locality_map)
+    }
+
+    // ---------------------------------------------------------------
+    // Locality-eviction policy: evict ONLY on NotFound / DataLoss.
+    // Transient failures (DeadlineExceeded, Unavailable, Internal,
+    // Aborted, Unknown transport blips) must KEEP the locality entry —
+    // otherwise a single network hiccup permanently loses the only
+    // routing record for blobs held by a single peer.
+    //
+    // Spec source: bug report — single peer-fetch failure (e.g. one
+    // missed deadline) currently nukes the locality entry forever, so
+    // subsequent has_with_results / FMB miss the fast path even though
+    // the peer still holds the blob.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_should_evict_on_not_found() {
+        let e = make_err!(Code::NotFound, "blob not present on peer");
+        assert!(
+            should_evict_locality_on_peer_error(&e),
+            "NotFound is a definitive 'peer no longer holds blob' signal — must evict"
+        );
+    }
+
+    #[test]
+    fn test_should_evict_on_data_loss() {
+        let e = make_err!(Code::DataLoss, "peer delivered truncated bytes");
+        assert!(
+            should_evict_locality_on_peer_error(&e),
+            "DataLoss means the peer's stored copy is unusable — must evict"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_on_deadline_exceeded() {
+        let e = make_err!(Code::DeadlineExceeded, "peer hung past deadline");
+        assert!(
+            !should_evict_locality_on_peer_error(&e),
+            "DeadlineExceeded is transient — peer may still hold the blob; \
+             evicting would permanently lose locality after one slow fetch"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_on_unavailable() {
+        let e = make_err!(Code::Unavailable, "transient unavailable");
+        assert!(
+            !should_evict_locality_on_peer_error(&e),
+            "Unavailable is transient (KeepAliveTimedOut, RST_STREAM, etc.) \
+             — must keep the locality entry"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_on_internal() {
+        let e = make_err!(Code::Internal, "peer hit an internal error");
+        assert!(
+            !should_evict_locality_on_peer_error(&e),
+            "Internal does not prove the peer lost the blob"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_on_aborted() {
+        let e = make_err!(Code::Aborted, "peer aborted the stream");
+        assert!(
+            !should_evict_locality_on_peer_error(&e),
+            "Aborted is transient — must keep locality entry"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_on_unknown_transport_blip() {
+        let e = make_err!(Code::Unknown, "h2 transport blip");
+        assert!(
+            !should_evict_locality_on_peer_error(&e),
+            "Unknown / transport blip is handled by connection drop, \
+             not locality eviction"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_on_cancelled() {
+        let e = make_err!(Code::Cancelled, "client cancelled the rpc");
+        assert!(
+            !should_evict_locality_on_peer_error(&e),
+            "Cancelled is transient (caller dropped) — does not prove \
+             the peer lost the blob"
+        );
+    }
+
+    #[test]
+    fn test_should_keep_on_failed_precondition() {
+        let e = make_err!(Code::FailedPrecondition, "peer in unexpected state");
+        assert!(
+            !should_evict_locality_on_peer_error(&e),
+            "FailedPrecondition is transient — does not prove the peer \
+             lost the blob"
+        );
+    }
+
+    /// Exhaustive table covering every `tonic::Code` variant in the
+    /// canonical 0..=16 range. Any change to the helper that reclassifies
+    /// an existing variant fails this test, so a future maintainer who
+    /// widens eviction to a transient code without updating the table
+    /// will see it go red. Pair with the per-case tests above for
+    /// prose-level intent on the high-traffic codes.
+    #[test]
+    fn test_locality_eviction_policy_for_all_grpc_codes() {
+        // (code, expected_evict). Spec: evict ONLY on NotFound + DataLoss;
+        // every other code (including Ok, which never actually appears as
+        // an error but is included as a sanity row) must keep locality.
+        let cases: &[(Code, bool)] = &[
+            (Code::Ok, false),
+            (Code::Cancelled, false),
+            (Code::Unknown, false),
+            (Code::InvalidArgument, false),
+            (Code::DeadlineExceeded, false),
+            (Code::NotFound, true),
+            (Code::AlreadyExists, false),
+            (Code::PermissionDenied, false),
+            (Code::ResourceExhausted, false),
+            (Code::FailedPrecondition, false),
+            (Code::Aborted, false),
+            (Code::OutOfRange, false),
+            (Code::Unimplemented, false),
+            (Code::Internal, false),
+            (Code::Unavailable, false),
+            (Code::DataLoss, true),
+            (Code::Unauthenticated, false),
+        ];
+        for (code, expected) in cases {
+            let e = make_err!(*code, "table-driven test for {:?}", code);
+            let actual = should_evict_locality_on_peer_error(&e);
+            assert_eq!(
+                actual, *expected,
+                "Code::{code:?}: expected evict={expected}, got evict={actual}"
+            );
+        }
     }
 
     #[test]
