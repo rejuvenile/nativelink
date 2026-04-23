@@ -108,6 +108,58 @@ impl std::fmt::Debug for Transport {
     }
 }
 
+/// Outcome of one chunk-fetch attempt, used by `get_part_parallel`'s
+/// post-loop classifier.
+#[derive(Debug, PartialEq, Eq)]
+enum ChunkAttemptOutcome {
+    /// Got `chunk_length` bytes — the chunk is complete.
+    Complete,
+    /// `stream.next()` returned `None` (the peer's `Status::OK` trailer)
+    /// before `chunk_length` bytes arrived. The bytestream contract says
+    /// this is success: the resource is shorter than the requested range.
+    /// Forensic: a 183-byte blob requested via the parallel path
+    /// (`chunk_length` >> 183) used to land here and get misclassified
+    /// as `DataLoss`, leading to the digest 1e08eefa…-183 zombie loop.
+    CleanShort,
+    /// The loop broke on an empty data frame with no terminal trailer
+    /// observed yet. Most common cause: server-side `tx` channel
+    /// dropped without a Status frame (e.g. FastSlowStore's
+    /// `data_stream_fut` canceled mid-flight). Retry the residual
+    /// range — the next attempt will either complete or surface a
+    /// real status.
+    AmbiguousEarlyBreak,
+}
+
+/// Pure-function classifier for `get_part_parallel`'s per-chunk attempt
+/// loop. Encapsulated so it can be unit-tested without standing up a
+/// real gRPC bytestream server. Inputs:
+///
+/// * `clean_eof` — `true` iff the per-attempt `loop` exited because
+///   `stream.next()` returned `None`. tonic's `Streaming::poll_next`
+///   only yields `None` after the underlying response body finished
+///   without a non-OK gRPC status, so `None` ⇔ `Status::OK` trailer.
+///   `Some(Err(status))` (any non-OK trailer) is handled inside the
+///   loop and never reaches this function.
+/// * `bytes_received` — total bytes the per-chunk fetcher emitted
+///   across all attempts so far, including this one.
+/// * `chunk_length` — the requested range size for this chunk.
+fn classify_chunk_attempt(
+    clean_eof: bool,
+    bytes_received: u64,
+    chunk_length: u64,
+) -> ChunkAttemptOutcome {
+    if bytes_received == chunk_length {
+        return ChunkAttemptOutcome::Complete;
+    }
+    if clean_eof {
+        // Status::OK + bytes_received < chunk_length = resource exhausted.
+        // The blob is shorter than the caller's requested range. Treat as
+        // success (Bug B fix: the previous code returned DataLoss here).
+        return ChunkAttemptOutcome::CleanShort;
+    }
+    ChunkAttemptOutcome::AmbiguousEarlyBreak
+}
+
 #[derive(Debug, MetricsComponent)]
 pub struct GrpcStore {
     #[metric(help = "Instance name for the store")]
@@ -1594,9 +1646,29 @@ impl GrpcStore {
                                             // resumes at the new
                                             // offset.
                                             let mut bytes_this_attempt: u64 = 0;
+                                            // Track HOW the loop exited so
+                                            // the post-loop classifier
+                                            // can distinguish a clean
+                                            // `Status::OK` trailer
+                                            // (`stream.next() == None`,
+                                            // `clean_eof == true`) from
+                                            // an empty-data-frame early
+                                            // break (`clean_eof == false`).
+                                            // tonic's `Streaming` returns
+                                            // `Some(Err(status))` for any
+                                            // non-OK trailer and `None`
+                                            // only for `Status::OK` — so
+                                            // a `None` here is unambiguously
+                                            // the peer signalling
+                                            // "resource exhausted at this
+                                            // offset".
+                                            let mut clean_eof = false;
                                             loop {
                                                 match stream.next().await {
-                                                    None => break,
+                                                    None => {
+                                                        clean_eof = true;
+                                                        break;
+                                                    }
                                                     Some(Ok(message)) => {
                                                         if message.data.is_empty() {
                                                             break;
@@ -1618,17 +1690,41 @@ impl GrpcStore {
                                                         }
                                                     }
                                                     Some(Err(status)) => {
-                                                        // Network /
-                                                        // server-side
-                                                        // error — let
+                                                        // Trailer is a
+                                                        // non-OK gRPC
+                                                        // status. `NotFound`
+                                                        // is terminal — the
+                                                        // peer's blob is
+                                                        // gone, retrying
+                                                        // the same residual
+                                                        // range will keep
+                                                        // hitting the same
+                                                        // 404. Surface as
+                                                        // `RetryResult::Err`
+                                                        // so the locality-
+                                                        // eviction path in
+                                                        // `WorkerProxyStore`
+                                                        // sees the real
+                                                        // code and clears
+                                                        // the stale entry.
+                                                        // Other codes
+                                                        // (Unavailable,
+                                                        // Internal, Aborted,
+                                                        // …) are typically
+                                                        // transient — let
                                                         // the retrier
-                                                        // decide based
-                                                        // on the gRPC
-                                                        // status code.
+                                                        // decide.
+                                                        let code = status.code();
                                                         let err = Into::<Error>::into(status).append(format!(
                                                             "chunk {idx} at offset {resume_offset} (attempt {})",
                                                             state.attempt
                                                         ));
+                                                        if code == Code::NotFound {
+                                                            return Some((
+                                                                RetryResult::Err(err),
+                                                                state,
+                                                            ));
+                                                        }
                                                         return Some((
                                                             RetryResult::Retry(err),
                                                             state,
@@ -1637,26 +1733,44 @@ impl GrpcStore {
                                                 }
                                             }
 
-                                            if state.bytes_received == chunk_length {
-                                                return Some((
-                                                    RetryResult::Ok(()),
-                                                    state,
-                                                ));
+                                            // Classify the per-attempt
+                                            // outcome via the pure helper
+                                            // (testable in isolation):
+                                            //   Complete            → Ok
+                                            //   CleanShort          → Ok (Bug B fix)
+                                            //   AmbiguousEarlyBreak → Retry(DataLoss)
+                                            //
+                                            // Bug B forensic context: a
+                                            // 183-byte blob fetched via the
+                                            // parallel path used to land
+                                            // here as `bytes_received < chunk_length`
+                                            // with `clean_eof = true`,
+                                            // misclassified as DataLoss,
+                                            // and looped infinitely on
+                                            // digest 1e08eefa…-183 in
+                                            // production. The peer's
+                                            // bytestream upload-skip fast
+                                            // path also saw `has()` return
+                                            // true (locality lying because
+                                            // eviction only ran on
+                                            // `Code::NotFound`), so Bazel's
+                                            // re-uploads were silently
+                                            // dropped and the loop
+                                            // continued forever.
+                                            match classify_chunk_attempt(
+                                                clean_eof,
+                                                state.bytes_received,
+                                                chunk_length,
+                                            ) {
+                                                ChunkAttemptOutcome::Complete
+                                                | ChunkAttemptOutcome::CleanShort => {
+                                                    return Some((
+                                                        RetryResult::Ok(()),
+                                                        state,
+                                                    ));
+                                                }
+                                                ChunkAttemptOutcome::AmbiguousEarlyBreak => {}
                                             }
-
-                                            // Stream ended early.
-                                            // Retry the residual
-                                            // range. The most common
-                                            // production trigger is
-                                            // the server's `tx`
-                                            // channel dropped without
-                                            // an EOF (e.g.
-                                            // FastSlowStore's
-                                            // data_stream_fut canceled
-                                            // mid-flight), which
-                                            // surfaces here as
-                                            // `bytes_received == 0`
-                                            // and no Status frame.
                                             warn!(
                                                 chunk_idx = idx,
                                                 resume_offset,
@@ -1665,7 +1779,7 @@ impl GrpcStore {
                                                 bytes_received_total = state.bytes_received,
                                                 expected = chunk_length,
                                                 attempt = state.attempt,
-                                                "parallel read chunk: stream ended early, will retry residual range"
+                                                "parallel read chunk: stream ended early without Status trailer, will retry residual range"
                                             );
                                             Some((
                                                 RetryResult::Retry(make_err!(
@@ -2100,3 +2214,103 @@ impl StoreDriver for GrpcStore {
 }
 
 default_health_status_indicator!(GrpcStore);
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkAttemptOutcome, classify_chunk_attempt};
+
+    /// Bug B regression: a clean `Status::OK` trailer (`clean_eof = true`)
+    /// with `bytes_received < chunk_length` must classify as
+    /// `CleanShort` (treated as success), NOT as a truncation that needs
+    /// retry. This is the smallest reproducer of the digest 1e08eefa…-183
+    /// infinite zombie loop: the per-chunk fetcher saw 183 bytes from
+    /// the peer, then `stream.next()` returned `None` (peer's
+    /// `Status::OK` trailer), and the previous classifier emitted
+    /// `RetryResult::Retry(Code::DataLoss)` because the chunk requested
+    /// more bytes than the entire blob held.
+    ///
+    /// tonic's `Streaming::poll_next` only yields `None` after the
+    /// underlying response body finished WITHOUT a non-OK gRPC status
+    /// (see `tonic::codec::decode::Streaming::poll_next` →
+    /// `inner.response()`), so `clean_eof == true` is unambiguous.
+    #[test]
+    fn classify_clean_eof_short_blob_is_clean_short() {
+        let outcome = classify_chunk_attempt(
+            /*clean_eof=*/ true,
+            /*bytes_received=*/ 183,
+            /*chunk_length=*/ 2_500_000,
+        );
+        assert_eq!(
+            outcome,
+            ChunkAttemptOutcome::CleanShort,
+            "Bug B: peer returned 183 bytes + Status::OK for a request \
+             asking for 2.5 MiB — must be CleanShort (success), not retry"
+        );
+    }
+
+    /// Sanity: full chunk delivered + clean EOF still classifies as
+    /// `Complete`. (`clean_eof` is irrelevant once `bytes_received == chunk_length`.)
+    #[test]
+    fn classify_full_chunk_with_clean_eof_is_complete() {
+        let outcome = classify_chunk_attempt(true, 1024, 1024);
+        assert_eq!(outcome, ChunkAttemptOutcome::Complete);
+    }
+
+    /// Sanity: full chunk delivered without clean EOF (e.g. the peer
+    /// closed early after delivering exactly `chunk_length` bytes) is
+    /// still `Complete`.
+    #[test]
+    fn classify_full_chunk_without_clean_eof_is_complete() {
+        let outcome = classify_chunk_attempt(false, 1024, 1024);
+        assert_eq!(outcome, ChunkAttemptOutcome::Complete);
+    }
+
+    /// Bug B regression: empty-data-frame early break (no clean EOF) +
+    /// short bytes → `AmbiguousEarlyBreak`. The pre-fix behaviour
+    /// (always retry) is preserved for this case — empty data frames
+    /// with no trailer are suspicious enough to warrant a retry.
+    #[test]
+    fn classify_empty_data_break_is_ambiguous_early_break() {
+        let outcome = classify_chunk_attempt(
+            /*clean_eof=*/ false,
+            /*bytes_received=*/ 100,
+            /*chunk_length=*/ 1024,
+        );
+        assert_eq!(outcome, ChunkAttemptOutcome::AmbiguousEarlyBreak);
+    }
+
+    /// Edge case: zero bytes received with a clean EOF — typically
+    /// reading at offset >= resource size. Must surface as success
+    /// (the resource is exhausted), NOT data loss.
+    #[test]
+    fn classify_zero_bytes_clean_eof_is_clean_short() {
+        let outcome = classify_chunk_attempt(true, 0, 4096);
+        assert_eq!(outcome, ChunkAttemptOutcome::CleanShort);
+    }
+
+    /// Edge case: zero bytes received without a clean EOF — the loop
+    /// broke on an empty data frame before any data and before a
+    /// trailer. Stays `AmbiguousEarlyBreak` (retry).
+    #[test]
+    fn classify_zero_bytes_no_clean_eof_is_ambiguous() {
+        let outcome = classify_chunk_attempt(false, 0, 4096);
+        assert_eq!(outcome, ChunkAttemptOutcome::AmbiguousEarlyBreak);
+    }
+
+    /// Defensive: `bytes_received > chunk_length` is a server protocol
+    /// violation (the server returned more bytes than asked for). The
+    /// classifier should not panic; the equality check `== chunk_length`
+    /// fails so we fall through. With `clean_eof = true` we treat as
+    /// CleanShort (caller already accumulated the data via the writer
+    /// and the digest hash check downstream will catch any corruption);
+    /// with `clean_eof = false` we treat as AmbiguousEarlyBreak (retry).
+    /// Either is defensible — the key invariant is "no panic and no
+    /// silent DataLoss for clean-OK responses."
+    #[test]
+    fn classify_overrun_with_clean_eof_does_not_panic() {
+        let outcome = classify_chunk_attempt(true, 5000, 4096);
+        // overrun + clean_eof: not Complete (== fails), and clean_eof
+        // path returns CleanShort.
+        assert_eq!(outcome, ChunkAttemptOutcome::CleanShort);
+    }
+}

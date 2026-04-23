@@ -25,7 +25,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use nativelink_config::stores::{ClientTlsConfig, GrpcEndpoint, GrpcSpec, Retry, StoreType};
 use nativelink_error::{Code, Error, ResultExt, make_err};
@@ -482,17 +482,27 @@ impl WorkerProxyStore {
                     return Ok(true);
                 }
                 Err(e) => {
-                    if is_connection_error(&e) {
+                    // Same locality-eviction policy as `try_read_from_worker`:
+                    // hard-evict on any peer failure that isn't a transport
+                    // connection error (the latter also drops the cached
+                    // connection). The locality map is a hint, not a
+                    // contract, and a peer that failed to deliver the digest
+                    // shouldn't keep claiming to have it.
+                    let is_conn_err = is_connection_error(&e);
+                    if is_conn_err {
                         self.remove_worker_endpoint(endpoint);
-                    } else if e.code == Code::NotFound {
-                        // Worker said it doesn't have this blob — the
-                        // locality map's claim is stale. Evict so the
-                        // next has_with_results / FindMissingBlobs
-                        // doesn't keep returning a ghost hit.
-                        self.locality_map
-                            .write()
-                            .evict_blobs(endpoint, &[digest]);
                     }
+                    self.locality_map
+                        .write()
+                        .evict_blobs(endpoint, &[digest]);
+                    error!(
+                        ?digest,
+                        endpoint = endpoint.as_str(),
+                        code = ?e.code,
+                        connection_error = is_conn_err,
+                        ?e,
+                        "WorkerProxyStore: redirected peer fetch failed, evicting locality entry"
+                    );
                     warn!(
                         ?digest,
                         endpoint = endpoint.as_str(),
@@ -561,19 +571,41 @@ impl WorkerProxyStore {
                     return Ok(true);
                 }
                 Err(e) => {
-                    if is_connection_error(&e) {
+                    // Hard-evict the locality entry on ANY peer failure that
+                    // isn't a transport-level connection error (the latter is
+                    // already handled by `remove_worker_endpoint`, which drops
+                    // the cached connection so a future fetch reconnects).
+                    //
+                    // The locality map is a HINT, not a contract. A peer that
+                    // failed to deliver this digest — `NotFound` (peer evicted
+                    // it), `DataLoss` (genuine truncation), `Internal` (peer
+                    // bug), `DeadlineExceeded` (peer hung), etc. — has lost
+                    // claim to this digest. Continuing to trust the entry on
+                    // the next has_with_results / FindMissingBlobs causes the
+                    // bytestream upload-skip fast path to drop legitimate
+                    // re-uploads, producing the infinite zombie NOT_FOUND loop
+                    // that affected digest 1e08eefa…-183 in production.
+                    //
+                    // Forensic context: before this widening, the eviction
+                    // branch only matched `Code::NotFound`. When Bug B in
+                    // grpc_store::get_part_parallel misclassified clean-EOF
+                    // as DataLoss, the locality entry was preserved forever
+                    // and Bazel saw infinite NOT_FOUND retries.
+                    let is_conn_err = is_connection_error(&e);
+                    if is_conn_err {
                         self.remove_worker_endpoint(endpoint);
-                    } else if e.code == Code::NotFound {
-                        // Worker said it doesn't have this blob — the
-                        // locality map's claim is stale. Evict so the
-                        // next has_with_results / FindMissingBlobs
-                        // doesn't keep returning a ghost hit. Safe to do
-                        // here even mid-loop because remaining peers
-                        // are looked up from the original `workers` snapshot.
-                        self.locality_map
-                            .write()
-                            .evict_blobs(endpoint, &[digest]);
                     }
+                    self.locality_map
+                        .write()
+                        .evict_blobs(endpoint, &[digest]);
+                    error!(
+                        ?digest,
+                        endpoint = %endpoint,
+                        code = ?e.code,
+                        connection_error = is_conn_err,
+                        ?e,
+                        "WorkerProxyStore: peer fetch failed, evicting locality entry"
+                    );
                     let bytes_written_total =
                         writer.get_bytes_written() - bytes_before_proxy;
                     warn!(
@@ -916,6 +948,82 @@ impl WorkerProxyStore {
             .await
             .map_err(|e| make_err!(Code::Internal, "WorkerProxyStore: {winner_name} task join error: {e}"))?
             .err_tip(|| format!("WorkerProxyStore: {winner_name} get_part failed after winning race"))
+    }
+
+    /// Server racer either errored or returned an empty-EOF for a non-zero
+    /// digest (stale-positive). Wait for the peer racer instead. If the
+    /// peer also produces an empty-EOF for a non-zero digest, surface
+    /// `Code::NotFound` — the blob is unavailable from either source.
+    async fn await_peer_after_empty_server(
+        writer: &mut DropCloserWriteHalf,
+        peer_rx: &mut DropCloserReadHalf,
+        peer_handle: JoinHandle<Result<(), Error>>,
+        digest: &DigestInfo,
+        peer_endpoint: &Arc<str>,
+        is_zero_blob: bool,
+    ) -> Result<(), Error> {
+        let peer_chunk = peer_rx.recv().await
+            .err_tip(|| "WorkerProxyStore: peer recv after server failure/empty")?;
+        if peer_chunk.is_empty() {
+            if is_zero_blob {
+                writer.send_eof()
+                    .err_tip(|| "WorkerProxyStore: peer EOF for zero-length blob")?;
+                return peer_handle.await
+                    .map_err(|e| make_err!(Code::Internal, "peer task join: {e}"))?;
+            }
+            // Non-zero digest, no data from either racer — surface NotFound.
+            return Err(make_err!(
+                Code::NotFound,
+                "WorkerProxyStore: both server and peer {} returned empty EOF for non-zero digest {:?} (size_bytes={})",
+                peer_endpoint,
+                digest,
+                digest.size_bytes(),
+            ));
+        }
+        debug!(
+            ?digest,
+            endpoint = %peer_endpoint,
+            "WorkerProxyStore: peer won race (server empty/failed)"
+        );
+        writer.send(peer_chunk).await
+            .err_tip(|| "WorkerProxyStore: sending peer fallback chunk")?;
+        Self::forward_racer("peer", writer, peer_rx, peer_handle).await
+    }
+
+    /// Peer racer either errored or returned an empty-EOF for a non-zero
+    /// digest (stale-positive — locality already evicted by caller). Wait
+    /// for the server racer instead. If the server also returns empty for
+    /// a non-zero digest, surface `Code::NotFound`.
+    async fn await_server_after_empty_peer(
+        writer: &mut DropCloserWriteHalf,
+        server_rx: &mut DropCloserReadHalf,
+        server_handle: JoinHandle<Result<(), Error>>,
+        digest: &DigestInfo,
+        is_zero_blob: bool,
+    ) -> Result<(), Error> {
+        let server_chunk = server_rx.recv().await
+            .err_tip(|| "WorkerProxyStore: server recv after peer failure/empty")?;
+        if server_chunk.is_empty() {
+            if is_zero_blob {
+                writer.send_eof()
+                    .err_tip(|| "WorkerProxyStore: server EOF for zero-length blob")?;
+                return server_handle.await
+                    .map_err(|e| make_err!(Code::Internal, "server task join: {e}"))?;
+            }
+            return Err(make_err!(
+                Code::NotFound,
+                "WorkerProxyStore: both peer and server returned empty EOF for non-zero digest {:?} (size_bytes={})",
+                digest,
+                digest.size_bytes(),
+            ));
+        }
+        debug!(
+            ?digest,
+            "WorkerProxyStore: server won race (peer empty/failed)"
+        );
+        writer.send(server_chunk).await
+            .err_tip(|| "WorkerProxyStore: sending server fallback chunk")?;
+        Self::forward_racer("server", writer, server_rx, server_handle).await
     }
 
     /// Mirror a blob to a random connected worker for OOM redundancy.
@@ -1497,6 +1605,13 @@ impl StoreDriver for WorkerProxyStore {
                 .await
         });
 
+        // Whether an empty initial chunk is a legitimate zero-length-blob
+        // success. For non-zero digests, an empty first chunk is a
+        // stale-positive: the racer claimed it had the blob but produced
+        // no bytes (e.g. peer's BatchReadBlobs returned `data: vec![]`
+        // for an evicted blob). Must NOT be treated as success.
+        let is_zero_blob = digest.size_bytes() == 0;
+
         // Race: wait for the first racer to produce a data chunk (or error).
         tokio::select! {
             server_result = server_rx.recv() => {
@@ -1512,17 +1627,29 @@ impl StoreDriver for WorkerProxyStore {
                             .err_tip(|| "WorkerProxyStore: sending server winner chunk")?;
                         Self::forward_racer("server", writer, &mut server_rx, server_handle).await
                     }
-                    Ok(_empty) => {
-                        // Server returned EOF immediately (zero-length blob).
+                    Ok(_empty) if is_zero_blob => {
+                        // Legitimate zero-length blob — server won the race.
                         peer_handle.abort();
                         debug!(
                             ?digest,
-                            "WorkerProxyStore: server won race (empty blob)"
+                            "WorkerProxyStore: server won race (zero-length blob)"
                         );
                         writer.send_eof()
-                            .err_tip(|| "WorkerProxyStore: sending EOF for empty blob")?;
+                            .err_tip(|| "WorkerProxyStore: sending EOF for zero-length blob")?;
                         server_handle.await
                             .map_err(|e| make_err!(Code::Internal, "server task join: {e}"))?
+                    }
+                    Ok(_empty) => {
+                        // Stale-positive: server reported EOF with no bytes
+                        // for a non-zero digest. Wait for the peer instead.
+                        warn!(
+                            ?digest,
+                            size_bytes = digest.size_bytes(),
+                            "WorkerProxyStore: server returned empty EOF for non-zero digest, waiting for peer"
+                        );
+                        Self::await_peer_after_empty_server(
+                            writer, &mut peer_rx, peer_handle, &digest, &peer_endpoint, is_zero_blob,
+                        ).await
                     }
                     Err(_server_err) => {
                         // Server racer failed — wait for peer.
@@ -1530,22 +1657,9 @@ impl StoreDriver for WorkerProxyStore {
                             ?digest,
                             "WorkerProxyStore: server racer failed, waiting for peer"
                         );
-                        let peer_chunk = peer_rx.recv().await
-                            .err_tip(|| "WorkerProxyStore: peer recv after server failure")?;
-                        if peer_chunk.is_empty() {
-                            writer.send_eof()
-                                .err_tip(|| "WorkerProxyStore: peer EOF after server failure")?;
-                            return peer_handle.await
-                                .map_err(|e| make_err!(Code::Internal, "peer task join: {e}"))?;
-                        }
-                        debug!(
-                            ?digest,
-                            endpoint = %peer_endpoint,
-                            "WorkerProxyStore: peer won race (server failed)"
-                        );
-                        writer.send(peer_chunk).await
-                            .err_tip(|| "WorkerProxyStore: sending peer fallback chunk")?;
-                        Self::forward_racer("peer", writer, &mut peer_rx, peer_handle).await
+                        Self::await_peer_after_empty_server(
+                            writer, &mut peer_rx, peer_handle, &digest, &peer_endpoint, is_zero_blob,
+                        ).await
                     }
                 }
             }
@@ -1563,18 +1677,36 @@ impl StoreDriver for WorkerProxyStore {
                             .err_tip(|| "WorkerProxyStore: sending peer winner chunk")?;
                         Self::forward_racer("peer", writer, &mut peer_rx, peer_handle).await
                     }
-                    Ok(_empty) => {
-                        // Peer returned EOF immediately (zero-length blob).
+                    Ok(_empty) if is_zero_blob => {
+                        // Legitimate zero-length blob — peer won the race.
                         server_handle.abort();
                         debug!(
                             ?digest,
                             endpoint = %peer_endpoint,
-                            "WorkerProxyStore: peer won race (empty blob)"
+                            "WorkerProxyStore: peer won race (zero-length blob)"
                         );
                         writer.send_eof()
-                            .err_tip(|| "WorkerProxyStore: sending EOF for empty blob from peer")?;
+                            .err_tip(|| "WorkerProxyStore: sending EOF for zero-length blob from peer")?;
                         peer_handle.await
                             .map_err(|e| make_err!(Code::Internal, "peer task join: {e}"))?
+                    }
+                    Ok(_empty) => {
+                        // Stale-positive: peer reported EOF with no bytes
+                        // for a non-zero digest. Evict the locality entry
+                        // (peer claimed it had it, but lied) and wait for
+                        // the server instead.
+                        warn!(
+                            ?digest,
+                            size_bytes = digest.size_bytes(),
+                            endpoint = %peer_endpoint,
+                            "WorkerProxyStore: peer returned empty EOF for non-zero digest, evicting locality and waiting for server"
+                        );
+                        self.locality_map
+                            .write()
+                            .evict_blobs(&peer_endpoint, &[digest]);
+                        Self::await_server_after_empty_peer(
+                            writer, &mut server_rx, server_handle, &digest, is_zero_blob,
+                        ).await
                     }
                     Err(_peer_err) => {
                         // Peer racer failed — wait for server.
@@ -1583,21 +1715,9 @@ impl StoreDriver for WorkerProxyStore {
                             endpoint = %peer_endpoint,
                             "WorkerProxyStore: peer racer failed, waiting for server"
                         );
-                        let server_chunk = server_rx.recv().await
-                            .err_tip(|| "WorkerProxyStore: server recv after peer failure")?;
-                        if server_chunk.is_empty() {
-                            writer.send_eof()
-                                .err_tip(|| "WorkerProxyStore: server EOF after peer failure")?;
-                            return server_handle.await
-                                .map_err(|e| make_err!(Code::Internal, "server task join: {e}"))?;
-                        }
-                        debug!(
-                            ?digest,
-                            "WorkerProxyStore: server won race (peer failed)"
-                        );
-                        writer.send(server_chunk).await
-                            .err_tip(|| "WorkerProxyStore: sending server fallback chunk")?;
-                        Self::forward_racer("server", writer, &mut server_rx, server_handle).await
+                        Self::await_server_after_empty_peer(
+                            writer, &mut server_rx, server_handle, &digest, is_zero_blob,
+                        ).await
                     }
                 }
             }
