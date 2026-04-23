@@ -278,10 +278,21 @@ async fn check_chunk_boundary_reads_test() -> Result<(), Error> {
 async fn has_checks_content_store() -> Result<(), Error> {
     const DATA_SIZE: usize = MEGABYTE_SZ / 4;
 
+    // MokaEvictingMap weighs entries in KB (ceil(bytes / 1024)) because moka's
+    // weigher returns u32 and we need to support multi-GB caches. Two
+    // consequences for this test:
+    //   1. `max_bytes` is rounded down to the nearest KB to compute capacity.
+    //   2. Each chunk's weight is rounded UP to the nearest KB.
+    // Pick a cap that comfortably holds digest1's ~256 KiB worth of FastCDC
+    // chunks (with up to ~128 bytes KB-rounding slack per chunk) but leaves
+    // no room for the second blob, so writing digest2 must evict at least
+    // one of digest1's chunks under the LRU policy.
+    const CACHE_CAP_BYTES: usize = (DATA_SIZE * 3) / 2;
+
     let index_store = MemoryStore::new(&MemorySpec::default());
     let content_store = MemoryStore::new(&MemorySpec {
         eviction_policy: Some(nativelink_config::stores::EvictionPolicy {
-            max_bytes: DATA_SIZE + 1,
+            max_bytes: CACHE_CAP_BYTES,
             ..Default::default()
         }),
     });
@@ -306,12 +317,20 @@ async fn has_checks_content_store() -> Result<(), Error> {
         assert_eq!(size_info, Some(DATA_SIZE as u64), "Expected sizes to match");
     }
     {
-        // We now add one more item to the store, which will trigger eviction of one of
-        // the existing items because max_bytes will be exceeded.
-        const DATA2: &str = "1234";
-        let digest2 = DigestInfo::try_new(VALID_HASH2, DATA2.len()).unwrap();
+        // Write a second blob whose content-addressed chunks differ from
+        // digest1's. It must be large enough that the cache cannot hold
+        // both blobs' chunks simultaneously, forcing eviction of at least
+        // one of digest1's chunks. We construct distinct random bytes via
+        // a different rand seed so blake3 chunk hashes differ from digest1.
+        let data2 = {
+            let mut value = vec![0u8; DATA_SIZE];
+            let mut rng = SmallRng::seed_from_u64(2);
+            rng.fill(&mut value[..]);
+            value
+        };
+        let digest2 = DigestInfo::try_new(VALID_HASH2, data2.len()).unwrap();
         store
-            .update_oneshot(digest2, DATA2.into())
+            .update_oneshot(digest2, data2.clone().into())
             .await
             .err_tip(|| "Failed to write data to dedup store")?;
 
@@ -320,7 +339,7 @@ async fn has_checks_content_store() -> Result<(), Error> {
             let size_info = store.has(digest2).await.err_tip(|| "Failed to run .has")?;
             assert_eq!(
                 size_info,
-                Some(DATA2.len() as u64),
+                Some(data2.len() as u64),
                 "Expected sizes to match"
             );
         }
