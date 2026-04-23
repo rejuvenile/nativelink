@@ -1891,3 +1891,89 @@ async fn populate_producer_error_propagates_to_waiters() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Regression for the inline-fast-path optimisation in `copy_slow_to_fast`.
+/// A single-caller cache-miss `populate_fast_store` MUST run the producer
+/// inline (no `tokio::spawn`) and skip the streaming-buffer drain. The
+/// observable signal is `populate_spawn_count`, which the inline path
+/// leaves unchanged. The cancellation-prone `get_part` streaming path
+/// keeps `spawn_populate_producer_with_role` and DOES bump the counter —
+/// asserted as a contrast so future refactors that accidentally route
+/// `copy_slow_to_fast` back through the spawn path get caught.
+///
+/// Cancellation safety for the streaming `get_part` path remains covered
+/// by `populate_survives_caller_cancellation`. This test does not assert
+/// cancellation semantics — only the spawn-vs-inline routing.
+#[nativelink_test]
+async fn populate_inline_does_not_spawn() -> Result<(), Error> {
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store.clone(),
+    );
+
+    // Seed the slow store with a blob.
+    let payload_a = make_random_data(64 * 1024);
+    let digest_a = DigestInfo::try_new(VALID_HASH, payload_a.len() as u64).unwrap();
+    slow_store
+        .update_oneshot(digest_a, payload_a.clone().into())
+        .await?;
+
+    // Inline fast path: single-caller populate_fast_store on a cache-miss
+    // blob must NOT spawn the producer. populate_spawn_count must stay 0.
+    assert_eq!(
+        fast_slow_store.populate_spawn_count(),
+        0,
+        "test setup: populate_spawn_count must start at 0",
+    );
+    fast_slow_store
+        .populate_fast_store(digest_a.into())
+        .await?;
+    assert_eq!(
+        fast_slow_store.populate_spawn_count(),
+        0,
+        "single-caller populate_fast_store MUST run the producer inline \
+         and skip tokio::spawn (inline fast path optimisation). A non-zero \
+         counter means copy_slow_to_fast regressed back through \
+         spawn_populate_producer_with_role.",
+    );
+
+    // Contrast: the cancellation-prone get_part path on a fresh cache miss
+    // SHOULD bump the counter (it keeps spawn-detach for cancellation
+    // safety, covered by populate_survives_caller_cancellation).
+    let payload_b = make_random_data(64 * 1024);
+    let digest_b = DigestInfo::try_new(
+        // Distinct hash so the populator runs again on a separate key.
+        "fedcba9876543210000000000000000000000000000000000000000000000000",
+        payload_b.len() as u64,
+    )
+    .unwrap();
+    slow_store
+        .update_oneshot(digest_b, payload_b.clone().into())
+        .await?;
+    let read_back = Store::new(fast_slow_store.clone())
+        .get_part_unchunked(digest_b, 0, None)
+        .await?;
+    assert_eq!(
+        read_back.as_ref(),
+        payload_b.as_slice(),
+        "get_part must return the populate data verbatim",
+    );
+    assert_eq!(
+        fast_slow_store.populate_spawn_count(),
+        1,
+        "get_part's cancellation-safe path MUST still spawn-detach. \
+         Counter must bump from 0 to 1 over a single populate via get_part. \
+         If this assertion fires, get_part likely regressed to inline (which \
+         would break populate_survives_caller_cancellation).",
+    );
+
+    Ok(())
+}

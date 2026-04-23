@@ -131,16 +131,23 @@ impl Drop for LoaderGuard {
         };
 
         let mut guard = store.populating_digests.lock();
-        if let std::collections::hash_map::Entry::Occupied(occupied_entry) =
-            guard.entry(self.key.borrow().into_owned())
-        {
-            if Arc::ptr_eq(&occupied_entry.get().0, &loader) {
+        // Lookup-by-borrow avoids the previous `self.key.borrow().into_owned()`
+        // clone on every Drop. We hold `self.key: StoreKey<'static>` directly
+        // and reuse it for both the lookup and the conditional remove.
+        let should_remove = match guard.get(&self.key) {
+            Some((existing_loader, _)) if Arc::ptr_eq(existing_loader, &loader) => {
                 drop(loader);
-                if Arc::strong_count(&occupied_entry.get().0) == 1 {
-                    // This is the last loader, so remove it.
-                    occupied_entry.remove();
-                }
+                // Re-lookup after dropping our own loader Arc so the
+                // strong_count check sees only the map's own ref + any
+                // live LoaderGuards (waiters / inline producer).
+                guard
+                    .get(&self.key)
+                    .is_some_and(|(l, _)| Arc::strong_count(l) == 1)
             }
+            _ => false,
+        };
+        if should_remove {
+            guard.remove(&self.key);
         }
     }
 }
@@ -185,6 +192,18 @@ impl FastSlowStore {
             .lock()
             .get(&owned)
             .map(|(_, inner)| Arc::clone(inner))
+    }
+
+    /// Diagnostic / test-only counter: every `tokio::spawn` performed by the
+    /// populate machinery in `spawn_populate_producer_with_role` increments
+    /// this counter. The inline-fast-path in [`copy_slow_to_fast`] leaves
+    /// it unchanged for single-caller cache-miss populates. Used by
+    /// `populate_inline_does_not_spawn` to keep the optimisation honest.
+    #[doc(hidden)]
+    pub fn populate_spawn_count(&self) -> u64 {
+        self.metrics
+            .populate_spawn_count
+            .load(Ordering::Acquire)
     }
 
     /// Fence out new background slow writes and wait for all existing
@@ -346,32 +365,37 @@ impl FastSlowStore {
         // Get a single loader instance that's used to populate the fast store
         // for this digest.  If another request comes in then it's de-duplicated.
         // Pre-compute the owned key outside the lock to minimize lock hold time.
-        let owned_key = key.borrow().into_owned();
+        // The earlier `key.borrow().into_owned()` did a redundant `borrow`
+        // before the clone — `key.into_owned()` is the direct equivalent.
         let digest = match key.borrow() {
             StoreKey::Digest(d) => d,
             _ => DigestInfo::zero_digest(),
         };
-        let (loader, streaming_inner, is_new) = match self
-            .populating_digests
-            .lock()
-            .entry(owned_key.borrow().into_owned())
-        {
-            std::collections::hash_map::Entry::Occupied(occupied_entry) => {
-                let (l, s) = occupied_entry.get();
+        let owned_key = key.into_owned();
+        // Use `get` first so the Occupied (waiter) hot path avoids the
+        // extra `owned_key` clone the `entry()` API would force at the
+        // call site. The Vacant (populator) path still clones once for
+        // the HashMap key, but the original `owned_key` is reused for
+        // `LoaderGuard.key` so the populator path stays at one extra
+        // allocation total — same as before, just without the wasted
+        // clone on hits.
+        let mut guard = self.populating_digests.lock();
+        let (loader, streaming_inner, is_new) =
+            if let Some((l, s)) = guard.get(&owned_key) {
                 (l.clone(), s.clone(), false)
-            }
-            std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+            } else {
                 let inner = Arc::new(StreamingBlobInner::new(
                     digest,
                     Self::POPULATE_STREAM_BUFFER_BYTES,
                 ));
-                let entry = vacant_entry.insert((
-                    Arc::new(OnceCell::new()),
-                    Arc::clone(&inner),
-                ));
-                (entry.0.clone(), inner, true)
-            }
-        };
+                let loader = Arc::new(OnceCell::new());
+                guard.insert(
+                    owned_key.borrow().into_owned(),
+                    (Arc::clone(&loader), Arc::clone(&inner)),
+                );
+                (loader, inner, true)
+            };
+        drop(guard);
         LoaderGuard {
             weak_store: self.weak_self.clone(),
             key: owned_key,
@@ -382,8 +406,10 @@ impl FastSlowStore {
     }
 
     /// Producer body: drives the slow→fast copy and fans data out to the
-    /// streaming buffer. Runs detached on its own tokio task; survives
-    /// caller cancellation.
+    /// streaming buffer. Returns the producer's merged terminal status so
+    /// the inline caller in [`copy_slow_to_fast`] can propagate it
+    /// directly without re-reading the streaming buffer; the spawn-detach
+    /// path in [`spawn_populate_producer_with_role`] simply discards it.
     ///
     /// Always terminates the streaming buffer before returning:
     /// - On success: `send_eof` after both `data_stream_fut` and
@@ -391,12 +417,21 @@ impl FastSlowStore {
     /// - On error: `send_error` with the structured upstream error.
     /// The `StreamingBlobWriter::Drop` fallback ("writer dropped without
     /// sending EOF") remains as a safety net only — it should never fire
-    /// from this function.
+    /// from successful normal-return paths from this function.
+    ///
+    /// Cancel-safety: if the awaiting future is dropped mid-flight, the
+    /// streaming buffer terminates via `StreamingBlobWriter::Drop` with
+    /// the generic "writer dropped without sending EOF" Internal error.
+    /// Callers that cannot tolerate this (e.g., `get_part` which serves
+    /// gRPC streaming reads) MUST drive this future from a `tokio::spawn`
+    /// so caller cancellation does not propagate. Callers that bound the
+    /// producer's lifetime to themselves (`copy_slow_to_fast` from action
+    /// downloads) accept this trade in exchange for skipping the spawn.
     async fn run_producer(
         arc_self: Arc<Self>,
         loader_guard: LoaderGuard,
         mut streaming_writer: StreamingBlobWriter,
-    ) {
+    ) -> Result<(), Error> {
         // The guard's Drop removes the populating_digests entry when this
         // function returns (by panic or normal completion). Holding it for
         // the producer's full lifetime is what allows late-arriving
@@ -451,8 +486,9 @@ impl FastSlowStore {
         let reader_stream_size = match head_result {
             Ok(size) => size,
             Err(err) => {
+                let returned = err.clone();
                 streaming_writer.send_error(err);
-                return;
+                return Err(returned);
             }
         };
 
@@ -553,6 +589,10 @@ impl FastSlowStore {
                 _ => fast_res.merge(slow_res).merge(Err(err)),
             },
         };
+        let returned = match &merged {
+            Ok(()) => Ok(()),
+            Err(err) => Err(err.clone()),
+        };
         match merged {
             Ok(()) => {
                 // Ignore the Result from send_eof: it only errors if a
@@ -567,6 +607,7 @@ impl FastSlowStore {
         // send_eof or send_error above, so the safety-net Drop is a no-op.
         // loader_guard drops here, removing the populating_digests entry
         // (subject to the strong-count check in LoaderGuard::Drop).
+        returned
     }
 
     /// Drain the streaming buffer until terminal state, discarding chunks.
@@ -643,6 +684,26 @@ impl FastSlowStore {
     /// Internal helper: copy a blob from the slow store into the fast store,
     /// using the de-duplicating loader. Assumes the caller has already verified
     /// the blob is not in the fast store (or does not care).
+    ///
+    /// Inline-fast-path optimisation: when this caller acquires the loader
+    /// as the populator (`is_new=true`), the producer runs **inline** in
+    /// the caller's task — no `tokio::spawn`, no streaming-buffer drain.
+    /// The producer's terminal `Result` is returned directly, eliminating
+    /// the per-populate spawn (~100 ns) and the per-chunk channel hop
+    /// through the streaming buffer (~500 ns/chunk). Waiters that joined
+    /// late still go through the streaming buffer as before.
+    ///
+    /// Cancel-safety trade: if the requester's future is dropped mid-
+    /// populate, the inline producer dies with it; the streaming buffer
+    /// terminates via `StreamingBlobWriter::Drop` with the generic
+    /// "writer dropped without sending EOF" Internal error, and any
+    /// late-arriving waiters fall back to the slow store with that error
+    /// surfaced through the existing waiter recovery path. This is
+    /// acceptable for `copy_slow_to_fast` callers (action-bound
+    /// `populate_fast_store{,_unchecked}` from the worker) which rarely
+    /// cancel mid-populate. The cancellation-prone `get_part` path keeps
+    /// `spawn_populate_producer_with_role`'s spawn-detach for full
+    /// cancellation safety (covered by `populate_survives_caller_cancellation`).
     async fn copy_slow_to_fast(&self, key: StoreKey<'_>) -> Result<(), Error> {
         // If the fast store is noop or read only or update only then this is an error.
         if self
@@ -658,43 +719,56 @@ impl FastSlowStore {
             ));
         }
 
-        // Spawn-detach the producer if we're the first caller for this
-        // key, then capture the streaming buffer to wait for the
-        // producer to finish. With the spawn-detach fix, this caller
-        // can be cancelled and the producer continues populating the
-        // fast store independently.
-        let streaming_inner =
-            Self::spawn_populate_producer(self.get_arc().ok_or_else(|| {
-                make_err!(
-                    Code::Internal,
-                    "FastSlowStore dropped during populate spawn"
-                )
-            })?, key.borrow());
-        // Wait for the producer to finish by draining the streaming
-        // buffer. Data is discarded — copy_slow_to_fast cares only
-        // that the producer reaches its terminal state.
-        Self::drain_streaming_buffer(&streaming_inner)
-            .await
-            .err_tip(|| "Failed to populate()")
+        let arc_self = self.get_arc().ok_or_else(|| {
+            make_err!(
+                Code::Internal,
+                "FastSlowStore dropped during populate"
+            )
+        })?;
+        let loader_guard = arc_self.get_loader(key.borrow());
+        let streaming_inner = Arc::clone(&loader_guard.streaming_inner);
+        if loader_guard.is_new {
+            // Inline fast path: we own the populator. Run the producer
+            // in this task — no spawn, no streaming-buffer drain — and
+            // return its terminal Result directly. Cancellation drops
+            // the producer (see method-level Cancel-safety note).
+            //
+            // Construct the writer immediately; `LoaderGuard` is moved
+            // into `run_producer` and ensures the populating_digests
+            // entry is cleared on producer return / drop.
+            let writer = StreamingBlobWriter::new(streaming_inner);
+            Self::run_producer(arc_self, loader_guard, writer)
+                .await
+                .err_tip(|| "Failed to populate()")
+        } else {
+            // Late waiter: another caller is already running the
+            // producer (either inline in their own task or spawn-
+            // detached via `get_part`). Drop our guard and observe the
+            // producer via the streaming buffer, the same way pre-fix
+            // waiters did. Data is discarded — we care only that the
+            // producer reaches a terminal state.
+            drop(loader_guard);
+            Self::drain_streaming_buffer(&streaming_inner)
+                .await
+                .err_tip(|| "Failed to populate()")
+        }
     }
 
-    /// Spawn the populator for `key` if not already spawned and return
-    /// the shared streaming buffer. Idempotent: subsequent callers for
-    /// the same key receive the same buffer and do not re-spawn.
+    /// Spawn the populator for `key` if not already running, returning
+    /// the shared streaming buffer plus a flag indicating whether THIS
+    /// caller is the populator (`is_new=true` at loader-acquisition).
+    /// Idempotent: subsequent callers for the same key share the buffer
+    /// and do not re-spawn.
     ///
-    /// The producer runs detached on its own tokio task; cancellation
-    /// of the caller does not cancel the producer.
-    fn spawn_populate_producer(
-        arc_self: Arc<Self>,
-        key: StoreKey<'_>,
-    ) -> Arc<StreamingBlobInner> {
-        Self::spawn_populate_producer_with_role(arc_self, key).0
-    }
-
-    /// Like [`spawn_populate_producer`] but also reports whether THIS
-    /// caller is the one that spawned the producer (`is_new=true` at
-    /// loader-acquisition). Used by `get_part` to preserve pre-fix
-    /// populator-vs-waiter error semantics.
+    /// The producer runs detached on its own tokio task — cancellation
+    /// of the caller does not cancel the producer. This is the
+    /// cancellation-safe path used by `get_part` for streaming gRPC
+    /// reads. The cheaper inline-fast-path in [`copy_slow_to_fast`] is
+    /// preferred when the caller can bound the producer's lifetime to
+    /// itself.
+    ///
+    /// Each spawn bumps `populate_spawn_count` so the inline-fast-path
+    /// optimisation can be regression-tested via that counter.
     fn spawn_populate_producer_with_role(
         arc_self: Arc<Self>,
         key: StoreKey<'_>,
@@ -714,14 +788,18 @@ impl FastSlowStore {
             // slip in and drop the writer un-EOF'd.
             let writer = StreamingBlobWriter::new(streaming_inner.clone());
             let arc_for_producer = Arc::clone(&arc_self);
+            arc_self
+                .metrics
+                .populate_spawn_count
+                .fetch_add(1, Ordering::Release);
             // The JoinHandle is intentionally dropped — the producer is
             // detached and runs to completion regardless of caller
             // lifetime. Dropping the JoinHandle does NOT abort the task.
-            drop(tokio::spawn(Self::run_producer(
-                arc_for_producer,
-                loader_guard,
-                writer,
-            )));
+            // The producer's terminal Result is discarded here; waiters
+            // observe terminal state via the streaming buffer.
+            drop(tokio::spawn(async move {
+                drop(Self::run_producer(arc_for_producer, loader_guard, writer).await);
+            }));
         } else {
             // Another caller spawned the producer; nothing to do. Drop
             // the guard — the producer's guard keeps the entry alive.
@@ -2144,6 +2222,15 @@ struct FastSlowStoreMetrics {
     slow_store_hit_count: AtomicU64,
     #[metric(help = "Downloaded bytes from the slow store")]
     slow_store_downloaded_bytes: AtomicU64,
+    /// Counts every `tokio::spawn` issued by the populate machinery in
+    /// `spawn_populate_producer_with_role`. The inline-fast-path in
+    /// `copy_slow_to_fast` keeps this counter unchanged for single-
+    /// caller cache-miss populates; only `get_part` (cancellation-prone
+    /// gRPC streaming reads) bumps it. Used by
+    /// `populate_inline_does_not_spawn` to pin the optimisation against
+    /// regression.
+    #[metric(help = "Count of tokio::spawn issued by the populate machinery")]
+    populate_spawn_count: AtomicU64,
 }
 
 impl Drop for FastSlowStore {
