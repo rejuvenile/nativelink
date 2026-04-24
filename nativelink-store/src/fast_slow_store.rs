@@ -37,6 +37,7 @@ use nativelink_util::buf_channel::{
 };
 use nativelink_util::fs;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+use nativelink_util::precondition_failure::make_precondition_failure_any;
 use nativelink_util::store_trait::{
     IS_MIRROR_REQUEST, ItemCallback, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
     UploadSizeInfo, slow_update_store_with_file,
@@ -820,12 +821,15 @@ impl FastSlowStore {
                             slow_store = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
                             "CAS read miss: blob not found in slow store"
                         );
-                        make_err!(
+                        let digest = key.borrow().into_digest();
+                        let mut err = make_err!(
                             Code::NotFound,
                             "Object {} not found in either fast or slow store. \
                                 If using multiple workers, ensure all workers share the same CAS storage path.",
                             key.as_str()
-                        )
+                        );
+                        err.details.push(make_precondition_failure_any(digest));
+                        err
                     })?;
                 Ok(UploadSizeInfo::ExactSize(size))
             }

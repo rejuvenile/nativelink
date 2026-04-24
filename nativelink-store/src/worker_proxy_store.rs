@@ -38,6 +38,7 @@ use nativelink_util::buf_channel::{
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
+use nativelink_util::precondition_failure::make_precondition_failure_any;
 use nativelink_util::store_trait::{
     IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, REDIRECT_PREFIX, Store, StoreDriver,
     StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
@@ -982,10 +983,12 @@ impl WorkerProxyStore {
             // Workers handle their own peer fetching via WorkerProxyStore on
             // the worker side with race_peers enabled.
             let digest = key.borrow().into_digest();
-            return Err(make_err!(
+            let mut err = make_err!(
                 Code::NotFound,
                 "Blob {digest:?} not found in inner store (worker request, no redirect)"
-            ));
+            );
+            err.details.push(make_precondition_failure_any(digest));
+            return Err(err);
         }
 
         let bytes_before_workers = writer.get_bytes_written();
@@ -1030,11 +1033,13 @@ impl WorkerProxyStore {
             Err(e) => return Err(e),
         }
 
-        Err(make_err!(
+        let digest = key.borrow().into_digest();
+        let mut err = make_err!(
             Code::NotFound,
-            "Blob {:?} not found in inner store or any worker",
-            key.borrow().into_digest()
-        ))
+            "Blob {digest:?} not found in inner store or any worker"
+        );
+        err.details.push(make_precondition_failure_any(digest));
+        Err(err)
     }
 
     /// Forward remaining data from a racer's read half to the caller's writer,

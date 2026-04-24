@@ -307,6 +307,18 @@ impl From<redis::RedisError> for Error {
 
 impl From<tonic::Status> for Error {
     fn from(status: tonic::Status) -> Self {
+        // Round-trip the `grpc-status-details-bin` trailer encoded by the
+        // sibling `From<Error> for tonic::Status` below — without this,
+        // REAPI v2 §2.2.4 PreconditionFailure details are silently dropped
+        // and Bazel cannot recover from missing-blob errors.
+        let details_bytes = status.details();
+        if !details_bytes.is_empty() {
+            if let Ok(rpc_status) =
+                <nativelink_proto::google::rpc::Status as prost::Message>::decode(details_bytes)
+            {
+                return Self::from(rpc_status);
+            }
+        }
         Self::new(status.code(), status.to_string())
     }
 }
@@ -653,5 +665,37 @@ mod tests {
             status.details().is_empty(),
             "tonic::Status::details() should stay empty when Error has no details",
         );
+    }
+
+    #[test]
+    fn tonic_status_to_error_decodes_details() {
+        let any = prost_types::Any {
+            type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+            value: vec![7, 8, 9, 10],
+        };
+
+        // Build an Error → tonic::Status (uses the send-side encoder).
+        let original_err = Error {
+            code: Code::FailedPrecondition,
+            messages: vec!["blob missing".into()],
+            details: vec![any.clone()],
+        };
+        let status: tonic::Status = original_err.into();
+
+        // Round-trip back via From<tonic::Status>.
+        let recovered: Error = status.into();
+        assert_eq!(recovered.code, Code::FailedPrecondition);
+        assert_eq!(recovered.details.len(), 1, "details must round-trip");
+        assert_eq!(recovered.details[0].type_url, any.type_url);
+        assert_eq!(recovered.details[0].value, any.value);
+    }
+
+    #[test]
+    fn tonic_status_to_error_no_trailer_falls_back_gracefully() {
+        let status = tonic::Status::not_found("plain message");
+        let err: Error = status.into();
+        assert_eq!(err.code, Code::NotFound);
+        assert!(err.details.is_empty());
+        assert!(err.message_string().contains("plain message"));
     }
 }
