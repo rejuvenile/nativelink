@@ -269,6 +269,29 @@ fn is_connection_error(e: &Error) -> bool {
     matches!(e.code, Code::Unavailable | Code::Unknown)
 }
 
+/// Architectural invariant: if the local chain failed to serve, ALWAYS
+/// consult peers before giving up. The bytestream Read RPC's defense against
+/// missing blobs is the cluster-wide peer-fetch hop; any failure shape that
+/// means "this digest can't be served from the local chain" must fall through
+/// to `try_read_from_worker` instead of being returned directly.
+///
+/// Mirrors `existence_cache_store::is_unrecoverable_read_error` and broadens
+/// it with `Unavailable` — a transient inner-store unavailability is exactly
+/// when peer-fetch should kick in. The existence-cache predicate excludes
+/// `Unavailable` because re-evicting on every connectivity blip forces
+/// re-uploads; for peer-fetch the cost asymmetry is reversed (one extra peer
+/// RPC vs. a spurious NotFound surfaced to the client).
+fn should_try_peers(code: Code) -> bool {
+    matches!(
+        code,
+        Code::NotFound
+            | Code::DataLoss
+            | Code::Internal
+            | Code::OutOfRange
+            | Code::Unavailable
+    )
+}
+
 /// Locality-eviction policy: should this peer-fetch failure cause us to drop
 /// the locality entry mapping `digest -> endpoint`?
 ///
@@ -913,10 +936,11 @@ impl WorkerProxyStore {
             .await
         {
             Ok(()) => return Ok(()),
-            Err(e) if e.code == Code::NotFound => {
+            Err(e) if should_try_peers(e.code) => {
                 trace!(
                     key = ?key.borrow().into_digest(),
-                    "WorkerProxyStore: inner store miss (NotFound), consulting locality map"
+                    code = ?e.code,
+                    "WorkerProxyStore: inner store miss, consulting locality map"
                 );
             }
             Err(e) if e.code == Code::FailedPrecondition => {
@@ -2187,6 +2211,43 @@ mod tests {
             assert_eq!(
                 actual, *expected,
                 "Code::{code:?}: expected evict={expected}, got evict={actual}"
+            );
+        }
+    }
+
+    /// Exhaustive table for `should_try_peers`. The architectural invariant
+    /// is "if the local chain failed to serve, ALWAYS consult peers before
+    /// giving up", so the predicate must include every code that means
+    /// "blob not served by local chain": NotFound, DataLoss, Internal,
+    /// OutOfRange, Unavailable. Every other code (success, redirect,
+    /// authn/authz, client-side validation) MUST return false so the inner
+    /// store's error reaches the caller untouched.
+    #[test]
+    fn test_should_try_peers_for_all_grpc_codes() {
+        let cases: &[(Code, bool)] = &[
+            (Code::Ok, false),
+            (Code::Cancelled, false),
+            (Code::Unknown, false),
+            (Code::InvalidArgument, false),
+            (Code::DeadlineExceeded, false),
+            (Code::NotFound, true),
+            (Code::AlreadyExists, false),
+            (Code::PermissionDenied, false),
+            (Code::ResourceExhausted, false),
+            (Code::FailedPrecondition, false),
+            (Code::Aborted, false),
+            (Code::OutOfRange, true),
+            (Code::Unimplemented, false),
+            (Code::Internal, true),
+            (Code::Unavailable, true),
+            (Code::DataLoss, true),
+            (Code::Unauthenticated, false),
+        ];
+        for (code, expected) in cases {
+            let actual = should_try_peers(*code);
+            assert_eq!(
+                actual, *expected,
+                "Code::{code:?}: expected try_peers={expected}, got try_peers={actual}"
             );
         }
     }

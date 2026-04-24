@@ -1090,3 +1090,266 @@ async fn peer_unavailable_pre_eof_drops_cached_connection() -> Result<(), Error>
 
     Ok(())
 }
+
+// ===================================================================
+// Issue #117: bytestream Read RPCs that fail with non-NotFound codes
+// (e.g. Code::Internal "writer dropped without sending EOF" produced
+// by `StreamingBlobWriter::Drop` when a populator task is cancelled)
+// MUST still consult peers. Pre-fix the gate in
+// `WorkerProxyStore::get_part_sequential` only matched NotFound,
+// so the bypass returned the inner-store error directly without
+// invoking `try_read_from_worker` — even though the blob existed
+// on a peer worker.
+// ===================================================================
+
+/// A store wrapper whose `get_part` always returns a configurable
+/// error code/message. Used as the inner store of the WorkerProxyStore
+/// to exercise the gate-broadening logic for codes other than NotFound.
+#[derive(Debug, MetricsComponent)]
+struct ErrorOnReadStore {
+    err_code: Code,
+    err_marker: String,
+}
+
+default_health_status_indicator!(ErrorOnReadStore);
+
+#[async_trait]
+impl StoreDriver for ErrorOnReadStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        for slot in results.iter_mut() {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        Err(make_err!(
+            Code::Unimplemented,
+            "ErrorOnReadStore: update not supported"
+        ))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(self.err_code, "{}", self.err_marker))
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Helper: build a WorkerProxyStore wrapping an inner ErrorOnReadStore that
+/// always returns `(err_code, err_marker)` from get_part. Returns the proxy
+/// Arc, the proxy as a Store, and the locality map.
+fn make_proxy_with_failing_inner(
+    err_code: Code,
+    err_marker: &str,
+) -> (Arc<WorkerProxyStore>, Store, SharedBlobLocalityMap) {
+    let inner = Store::new(Arc::new(ErrorOnReadStore {
+        err_code,
+        err_marker: err_marker.to_string(),
+    }));
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
+    let proxy = Store::new(proxy_arc.clone());
+    (proxy_arc, proxy, locality_map)
+}
+
+// -------------------------------------------------------------------
+// 28. Inner store fails with Code::Internal — peer-fetch IS invoked
+//     and returns the blob from the peer. (Production case from
+//     StreamingBlobWriter::Drop "writer dropped without sending EOF".)
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn inner_internal_error_falls_through_to_peer_fetch() -> Result<(), Error> {
+    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
+        Code::Internal,
+        "writer dropped without sending EOF",
+    );
+
+    let value = b"data only on the peer worker";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_store
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+
+    let peer_endpoint = "grpc://peer-worker:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    let result = proxy.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(
+        result.as_ref(),
+        value,
+        "Expected peer-fetch to be invoked when inner store fails with Internal, \
+         and to return the blob from the peer"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 29. Inner store fails with Code::DataLoss — peer-fetch IS invoked.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn inner_dataloss_error_falls_through_to_peer_fetch() -> Result<(), Error> {
+    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
+        Code::DataLoss,
+        "verify_store: hash mismatch",
+    );
+
+    let value = b"valid bytes from peer";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_store
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+
+    let peer_endpoint = "grpc://peer-worker:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    let result = proxy.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(result.as_ref(), value);
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 30. Inner store fails with Code::Unavailable — peer-fetch IS invoked.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn inner_unavailable_error_falls_through_to_peer_fetch() -> Result<(), Error> {
+    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
+        Code::Unavailable,
+        "inner store transiently unavailable",
+    );
+
+    let value = b"served by peer despite inner Unavailable";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_store
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+
+    let peer_endpoint = "grpc://peer-worker:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    let result = proxy.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(result.as_ref(), value);
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 31. Inner store fails with Code::OutOfRange — peer-fetch IS invoked.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn inner_out_of_range_error_falls_through_to_peer_fetch() -> Result<(), Error> {
+    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
+        Code::OutOfRange,
+        "requested range exceeds blob length",
+    );
+
+    let value = b"served by peer despite inner OutOfRange";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_store
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+
+    let peer_endpoint = "grpc://peer-worker:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    let result = proxy.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(result.as_ref(), value);
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 32. Inner store fails with Code::PermissionDenied — peer-fetch is
+//     NOT invoked (PermissionDenied is not a "can't be served" signal,
+//     it's a deliberate authz refusal that the caller must see).
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn inner_permission_denied_does_not_invoke_peer_fetch() -> Result<(), Error> {
+    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
+        Code::PermissionDenied,
+        "INNER_PERMISSION_DENIED_MARKER",
+    );
+
+    let value = b"this peer data must NOT be returned";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_store
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+
+    let peer_endpoint = "grpc://peer-worker:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    let result = proxy.get_part_unchunked(digest, 0, None).await;
+    let err = result.expect_err("Expected PermissionDenied to propagate");
+    assert_eq!(
+        err.code,
+        Code::PermissionDenied,
+        "PermissionDenied must propagate; peer-fetch must NOT be invoked. err={err:?}"
+    );
+    assert!(
+        err.message_string().contains("INNER_PERMISSION_DENIED_MARKER"),
+        "Expected the original inner-store error message to surface, got: {}",
+        err.message_string()
+    );
+
+    Ok(())
+}
