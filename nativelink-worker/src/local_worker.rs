@@ -1225,7 +1225,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             // eligible for eviction again, and clear them from the
                             // pending-upload set so they won't be re-uploaded on reconnect.
                             let digest_count = blobs.digests.len();
+                            info!(
+                                target: "nativelink::stable_storage_received",
+                                digest_count,
+                                "BlobsInStableStorage: arm entered (BEFORE any gate)"
+                            );
                             if let Some(ref state) = self.blobs_available_state {
+                                info!(
+                                    target: "nativelink::stable_storage_gate",
+                                    digest_count,
+                                    "blobs_available_state present, processing"
+                                );
                                 let fs_store = &state.fs_store;
                                 let mut unpinned = 0usize;
                                 let mut acked_digests = Vec::with_capacity(digest_count);
@@ -1268,6 +1278,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     "BlobsInStableStorage: unpinned digests from local CAS"
                                 );
                             } else {
+                                warn!(
+                                    target: "nativelink::stable_storage_gate",
+                                    digest_count,
+                                    "blobs_available_state is None, dropping unpin (BUG?)"
+                                );
                                 trace!(
                                     digest_count,
                                     "BlobsInStableStorage: no FilesystemStore available, ignoring"

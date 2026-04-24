@@ -364,6 +364,10 @@ async fn inner_main(
                 tokio::spawn(async move {
                     loop {
                         store_notify.notified().await;
+                        info!(
+                            target: "nativelink::stable_notify_fire",
+                            "stable_notify fired by a CAS store"
+                        );
                         merged.notify_one();
                     }
                 });
@@ -386,10 +390,21 @@ async fn inner_main(
                     if all_digests.is_empty() {
                         continue;
                     }
-                    for scheduler in &schedulers {
+                    info!(
+                        target: "nativelink::stable_storage_broadcast",
+                        digest_count = all_digests.len(),
+                        scheduler_count = schedulers.len(),
+                        "BlobsInStableStorage: broadcasting drained digests"
+                    );
+                    for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
                         scheduler
                             .broadcast_blobs_in_stable_storage(all_digests.clone())
                             .await;
+                        info!(
+                            target: "nativelink::stable_storage_broadcast",
+                            scheduler_idx,
+                            "BlobsInStableStorage: broadcast returned for scheduler"
+                        );
                     }
                 }
             });
