@@ -4622,6 +4622,16 @@ impl RunningActionsManagerImpl {
             filesystem_store.pin_digest(digest);
         }
 
+        // Lifecycle log: emitted unconditionally so silent loss of the
+        // spawned upload task (drop, panic, runtime shutdown before run)
+        // is detectable by absence of a matching "background CAS upload
+        // completed" line for the same digest count.
+        info!(
+            initial_digest_count = digests.len(),
+            tree_count = tree_digests.len(),
+            "spawn_upload_to_remote: scheduling background CAS upload",
+        );
+
         let cas_store = self.cas_store.clone();
         tokio::spawn(async move {
             let slow_store = cas_store.slow_store();
