@@ -269,6 +269,56 @@ fn is_connection_error(e: &Error) -> bool {
     matches!(e.code, Code::Unavailable | Code::Unknown)
 }
 
+/// Architectural invariant: if the local chain failed to serve, ALWAYS
+/// consult peers before giving up. The bytestream Read RPC's defense against
+/// missing blobs is the cluster-wide peer-fetch hop; any failure shape that
+/// means "this digest can't be served from the local chain" must fall through
+/// to `try_read_from_worker` instead of being returned directly.
+///
+/// Distinct from `existence_cache_store::is_unrecoverable_read_error`: the
+/// existence-cache predicate is conservative because it controls whether to
+/// drop a positive cache entry, and re-evicting on every connectivity blip
+/// would force re-uploads (expensive). Here the cost asymmetry is reversed:
+/// one extra peer RPC against a digest the cluster might still hold, vs.
+/// surfacing a spurious read failure to the client. We therefore include
+/// every code that means "blob not served by the local chain":
+///   * `NotFound`           — primary case (local store evicted / never had it).
+///   * `DataLoss`           — verifier rejected stored bytes; peer copy may be intact.
+///   * `Internal`           — `StreamingBlobWriter::Drop`, async cancellation, etc.
+///   * `OutOfRange`         — local store reported truncated blob; peer may have full size.
+///   * `Unavailable`        — transient inner-store unavailability (e.g. ZFS hiccup).
+///   * `Unknown`            — tonic maps unrecognized HTTP/2 statuses (e.g. proxy
+///                            bouncing the connection mid-stream) to `Unknown`;
+///                            same shape as `Internal` from the caller's view.
+///   * `ResourceExhausted`  — local CPU / memory / connection cap saturated; peers
+///                            with available capacity may still serve.
+///
+/// Codes deliberately excluded:
+///   * `Aborted`            — used by tonic for ABA conflicts on AC writes; not a
+///                            "blob can't be served" signal.
+///   * `DeadlineExceeded`   — caller's deadline already passed; trying peers wastes
+///                            work on a stream the caller has stopped reading.
+///   * `Cancelled`          — caller has gone away.
+///   * `PermissionDenied` / `Unauthenticated` — deliberate authz refusal that the
+///                            caller must see.
+///   * `InvalidArgument`    — client bug; peers will reject the same input.
+///   * `FailedPrecondition` — reserved for the redirect-prefix protocol (handled
+///                            in the explicit `FailedPrecondition` arm above).
+///   * `Unimplemented` / `AlreadyExists` / `Ok` — not error shapes that map to
+///                            "try peers".
+fn should_try_peers(code: Code) -> bool {
+    matches!(
+        code,
+        Code::NotFound
+            | Code::DataLoss
+            | Code::Internal
+            | Code::OutOfRange
+            | Code::Unavailable
+            | Code::Unknown
+            | Code::ResourceExhausted
+    )
+}
+
 /// Locality-eviction policy: should this peer-fetch failure cause us to drop
 /// the locality entry mapping `digest -> endpoint`?
 ///
@@ -905,6 +955,16 @@ impl WorkerProxyStore {
         length: Option<u64>,
     ) -> Result<(), Error> {
         let mut redirect_endpoints: Option<Vec<String>> = None;
+        // Capture the writer's byte position BEFORE calling the inner store.
+        // If the inner store streams partial bytes and then errors with a
+        // peer-fallback-eligible code (e.g. mid-stream Internal/DataLoss/
+        // Unavailable from a verifier or connection drop), we MUST NOT fall
+        // through to the peer fetch — the peer would write the full blob
+        // again, producing a corrupt prefix-from-inner + full-peer-copy
+        // stream. Surface the original error instead. This mirrors the
+        // post-peer-fallback bytes-written guard a few hundred lines below
+        // (search for `bytes_written_by_workers`).
+        let bytes_before_inner = writer.get_bytes_written();
         match IS_WORKER_REQUEST
             .scope(
                 true,
@@ -913,10 +973,26 @@ impl WorkerProxyStore {
             .await
         {
             Ok(()) => return Ok(()),
-            Err(e) if e.code == Code::NotFound => {
+            Err(e) if should_try_peers(e.code) => {
+                let bytes_written_by_inner =
+                    writer.get_bytes_written() - bytes_before_inner;
+                if bytes_written_by_inner > 0 {
+                    // Inner wrote partial bytes before erroring; peer-fetch
+                    // would corrupt the consumer stream. Surface the
+                    // original error.
+                    return Err(make_err!(
+                        e.code,
+                        "WorkerProxyStore: inner store wrote {bytes_written_by_inner} bytes \
+                         then failed with {:?} ({}); cannot peer-fetch without corrupting \
+                         consumer stream",
+                        e.code,
+                        e.message_string()
+                    ));
+                }
                 trace!(
                     key = ?key.borrow().into_digest(),
-                    "WorkerProxyStore: inner store miss (NotFound), consulting locality map"
+                    code = ?e.code,
+                    "WorkerProxyStore: inner store miss, consulting locality map"
                 );
             }
             Err(e) if e.code == Code::FailedPrecondition => {
@@ -2191,6 +2267,44 @@ mod tests {
             assert_eq!(
                 actual, *expected,
                 "Code::{code:?}: expected evict={expected}, got evict={actual}"
+            );
+        }
+    }
+
+    /// Exhaustive table for `should_try_peers`. The architectural invariant
+    /// is "if the local chain failed to serve, ALWAYS consult peers before
+    /// giving up", so the predicate must include every code that means
+    /// "blob not served by local chain": NotFound, DataLoss, Internal,
+    /// OutOfRange, Unavailable, Unknown, ResourceExhausted. Every other
+    /// code (Cancelled/DeadlineExceeded — caller gone; Aborted — AC ABA;
+    /// authn/authz; client-side validation; redirect protocol) MUST return
+    /// false so the inner store's error reaches the caller untouched.
+    #[test]
+    fn test_should_try_peers_for_all_grpc_codes() {
+        let cases: &[(Code, bool)] = &[
+            (Code::Ok, false),
+            (Code::Cancelled, false),
+            (Code::Unknown, true),
+            (Code::InvalidArgument, false),
+            (Code::DeadlineExceeded, false),
+            (Code::NotFound, true),
+            (Code::AlreadyExists, false),
+            (Code::PermissionDenied, false),
+            (Code::ResourceExhausted, true),
+            (Code::FailedPrecondition, false),
+            (Code::Aborted, false),
+            (Code::OutOfRange, true),
+            (Code::Unimplemented, false),
+            (Code::Internal, true),
+            (Code::Unavailable, true),
+            (Code::DataLoss, true),
+            (Code::Unauthenticated, false),
+        ];
+        for (code, expected) in cases {
+            let actual = should_try_peers(*code);
+            assert_eq!(
+                actual, *expected,
+                "Code::{code:?}: expected try_peers={expected}, got try_peers={actual}"
             );
         }
     }
