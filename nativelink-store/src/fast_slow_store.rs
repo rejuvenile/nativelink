@@ -414,9 +414,14 @@ impl FastSlowStore {
         self.mirror_blobs_max_bytes.store(cap, Ordering::Relaxed);
     }
 
-    /// Snapshot of all mirror-blob digests currently held. Used by the
-    /// worker's full `BlobsAvailable` snapshot path.
-    // O(N) under lock — N is bounded by `MIRROR_BLOBS_MAX_BYTES / blob_size`.
+    /// Snapshot of all mirror-blob digests currently held.
+    ///
+    /// Legacy accessor: most callers should use
+    /// [`Self::snapshot_and_reset_mirror_changes`] instead, which also
+    /// drains the change tracker atomically. This is kept for tests and
+    /// any future caller that genuinely wants a snapshot without
+    /// touching deltas.
+    // O(N) under lock — N is bounded by `mirror_blobs_max_bytes / blob_size`.
     pub fn mirror_blob_digests(&self) -> Vec<DigestInfo> {
         let guard = self.mirror_blobs.lock();
         guard.keys().copied().collect()

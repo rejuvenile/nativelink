@@ -1121,12 +1121,21 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         // 2. A mirror-blob insert/remove (immediate wake — only
                         //    armed if a CAS server FastSlowStore exists)
                         // 3. The backstop interval (catches subtree-only changes)
+                        //
+                        // Stack-pinned Notified instead of `Box::pin` per
+                        // iteration — saves one heap allocation per
+                        // BlobsAvailable wakeup. A fresh `Notified` is
+                        // semantically required each iteration (it consumes
+                        // exactly one notification permit), so the future
+                        // itself must be re-created; `tokio::pin!` keeps it
+                        // on the stack.
                         let mirror_wait = OptionFuture::from(
-                            mirror_notify.as_ref().map(|mn| Box::pin(mn.notified())),
+                            mirror_notify.as_deref().map(Notify::notified),
                         );
+                        tokio::pin!(mirror_wait);
                         tokio::select! {
                             () = state.notify.notified() => {}
-                            Some(()) = mirror_wait => {}
+                            Some(()) = &mut mirror_wait => {}
                             () = sleep(state.max_interval) => {}
                         }
                         Self::send_periodic_blobs_available(
