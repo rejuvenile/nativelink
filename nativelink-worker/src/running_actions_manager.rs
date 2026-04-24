@@ -992,6 +992,10 @@ async fn execute_batch_read(
         .err_tip(|| "In execute_batch_read")?
         .into_inner();
 
+    // Write directly to the fast store: these blobs were just fetched from
+    // the slow (server) store via BatchReadBlobs, so routing the writeback
+    // through the FastSlowStore wrapper would loop them back upstream.
+    #[allow(clippy::disallowed_methods)]
     let fast_store = cas_store.fast_store();
 
     // Parse all valid responses first, then write to fast store concurrently.
@@ -4448,6 +4452,10 @@ impl RunningActionsManagerImpl {
         callbacks: Callbacks,
     ) -> Result<Self, Error> {
         // Sadly because of some limitations of how Any works we need to clone more times than optimal.
+        // Concrete FilesystemStore needed for hardlink and pin operations on
+        // the action sandbox; the FastSlowStore wrapper hides the concrete
+        // type so the downcast must reach into the inner store directly.
+        #[allow(clippy::disallowed_methods)]
         let filesystem_store = args
             .cas_store
             .fast_store()
@@ -4505,6 +4513,11 @@ impl RunningActionsManagerImpl {
         // locally by the worker's own action upload and written to the
         // FilesystemStore. Mirror blobs are server-pushed CAS data, never
         // Tree-shaped, so a mirror-only Tree digest is impossible.
+        // Read tree protos from the local fast store only: the action just
+        // produced these on this worker, so consulting slow (server) on miss
+        // would block the locality-registration hot path on a network round
+        // trip for a blob that is supposed to be local.
+        #[allow(clippy::disallowed_methods)]
         let fast_store = self.cas_store.fast_store();
         let mut file_digests = Vec::new();
         for folder in &action_result.output_folders {

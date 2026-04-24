@@ -1,0 +1,30 @@
+# Per-crate clippy config for nativelink-worker.
+#
+# Clippy walks up from each source file and uses the FIRST clippy.toml found,
+# so this file COMPLETELY OVERRIDES the workspace clippy.toml for sources in
+# this crate. Keep the workspace entries in sync below; new shared rules added
+# to the workspace clippy.toml must be added here too, or worker code will
+# silently lose enforcement.
+#
+# Why this file exists: the FastSlowStore::fast_store() rule below is scoped
+# to nativelink-worker only — other crates have legitimate non-allowlisted
+# uses (e.g. nativelink-scheduler's probe_partition_size_inner) that will be
+# audited separately.
+disallowed-methods = [
+  { path = "std::thread::Builder::new", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "std::thread::spawn", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "tokio::runtime::Builder::new_current_thread", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "tokio::runtime::Builder::new_multi_thread", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "tokio::runtime::Builder::new_multi_thread_alt", reason = "use one of the `nativelink-util::task` functions instead", allow-invalid = true }, # Can be invalid because depends on feature flags
+  { path = "tokio::runtime::Runtime::block_on", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "tokio::runtime::Runtime::new", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "tokio::runtime::Runtime::spawn", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "tokio::runtime::Runtime::spawn_blocking", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "tokio::spawn", reason = "use `nativelink-util::task::spawn` or `nativelink-util::task::background_spawn` instead" },
+  { path = "tokio::task::block_in_place", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "tokio::task::spawn", reason = "use `nativelink-util::task::spawn` or `nativelink-util::task::background_spawn` instead" },
+  { path = "tokio::task::spawn_blocking", reason = "use `nativelink-util::task::spawn_blocking` instead" },
+  { path = "tokio::task::spawn_local", reason = "use one of the `nativelink-util::task` functions instead" },
+  { path = "nativelink_store::fast_slow_store::FastSlowStore::fast_store", reason = "Reach for the FastSlowStore wrapper (Store::new(cas_store_arc)) instead so mirror_blobs and peer locality routing remain visible. Bypassing the wrapper to read the inner FilesystemStore caused the original mirror-durability bug. If you genuinely need the concrete FilesystemStore for a downcast (BlobChangeTracker, hardlink ops) or construction-time wiring, allow with #[allow(clippy::disallowed_methods)] and add a comment explaining why." },
+]
+msrv = "1.87.0"

@@ -1290,7 +1290,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         count,
                         "retrying failed slow-store uploads on reconnect"
                     );
-                    // Re-pin to refresh the pin timeout before uploading.
+                    // Re-pin to refresh the pin timeout before uploading. We
+                    // pin on the inner fast (FilesystemStore) directly because
+                    // that is the store whose eviction we are guarding against;
+                    // pinning through the wrapper would also forward to the
+                    // slow store, which is meaningless for a remote GrpcStore.
+                    #[allow(clippy::disallowed_methods)]
                     cas_store.fast_store().pin_digests(&failed);
                     tokio::spawn(async move {
                         Self::handle_upload_missing_blobs(&ram, failed).await;
@@ -1900,6 +1905,10 @@ pub async fn new_local_worker(
         // the on-disk `FilesystemStore` into a NEW `FastSlowStore` that
         // gets its own empty `mirror_blobs` map. There is no missed-mirror
         // hit risk because the new wrapper has no mirror state yet.
+        // Construction-time wiring: extract the existing fast/slow handles to
+        // re-wrap them in a new FastSlowStore — there is no wrapper to route
+        // through here because the new wrapper does not exist yet.
+        #[allow(clippy::disallowed_methods)]
         let fast_store = fast_slow_store.fast_store().clone();
         let fss_spec = nativelink_config::stores::FastSlowSpec {
             fast: nativelink_config::stores::StoreSpec::Noop(Default::default()),
@@ -1978,6 +1987,11 @@ pub async fn new_local_worker(
         // wrapper has its own empty `mirror_blobs` map and is the one
         // that subsequently receives `IS_MIRROR_REQUEST` writes via the
         // CAS server, so the empty start state is correct.
+        // Construction-time wiring: building a sibling FastSlowStore that
+        // shares the same fast/slow store handles but flips slow_direction to
+        // ReadOnly. We need the underlying Store handles, not a wrapper, so
+        // there is nothing to route through.
+        #[allow(clippy::disallowed_methods)]
         let fast_store = effective_cas_store.fast_store().clone();
         let slow_store = effective_cas_store.slow_store().clone();
         let fss_spec = nativelink_config::stores::FastSlowSpec {
@@ -2022,6 +2036,10 @@ pub async fn new_local_worker(
         // from `cas_server_fss.snapshot_and_reset_mirror_changes()` —
         // the two snapshots have different lifetimes and routing
         // semantics on the server side and must NOT be merged here.
+        // Concrete FilesystemStore needed for BlobChangeTracker registration;
+        // the wrapper hides the concrete type so the downcast must read the
+        // inner store directly.
+        #[allow(clippy::disallowed_methods)]
         let fs_store_opt: Option<Arc<FilesystemStore>> = fast_slow_store
             .fast_store()
             .downcast_ref::<FilesystemStore>(None)
