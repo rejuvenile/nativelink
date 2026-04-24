@@ -2456,3 +2456,73 @@ async fn failed_populate_does_not_reissue_slow_store_probe() -> Result<(), Error
 
     Ok(())
 }
+
+/// Non-NotFound producer errors (Code::Internal "writer dropped",
+/// Aborted, Unavailable, etc.) represent transient stream-level
+/// failures where the blob may still be present in slow_store. The
+/// terminal-state branch must NOT short-circuit on these — it must
+/// fall through to the slow-store fallback so a recoverable read can
+/// succeed.
+///
+/// Without this gate, ~13 "writer dropped" Internal events / 2hr in
+/// production would be demoted from "recoverable via slow_store
+/// fallback" to "propagate Internal up the stack."
+#[nativelink_test]
+async fn terminal_internal_err_falls_back_to_slow_store() -> Result<(), Error> {
+    use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
+
+    let payload = b"recovered-from-slow-store".to_vec();
+    let digest = DigestInfo::try_new(VALID_HASH, payload.len() as u64).unwrap();
+
+    // Slow store HAS the blob — populate before constructing FastSlowStore
+    // so the fallback can succeed on the second call.
+    let slow_memory = MemoryStore::new(&MemorySpec::default());
+    slow_memory
+        .update_oneshot(digest.into(), payload.clone().into())
+        .await?;
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(slow_memory);
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Pre-arm with a terminal Code::Internal — simulates the
+    // production "writer dropped without sending EOF" Internal that
+    // StreamingBlobWriter::Drop emits when a producer task is cancelled
+    // or panics mid-stream.
+    {
+        let inner = Arc::new(StreamingBlobInner::new(digest, 64 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        writer.send_error(make_err!(
+            Code::Internal,
+            "synthetic terminal Internal: writer dropped without sending EOF"
+        ));
+        drop(writer);
+        assert!(inner.is_terminal(), "writer.send_error must mark terminal");
+        fast_slow_store.test_install_terminal_populate(digest.into(), inner);
+    }
+
+    // The terminal-state branch sees Err(Internal), DOES NOT
+    // short-circuit (gate is Code::NotFound only), and falls through
+    // to slow_store.get_part — which has the blob, so the read
+    // succeeds.
+    let result = fast_slow_store.get_part_unchunked(digest, 0, None).await?;
+    assert_eq!(
+        result.as_ref(),
+        payload.as_slice(),
+        "REGRESSION: terminal-Err non-NotFound short-circuited instead of \
+         falling back to slow_store. The Code::NotFound gate at \
+         fast_slow_store.rs is missing or broken — non-NotFound terminal \
+         errors must fall through so recoverable reads succeed.",
+    );
+
+    Ok(())
+}

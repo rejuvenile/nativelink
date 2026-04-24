@@ -2763,7 +2763,7 @@ impl StoreDriver for FastSlowStore {
 
         // If the producer already finished, branch on its terminal state:
         //
-        // - Producer Err: the producer's `send_error` carries the
+        // - Producer Err NotFound: the producer's `send_error` carries the
         //   structured upstream failure (typically NotFound from
         //   slow_store.has() in `run_producer`). The fast store was
         //   never populated, so probing it would always return NotFound
@@ -2775,17 +2775,30 @@ impl StoreDriver for FastSlowStore {
         //   (1825 fires / 3 stale-positive digests / 20 min observed in
         //   production on 2026-04-24).
         //
+        // - Producer Err non-NotFound (Internal "writer dropped",
+        //   Aborted, Unavailable): transient stream-level failure where
+        //   the blob may still be present in slow_store. Fall through
+        //   to the slow-store fallback so a recoverable read can succeed.
+        //   In production we observe ~13 "writer dropped" events / 2hr
+        //   on buildcache that benefit from this fallback.
+        //
         // - Producer Ok: the fast store HAS the data unless evicted
         //   between producer-EOF and this read. Probe; on NotFound
         //   fall back to slow with the (now-accurate) eviction warn.
         if streaming_inner.is_terminal() {
             if let Some(Err(producer_err)) = streaming_inner.terminal_result() {
-                debug!(
-                    ?key,
-                    code = ?producer_err.code,
-                    "populate already failed terminally, returning producer error directly"
-                );
-                return Err(producer_err);
+                if producer_err.code == Code::NotFound {
+                    debug!(
+                        ?key,
+                        code = ?producer_err.code,
+                        "populate already failed with NotFound, returning producer error directly"
+                    );
+                    return Err(producer_err);
+                }
+                // Non-NotFound terminal Err (Code::Internal "writer
+                // dropped", Aborted, Unavailable, etc.) — fall through
+                // to the slow-store fallback below; the blob may still
+                // be present even though the producer's stream failed.
             }
             let bytes_before = writer.get_bytes_written();
             return match self
