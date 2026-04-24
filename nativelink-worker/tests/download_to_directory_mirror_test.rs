@@ -46,32 +46,34 @@ use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
 use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreLike};
 use nativelink_worker::running_actions_manager::download_to_directory;
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
-fn temp_path(suffix: &str) -> String {
-    // Use `tempfile::Builder` for race-free unique-name generation; `.keep()`
-    // disarms the auto-cleanup so the FilesystemStore (which lives past the
-    // test body inside Arcs) doesn't see its content_path vanish mid-run.
-    // Tradeoff: tmp files leak; the OS reclaims them on next /tmp sweep.
+/// Creates a uniquely-named TempDir whose Drop cleans up at end of scope.
+/// Caller MUST bind the returned `TempDir` to a local so the path stays
+/// valid for the FilesystemStore (held in Arcs) — see the mongo_runner
+/// fix in commit 086d0d31 for the same anti-pattern (`.keep()` leak).
+fn make_temp_dir(suffix: &str) -> TempDir {
     tempfile::Builder::new()
         .prefix(&format!("nl_dl_to_dir_{suffix}_"))
         .tempdir()
         .expect("tempdir")
-        .keep()
-        .to_string_lossy()
-        .into_owned()
 }
 
-async fn make_filesystem_store() -> Arc<FilesystemStore> {
-    let content = temp_path("content");
-    let temp = temp_path("temp");
-    FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
-        content_path: content,
-        temp_path: temp,
+/// Returns the FilesystemStore plus the two `TempDir` handles backing its
+/// `content_path` and `temp_path`. The caller MUST bind both `TempDir`s
+/// to locals so they outlive every Arc'd reference to the store.
+async fn make_filesystem_store() -> (Arc<FilesystemStore>, TempDir, TempDir) {
+    let content_dir = make_temp_dir("content");
+    let temp_dir = make_temp_dir("temp");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_dir.path().to_string_lossy().into_owned(),
+        temp_path: temp_dir.path().to_string_lossy().into_owned(),
         eviction_policy: Some(EvictionPolicy::default()),
         ..Default::default()
     })
     .await
-    .expect("create filesystem store")
+    .expect("create filesystem store");
+    (store, content_dir, temp_dir)
 }
 
 fn make_fss(
@@ -119,7 +121,7 @@ async fn mirror_only_blob_materialized_via_download_to_directory() {
     // `cas_store.fast_store()`. Using two separate stores would write
     // to one and read from the other and the hardlink would fail
     // independent of the mirror logic under test.
-    let shared_fs = make_filesystem_store().await;
+    let (shared_fs, _content_dir, _temp_dir) = make_filesystem_store().await;
 
     // Empty slow store — represents "server is down" or "server has
     // lost the blob". Any populate request for the test blob MUST fail
@@ -163,8 +165,8 @@ async fn mirror_only_blob_materialized_via_download_to_directory() {
     let mut pre_resolved = HashMap::new();
     pre_resolved.insert(root_dir_digest, root_dir);
 
-    let work_dir = temp_path("work");
-    tokio::fs::create_dir_all(&work_dir).await.expect("create work dir");
+    let work_dir_handle = make_temp_dir("work");
+    let work_dir = work_dir_handle.path().to_string_lossy().into_owned();
 
     let fs_pin: Pin<&FilesystemStore> = Pin::new(shared_fs.as_ref());
     download_to_directory(
@@ -189,6 +191,6 @@ async fn mirror_only_blob_materialized_via_download_to_directory() {
         "materialized file bytes must match the mirror copy"
     );
 
-    // Cleanup.
-    tokio::fs::remove_dir_all(&work_dir).await.ok();
+    // `work_dir_handle` and the FilesystemStore TempDirs are dropped at
+    // end of scope, cleaning up all on-disk state.
 }

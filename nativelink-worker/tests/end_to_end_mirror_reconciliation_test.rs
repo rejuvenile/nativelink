@@ -68,28 +68,31 @@ use nativelink_worker::local_worker::{
     BlobsAvailableState, handle_blobs_in_stable_storage,
 };
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
-fn temp_path(suffix: &str) -> String {
-    tempfile::Builder::new()
-        .prefix(&format!("nl_e2e_{suffix}_"))
+/// Returns the FilesystemStore plus the two `TempDir` handles backing its
+/// `content_path` and `temp_path`. The caller MUST bind both `TempDir`s
+/// to locals so they outlive every Arc'd reference to the store —
+/// otherwise the on-disk dirs leak (same anti-pattern as the mongo_runner
+/// `.keep()` leak fixed in commit 086d0d31).
+async fn make_filesystem_store() -> (Arc<FilesystemStore>, TempDir, TempDir) {
+    let content_dir = tempfile::Builder::new()
+        .prefix("nl_e2e_content_")
         .tempdir()
-        .expect("tempdir")
-        .keep()
-        .to_string_lossy()
-        .into_owned()
-}
-
-async fn make_filesystem_store() -> Arc<FilesystemStore> {
-    let content_path = temp_path("content");
-    let temp = temp_path("temp");
-    FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
-        content_path,
-        temp_path: temp,
+        .expect("tempdir");
+    let temp_dir = tempfile::Builder::new()
+        .prefix("nl_e2e_temp_")
+        .tempdir()
+        .expect("tempdir");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_dir.path().to_string_lossy().into_owned(),
+        temp_path: temp_dir.path().to_string_lossy().into_owned(),
         eviction_policy: Some(EvictionPolicy::default()),
         ..Default::default()
     })
     .await
-    .expect("create filesystem store")
+    .expect("create filesystem store");
+    (store, content_dir, temp_dir)
 }
 
 fn make_fss_for_mirror() -> Arc<FastSlowStore> {
@@ -191,7 +194,7 @@ async fn server_restart_reconciliation_full_flow() {
     // -------- Step 5: server sends BlobsInStableStorage --------------
     // Production code: the dispatch arm calls
     // `handle_blobs_in_stable_storage(state, cas_store, &proto)`.
-    let fs_store = make_filesystem_store().await;
+    let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
     let state = BlobsAvailableState::new_for_test(fs_store, Some(cas_fss.clone()));
     let proto = vec![ProtoDigest::from(blob)];
     handle_blobs_in_stable_storage(&state, None, &proto);

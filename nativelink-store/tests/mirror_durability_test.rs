@@ -465,20 +465,20 @@ async fn mirror_materialize_sets_0o555_mode_on_disk() {
 
     // Build a FastSlowStore whose fast tier is a real FilesystemStore so
     // the post-write chmod actually fires. (`make_fss()` uses a memory
-    // fast store, which has no on-disk file to inspect.)
+    // fast store, which has no on-disk file to inspect.) Bind both
+    // `TempDir`s to locals so Drop fires at end of scope (same anti-
+    // pattern as the mongo_runner `.keep()` leak fixed in 086d0d31).
     let content_dir = tempfile::Builder::new()
         .prefix("nl_mirror_mode_content_")
         .tempdir()
-        .expect("tempdir")
-        .keep();
+        .expect("tempdir");
     let temp_dir = tempfile::Builder::new()
         .prefix("nl_mirror_mode_temp_")
         .tempdir()
-        .expect("tempdir")
-        .keep();
+        .expect("tempdir");
     let fs_store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
-        content_path: content_dir.to_string_lossy().into_owned(),
-        temp_path: temp_dir.to_string_lossy().into_owned(),
+        content_path: content_dir.path().to_string_lossy().into_owned(),
+        temp_path: temp_dir.path().to_string_lossy().into_owned(),
         eviction_policy: Some(EvictionPolicy::default()),
         ..Default::default()
     })
@@ -506,7 +506,7 @@ async fn mirror_materialize_sets_0o555_mode_on_disk() {
 
     // Locate the on-disk file via the documented path layout and assert
     // the mode is exactly 0o555 (CAS read-execute, no write).
-    let content_path_str = content_dir.to_string_lossy().into_owned();
+    let content_path_str = content_dir.path().to_string_lossy().into_owned();
     let on_disk_path = digest_content_path(&content_path_str, &digest);
     let meta = std::fs::metadata(&on_disk_path).unwrap_or_else(|err| {
         panic!(

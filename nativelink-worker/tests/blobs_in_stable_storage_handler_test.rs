@@ -42,32 +42,31 @@ use nativelink_worker::local_worker::{
     BlobsAvailableState, handle_blobs_in_stable_storage,
 };
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
-fn temp_path(suffix: &str) -> String {
-    // Use `tempfile::Builder` for race-free unique-name generation; `.keep()`
-    // disarms the auto-cleanup so the FilesystemStore (which lives past the
-    // test body inside Arcs) doesn't see its content_path vanish mid-run.
-    // Tradeoff: tmp files leak; the OS reclaims them on next /tmp sweep.
-    tempfile::Builder::new()
-        .prefix(&format!("nl_blobs_in_stable_{suffix}_"))
+/// Returns the FilesystemStore plus the two `TempDir` handles backing its
+/// `content_path` and `temp_path`. The caller MUST bind both `TempDir`s
+/// to locals so they outlive every Arc'd reference to the store —
+/// otherwise the on-disk dirs leak (same anti-pattern as the mongo_runner
+/// `.keep()` leak fixed in commit 086d0d31).
+async fn make_filesystem_store() -> (Arc<FilesystemStore>, TempDir, TempDir) {
+    let content_dir = tempfile::Builder::new()
+        .prefix("nl_blobs_in_stable_content_")
         .tempdir()
-        .expect("tempdir")
-        .keep()
-        .to_string_lossy()
-        .into_owned()
-}
-
-async fn make_filesystem_store() -> Arc<FilesystemStore> {
-    let content_path = temp_path("content");
-    let temp = temp_path("temp");
-    FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
-        content_path,
-        temp_path: temp,
+        .expect("tempdir");
+    let temp_dir = tempfile::Builder::new()
+        .prefix("nl_blobs_in_stable_temp_")
+        .tempdir()
+        .expect("tempdir");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_dir.path().to_string_lossy().into_owned(),
+        temp_path: temp_dir.path().to_string_lossy().into_owned(),
         eviction_policy: Some(EvictionPolicy::default()),
         ..Default::default()
     })
     .await
-    .expect("create filesystem store")
+    .expect("create filesystem store");
+    (store, content_dir, temp_dir)
 }
 
 fn make_fss_for_mirror() -> Arc<FastSlowStore> {
@@ -120,7 +119,7 @@ async fn mirror_blob_removed_when_proto_received() {
         "both mirror blobs pinned before handler"
     );
 
-    let fs_store = make_filesystem_store().await;
+    let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
     let state = BlobsAvailableState::new_for_test(fs_store, Some(cas_fss.clone()));
 
     // Construct the proto exactly the way the dispatch arm receives it.
@@ -149,7 +148,7 @@ async fn invalid_proto_digest_does_not_crash_handler() {
     let valid_digest = mk_digest(3, 4);
     write_mirror(&cas_fss, valid_digest, Bytes::from_static(b"abcd")).await;
 
-    let fs_store = make_filesystem_store().await;
+    let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
     let state = BlobsAvailableState::new_for_test(fs_store, Some(cas_fss.clone()));
 
     let proto = vec![
@@ -173,7 +172,7 @@ async fn invalid_proto_digest_does_not_crash_handler() {
 /// passing None and verifying the call returns without panicking.
 #[nativelink_test]
 async fn handler_no_op_when_cas_server_fss_absent() {
-    let fs_store = make_filesystem_store().await;
+    let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
     let state = BlobsAvailableState::new_for_test(fs_store, None);
     let digest = mk_digest(4, 4);
     let proto = vec![proto_digest_for(&digest)];

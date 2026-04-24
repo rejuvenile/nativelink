@@ -24,7 +24,6 @@
 //! pinning behavior on the production-shaped EvictingMap is exercised
 //! without requiring a full action sandbox.
 
-use std::env;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -38,16 +37,7 @@ use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{Store, StoreLike};
-use rand::Rng;
-
-fn temp_dir(suffix: &str) -> String {
-    format!(
-        "{}/{}/{suffix}",
-        env::var("TEST_TMPDIR")
-            .unwrap_or_else(|_| env::temp_dir().to_str().unwrap().to_string()),
-        rand::rng().random::<u64>(),
-    )
-}
+use tempfile::TempDir;
 
 fn digest_for(seed: u64, size: u64) -> DigestInfo {
     // Deterministic sha256 of (seed, size) tuple.
@@ -60,16 +50,26 @@ fn digest_for(seed: u64, size: u64) -> DigestInfo {
     DigestInfo::try_new(&hex, size).unwrap()
 }
 
+/// Builds a `FastSlowStore` with a real on-disk fast tier. Returns the
+/// FSS, the fast/slow `Store` handles, and the `TempDir` backing the
+/// FilesystemStore content/temp paths. Caller MUST bind the `TempDir`
+/// to a local so its Drop fires at end of scope (otherwise the on-disk
+/// directories leak — same anti-pattern as the mongo_runner `.keep()`
+/// leak fixed in commit 086d0d31).
 async fn make_fss(
     fast_max_bytes: usize,
-) -> Result<(Arc<FastSlowStore>, Store, Store), Error> {
-    let content_path = temp_dir("populate_pin_content");
-    let temp_path = temp_dir("populate_pin_temp");
+) -> Result<(Arc<FastSlowStore>, Store, Store, TempDir), Error> {
+    let root = tempfile::Builder::new()
+        .prefix("populate_pin_")
+        .tempdir()
+        .expect("tempdir");
+    let content_path = root.path().join("content");
+    let temp_path = root.path().join("temp");
     tokio::fs::create_dir_all(&content_path).await.unwrap();
     tokio::fs::create_dir_all(&temp_path).await.unwrap();
     let fs_arc = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
-        content_path,
-        temp_path,
+        content_path: content_path.to_string_lossy().into_owned(),
+        temp_path: temp_path.to_string_lossy().into_owned(),
         eviction_policy: Some(EvictionPolicy {
             max_bytes: fast_max_bytes,
             ..Default::default()
@@ -89,7 +89,7 @@ async fn make_fss(
         fast_store.clone(),
         slow_store.clone(),
     );
-    Ok((fss, fast_store, slow_store))
+    Ok((fss, fast_store, slow_store, root))
 }
 
 // -------------------------------------------------------------------------
@@ -109,7 +109,7 @@ async fn populate_pin_prevents_self_cannibalization() -> Result<(), Error> {
     const PRESSURE_BLOBS: usize = 32;
     const PRESSURE_SIZE: usize = 32 * 1024;
 
-    let (fss, fast_store, slow_store) = make_fss(FAST_BYTES).await?;
+    let (fss, fast_store, slow_store, _temp_root) = make_fss(FAST_BYTES).await?;
 
     // Seed N "tracked" blobs and PRESSURE_BLOBS sibling blobs in slow.
     let mut digests = Vec::with_capacity(N);
@@ -174,7 +174,7 @@ async fn populate_without_pin_loses_blobs_to_eviction() -> Result<(), Error> {
     const PRESSURE_BLOBS: usize = 32;
     const PRESSURE_SIZE: usize = 32 * 1024;
 
-    let (fss, fast_store, slow_store) = make_fss(FAST_BYTES).await?;
+    let (fss, fast_store, slow_store, _temp_root) = make_fss(FAST_BYTES).await?;
 
     let mut digests = Vec::with_capacity(N);
     for i in 0..N {
@@ -238,7 +238,7 @@ async fn populate_pin_cap_exhaustion_warns() -> Result<(), Error> {
     const BLOB_SIZE: usize = 8 * 1024;
     const FAST_BYTES: usize = 128 * 1024;
 
-    let (fss, fast_store, slow_store) = make_fss(FAST_BYTES).await?;
+    let (fss, fast_store, slow_store, _temp_root) = make_fss(FAST_BYTES).await?;
 
     let mut digests = Vec::with_capacity(N);
     for i in 0..N {
