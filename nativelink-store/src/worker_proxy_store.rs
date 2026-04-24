@@ -36,9 +36,8 @@ use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
-use nativelink_util::common::DigestInfo;
+use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
-use nativelink_util::precondition_failure::make_precondition_failure_any;
 use nativelink_util::store_trait::{
     IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, REDIRECT_PREFIX, Store, StoreDriver,
     StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
@@ -983,12 +982,10 @@ impl WorkerProxyStore {
             // Workers handle their own peer fetching via WorkerProxyStore on
             // the worker side with race_peers enabled.
             let digest = key.borrow().into_digest();
-            let mut err = make_err!(
-                Code::NotFound,
-                "Blob {digest:?} not found in inner store (worker request, no redirect)"
-            );
-            err.details.push(make_precondition_failure_any(digest));
-            return Err(err);
+            return Err(Error::not_found_with_detail(
+                format!("Blob {digest:?} not found in inner store (worker request, no redirect)"),
+                make_precondition_failure_any(digest),
+            ));
         }
 
         let bytes_before_workers = writer.get_bytes_written();
@@ -1034,12 +1031,10 @@ impl WorkerProxyStore {
         }
 
         let digest = key.borrow().into_digest();
-        let mut err = make_err!(
-            Code::NotFound,
-            "Blob {digest:?} not found in inner store or any worker"
-        );
-        err.details.push(make_precondition_failure_any(digest));
-        Err(err)
+        Err(Error::not_found_with_detail(
+            format!("Blob {digest:?} not found in inner store or any worker"),
+            make_precondition_failure_any(digest),
+        ))
     }
 
     /// Forward remaining data from a racer's read half to the caller's writer,

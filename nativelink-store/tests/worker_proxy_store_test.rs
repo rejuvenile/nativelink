@@ -1090,3 +1090,97 @@ async fn peer_unavailable_pre_eof_drops_cached_connection() -> Result<(), Error>
 
     Ok(())
 }
+
+// ===================================================================
+// Reviewer Finding 2 (testing-czar Gap 2): construction-site coverage
+// for the REAPI v2 §2.2.4 PreconditionFailure detail attachment in
+// `worker_proxy_store.rs:985` (worker request, no redirect path) and
+// `worker_proxy_store.rs:1033` (inner store + all workers miss path).
+// ===================================================================
+
+/// Helper to assert that an error carries a single `PreconditionFailure`
+/// MISSING violation whose `subject` is `"blobs/<hash>/<size>"`.
+fn assert_precondition_failure_for_digest(err: &Error, digest: DigestInfo) {
+    use prost::Message;
+    use nativelink_util::common::PreconditionFailure;
+
+    assert_eq!(
+        err.details.len(),
+        1,
+        "expected exactly one PreconditionFailure detail, got {}: {err:?}",
+        err.details.len(),
+    );
+    let detail = &err.details[0];
+    assert!(
+        detail.type_url.ends_with("PreconditionFailure"),
+        "detail type_url should end with 'PreconditionFailure', got: {}",
+        detail.type_url,
+    );
+    let pf = PreconditionFailure::decode(detail.value.as_slice())
+        .expect("detail value must decode as PreconditionFailure");
+    assert_eq!(pf.violations.len(), 1, "expected one violation");
+    assert_eq!(pf.violations[0].r#type, "MISSING");
+    let expected_subject = format!(
+        "blobs/{}/{}",
+        digest.packed_hash(),
+        digest.size_bytes(),
+    );
+    assert_eq!(
+        pf.violations[0].subject, expected_subject,
+        "violation subject must be 'blobs/<hash>/<size>', got: {}",
+        pf.violations[0].subject,
+    );
+}
+
+/// Asserts that the worker-request, no-redirect NotFound path at
+/// `worker_proxy_store.rs:985` attaches a `PreconditionFailure` detail
+/// with the missing digest as `subject`. This is the path Bazel
+/// observes when a worker asks the server-side proxy for a blob the
+/// inner store doesn't have and the server refuses to redirect (to
+/// avoid the worker→server→worker redirect loop).
+#[nativelink_test]
+async fn worker_request_no_redirect_not_found_carries_precondition_detail() -> Result<(), Error> {
+    let (proxy, _inner, _locality_map) = make_proxy_store();
+    let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+
+    // IS_WORKER_REQUEST=true with no locality entries → hits the
+    // construction site at line 985 directly.
+    let result = IS_WORKER_REQUEST
+        .scope(true, proxy.get_part_unchunked(digest, 0, None))
+        .await;
+
+    let err = result.err().expect("expected NotFound for worker request with no peers");
+    assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
+    assert_precondition_failure_for_digest(&err, digest);
+    Ok(())
+}
+
+/// Asserts that the "inner store + all workers miss" NotFound path at
+/// `worker_proxy_store.rs:1033` attaches a `PreconditionFailure` detail.
+/// This is the path Bazel observes when the proxy attempted peer
+/// fetches that all failed AND the inner-store retry also returned
+/// NotFound. Triggered by registering an unreachable peer in the
+/// locality map (so worker fetch is attempted and fails) with
+/// `IS_WORKER_REQUEST=false`.
+#[nativelink_test]
+async fn inner_store_and_all_workers_miss_carries_precondition_detail() -> Result<(), Error> {
+    let (proxy, _inner, locality_map) = make_proxy_store();
+    let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+
+    // Register a peer whose URI is invalid — peer attempt will fail
+    // immediately during create_worker_connection, then the inner
+    // store retry runs, sees nothing, and falls through to the line
+    // 1033 construction site.
+    locality_map
+        .write()
+        .register_blobs("not a valid uri", &[digest]);
+
+    let result = IS_WORKER_REQUEST
+        .scope(false, proxy.get_part_unchunked(digest, 0, None))
+        .await;
+
+    let err = result.err().expect("expected NotFound after all workers fail and inner misses");
+    assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
+    assert_precondition_failure_for_digest(&err, digest);
+    Ok(())
+}

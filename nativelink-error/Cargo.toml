@@ -34,6 +34,7 @@ tonic = { version = "0.14.5", features = [
   "tls-aws-lc",
   "transport",
 ], default-features = false }
+tracing = { version = "0.1.41", default-features = false }
 url = { version = "2.5.7", default-features = false }
 uuid = { version = "1.16.0", default-features = false, features = ["std"] }
 walkdir = { version = "2.5.0", default-features = false }

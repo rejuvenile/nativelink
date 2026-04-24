@@ -2178,3 +2178,60 @@ async fn flush_slow_writes_no_lost_wakeup() -> Result<(), Error> {
     }
     Ok(())
 }
+
+// ===================================================================
+// Reviewer Finding 2 (testing-czar Gap 2): construction-site coverage
+// for the REAPI v2 §2.2.4 PreconditionFailure detail attachment in
+// `fast_slow_store.rs:823` (slow-store `.has()` miss in `run_producer`).
+// Without the detail, Bazel sees a generic NotFound and cannot recover
+// by re-uploading the missing blob.
+// ===================================================================
+
+/// Asserts that calling `get_part` on an empty FastSlowStore (where the
+/// slow store reports the blob missing via `.has()`) returns a NotFound
+/// error carrying a `PreconditionFailure` detail with `subject` of the
+/// form `"blobs/<hash>/<size>"`. This guards the construction site at
+/// `nativelink-store/src/fast_slow_store.rs:823`.
+///
+/// Uses `make_stores()` (non-lazy slow store) so the populator's
+/// `slow_store.has()` branch fires — `LazyExistenceOnSync` would skip
+/// the `.has()` call and bypass the construction site under test.
+#[nativelink_test]
+async fn fast_slow_store_not_found_carries_precondition_failure_detail() -> Result<(), Error> {
+    use prost::Message;
+    use nativelink_util::common::PreconditionFailure;
+
+    let (fast_slow_store, _fast_store, _slow_store) = make_stores();
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+
+    let result = fast_slow_store.get_part_unchunked(digest, 0, None).await;
+    let err = result.err().expect("expected NotFound for missing blob");
+    assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
+    assert_eq!(
+        err.details.len(),
+        1,
+        "expected exactly one PreconditionFailure detail, got {}: {err:?}",
+        err.details.len(),
+    );
+    let detail = &err.details[0];
+    assert!(
+        detail.type_url.ends_with("PreconditionFailure"),
+        "detail type_url should end with 'PreconditionFailure', got: {}",
+        detail.type_url,
+    );
+    let pf = PreconditionFailure::decode(detail.value.as_slice())
+        .expect("detail value must decode as PreconditionFailure");
+    assert_eq!(pf.violations.len(), 1, "expected one violation");
+    assert_eq!(pf.violations[0].r#type, "MISSING");
+    let expected_subject = format!(
+        "blobs/{}/{}",
+        digest.packed_hash(),
+        digest.size_bytes(),
+    );
+    assert_eq!(
+        pf.violations[0].subject, expected_subject,
+        "violation subject must be 'blobs/<hash>/<size>', got: {}",
+        pf.violations[0].subject,
+    );
+    Ok(())
+}

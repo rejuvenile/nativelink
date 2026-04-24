@@ -66,11 +66,10 @@ use nativelink_util::action_messages::{
     ActionInfo, ActionResult, DirectoryInfo, ExecutionMetadata, FileInfo, NameOrPath, OperationId,
     SymlinkInfo, to_execute_response,
 };
-use nativelink_util::common::{DigestInfo, fs};
+use nativelink_util::common::{DigestInfo, fs, make_precondition_failure_any};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::buf_channel::make_buf_channel_pair;
-use nativelink_util::precondition_failure::make_precondition_failure_any;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo};
 use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::{background_spawn, spawn, spawn_blocking};

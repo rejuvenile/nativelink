@@ -1238,15 +1238,55 @@ async fn worker_translates_not_found_to_failed_precondition_test() -> Result<(),
         .expect_create_and_add_action(Ok(running_action.clone()))
         .await;
 
+    // Build a PreconditionFailure detail (MISSING violation) to attach to
+    // the source NotFound — same shape produced by store-layer NotFound
+    // returns. Reviewer Finding 3: assert that the worker's
+    // NotFound→FailedPrecondition translation does NOT drop these
+    // details (REAPI v2 §2.2.4 — Bazel needs the violation to know
+    // which blob to re-upload).
+    #[derive(prost::Message)]
+    struct PfViolation {
+        #[prost(string, tag = "1")]
+        r#type: String,
+        #[prost(string, tag = "2")]
+        subject: String,
+        #[prost(string, tag = "3")]
+        description: String,
+    }
+    #[derive(prost::Message)]
+    struct PfFailure {
+        #[prost(message, repeated, tag = "1")]
+        violations: Vec<PfViolation>,
+    }
+
+    let missing_digest = DigestInfo::new([0xCD; 32], 99);
+    let detail = PfFailure {
+        violations: vec![PfViolation {
+            r#type: "MISSING".into(),
+            subject: format!(
+                "blobs/{}/{}",
+                missing_digest.packed_hash(),
+                missing_digest.size_bytes(),
+            ),
+            description: String::new(),
+        }],
+    };
+    let any = prost_types::Any {
+        type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+        value: detail.encode_to_vec(),
+    };
+
     // Make the action fail with a NotFound error during get_finished_result.
     // The "not found in" substring matches what production CAS-miss errors
     // look like (e.g. "Blob ... not found in inner store or any worker") and
     // is what `local_worker.rs` looks for to trigger REAPI translation.
+    let mut source_err = make_err!(
+        Code::NotFound,
+        "Blob abc not found in inner store or any worker"
+    );
+    source_err.details.push(any.clone());
     running_action
-        .simple_expect_get_finished_result(Err(make_err!(
-            Code::NotFound,
-            "Blob abc not found in inner store or any worker"
-        )))
+        .simple_expect_get_finished_result(Err(source_err))
         .await?;
 
     // Now our client should be notified that our runner finished.
@@ -1274,6 +1314,18 @@ async fn worker_translates_not_found_to_failed_precondition_test() -> Result<(),
         "Expected status message to preserve original 'not found in' context, got: {}",
         status.message
     );
+    // Reviewer Finding 3: NotFound→FailedPrecondition translation in
+    // `local_worker.rs` (≈line 1683) MUST preserve `e.details` rather
+    // than rebuilding the error via `make_err!`. Translation re-stamps
+    // the code in-place; this guards against a future regression that
+    // drops details on the floor.
+    assert_eq!(
+        status.details.len(),
+        1,
+        "PreconditionFailure detail must survive NotFound→FailedPrecondition translation",
+    );
+    assert_eq!(status.details[0].type_url, any.type_url);
+    assert_eq!(status.details[0].value, any.value);
 
     Ok(())
 }
