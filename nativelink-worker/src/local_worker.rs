@@ -1797,6 +1797,12 @@ pub async fn new_local_worker(
         // Build a new FastSlowStore: fast=local disk, slow=WorkerProxyStore(central CAS).
         // Preserve the original store's direction config so that e.g.
         // slow_direction=get prevents uploads from propagating to the server.
+        //
+        // Sibling-bug audit (review #7): `.fast_store()` here is store
+        // *construction*, not a `has_with_results` lookup. We are wrapping
+        // the on-disk `FilesystemStore` into a NEW `FastSlowStore` that
+        // gets its own empty `mirror_blobs` map. There is no missed-mirror
+        // hit risk because the new wrapper has no mirror state yet.
         let fast_store = fast_slow_store.fast_store().clone();
         let fss_spec = nativelink_config::stores::FastSlowSpec {
             fast: nativelink_config::stores::StoreSpec::Noop(Default::default()),
@@ -1869,6 +1875,12 @@ pub async fn new_local_worker(
     // reconnect retry (which drains from the RunningActionsManager's
     // store) also picks up unacked mirror digests.
     let effective_cas_store_for_cas_server = {
+        // Sibling-bug audit (review #7): `.fast_store()` here is store
+        // *construction*. We rebuild a sibling FastSlowStore with the
+        // same on-disk fast tier but ReadOnly slow direction. The new
+        // wrapper has its own empty `mirror_blobs` map and is the one
+        // that subsequently receives `IS_MIRROR_REQUEST` writes via the
+        // CAS server, so the empty start state is correct.
         let fast_store = effective_cas_store.fast_store().clone();
         let slow_store = effective_cas_store.slow_store().clone();
         let fss_spec = nativelink_config::stores::FastSlowSpec {
@@ -1906,7 +1918,13 @@ pub async fn new_local_worker(
     // The send loop wakes immediately on blob insert/eviction via Notify,
     // with a backstop interval to catch subtree-only changes.
     let blobs_available_state = if config.cas_server_port.is_some() {
-        // Try to get a reference to the FilesystemStore (the fast store in FastSlowStore).
+        // Sibling-bug audit (review #7): fast-store-only is intentional.
+        // BlobsAvailable advertises ON-DISK digests so peer workers can
+        // fetch them. Mirror-blob digests are reported via a separate
+        // `pinned_mirror_digests` field on the same proto, populated
+        // from `cas_server_fss.snapshot_and_reset_mirror_changes()` —
+        // the two snapshots have different lifetimes and routing
+        // semantics on the server side and must NOT be merged here.
         let fs_store_opt: Option<Arc<FilesystemStore>> = fast_slow_store
             .fast_store()
             .downcast_ref::<FilesystemStore>(None)

@@ -1130,6 +1130,41 @@ impl FastSlowStore {
         (streaming_inner, is_new)
     }
 
+    /// If `key` is currently held in the in-memory `mirror_blobs` map,
+    /// write its bytes into the fast store and return `true`. Otherwise
+    /// return `false` (and the caller falls back to the slow-store
+    /// populate path). This is what makes `populate_fast_store_*` and
+    /// the directory-cache hardlink path work correctly when the only
+    /// surviving copy of a blob is in `mirror_blobs` — without it, a
+    /// mirror-only blob would be re-fetched from the slow store and, if
+    /// the server is the slow store and is down or has lost the blob,
+    /// the populate would fail with NotFound even though the worker
+    /// holds the bytes in memory.
+    async fn materialize_mirror_to_fast(
+        &self,
+        key: StoreKey<'_>,
+    ) -> Result<bool, Error> {
+        let digest = key.borrow().into_digest();
+        let maybe_data = self
+            .mirror_blobs
+            .lock()
+            .get(&digest)
+            .map(|(d, _)| d.clone());
+        let Some(data) = maybe_data else {
+            return Ok(false);
+        };
+        // Write directly to fast_store via the standard update path.
+        // `update_oneshot` is a single-buffer write — no streaming
+        // required since the bytes are already in RAM.
+        self.fast_store
+            .update_oneshot(digest, data)
+            .await
+            .err_tip(|| {
+                "materialize_mirror_to_fast: writing in-memory mirror blob to fast store"
+            })?;
+        Ok(true)
+    }
+
     /// Ensure our fast store is populated. This should be kept as a low
     /// cost function. Since the data itself is shared and not copied it should be fairly
     /// low cost to just discard the data, but does cost a few mutex locks while
@@ -1141,6 +1176,14 @@ impl FastSlowStore {
             .await
             .err_tip(|| "While querying in populate_fast_store")?;
         if maybe_size_info.is_some() {
+            return Ok(());
+        }
+
+        // If we hold a mirror copy in memory, materialize from there
+        // instead of round-tripping the slow store. This is the
+        // server-restart-resilience path: a mirror-only blob's bytes
+        // live nowhere else.
+        if self.materialize_mirror_to_fast(key.borrow()).await? {
             return Ok(());
         }
 
@@ -1182,6 +1225,40 @@ impl FastSlowStore {
     }
 
     pub async fn populate_fast_store_unchecked(&self, key: StoreKey<'_>) -> Result<(), Error> {
+        // If we hold a mirror copy in memory, materialize from there
+        // instead of round-tripping the slow store. Mirror-only blobs
+        // that live nowhere else (server lost the blob, or has not yet
+        // accepted the upload) MUST resolve via this path or the worker
+        // would re-fetch from the slow store and fail.
+        match self.materialize_mirror_to_fast(key.borrow()).await {
+            Ok(true) => {
+                // Verify it actually landed (same eviction-race guard
+                // as the slow-store path). If not present, the next
+                // copy_slow_to_fast attempt is the natural retry.
+                if Self::verify_present_with_failpoint(
+                    &self.fast_store,
+                    key.borrow(),
+                    "fast_slow_populate_unchecked_force_evict_first",
+                    "populate_fast_store_unchecked: mirror-materialize verify",
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                warn!(
+                    %key,
+                    "populate_fast_store_unchecked: mirror-materialized blob evicted before verify; falling back to slow store",
+                );
+            }
+            Ok(false) => {} // No mirror copy; fall through to slow store.
+            Err(err) => {
+                warn!(
+                    %key,
+                    ?err,
+                    "populate_fast_store_unchecked: mirror-materialize failed; falling back to slow store",
+                );
+            }
+        }
         if let Err(err) = self.copy_slow_to_fast(key.borrow()).await {
             error!(
                 %key,

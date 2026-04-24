@@ -24,7 +24,7 @@ use nativelink_macro::nativelink_test;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreLike};
+use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreKey, StoreLike};
 use pretty_assertions::assert_eq;
 
 fn make_fss() -> std::sync::Arc<FastSlowStore> {
@@ -384,6 +384,68 @@ async fn mirror_only_digest_visible_via_wrapper() {
         .await
         .expect("get_part_unchunked");
     assert_eq!(read_back, data, "wrapper reads mirror-only blob bytes");
+}
+
+/// Test (review #3): a mirror-only blob (held in `mirror_blobs`, NOT
+/// on the slow store and NOT yet on the fast store) MUST be
+/// materializable to the fast store via `populate_fast_store_unchecked`
+/// — without round-tripping the slow store. The slow store may be down
+/// or may have lost the blob; the worker is the only durable holder.
+///
+/// Pre-fix `populate_fast_store_unchecked` always called
+/// `copy_slow_to_fast`, which would fail with NotFound here.
+#[nativelink_test]
+async fn populate_fast_store_unchecked_materializes_mirror_only_blob() {
+    let fss = make_fss();
+    let digest = d(50, 4);
+    let data = Bytes::from_static(b"miry");
+    write_mirror(&fss, digest, data.clone()).await;
+
+    // Confirm the slow store does NOT have it (the mirror write is
+    // memory-only and never touches slow_store).
+    let slow_has = fss
+        .slow_store()
+        .has(StoreKey::from(digest))
+        .await
+        .expect("slow has");
+    assert!(slow_has.is_none(), "mirror write must not touch slow store");
+
+    // populate_fast_store_unchecked must succeed via mirror materialization.
+    fss.populate_fast_store_unchecked(StoreKey::from(digest))
+        .await
+        .expect("mirror-only populate must succeed");
+
+    // After populate, the bytes must be on the fast store.
+    let read_back = fss
+        .fast_store()
+        .get_part_unchunked(digest, 0, None)
+        .await
+        .expect("read-back from fast store");
+    assert_eq!(read_back, data, "fast store has the materialized mirror bytes");
+}
+
+/// Test (review #3): same flow via `populate_fast_store` (which checks
+/// `has()` first). After clearing the fast store, a fresh populate must
+/// route through the mirror materialization path.
+#[nativelink_test]
+async fn populate_fast_store_uses_mirror_when_disk_empty() {
+    let fss = make_fss();
+    let digest = d(51, 5);
+    let data = Bytes::from_static(b"miryy");
+    write_mirror(&fss, digest, data.clone()).await;
+
+    // populate_fast_store must succeed even though the slow store is
+    // empty.
+    fss.populate_fast_store(StoreKey::from(digest))
+        .await
+        .expect("populate_fast_store must materialize mirror");
+
+    let read_back = fss
+        .fast_store()
+        .get_part_unchunked(digest, 0, None)
+        .await
+        .expect("read-back from fast store");
+    assert_eq!(read_back, data);
 }
 
 /// Lock-ordering regression test (review #2): the canonical acquisition

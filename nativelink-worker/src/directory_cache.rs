@@ -465,7 +465,11 @@ impl DirectoryCache {
             )
         })?;
 
-        // Try to extract the FilesystemStore from the FastSlowStore if provided.
+        // Sibling-bug audit (review #7): fast-store-only is intentional.
+        // We need a `FilesystemStore` reference for direct hardlinking
+        // from the on-disk CAS. Mirror blobs live in memory and cannot
+        // be hardlinked; mirror-only digests must be materialized via
+        // `populate_fast_store_unchecked` before any hardlink path.
         let filesystem_store = fast_slow_store.as_ref().and_then(|fss| {
             fss.fast_store()
                 .downcast_ref::<FilesystemStore>(None)
@@ -2104,6 +2108,13 @@ impl DirectoryCache {
         let fast_path_result = if let (Some(fss), Some(_fs_store)) =
             (&self.fast_slow_store, &self.filesystem_store)
         {
+            // Sibling-bug audit (review #7): `.fast_store()` here extracts
+            // the concrete `FilesystemStore` for hardlink operations
+            // performed inside `download_to_directory`. The has-check
+            // there now routes through the FastSlowStore wrapper (`fss`)
+            // so mirror-only blobs are recognized; this `Pin<&FilesystemStore>`
+            // is used only for on-disk hardlink emission once blobs are
+            // materialized.
             let fs_pin = Pin::new(
                 fss.fast_store()
                     .downcast_ref::<FilesystemStore>(None)
@@ -2392,14 +2403,17 @@ impl DirectoryCache {
                 let store_keys: Vec<StoreKey<'_>> =
                     unique_digests.iter().map(|d| (*d).into()).collect();
                 let mut has_results = vec![None; store_keys.len()];
-                // Intentionally fast_store-only (NOT the FastSlowStore wrapper):
-                // a positive result here is interpreted as "blob bytes are
-                // present on disk and ready for hardlink". Mirror blobs live
-                // in memory only — treating them as cached would skip the
-                // download path that materializes them on disk for
-                // hardlinking, and the subsequent hardlink would fail. The
-                // populate_and_hardlink path used by the materializer pulls
-                // mirror-only blobs onto disk via the slow store.
+                // Sibling-bug audit (review #3 + #7): fast_store-only is
+                // intentional here. A positive result means "blob is on
+                // disk and ready for hardlink". Mirror-only blobs (held
+                // in `mirror_blobs` but not on disk) must NOT be
+                // reported as "cached" or the hardlink path would fail.
+                // The `populate_fast_store_unchecked` call below
+                // materializes mirror blobs to disk before the hardlink
+                // step (see `materialize_mirror_to_fast` in
+                // `fast_slow_store.rs`), so a mirror-only digest
+                // correctly flows through the missing→populate→hardlink
+                // pipeline rather than re-fetching from the slow store.
                 Pin::new(fss.fast_store())
                     .has_with_results(&store_keys, &mut has_results)
                     .await
@@ -2885,6 +2899,13 @@ impl DirectoryCache {
                 let store_keys: Vec<StoreKey<'_>> =
                     unique_digests.iter().map(|d| (*d).into()).collect();
                 let mut has_results = vec![None; store_keys.len()];
+                // Sibling-bug audit (review #3 + #7): see the matching
+                // comment in `construct_with_subtrees` above. Mirror-only
+                // digests appear as "missing" here and are materialized
+                // to disk via `populate_fast_store_unchecked`, which
+                // checks `mirror_blobs` first. The wrapper-level
+                // has-check is intentionally NOT used so the hardlink
+                // path can rely on disk presence after populate.
                 Pin::new(fss.fast_store())
                     .has_with_results(&store_keys, &mut has_results)
                     .await
