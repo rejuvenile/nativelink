@@ -403,6 +403,21 @@ impl FastSlowStore {
         self.mirror_blobs.lock().len()
     }
 
+    /// Current total bytes held in `mirror_blobs`. Used by
+    /// `send_periodic_blobs_available` to advertise capacity to the
+    /// server's mirror picker (review #1: pre-check capacity before
+    /// consuming the source stream).
+    pub fn mirror_blobs_used_bytes(&self) -> u64 {
+        self.mirror_blobs_total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Configured cap on `mirror_blobs` aggregate bytes. Reported with
+    /// `mirror_blobs_used_bytes` so the server's picker can compute
+    /// remaining capacity per peer.
+    pub fn mirror_blobs_max_bytes(&self) -> u64 {
+        self.mirror_blobs_max_bytes.load(Ordering::Relaxed)
+    }
+
     /// Test-only: override the mirror-blob byte cap so cap-exceeded paths
     /// can be exercised without allocating gigabytes. Production code MUST
     /// NOT call this — the cap is sized for production memory budgets.

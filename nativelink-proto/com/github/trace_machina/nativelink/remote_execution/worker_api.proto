@@ -165,6 +165,19 @@ message BlobsAvailableNotification {
     /// drop the pin. This protects mirror blobs across server restarts —
     /// the worker holds the only copy until the server is ready to receive.
     repeated build.bazel.remote.execution.v2.Digest pinned_mirror_digests = 13;
+
+    /// Current `mirror_blobs` total bytes held in memory on this worker.
+    /// Reported on every BlobsAvailable so the server's mirror writer
+    /// (`WorkerProxyStore`) can pre-check capacity before consuming a
+    /// source stream. `0` is reported by workers that don't have a CAS
+    /// server / mirror store (the absence of a pin map is indistinguishable
+    /// from "currently empty"); the server's picker treats `0` as
+    /// unknown when paired with `mirror_max_bytes = 0`.
+    uint64 mirror_used_bytes = 14;
+    /// Configured `MIRROR_BLOBS_MAX_BYTES` cap on this worker. `0`
+    /// means unknown — the picker disables the capacity filter for
+    /// this endpoint.
+    uint64 mirror_max_bytes = 15;
 }
 
 /// Notification that blobs have been evicted from a worker.

@@ -63,6 +63,11 @@ pub struct WorkerApiServer {
     locality_map: Option<SharedBlobLocalityMap>,
     /// CAS store for checking blob existence during backfill requests.
     cas_store: Option<Store>,
+    /// Optional handle on the `WorkerProxyStore` so we can plumb
+    /// per-worker mirror capacity reports (review #1) into the
+    /// picker's pre-check filter. None for tests / standalone runs
+    /// without peer mirroring.
+    worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
 }
 
 impl core::fmt::Debug for WorkerApiServer {
@@ -79,6 +84,7 @@ impl WorkerApiServer {
         schedulers: &HashMap<String, Arc<dyn WorkerScheduler>>,
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
+        worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
     ) -> Result<Self, Error> {
         let node_id = {
             let mut out = [0; 6];
@@ -123,6 +129,7 @@ impl WorkerApiServer {
             node_id,
             locality_map,
             cas_store,
+            worker_proxy,
         )
     }
 
@@ -135,6 +142,7 @@ impl WorkerApiServer {
         node_id: [u8; 6],
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
+        worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
     ) -> Result<Self, Error> {
         let scheduler = schedulers
             .get(&config.scheduler)
@@ -151,6 +159,7 @@ impl WorkerApiServer {
             node_id,
             locality_map,
             cas_store,
+            worker_proxy,
         })
     }
 
@@ -230,6 +239,7 @@ impl WorkerApiServer {
             worker_id.clone(),
             self.locality_map.clone(),
             self.cas_store.clone(),
+            self.worker_proxy.clone(),
             worker_cas_endpoint,
             worker_tx,
             update_stream,
@@ -306,6 +316,9 @@ struct WorkerConnection {
     locality_map: Option<SharedBlobLocalityMap>,
     /// CAS store for checking blob existence during backfill.
     cas_store: Option<Store>,
+    /// WorkerProxyStore handle for plumbing per-endpoint mirror
+    /// capacity reports (review #1).
+    worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
     cas_endpoint: String,
     /// Channel to send messages back to this worker.
     worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
@@ -326,6 +339,7 @@ impl WorkerConnection {
         worker_id: WorkerId,
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
+        worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         cas_endpoint: String,
         worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
         mut connection: impl Stream<Item = Result<UpdateForScheduler, Status>> + Unpin + Send + 'static,
@@ -336,6 +350,7 @@ impl WorkerConnection {
             worker_id,
             locality_map,
             cas_store,
+            worker_proxy,
             cas_endpoint,
             worker_tx,
             last_backfill_epoch_secs: AtomicU64::new(0),
@@ -557,6 +572,24 @@ impl WorkerConnection {
             debug!(worker_id=?self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct, "BlobsAvailable received with CPU load");
             if let Err(err) = self.scheduler.update_worker_load(&self.worker_id, cpu_load_pct, p_core_load_pct, e_core_load_pct).await {
                 warn!(worker_id=?self.worker_id, ?err, cpu_load_pct, p_core_load_pct, e_core_load_pct, "Failed to update worker load");
+            }
+        }
+
+        // Mirror capacity report (review #1): the worker advertises its
+        // current `mirror_blobs` total bytes and configured cap on every
+        // BlobsAvailable. Plumb them into the WorkerProxyStore picker
+        // so subsequent mirror writes can pre-check capacity per peer
+        // and avoid consuming a source stream we know cannot be
+        // accepted. mirror_max_bytes == 0 means the worker has no CAS
+        // server / mirror store; skip the report rather than store
+        // (used=0, max=0) which would make `fits()` always succeed.
+        if notification.mirror_max_bytes > 0 {
+            if let Some(ref proxy) = self.worker_proxy {
+                proxy.record_mirror_capacity(
+                    &notification.worker_cas_endpoint,
+                    notification.mirror_used_bytes,
+                    notification.mirror_max_bytes,
+                );
             }
         }
 

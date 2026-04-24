@@ -1116,6 +1116,19 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             p_core_load_pct: p_load,
             e_core_load_pct: e_load,
             pinned_mirror_digests,
+            // Mirror capacity report (review #1): server's picker uses
+            // these to filter peers that cannot fit a blob BEFORE
+            // consuming the source stream. `(0, 0)` for workers with
+            // no CAS server / mirror store ⇒ picker treats as unknown
+            // and disables the filter for this endpoint.
+            mirror_used_bytes: state
+                .cas_server_fss
+                .as_ref()
+                .map_or(0, |fss| fss.mirror_blobs_used_bytes()),
+            mirror_max_bytes: state
+                .cas_server_fss
+                .as_ref()
+                .map_or(0, |fss| fss.mirror_blobs_max_bytes()),
         };
 
         if let Err(err) = grpc_client.blobs_available(notification).await {
@@ -1587,6 +1600,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             p_core_load_pct: p_load,
                                                             e_core_load_pct: e_load,
                                                             pinned_mirror_digests: Vec::new(),
+                                                            mirror_used_bytes: 0,
+                                                            mirror_max_bytes: 0,
                                                         }
                                                     ).await {
                                                         warn!(?err, "Failed to send blobs_available notification");

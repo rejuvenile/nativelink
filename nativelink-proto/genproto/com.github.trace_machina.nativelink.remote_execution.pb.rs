@@ -153,6 +153,17 @@ pub struct BlobsAvailableNotification {
     pub pinned_mirror_digests: ::prost::alloc::vec::Vec<
         super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
     >,
+    /// / Current `mirror_blobs` total bytes held in memory on this worker.
+    /// / Reported on every BlobsAvailable so the server's mirror writer
+    /// / (`WorkerProxyStore`) can pre-check capacity before consuming a
+    /// / source stream.
+    #[prost(uint64, tag = "14")]
+    pub mirror_used_bytes: u64,
+    /// / Configured `MIRROR_BLOBS_MAX_BYTES` cap on this worker. `0`
+    /// / means unknown — the picker disables the capacity filter for
+    /// / this endpoint.
+    #[prost(uint64, tag = "15")]
+    pub mirror_max_bytes: u64,
 }
 /// / Notification that blobs have been evicted from a worker.
 #[derive(Clone, PartialEq, ::prost::Message)]

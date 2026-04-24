@@ -182,6 +182,7 @@ async fn setup_api_server_with_task_limit(
         [1u8; 6],
         None,
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -695,6 +696,7 @@ async fn setup_api_server_with_locality(
         [1u8; 6],
         Some(locality_map.clone()),
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -777,6 +779,9 @@ pub async fn handle_blobs_available_populates_locality_map_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -834,6 +839,9 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -864,6 +872,9 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -917,6 +928,9 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -938,6 +952,9 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -983,6 +1000,9 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1004,6 +1024,9 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1054,6 +1077,9 @@ pub async fn worker_disconnect_cleans_up_locality_map_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1134,6 +1160,9 @@ pub async fn blobs_available_with_malformed_digests_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1183,6 +1212,9 @@ pub async fn blobs_evicted_is_noop_for_wire_compat_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
