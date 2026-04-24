@@ -1082,12 +1082,14 @@ impl WorkerProxyStore {
                     .map_err(|e| make_err!(Code::Internal, "peer task join: {e}"))?;
             }
             // Non-zero digest, no data from either racer — surface NotFound.
-            return Err(make_err!(
-                Code::NotFound,
-                "WorkerProxyStore: both server and peer {} returned empty EOF for non-zero digest {:?} (size_bytes={})",
-                peer_endpoint,
-                digest,
-                digest.size_bytes(),
+            return Err(Error::not_found_with_detail(
+                format!(
+                    "WorkerProxyStore: both server and peer {} returned empty EOF for non-zero digest {:?} (size_bytes={})",
+                    peer_endpoint,
+                    digest,
+                    digest.size_bytes(),
+                ),
+                make_precondition_failure_any(*digest),
             ));
         }
         debug!(
@@ -1120,11 +1122,13 @@ impl WorkerProxyStore {
                 return server_handle.await
                     .map_err(|e| make_err!(Code::Internal, "server task join: {e}"))?;
             }
-            return Err(make_err!(
-                Code::NotFound,
-                "WorkerProxyStore: both peer and server returned empty EOF for non-zero digest {:?} (size_bytes={})",
-                digest,
-                digest.size_bytes(),
+            return Err(Error::not_found_with_detail(
+                format!(
+                    "WorkerProxyStore: both peer and server returned empty EOF for non-zero digest {:?} (size_bytes={})",
+                    digest,
+                    digest.size_bytes(),
+                ),
+                make_precondition_failure_any(*digest),
             ));
         }
         debug!(
