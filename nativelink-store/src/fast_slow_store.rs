@@ -222,6 +222,29 @@ impl FastSlowStore {
         self.in_flight_slow_writes.lock().len()
     }
 
+    /// Test-only: insert a synthetic in-flight slow-write entry. Used by the
+    /// `flush_slow_writes` lost-wakeup regression test to drive the predicate
+    /// without spinning up the full populate machinery.
+    #[doc(hidden)]
+    pub fn test_insert_in_flight(&self, key: StoreKey<'static>, chunks: Vec<Bytes>) {
+        self.in_flight_slow_writes.lock().insert(key, chunks);
+    }
+
+    /// Test-only: remove an in-flight slow-write entry and fire
+    /// `notify_waiters()` if the map is now empty — mirrors the production
+    /// completion path (see lines around `in_flight_empty_notify.notify_waiters()`).
+    #[doc(hidden)]
+    pub fn test_remove_in_flight_and_notify(&self, key: StoreKey<'static>) {
+        let now_empty = {
+            let mut guard = self.in_flight_slow_writes.lock();
+            guard.remove(&key);
+            guard.is_empty()
+        };
+        if now_empty {
+            self.in_flight_empty_notify.notify_waiters();
+        }
+    }
+
     /// Returns the streaming-blob inner for an in-flight populate, if one
     /// exists for `key`. Diagnostic / test helper: lets callers (and
     /// regression tests) inspect terminal state and verify that errors
@@ -260,7 +283,17 @@ impl FastSlowStore {
         loop {
             // Register the notified future BEFORE checking the count to
             // avoid missing a notification between check and await.
+            // `Notify::notified()` does not register interest until the
+            // future is first polled, so we must `pin!` + `enable()` to
+            // arm the subscription before evaluating the predicate.
+            // Otherwise a `notify_waiters()` racing with the predicate
+            // check (e.g. the in-flight write completing concurrently)
+            // is silently dropped — the canonical tokio::sync::Notify
+            // lost-wakeup pattern. See sibling fixes f1750357 (cleanup
+            // wait) and the streaming_blob audit aeb299cfb735c56b1.
             let notified = self.in_flight_empty_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let count = self.in_flight_slow_writes.lock().len();
             if count == 0 {
                 return 0;

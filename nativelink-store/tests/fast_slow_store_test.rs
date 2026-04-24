@@ -2069,3 +2069,112 @@ async fn drain_streaming_buffer_eviction_race_propagates_error() -> Result<(), E
     }
     Ok(())
 }
+
+/// Regression test for the lost-wakeup race in `FastSlowStore::flush_slow_writes`.
+///
+/// `Notify::notified()` does NOT register interest until the returned future is
+/// first polled. The previous implementation was:
+///
+/// ```ignore
+/// let notified = self.in_flight_empty_notify.notified();
+/// // <-- interest NOT yet registered: future not polled
+/// let count = self.in_flight_slow_writes.lock().len();
+/// // <-- racing notify_waiters() here is LOST
+/// timeout_at(deadline, notified).await
+/// ```
+///
+/// The fix is the canonical `pin!` + `enable()` subscribe-before-predicate
+/// pattern — see commit f1750357 (cleanup wait) and the streaming_blob audit
+/// for sibling fixes. With the fix, `enable()` arms the subscription before
+/// the predicate evaluation, so a concurrently-firing `notify_waiters()` is
+/// captured rather than dropped.
+///
+/// Strategy: pre-populate one in-flight entry so `flush_slow_writes` enters
+/// the await path. Drive the race by calling `flush_slow_writes` first (so it
+/// has reached the await), then drain the entry and notify. With the fix the
+/// notify reliably wakes the flush; without it the notify may be lost and
+/// flush blocks until the deadline.
+///
+/// Requires `multi_thread` runtime: the lost-wakeup window between
+/// `notified()` (which does not register interest) and the first poll inside
+/// `timeout_at` is essentially zero on a current-thread runtime — there is no
+/// `.await` between them, so a single-threaded executor cannot interleave the
+/// concurrent `notify_waiters()` call into that window. Real parallelism is
+/// required to reproduce the bug, matching the production deployment.
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn flush_slow_writes_no_lost_wakeup() -> Result<(), Error> {
+    use tokio::sync::Barrier;
+    // Per-iteration timeout. With the fix, every iteration completes in
+    // microseconds. Without the fix, lost-wakeup iterations stall the full
+    // duration — multiplied across iterations, total wall time blows past
+    // any reasonable test budget, which is exactly what we assert on.
+    const PER_ITER_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(200);
+    // Many iterations to give the racing pair (`notify_waiters` vs. the
+    // flush task's predicate-check and first poll of `timeout_at`) lots of
+    // chances to interleave on a multi-thread runtime. Even one missed
+    // wakeup pushes the test budget over.
+    const ITERS: usize = 256;
+    // Per-iteration successful-flush deadline. With the fix, well under 50ms
+    // each. A full-timeout iteration would exceed this.
+    const PER_ITER_BUDGET: core::time::Duration = core::time::Duration::from_millis(150);
+
+    for iter in 0..ITERS {
+        let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let fss = Arc::new(FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Memory(MemorySpec::default()),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+            },
+            fast,
+            slow,
+        ));
+
+        let key: StoreKey<'static> =
+            StoreKey::Digest(DigestInfo::try_new(VALID_HASH, 1).unwrap());
+        fss.test_insert_in_flight(key.clone(), vec![Bytes::from_static(b"x")]);
+
+        // Barrier ensures both racers release at the same instant, maximising
+        // the chance that `notify_waiters()` lands inside the lost-wakeup
+        // window between `notified()` and the first poll of `timeout_at`.
+        let barrier = Arc::new(Barrier::new(2));
+
+        let fss_flush = Arc::clone(&fss);
+        let barrier_flush = Arc::clone(&barrier);
+        let flush_task = tokio::spawn(async move {
+            barrier_flush.wait().await;
+            fss_flush.flush_slow_writes(PER_ITER_TIMEOUT).await
+        });
+
+        let fss_notify = Arc::clone(&fss);
+        let barrier_notify = Arc::clone(&barrier);
+        let key_notify = key.clone();
+        let notify_task = tokio::spawn(async move {
+            barrier_notify.wait().await;
+            fss_notify.test_remove_in_flight_and_notify(key_notify);
+        });
+
+        let start = std::time::Instant::now();
+        let remaining = flush_task
+            .await
+            .map_err(|e| make_err!(Code::Internal, "flush task panic: {e:?}"))?;
+        notify_task
+            .await
+            .map_err(|e| make_err!(Code::Internal, "notify task panic: {e:?}"))?;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            remaining, 0,
+            "iter {iter}: flush_slow_writes returned {remaining} (expected 0); \
+             notify was lost and flush hit the deadline",
+        );
+        assert!(
+            elapsed < PER_ITER_BUDGET,
+            "iter {iter}: flush_slow_writes took {elapsed:?} (expected <{PER_ITER_BUDGET:?}); \
+             lost-wakeup forced a full deadline wait",
+        );
+    }
+    Ok(())
+}
