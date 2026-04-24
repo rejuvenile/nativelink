@@ -2392,6 +2392,14 @@ impl DirectoryCache {
                 let store_keys: Vec<StoreKey<'_>> =
                     unique_digests.iter().map(|d| (*d).into()).collect();
                 let mut has_results = vec![None; store_keys.len()];
+                // Intentionally fast_store-only (NOT the FastSlowStore wrapper):
+                // a positive result here is interpreted as "blob bytes are
+                // present on disk and ready for hardlink". Mirror blobs live
+                // in memory only — treating them as cached would skip the
+                // download path that materializes them on disk for
+                // hardlinking, and the subsequent hardlink would fail. The
+                // populate_and_hardlink path used by the materializer pulls
+                // mirror-only blobs onto disk via the slow store.
                 Pin::new(fss.fast_store())
                     .has_with_results(&store_keys, &mut has_results)
                     .await

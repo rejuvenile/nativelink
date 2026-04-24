@@ -1382,12 +1382,28 @@ pub fn download_to_directory<'a>(
             let store_keys: Vec<StoreKey<'_>> =
                 unique_digests.iter().map(|d| (*d).into()).collect();
             let mut has_results = vec![None; store_keys.len()];
+            // Route via the FastSlowStore wrapper (NOT cas_store.fast_store()).
+            // The wrapper's has_with_results also checks `mirror_blobs` so a
+            // server-pushed mirror copy held in memory is treated as already
+            // present and not re-downloaded. populate_and_hardlink will pull
+            // the bytes onto disk on demand for the actual hardlink. Pre-fix
+            // this asked only the FilesystemStore, so a mirror-only blob
+            // would be re-fetched from the slow store unnecessarily — and on
+            // a server restart with the only durable copy in mirror_blobs,
+            // could appear missing entirely.
+            let cas_store_arc = cas_store.get_arc().ok_or_else(|| {
+                make_err!(
+                    Code::Internal,
+                    "cas_store weak ref upgrade failed during has_with_results"
+                )
+            })?;
+            let cas_store_wrapped = Store::new(cas_store_arc);
             // Check in chunks to reduce Mutex hold time in the fast store,
             // allowing concurrent operations from other actions to interleave.
             const HAS_CHECK_CHUNK: usize = 2000;
             for start in (0..store_keys.len()).step_by(HAS_CHECK_CHUNK) {
                 let end = (start + HAS_CHECK_CHUNK).min(store_keys.len());
-                Pin::new(cas_store.fast_store())
+                cas_store_wrapped
                     .has_with_results(&store_keys[start..end], &mut has_results[start..end])
                     .await
                     .err_tip(|| "Batch has_with_results on fast store")?;
@@ -4484,6 +4500,11 @@ impl RunningActionsManagerImpl {
         &self,
         action_result: &ActionResult,
     ) -> Vec<DigestInfo> {
+        // Safe to read directly from fast_store (skipping the FastSlowStore
+        // wrapper / mirror_blobs path): Tree protos here are produced
+        // locally by the worker's own action upload and written to the
+        // FilesystemStore. Mirror blobs are server-pushed CAS data, never
+        // Tree-shaped, so a mirror-only Tree digest is impossible.
         let fast_store = self.cas_store.fast_store();
         let mut file_digests = Vec::new();
         for folder in &action_result.output_folders {

@@ -693,11 +693,13 @@ impl WorkerConnection {
                 "BlobsAvailable received pinned mirror digests"
             );
         }
-        // Merge into `digests` so the locality registration below covers
-        // them. Cloning into a separate Vec for the pull pipeline keeps
-        // the existence-check scope explicit (we *only* pull mirror digests
-        // bypassing cooldown, not the much larger generic digests set).
-        digests.extend(pinned_mirror.iter().copied());
+        // Pinned-mirror digests are registered in the locality map in a
+        // dedicated `register_blobs` call below (alongside `digests`) — we do
+        // NOT extend `digests` here. Doing so would cause both the generic
+        // backfill path (which respects BACKFILL_COOLDOWN) and the dedicated
+        // mirror-pull path (which bypasses it) to schedule the same uploads;
+        // `backfill_inflight` deduplicates them, but the duplicate work is
+        // wasteful and the duplication obscures intent.
 
         // Acquire the write lock once for all mutations to avoid repeated
         // lock acquisition and eliminate inconsistency windows.
@@ -732,6 +734,14 @@ impl WorkerConnection {
                 "Registering blobs available from worker"
             );
             map.register_blobs(endpoint, &digests);
+        }
+
+        // Register pinned mirror digests in the locality map so reads from
+        // this worker can find them. Kept separate from `digests` so the
+        // mirror-pull path below (which bypasses BACKFILL_COOLDOWN) is the
+        // *only* code path that schedules backfill for these digests.
+        if !pinned_mirror.is_empty() {
+            map.register_blobs(endpoint, &pinned_mirror);
         }
 
         // Mirror-pull pipeline: any digest the worker is holding pinned in

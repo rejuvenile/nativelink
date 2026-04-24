@@ -23,7 +23,7 @@ use std::env;
 use std::process::Stdio;
 use std::sync::{Arc, Weak};
 
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, OptionFuture};
 use futures::stream::FuturesUnordered;
 use futures::{Future, FutureExt, StreamExt, TryFutureExt, select};
 use nativelink_config::cas_server::{EnvironmentSource, LocalWorkerConfig};
@@ -913,7 +913,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         running_actions_manager: &Arc<U>,
         is_first: bool,
     ) -> Result<(), Error> {
-        let (digest_infos, mut evicted_digests, pinned_mirror_digests) = if is_first {
+        let (digest_infos, evicted_digests, pinned_mirror_digests) = if is_first {
             // Full snapshot: scan everything once.
             let all = state.fs_store.get_all_digests_with_timestamps();
             // Drain any changes that accumulated during startup.
@@ -926,17 +926,25 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 })
                 .collect();
 
-            // Mirror digests: full snapshot of currently-pinned mirror blobs.
-            // Drain the change tracker so subsequent deltas start fresh.
-            let mirror_digests = if let Some(ref fss) = state.cas_server_fss {
-                let snap = fss.mirror_blob_digests();
-                drop(fss.drain_mirror_changes());
-                snap.into_iter().map(|d| d.into()).collect()
-            } else {
-                Vec::new()
-            };
+            // Mirror digests: drain deltas FIRST, then take the snapshot
+            // (atomically, under both mirror locks). If we snapshotted first
+            // and then drained, a concurrent `remove_mirror_blobs` could land
+            // between the two calls — its `removed` delta would be discarded
+            // by the snapshot reset and the digest would never reach the
+            // server's locality map cleanup. The snapshot covers all live
+            // pins at the post-drain moment; drained `removed` deltas are
+            // merged into `evicted_digests` so the locality map is cleaned.
+            let (mirror_evicted_protos, mirror_pinned_protos) =
+                if let Some(ref fss) = state.cas_server_fss {
+                    let (mc, snap) = fss.snapshot_and_reset_mirror_changes();
+                    let evicted: Vec<_> = mc.removed.into_iter().map(|d| d.into()).collect();
+                    let pinned: Vec<_> = snap.into_iter().map(|d| d.into()).collect();
+                    (evicted, pinned)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
 
-            (infos, Vec::new(), mirror_digests)
+            (infos, mirror_evicted_protos, mirror_pinned_protos)
         } else {
             // Delta: swap out accumulated changes. Touched digests (from
             // on_get cache hits) are merged with `added` so the server's
@@ -956,8 +964,9 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             let mut evicted_protos: Vec<_> =
                 changes.evicted.iter().map(|d| (*d).into()).collect();
 
-            // Mirror delta: send currently-added pins and merge removed pins
-            // into evicted_digests so the server cleans up locality entries.
+            // Mirror delta: drain → send `added` as `pinned_mirror_digests`
+            // and merge `removed` into `evicted_digests` so the server cleans
+            // up locality entries for blobs we no longer hold.
             let mirror_added_protos: Vec<_> =
                 if let Some(ref fss) = state.cas_server_fss {
                     let mc = fss.drain_mirror_changes();
@@ -971,7 +980,6 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
 
             (infos, evicted_protos, mirror_added_protos)
         };
-        let _ = &mut evicted_digests;
 
         // Collect subtree delta or full snapshot.
         let (cached_directory_digests, added_subtree_digests, removed_subtree_digests, is_full_subtree_snapshot) = if is_first {
@@ -1110,19 +1118,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     loop {
                         // Wait for any of:
                         // 1. A FilesystemStore blob insert/eviction (immediate wake)
-                        // 2. A mirror-blob insert/remove (immediate wake)
+                        // 2. A mirror-blob insert/remove (immediate wake — only
+                        //    armed if a CAS server FastSlowStore exists)
                         // 3. The backstop interval (catches subtree-only changes)
-                        if let Some(ref mn) = mirror_notify {
-                            tokio::select! {
-                                () = state.notify.notified() => {}
-                                () = mn.notified() => {}
-                                () = sleep(state.max_interval) => {}
-                            }
-                        } else {
-                            tokio::select! {
-                                () = state.notify.notified() => {}
-                                () = sleep(state.max_interval) => {}
-                            }
+                        let mirror_wait = OptionFuture::from(
+                            mirror_notify.as_ref().map(|mn| Box::pin(mn.notified())),
+                        );
+                        tokio::select! {
+                            () = state.notify.notified() => {}
+                            Some(()) = mirror_wait => {}
+                            () = sleep(state.max_interval) => {}
                         }
                         Self::send_periodic_blobs_available(
                             &mut grpc_client,
