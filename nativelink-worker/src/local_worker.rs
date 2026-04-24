@@ -1389,7 +1389,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         }
                         Update::BlobsInStableStorage(blobs) => {
                             let digest_count = blobs.digests.len();
+                            info!(
+                                target: "nativelink::stable_storage_received",
+                                digest_count,
+                                "BlobsInStableStorage: arm entered (BEFORE any gate)"
+                            );
                             if let Some(ref state) = self.blobs_available_state {
+                                info!(
+                                    target: "nativelink::stable_storage_gate",
+                                    digest_count,
+                                    "blobs_available_state present, processing"
+                                );
                                 let cas_store_for_ack =
                                     self.running_actions_manager.get_cas_store();
                                 handle_blobs_in_stable_storage(
@@ -1398,6 +1408,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     &blobs.digests,
                                 );
                             } else {
+                                warn!(
+                                    target: "nativelink::stable_storage_gate",
+                                    digest_count,
+                                    "blobs_available_state is None, dropping unpin (BUG?)"
+                                );
                                 trace!(
                                     digest_count,
                                     "BlobsInStableStorage: no FilesystemStore available, ignoring"

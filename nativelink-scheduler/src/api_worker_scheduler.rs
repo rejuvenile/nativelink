@@ -2463,29 +2463,47 @@ impl ApiWorkerScheduler {
         });
 
         // Collect sender handles under a brief read lock, then send outside.
-        let senders: Vec<_> = {
+        let senders: Vec<(WorkerId, _)> = {
             let inner = self.inner.read().await;
             inner
                 .workers
                 .iter()
-                .map(|(_, w)| w.tx.clone())
+                .map(|(id, w)| (id.clone(), w.tx.clone()))
                 .collect()
         };
 
         let worker_count = senders.len();
+        let digest_count = digests.len();
+        info!(
+            target: "nativelink::stable_storage_dispatch",
+            worker_count,
+            digest_count,
+            "broadcast_blobs_in_stable_storage: dispatching to all workers"
+        );
         let mut send_failures = 0usize;
-        for tx in &senders {
-            if tx
-                .send(UpdateForWorker {
-                    update: Some(msg.clone()),
-                })
-                .is_err()
-            {
-                send_failures += 1;
+        for (worker_id, tx) in &senders {
+            match tx.send(UpdateForWorker {
+                update: Some(msg.clone()),
+            }) {
+                Ok(()) => {
+                    info!(
+                        target: "nativelink::stable_storage_dispatch_per_worker",
+                        worker_id = %worker_id,
+                        "BlobsInStableStorage: sent to worker"
+                    );
+                }
+                Err(e) => {
+                    send_failures += 1;
+                    warn!(
+                        target: "nativelink::stable_storage_dispatch_per_worker",
+                        worker_id = %worker_id,
+                        ?e,
+                        "BlobsInStableStorage: send failed"
+                    );
+                }
             }
         }
 
-        let digest_count = digests.len();
         if send_failures > 0 {
             debug!(
                 digest_count,
