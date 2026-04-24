@@ -1604,16 +1604,42 @@ impl StoreDriver for FastSlowStore {
                 Result::<(), Error>::Ok(())
             };
             let (write_result, send_result) = tokio::join!(write_fut, send_fut);
+
+            let slow_ms = slow_start.elapsed().as_millis();
+            let mut result = send_result.and(write_result);
+
+            // Failpoint: force background slow-write failure regardless of
+            // the actual outcome. Used by the race-fix regression test and
+            // by tests that exercise the completion-listener wiring. The
+            // failpoint flips `result` to Err so the failure-recovery path
+            // (pin + failed-set insert) executes, exercising the closed
+            // race window between in_flight removal and pin.
+            #[cfg(feature = "failpoints")]
             {
-                let mut guard = in_flight.lock();
-                guard.remove(&key_for_bg);
-                if guard.is_empty() {
-                    in_flight_empty.notify_waiters();
+                fn forced_failure() -> Result<(), Error> {
+                    fail::fail_point!("fast_slow_background_slow_write_fail", |_| {
+                        Err(make_err!(
+                            Code::Internal,
+                            "failpoint: background slow write forced failure"
+                        ))
+                    });
+                    Ok(())
+                }
+                if let Err(err) = forced_failure() {
+                    result = Err(err);
                 }
             }
-            let slow_ms = slow_start.elapsed().as_millis();
-            let result = send_result.and(write_result);
-            match result {
+
+            // CRITICAL: failure recovery (pin + failed-set insert) MUST run
+            // BEFORE removing from `in_flight_slow_writes`. Previously we
+            // removed first, opening a microseconds-to-ms window in which
+            // the blob was reachable from neither in_flight nor (if
+            // MemoryStore had already evicted) the fast store, while the
+            // ExistenceCache still claimed it existed. Reordering closes
+            // the race: by the time in_flight is empty, the blob is either
+            // pinned in fast store (failure path) or stable_digests has
+            // been notified (success path) and the listener has fired.
+            match &result {
                 Ok(()) => {
                     if let StoreKey::Digest(digest) = &key_for_bg {
                         stable_digests_ref.lock().push(*digest);
@@ -1644,6 +1670,16 @@ impl StoreDriver for FastSlowStore {
                         "FastSlowStore::update: background slow write FAILED — \
                          blob pinned, will retry on reconnect",
                     );
+                }
+            }
+
+            // Now safe to remove the in-flight entry — failure recovery
+            // has already observed the terminal state.
+            {
+                let mut guard = in_flight.lock();
+                guard.remove(&key_for_bg);
+                if guard.is_empty() {
+                    in_flight_empty.notify_waiters();
                 }
             }
         });
@@ -1796,18 +1832,34 @@ impl StoreDriver for FastSlowStore {
                 );
             }
             let slow_start = std::time::Instant::now();
-            let result = slow_store
+            let mut result = slow_store
                 .update_oneshot(key_for_bg.borrow(), data)
                 .await;
+
+            // Failpoint: force background slow-write failure (matches the
+            // failpoint in the streaming `update` path). Tests use this to
+            // verify the post-spawn ordering invariant — failure recovery
+            // (pin + failed-set insert) MUST run before in_flight removal.
+            #[cfg(feature = "failpoints")]
             {
-                let mut guard = in_flight.lock();
-                guard.remove(&key_for_bg);
-                if guard.is_empty() {
-                    in_flight_empty.notify_waiters();
+                fn forced_failure() -> Result<(), Error> {
+                    fail::fail_point!("fast_slow_background_slow_write_fail", |_| {
+                        Err(make_err!(
+                            Code::Internal,
+                            "failpoint: background slow write forced failure"
+                        ))
+                    });
+                    Ok(())
+                }
+                if let Err(err) = forced_failure() {
+                    result = Err(err);
                 }
             }
+
             let slow_ms = slow_start.elapsed().as_millis();
-            match result {
+            // CRITICAL ordering: failure recovery before in_flight removal
+            // (see streaming `update` path for full rationale).
+            match &result {
                 Ok(()) => {
                     if let StoreKey::Digest(digest) = &key_for_bg {
                         stable_digests_ref.lock().push(*digest);
@@ -1836,6 +1888,16 @@ impl StoreDriver for FastSlowStore {
                         "FastSlowStore::update_oneshot: background slow write FAILED — \
                          blob pinned, will retry on reconnect",
                     );
+                }
+            }
+
+            // Now safe to remove in-flight entry — failure recovery has
+            // already run.
+            {
+                let mut guard = in_flight.lock();
+                guard.remove(&key_for_bg);
+                if guard.is_empty() {
+                    in_flight_empty.notify_waiters();
                 }
             }
         });

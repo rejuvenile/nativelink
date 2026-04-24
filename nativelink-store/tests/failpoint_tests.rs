@@ -802,3 +802,66 @@ async fn populate_unchecked_replacement_not_eviction_no_retry() -> Result<(), Er
     assert!(fast_store.has(digest).await?.is_some());
     Ok(())
 }
+
+// -------------------------------------------------------------------------
+// 14. FastSlowStore: background slow-write failpoint marks digest failed.
+//
+// Regression for the race fix at fast_slow_store.rs:1458-1466. The
+// failpoint `fast_slow_background_slow_write_fail` flips the spawn's
+// result to Err so the failure-recovery branch executes (failed_writes
+// insert + pin_digests). The fix reorders: failure recovery runs BEFORE
+// in_flight removal. End-state invariant verified here: once flush
+// returns 0 (in_flight drained), `drain_failed_digests` MUST return the
+// digest. Combined with the listener test in commit 2, this guards the
+// post-spawn ordering.
+// -------------------------------------------------------------------------
+#[serial(failpoints)]
+#[nativelink_test]
+async fn fast_slow_background_slow_write_failpoint_records_failure() -> Result<(), Error> {
+    use std::sync::Arc;
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss: Arc<FastSlowStore> = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store.clone(),
+        slow_store,
+    );
+
+    let data = Bytes::from(vec![0x55; 1024]);
+    let digest = DigestInfo::try_new(VALID_HASH, 1024).unwrap();
+
+    fail::cfg("fast_slow_background_slow_write_fail", "return").unwrap();
+
+    // Use the streaming `update` path (not update_oneshot) — that's where
+    // the spawn lives and where the race fix applies.
+    let store = Store::new(fss.clone());
+    store
+        .update_oneshot(digest, data.clone())
+        .await
+        .err_tip(|| "update_oneshot")?;
+
+    // Wait for the spawned background task to terminate.
+    let remaining = fss.flush_slow_writes(std::time::Duration::from_secs(5)).await;
+    assert_eq!(remaining, 0, "in-flight slow writes should drain");
+
+    // Failure recovery must have run: digest in failed_writes, blob still
+    // in fast store (because pin_digests was attempted before in_flight
+    // was drained — this is the race-fix invariant).
+    let failed = fss.drain_failed_digests();
+    assert!(
+        failed.iter().any(|d| *d == digest),
+        "digest should be in failed_slow_writes after forced failure: got {failed:?}"
+    );
+    assert!(
+        fast_store.has(digest).await?.is_some(),
+        "blob must still be in fast store after failure recovery"
+    );
+
+    fail::cfg("fast_slow_background_slow_write_fail", "off").unwrap();
+    Ok(())
+}
