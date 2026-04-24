@@ -448,82 +448,139 @@ async fn populate_fast_store_uses_mirror_when_disk_empty() {
     assert_eq!(read_back, data);
 }
 
-/// Lock-ordering regression test (review #2): the canonical acquisition
-/// order is `mirror_blobs` BEFORE `mirror_changes`. A previous version of
-/// `snapshot_and_reset_mirror_changes` took the locks in the inverted
-/// order and could AB/BA-deadlock with a concurrent insert/remove.
+/// Lock-ordering regression test (review #2/#4/#5): the canonical
+/// acquisition order is `mirror_blobs` BEFORE `mirror_changes`. A previous
+/// version of `snapshot_and_reset_mirror_changes` took the locks in the
+/// inverted order and could AB/BA-deadlock with a concurrent insert/remove.
 ///
-/// The test runs many iterations of producer (insert), consumer (remove),
-/// and snapshotter (drain+snapshot) tasks in parallel. With the inverted
-/// order, on a multi-core runtime this wedges the test runtime within a
-/// few iterations. With the correct order, all three tasks complete
-/// promptly. We bound completion with a generous wall-clock timeout so a
-/// regression surfaces as a test timeout rather than a hang. Multi-thread
-/// tokio flavor is required: a single-threaded runtime serializes the
-/// tasks and cannot exhibit AB/BA on `parking_lot::Mutex`.
-#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+/// Implementation notes (review #4):
+///   * Run on an OS thread, not a tokio task. A deadlock here will block
+///     ALL tokio worker threads (these are sync `parking_lot::Mutex`
+///     waits, not awaits), so an inner `tokio::time::timeout` would
+///     never fire — we'd wedge the entire test suite. The OS-thread guard
+///     uses `std::sync::mpsc::recv_timeout` so a regression surfaces as
+///     a clean panic ("AB/BA deadlock detected") within 15 seconds.
+///   * 10_000 iterations with NO `yield_now()` — `yield_now()` lets the
+///     scheduler reorder operations, which weakens the contention race.
+///     A regression should show up within a few hundred iterations under
+///     real contention; 10_000 gives a wide safety margin.
+///   * `flavor = "current_thread"` — the contention is between the
+///     spawned OS thread (running the producer/remover/snapshotter on its
+///     own runtime) and... nothing else here. We control the parallelism
+///     directly with three `std::thread::spawn` workers below to ensure
+///     they execute on three real OS threads simultaneously, which is
+///     the only configuration that exhibits the AB/BA race on
+///     `parking_lot::Mutex`.
+#[nativelink_test]
 async fn lock_ordering_no_deadlock_under_contention() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::time::{Duration, timeout};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    let fss = make_fss();
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    const ITERATIONS: u32 = 10_000;
+    const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
-    // Inserter: bursts mirror writes for a series of digests.
-    let inserter = {
-        let fss = fss.clone();
-        let stop = stop.clone();
-        tokio::spawn(async move {
-            for i in 0..200u8 {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let digest = d(i, 1);
-                // Best-effort: cap-exceeded is fine, we only care about
-                // exercising the lock acquisition order.
-                let _ = try_write_mirror(&fss, digest, Bytes::from_static(b"x")).await;
-                tokio::task::yield_now().await;
-            }
+    // The stress workload runs on dedicated OS threads (NOT tokio tasks)
+    // so an AB/BA deadlock on the parking_lot mutexes can't wedge the
+    // tokio worker pool. Each worker thread owns a fresh current-thread
+    // tokio runtime for the async helpers. The outer thread waits via
+    // an std::sync::mpsc::recv_timeout so we surface a deadlock as a
+    // clean panic ("AB/BA deadlock detected") within the bound.
+    //
+    // make_fss() is called inside the stress thread so its construction
+    // sees a tokio context (MemoryStore/FastSlowStore initializers may
+    // touch tokio internals on creation).
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let _runner = std::thread::Builder::new()
+        .name("mirror-lock-ordering-stress".into())
+        .spawn(move || {
+            let setup_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let fss = setup_rt.block_on(async { make_fss() });
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+            // Inserter: bursts mirror writes for a rolling set of digests.
+            // Uses a tokio current-thread runtime per worker so the async
+            // `try_write_mirror` helper can be reused; the locks under
+            // test are sync `parking_lot::Mutex` so the runtime choice
+            // doesn't affect the AB/BA race itself.
+            let t_inserter = {
+                let fss = fss.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        for i in 0..ITERATIONS {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let digest = d((i % 200) as u8, 1);
+                            let _ = try_write_mirror(
+                                &fss,
+                                digest,
+                                Bytes::from_static(b"x"),
+                            )
+                            .await;
+                        }
+                    });
+                })
+            };
+
+            // Remover: same rolling set so insert/remove genuinely contend.
+            let t_remover = {
+                let fss = fss.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    for i in 0..ITERATIONS {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        fss.remove_mirror_blobs(&[d((i % 200) as u8, 1)]);
+                    }
+                })
+            };
+
+            // Snapshotter: this is the call site at risk of AB/BA. Hammer
+            // it from a third thread so all three orderings can interleave.
+            let t_snapshotter = {
+                let fss = fss.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..ITERATIONS {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = fss.snapshot_and_reset_mirror_changes();
+                    }
+                })
+            };
+
+            t_inserter.join().expect("inserter panicked");
+            t_remover.join().expect("remover panicked");
+            t_snapshotter.join().expect("snapshotter panicked");
+            // Best-effort: a deadlocked stress thread will never reach
+            // here; the test failure path is the recv_timeout below.
+            let _ = done_tx.send(());
         })
-    };
+        .expect("spawn stress thread");
 
-    // Remover: removes a rolling subset of digests.
-    let remover = {
-        let fss = fss.clone();
-        let stop = stop.clone();
-        tokio::spawn(async move {
-            for i in 0..200u8 {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                fss.remove_mirror_blobs(&[d(i, 1)]);
-                tokio::task::yield_now().await;
-            }
-        })
-    };
-
-    // Snapshotter: drives `snapshot_and_reset_mirror_changes` (the site of
-    // the AB/BA risk) under contention.
-    let snapshotter = {
-        let fss = fss.clone();
-        let stop = stop.clone();
-        tokio::spawn(async move {
-            for _ in 0..200 {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let _ = fss.snapshot_and_reset_mirror_changes();
-                tokio::task::yield_now().await;
-            }
-        })
-    };
-
-    let all = async {
-        let _ = tokio::join!(inserter, remover, snapshotter);
-    };
-    let res = timeout(Duration::from_secs(15), all).await;
-    stop.store(true, Ordering::Relaxed);
-    res.expect(
-        "lock-ordering AB/BA regression: snapshot+insert+remove wedged within 15s",
-    );
+    match done_rx.recv_timeout(DEADLOCK_TIMEOUT) {
+        Ok(()) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!(
+                "AB/BA deadlock detected: lock-ordering stress did not \
+                 complete {ITERATIONS} iterations within {DEADLOCK_TIMEOUT:?} — \
+                 `snapshot_and_reset_mirror_changes` is likely taking the \
+                 mirror_blobs/mirror_changes locks in the wrong order"
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("stress thread panicked before signaling completion");
+        }
+    }
 }

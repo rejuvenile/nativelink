@@ -759,10 +759,11 @@ impl WorkerConnection {
         }
 
         // Collapse generic + pinned-mirror registrations into a single
-        // `register_blobs` call so we allocate the endpoint `Arc<str>`
+        // `register_blobs_iter` call so we allocate the endpoint `Arc<str>`
         // once per tick instead of twice (10 workers × 100ms = ~200
-        // alloc/sec saved). Pinned-mirror digests still take a SEPARATE
-        // mirror-pull code path below — combining the locality
+        // alloc/sec saved). The iterator form chains both slices without
+        // building an intermediate `Vec`. Pinned-mirror digests still take
+        // a SEPARATE mirror-pull code path below — combining the locality
         // registration does not merge their backfill scheduling.
         if !digests.is_empty() || !pinned_mirror.is_empty() {
             debug!(
@@ -773,17 +774,10 @@ impl WorkerConnection {
                 is_full_snapshot,
                 "Registering blobs available from worker"
             );
-            if pinned_mirror.is_empty() {
-                map.register_blobs(endpoint, &digests);
-            } else if digests.is_empty() {
-                map.register_blobs(endpoint, &pinned_mirror);
-            } else {
-                let mut combined: Vec<DigestInfo> =
-                    Vec::with_capacity(digests.len() + pinned_mirror.len());
-                combined.extend_from_slice(&digests);
-                combined.extend_from_slice(&pinned_mirror);
-                map.register_blobs(endpoint, &combined);
-            }
+            map.register_blobs_iter(
+                endpoint,
+                digests.iter().copied().chain(pinned_mirror.iter().copied()),
+            );
         }
 
         // Mirror-pull pipeline: any digest the worker is holding pinned in

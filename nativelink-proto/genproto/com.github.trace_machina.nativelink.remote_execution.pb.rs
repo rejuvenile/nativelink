@@ -146,9 +146,17 @@ pub struct BlobsAvailableNotification {
     /// / Digests of blobs the worker is holding pinned in memory as a server
     /// / mirror (received via x-nativelink-mirror writes). The worker has no
     /// / disk copy and the server may not have a stable copy yet — the worker
-    /// / is the only durable holder. The server must register these in the
-    /// / locality map AND request `UploadMissingBlobs` for any not yet stably
-    /// / stored. The pin is dropped only when `BlobsInStableStorage` arrives.
+    /// / is the only durable holder.
+    /// /
+    /// / On receiving these, the server MUST:
+    /// /   1. Register them in the locality map (so reads can find them),
+    /// /   2. For digests it does not already have stably stored, request an
+    /// /      `UploadMissingBlobs` so the worker uploads the bytes back to the
+    /// /      server's slow store.
+    /// / Once the server has stably stored a digest it will broadcast a
+    /// / `BlobsInStableStorage` for it; only that signal causes the worker to
+    /// / drop the pin. This protects mirror blobs across server restarts —
+    /// / the worker holds the only copy until the server is ready to receive.
     #[prost(message, repeated, tag = "13")]
     pub pinned_mirror_digests: ::prost::alloc::vec::Vec<
         super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
@@ -156,7 +164,10 @@ pub struct BlobsAvailableNotification {
     /// / Current `mirror_blobs` total bytes held in memory on this worker.
     /// / Reported on every BlobsAvailable so the server's mirror writer
     /// / (`WorkerProxyStore`) can pre-check capacity before consuming a
-    /// / source stream.
+    /// / source stream. `0` is reported by workers that don't have a CAS
+    /// / server / mirror store (the absence of a pin map is indistinguishable
+    /// / from "currently empty"); the server's picker treats `0` as
+    /// / unknown when paired with `mirror_max_bytes = 0`.
     #[prost(uint64, tag = "14")]
     pub mirror_used_bytes: u64,
     /// / Configured `MIRROR_BLOBS_MAX_BYTES` cap on this worker. `0`

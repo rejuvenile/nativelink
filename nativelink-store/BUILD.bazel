@@ -219,6 +219,34 @@ rust_test(
     ],
 )
 
+# Mirror durability integration test. Requires `test-utils` so the
+# `set_mirror_blobs_max_bytes_for_test` and other internal hooks compile.
+# Note: this test depends on `nativelink-store` being built with the same
+# feature; cargo handles this via the dev-dependency chain. Under Bazel,
+# the equivalent end-to-end coverage is the `cargo test --features test-utils`
+# CI step (see `.github/workflows/native-cargo.yaml`); this rust_test entry
+# documents the intent and surfaces it if/when Bazel feature plumbing lands.
+rust_test(
+    name = "mirror_durability_test",
+    timeout = "short",
+    srcs = ["tests/mirror_durability_test.rs"],
+    crate_features = ["test-utils"],
+    proc_macro_deps = [
+        "//nativelink-macro",
+        "@crates//:async-trait",
+    ],
+    deps = [
+        ":nativelink-store",
+        "//nativelink-config",
+        "//nativelink-error",
+        "//nativelink-util",
+        "@crates//:bytes",
+        "@crates//:futures",
+        "@crates//:pretty_assertions",
+        "@crates//:tokio",
+    ],
+)
+
 rust_doc(
     name = "docs",
     crate = ":nativelink-store",

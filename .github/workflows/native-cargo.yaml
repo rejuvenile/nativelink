@@ -51,5 +51,14 @@ jobs:
       - name: Test on ${{ runner.os }}
         run: cargo test --all --profile=smol
 
+      - name: Test mirror durability (test-utils feature)
+        # The mirror_durability / blobs_in_stable_storage / download_to_directory
+        # mirror integration tests are gated on the `test-utils` feature so the
+        # internal-only test hooks (`set_mirror_blobs_max_bytes_for_test`,
+        # `BlobsAvailableState::new_for_test`) cannot leak into release builds.
+        # The default `--all` step above does NOT pass the feature flag, so
+        # these tests would otherwise be silently skipped from CI.
+        run: cargo test -p nativelink-store -p nativelink-worker --features test-utils --tests
+
       - name: Check schema export
         run: cargo run --bin build-schema --features dev-schema --package nativelink-config

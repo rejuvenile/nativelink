@@ -213,6 +213,17 @@ impl BlobLocalityMap {
     /// Arc<str> cloning is avoided for existing endpoints (only atomic refcount
     /// on first insert per endpoint).
     pub fn register_blobs(&mut self, endpoint: &str, digests: &[DigestInfo]) {
+        self.register_blobs_iter(endpoint, digests.iter().copied());
+    }
+
+    /// Iterator-form of [`register_blobs`]. Lets callers chain multiple
+    /// digest sources (e.g. normal `digests` + `pinned_mirror`) without
+    /// allocating a merged `Vec`. The endpoint `Arc<str>` is still
+    /// allocated exactly once.
+    pub fn register_blobs_iter<I>(&mut self, endpoint: &str, digests: I)
+    where
+        I: IntoIterator<Item = DigestInfo>,
+    {
         // Allocate the endpoint Arc<str> once; the EndpointList.insert() only
         // clones it when the endpoint is genuinely new for that digest.
         let ep: Arc<str> = endpoint.into();
@@ -221,7 +232,7 @@ impl BlobLocalityMap {
             .entry(ep.clone())
             .or_insert_with(|| HashSet::with_hasher(DigestBuildHasher));
 
-        for &digest in digests {
+        for digest in digests {
             digest_set.insert(digest);
             self.blobs
                 .entry(digest)
