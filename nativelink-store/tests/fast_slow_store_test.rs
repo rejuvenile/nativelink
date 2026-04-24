@@ -2235,3 +2235,224 @@ async fn fast_slow_store_not_found_carries_precondition_failure_detail() -> Resu
     );
     Ok(())
 }
+
+// ===================================================================
+// Task #124: misleading "fast store item evicted after populate" warn.
+//
+// The terminal-state branch in `FastSlowStore::get_part` previously
+// fired the "evicted after populate" warn for EVERY case where the
+// fast store returned NotFound after the producer terminated — including
+// the very common case where the producer ITSELF failed with NotFound
+// (slow-store had nothing to populate). Production logs (2026-04-24)
+// showed 1825 fires of this warn against 3 stale-positive existence-cache
+// digests in 20 minutes; 100% of the warns were preceded by `head_result
+// Err: NotFound` in `run_producer` — the fast store was never populated,
+// nothing was evicted, the warn message was a lie.
+//
+// The post-fix terminal-state branch consults `terminal_result()` first:
+// - Producer Err  → return that error directly. No fast/slow probe — both
+//   are guaranteed-NotFound (fast was never written; slow was the source
+//   of the producer's NotFound) and the round-trip wastes work AND emits
+//   the misleading warn.
+// - Producer Ok   → fast store HAS the data unless evicted. Probe; on
+//   NotFound, fall back to slow with the (now-accurate) "evicted after
+//   populate" warn.
+// ===================================================================
+
+/// Slow store that fails `has` with NotFound and counts every
+/// `has_with_results` and `get_part` call. Used to assert that a
+/// failed-populate get_part does NOT re-issue the slow-store probe
+/// after the producer already proved the slow store has nothing.
+#[derive(MetricsComponent)]
+struct CountingNotFoundSlowStore {
+    has_calls: Arc<core::sync::atomic::AtomicU32>,
+    get_calls: Arc<core::sync::atomic::AtomicU32>,
+}
+
+#[async_trait]
+impl StoreDriver for CountingNotFoundSlowStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.has_calls.fetch_add(1, Ordering::Relaxed);
+        for r in results.iter_mut() {
+            *r = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _digest: StoreKey<'_>,
+        _reader: nativelink_util::buf_channel::DropCloserReadHalf,
+        _size_info: nativelink_util::store_trait::UploadSizeInfo,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        self.get_calls.fetch_add(1, Ordering::Relaxed);
+        Err(make_err!(Code::NotFound, "CountingNotFoundSlowStore: blob absent"))
+    }
+
+    fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+        self
+    }
+
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+default_health_status_indicator!(CountingNotFoundSlowStore);
+
+/// Regression for the misleading-warn / wasted-slow-probe flow in
+/// the `is_terminal()` branch of `FastSlowStore::get_part`.
+///
+/// Pre-fix: when a waiter arrives AFTER the producer has terminated
+/// with an Err (e.g. slow store had nothing to populate), the
+/// terminal-state branch probes the fast store (NotFound — never
+/// populated), then FALLS THROUGH to `slow_store.get_part` (NotFound
+/// again), emitting the misleading "fast store item evicted after
+/// populate" warn. The redundant probe AND the misleading warn fire
+/// on EVERY waiter that hits the terminal branch.
+///
+/// Post-fix: the terminal-state branch consults `terminal_result()`
+/// first and returns the producer's error directly — no fast probe,
+/// no slow fallback, no misleading warn.
+///
+/// Determinism: we drive a producer to a terminal-Err state directly
+/// via `populating_streaming_inner` injection rather than racing two
+/// `get_part` calls (which would non-deterministically hit either the
+/// streaming-read path OR the terminal-state branch depending on
+/// scheduler whim). The test preconditions (post-injection,
+/// `is_terminal() == true`, `terminal_result() == Some(Err(_))`) match
+/// the production state captured in journalctl: producer ran, slow
+/// store said NotFound, send_error fired, LoaderGuard's Drop already
+/// removed the populating_digests entry, then a NEW waiter arrives.
+#[nativelink_test]
+async fn failed_populate_does_not_reissue_slow_store_probe() -> Result<(), Error> {
+    use nativelink_util::streaming_blob::StreamingBlobWriter;
+
+    let has_calls = Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let get_calls = Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let slow_inner = Arc::new(CountingNotFoundSlowStore {
+        has_calls: Arc::clone(&has_calls),
+        get_calls: Arc::clone(&get_calls),
+    });
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(slow_inner);
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+
+    // First call: drives the streaming-populate path. Producer spawns,
+    // slow_store.has() returns NotFound (head_result Err), `send_error`
+    // fires on the streaming buffer, the waiter's streaming-read loop
+    // observes the error and falls back to `slow_store.get_part` (a
+    // SEPARATE warn path, not the one under test). After this call
+    // returns, the producer has terminated and `LoaderGuard::Drop` has
+    // removed the populating_digests entry.
+    let result = fast_slow_store.get_part_unchunked(digest, 0, None).await;
+    let err = result.err().expect("expected NotFound");
+    assert_eq!(err.code, Code::NotFound, "first call got: {err:?}");
+
+    // Snapshot counters AFTER the first call completes — the assertion
+    // below measures only the second call's slow-store traffic.
+    let has_after_first = has_calls.load(Ordering::Relaxed);
+    let get_after_first = get_calls.load(Ordering::Relaxed);
+
+    // Pre-arm the terminal-state branch deterministically. Inject a
+    // freshly-constructed populating_digests entry whose StreamingBlob
+    // is ALREADY in terminal-Err state. A subsequent `get_part` will
+    // call `spawn_populate_producer_with_role`, find the entry as a
+    // waiter (`is_new=false`, no producer spawn), see `is_terminal()`
+    // == true, and execute the branch under test.
+    {
+        use nativelink_util::streaming_blob::StreamingBlobInner;
+        let inner = Arc::new(StreamingBlobInner::new(digest, 64 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        writer.send_error(make_err!(
+            Code::NotFound,
+            "synthetic terminal-error reproducing run_producer's head_result Err"
+        ));
+        drop(writer);
+        assert!(inner.is_terminal(), "writer.send_error must mark terminal");
+        assert!(inner.has_error(), "terminal must be Err, not Ok");
+        // SAFETY-OF-CONTRACT: this hook puts the FastSlowStore in the
+        // exact state the production logs show (terminal-Err
+        // streaming_inner registered for the digest) so the second
+        // get_part deterministically enters the terminal-state branch.
+        fast_slow_store.test_install_terminal_populate(digest.into(), inner);
+    }
+
+    // Second call: enters `spawn_populate_producer_with_role` as a
+    // WAITER (the entry already exists, no fresh spawn), sees
+    // `is_terminal()` == true, and executes the branch under test.
+    //
+    // Pre-fix: probes fast_store (NotFound), emits the misleading
+    // "fast store item evicted after populate" warn, falls through to
+    // `slow_store.get_part` (NotFound) — bumps get_calls by 1.
+    //
+    // Post-fix: `terminal_result()` is consulted first; the producer's
+    // error is returned directly. get_calls stays the same.
+    let result_2 = fast_slow_store.get_part_unchunked(digest, 0, None).await;
+    let err_2 = result_2.err().expect("expected NotFound on second call");
+    assert_eq!(err_2.code, Code::NotFound, "second call got: {err_2:?}");
+
+    let has_after_second = has_calls.load(Ordering::Relaxed);
+    let get_after_second = get_calls.load(Ordering::Relaxed);
+
+    // No fresh producer should have run (we injected a pre-terminated
+    // streaming_inner, so the second call should be a waiter). Hence
+    // has_calls should NOT have bumped.
+    assert_eq!(
+        has_after_second, has_after_first,
+        "second call should NOT spawn a fresh producer (test injected a \
+         pre-terminated populating_digests entry). had {has_after_first}, \
+         then {has_after_second}",
+    );
+
+    // The redundant slow-store get_part is the bug: the
+    // terminal-state branch must NOT re-probe the slow store after the
+    // producer already returned NotFound.
+    assert_eq!(
+        get_after_second, get_after_first,
+        "REGRESSION: terminal-state branch re-probed slow store after \
+         producer already returned NotFound. Pre-fix this fires the \
+         misleading 'fast store item evicted after populate' warn for \
+         every waiter. Got {get_after_second} get_part calls; expected \
+         {get_after_first} (no extra probe).",
+    );
+
+    Ok(())
+}
