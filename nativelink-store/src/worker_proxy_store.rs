@@ -1347,18 +1347,56 @@ impl WorkerProxyStore {
     /// includes mirror-bytes fields. Used by `pick_mirror_endpoint_*`
     /// to filter peers whose `(used + size_bytes) > max` BEFORE the
     /// source stream is consumed (review #1).
+    ///
+    /// Short-circuits when `(used_bytes, max_bytes)` is unchanged from the
+    /// last report (review #10) — workers tick every ~100ms and a
+    /// long-running cluster can spin record_mirror_capacity at ~100/s/peer
+    /// taking the RwLock::write each time. The early-return uses the
+    /// read lock and `RwLock` upgrades only on a real change.
     pub fn record_mirror_capacity(
         &self,
         endpoint: &str,
         used_bytes: u64,
         max_bytes: u64,
     ) {
+        // Read-only fast path: skip the write lock when the value hasn't
+        // changed since the last tick. Most ticks are no-ops.
+        {
+            let state = self.mirror_state.read();
+            if let Some(entry) = state.get(endpoint) {
+                if entry.mirror_used_bytes == Some(used_bytes)
+                    && entry.mirror_max_bytes == Some(max_bytes)
+                {
+                    return;
+                }
+            }
+        }
         let mut state = self.mirror_state.write();
         let entry = state
             .entry(Arc::from(endpoint))
             .or_insert_with(MirrorEndpointState::new);
         entry.mirror_used_bytes = Some(used_bytes);
         entry.mirror_max_bytes = Some(max_bytes);
+    }
+
+    /// Test-only accessor: returns the last-reported `(used, max)` for
+    /// `endpoint`, or `None` if no capacity report has been recorded.
+    /// Used by integration tests to assert that `BlobsAvailable`
+    /// capacity fields are plumbed end-to-end through
+    /// `WorkerApiServer::handle_blobs_available`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn mirror_capacity_for_test(
+        &self,
+        endpoint: &str,
+    ) -> Option<(u64, u64)> {
+        let state = self.mirror_state.read();
+        state.get(endpoint).and_then(|entry| {
+            match (entry.mirror_used_bytes, entry.mirror_max_bytes) {
+                (Some(u), Some(m)) => Some((u, m)),
+                _ => None,
+            }
+        })
     }
 
     /// Record a mirror-write failure against `endpoint` according to its

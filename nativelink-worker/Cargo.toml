@@ -103,3 +103,7 @@ required-features = ["test-utils"]
 [[test]]
 name = "download_to_directory_mirror_test"
 required-features = ["test-utils"]
+
+[[test]]
+name = "end_to_end_mirror_reconciliation_test"
+required-features = ["test-utils"]
