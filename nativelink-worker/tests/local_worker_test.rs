@@ -1239,32 +1239,40 @@ async fn worker_translates_not_found_to_failed_precondition_test() -> Result<(),
         .await;
 
     // Make the action fail with a NotFound error during get_finished_result.
-    // This simulates a missing input blob scenario.
+    // The "not found in" substring matches what production CAS-miss errors
+    // look like (e.g. "Blob ... not found in inner store or any worker") and
+    // is what `local_worker.rs` looks for to trigger REAPI translation.
     running_action
-        .simple_expect_get_finished_result(Err(make_err!(Code::NotFound, "Object not found")))
+        .simple_expect_get_finished_result(Err(make_err!(
+            Code::NotFound,
+            "Blob abc not found in inner store or any worker"
+        )))
         .await?;
 
     // Now our client should be notified that our runner finished.
     let execution_response = test_context.client.expect_execution_response(Ok(())).await;
 
-    // The worker should have translated NotFound into FailedPrecondition per the REAPI spec.
-    let error_status = match execution_response.result {
-        Some(execute_result::Result::InternalError(status)) => status,
-        other => panic!(
-            "Expected InternalError result, got: {:?}",
-            other
-        ),
+    // The worker should have translated NotFound into FailedPrecondition per
+    // the REAPI spec. Translation produces an ExecuteResponse whose status
+    // carries the re-stamped code so Bazel's recovery path can re-upload.
+    let execute_response = match execution_response.result {
+        Some(execute_result::Result::ExecuteResponse(resp)) => resp,
+        other => panic!("Expected ExecuteResponse result, got: {other:?}"),
     };
 
+    let status = execute_response
+        .status
+        .expect("translated ExecuteResponse must carry a status");
     assert_eq!(
-        error_status.code,
+        status.code,
         Code::FailedPrecondition as i32,
-        "Expected NotFound to be translated to FailedPrecondition"
+        "Expected NotFound to be translated to FailedPrecondition, got message: {}",
+        status.message
     );
     assert!(
-        error_status.message.contains("One or more input blobs missing"),
-        "Expected error message to contain 'One or more input blobs missing', got: {}",
-        error_status.message
+        status.message.contains("not found in"),
+        "Expected status message to preserve original 'not found in' context, got: {}",
+        status.message
     );
 
     Ok(())
