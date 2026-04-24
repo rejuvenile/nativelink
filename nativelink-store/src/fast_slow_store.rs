@@ -1915,10 +1915,10 @@ impl StoreDriver for FastSlowStore {
         let slow_store = self.slow_store.clone();
         let key_for_bg = owned_key.clone();
         let spawn_instant = std::time::Instant::now();
-        debug!(
+        info!(
             ?key,
-            total_bytes = bytes_sent,
-            "FastSlowStore::update: background slow write starting",
+            bytes_sent,
+            "FastSlowStore::update: background slow write spawned",
         );
         tokio::spawn(async move {
             let schedule_delay_ms = spawn_instant.elapsed().as_millis();
@@ -1926,7 +1926,7 @@ impl StoreDriver for FastSlowStore {
                 warn!(
                     key = ?key_for_bg,
                     schedule_delay_ms,
-                    total_bytes = bytes_sent,
+                    bytes_sent,
                     "FastSlowStore: background slow write task was \
                      delayed before starting",
                 );
@@ -1997,11 +1997,11 @@ impl StoreDriver for FastSlowStore {
                         stable_digests_ref.lock().push(*digest);
                         stable_notify_ref.notify_one();
                     }
-                    debug!(
+                    info!(
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
-                        total_bytes = bytes_sent,
+                        bytes_sent,
                         "FastSlowStore::update: background slow write complete",
                     );
                 }
@@ -2017,7 +2017,7 @@ impl StoreDriver for FastSlowStore {
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
-                        total_bytes = bytes_sent,
+                        bytes_sent,
                         error = ?e,
                         "FastSlowStore::update: background slow write FAILED — \
                          blob pinned, will retry on reconnect",
@@ -2146,10 +2146,10 @@ impl StoreDriver for FastSlowStore {
         let slow_store = self.slow_store.clone();
         let key_for_bg = owned_key.clone();
         let spawn_instant = std::time::Instant::now();
-        debug!(
+        info!(
             ?key,
             data_len,
-            "FastSlowStore::update_oneshot: background slow write starting",
+            "FastSlowStore::update_oneshot: background slow write spawned",
         );
         tokio::spawn(async move {
             let schedule_delay_ms = spawn_instant.elapsed().as_millis();
@@ -2196,7 +2196,7 @@ impl StoreDriver for FastSlowStore {
                         stable_digests_ref.lock().push(*digest);
                         stable_notify_ref.notify_one();
                     }
-                    debug!(
+                    info!(
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
