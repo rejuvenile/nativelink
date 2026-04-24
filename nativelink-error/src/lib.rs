@@ -51,13 +51,123 @@ macro_rules! error_if {
     }};
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Error {
     #[serde(with = "CodeDef")]
     pub code: Code,
     pub messages: Vec<String>,
     #[serde(skip)]
     pub details: Vec<prost_types::Any>,
+}
+
+/// Local mirror of `google.rpc.PreconditionFailure` (defined again in
+/// `nativelink-util::common` for callers; replicated here to keep
+/// `nativelink-error` cycle-free). Used only by the custom `Debug` impl
+/// to decode `Error::details` entries whose `type_url` is the REAPI v2
+/// MISSING-violation type, so high-frequency NotFound logs stay compact
+/// instead of dumping the encoded protobuf as a decimal byte array.
+#[derive(prost::Message)]
+struct DebugPreconditionFailure {
+    #[prost(message, repeated, tag = "1")]
+    violations: Vec<DebugViolation>,
+}
+
+#[derive(prost::Message)]
+struct DebugViolation {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    subject: String,
+    #[prost(string, tag = "3")]
+    description: String,
+}
+
+const PRECONDITION_FAILURE_TYPE_URL: &str =
+    "type.googleapis.com/google.rpc.PreconditionFailure";
+
+/// `Debug` adapter for a single `prost_types::Any`: decodes well-known
+/// types (currently `google.rpc.PreconditionFailure`) into a compact,
+/// human-readable summary; for unknown types, emits `Any { type_url, len }`
+/// instead of dumping `value` as a decimal byte array. Without this,
+/// every NotFound log line carrying a REAPI MISSING detail printed
+/// ~1KB of `[10, 88, 10, 7, ...]` and starved the tracing-appender.
+struct AnyDebug<'a>(&'a prost_types::Any);
+
+impl core::fmt::Debug for AnyDebug<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.type_url == PRECONDITION_FAILURE_TYPE_URL {
+            // Best-effort decode. Fall through to byte-count summary on
+            // failure rather than panicking — a malformed detail must
+            // never break logging.
+            if let Ok(pf) = <DebugPreconditionFailure as prost::Message>::decode(
+                self.0.value.as_slice(),
+            ) {
+                let mut dbg = f.debug_struct("PreconditionFailure");
+                dbg.field("violations", &ViolationsDebug(&pf.violations));
+                return dbg.finish();
+            }
+        }
+        f.debug_struct("Any")
+            .field("type_url", &self.0.type_url)
+            .field("len", &self.0.value.len())
+            .finish()
+    }
+}
+
+struct ViolationsDebug<'a>(&'a [DebugViolation]);
+
+impl core::fmt::Debug for ViolationsDebug<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut list = f.debug_list();
+        for v in self.0 {
+            list.entry(&ViolationDebug(v));
+        }
+        list.finish()
+    }
+}
+
+struct ViolationDebug<'a>(&'a DebugViolation);
+
+impl core::fmt::Debug for ViolationDebug<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut dbg = f.debug_struct("Violation");
+        dbg.field("type", &self.0.r#type);
+        dbg.field("subject", &self.0.subject);
+        if !self.0.description.is_empty() {
+            dbg.field("description", &self.0.description);
+        }
+        dbg.finish()
+    }
+}
+
+struct DetailsDebug<'a>(&'a [prost_types::Any]);
+
+impl core::fmt::Debug for DetailsDebug<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut list = f.debug_list();
+        for any in self.0 {
+            list.entry(&AnyDebug(any));
+        }
+        list.finish()
+    }
+}
+
+impl core::fmt::Debug for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Manually mirrored against `Display` below so `{:?}` and `{}`
+        // produce the same field set; the only divergence from a derived
+        // `Debug` is the `details` formatter (compact decode of REAPI
+        // PreconditionFailure, byte-count fallback for unknown types).
+        let mut builder = f.debug_struct("Error");
+        builder.field("code", &self.code);
+        if !self.messages.is_empty() {
+            builder.field("messages", &self.messages);
+        }
+        if !self.details.is_empty() {
+            builder.field("details", &DetailsDebug(&self.details));
+        }
+        builder.finish()
+    }
 }
 
 impl MetricsComponent for Error {
@@ -187,6 +297,9 @@ impl From<nativelink_proto::google::rpc::Status> for Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // A manual impl to reduce the noise of frequently empty fields.
+        // `details` is rendered through `DetailsDebug` so REAPI MISSING
+        // payloads decode to a compact summary instead of dumping the
+        // encoded bytes as a decimal array (would flood server logs).
         let mut builder = f.debug_struct("Error");
 
         builder.field("code", &self.code);
@@ -196,7 +309,7 @@ impl core::fmt::Display for Error {
         }
 
         if !self.details.is_empty() {
-            builder.field("details", &self.details);
+            builder.field("details", &DetailsDebug(&self.details));
         }
 
         builder.finish()
@@ -734,5 +847,196 @@ mod tests {
         assert_eq!(err.code, Code::NotFound);
         assert!(err.details.is_empty());
         assert!(err.message_string().contains("plain message"));
+    }
+
+    /// Build a realistic `PreconditionFailure` Any payload — same wire shape
+    /// `nativelink_util::common::make_precondition_failure_any` produces for
+    /// a missing-blob NotFound. Uses raw prost encoding so this test does
+    /// not depend on `nativelink-util` (would create a cycle).
+    fn sample_precondition_failure_any(subject: &str) -> prost_types::Any {
+        // PreconditionFailure { violations: [Violation { type, subject, description }] }
+        // Hand-encode with prost::Message via a local mirror of the proto.
+        #[derive(prost::Message)]
+        struct Violation {
+            #[prost(string, tag = "1")]
+            r#type: String,
+            #[prost(string, tag = "2")]
+            subject: String,
+            #[prost(string, tag = "3")]
+            description: String,
+        }
+        #[derive(prost::Message)]
+        struct PreconditionFailure {
+            #[prost(message, repeated, tag = "1")]
+            violations: Vec<Violation>,
+        }
+        let pf = PreconditionFailure {
+            violations: vec![Violation {
+                r#type: "MISSING".into(),
+                subject: subject.into(),
+                description: String::new(),
+            }],
+        };
+        prost_types::Any {
+            type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+            value: prost::Message::encode_to_vec(&pf),
+        }
+    }
+
+    #[test]
+    fn debug_format_decodes_precondition_failure_compactly() {
+        // A real on-the-wire MISSING violation for a long blob subject —
+        // the kind that floods server logs at ~1500 lines/sec via
+        // not_found_with_detail. The derived `Debug` for `Vec<u8>` would
+        // print every byte as a decimal (e.g. `[10, 88, 10, 7, 77, ...]`),
+        // consuming ~1KB/line and falling tracing-appender 30-90s behind.
+        let detail = sample_precondition_failure_any(
+            "blobs/8513dc4e1a2b3c4d5e6f70819293a4b5c6d7e8f9001020304050607080910abc/183",
+        );
+        // Sanity: the encoded bytes really are long enough to flood logs
+        // if printed as a decimal array.
+        assert!(
+            detail.value.len() > 60,
+            "test fixture must be wide enough to expose the byte-array bug",
+        );
+
+        let err = Error::not_found_with_detail("Object not found in store", detail);
+        let formatted = format!("{err:?}");
+
+        // Semantic info must survive — readers need to know it's a
+        // PreconditionFailure with the missing blob's subject.
+        assert!(
+            formatted.contains("PreconditionFailure"),
+            "Debug must mention PreconditionFailure; got: {formatted}",
+        );
+        assert!(
+            formatted.contains("MISSING"),
+            "Debug must mention the violation type MISSING; got: {formatted}",
+        );
+        assert!(
+            formatted.contains("blobs/8513dc4e"),
+            "Debug must include the violation subject; got: {formatted}",
+        );
+
+        // The bug pattern: derived Debug renders Vec<u8> as
+        // `[10, 88, 10, 7, ...]`. Forbid any decimal-array prefix of more
+        // than 8 numbers — that's the signature of a raw bytes dump.
+        let decimal_array = regex_like_decimal_run(&formatted);
+        assert!(
+            decimal_array <= 8,
+            "Debug must not dump bytes as a decimal array (found run of {decimal_array}); got: {formatted}",
+        );
+
+        // Compact: a single-violation NotFound must not exceed 400 chars.
+        // The pre-fix derived Debug ran ~600+ chars on this fixture.
+        assert!(
+            formatted.len() < 400,
+            "Debug must stay compact (<400 chars); got {} chars: {formatted}",
+            formatted.len(),
+        );
+
+        // Code and message must still print.
+        assert!(formatted.contains("NotFound"));
+        assert!(formatted.contains("Object not found in store"));
+    }
+
+    #[test]
+    fn debug_format_unknown_type_url_falls_back_to_byte_count() {
+        // Anys with type_urls we don't know how to decode must still
+        // collapse to a compact byte-count summary instead of a raw byte
+        // dump — same property as the PreconditionFailure path.
+        let detail = prost_types::Any {
+            type_url: "type.googleapis.com/some.unknown.Type".into(),
+            value: vec![42u8; 200],
+        };
+        let err = Error {
+            code: Code::Internal,
+            messages: vec!["unknown detail".into()],
+            details: vec![detail],
+        };
+        let formatted = format!("{err:?}");
+
+        let decimal_array = regex_like_decimal_run(&formatted);
+        assert!(
+            decimal_array <= 8,
+            "unknown-type Debug must not dump bytes as a decimal array (run of {decimal_array}); got: {formatted}",
+        );
+        assert!(
+            formatted.contains("200 bytes") || formatted.contains("len: 200"),
+            "unknown-type Debug must indicate the byte length; got: {formatted}",
+        );
+        assert!(
+            formatted.contains("some.unknown.Type"),
+            "unknown-type Debug must preserve the type_url; got: {formatted}",
+        );
+        assert!(
+            formatted.len() < 200,
+            "unknown-type Debug stays compact (<200 chars); got {} chars: {formatted}",
+            formatted.len(),
+        );
+    }
+
+    #[test]
+    fn debug_format_no_details_unchanged() {
+        // No details: the field should be omitted (matches existing
+        // Display behavior so production logs stay clean).
+        let err = Error {
+            code: Code::Internal,
+            messages: vec!["boom".into()],
+            details: Vec::new(),
+        };
+        let formatted = format!("{err:?}");
+        assert!(formatted.contains("Internal"));
+        assert!(formatted.contains("boom"));
+        assert!(
+            !formatted.contains("details"),
+            "details field should be omitted when empty; got: {formatted}",
+        );
+    }
+
+    /// Find the longest run of consecutive `<int>, ` (or `<int>]`) tokens
+    /// in `s` — the signature of a `Vec<u8>` Debug dump. Returns the count
+    /// of decimal numbers in the longest such run. A "run" must look like
+    /// `[N, N, N, ...]` to match — isolated numbers in legitimate text
+    /// (e.g. byte counts, lengths) won't trigger.
+    fn regex_like_decimal_run(s: &str) -> usize {
+        let bytes = s.as_bytes();
+        let mut max_run = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'[' {
+                i += 1;
+                continue;
+            }
+            // Try to walk a `[N, N, N, ...]` sequence starting at i.
+            let mut j = i + 1;
+            let mut count = 0usize;
+            loop {
+                // Skip optional whitespace.
+                while j < bytes.len() && bytes[j] == b' ' {
+                    j += 1;
+                }
+                // Need at least one digit.
+                let start = j;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j == start {
+                    break;
+                }
+                count += 1;
+                // After a number, require either `, ` (continue) or `]` (end).
+                if j < bytes.len() && bytes[j] == b',' {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            if count > max_run {
+                max_run = count;
+            }
+            i = j.max(i + 1);
+        }
+        max_run
     }
 }
