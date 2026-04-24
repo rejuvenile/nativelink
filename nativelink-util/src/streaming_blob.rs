@@ -90,6 +90,20 @@ pub struct StreamingBlobInner {
     /// `notify_waits_over_5s_total()` for production scraping; lets us
     /// verify whether the 646d7623 fix eliminated the lost-wakeup wedge.
     notify_waits_over_5s: AtomicU64,
+
+    /// Tokio task ID of the producer at construction time. `None` if
+    /// the inner is built outside a *spawned* tokio task —
+    /// `tokio::task::try_id()` returns `None` from `block_on` futures.
+    /// In production every streaming_blob writer is built from a
+    /// spawned task (e.g. `ByteStreamServer::write`, worker background
+    /// uploads), so this is consistently `Some`. When the next-chunk
+    /// deadline fires with `terminal_present: false`, this names the
+    /// task to grep for in the worker journal/log: the producer that
+    /// is wedged upstream of streaming_blob (e.g. blocked on a gRPC
+    /// read with no per-frame deadline). Without this, the deadline
+    /// log only names the digest, and the operator has no way to
+    /// correlate the wedge to a specific upload context.
+    producer_task_id: Option<String>,
 }
 
 impl fmt::Debug for StreamingBlobInner {
@@ -104,12 +118,21 @@ impl fmt::Debug for StreamingBlobInner {
             )
             .field("max_buffer_bytes", &self.max_buffer_bytes)
             .field("terminal", &self.terminal.lock().is_some())
+            .field("producer_task_id", &self.producer_task_id)
             .finish()
     }
 }
 
 impl StreamingBlobInner {
     pub fn new(digest: DigestInfo, max_buffer_bytes: u64) -> Self {
+        // Capture the producer's tokio task ID at construction time. The
+        // writer that constructs this `Inner` is, by convention, the
+        // producer task. `try_id` returns `None` when called outside a
+        // tokio task (e.g. from a synchronous thread or from one of our
+        // own unit tests that constructs `Inner` directly without a
+        // runtime); record it as a string so the eventual deadline log
+        // line can emit a stable, ungated value.
+        let producer_task_id = tokio::task::try_id().map(|id| id.to_string());
         Self {
             chunks: RwLock::new(VecDeque::new()),
             chunk_count: AtomicU64::new(0),
@@ -121,7 +144,15 @@ impl StreamingBlobInner {
             earliest_chunk_idx: AtomicU64::new(0),
             created_at: Instant::now(),
             notify_waits_over_5s: AtomicU64::new(0),
+            producer_task_id,
         }
+    }
+
+    /// Tokio task ID of the producer captured at `Inner` construction
+    /// time. See [`StreamingBlobInner::producer_task_id`] field doc for
+    /// rationale.
+    pub fn producer_task_id(&self) -> Option<&str> {
+        self.producer_task_id.as_deref()
     }
 
     /// Total `next_chunk` notify waits observed exceeding
@@ -517,6 +548,7 @@ impl StreamingBlobReader {
                 //            streaming_blob (e.g. blocked on a gRPC read with
                 //            no per-frame deadline, holding a lock, or the
                 //            tokio task is starved). Bug lives upstream.
+                let producer_tid = self.inner.producer_task_id.as_deref().unwrap_or("<none>");
                 if terminal_present {
                     error!(
                         digest = %self.inner.digest,
@@ -525,6 +557,7 @@ impl StreamingBlobReader {
                         chunk_count,
                         earliest,
                         wait_ms = wait_elapsed.as_millis() as u64,
+                        producer_task_id = %producer_tid,
                         "streaming blob reader notify deadline exceeded — \
                          terminal IS set, this is a genuine lost wakeup"
                     );
@@ -536,10 +569,24 @@ impl StreamingBlobReader {
                         chunk_count,
                         earliest,
                         wait_ms = wait_elapsed.as_millis() as u64,
+                        producer_task_id = %producer_tid,
                         "streaming blob reader notify deadline exceeded — \
                          terminal NOT set, producer is wedged upstream \
                          (e.g. gRPC read with no deadline, or task starvation)"
                     );
+                    // Force a thread-stack dump at the EXACT moment of the
+                    // wedge — this is the most decisive single artifact for
+                    // diagnosing what the producer task is parked on. The
+                    // standard StallGuard rate-limit is bypassed because the
+                    // streaming_blob deadline is itself a targeted-detector
+                    // signal (not a generic guard); without this, the dump
+                    // is suppressed if a sibling guard fired moments before.
+                    let label = format!(
+                        "streaming_blob_deadline digest={} producer_task={}",
+                        self.inner.digest,
+                        producer_tid,
+                    );
+                    crate::stall_detector::force_dump_thread_stacks(&label);
                 }
                 return Err(make_err!(
                     Code::DeadlineExceeded,
@@ -1466,6 +1513,68 @@ mod tests {
             inner.notify_waits_over_5s_total(),
             1,
             "expected slow-wait counter to increment exactly once"
+        );
+    }
+
+    /// Spec: when constructed inside a tokio task, `producer_task_id`
+    /// MUST be set so the deadline log can name the wedge culprit.
+    /// When constructed outside a tokio task, `producer_task_id` MUST
+    /// be `None` and not panic.
+    #[test]
+    fn producer_task_id_none_outside_runtime() {
+        // Construct StreamingBlob *outside* any tokio runtime — emulates
+        // synthetic code paths and proves we don't panic on `try_id`.
+        let inner = Arc::new(StreamingBlobInner::new(test_digest(123), 1024));
+        assert!(
+            inner.producer_task_id().is_none(),
+            "producer_task_id must be None outside a tokio task, got {:?}",
+            inner.producer_task_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn producer_task_id_some_inside_spawned_task() {
+        // `tokio::task::try_id()` returns Some only inside a *spawned*
+        // task. The `#[tokio::test]` body runs on `block_on` (not a
+        // task) so we must spawn to actually exercise capture. In
+        // production, every streaming_blob writer is built from inside
+        // a spawned task (e.g. ByteStreamServer::write, worker
+        // background uploads), so this is the path that matters.
+        let tid = tokio::spawn(async {
+            let (writer, _reader) = StreamingBlob::new(test_digest(124), 1024);
+            writer.inner.producer_task_id().map(str::to_string)
+        })
+        .await
+        .unwrap();
+        assert!(
+            tid.is_some(),
+            "producer_task_id must be Some inside a spawned task"
+        );
+        // The captured ID must be a parseable u64 string (tokio Id Display).
+        let s = tid.unwrap();
+        assert!(
+            s.parse::<u64>().is_ok(),
+            "producer_task_id should be a u64 string, got {s:?}"
+        );
+    }
+
+    /// Spec: when the producer task spawns the blob, the captured ID
+    /// MUST refer to that producer task — not to whichever reader task
+    /// later observes the deadline. This is the property that lets the
+    /// operator grep the worker journal for the wedged producer.
+    #[tokio::test]
+    async fn producer_task_id_identifies_constructor() {
+        // Build the writer in a spawned task; capture its tokio task id
+        // independently and confirm the inner records the same id.
+        let handle = tokio::spawn(async move {
+            let real_id = tokio::task::try_id().unwrap().to_string();
+            let (writer, _reader) = StreamingBlob::new(test_digest(125), 1024);
+            (real_id, writer.inner.producer_task_id().unwrap().to_string())
+        });
+        let (real_id, captured) = handle.await.unwrap();
+        assert_eq!(
+            real_id, captured,
+            "producer_task_id MUST match the constructing task's tokio id"
         );
     }
 

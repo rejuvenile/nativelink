@@ -929,13 +929,59 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         }
                     } else {
                         let (tx, rx) = make_buf_channel_pair();
-                        let read_fut = cas_store_wrapped.get(digest, tx);
-                        let write_fut = slow_store.update(
-                            digest,
-                            rx,
-                            UploadSizeInfo::ExactSize(digest.size_bytes()),
-                        );
+                        // Phase-tagged tracing — same instrumentation pattern
+                        // as RunningActionsManagerImpl::spawn_upload_to_remote.
+                        // Names which half of the streaming upload wedges so a
+                        // 30s+ stall on UploadMissingBlobs surfaces the
+                        // specific phase (fast read vs. gRPC send) in the log.
+                        const SLOW_PHASE_WARN: Duration = Duration::from_secs(5);
+                        let upload_phase_start = std::time::Instant::now();
+                        let read_fut = async {
+                            let phase_start = std::time::Instant::now();
+                            let res = cas_store_wrapped.get(digest, tx).await;
+                            let elapsed = phase_start.elapsed();
+                            if elapsed >= SLOW_PHASE_WARN {
+                                warn!(
+                                    ?digest,
+                                    size_bytes = digest.size_bytes(),
+                                    elapsed_ms = elapsed.as_millis() as u64,
+                                    "UploadMissingBlobs: slow fast-store read phase",
+                                );
+                            }
+                            res
+                        };
+                        let write_fut = async {
+                            let phase_start = std::time::Instant::now();
+                            let res = slow_store
+                                .update(
+                                    digest,
+                                    rx,
+                                    UploadSizeInfo::ExactSize(digest.size_bytes()),
+                                )
+                                .await;
+                            let elapsed = phase_start.elapsed();
+                            if elapsed >= SLOW_PHASE_WARN {
+                                warn!(
+                                    ?digest,
+                                    size_bytes = digest.size_bytes(),
+                                    elapsed_ms = elapsed.as_millis() as u64,
+                                    "UploadMissingBlobs: slow slow-store write phase (gRPC send)",
+                                );
+                            }
+                            res
+                        };
                         let (read_res, write_res) = tokio::join!(read_fut, write_fut);
+                        let total_elapsed = upload_phase_start.elapsed();
+                        if total_elapsed >= SLOW_PHASE_WARN {
+                            warn!(
+                                ?digest,
+                                size_bytes = digest.size_bytes(),
+                                total_elapsed_ms = total_elapsed.as_millis() as u64,
+                                read_ok = read_res.is_ok(),
+                                write_ok = write_res.is_ok(),
+                                "UploadMissingBlobs: slow streaming upload (combined)",
+                            );
+                        }
                         if write_res.is_ok() {
                             Ok(())
                         } else {

@@ -4771,13 +4771,69 @@ impl RunningActionsManagerImpl {
                             let (tx, rx) = make_buf_channel_pair();
                             // Read via cas_store so the self-healing fallback
                             // applies on eviction during streaming uploads too.
-                            let read_fut = cas_store_ref.get(digest, tx);
-                            let write_fut = slow_store.update(
-                                digest,
-                                rx,
-                                UploadSizeInfo::ExactSize(digest.size_bytes()),
-                            );
+                            //
+                            // Phase-tagged tracing: name the read and write
+                            // halves separately so when either wedges, the
+                            // post-mortem log shows which side stalled. The
+                            // `tokio::join!` below does not natively report
+                            // which half is slow, so we wrap each side in an
+                            // async block that logs a `warn!` if it exceeds
+                            // `SLOW_PHASE_WARN`. This converts an opaque
+                            // upload-stalled event into "read from fast
+                            // store took Ms" or "gRPC write to slow store
+                            // took Ms" — which names the wedged side
+                            // directly.
+                            const SLOW_PHASE_WARN: Duration = Duration::from_secs(5);
+                            let upload_phase_start = std::time::Instant::now();
+                            let read_fut = async {
+                                let phase_start = std::time::Instant::now();
+                                let res = cas_store_ref.get(digest, tx).await;
+                                let elapsed = phase_start.elapsed();
+                                if elapsed >= SLOW_PHASE_WARN {
+                                    warn!(
+                                        ?digest,
+                                        size_bytes = digest.size_bytes(),
+                                        elapsed_ms = elapsed.as_millis() as u64,
+                                        "upload_to_remote: slow fast-store read phase",
+                                    );
+                                }
+                                res
+                            };
+                            let write_fut = async {
+                                let phase_start = std::time::Instant::now();
+                                let res = slow_store.update(
+                                    digest,
+                                    rx,
+                                    UploadSizeInfo::ExactSize(digest.size_bytes()),
+                                ).await;
+                                let elapsed = phase_start.elapsed();
+                                if elapsed >= SLOW_PHASE_WARN {
+                                    warn!(
+                                        ?digest,
+                                        size_bytes = digest.size_bytes(),
+                                        elapsed_ms = elapsed.as_millis() as u64,
+                                        "upload_to_remote: slow slow-store write phase (gRPC send)",
+                                    );
+                                }
+                                res
+                            };
                             let (read_res, write_res) = tokio::join!(read_fut, write_fut);
+                            let total_elapsed = upload_phase_start.elapsed();
+                            if total_elapsed >= SLOW_PHASE_WARN {
+                                // Surface the combined-phase wedge — useful when
+                                // one half fails fast (e.g. EOF) but the other
+                                // hangs. Logged with read+write completion status
+                                // so the operator can tell which half actually
+                                // wedged (the one that did NOT complete cleanly).
+                                warn!(
+                                    ?digest,
+                                    size_bytes = digest.size_bytes(),
+                                    total_elapsed_ms = total_elapsed.as_millis() as u64,
+                                    read_ok = read_res.is_ok(),
+                                    write_ok = write_res.is_ok(),
+                                    "upload_to_remote: slow streaming upload (combined)",
+                                );
+                            }
                             // If the write succeeded, the upload is done even if
                             // the read side got a "receiver disconnected" error
                             // (e.g. server already had the blob and closed early).
