@@ -66,7 +66,7 @@ use nativelink_util::action_messages::{
     ActionInfo, ActionResult, DirectoryInfo, ExecutionMetadata, FileInfo, NameOrPath, OperationId,
     SymlinkInfo, to_execute_response,
 };
-use nativelink_util::common::{DigestInfo, fs};
+use nativelink_util::common::{DigestInfo, fs, make_precondition_failure_any};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::buf_channel::make_buf_channel_pair;
@@ -114,36 +114,6 @@ enum SideChannelFailureReason {
 struct SideChannelInfo {
     /// If the task should be considered a failure and why.
     failure: Option<SideChannelFailureReason>,
-}
-
-#[derive(prost::Message)]
-struct PreconditionFailure {
-    #[prost(message, repeated, tag = "1")]
-    violations: Vec<Violation>,
-}
-
-#[derive(prost::Message)]
-struct Violation {
-    #[prost(string, tag = "1")]
-    r#type: String,
-    #[prost(string, tag = "2")]
-    subject: String,
-    #[prost(string, tag = "3")]
-    description: String,
-}
-
-fn make_precondition_failure_any(digest: DigestInfo) -> prost_types::Any {
-    let failure = PreconditionFailure {
-        violations: vec![Violation {
-            r#type: "MISSING".into(),
-            subject: format!("blobs/{}/{}", digest.packed_hash(), digest.size_bytes()),
-            description: String::new(),
-        }],
-    };
-    prost_types::Any {
-        type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
-        value: failure.encode_to_vec(),
-    }
 }
 
 /// Metadata about a file to be materialized from CAS to disk.

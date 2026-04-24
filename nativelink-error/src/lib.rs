@@ -139,6 +139,27 @@ impl Error {
     pub fn message_string(&self) -> String {
         self.messages.join(" : ")
     }
+
+    /// Construct a `NotFound` error for a missing blob digest with a
+    /// pre-built detail (typically a `PreconditionFailure` MISSING violation
+    /// from `nativelink_util::common::make_precondition_failure_any`)
+    /// already attached. REAPI v2 §2.2.4 requires the structured detail so
+    /// Bazel can re-upload. Use at every store-layer NotFound construction
+    /// site that returns a missing-blob result.
+    ///
+    /// Lives on `Error` (not on a util helper) so the REAPI invariant is
+    /// encapsulated in one named constructor and call sites stay one line.
+    /// The detail is taken pre-built to avoid coupling `nativelink-error`
+    /// to `nativelink-util` (cycle); callers pass
+    /// `make_precondition_failure_any(digest)`.
+    #[must_use]
+    pub fn not_found_with_detail(msg: impl Into<String>, detail: prost_types::Any) -> Self {
+        Self {
+            code: Code::NotFound,
+            messages: vec![msg.into()],
+            details: vec![detail],
+        }
+    }
 }
 
 impl core::error::Error for Error {}
@@ -307,6 +328,34 @@ impl From<redis::RedisError> for Error {
 
 impl From<tonic::Status> for Error {
     fn from(status: tonic::Status) -> Self {
+        // Round-trip the `grpc-status-details-bin` trailer encoded by the
+        // sibling `From<Error> for tonic::Status` below — without this,
+        // REAPI v2 §2.2.4 PreconditionFailure details are silently dropped
+        // and Bazel cannot recover from missing-blob errors.
+        //
+        // The empty-bytes guard is *not* redundant: protobuf decodes an
+        // empty buffer as an all-default `Status { code: 0, message: "",
+        // details: vec![] }`, which would then convert to
+        // `Error { code: Code::Ok, ... }` and silently lose the original
+        // `status.code()` (e.g. `NotFound`).
+        let details_bytes = status.details();
+        if !details_bytes.is_empty() {
+            match <nativelink_proto::google::rpc::Status as prost::Message>::decode(details_bytes) {
+                Ok(rpc_status) => return Self::from(rpc_status),
+                Err(err) => {
+                    // A non-empty `grpc-status-details-bin` trailer that
+                    // fails to decode is a real bug (peer encoded
+                    // something other than `google.rpc.Status`). Log so
+                    // the symptom isn't silently masked by the fallback.
+                    tracing::warn!(
+                        bytes_len = details_bytes.len(),
+                        ?err,
+                        code = ?status.code(),
+                        "tonic::Status carried non-empty details that failed to decode as google.rpc.Status; falling back to code+message only",
+                    );
+                }
+            }
+        }
         Self::new(status.code(), status.to_string())
     }
 }
@@ -653,5 +702,37 @@ mod tests {
             status.details().is_empty(),
             "tonic::Status::details() should stay empty when Error has no details",
         );
+    }
+
+    #[test]
+    fn tonic_status_to_error_decodes_details() {
+        let any = prost_types::Any {
+            type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+            value: vec![7, 8, 9, 10],
+        };
+
+        // Build an Error → tonic::Status (uses the send-side encoder).
+        let original_err = Error {
+            code: Code::FailedPrecondition,
+            messages: vec!["blob missing".into()],
+            details: vec![any.clone()],
+        };
+        let status: tonic::Status = original_err.into();
+
+        // Round-trip back via From<tonic::Status>.
+        let recovered: Error = status.into();
+        assert_eq!(recovered.code, Code::FailedPrecondition);
+        assert_eq!(recovered.details.len(), 1, "details must round-trip");
+        assert_eq!(recovered.details[0].type_url, any.type_url);
+        assert_eq!(recovered.details[0].value, any.value);
+    }
+
+    #[test]
+    fn tonic_status_to_error_no_trailer_falls_back_gracefully() {
+        let status = tonic::Status::not_found("plain message");
+        let err: Error = status.into();
+        assert_eq!(err.code, Code::NotFound);
+        assert!(err.details.is_empty());
+        assert!(err.message_string().contains("plain message"));
     }
 }

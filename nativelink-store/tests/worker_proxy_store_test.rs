@@ -18,7 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::stores::MemorySpec;
-use nativelink_error::{Code, Error, make_err};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_store::memory_store::MemoryStore;
@@ -1088,5 +1088,320 @@ async fn peer_unavailable_pre_eof_drops_cached_connection() -> Result<(), Error>
         "Expected cached connection to be removed after pre-EOF Unavailable"
     );
 
+    Ok(())
+}
+
+// ===================================================================
+// Reviewer Finding 2 (testing-czar Gap 2): construction-site coverage
+// for the REAPI v2 §2.2.4 PreconditionFailure detail attachment in
+// `worker_proxy_store.rs:985` (worker request, no redirect path) and
+// `worker_proxy_store.rs:1033` (inner store + all workers miss path).
+// ===================================================================
+
+/// Helper to assert that an error carries a single `PreconditionFailure`
+/// MISSING violation whose `subject` is `"blobs/<hash>/<size>"`.
+fn assert_precondition_failure_for_digest(err: &Error, digest: DigestInfo) {
+    use prost::Message;
+    use nativelink_util::common::PreconditionFailure;
+
+    assert_eq!(
+        err.details.len(),
+        1,
+        "expected exactly one PreconditionFailure detail, got {}: {err:?}",
+        err.details.len(),
+    );
+    let detail = &err.details[0];
+    assert!(
+        detail.type_url.ends_with("PreconditionFailure"),
+        "detail type_url should end with 'PreconditionFailure', got: {}",
+        detail.type_url,
+    );
+    let pf = PreconditionFailure::decode(detail.value.as_slice())
+        .expect("detail value must decode as PreconditionFailure");
+    assert_eq!(pf.violations.len(), 1, "expected one violation");
+    assert_eq!(pf.violations[0].r#type, "MISSING");
+    let expected_subject = format!(
+        "blobs/{}/{}",
+        digest.packed_hash(),
+        digest.size_bytes(),
+    );
+    assert_eq!(
+        pf.violations[0].subject, expected_subject,
+        "violation subject must be 'blobs/<hash>/<size>', got: {}",
+        pf.violations[0].subject,
+    );
+}
+
+/// Asserts that the worker-request, no-redirect NotFound path at
+/// `worker_proxy_store.rs:985` attaches a `PreconditionFailure` detail
+/// with the missing digest as `subject`. This is the path Bazel
+/// observes when a worker asks the server-side proxy for a blob the
+/// inner store doesn't have and the server refuses to redirect (to
+/// avoid the worker→server→worker redirect loop).
+#[nativelink_test]
+async fn worker_request_no_redirect_not_found_carries_precondition_detail() -> Result<(), Error> {
+    let (proxy, _inner, _locality_map) = make_proxy_store();
+    let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+
+    // IS_WORKER_REQUEST=true with no locality entries → hits the
+    // construction site at line 985 directly.
+    let result = IS_WORKER_REQUEST
+        .scope(true, proxy.get_part_unchunked(digest, 0, None))
+        .await;
+
+    let err = result.err().expect("expected NotFound for worker request with no peers");
+    assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
+    assert_precondition_failure_for_digest(&err, digest);
+    Ok(())
+}
+
+/// Asserts that the "inner store + all workers miss" NotFound path at
+/// `worker_proxy_store.rs:1033` attaches a `PreconditionFailure` detail.
+/// This is the path Bazel observes when the proxy attempted peer
+/// fetches that all failed AND the inner-store retry also returned
+/// NotFound. Triggered by registering an unreachable peer in the
+/// locality map (so worker fetch is attempted and fails) with
+/// `IS_WORKER_REQUEST=false`.
+#[nativelink_test]
+async fn inner_store_and_all_workers_miss_carries_precondition_detail() -> Result<(), Error> {
+    let (proxy, _inner, locality_map) = make_proxy_store();
+    let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+
+    // Register a peer whose URI is invalid — peer attempt will fail
+    // immediately during create_worker_connection, then the inner
+    // store retry runs, sees nothing, and falls through to the line
+    // 1033 construction site.
+    locality_map
+        .write()
+        .register_blobs("not a valid uri", &[digest]);
+
+    let result = IS_WORKER_REQUEST
+        .scope(false, proxy.get_part_unchunked(digest, 0, None))
+        .await;
+
+    let err = result.err().expect("expected NotFound after all workers fail and inner misses");
+    assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
+    assert_precondition_failure_for_digest(&err, digest);
+    Ok(())
+}
+
+// ===================================================================
+// Sibling-bug coverage (testing-czar round 2): the racing-fetch path
+// in `WorkerProxyStore::get_part` has two more NotFound construction
+// sites that surface to Bazel without the REAPI v2 §2.2.4
+// PreconditionFailure detail when *both* server and peer return an
+// empty EOF for a non-zero digest:
+//   - `worker_proxy_store.rs:1085` (await_peer_after_empty_server,
+//     server's empty EOF wins the race; peer also empty)
+//   - `worker_proxy_store.rs:1124` (await_server_after_empty_peer,
+//     peer's empty EOF wins the race; server also empty)
+//
+// These are reachable in production whenever a stale-positive locality
+// entry races a stale slow-store result. Both must attach the same
+// MISSING violation detail so Bazel can re-upload.
+// ===================================================================
+
+/// A minimal `StoreDriver` whose `get_part` emits an empty EOF without
+/// writing any chunks. Used to simulate the empty-EOF stale-positive
+/// that `await_*_after_empty_*` is designed to handle. Each instance
+/// can be optionally gated on an external `Notify` so the test can
+/// pin which side wins the racing-fetch `tokio::select!`.
+/// `has_with_results` reports the blob present so the racing path is
+/// engaged on either side.
+#[derive(Debug, MetricsComponent)]
+struct EmptyEofStore {
+    /// Reported size for any digest queried via `has_with_results`.
+    declared_size: u64,
+    /// Optional gate: if `Some`, `get_part` awaits a notification on
+    /// this `Notify` before emitting EOF. Used to make the race
+    /// outcome deterministic in the unit tests below.
+    release: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl EmptyEofStore {
+    fn ungated(declared_size: u64) -> Arc<Self> {
+        Arc::new(Self {
+            declared_size,
+            release: None,
+        })
+    }
+
+    fn gated(declared_size: u64, gate: Arc<tokio::sync::Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            declared_size,
+            release: Some(gate),
+        })
+    }
+}
+
+default_health_status_indicator!(EmptyEofStore);
+
+#[async_trait]
+impl StoreDriver for EmptyEofStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        for slot in results.iter_mut().take(digests.len()) {
+            *slot = Some(self.declared_size);
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        Err(make_err!(Code::Unimplemented, "EmptyEofStore does not support update"))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        // If this side is gated (the "loser"), wait for the test to
+        // notify after the proxy has had time to consume the winner's
+        // EOF and enter the appropriate `await_*_after_empty_*` arm.
+        if let Some(notify) = self.release.as_ref() {
+            notify.notified().await;
+        }
+        writer
+            .send_eof()
+            .err_tip(|| "EmptyEofStore: send_eof failed")?;
+        Ok(())
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Drives the proxy's racing fetch with one ungated side (the
+/// "winner") and one gated side (the "loser"). Returns the final
+/// proxy result. The loser stays blocked on `loser_gate` until the
+/// caller fires it AFTER the proxy has had time to consume the
+/// winner's EOF and enter the corresponding `await_*_after_empty_*`
+/// arm — pinning the race outcome.
+async fn drive_empty_eof_race(
+    server_inner: Arc<EmptyEofStore>,
+    peer_store: Arc<EmptyEofStore>,
+    loser_gate: Arc<tokio::sync::Notify>,
+    digest: DigestInfo,
+    peer_endpoint: &str,
+) -> Result<Bytes, Error> {
+    let server_inner_store = Store::new(server_inner);
+    let peer_store_handle = Store::new(peer_store);
+
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(server_inner_store, locality_map.clone());
+    proxy_arc.enable_race_peers();
+    let proxy = Store::new(proxy_arc.clone());
+
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store_handle);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    // Spawn the proxy call so the test task can fire the loser gate
+    // concurrently. Yield several times first so the proxy task gets
+    // scheduled, spawns its racer tasks, drains the winner's EOF, and
+    // enters the relevant `await_*_after_empty_*` arm before the
+    // loser produces its EOF.
+    let handle = tokio::spawn(async move {
+        proxy.get_part_unchunked(digest, 0, None).await
+    });
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    loser_gate.notify_one();
+    handle
+        .await
+        .map_err(|e| make_err!(Code::Internal, "test task join: {e}"))?
+}
+
+/// Asserts that when the server racer wins with an empty EOF and the
+/// peer racer also produces an empty EOF, the resulting NotFound at
+/// `worker_proxy_store.rs:1085` carries a `PreconditionFailure`
+/// MISSING-violation detail keyed to the requested digest.
+#[nativelink_test]
+async fn await_peer_after_empty_server_carries_precondition_detail() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+    let peer_gate = Arc::new(tokio::sync::Notify::new());
+
+    let server_inner = EmptyEofStore::ungated(digest.size_bytes());
+    let peer_store = EmptyEofStore::gated(digest.size_bytes(), peer_gate.clone());
+
+    let result = drive_empty_eof_race(
+        server_inner,
+        peer_store,
+        peer_gate,
+        digest,
+        "grpc://gated-peer:50081",
+    )
+    .await;
+    let err = result
+        .err()
+        .expect("expected NotFound when both server and peer return empty EOF");
+    assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
+    let msg = err.message_string();
+    assert!(
+        msg.contains("both server and peer"),
+        "expected await_peer_after_empty_server message (line 1085 path), got: {msg}",
+    );
+    assert_precondition_failure_for_digest(&err, digest);
+    Ok(())
+}
+
+/// Symmetric to the above: when the peer racer wins with an empty EOF
+/// and the server racer also produces an empty EOF, the resulting
+/// NotFound at `worker_proxy_store.rs:1124` must also carry the
+/// `PreconditionFailure` MISSING-violation detail.
+#[nativelink_test]
+async fn await_server_after_empty_peer_carries_precondition_detail() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+    let server_gate = Arc::new(tokio::sync::Notify::new());
+
+    let server_inner = EmptyEofStore::gated(digest.size_bytes(), server_gate.clone());
+    let peer_store = EmptyEofStore::ungated(digest.size_bytes());
+
+    let result = drive_empty_eof_race(
+        server_inner,
+        peer_store,
+        server_gate,
+        digest,
+        "grpc://winner-peer:50081",
+    )
+    .await;
+    let err = result
+        .err()
+        .expect("expected NotFound when both peer and server return empty EOF");
+    assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
+    let msg = err.message_string();
+    assert!(
+        msg.contains("both peer and server"),
+        "expected await_server_after_empty_peer message (line 1124 path), got: {msg}",
+    );
+    assert_precondition_failure_for_digest(&err, digest);
     Ok(())
 }

@@ -36,7 +36,7 @@ use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
-use nativelink_util::common::DigestInfo;
+use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
     IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, REDIRECT_PREFIX, Store, StoreDriver,
@@ -982,9 +982,9 @@ impl WorkerProxyStore {
             // Workers handle their own peer fetching via WorkerProxyStore on
             // the worker side with race_peers enabled.
             let digest = key.borrow().into_digest();
-            return Err(make_err!(
-                Code::NotFound,
-                "Blob {digest:?} not found in inner store (worker request, no redirect)"
+            return Err(Error::not_found_with_detail(
+                format!("Blob {digest:?} not found in inner store (worker request, no redirect)"),
+                make_precondition_failure_any(digest),
             ));
         }
 
@@ -1030,10 +1030,10 @@ impl WorkerProxyStore {
             Err(e) => return Err(e),
         }
 
-        Err(make_err!(
-            Code::NotFound,
-            "Blob {:?} not found in inner store or any worker",
-            key.borrow().into_digest()
+        let digest = key.borrow().into_digest();
+        Err(Error::not_found_with_detail(
+            format!("Blob {digest:?} not found in inner store or any worker"),
+            make_precondition_failure_any(digest),
         ))
     }
 
@@ -1082,12 +1082,14 @@ impl WorkerProxyStore {
                     .map_err(|e| make_err!(Code::Internal, "peer task join: {e}"))?;
             }
             // Non-zero digest, no data from either racer — surface NotFound.
-            return Err(make_err!(
-                Code::NotFound,
-                "WorkerProxyStore: both server and peer {} returned empty EOF for non-zero digest {:?} (size_bytes={})",
-                peer_endpoint,
-                digest,
-                digest.size_bytes(),
+            return Err(Error::not_found_with_detail(
+                format!(
+                    "WorkerProxyStore: both server and peer {} returned empty EOF for non-zero digest {:?} (size_bytes={})",
+                    peer_endpoint,
+                    digest,
+                    digest.size_bytes(),
+                ),
+                make_precondition_failure_any(*digest),
             ));
         }
         debug!(
@@ -1120,11 +1122,13 @@ impl WorkerProxyStore {
                 return server_handle.await
                     .map_err(|e| make_err!(Code::Internal, "server task join: {e}"))?;
             }
-            return Err(make_err!(
-                Code::NotFound,
-                "WorkerProxyStore: both peer and server returned empty EOF for non-zero digest {:?} (size_bytes={})",
-                digest,
-                digest.size_bytes(),
+            return Err(Error::not_found_with_detail(
+                format!(
+                    "WorkerProxyStore: both peer and server returned empty EOF for non-zero digest {:?} (size_bytes={})",
+                    digest,
+                    digest.size_bytes(),
+                ),
+                make_precondition_failure_any(*digest),
             ));
         }
         debug!(

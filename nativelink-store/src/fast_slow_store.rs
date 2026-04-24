@@ -31,10 +31,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use nativelink_config::stores::{FastSlowSpec, StoreDirection};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::common::DigestInfo;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair_with_size,
 };
+use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::fs;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
@@ -820,11 +820,14 @@ impl FastSlowStore {
                             slow_store = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
                             "CAS read miss: blob not found in slow store"
                         );
-                        make_err!(
-                            Code::NotFound,
-                            "Object {} not found in either fast or slow store. \
+                        let digest = key.borrow().into_digest();
+                        Error::not_found_with_detail(
+                            format!(
+                                "Object {} not found in either fast or slow store. \
                                 If using multiple workers, ensure all workers share the same CAS storage path.",
-                            key.as_str()
+                                key.as_str(),
+                            ),
+                            make_precondition_failure_any(digest),
                         )
                     })?;
                 Ok(UploadSizeInfo::ExactSize(size))

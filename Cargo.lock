@@ -3336,6 +3336,7 @@ dependencies = [
  "serde_json5",
  "tokio",
  "tonic",
+ "tracing",
  "url",
  "uuid",
  "walkdir",

@@ -110,6 +110,44 @@ impl DigestInfo {
     }
 }
 
+/// Local mirror of `google.rpc.PreconditionFailure` (not generated in
+/// `nativelink-proto`). Used so store-layer NotFound errors carry a REAPI
+/// v2 §2.2.4 MISSING violation that lets Bazel re-upload the blob.
+#[derive(Message)]
+pub struct PreconditionFailure {
+    #[prost(message, repeated, tag = "1")]
+    pub violations: Vec<Violation>,
+}
+
+#[derive(Message)]
+pub struct Violation {
+    #[prost(string, tag = "1")]
+    pub r#type: String,
+    #[prost(string, tag = "2")]
+    pub subject: String,
+    #[prost(string, tag = "3")]
+    pub description: String,
+}
+
+/// Build a `prost_types::Any` containing a single MISSING `PreconditionFailure`
+/// violation for `digest`. Attach to `Error.details` on NotFound returns from
+/// the CAS so Bazel can recover via re-upload (REAPI v2 §2.2.4). Use via
+/// `Error::not_found_with_detail` to keep call sites compact.
+#[must_use]
+pub fn make_precondition_failure_any(digest: DigestInfo) -> prost_types::Any {
+    let failure = PreconditionFailure {
+        violations: vec![Violation {
+            r#type: "MISSING".into(),
+            subject: format!("blobs/{}/{}", digest.packed_hash(), digest.size_bytes()),
+            description: String::new(),
+        }],
+    };
+    prost_types::Any {
+        type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+        value: failure.encode_to_vec(),
+    }
+}
+
 /// Counts the number of digits a number needs if it were to be
 /// converted to a string.
 const fn count_digits(mut num: u64) -> usize {
