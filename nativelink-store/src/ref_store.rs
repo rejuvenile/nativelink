@@ -83,8 +83,18 @@ impl RefStore {
             }
         }
         // This should protect us against multiple writers writing the same location at the same
-        // time.
+        // time. We must also hold this lock across the callback snapshot + publish below so that
+        // a concurrent `register_item_callback` cannot observe `*ref_store == None`, push its
+        // callback, and have us publish a snapshot taken before that push (silently dropping the
+        // callback). See also `register_item_callback`.
         let _lock = self.inner.mux.lock();
+        // Re-check after taking the lock: another caller may have populated `ref_store`
+        // between our fast-path read and acquiring the mutex.
+        unsafe {
+            if let Some(ref store) = *ref_store {
+                return Ok(store);
+            }
+        }
         let store_manager = self
             .store_manager
             .upgrade()
@@ -159,6 +169,12 @@ impl StoreDriver for RefStore {
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
+        // Hold `inner.mux` across the push + read-of-ref_store so that we cannot interleave
+        // with `get_store()`'s slow path between the snapshot of `item_callbacks` and the
+        // publish of `*ref_store`. Without this, a slow-path init could publish an inner store
+        // that is missing this callback, and we would see `*ref_store == None` here and skip
+        // direct propagation — silently dropping the callback forever.
+        let _lock = self.inner.mux.lock();
         self.item_callbacks.lock().push(callback.clone());
         let ref_store = self.inner.cell.0.get();
         unsafe {
