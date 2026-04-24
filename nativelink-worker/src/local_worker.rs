@@ -631,7 +631,7 @@ const DEFAULT_MAX_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
 #[derive(Clone, Debug)]
 pub struct BlobsAvailableState {
     /// Reference to the worker's local FilesystemStore (the fast store in FastSlowStore).
-    pub(crate) fs_store: Arc<FilesystemStore>,
+    fs_store: Arc<FilesystemStore>,
     /// Tracks inserted and evicted digests between sends.
     tracker: Arc<BlobChangeTracker>,
     /// The worker's CAS endpoint for peer serving (e.g. "grpc://192.168.100.5:50081").
@@ -644,7 +644,7 @@ pub struct BlobsAvailableState {
     max_interval: Duration,
     /// The FastSlowStore backing the worker's CAS server. Used to clean up
     /// mirror blobs when `BlobsInStableStorage` is received.
-    pub(crate) cas_server_fss: Option<Arc<FastSlowStore>>,
+    cas_server_fss: Option<Arc<FastSlowStore>>,
 }
 
 impl BlobsAvailableState {

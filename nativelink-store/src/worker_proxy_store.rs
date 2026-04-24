@@ -136,9 +136,13 @@ impl MirrorEndpointState {
     /// Returns true if a mirror write of `size_bytes` would fit within
     /// the last-reported capacity. Returns true for unknown capacity
     /// (no report yet) so we don't filter out workers we have no
-    /// information about.
+    /// information about. Also returns true defensively when `max == 0`
+    /// (treat as "no cap configured" rather than "instantly full") so a
+    /// future code path that records a stale `(used, 0)` cannot lock the
+    /// peer out of all picker rotations.
     fn fits(&self, size_bytes: u64) -> bool {
         match (self.mirror_used_bytes, self.mirror_max_bytes) {
+            (Some(_), Some(0)) => true,
             (Some(used), Some(max)) => used.saturating_add(size_bytes) <= max,
             _ => true,
         }
@@ -1146,18 +1150,6 @@ impl WorkerProxyStore {
     /// taken only on (a) first-ever sighting of an endpoint or (b) cleanup
     /// of an expired quarantine. Mirrors are called per blob during write
     /// bursts, so keeping the hot path read-only avoids serializing fan-out.
-    fn pick_mirror_endpoint(
-        &self,
-        endpoints: &[Arc<str>],
-        exclude: Option<&str>,
-    ) -> Option<(Arc<str>, Arc<Semaphore>)> {
-        // Backward-compatible wrapper used by tests and call sites that
-        // don't know the blob size up front. Equivalent to
-        // `pick_mirror_endpoint_for_size(endpoints, exclude, 0)`, which
-        // disables the capacity pre-check.
-        self.pick_mirror_endpoint_for_size(endpoints, exclude, 0)
-    }
-
     /// Pick a mirror endpoint, filtering out peers whose last-reported
     /// `(mirror_used_bytes + size_bytes) > mirror_max_bytes`. The
     /// capacity check is the review #1 fix: BEFORE the source stream is
@@ -1170,7 +1162,7 @@ impl WorkerProxyStore {
     ///
     /// `size_bytes = 0` skips the filter (used by callers that don't
     /// know the size — preserves pre-fix behavior).
-    fn pick_mirror_endpoint_for_size(
+    fn pick_mirror_endpoint(
         &self,
         endpoints: &[Arc<str>],
         exclude: Option<&str>,
@@ -1497,7 +1489,7 @@ impl WorkerProxyStore {
             // ResourceExhausted Err from `insert_mirror_blob` remains
             // as a racy fallback for stale capacity reports.
             let Some((endpoint, permits)) = self
-                .pick_mirror_endpoint_for_size(&endpoints, exclude, blob_size)
+                .pick_mirror_endpoint(&endpoints, exclude, blob_size)
             else {
                 self.mirror_dropped_quarantined.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -1632,7 +1624,7 @@ impl WorkerProxyStore {
         // source stream.
         let blob_size = digest.size_bytes();
         let Some((endpoint, permits)) = self
-            .pick_mirror_endpoint_for_size(&endpoints, None, blob_size)
+            .pick_mirror_endpoint(&endpoints, None, blob_size)
         else {
             self.mirror_dropped_quarantined.fetch_add(1, Ordering::Relaxed);
             drop(reader);
@@ -2137,7 +2129,7 @@ mod tests {
         let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
 
         // Initialize entries (the picker write-path inserts default state).
-        let _ = proxy.pick_mirror_endpoint_for_size(&endpoints, None, 0);
+        let _ = proxy.pick_mirror_endpoint(&endpoints, None, 0);
 
         // 'a' has 100 bytes free, 'b' has 0 bytes free.
         proxy.record_mirror_capacity("a", 0, 100);
@@ -2146,7 +2138,7 @@ mod tests {
         // For a 10-byte write, picker MUST always pick 'a' (b is full).
         for _ in 0..50 {
             let (chosen, _) =
-                proxy.pick_mirror_endpoint_for_size(&endpoints, None, 10).unwrap();
+                proxy.pick_mirror_endpoint(&endpoints, None, 10).unwrap();
             assert_eq!(
                 chosen.as_ref(),
                 "a",
@@ -2160,7 +2152,7 @@ mod tests {
         let mut saw_b = false;
         for _ in 0..50 {
             let (chosen, _) =
-                proxy.pick_mirror_endpoint_for_size(&endpoints, None, 0).unwrap();
+                proxy.pick_mirror_endpoint(&endpoints, None, 0).unwrap();
             match chosen.as_ref() {
                 "a" => saw_a = true,
                 "b" => saw_b = true,
@@ -2183,7 +2175,7 @@ mod tests {
         let endpoints: Vec<Arc<str>> = vec!["a".into()];
 
         // No record_mirror_capacity call — capacity stays unknown.
-        let pick = proxy.pick_mirror_endpoint_for_size(&endpoints, None, 1_000_000);
+        let pick = proxy.pick_mirror_endpoint(&endpoints, None, 1_000_000);
         assert!(
             pick.is_some(),
             "unknown capacity must not block the picker"
@@ -2202,15 +2194,66 @@ mod tests {
         let proxy = WorkerProxyStore::new(inner, locality_map);
         let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
 
-        let _ = proxy.pick_mirror_endpoint_for_size(&endpoints, None, 0);
+        let _ = proxy.pick_mirror_endpoint(&endpoints, None, 0);
         proxy.record_mirror_capacity("a", 100, 100);
         proxy.record_mirror_capacity("b", 100, 100);
 
-        let pick = proxy.pick_mirror_endpoint_for_size(&endpoints, None, 50);
+        let pick = proxy.pick_mirror_endpoint(&endpoints, None, 50);
         assert!(
             pick.is_some(),
             "all-full case must still return a peer (degraded > nothing)"
         );
+        Ok(())
+    }
+
+    /// Boundary check (review #13): `used + size_bytes == max` must
+    /// return true. Guards against an off-by-one regression where the
+    /// `<=` check were tightened to `<` (which would silently reject
+    /// the very last byte of capacity and shunt traffic to a
+    /// less-saturated peer for no reason).
+    ///
+    /// The test uses TWO peers — "a" exactly at boundary, "b" with
+    /// plenty of room — and asserts the picker round-robins both. With
+    /// the mutation (`<` instead of `<=`), "a" would be excluded from
+    /// the eligible pool and the picker would always return "b".
+    #[nativelink_test]
+    async fn test_fits_at_exact_boundary_returns_true() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
+
+        // Force state entries to exist before we record capacity.
+        let _ = proxy.pick_mirror_endpoint(&endpoints, None, 0);
+        // "a" has exactly 900 bytes free; "b" has 100_000.
+        proxy.record_mirror_capacity("a", 100, 1000);
+        proxy.record_mirror_capacity("b", 0, 100_000);
+
+        // For a 900-byte write (exactly fills "a"), both must be eligible
+        // — round-robin should hit "a" at least once.
+        let mut saw_a = false;
+        let mut saw_b = false;
+        for _ in 0..200 {
+            let (chosen, _) = proxy
+                .pick_mirror_endpoint(&endpoints, None, 900)
+                .expect("at least one peer eligible");
+            match chosen.as_ref() {
+                "a" => saw_a = true,
+                "b" => saw_b = true,
+                other => panic!("unexpected endpoint: {other}"),
+            }
+            if saw_a && saw_b {
+                break;
+            }
+        }
+        assert!(
+            saw_a,
+            "fits at exact capacity boundary (used + size == max) must \
+             include the boundary peer in the eligible pool — pre-fix \
+             `<` instead of `<=` would exclude 'a' and only return 'b'"
+        );
+        assert!(saw_b, "non-boundary peer must also be eligible");
+
         Ok(())
     }
 
@@ -2271,7 +2314,7 @@ mod tests {
 
         // Picker must prefer "a" (the only non-quarantined eligible peer).
         let (chosen, _) = proxy
-            .pick_mirror_endpoint(&endpoints, None)
+            .pick_mirror_endpoint(&endpoints, None, 0)
             .expect("at least one eligible endpoint");
         assert_eq!(
             chosen.as_ref(),
@@ -2779,7 +2822,7 @@ mod tests {
 
         // pick_mirror_endpoint must skip "a" while it's quarantined.
         for _ in 0..20 {
-            let (chosen, _) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
+            let (chosen, _) = proxy.pick_mirror_endpoint(&endpoints, None, 0).unwrap();
             assert_ne!(
                 chosen.as_ref(),
                 "a",
@@ -2811,7 +2854,7 @@ mod tests {
         // was cleared.
         proxy.record_mirror_failure("a", MirrorFailureKind::Generic);
         let (chosen, _) = proxy
-            .pick_mirror_endpoint(&endpoints, None)
+            .pick_mirror_endpoint(&endpoints, None, 0)
             .expect("endpoint should be eligible");
         assert_eq!(chosen.as_ref(), "a");
 
@@ -2835,7 +2878,7 @@ mod tests {
             }
         }
 
-        let pick = proxy.pick_mirror_endpoint(&endpoints, None);
+        let pick = proxy.pick_mirror_endpoint(&endpoints, None, 0);
         assert!(pick.is_some(), "should fall back to full set when all quarantined");
 
         Ok(())
@@ -2854,7 +2897,7 @@ mod tests {
 
         for _ in 0..50 {
             let (chosen, _) = proxy
-                .pick_mirror_endpoint(&endpoints, Some("a"))
+                .pick_mirror_endpoint(&endpoints, Some("a"), 0)
                 .expect("eligible endpoints exist");
             assert_ne!(chosen.as_ref(), "a", "excluded endpoint must be skipped");
         }
@@ -2873,8 +2916,8 @@ mod tests {
         let proxy = WorkerProxyStore::new(inner, locality_map);
         let endpoints: Vec<Arc<str>> = vec!["only".into()];
 
-        let (_, sem1) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
-        let (_, sem2) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
+        let (_, sem1) = proxy.pick_mirror_endpoint(&endpoints, None, 0).unwrap();
+        let (_, sem2) = proxy.pick_mirror_endpoint(&endpoints, None, 0).unwrap();
         assert!(
             Arc::ptr_eq(&sem1, &sem2),
             "permit semaphore must be shared across picks"

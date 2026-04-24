@@ -18,10 +18,13 @@
 //! evidence is summarized in the PR description.
 
 use bytes::Bytes;
-use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
+use nativelink_config::stores::{
+    EvictionPolicy, FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
+};
 use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_store::fast_slow_store::FastSlowStore;
+use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreKey, StoreLike};
@@ -446,6 +449,77 @@ async fn populate_fast_store_uses_mirror_when_disk_empty() {
         .await
         .expect("read-back from fast store");
     assert_eq!(read_back, data);
+}
+
+/// Mirror-materialize must produce a CAS file with the canonical 0o555
+/// mode (review #14). Pre-set in `filesystem_store::emplace_file`; this
+/// test guards against a regression where the mirror-materialize path
+/// bypasses or post-overwrites that mode bit. Linux-only: macOS dev
+/// targets don't go through the same chmod path.
+#[cfg(target_os = "linux")]
+#[nativelink_test]
+async fn mirror_materialize_sets_0o555_mode_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use nativelink_store::filesystem_store::digest_content_path;
+
+    // Build a FastSlowStore whose fast tier is a real FilesystemStore so
+    // the post-write chmod actually fires. (`make_fss()` uses a memory
+    // fast store, which has no on-disk file to inspect.)
+    let content_dir = tempfile::Builder::new()
+        .prefix("nl_mirror_mode_content_")
+        .tempdir()
+        .expect("tempdir")
+        .keep();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("nl_mirror_mode_temp_")
+        .tempdir()
+        .expect("tempdir")
+        .keep();
+    let fs_store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_dir.to_string_lossy().into_owned(),
+        temp_path: temp_dir.to_string_lossy().into_owned(),
+        eviction_policy: Some(EvictionPolicy::default()),
+        ..Default::default()
+    })
+    .await
+    .expect("filesystem store");
+
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(fs_store),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    );
+
+    let digest = d(60, 4);
+    let data = Bytes::from_static(b"perm");
+    write_mirror(&fss, digest, data.clone()).await;
+
+    fss.populate_fast_store_unchecked(StoreKey::from(digest))
+        .await
+        .expect("mirror-only populate");
+
+    // Locate the on-disk file via the documented path layout and assert
+    // the mode is exactly 0o555 (CAS read-execute, no write).
+    let content_path_str = content_dir.to_string_lossy().into_owned();
+    let on_disk_path = digest_content_path(&content_path_str, &digest);
+    let meta = std::fs::metadata(&on_disk_path).unwrap_or_else(|err| {
+        panic!(
+            "expected materialized file at {}: {err:?}",
+            std::path::Path::new(&on_disk_path).display()
+        )
+    });
+    let mode = meta.permissions().mode() & 0o7777;
+    assert_eq!(
+        mode, 0o555,
+        "materialized CAS file mode must be 0o555 (got {mode:o}) at {}",
+        std::path::Path::new(&on_disk_path).display()
+    );
 }
 
 /// Lock-ordering regression test (review #2/#4/#5): the canonical

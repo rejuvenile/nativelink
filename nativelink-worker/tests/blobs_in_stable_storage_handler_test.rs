@@ -44,17 +44,17 @@ use nativelink_worker::local_worker::{
 use pretty_assertions::assert_eq;
 
 fn temp_path(suffix: &str) -> String {
-    let dir = std::env::temp_dir();
-    let nonce = format!(
-        "{}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        suffix,
-    );
-    dir.join(nonce).to_string_lossy().into_owned()
+    // Use `tempfile::Builder` for race-free unique-name generation; `.keep()`
+    // disarms the auto-cleanup so the FilesystemStore (which lives past the
+    // test body inside Arcs) doesn't see its content_path vanish mid-run.
+    // Tradeoff: tmp files leak; the OS reclaims them on next /tmp sweep.
+    tempfile::Builder::new()
+        .prefix(&format!("nl_blobs_in_stable_{suffix}_"))
+        .tempdir()
+        .expect("tempdir")
+        .keep()
+        .to_string_lossy()
+        .into_owned()
 }
 
 async fn make_filesystem_store() -> Arc<FilesystemStore> {
