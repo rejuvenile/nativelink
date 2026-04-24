@@ -507,16 +507,40 @@ impl StreamingBlobReader {
             if timeout_result.is_err() {
                 let chunk_count = self.inner.chunk_count.load(Ordering::Acquire);
                 let earliest = self.inner.earliest_chunk_idx.load(Ordering::Acquire);
-                error!(
-                    digest = %self.inner.digest,
-                    age_ms = self.inner.age_ms(),
-                    cursor_chunk_idx = self.cursor_chunk_idx,
-                    chunk_count,
-                    earliest,
-                    terminal_present,
-                    wait_ms = wait_elapsed.as_millis() as u64,
-                    "streaming blob reader notify deadline exceeded — suspected lost wakeup"
-                );
+                // terminal_present distinguishes two distinct failure modes that
+                // both surface as "reader timed out waiting for notify":
+                //   - true:  writer dropped/finished but its notify_waiters() did
+                //            not wake this reader. Genuine lost wakeup; bug
+                //            lives in the notify primitive integration here.
+                //   - false: writer is still alive (no terminal state set);
+                //            the producer task itself is wedged upstream of
+                //            streaming_blob (e.g. blocked on a gRPC read with
+                //            no per-frame deadline, holding a lock, or the
+                //            tokio task is starved). Bug lives upstream.
+                if terminal_present {
+                    error!(
+                        digest = %self.inner.digest,
+                        age_ms = self.inner.age_ms(),
+                        cursor_chunk_idx = self.cursor_chunk_idx,
+                        chunk_count,
+                        earliest,
+                        wait_ms = wait_elapsed.as_millis() as u64,
+                        "streaming blob reader notify deadline exceeded — \
+                         terminal IS set, this is a genuine lost wakeup"
+                    );
+                } else {
+                    error!(
+                        digest = %self.inner.digest,
+                        age_ms = self.inner.age_ms(),
+                        cursor_chunk_idx = self.cursor_chunk_idx,
+                        chunk_count,
+                        earliest,
+                        wait_ms = wait_elapsed.as_millis() as u64,
+                        "streaming blob reader notify deadline exceeded — \
+                         terminal NOT set, producer is wedged upstream \
+                         (e.g. gRPC read with no deadline, or task starvation)"
+                    );
+                }
                 return Err(make_err!(
                     Code::DeadlineExceeded,
                     "streaming blob next_chunk: notify deadline exceeded"
