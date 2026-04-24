@@ -987,6 +987,27 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         self.evicting_map.unpin_key(&key);
     }
 
+    /// Test hook: drive the pin-expiry sweep deterministically. The
+    /// production background loop in `start_background_eviction` calls
+    /// this once per 10s tick. Integration tests for the auto-unpin →
+    /// `failed_slow_writes` plumbing call it directly so they don't have
+    /// to wait the real `PIN_TIMEOUT_SECS = 120s` deadline. Doc-hidden
+    /// to keep the public API surface tight.
+    #[doc(hidden)]
+    pub async fn test_expire_stale_pins(&self) {
+        self.evicting_map.expire_stale_pins().await;
+    }
+
+    /// Test hook: force a pinned digest's deadline past
+    /// `PIN_TIMEOUT_SECS` so the next sweep treats it as stale. Returns
+    /// `true` if the digest was pinned. Doc-hidden — paired with
+    /// `test_expire_stale_pins` for deterministic auto-unpin tests.
+    #[doc(hidden)]
+    pub fn test_force_pin_expired(&self, digest: &DigestInfo) -> bool {
+        let key: StoreKey<'static> = (*digest).into();
+        self.evicting_map.test_force_pin_expired(&key)
+    }
+
     /// Returns all digest entries in the cache with their absolute last-access
     /// timestamps (seconds since UNIX epoch). String-keyed entries are skipped.
     /// This is a peek-only operation and does NOT promote entries in the LRU.
