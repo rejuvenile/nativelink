@@ -16,14 +16,13 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::Poll;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use futures::task::Context;
 use futures::{Future, Stream, TryFutureExt};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
-use parking_lot::Mutex as PlMutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::warn;
@@ -49,8 +48,10 @@ struct ChannelDiag {
     /// `tokio::task::Id` so we don't need that type to be `Display` in
     /// every consumer (it is, but this avoids the dep). Lazily set on
     /// the first `send` because the channel is often constructed in a
-    /// different task than the one that ultimately produces.
-    producer_task_id: PlMutex<Option<String>>,
+    /// different task than the one that ultimately produces. Uses
+    /// `OnceLock` so the steady-state hot path (every chunk after the
+    /// first) is a single atomic load + early return — no mutex.
+    producer_task_id: OnceLock<String>,
     /// Unix-epoch milliseconds of the most recent successful send.
     /// `0` means "no successful send yet" — distinguishable from a
     /// real send because we record `1` when t==0 happens to land at
@@ -64,13 +65,12 @@ struct ChannelDiag {
 
 impl ChannelDiag {
     fn record_send(&self) {
-        // Lazily capture the producer task id on first send.
-        {
-            let mut id = self.producer_task_id.lock();
-            if id.is_none() {
-                if let Some(tid) = tokio::task::try_id() {
-                    *id = Some(tid.to_string());
-                }
+        // Lazily capture the producer task id on first send. After the
+        // first set, this is a single atomic load + early return — no
+        // mutex, no allocation. Per-chunk hot path stays branch-cheap.
+        if self.producer_task_id.get().is_none() {
+            if let Some(tid) = tokio::task::try_id() {
+                let _ = self.producer_task_id.set(tid.to_string());
             }
         }
         let now_ms = std::time::SystemTime::now()
@@ -83,7 +83,7 @@ impl ChannelDiag {
 
     fn snapshot(&self) -> ChannelDiagSnapshot {
         ChannelDiagSnapshot {
-            producer_task_id: self.producer_task_id.lock().clone(),
+            producer_task_id: self.producer_task_id.get().cloned(),
             last_send_at_epoch_ms: self.last_send_at_epoch_ms.load(Ordering::Relaxed),
             sends_total: self.sends_total.load(Ordering::Relaxed),
         }
@@ -685,9 +685,13 @@ mod diag_tests {
     #[tokio::test]
     async fn diag_keeps_first_producer_across_sends() {
         let (tx, rx) = make_buf_channel_pair();
-        // Channel for the test driver to wait on the producer's first
-        // and second sends so we can read the diag mid-stream.
+        // Two-way handshake so the producer waits for the test driver
+        // to snapshot snap1 before issuing send "b". Without this gate
+        // the producer can race ahead of the snapshot — sends_total
+        // would be 2 by the time we look. Per CLAUDE.md "no sleep as
+        // synchronization": use channels, not timing, to serialize.
         let (after_first, mut wait_first) = tokio::sync::mpsc::channel::<()>(1);
+        let (proceed_to_second, mut wait_to_proceed) = tokio::sync::mpsc::channel::<()>(1);
         let (after_second, mut wait_second) = tokio::sync::mpsc::channel::<()>(1);
 
         let producer = tokio::spawn(async move {
@@ -695,20 +699,23 @@ mod diag_tests {
             let mut tx = tx;
             tx.send(Bytes::from_static(b"a")).await.unwrap();
             after_first.send(()).await.unwrap();
-            // Sleep at least 2 ms of wall-clock so the second send has
-            // a chance to land on a different millisecond timestamp.
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            // Block until the test driver has read snap1, then proceed.
+            wait_to_proceed.recv().await.unwrap();
             tx.send(Bytes::from_static(b"b")).await.unwrap();
             after_second.send(()).await.unwrap();
             pid
         });
 
-        // Snapshot after the first send.
+        // Snapshot after the first send (producer is blocked on
+        // `wait_to_proceed.recv` so sends_total is exactly 1).
         wait_first.recv().await.unwrap();
         let snap1 = rx.diag.snapshot();
         assert_eq!(snap1.sends_total, 1);
         let ts1 = snap1.last_send_at_epoch_ms;
         let first_id = snap1.producer_task_id.clone().unwrap();
+
+        // Release the producer to issue the second send.
+        proceed_to_second.send(()).await.unwrap();
 
         // Snapshot after the second send.
         wait_second.recv().await.unwrap();
