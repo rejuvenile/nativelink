@@ -1102,80 +1102,20 @@ async fn peer_unavailable_pre_eof_drops_cached_connection() -> Result<(), Error>
 // on a peer worker.
 // ===================================================================
 
-/// A store wrapper whose `get_part` always returns a configurable
-/// error code/message. Used as the inner store of the WorkerProxyStore
-/// to exercise the gate-broadening logic for codes other than NotFound.
-#[derive(Debug, MetricsComponent)]
-struct ErrorOnReadStore {
-    err_code: Code,
-    err_marker: String,
-}
-
-default_health_status_indicator!(ErrorOnReadStore);
-
-#[async_trait]
-impl StoreDriver for ErrorOnReadStore {
-    async fn has_with_results(
-        self: Pin<&Self>,
-        _digests: &[StoreKey<'_>],
-        results: &mut [Option<u64>],
-    ) -> Result<(), Error> {
-        for slot in results.iter_mut() {
-            *slot = None;
-        }
-        Ok(())
-    }
-
-    async fn update(
-        self: Pin<&Self>,
-        _key: StoreKey<'_>,
-        _reader: DropCloserReadHalf,
-        _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Err(make_err!(
-            Code::Unimplemented,
-            "ErrorOnReadStore: update not supported"
-        ))
-    }
-
-    async fn get_part(
-        self: Pin<&Self>,
-        _key: StoreKey<'_>,
-        _writer: &mut DropCloserWriteHalf,
-        _offset: u64,
-        _length: Option<u64>,
-    ) -> Result<(), Error> {
-        Err(make_err!(self.err_code, "{}", self.err_marker))
-    }
-
-    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
-        self
-    }
-
-    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
-        self
-    }
-
-    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
-        self
-    }
-
-    fn register_item_callback(
-        self: Arc<Self>,
-        _callback: Arc<dyn ItemCallback>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-}
-
-/// Helper: build a WorkerProxyStore wrapping an inner ErrorOnReadStore that
-/// always returns `(err_code, err_marker)` from get_part. Returns the proxy
-/// Arc, the proxy as a Store, and the locality map.
+/// Helper: build a WorkerProxyStore wrapping an inner
+/// `PartialWriteThenErrorStore` whose `get_part` errors immediately
+/// (empty prefix → no bytes streamed) with `(err_code, err_marker)`.
+/// Returns the proxy Arc, the proxy as a Store, and the locality map.
+///
+/// The unified `PartialWriteThenErrorStore` fake is defined below the
+/// red-team Finding 4 tests; it covers both "error before any bytes" (when
+/// `prefix.is_empty()`) and "error after partial bytes" (non-empty prefix).
 fn make_proxy_with_failing_inner(
     err_code: Code,
     err_marker: &str,
 ) -> (Arc<WorkerProxyStore>, Store, SharedBlobLocalityMap) {
-    let inner = Store::new(Arc::new(ErrorOnReadStore {
+    let inner = Store::new(Arc::new(PartialWriteThenErrorStore {
+        prefix: Bytes::new(),
         err_code,
         err_marker: err_marker.to_string(),
     }));
@@ -1373,38 +1313,123 @@ impl StoreDriver for PartialWriteThenErrorStore {
 }
 
 // -------------------------------------------------------------------
-// 30. Inner store writes 5 bytes THEN errors with Internal. A peer
-//     holds the full blob. The proxy MUST surface the inner-store
-//     error (NOT silently produce 5 + 16 = 21 bytes of corruption).
+// 30. Table-driven: for EVERY code in `should_try_peers`'s allowlist,
+//     if the inner store writes 5 bytes THEN errors with that code while
+//     a peer holds the full 16-byte blob, the proxy MUST surface the
+//     inner-store error (NOT silently produce 5 + 16 = 21 corrupt bytes).
+//
+// The corruption-guard logic in `get_part_sequential` is code-agnostic:
+// any of the 6 fall-through codes (Internal, DataLoss, Unavailable,
+// OutOfRange, Unknown, ResourceExhausted) can fire mid-stream and
+// trigger the same partial-write hazard. Treating only `Internal` would
+// leave the other 5 codes silently corrupting consumers.
+//
+// We assert (per code):
+//   * caller gets `Err` with the original code (not Ok with mixed bytes),
+//   * the surfaced error preserves the inner-store marker substring,
+//   * `bytes_written` matches the inner's partial write (5), NOT the
+//     5+16=21 "papered-over" shape.
 //
 // Mutation guard: comment out the `bytes_written_by_inner > 0` block in
-// `get_part_sequential` — this test must turn RED, returning Ok with
-// 5 + 16 = 21 corrupt bytes instead of an Err.
+// `get_part_sequential` — every row of this table must turn RED with
+// `Ok(21 bytes)` instead of `Err`.
 // -------------------------------------------------------------------
 #[nativelink_test]
 async fn inner_partial_write_then_error_is_not_papered_over_by_peer_fetch()
 -> Result<(), Error> {
-    // Inner: write 5 bytes "AAAAA" then error Internal.
-    let inner = Store::new(Arc::new(PartialWriteThenErrorStore {
-        prefix: Bytes::from_static(b"AAAAA"),
-        err_code: Code::Internal,
-        err_marker: "INNER_PARTIAL_THEN_INTERNAL".to_string(),
-    }));
-    let locality_map = new_shared_blob_locality_map();
-    let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
-    let proxy = Store::new(proxy_arc.clone());
+    // Every code in `should_try_peers`'s allowlist; all 6 must be
+    // guarded — keeping the guard code-agnostic keeps the corruption
+    // surface zero regardless of which code the inner store emits.
+    let cases: &[(Code, &str)] = &[
+        (Code::Internal, "INNER_PARTIAL_THEN_INTERNAL"),
+        (Code::DataLoss, "INNER_PARTIAL_THEN_DATALOSS"),
+        (Code::Unavailable, "INNER_PARTIAL_THEN_UNAVAILABLE"),
+        (Code::OutOfRange, "INNER_PARTIAL_THEN_OUT_OF_RANGE"),
+        (Code::Unknown, "INNER_PARTIAL_THEN_UNKNOWN"),
+        (Code::ResourceExhausted, "INNER_PARTIAL_THEN_RESOURCE_EXHAUSTED"),
+    ];
 
-    // Peer holds the full blob (16 bytes) for the same digest. Note
-    // `digest.size_bytes` (16) intentionally differs from what the
-    // inner partially streamed (5) — that's exactly the corruption
-    // shape the guard must prevent.
-    let value = b"0123456789abcdef"; // 16 bytes
+    // Inner partial-prefix length and peer blob length differ on
+    // purpose — 5 vs 16 — so a "papered-over" failure mode would
+    // produce a 21-byte corrupt stream that the assertion catches.
+    const PARTIAL_PREFIX: &[u8] = b"AAAAA"; // 5 bytes
+    let value: &[u8] = b"0123456789abcdef"; // 16 bytes
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    for (code, marker) in cases {
+        // Inner: write 5 bytes "AAAAA" then error with `code`.
+        let inner = Store::new(Arc::new(PartialWriteThenErrorStore {
+            prefix: Bytes::from_static(PARTIAL_PREFIX),
+            err_code: *code,
+            err_marker: (*marker).to_string(),
+        }));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
+        let proxy = Store::new(proxy_arc.clone());
+
+        // Peer holds the full blob for the same digest.
+        let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        peer_store
+            .update_oneshot(digest, Bytes::from_static(value))
+            .await?;
+        let peer_endpoint = "grpc://peer-worker:50081";
+        proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+        locality_map
+            .write()
+            .register_blobs(peer_endpoint, &[digest]);
+
+        let result = proxy.get_part_unchunked(digest, 0, None).await;
+        let err = match result {
+            Ok(data) => panic!(
+                "Code::{code:?} ({marker}): expected Err (corruption guard), \
+                 got Ok with {} bytes (papered-over shape would be 5+16=21)",
+                data.len()
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.code, *code,
+            "Code::{code:?} ({marker}): expected inner-store code to surface, got: {err:?}"
+        );
+        let msg = err.message_string();
+        assert!(
+            msg.contains(*marker),
+            "Code::{code:?} ({marker}): expected inner-store marker in surfaced error, got: {msg}"
+        );
+        // The error message also documents the partial-write shape so
+        // operators can recognize the corruption-guard fire.
+        assert!(
+            msg.contains("5 bytes"),
+            "Code::{code:?} ({marker}): expected guard to report bytes_written=5, got: {msg}"
+        );
+    }
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 31. `Code::Aborted` must NOT invoke the peer-fetch path.
+//     Aborted is reserved for AC ABA (write/write conflict) signalling
+//     and is not a "blob can't be served" signal. The original error
+//     must propagate untouched; peer-fetch must NOT be consulted (which
+//     we verify by registering peer data that, if returned, would
+//     overwrite the marker — and asserting it does not).
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn inner_aborted_does_not_invoke_peer_fetch() -> Result<(), Error> {
+    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
+        Code::Aborted,
+        "INNER_ABORTED_MARKER",
+    );
+
+    let value = b"this peer data must NOT be returned for Aborted";
     let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
 
     let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     peer_store
         .update_oneshot(digest, Bytes::from_static(value))
         .await?;
+
     let peer_endpoint = "grpc://peer-worker:50081";
     proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
     locality_map
@@ -1412,20 +1437,60 @@ async fn inner_partial_write_then_error_is_not_papered_over_by_peer_fetch()
         .register_blobs(peer_endpoint, &[digest]);
 
     let result = proxy.get_part_unchunked(digest, 0, None).await;
-    let err = result.expect_err(
-        "Expected Err: inner wrote 5 partial bytes then errored, peer-fetch \
-         would corrupt stream. Without the bytes-written guard, the proxy \
-         would silently fall through and produce 5+16=21 corrupt bytes.",
-    );
+    let err = result.expect_err("Expected Aborted to propagate");
     assert_eq!(
         err.code,
-        Code::Internal,
-        "Expected the inner-store Code::Internal to surface, got: {err:?}"
+        Code::Aborted,
+        "Aborted must propagate; peer-fetch must NOT be invoked. err={err:?}"
     );
-    let msg = err.message_string();
     assert!(
-        msg.contains("INNER_PARTIAL_THEN_INTERNAL"),
-        "Expected the original inner-store marker in the surfaced error, got: {msg}"
+        err.message_string().contains("INNER_ABORTED_MARKER"),
+        "Expected the original inner-store error message to surface, got: {}",
+        err.message_string()
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 32. `Code::DeadlineExceeded` must NOT invoke the peer-fetch path.
+//     The caller's deadline has already passed; spending more wall-clock
+//     on peer RPCs against a stream the caller has stopped reading is
+//     wasted work. The original DeadlineExceeded error must propagate
+//     untouched, and the peer-registered bytes must NOT be returned.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn inner_deadline_exceeded_does_not_invoke_peer_fetch() -> Result<(), Error> {
+    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
+        Code::DeadlineExceeded,
+        "INNER_DEADLINE_EXCEEDED_MARKER",
+    );
+
+    let value = b"this peer data must NOT be returned for DeadlineExceeded";
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_store
+        .update_oneshot(digest, Bytes::from_static(value))
+        .await?;
+
+    let peer_endpoint = "grpc://peer-worker:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    let result = proxy.get_part_unchunked(digest, 0, None).await;
+    let err = result.expect_err("Expected DeadlineExceeded to propagate");
+    assert_eq!(
+        err.code,
+        Code::DeadlineExceeded,
+        "DeadlineExceeded must propagate; peer-fetch must NOT be invoked. err={err:?}"
+    );
+    assert!(
+        err.message_string().contains("INNER_DEADLINE_EXCEEDED_MARKER"),
+        "Expected the original inner-store error message to surface, got: {}",
+        err.message_string()
     );
 
     Ok(())
