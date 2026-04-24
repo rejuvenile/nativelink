@@ -110,6 +110,15 @@ struct MirrorEndpointState {
     /// If `Some`, endpoint is in quarantine until this instant. While
     /// quarantined the endpoint is skipped during mirror selection.
     quarantined_until: Option<Instant>,
+    /// Last reported `mirror_blobs` total bytes from the worker. Updated
+    /// by `record_mirror_capacity` on every BlobsAvailable tick.
+    /// `None` until the worker reports its first capacity (older workers
+    /// or workers with no CAS server never report; treat as unknown ⇒
+    /// no pre-check filtering).
+    mirror_used_bytes: Option<u64>,
+    /// Last reported `MIRROR_BLOBS_MAX_BYTES` from the worker. Stored
+    /// per-endpoint because workers can be configured independently.
+    mirror_max_bytes: Option<u64>,
 }
 
 impl MirrorEndpointState {
@@ -119,6 +128,23 @@ impl MirrorEndpointState {
             consecutive_failures: 0,
             first_failure_at: None,
             quarantined_until: None,
+            mirror_used_bytes: None,
+            mirror_max_bytes: None,
+        }
+    }
+
+    /// Returns true if a mirror write of `size_bytes` would fit within
+    /// the last-reported capacity. Returns true for unknown capacity
+    /// (no report yet) so we don't filter out workers we have no
+    /// information about. Also returns true defensively when `max == 0`
+    /// (treat as "no cap configured" rather than "instantly full") so a
+    /// future code path that records a stale `(used, 0)` cannot lock the
+    /// peer out of all picker rotations.
+    fn fits(&self, size_bytes: u64) -> bool {
+        match (self.mirror_used_bytes, self.mirror_max_bytes) {
+            (Some(_), Some(0)) => true,
+            (Some(used), Some(max)) => used.saturating_add(size_bytes) <= max,
+            _ => true,
         }
     }
 }
@@ -281,6 +307,38 @@ fn is_definitive_unreachable(e: &Error) -> bool {
             || m.contains("NetworkUnreachable")
             || m.contains("HostUnreachable")
     })
+}
+
+/// Classification of a mirror-write failure for `record_mirror_failure`.
+///
+/// Quarantine policy depends on the kind:
+///   * `DefinitiveUnreachable` — fast-quarantine on the first failure
+///     (the peer is provably gone; round-robin to it is wasted I/O).
+///   * `Generic` — only quarantine after `MIRROR_FAILURE_THRESHOLD`
+///     failures inside `MIRROR_FAILURE_WINDOW` (transient errors recover
+///     on retry; one or two failures must NOT quarantine).
+///   * `Saturated` — the peer's mirror cap is full. The peer is healthy
+///     but cannot accept this blob right now; the picker should route the
+///     next attempt elsewhere. Saturation must NOT count toward the
+///     consecutive-failure streak — it is not evidence the peer is broken.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum MirrorFailureKind {
+    Generic,
+    DefinitiveUnreachable,
+    Saturated,
+}
+
+/// Classifies an Error from a mirror write into a quarantine policy
+/// signal. Centralized so call sites cannot accidentally treat a
+/// ResourceExhausted (cap-full) response the same as a generic transient.
+fn classify_mirror_failure(e: &Error) -> MirrorFailureKind {
+    if e.code == Code::ResourceExhausted {
+        return MirrorFailureKind::Saturated;
+    }
+    if is_definitive_unreachable(e) {
+        return MirrorFailureKind::DefinitiveUnreachable;
+    }
+    MirrorFailureKind::Generic
 }
 
 impl WorkerProxyStore {
@@ -1105,10 +1163,23 @@ impl WorkerProxyStore {
     /// taken only on (a) first-ever sighting of an endpoint or (b) cleanup
     /// of an expired quarantine. Mirrors are called per blob during write
     /// bursts, so keeping the hot path read-only avoids serializing fan-out.
+    /// Pick a mirror endpoint, filtering out peers whose last-reported
+    /// `(mirror_used_bytes + size_bytes) > mirror_max_bytes`. The
+    /// capacity check is the review #1 fix: BEFORE the source stream is
+    /// consumed, we exclude peers we know cannot accept the blob.
+    /// Saturated peers that slip through (e.g. capacity report is stale
+    /// because the worker just inserted a different blob) still surface
+    /// the cap-exceeded `Err(ResourceExhausted)` from
+    /// `insert_mirror_blob`, which `record_mirror_failure(Saturated)`
+    /// handles without quarantining.
+    ///
+    /// `size_bytes = 0` skips the filter (used by callers that don't
+    /// know the size — preserves pre-fix behavior).
     fn pick_mirror_endpoint(
         &self,
         endpoints: &[Arc<str>],
         exclude: Option<&str>,
+        size_bytes: u64,
     ) -> Option<(Arc<str>, Arc<Semaphore>)> {
         if endpoints.is_empty() {
             return None;
@@ -1118,11 +1189,13 @@ impl WorkerProxyStore {
         // Try the read-only fast path. We can serve the request without a
         // write lock if every endpoint we'd consider has an existing entry
         // with no quarantine that needs clearing.
-        if let Some(pick) = self.pick_mirror_endpoint_read(endpoints, exclude, now) {
+        if let Some(pick) =
+            self.pick_mirror_endpoint_read(endpoints, exclude, now, size_bytes)
+        {
             return Some(pick);
         }
         // Slow path: missing entries or expired quarantines need cleanup.
-        self.pick_mirror_endpoint_write(endpoints, exclude, now)
+        self.pick_mirror_endpoint_write(endpoints, exclude, now, size_bytes)
     }
 
     /// Read-lock fast path. Returns `None` if any endpoint we'd consider is
@@ -1133,6 +1206,7 @@ impl WorkerProxyStore {
         endpoints: &[Arc<str>],
         exclude: Option<&str>,
         now: Instant,
+        size_bytes: u64,
     ) -> Option<(Arc<str>, Arc<Semaphore>)> {
         let state = self.mirror_state.read();
         let mut eligible_count = 0usize;
@@ -1147,9 +1221,17 @@ impl WorkerProxyStore {
             };
             considered_count += 1;
             match entry.quarantined_until {
-                Some(t) if t > now => {} // still quarantined, skip
-                Some(_) => return None,  // expired — clear under write lock
-                None => eligible_count += 1,
+                Some(t) if t > now => continue, // still quarantined, skip
+                Some(_) => return None,         // expired — clear under write lock
+                None => {
+                    if size_bytes == 0 || entry.fits(size_bytes) {
+                        eligible_count += 1;
+                    }
+                    // Capacity-rejected peers count toward considered_count
+                    // (so the caller knows there ARE peers, just full)
+                    // but NOT toward eligible_count (so the picker
+                    // prefers a fits-able peer).
+                }
             }
         }
         if considered_count == 0 {
@@ -1173,7 +1255,14 @@ impl WorkerProxyStore {
             // quarantine, so this lookup must succeed.
             let entry = state.get(ep)?;
             let active = entry.quarantined_until.is_some_and(|t| t > now);
-            let in_pool = if eligible_count > 0 { !active } else { true };
+            let fits = size_bytes == 0 || entry.fits(size_bytes);
+            let in_pool = if eligible_count > 0 {
+                !active && fits
+            } else {
+                // Degraded mode: every peer is either quarantined or
+                // saturated. Pick anyway (better to try than to drop).
+                true
+            };
             if !in_pool {
                 continue;
             }
@@ -1192,6 +1281,7 @@ impl WorkerProxyStore {
         endpoints: &[Arc<str>],
         exclude: Option<&str>,
         now: Instant,
+        size_bytes: u64,
     ) -> Option<(Arc<str>, Arc<Semaphore>)> {
         let mut state = self.mirror_state.write();
         let mut eligible_count = 0usize;
@@ -1207,10 +1297,12 @@ impl WorkerProxyStore {
             if entry.quarantined_until.is_some_and(|t| t > now) {
                 continue;
             }
-            // Either never quarantined or quarantine expired — clear and
-            // mark eligible.
+            // Either never quarantined or quarantine expired — clear.
             entry.quarantined_until = None;
-            eligible_count += 1;
+            // Apply the same capacity filter as the read path.
+            if size_bytes == 0 || entry.fits(size_bytes) {
+                eligible_count += 1;
+            }
         }
         if considered_count == 0 {
             return None;
@@ -1229,7 +1321,12 @@ impl WorkerProxyStore {
             }
             let entry = state.get(ep)?;
             let active = entry.quarantined_until.is_some_and(|t| t > now);
-            let in_pool = if eligible_count > 0 { !active } else { true };
+            let fits = size_bytes == 0 || entry.fits(size_bytes);
+            let in_pool = if eligible_count > 0 {
+                !active && fits
+            } else {
+                true
+            };
             if !in_pool {
                 continue;
             }
@@ -1250,40 +1347,119 @@ impl WorkerProxyStore {
         }
     }
 
-    /// Increment failure count for `endpoint`. With `definitive=false`,
-    /// quarantine fires only after `MIRROR_FAILURE_THRESHOLD` failures
-    /// inside `MIRROR_FAILURE_WINDOW`. With `definitive=true`, quarantine
-    /// fires immediately on the first failure — `MIRROR_FAILURE_WINDOW` is
-    /// bypassed because a transport-level `ConnectionRefused` /
-    /// `NetworkUnreachable` / `HostUnreachable` is sufficient evidence
-    /// that the peer is gone, and we want to stop round-robin routing to
-    /// the dead worker for the ~1s it would take to accumulate 5 failures.
-    /// In both cases the quarantine itself lasts `MIRROR_QUARANTINE_DURATION`.
-    fn record_mirror_failure(&self, endpoint: &str, definitive: bool) {
+    /// Record the last-reported mirror-blob capacity for `endpoint`.
+    /// Called from the worker_api_server when `BlobsAvailableNotification`
+    /// includes mirror-bytes fields. Used by `pick_mirror_endpoint_*`
+    /// to filter peers whose `(used + size_bytes) > max` BEFORE the
+    /// source stream is consumed (review #1).
+    ///
+    /// Short-circuits when `(used_bytes, max_bytes)` is unchanged from the
+    /// last report (review #10) — workers tick every ~100ms and a
+    /// long-running cluster can spin record_mirror_capacity at ~100/s/peer
+    /// taking the RwLock::write each time. The early-return uses the
+    /// read lock and `RwLock` upgrades only on a real change.
+    pub fn record_mirror_capacity(
+        &self,
+        endpoint: &str,
+        used_bytes: u64,
+        max_bytes: u64,
+    ) {
+        // Read-only fast path: skip the write lock when the value hasn't
+        // changed since the last tick. Most ticks are no-ops.
+        {
+            let state = self.mirror_state.read();
+            if let Some(entry) = state.get(endpoint) {
+                if entry.mirror_used_bytes == Some(used_bytes)
+                    && entry.mirror_max_bytes == Some(max_bytes)
+                {
+                    return;
+                }
+            }
+        }
+        let mut state = self.mirror_state.write();
+        let entry = state
+            .entry(Arc::from(endpoint))
+            .or_insert_with(MirrorEndpointState::new);
+        entry.mirror_used_bytes = Some(used_bytes);
+        entry.mirror_max_bytes = Some(max_bytes);
+    }
+
+    /// Test-only accessor: returns the last-reported `(used, max)` for
+    /// `endpoint`, or `None` if no capacity report has been recorded.
+    /// Used by integration tests to assert that `BlobsAvailable`
+    /// capacity fields are plumbed end-to-end through
+    /// `WorkerApiServer::handle_blobs_available`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn mirror_capacity_for_test(
+        &self,
+        endpoint: &str,
+    ) -> Option<(u64, u64)> {
+        let state = self.mirror_state.read();
+        state.get(endpoint).and_then(|entry| {
+            match (entry.mirror_used_bytes, entry.mirror_max_bytes) {
+                (Some(u), Some(m)) => Some((u, m)),
+                _ => None,
+            }
+        })
+    }
+
+    /// Record a mirror-write failure against `endpoint` according to its
+    /// classification:
+    ///   * [`MirrorFailureKind::Generic`] — quarantine fires only after
+    ///     `MIRROR_FAILURE_THRESHOLD` failures inside `MIRROR_FAILURE_WINDOW`.
+    ///   * [`MirrorFailureKind::DefinitiveUnreachable`] — quarantine fires
+    ///     immediately. A transport-level `ConnectionRefused` /
+    ///     `NetworkUnreachable` / `HostUnreachable` is sufficient evidence
+    ///     that the peer is gone; we want to stop round-robin routing to
+    ///     the dead worker rather than burn the ~1s it would take to
+    ///     accumulate 5 failures.
+    ///   * [`MirrorFailureKind::Saturated`] — the peer's mirror cap is full.
+    ///     This is NOT evidence the peer is broken — it is healthy and
+    ///     responding, just out of room. Skip the streak update entirely
+    ///     so a peer that fills up first does not get quarantined out of
+    ///     the rotation; the picker filters saturated peers via the
+    ///     capacity pre-check (review #1) so this path is a fallback for
+    ///     the small remaining race window only.
+    /// In all cases the quarantine itself lasts `MIRROR_QUARANTINE_DURATION`.
+    fn record_mirror_failure(&self, endpoint: &str, kind: MirrorFailureKind) {
         let now = Instant::now();
         let mut state = self.mirror_state.write();
         let entry = state
             .entry(Arc::from(endpoint))
             .or_insert_with(MirrorEndpointState::new);
-        if definitive {
-            entry.consecutive_failures = MIRROR_FAILURE_THRESHOLD;
-            if entry.first_failure_at.is_none() {
-                entry.first_failure_at = Some(now);
+        match kind {
+            MirrorFailureKind::Saturated => {
+                // Healthy peer, just full. Do not perturb the failure
+                // streak — quarantining a full peer would compound a
+                // transient memory-pressure issue into a hard outage.
+                debug!(
+                    endpoint,
+                    "mirror: peer saturated (ResourceExhausted); skipping quarantine streak update"
+                );
+                return;
             }
-        } else {
-            // Reset the streak if the previous failure was outside the window —
-            // a slow drip of unrelated failures shouldn't trigger quarantine.
-            match entry.first_failure_at {
-                Some(t) if now.duration_since(t) > MIRROR_FAILURE_WINDOW => {
-                    entry.consecutive_failures = 1;
+            MirrorFailureKind::DefinitiveUnreachable => {
+                entry.consecutive_failures = MIRROR_FAILURE_THRESHOLD;
+                if entry.first_failure_at.is_none() {
                     entry.first_failure_at = Some(now);
                 }
-                None => {
-                    entry.consecutive_failures = 1;
-                    entry.first_failure_at = Some(now);
-                }
-                _ => {
-                    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            }
+            MirrorFailureKind::Generic => {
+                // Reset the streak if the previous failure was outside the window —
+                // a slow drip of unrelated failures shouldn't trigger quarantine.
+                match entry.first_failure_at {
+                    Some(t) if now.duration_since(t) > MIRROR_FAILURE_WINDOW => {
+                        entry.consecutive_failures = 1;
+                        entry.first_failure_at = Some(now);
+                    }
+                    None => {
+                        entry.consecutive_failures = 1;
+                        entry.first_failure_at = Some(now);
+                    }
+                    _ => {
+                        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                    }
                 }
             }
         }
@@ -1295,7 +1471,7 @@ impl WorkerProxyStore {
                 endpoint,
                 consecutive_failures = entry.consecutive_failures,
                 quarantine_secs = MIRROR_QUARANTINE_DURATION.as_secs(),
-                definitive,
+                ?kind,
                 "mirror: quarantining endpoint after consecutive failures"
             );
         }
@@ -1312,6 +1488,7 @@ impl WorkerProxyStore {
         }
 
         self.mirror_total_attempted.fetch_add(1, Ordering::Relaxed);
+        let blob_size = data.len() as u64;
 
         // Try once on a healthy endpoint. On a connection-level failure,
         // try once more on a different endpoint — most mirror failures
@@ -1320,7 +1497,13 @@ impl WorkerProxyStore {
         let mut last_endpoint: Option<Arc<str>> = None;
         for attempt in 0..2 {
             let exclude = last_endpoint.as_deref();
-            let Some((endpoint, permits)) = self.pick_mirror_endpoint(&endpoints, exclude) else {
+            // Capacity pre-check (review #1): filter out peers we know
+            // can't fit this blob BEFORE we consume the source. The
+            // ResourceExhausted Err from `insert_mirror_blob` remains
+            // as a racy fallback for stale capacity reports.
+            let Some((endpoint, permits)) = self
+                .pick_mirror_endpoint(&endpoints, exclude, blob_size)
+            else {
                 self.mirror_dropped_quarantined.fetch_add(1, Ordering::Relaxed);
                 return;
             };
@@ -1357,7 +1540,10 @@ impl WorkerProxyStore {
                     attempt,
                     "mirror: failed to connect to worker"
                 );
-                self.record_mirror_failure(&endpoint, true);
+                self.record_mirror_failure(
+                    &endpoint,
+                    MirrorFailureKind::DefinitiveUnreachable,
+                );
                 last_endpoint = Some(endpoint);
                 continue;
             };
@@ -1406,7 +1592,7 @@ impl WorkerProxyStore {
                     return;
                 }
                 Err(e) => {
-                    self.record_mirror_failure(&endpoint, is_definitive_unreachable(&e));
+                    self.record_mirror_failure(&endpoint, classify_mirror_failure(&e));
                     let retry = attempt == 0 && is_connection_error(&e);
                     warn!(
                         %digest,
@@ -1444,9 +1630,15 @@ impl WorkerProxyStore {
         self.mirror_total_attempted.fetch_add(1, Ordering::Relaxed);
 
         // Streaming path can't retry: bytes from `reader` are consumed once.
-        // We still benefit from the per-worker permit (fair fan-out) and the
-        // health quarantine (skip dead workers).
-        let Some((endpoint, permits)) = self.pick_mirror_endpoint(&endpoints, None) else {
+        // We still benefit from the per-worker permit (fair fan-out), the
+        // health quarantine (skip dead workers), and the capacity
+        // pre-check (review #1): the digest's size is known up front, so
+        // pick a peer that has room BEFORE we start consuming the
+        // source stream.
+        let blob_size = digest.size_bytes();
+        let Some((endpoint, permits)) = self
+            .pick_mirror_endpoint(&endpoints, None, blob_size)
+        else {
             self.mirror_dropped_quarantined.fetch_add(1, Ordering::Relaxed);
             drop(reader);
             return;
@@ -1475,7 +1667,10 @@ impl WorkerProxyStore {
                 endpoint = endpoint.as_ref(),
                 "mirror_stream: failed to connect to worker"
             );
-            self.record_mirror_failure(&endpoint, true);
+            self.record_mirror_failure(
+                &endpoint,
+                MirrorFailureKind::DefinitiveUnreachable,
+            );
             drop(reader);
             return;
         };
@@ -1502,7 +1697,7 @@ impl WorkerProxyStore {
                 );
             }
             Err(e) => {
-                self.record_mirror_failure(&endpoint, is_definitive_unreachable(&e));
+                self.record_mirror_failure(&endpoint, classify_mirror_failure(&e));
                 warn!(
                     %digest,
                     size_bytes,
@@ -2034,6 +2229,254 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    // Review #4: ResourceExhausted classifies as Saturated, NOT as a
+    // quarantine-eligible failure. A peer that fills up first must not
+    // get pulled out of rotation as if it were broken.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_classify_mirror_failure_resource_exhausted_is_saturated() {
+        let e = make_err!(Code::ResourceExhausted, "mirror cap exceeded");
+        assert_eq!(classify_mirror_failure(&e), MirrorFailureKind::Saturated);
+    }
+
+    #[test]
+    fn test_classify_mirror_failure_definitive_takes_precedence_over_generic() {
+        let e = make_err!(
+            Code::Unavailable,
+            "tcp connect error: ConnectionRefused (os error 111)"
+        );
+        assert_eq!(
+            classify_mirror_failure(&e),
+            MirrorFailureKind::DefinitiveUnreachable
+        );
+    }
+
+    #[test]
+    fn test_classify_mirror_failure_other_codes_are_generic() {
+        for code in [
+            Code::Unknown,
+            Code::Unavailable, // bare, no transport substring
+            Code::Internal,
+            Code::DeadlineExceeded,
+        ] {
+            let e = make_err!(code, "generic transient");
+            assert_eq!(
+                classify_mirror_failure(&e),
+                MirrorFailureKind::Generic,
+                "unexpected classification for {code:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Review #1: capacity pre-check filters out peers that cannot fit
+    // the next mirror write before the source stream is consumed.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_capacity_aware_picker_filters_full_peers() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
+
+        // Initialize entries (the picker write-path inserts default state).
+        let _ = proxy.pick_mirror_endpoint(&endpoints, None, 0);
+
+        // 'a' has 100 bytes free, 'b' has 0 bytes free.
+        proxy.record_mirror_capacity("a", 0, 100);
+        proxy.record_mirror_capacity("b", 100, 100);
+
+        // For a 10-byte write, picker MUST always pick 'a' (b is full).
+        for _ in 0..50 {
+            let (chosen, _) =
+                proxy.pick_mirror_endpoint(&endpoints, None, 10).unwrap();
+            assert_eq!(
+                chosen.as_ref(),
+                "a",
+                "10-byte write must skip the full peer"
+            );
+        }
+
+        // For size_bytes = 0 (unknown size), filter is disabled — both
+        // peers are eligible.
+        let mut saw_a = false;
+        let mut saw_b = false;
+        for _ in 0..50 {
+            let (chosen, _) =
+                proxy.pick_mirror_endpoint(&endpoints, None, 0).unwrap();
+            match chosen.as_ref() {
+                "a" => saw_a = true,
+                "b" => saw_b = true,
+                other => panic!("unexpected endpoint: {other}"),
+            }
+        }
+        assert!(saw_a && saw_b, "size=0 must round-robin both peers");
+
+        Ok(())
+    }
+
+    /// Capacity is unknown for a peer that has never reported (older
+    /// worker). The picker treats unknown capacity as "fits" so we
+    /// don't filter out workers we have no information about.
+    #[nativelink_test]
+    async fn test_unknown_capacity_treated_as_fits() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into()];
+
+        // No record_mirror_capacity call — capacity stays unknown.
+        let pick = proxy.pick_mirror_endpoint(&endpoints, None, 1_000_000);
+        assert!(
+            pick.is_some(),
+            "unknown capacity must not block the picker"
+        );
+        assert_eq!(pick.unwrap().0.as_ref(), "a");
+        Ok(())
+    }
+
+    /// Degraded mode: every peer is over capacity. The picker still
+    /// returns SOMETHING rather than dropping the write — the
+    /// downstream Saturated Err is the safety net.
+    #[nativelink_test]
+    async fn test_all_peers_full_falls_back_to_full_set() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
+
+        let _ = proxy.pick_mirror_endpoint(&endpoints, None, 0);
+        proxy.record_mirror_capacity("a", 100, 100);
+        proxy.record_mirror_capacity("b", 100, 100);
+
+        let pick = proxy.pick_mirror_endpoint(&endpoints, None, 50);
+        assert!(
+            pick.is_some(),
+            "all-full case must still return a peer (degraded > nothing)"
+        );
+        Ok(())
+    }
+
+    /// Boundary check (review #13): `used + size_bytes == max` must
+    /// return true. Guards against an off-by-one regression where the
+    /// `<=` check were tightened to `<` (which would silently reject
+    /// the very last byte of capacity and shunt traffic to a
+    /// less-saturated peer for no reason).
+    ///
+    /// The test uses TWO peers — "a" exactly at boundary, "b" with
+    /// plenty of room — and asserts the picker round-robins both. With
+    /// the mutation (`<` instead of `<=`), "a" would be excluded from
+    /// the eligible pool and the picker would always return "b".
+    #[nativelink_test]
+    async fn test_fits_at_exact_boundary_returns_true() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
+
+        // Force state entries to exist before we record capacity.
+        let _ = proxy.pick_mirror_endpoint(&endpoints, None, 0);
+        // "a" has exactly 900 bytes free; "b" has 100_000.
+        proxy.record_mirror_capacity("a", 100, 1000);
+        proxy.record_mirror_capacity("b", 0, 100_000);
+
+        // For a 900-byte write (exactly fills "a"), both must be eligible
+        // — round-robin should hit "a" at least once.
+        let mut saw_a = false;
+        let mut saw_b = false;
+        for _ in 0..200 {
+            let (chosen, _) = proxy
+                .pick_mirror_endpoint(&endpoints, None, 900)
+                .expect("at least one peer eligible");
+            match chosen.as_ref() {
+                "a" => saw_a = true,
+                "b" => saw_b = true,
+                other => panic!("unexpected endpoint: {other}"),
+            }
+            if saw_a && saw_b {
+                break;
+            }
+        }
+        assert!(
+            saw_a,
+            "fits at exact capacity boundary (used + size == max) must \
+             include the boundary peer in the eligible pool — pre-fix \
+             `<` instead of `<=` would exclude 'a' and only return 'b'"
+        );
+        assert!(saw_b, "non-boundary peer must also be eligible");
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Review #4: a stream of Saturated failures must NOT quarantine the
+    // endpoint, regardless of count — saturation is not evidence of a
+    // broken peer. With the pre-fix bool API every failure (including
+    // the cap-exceeded Err returned by `insert_mirror_blob`) bumped the
+    // streak; this would quarantine a healthy peer that just filled up.
+    //
+    // We assert the underlying state rather than just the picker outcome
+    // — `pick_mirror_endpoint` falls back to the full set when every
+    // endpoint is quarantined (degraded > nothing), so a single-endpoint
+    // pool would still return `a` even if it were quarantined.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_saturated_failures_do_not_quarantine() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
+
+        // First, quarantine "b" so the picker has a real preference path.
+        for _ in 0..MIRROR_FAILURE_THRESHOLD {
+            proxy.record_mirror_failure("b", MirrorFailureKind::Generic);
+        }
+
+        // Hammer "a" with saturated failures.
+        for _ in 0..(MIRROR_FAILURE_THRESHOLD * 4) {
+            proxy.record_mirror_failure("a", MirrorFailureKind::Saturated);
+        }
+
+        // Direct state check: "a" must NOT be quarantined and must NOT
+        // have accumulated any consecutive_failures.
+        {
+            let st = proxy.mirror_state.read();
+            match st.get("a") {
+                Some(entry) => {
+                    assert!(
+                        entry.quarantined_until.is_none(),
+                        "saturated peer must not be quarantined; quarantined_until={:?}",
+                        entry.quarantined_until
+                    );
+                    assert_eq!(
+                        entry.consecutive_failures, 0,
+                        "saturated failures must not bump consecutive_failures, got {}",
+                        entry.consecutive_failures
+                    );
+                }
+                None => {
+                    // Either no entry was ever inserted (also acceptable —
+                    // proves we did not perturb the streak) or the impl
+                    // chose to record under a different key. Both are
+                    // fine for this assertion's intent.
+                }
+            }
+        }
+
+        // Picker must prefer "a" (the only non-quarantined eligible peer).
+        let (chosen, _) = proxy
+            .pick_mirror_endpoint(&endpoints, None, 0)
+            .expect("at least one eligible endpoint");
+        assert_eq!(
+            chosen.as_ref(),
+            "a",
+            "saturated 'a' must be preferred over quarantined 'b'"
+        );
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
     // 1. Inner store hit returns data without consulting locality map.
     // ---------------------------------------------------------------
     #[nativelink_test]
@@ -2525,12 +2968,12 @@ mod tests {
 
         // Drive endpoint "a" past the failure threshold.
         for _ in 0..MIRROR_FAILURE_THRESHOLD {
-            proxy.record_mirror_failure("a", false);
+            proxy.record_mirror_failure("a", MirrorFailureKind::Generic);
         }
 
         // pick_mirror_endpoint must skip "a" while it's quarantined.
         for _ in 0..20 {
-            let (chosen, _) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
+            let (chosen, _) = proxy.pick_mirror_endpoint(&endpoints, None, 0).unwrap();
             assert_ne!(
                 chosen.as_ref(),
                 "a",
@@ -2554,15 +2997,15 @@ mod tests {
 
         // Accumulate failures, then succeed before crossing the threshold.
         for _ in 0..(MIRROR_FAILURE_THRESHOLD - 1) {
-            proxy.record_mirror_failure("a", false);
+            proxy.record_mirror_failure("a", MirrorFailureKind::Generic);
         }
         proxy.record_mirror_success("a");
 
         // One more failure must NOT trigger quarantine because the streak
         // was cleared.
-        proxy.record_mirror_failure("a", false);
+        proxy.record_mirror_failure("a", MirrorFailureKind::Generic);
         let (chosen, _) = proxy
-            .pick_mirror_endpoint(&endpoints, None)
+            .pick_mirror_endpoint(&endpoints, None, 0)
             .expect("endpoint should be eligible");
         assert_eq!(chosen.as_ref(), "a");
 
@@ -2582,11 +3025,11 @@ mod tests {
 
         for ep in ["a", "b"] {
             for _ in 0..MIRROR_FAILURE_THRESHOLD {
-                proxy.record_mirror_failure(ep, false);
+                proxy.record_mirror_failure(ep, MirrorFailureKind::Generic);
             }
         }
 
-        let pick = proxy.pick_mirror_endpoint(&endpoints, None);
+        let pick = proxy.pick_mirror_endpoint(&endpoints, None, 0);
         assert!(pick.is_some(), "should fall back to full set when all quarantined");
 
         Ok(())
@@ -2605,7 +3048,7 @@ mod tests {
 
         for _ in 0..50 {
             let (chosen, _) = proxy
-                .pick_mirror_endpoint(&endpoints, Some("a"))
+                .pick_mirror_endpoint(&endpoints, Some("a"), 0)
                 .expect("eligible endpoints exist");
             assert_ne!(chosen.as_ref(), "a", "excluded endpoint must be skipped");
         }
@@ -2624,8 +3067,8 @@ mod tests {
         let proxy = WorkerProxyStore::new(inner, locality_map);
         let endpoints: Vec<Arc<str>> = vec!["only".into()];
 
-        let (_, sem1) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
-        let (_, sem2) = proxy.pick_mirror_endpoint(&endpoints, None).unwrap();
+        let (_, sem1) = proxy.pick_mirror_endpoint(&endpoints, None, 0).unwrap();
+        let (_, sem2) = proxy.pick_mirror_endpoint(&endpoints, None, 0).unwrap();
         assert!(
             Arc::ptr_eq(&sem1, &sem2),
             "permit semaphore must be shared across picks"

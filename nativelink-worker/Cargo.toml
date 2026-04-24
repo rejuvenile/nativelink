@@ -11,6 +11,9 @@ nix = []
 pprof = ["nativelink-util/pprof"]
 quic = ["dep:tonic-h3", "dep:quinn", "dep:h3-quinn", "dep:rcgen", "dep:rustls", "dep:socket2", "nativelink-util/quic", "nativelink-store/quic"]
 failpoints = ["dep:fail", "fail/failpoints", "nativelink-store/failpoints", "nativelink-util/failpoints"]
+# Test-only constructors (e.g. `BlobsAvailableState::new_for_test`).
+# Production builds MUST NOT enable this feature.
+test-utils = ["nativelink-store/test-utils"]
 
 [dependencies]
 nativelink-config = { path = "../nativelink-config" }
@@ -92,3 +95,15 @@ tracing-test = { version = "0.2.5", default-features = false, features = [
 [package.metadata.cargo-machete]
 # Used by nativelink_test macro
 ignored = ["tracing-test"]
+
+[[test]]
+name = "blobs_in_stable_storage_handler_test"
+required-features = ["test-utils"]
+
+[[test]]
+name = "download_to_directory_mirror_test"
+required-features = ["test-utils"]
+
+[[test]]
+name = "end_to_end_mirror_reconciliation_test"
+required-features = ["test-utils"]

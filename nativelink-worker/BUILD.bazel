@@ -108,6 +108,55 @@ rust_test(
     ],
 )
 
+# Mirror reconciliation integration tests. Require `test-utils` so the
+# internal hooks `BlobsAvailableState::new_for_test` and
+# `FastSlowStore::set_mirror_blobs_max_bytes_for_test` compile.
+# See `mirror_durability_test` in nativelink-store/BUILD.bazel for the
+# Bazel-vs-cargo feature plumbing note. The cargo CI step
+# (`.github/workflows/native-cargo.yaml`) is the authoritative coverage.
+rust_test(
+    name = "blobs_in_stable_storage_handler_test",
+    timeout = "short",
+    srcs = ["tests/blobs_in_stable_storage_handler_test.rs"],
+    crate_features = ["test-utils"],
+    proc_macro_deps = [
+        "//nativelink-macro",
+        "@crates//:async-trait",
+    ],
+    deps = [
+        ":nativelink-worker",
+        "//nativelink-config",
+        "//nativelink-proto",
+        "//nativelink-store",
+        "//nativelink-util",
+        "@crates//:bytes",
+        "@crates//:pretty_assertions",
+        "@crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "download_to_directory_mirror_test",
+    timeout = "short",
+    srcs = ["tests/download_to_directory_mirror_test.rs"],
+    crate_features = ["test-utils"],
+    proc_macro_deps = [
+        "//nativelink-macro",
+        "@crates//:async-trait",
+    ],
+    deps = [
+        ":nativelink-worker",
+        "//nativelink-config",
+        "//nativelink-proto",
+        "//nativelink-store",
+        "//nativelink-util",
+        "@crates//:bytes",
+        "@crates//:pretty_assertions",
+        "@crates//:prost",
+        "@crates//:tokio",
+    ],
+)
+
 rust_doc(
     name = "docs",
     crate = ":nativelink-worker",

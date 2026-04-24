@@ -127,6 +127,11 @@ uuid = { version = "1.16.0", default-features = false, features = [
 io-uring = ["nativelink-util/io-uring"]
 quic = ["nativelink-util/quic"]
 failpoints = ["dep:fail", "fail/failpoints", "nativelink-util/failpoints"]
+# Test-only hooks (e.g. `set_mirror_blobs_max_bytes_for_test`). Must be
+# enabled by integration tests under `[dev-dependencies]`. Production
+# builds MUST NOT enable this feature — these hooks bypass safety
+# invariants for testing convenience.
+test-utils = []
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
@@ -175,3 +180,10 @@ zip = { version = "7.2.0", default-features = false, features = [
 [package.metadata.cargo-machete]
 # Used by nativelink_test macro
 ignored = ["tracing-test"]
+
+# Integration tests that need the in-crate `test-utils` feature gate.
+# Run with: `cargo test -p nativelink-store --features test-utils --test mirror_durability_test`
+# (cargo auto-skips tests whose required-features are not enabled.)
+[[test]]
+name = "mirror_durability_test"
+required-features = ["test-utils"]

@@ -293,6 +293,12 @@ async fn inner_main(
     // WorkerProxyStore which would consider blobs on workers as "present".
     let mut unwrapped_cas_stores: HashMap<String, nativelink_util::store_trait::Store> =
         HashMap::new();
+    // Per-store WorkerProxyStore Arcs so WorkerApiServer can call
+    // `record_mirror_capacity` (review #1).
+    let mut worker_proxy_stores: HashMap<
+        String,
+        Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>,
+    > = HashMap::new();
     let cas_store_names: HashSet<String> = {
         let mut names: HashSet<String> = HashSet::new();
         for server_cfg in &server_cfgs {
@@ -314,20 +320,20 @@ async fn inner_main(
                 // Save the unwrapped store before replacing it with
                 // the WorkerProxyStore wrapper.
                 unwrapped_cas_stores.insert(store_name.clone(), original_store.clone());
-                let proxy_store = nativelink_util::store_trait::Store::new(
-                    if let Some(ref tls) = worker_proxy_tls {
-                        nativelink_store::worker_proxy_store::WorkerProxyStore::new_with_tls(
-                            original_store,
-                            locality_map.clone(),
-                            tls.clone(),
-                        )
-                    } else {
-                        nativelink_store::worker_proxy_store::WorkerProxyStore::new(
-                            original_store,
-                            locality_map.clone(),
-                        )
-                    },
-                );
+                let proxy_arc = if let Some(ref tls) = worker_proxy_tls {
+                    nativelink_store::worker_proxy_store::WorkerProxyStore::new_with_tls(
+                        original_store,
+                        locality_map.clone(),
+                        tls.clone(),
+                    )
+                } else {
+                    nativelink_store::worker_proxy_store::WorkerProxyStore::new(
+                        original_store,
+                        locality_map.clone(),
+                    )
+                };
+                worker_proxy_stores.insert(store_name.clone(), proxy_arc.clone());
+                let proxy_store = nativelink_util::store_trait::Store::new(proxy_arc);
                 store_manager.add_store(store_name, proxy_store);
                 info!(
                     store_name,
@@ -575,8 +581,21 @@ async fn inner_main(
                             .iter()
                             .next()
                             .and_then(|name| unwrapped_cas_stores.get(name).cloned());
-                        WorkerApiServer::new(&cfg, &worker_schedulers, Some(locality_map.clone()), backfill_cas)
-                            .map(|v| Some(svc_setup!(v)))
+                        // Pass the matching WorkerProxyStore Arc so the
+                        // server can plumb mirror capacity reports
+                        // (review #1) into the picker's pre-check.
+                        let worker_proxy = cas_store_names
+                            .iter()
+                            .next()
+                            .and_then(|name| worker_proxy_stores.get(name).cloned());
+                        WorkerApiServer::new(
+                            &cfg,
+                            &worker_schedulers,
+                            Some(locality_map.clone()),
+                            backfill_cas,
+                            worker_proxy,
+                        )
+                        .map(|v| Some(svc_setup!(v)))
                     })
                     .err_tip(|| "Could not create WorkerApi service")?,
             )

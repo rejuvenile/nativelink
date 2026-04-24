@@ -23,7 +23,7 @@ use std::env;
 use std::process::Stdio;
 use std::sync::{Arc, Weak};
 
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, OptionFuture};
 use futures::stream::FuturesUnordered;
 use futures::{Future, FutureExt, StreamExt, TryFutureExt, select};
 use nativelink_config::cas_server::{EnvironmentSource, LocalWorkerConfig};
@@ -647,6 +647,88 @@ pub struct BlobsAvailableState {
     cas_server_fss: Option<Arc<FastSlowStore>>,
 }
 
+impl BlobsAvailableState {
+    /// Test-only: build a `BlobsAvailableState` from explicit components.
+    /// The non-test path constructs this inline inside `new_local_worker`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn new_for_test(
+        fs_store: Arc<FilesystemStore>,
+        cas_server_fss: Option<Arc<FastSlowStore>>,
+    ) -> Self {
+        Self {
+            fs_store,
+            tracker: BlobChangeTracker::new(Arc::new(Notify::new())),
+            cas_endpoint: String::new(),
+            notify: Arc::new(Notify::new()),
+            max_interval: Duration::from_secs(60),
+            cas_server_fss,
+        }
+    }
+}
+
+/// Process a `BlobsInStableStorage` notification from the server:
+///   * Unpin the digests on the local FilesystemStore so they become
+///     eligible for eviction.
+///   * Drop them from the pending-upload (`failed_slow_writes`) set
+///     so a reconnect doesn't re-upload them.
+///   * Drop the in-memory mirror copies from the CAS server's
+///     FastSlowStore — the server now has its own durable copy and
+///     the worker no longer needs to hold one.
+///
+/// Extracted from the `Update::BlobsInStableStorage` match arm in
+/// `LocalWorkerImpl::run` so the handler is unit-testable without
+/// standing up the full scheduler/worker stream stack. The dispatch
+/// arm is a thin call site; all behavior lives here.
+pub fn handle_blobs_in_stable_storage(
+    state: &BlobsAvailableState,
+    cas_store: Option<&Arc<FastSlowStore>>,
+    proto_digests: &[nativelink_proto::build::bazel::remote::execution::v2::Digest],
+) {
+    let digest_count = proto_digests.len();
+    let fs_store = &state.fs_store;
+    let mut unpinned = 0usize;
+    let mut acked_digests: Vec<DigestInfo> = Vec::with_capacity(digest_count);
+    for proto_digest in proto_digests {
+        if let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) {
+            fs_store.unpin_digest(&digest);
+            acked_digests.push(digest);
+            unpinned += 1;
+        } else {
+            warn!(
+                ?proto_digest,
+                "BlobsInStableStorage: invalid digest, skipping unpin"
+            );
+        }
+    }
+    // Clear from pending-upload set on both stores (the CAS server
+    // store and the action upload store may track different digests;
+    // they share the failed_slow_writes set under the hood).
+    if let Some(cas_store) = cas_store {
+        cas_store.ack_digests(&acked_digests);
+    }
+    // Clean up mirror blobs from the CAS server's FastSlowStore — the
+    // server has confirmed it persisted these, so the worker no longer
+    // needs to hold the in-memory copies.
+    if let Some(cas_fss) = state.cas_server_fss.as_ref() {
+        let before = cas_fss.mirror_blob_count();
+        cas_fss.remove_mirror_blobs(&acked_digests);
+        let removed = before - cas_fss.mirror_blob_count();
+        if removed > 0 {
+            info!(
+                removed,
+                remaining = cas_fss.mirror_blob_count(),
+                "BlobsInStableStorage: removed mirror blobs from memory"
+            );
+        }
+    }
+    info!(
+        unpinned,
+        digest_count,
+        "BlobsInStableStorage: unpinned digests from local CAS"
+    );
+}
+
 struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> {
     config: &'a LocalWorkerConfig,
     // According to the tonic documentation it is a cheap operation to clone this.
@@ -752,7 +834,6 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             warn!("UploadMissingBlobs: no CAS store available, ignoring");
             return;
         };
-        let fast_store = cas_store.fast_store();
         let slow_store = cas_store.slow_store();
         if slow_store
             .inner_store(None::<StoreKey<'_>>)
@@ -760,14 +841,21 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         {
             return;
         }
+        // Use the FastSlowStore wrapper (not just `fast_store()`) so reads
+        // transparently see mirror_blobs entries — the worker may hold a
+        // pinned mirror copy that never landed on disk, and that is the
+        // very copy the server is asking us to upload back.
+        let cas_store_wrapped: Store = Store::new(cas_store.clone());
 
-        // Check which blobs we actually have locally before uploading.
+        // Check which blobs we actually have locally (disk OR mirror) before
+        // uploading. FastSlowStore::has_with_results checks fast_store, the
+        // in_flight_slow_writes map, and mirror_blobs.
         let keys: Vec<StoreKey<'_>> = digests
             .iter()
             .map(|d| StoreKey::from(*d))
             .collect();
         let mut results = vec![None; keys.len()];
-        if let Err(err) = fast_store.has_with_results(&keys, &mut results).await {
+        if let Err(err) = cas_store_wrapped.has_with_results(&keys, &mut results).await {
             warn!(?err, "UploadMissingBlobs: failed to check local store");
             return;
         }
@@ -798,7 +886,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let mut uploads: FuturesUnordered<_> = present
             .iter()
             .map(|&digest| {
-                let fast_store = fast_store.clone();
+                let cas_store_wrapped = cas_store_wrapped.clone();
                 let slow_store = slow_store.clone();
                 let semaphore = semaphore.clone();
                 async move {
@@ -807,16 +895,18 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         .await
                         .expect("semaphore should not be closed");
                     // Use in-memory transfer for small blobs, streaming for
-                    // large ones to avoid OOM on multi-GB blobs.
+                    // large ones to avoid OOM on multi-GB blobs. Reads go
+                    // through the FastSlowStore wrapper so mirror_blobs
+                    // entries are visible.
                     const STREAMING_THRESHOLD: u64 = 1024 * 1024; // 1 MiB
                     let result = if digest.size_bytes() <= STREAMING_THRESHOLD {
-                        match fast_store.get_part_unchunked(digest, 0, None).await {
+                        match cas_store_wrapped.get_part_unchunked(digest, 0, None).await {
                             Ok(data) => slow_store.update_oneshot(digest, data).await,
                             Err(err) => Err(err),
                         }
                     } else {
                         let (tx, rx) = make_buf_channel_pair();
-                        let read_fut = fast_store.get(digest, tx);
+                        let read_fut = cas_store_wrapped.get(digest, tx);
                         let write_fut = slow_store.update(
                             digest,
                             rx,
@@ -905,7 +995,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         running_actions_manager: &Arc<U>,
         is_first: bool,
     ) -> Result<(), Error> {
-        let (digest_infos, evicted_digests) = if is_first {
+        let (digest_infos, evicted_digests, pinned_mirror_digests) = if is_first {
             // Full snapshot: scan everything once.
             let all = state.fs_store.get_all_digests_with_timestamps();
             // Drain any changes that accumulated during startup.
@@ -918,7 +1008,25 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 })
                 .collect();
 
-            (infos, Vec::new())
+            // Mirror digests: drain deltas FIRST, then take the snapshot
+            // (atomically, under both mirror locks). If we snapshotted first
+            // and then drained, a concurrent `remove_mirror_blobs` could land
+            // between the two calls — its `removed` delta would be discarded
+            // by the snapshot reset and the digest would never reach the
+            // server's locality map cleanup. The snapshot covers all live
+            // pins at the post-drain moment; drained `removed` deltas are
+            // merged into `evicted_digests` so the locality map is cleaned.
+            let (mirror_evicted_protos, mirror_pinned_protos) =
+                if let Some(ref fss) = state.cas_server_fss {
+                    let (mc, snap) = fss.snapshot_and_reset_mirror_changes();
+                    let evicted: Vec<_> = mc.removed.into_iter().map(|d| d.into()).collect();
+                    let pinned: Vec<_> = snap.into_iter().map(|d| d.into()).collect();
+                    (evicted, pinned)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+
+            (infos, mirror_evicted_protos, mirror_pinned_protos)
         } else {
             // Delta: swap out accumulated changes. Touched digests (from
             // on_get cache hits) are merged with `added` so the server's
@@ -935,9 +1043,24 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     digest: Some((*digest).into()),
                 })
                 .collect();
-            let evicted_protos = changes.evicted.iter().map(|d| (*d).into()).collect();
+            let mut evicted_protos: Vec<_> =
+                changes.evicted.iter().map(|d| (*d).into()).collect();
 
-            (infos, evicted_protos)
+            // Mirror delta: drain → send `added` as `pinned_mirror_digests`
+            // and merge `removed` into `evicted_digests` so the server cleans
+            // up locality entries for blobs we no longer hold.
+            let mirror_added_protos: Vec<_> =
+                if let Some(ref fss) = state.cas_server_fss {
+                    let mc = fss.drain_mirror_changes();
+                    for d in mc.removed {
+                        evicted_protos.push(d.into());
+                    }
+                    mc.added.into_iter().map(|d| d.into()).collect()
+                } else {
+                    Vec::new()
+                };
+
+            (infos, evicted_protos, mirror_added_protos)
         };
 
         // Collect subtree delta or full snapshot.
@@ -961,6 +1084,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let cached_dir_count = cached_directory_digests.len();
         let added_subtree_count = added_subtree_digests.len();
         let removed_subtree_count = removed_subtree_digests.len();
+        let pinned_mirror_count = pinned_mirror_digests.len();
 
         // Skip sending if there are truly no changes at all.
         if !is_first
@@ -968,6 +1092,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             && evicted_count == 0
             && added_subtree_count == 0
             && removed_subtree_count == 0
+            && pinned_mirror_count == 0
         {
             trace!("BlobsAvailable: no changes since last tick, skipping");
             return Ok(());
@@ -990,6 +1115,20 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             is_full_subtree_snapshot,
             p_core_load_pct: p_load,
             e_core_load_pct: e_load,
+            pinned_mirror_digests,
+            // Mirror capacity report (review #1): server's picker uses
+            // these to filter peers that cannot fit a blob BEFORE
+            // consuming the source stream. `(0, 0)` for workers with
+            // no CAS server / mirror store ⇒ picker treats as unknown
+            // and disables the filter for this endpoint.
+            mirror_used_bytes: state
+                .cas_server_fss
+                .as_ref()
+                .map_or(0, |fss| fss.mirror_blobs_used_bytes()),
+            mirror_max_bytes: state
+                .cas_server_fss
+                .as_ref()
+                .map_or(0, |fss| fss.mirror_blobs_max_bytes()),
         };
 
         if let Err(err) = grpc_client.blobs_available(notification).await {
@@ -1000,6 +1139,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 cached_dir_count,
                 added_subtree_count,
                 removed_subtree_count,
+                pinned_mirror_count,
                 is_first,
                 "Failed to send periodic BlobsAvailable"
             );
@@ -1014,6 +1154,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 cached_dir_count,
                 added_subtree_count,
                 removed_subtree_count,
+                pinned_mirror_count,
                 is_first,
                 "Sent periodic BlobsAvailable"
             );
@@ -1049,9 +1190,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         if let Some(ref state) = self.blobs_available_state {
             let mut grpc_client = self.grpc_client.clone();
             let state = state.clone();
-            // Extract mirror cleanup reference before state is moved into
-            // the BlobsAvailable loop.
-            let mirror_cleanup_fss = state.cas_server_fss.clone();
+            // Pull a notify handle for mirror-blob inserts/removes so the
+            // BlobsAvailable loop wakes promptly when the server pushes a
+            // mirror copy to us. Pre-fix the loop only woke on FilesystemStore
+            // changes — mirror writes were invisible until the next backstop
+            // tick, and the mirror-TTL sweeper would sometimes drop the only
+            // copy of a blob if the server was slow to ack stable storage.
+            let mirror_notify =
+                state.cas_server_fss.as_ref().map(|f| f.mirror_changes_notify());
             let ram = self.running_actions_manager.clone();
             futures.push(
                 async move {
@@ -1065,11 +1211,26 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     )
                     .await?;
                     loop {
-                        // Wait for either:
-                        // 1. A blob insert/eviction notification (immediate wake), or
-                        // 2. The backstop interval (catches subtree-only changes).
+                        // Wait for any of:
+                        // 1. A FilesystemStore blob insert/eviction (immediate wake)
+                        // 2. A mirror-blob insert/remove (immediate wake — only
+                        //    armed if a CAS server FastSlowStore exists)
+                        // 3. The backstop interval (catches subtree-only changes)
+                        //
+                        // Stack-pinned Notified instead of `Box::pin` per
+                        // iteration — saves one heap allocation per
+                        // BlobsAvailable wakeup. A fresh `Notified` is
+                        // semantically required each iteration (it consumes
+                        // exactly one notification permit), so the future
+                        // itself must be re-created; `tokio::pin!` keeps it
+                        // on the stack.
+                        let mirror_wait = OptionFuture::from(
+                            mirror_notify.as_deref().map(Notify::notified),
+                        );
+                        tokio::pin!(mirror_wait);
                         tokio::select! {
                             () = state.notify.notified() => {}
+                            Some(()) = &mut mirror_wait => {}
                             () = sleep(state.max_interval) => {}
                         }
                         Self::send_periodic_blobs_available(
@@ -1084,30 +1245,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 .boxed(),
             );
 
-            // Periodic cleanup of stale mirror blobs. If the server never sends
-            // BlobsInStableStorage for a digest (e.g., because the server
-            // restarted), mirror blobs would leak memory. This task expires
-            // blobs older than 120s every 30s.
-            if let Some(cas_fss_for_cleanup) = mirror_cleanup_fss {
-                futures.push(
-                    async move {
-                        const MIRROR_TTL: Duration = Duration::from_secs(120);
-                        const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
-                        loop {
-                            sleep(CLEANUP_INTERVAL).await;
-                            let expired = cas_fss_for_cleanup.expire_mirror_blobs(MIRROR_TTL);
-                            if expired > 0 {
-                                warn!(
-                                    expired,
-                                    remaining = cas_fss_for_cleanup.mirror_blob_count(),
-                                    "expired stale mirror blobs (no BlobsInStableStorage received)"
-                                );
-                            }
-                        }
-                    }
-                    .boxed(),
-                );
-            }
+            // NOTE: The mirror-TTL sweeper that previously expired pinned
+            // mirror blobs after 120s has been REMOVED. Mirror blobs are
+            // pinned indefinitely and only released when the server sends
+            // `BlobsInStableStorage` for the digest. During a server
+            // restart the worker holds the only durable copy; an aggressive
+            // TTL would drop that copy and lose data. The 2 GiB
+            // `MIRROR_BLOBS_MAX_BYTES` cap is the only bound, and silent
+            // drops at the cap are now logged at warn! level.
         }
 
         // On (re)connect, retry any failed background slow-store writes
@@ -1220,52 +1365,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             }
                         }
                         Update::BlobsInStableStorage(blobs) => {
-                            // Server confirms these blobs are persisted to stable storage.
-                            // Unpin them from the local FilesystemStore so they become
-                            // eligible for eviction again, and clear them from the
-                            // pending-upload set so they won't be re-uploaded on reconnect.
                             let digest_count = blobs.digests.len();
                             if let Some(ref state) = self.blobs_available_state {
-                                let fs_store = &state.fs_store;
-                                let mut unpinned = 0usize;
-                                let mut acked_digests = Vec::with_capacity(digest_count);
-                                for proto_digest in &blobs.digests {
-                                    if let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) {
-                                        fs_store.unpin_digest(&digest);
-                                        acked_digests.push(digest);
-                                        unpinned += 1;
-                                    } else {
-                                        warn!(
-                                            ?proto_digest,
-                                            "BlobsInStableStorage: invalid digest, skipping unpin"
-                                        );
-                                    }
-                                }
-                                // Clear from pending-upload set on both stores
-                                // (the CAS server store and the action upload store
-                                // may track different digests).
-                                if let Some(cas_store) = self.running_actions_manager.get_cas_store() {
-                                    cas_store.ack_digests(&acked_digests);
-                                }
-                                // Clean up mirror blobs from the CAS server's
-                                // FastSlowStore — the server has confirmed it
-                                // persisted these, so we no longer need memory copies.
-                                if let Some(ref cas_fss) = state.cas_server_fss {
-                                    let before = cas_fss.mirror_blob_count();
-                                    cas_fss.remove_mirror_blobs(&acked_digests);
-                                    let removed = before - cas_fss.mirror_blob_count();
-                                    if removed > 0 {
-                                        info!(
-                                            removed,
-                                            remaining = cas_fss.mirror_blob_count(),
-                                            "BlobsInStableStorage: removed mirror blobs from memory"
-                                        );
-                                    }
-                                }
-                                info!(
-                                    unpinned,
-                                    digest_count,
-                                    "BlobsInStableStorage: unpinned digests from local CAS"
+                                let cas_store_for_ack =
+                                    self.running_actions_manager.get_cas_store();
+                                handle_blobs_in_stable_storage(
+                                    state,
+                                    cas_store_for_ack.as_ref(),
+                                    &blobs.digests,
                                 );
                             } else {
                                 trace!(
@@ -1492,6 +1599,9 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             is_full_subtree_snapshot: false,
                                                             p_core_load_pct: p_load,
                                                             e_core_load_pct: e_load,
+                                                            pinned_mirror_digests: Vec::new(),
+                                                            mirror_used_bytes: 0,
+                                                            mirror_max_bytes: 0,
                                                         }
                                                     ).await {
                                                         warn!(?err, "Failed to send blobs_available notification");
@@ -1746,6 +1856,12 @@ pub async fn new_local_worker(
         // Build a new FastSlowStore: fast=local disk, slow=WorkerProxyStore(central CAS).
         // Preserve the original store's direction config so that e.g.
         // slow_direction=get prevents uploads from propagating to the server.
+        //
+        // Sibling-bug audit (review #7): `.fast_store()` here is store
+        // *construction*, not a `has_with_results` lookup. We are wrapping
+        // the on-disk `FilesystemStore` into a NEW `FastSlowStore` that
+        // gets its own empty `mirror_blobs` map. There is no missed-mirror
+        // hit risk because the new wrapper has no mirror state yet.
         let fast_store = fast_slow_store.fast_store().clone();
         let fss_spec = nativelink_config::stores::FastSlowSpec {
             fast: nativelink_config::stores::StoreSpec::Noop(Default::default()),
@@ -1818,6 +1934,12 @@ pub async fn new_local_worker(
     // reconnect retry (which drains from the RunningActionsManager's
     // store) also picks up unacked mirror digests.
     let effective_cas_store_for_cas_server = {
+        // Sibling-bug audit (review #7): `.fast_store()` here is store
+        // *construction*. We rebuild a sibling FastSlowStore with the
+        // same on-disk fast tier but ReadOnly slow direction. The new
+        // wrapper has its own empty `mirror_blobs` map and is the one
+        // that subsequently receives `IS_MIRROR_REQUEST` writes via the
+        // CAS server, so the empty start state is correct.
         let fast_store = effective_cas_store.fast_store().clone();
         let slow_store = effective_cas_store.slow_store().clone();
         let fss_spec = nativelink_config::stores::FastSlowSpec {
@@ -1855,7 +1977,13 @@ pub async fn new_local_worker(
     // The send loop wakes immediately on blob insert/eviction via Notify,
     // with a backstop interval to catch subtree-only changes.
     let blobs_available_state = if config.cas_server_port.is_some() {
-        // Try to get a reference to the FilesystemStore (the fast store in FastSlowStore).
+        // Sibling-bug audit (review #7): fast-store-only is intentional.
+        // BlobsAvailable advertises ON-DISK digests so peer workers can
+        // fetch them. Mirror-blob digests are reported via a separate
+        // `pinned_mirror_digests` field on the same proto, populated
+        // from `cas_server_fss.snapshot_and_reset_mirror_changes()` —
+        // the two snapshots have different lifetimes and routing
+        // semantics on the server side and must NOT be merged here.
         let fs_store_opt: Option<Arc<FilesystemStore>> = fast_slow_store
             .fast_store()
             .downcast_ref::<FilesystemStore>(None)

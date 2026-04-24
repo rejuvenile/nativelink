@@ -182,6 +182,7 @@ async fn setup_api_server_with_task_limit(
         [1u8; 6],
         None,
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -695,6 +696,7 @@ async fn setup_api_server_with_locality(
         [1u8; 6],
         Some(locality_map.clone()),
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -752,6 +754,238 @@ async fn setup_api_server_with_locality(
     })
 }
 
+// ----- Capacity-plumbing test (review #7) -----------------------------
+//
+// Verifies that mirror_used_bytes / mirror_max_bytes from a
+// `BlobsAvailableNotification` reach `WorkerProxyStore::record_mirror_capacity`
+// and end up in the picker's per-endpoint state. Pre-fix the existing
+// tests just wrote the literals `mirror_used_bytes: 0, mirror_max_bytes: 0`
+// to compile; nothing asserted that a non-zero report propagates.
+
+#[cfg(feature = "test-utils")]
+struct MirrorCapacityTestContext {
+    _scheduler: Arc<ApiWorkerScheduler>,
+    _worker_api_server: WorkerApiServer,
+    _connection_worker_stream: ConnectWorkerStream,
+    _worker_id: WorkerId,
+    worker_stream: mpsc::Sender<Update>,
+    worker_proxy: Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>,
+}
+
+#[cfg(feature = "test-utils")]
+async fn setup_api_server_with_mirror_proxy(
+    cas_endpoint: &str,
+) -> Result<MirrorCapacityTestContext, Error> {
+    use nativelink_config::stores::MemorySpec;
+    use nativelink_store::memory_store::MemoryStore;
+    use nativelink_store::worker_proxy_store::WorkerProxyStore;
+    use nativelink_util::store_trait::Store;
+
+    const SCHEDULER_NAME: &str = "DUMMY_SCHEDULE_NAME";
+    const UUID_SIZE: usize = 36;
+
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager::new());
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager.clone(),
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+
+    let locality_map = new_shared_blob_locality_map();
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let worker_proxy = WorkerProxyStore::new(inner, locality_map.clone());
+
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert(SCHEDULER_NAME.to_string(), scheduler.clone());
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: SCHEDULER_NAME.to_string(),
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [1u8; 6],
+        Some(locality_map.clone()),
+        None,
+        Some(worker_proxy.clone()),
+    )
+    .err_tip(|| "Error creating WorkerApiServer")?;
+
+    let connect_worker_request = ConnectWorkerRequest {
+        cas_endpoint: cas_endpoint.to_string(),
+        ..Default::default()
+    };
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Update::ConnectWorkerRequest(connect_worker_request))
+        .await
+        .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut connection_worker_stream = worker_api_server
+        .inner_connect_worker_for_testing(update_stream)
+        .await?
+        .into_inner();
+
+    let maybe_first_message = connection_worker_stream.next().await;
+    let first_update = maybe_first_message
+        .unwrap()
+        .err_tip(|| "Expected success result")?
+        .update
+        .err_tip(|| "Expected update field to be populated")?;
+    let worker_id = match first_update {
+        update_for_worker::Update::ConnectionResult(connection_result) => {
+            connection_result.worker_id
+        }
+        other => unreachable!("Expected ConnectionResult, got {:?}", other),
+    };
+    assert_eq!(worker_id.len(), UUID_SIZE);
+
+    Ok(MirrorCapacityTestContext {
+        _scheduler: scheduler,
+        _worker_api_server: worker_api_server,
+        _connection_worker_stream: connection_worker_stream,
+        _worker_id: worker_id.into(),
+        worker_stream: tx,
+        worker_proxy,
+    })
+}
+
+/// Send a `BlobsAvailable` with `mirror_used_bytes` / `mirror_max_bytes`
+/// set and verify the picker's per-endpoint state was updated.
+/// Mutate-test guidance: comment out the `proxy.record_mirror_capacity(...)`
+/// block in `worker_api_server.rs` (around the `if notification.mirror_max_bytes > 0`
+/// guard); this test must fail.
+#[cfg(feature = "test-utils")]
+#[nativelink_test]
+pub async fn mirror_capacity_report_plumbed_to_picker_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.20:50081";
+    let test_context = setup_api_server_with_mirror_proxy(cas_endpoint).await?;
+
+    // Pre-condition: no capacity recorded yet.
+    assert_eq!(
+        test_context.worker_proxy.mirror_capacity_for_test(cas_endpoint),
+        None,
+        "no capacity report yet"
+    );
+
+    // Worker reports: 1MiB used, 2GiB cap.
+    const REPORTED_USED: u64 = 1_000_000;
+    const REPORTED_MAX: u64 = 2_000_000_000;
+    test_context
+        .worker_stream
+        .send(Update::BlobsAvailable(BlobsAvailableNotification {
+            worker_cas_endpoint: cas_endpoint.to_string(),
+            digests: vec![],
+            is_full_snapshot: false,
+            evicted_digests: vec![],
+            digest_infos: vec![],
+            cpu_load_pct: 0,
+            cached_directory_digests: vec![],
+            added_subtree_digests: vec![],
+            removed_subtree_digests: vec![],
+            is_full_subtree_snapshot: false,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: REPORTED_USED,
+            mirror_max_bytes: REPORTED_MAX,
+        }))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
+
+    // Poll until the picker sees the report — bounded so a regression
+    // (no plumbing) surfaces as a clean failure rather than a hang.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let observed = loop {
+        if let Some(cap) =
+            test_context.worker_proxy.mirror_capacity_for_test(cas_endpoint)
+        {
+            break cap;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "mirror_used_bytes/mirror_max_bytes did not reach the picker \
+                 within 5s — `record_mirror_capacity` plumbing is broken"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(
+        observed,
+        (REPORTED_USED, REPORTED_MAX),
+        "picker must see the exact bytes the worker reported"
+    );
+
+    Ok(())
+}
+
+/// Capacity report with `mirror_max_bytes == 0` is suppressed by the
+/// dispatch arm — workers without a CAS server (and thus no mirror_blobs
+/// map) report zeroes that should NOT be stored as `(used=0, max=0)` because
+/// `fits()` would then always succeed for them.
+#[cfg(feature = "test-utils")]
+#[nativelink_test]
+pub async fn zero_mirror_max_does_not_record_capacity_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.21:50081";
+    let test_context = setup_api_server_with_mirror_proxy(cas_endpoint).await?;
+
+    test_context
+        .worker_stream
+        .send(Update::BlobsAvailable(BlobsAvailableNotification {
+            worker_cas_endpoint: cas_endpoint.to_string(),
+            digests: vec![],
+            is_full_snapshot: false,
+            evicted_digests: vec![],
+            digest_infos: vec![],
+            cpu_load_pct: 0,
+            cached_directory_digests: vec![],
+            added_subtree_digests: vec![],
+            removed_subtree_digests: vec![],
+            is_full_subtree_snapshot: false,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
+        }))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
+
+    // Wait long enough that any plumbing would have fired, then confirm
+    // nothing was recorded. Poll-and-fail-on-presence rather than just
+    // a single sleep: if the suppression IS broken, we want a deterministic
+    // catch on the first iteration.
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    while std::time::Instant::now() < deadline {
+        if test_context
+            .worker_proxy
+            .mirror_capacity_for_test(cas_endpoint)
+            .is_some()
+        {
+            panic!(
+                "mirror_max_bytes == 0 was recorded as capacity; this would \
+                 make `fits()` always return true and mask saturated peers"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
 #[nativelink_test]
 pub async fn handle_blobs_available_populates_locality_map_test()
 -> Result<(), Box<dyn core::error::Error>> {
@@ -777,6 +1011,9 @@ pub async fn handle_blobs_available_populates_locality_map_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -834,6 +1071,9 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -864,6 +1104,9 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -917,6 +1160,9 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -938,6 +1184,9 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -983,6 +1232,9 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1004,6 +1256,9 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1054,6 +1309,9 @@ pub async fn worker_disconnect_cleans_up_locality_map_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1134,6 +1392,9 @@ pub async fn blobs_available_with_malformed_digests_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1183,6 +1444,9 @@ pub async fn blobs_evicted_is_noop_for_wire_compat_test()
             is_full_subtree_snapshot: false,
             p_core_load_pct: 0,
             e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;

@@ -63,6 +63,10 @@ uuid = { version = "1.16.0", default-features = false, features = [
 
 [features]
 failpoints = ["fail/failpoints"]
+# Enables `mirror_capacity_for_test` accessor on `WorkerProxyStore` so the
+# capacity-plumbing integration test can assert that BlobsAvailable
+# capacity fields reach the picker.
+test-utils = ["nativelink-store/test-utils"]
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }

@@ -63,6 +63,11 @@ pub struct WorkerApiServer {
     locality_map: Option<SharedBlobLocalityMap>,
     /// CAS store for checking blob existence during backfill requests.
     cas_store: Option<Store>,
+    /// Optional handle on the `WorkerProxyStore` so we can plumb
+    /// per-worker mirror capacity reports (review #1) into the
+    /// picker's pre-check filter. None for tests / standalone runs
+    /// without peer mirroring.
+    worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
 }
 
 impl core::fmt::Debug for WorkerApiServer {
@@ -79,6 +84,7 @@ impl WorkerApiServer {
         schedulers: &HashMap<String, Arc<dyn WorkerScheduler>>,
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
+        worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
     ) -> Result<Self, Error> {
         let node_id = {
             let mut out = [0; 6];
@@ -123,6 +129,7 @@ impl WorkerApiServer {
             node_id,
             locality_map,
             cas_store,
+            worker_proxy,
         )
     }
 
@@ -135,6 +142,7 @@ impl WorkerApiServer {
         node_id: [u8; 6],
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
+        worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
     ) -> Result<Self, Error> {
         let scheduler = schedulers
             .get(&config.scheduler)
@@ -151,6 +159,7 @@ impl WorkerApiServer {
             node_id,
             locality_map,
             cas_store,
+            worker_proxy,
         })
     }
 
@@ -230,6 +239,7 @@ impl WorkerApiServer {
             worker_id.clone(),
             self.locality_map.clone(),
             self.cas_store.clone(),
+            self.worker_proxy.clone(),
             worker_cas_endpoint,
             worker_tx,
             update_stream,
@@ -306,6 +316,9 @@ struct WorkerConnection {
     locality_map: Option<SharedBlobLocalityMap>,
     /// CAS store for checking blob existence during backfill.
     cas_store: Option<Store>,
+    /// WorkerProxyStore handle for plumbing per-endpoint mirror
+    /// capacity reports (review #1).
+    worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
     cas_endpoint: String,
     /// Channel to send messages back to this worker.
     worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
@@ -326,6 +339,7 @@ impl WorkerConnection {
         worker_id: WorkerId,
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
+        worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         cas_endpoint: String,
         worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
         mut connection: impl Stream<Item = Result<UpdateForScheduler, Status>> + Unpin + Send + 'static,
@@ -336,6 +350,7 @@ impl WorkerConnection {
             worker_id,
             locality_map,
             cas_store,
+            worker_proxy,
             cas_endpoint,
             worker_tx,
             last_backfill_epoch_secs: AtomicU64::new(0),
@@ -560,6 +575,24 @@ impl WorkerConnection {
             }
         }
 
+        // Mirror capacity report (review #1): the worker advertises its
+        // current `mirror_blobs` total bytes and configured cap on every
+        // BlobsAvailable. Plumb them into the WorkerProxyStore picker
+        // so subsequent mirror writes can pre-check capacity per peer
+        // and avoid consuming a source stream we know cannot be
+        // accepted. mirror_max_bytes == 0 means the worker has no CAS
+        // server / mirror store; skip the report rather than store
+        // (used=0, max=0) which would make `fits()` always succeed.
+        if notification.mirror_max_bytes > 0 {
+            if let Some(ref proxy) = self.worker_proxy {
+                proxy.record_mirror_capacity(
+                    &notification.worker_cas_endpoint,
+                    notification.mirror_used_bytes,
+                    notification.mirror_max_bytes,
+                );
+            }
+        }
+
         // Update the worker's cached directory digests if any were reported (legacy path).
         if !notification.cached_directory_digests.is_empty() && !notification.is_full_subtree_snapshot {
             let cached_dirs: HashSet<DigestInfo> = notification
@@ -671,6 +704,36 @@ impl WorkerConnection {
                 .filter_map(|d| DigestInfo::try_from(d).ok()),
         );
 
+        // Pinned mirror digests: blobs the worker is holding *only* in
+        // memory because the server pushed them as a mirror. The worker is
+        // the durable holder until we ack via BlobsInStableStorage. We:
+        //   1. Register them in the locality map alongside normal digests so
+        //      reads from this worker can find them, AND
+        //   2. Always check existence and request `UploadMissingBlobs` for
+        //      any that aren't stably stored on the server. We deliberately
+        //      bypass the per-worker BACKFILL_COOLDOWN here — these are the
+        //      *only* copies; latency to durability matters more than the
+        //      tiny extra existence check load.
+        let pinned_mirror: Vec<DigestInfo> = notification
+            .pinned_mirror_digests
+            .into_iter()
+            .filter_map(|d| DigestInfo::try_from(d).ok())
+            .collect();
+        if !pinned_mirror.is_empty() {
+            debug!(
+                worker_id=?self.worker_id,
+                count=pinned_mirror.len(),
+                "BlobsAvailable received pinned mirror digests"
+            );
+        }
+        // Pinned-mirror digests are registered in the locality map in a
+        // dedicated `register_blobs` call below (alongside `digests`) — we do
+        // NOT extend `digests` here. Doing so would cause both the generic
+        // backfill path (which respects BACKFILL_COOLDOWN) and the dedicated
+        // mirror-pull path (which bypasses it) to schedule the same uploads;
+        // `backfill_inflight` deduplicates them, but the duplicate work is
+        // wasteful and the duplication obscures intent.
+
         // Acquire the write lock once for all mutations to avoid repeated
         // lock acquisition and eliminate inconsistency windows.
         //
@@ -695,15 +758,55 @@ impl WorkerConnection {
             map.evict_blobs(endpoint, &evicted);
         }
 
-        if !digests.is_empty() {
+        // Collapse generic + pinned-mirror registrations into a single
+        // `register_blobs_iter` call so we allocate the endpoint `Arc<str>`
+        // once per tick instead of twice (10 workers × 100ms = ~200
+        // alloc/sec saved). The iterator form chains both slices without
+        // building an intermediate `Vec`. Pinned-mirror digests still take
+        // a SEPARATE mirror-pull code path below — combining the locality
+        // registration does not merge their backfill scheduling.
+        if !digests.is_empty() || !pinned_mirror.is_empty() {
             debug!(
                 worker_id=?self.worker_id,
                 endpoint,
                 count=digests.len(),
+                pinned_mirror_count=pinned_mirror.len(),
                 is_full_snapshot,
                 "Registering blobs available from worker"
             );
-            map.register_blobs(endpoint, &digests);
+            map.register_blobs_iter(
+                endpoint,
+                digests.iter().copied().chain(pinned_mirror.iter().copied()),
+            );
+        }
+
+        // Mirror-pull pipeline: any digest the worker is holding pinned in
+        // memory MUST be pulled into the server's stable storage promptly,
+        // since the worker is the only durable holder. We bypass the
+        // BACKFILL_COOLDOWN throttle here — the cost of one extra existence
+        // check per worker per tick is negligible compared to the durability
+        // window we close. Once the upload lands in the server's slow store,
+        // the FastSlowStore push to `stable_digests` triggers the broadcast
+        // loop in `nativelink.rs` which sends `BlobsInStableStorage` back to
+        // the worker, dropping the pin.
+        if !pinned_mirror.is_empty() {
+            if let Some(ref cas_store) = self.cas_store {
+                let pinned = pinned_mirror.clone();
+                let cas = cas_store.clone();
+                let tx = self.worker_tx.clone();
+                let worker_id = self.worker_id.clone();
+                let inflight = self.backfill_inflight.clone();
+                background_spawn!("pull_pinned_mirror_blobs", async move {
+                    Self::request_missing_blob_uploads(
+                        &cas,
+                        &tx,
+                        &worker_id,
+                        &pinned,
+                        &inflight,
+                    )
+                    .await;
+                });
+            }
         }
 
         // After updating the locality map, check which of the newly reported
