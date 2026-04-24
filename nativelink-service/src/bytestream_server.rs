@@ -25,7 +25,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use futures::future::pending;
-use futures::stream::unfold;
+use futures::stream::{StreamExt, unfold};
 use futures::{Future, Stream, TryFutureExt, try_join};
 use nativelink_config::cas_server::{ByteStreamConfig, InstanceName, WithInstanceName};
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
@@ -450,13 +450,38 @@ impl Stream for LoggingReadStream {
         match &result {
             Poll::Ready(Some(Ok(response))) => {
                 self.bytes_sent += response.data.len() as u64;
+                let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+                let chunk_len = response.data.len();
+                info!(
+                    digest = %self.digest,
+                    outcome = "ok_chunk",
+                    chunk_len,
+                    elapsed_ms,
+                    "logging_read_stream poll yielded chunk",
+                );
             }
             Poll::Ready(None) => {
                 self.completed = true;
+                let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+                info!(
+                    digest = %self.digest,
+                    outcome = "stream_end",
+                    elapsed_ms,
+                    "logging_read_stream poll yielded end",
+                );
                 self.log_completion("ok");
             }
-            Poll::Ready(Some(Err(_))) => {
+            Poll::Ready(Some(Err(status))) => {
                 self.completed = true;
+                let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
+                info!(
+                    digest = %self.digest,
+                    outcome = "err",
+                    code = ?status.code(),
+                    msg = %status.message(),
+                    elapsed_ms,
+                    "logging_read_stream poll yielded error",
+                );
                 self.log_completion("error");
             }
             Poll::Pending => {}
@@ -1301,14 +1326,21 @@ impl ByteStreamServer {
         });
 
         let read_stream_span = error_span!("read_stream");
+        let entry_time = Instant::now();
 
         Ok(Box::pin(unfold(state, move |state| {
-            async {
+            async move {
             let mut state: ReaderState = state?; // If None our stream is done.
             let mut response = ReadResponse::default();
             {
                 let consume_fut = state.rx.consume(Some(state.max_bytes_per_stream));
                 tokio::pin!(consume_fut);
+                info!(
+                    %digest,
+                    branch = "consume_await_start",
+                    elapsed_ms = entry_time.elapsed().as_millis() as u64,
+                    "inner_read awaiting consume_fut",
+                );
                 loop {
                     tokio::select! {
                         read_result = &mut consume_fut => {
@@ -1316,17 +1348,38 @@ impl ByteStreamServer {
                                 Ok(bytes) => {
                                     if bytes.is_empty() {
                                         // EOF.
+                                        info!(
+                                            %digest,
+                                            branch = "consume_ok_eof",
+                                            elapsed_ms = entry_time.elapsed().as_millis() as u64,
+                                            "inner_read consume returned empty (EOF)",
+                                        );
                                         return None;
                                     }
                                     if bytes.len() > state.max_bytes_per_stream {
                                         let err = make_err!(Code::Internal, "Returned store size was larger than read size");
                                         return Some((Err(err.into()), None));
                                     }
+                                    let bytes_len = bytes.len();
                                     response.data = bytes;
                                     trace!(response.data = format!("<redacted len({})>", response.data.len()));
+                                    info!(
+                                        %digest,
+                                        branch = "consume_ok",
+                                        bytes_len,
+                                        elapsed_ms = entry_time.elapsed().as_millis() as u64,
+                                        "inner_read consume returned chunk",
+                                    );
                                     break;
                                 }
                                 Err(mut e) => {
+                                    info!(
+                                        %digest,
+                                        branch = "consume_err",
+                                        code = ?e.code,
+                                        elapsed_ms = entry_time.elapsed().as_millis() as u64,
+                                        "inner_read consume returned error",
+                                    );
                                     // We may need to propagate the error from reading the data through first.
                                     // For example, the NotFound error will come through `get_part_fut`, and
                                     // will not be present in `e`, but we need to ensure we pass NotFound error
@@ -1338,6 +1391,13 @@ impl ByteStreamServer {
                                         // not set.
                                         state.get_part_fut.await
                                     };
+                                    info!(
+                                        %digest,
+                                        branch = "get_part_resolved_after_consume_err",
+                                        is_err = get_part_result.is_err(),
+                                        elapsed_ms = entry_time.elapsed().as_millis() as u64,
+                                        "inner_read get_part_fut resolved after consume_err",
+                                    );
                                     if let Err(err) = get_part_result {
                                         e = err.merge(e);
                                     }
@@ -1368,6 +1428,13 @@ impl ByteStreamServer {
                             }
                         },
                         result = &mut state.get_part_fut => {
+                            info!(
+                                %digest,
+                                branch = "get_part_done",
+                                is_err = result.is_err(),
+                                elapsed_ms = entry_time.elapsed().as_millis() as u64,
+                                "inner_read get_part_fut resolved (still awaiting consume)",
+                            );
                             state.maybe_get_part_result = Some(result);
                             // It is non-deterministic on which future will finish in what order.
                             // It is also possible that the `state.rx.consume()` call above may not be able to
@@ -2582,7 +2649,25 @@ impl ByteStream for ByteStreamServer {
                 // Wrap in LoggingReadStream to log when the client finishes
                 // consuming all data (or drops the stream early).
                 let logging = LoggingReadStream::new(stream, start_time, digest, expected_size);
-                Response::new(Box::pin(logging))
+                // Falsifies whether the response stream produced its yield
+                // BEFORE handing it to tonic/h3. If items appear here but
+                // the worker never sees them, the wedge is downstream
+                // (tonic-h3 / h3-quinn). Captured AFTER LoggingReadStream
+                // so we observe what tonic actually polls.
+                let logged = StreamExt::inspect(logging, move |item| match item {
+                    Ok(resp) => info!(
+                        %digest,
+                        item_len = resp.data.len(),
+                        "h3_outbound_yielded_ok",
+                    ),
+                    Err(status) => info!(
+                        %digest,
+                        code = ?status.code(),
+                        msg = %status.message(),
+                        "h3_outbound_yielded_err",
+                    ),
+                });
+                Response::new(Box::pin(logged))
             });
 
         // Track metrics based on result
