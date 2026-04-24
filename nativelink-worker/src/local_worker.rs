@@ -1980,6 +1980,16 @@ pub async fn new_local_worker(
     // Both stores share the same failed_slow_writes set so that the
     // reconnect retry (which drains from the RunningActionsManager's
     // store) also picks up unacked mirror digests.
+    //
+    // `with_local_only_reads()` hard-codes p2p-source-only mode: the
+    // public CAS server's reads MUST never fall through to the slow tier
+    // (`GrpcStore`→server). On local miss we return NotFound so the
+    // asking server routes to a different peer or serves from its own
+    // CAS, instead of bouncing the request back through this worker's
+    // slow tier — which would loop straight back to the same worker via
+    // the locality map and wedge both ends. The regular `effective_cas_store`
+    // above keeps its slow tier active for action input fetches inside
+    // `RunningActionsManager`.
     let effective_cas_store_for_cas_server = {
         // Sibling-bug audit (review #7): `.fast_store()` here is store
         // *construction*. We rebuild a sibling FastSlowStore with the
@@ -1994,6 +2004,12 @@ pub async fn new_local_worker(
         #[allow(clippy::disallowed_methods)]
         let fast_store = effective_cas_store.fast_store().clone();
         let slow_store = effective_cas_store.slow_store().clone();
+        // `slow_direction = ReadOnly` is defensive only: with
+        // `local_only_reads = true` the read paths short-circuit before
+        // touching the slow tier, and `update()` early-returns under
+        // `IS_MIRROR_REQUEST` before consulting `slow_direction`. Cost
+        // is nil and the original 354 GB / 30 min bounce-loop is bad
+        // enough to justify defense-in-depth.
         let fss_spec = nativelink_config::stores::FastSlowSpec {
             fast: nativelink_config::stores::StoreSpec::Noop(Default::default()),
             slow: nativelink_config::stores::StoreSpec::Noop(Default::default()),
@@ -2001,8 +2017,12 @@ pub async fn new_local_worker(
             slow_direction: nativelink_config::stores::StoreDirection::ReadOnly,
         };
         FastSlowStore::new_with_shared_failed_writes(
-            &fss_spec, fast_store, slow_store, &effective_cas_store,
+            &fss_spec,
+            fast_store,
+            slow_store,
+            &effective_cas_store,
         )
+        .with_local_only_reads()
     };
     // Keep a reference for mirror blob cleanup in BlobsInStableStorage.
     let cas_server_fss = effective_cas_store_for_cas_server.clone();
