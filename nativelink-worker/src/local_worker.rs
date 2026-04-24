@@ -631,7 +631,7 @@ const DEFAULT_MAX_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
 #[derive(Clone, Debug)]
 pub struct BlobsAvailableState {
     /// Reference to the worker's local FilesystemStore (the fast store in FastSlowStore).
-    fs_store: Arc<FilesystemStore>,
+    pub(crate) fs_store: Arc<FilesystemStore>,
     /// Tracks inserted and evicted digests between sends.
     tracker: Arc<BlobChangeTracker>,
     /// The worker's CAS endpoint for peer serving (e.g. "grpc://192.168.100.5:50081").
@@ -644,7 +644,89 @@ pub struct BlobsAvailableState {
     max_interval: Duration,
     /// The FastSlowStore backing the worker's CAS server. Used to clean up
     /// mirror blobs when `BlobsInStableStorage` is received.
-    cas_server_fss: Option<Arc<FastSlowStore>>,
+    pub(crate) cas_server_fss: Option<Arc<FastSlowStore>>,
+}
+
+impl BlobsAvailableState {
+    /// Test-only: build a `BlobsAvailableState` from explicit components.
+    /// The non-test path constructs this inline inside `new_local_worker`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn new_for_test(
+        fs_store: Arc<FilesystemStore>,
+        cas_server_fss: Option<Arc<FastSlowStore>>,
+    ) -> Self {
+        Self {
+            fs_store,
+            tracker: BlobChangeTracker::new(Arc::new(Notify::new())),
+            cas_endpoint: String::new(),
+            notify: Arc::new(Notify::new()),
+            max_interval: Duration::from_secs(60),
+            cas_server_fss,
+        }
+    }
+}
+
+/// Process a `BlobsInStableStorage` notification from the server:
+///   * Unpin the digests on the local FilesystemStore so they become
+///     eligible for eviction.
+///   * Drop them from the pending-upload (`failed_slow_writes`) set
+///     so a reconnect doesn't re-upload them.
+///   * Drop the in-memory mirror copies from the CAS server's
+///     FastSlowStore — the server now has its own durable copy and
+///     the worker no longer needs to hold one.
+///
+/// Extracted from the `Update::BlobsInStableStorage` match arm in
+/// `LocalWorkerImpl::run` so the handler is unit-testable without
+/// standing up the full scheduler/worker stream stack. The dispatch
+/// arm is a thin call site; all behavior lives here.
+pub fn handle_blobs_in_stable_storage(
+    state: &BlobsAvailableState,
+    cas_store: Option<&Arc<FastSlowStore>>,
+    proto_digests: &[nativelink_proto::build::bazel::remote::execution::v2::Digest],
+) {
+    let digest_count = proto_digests.len();
+    let fs_store = &state.fs_store;
+    let mut unpinned = 0usize;
+    let mut acked_digests: Vec<DigestInfo> = Vec::with_capacity(digest_count);
+    for proto_digest in proto_digests {
+        if let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) {
+            fs_store.unpin_digest(&digest);
+            acked_digests.push(digest);
+            unpinned += 1;
+        } else {
+            warn!(
+                ?proto_digest,
+                "BlobsInStableStorage: invalid digest, skipping unpin"
+            );
+        }
+    }
+    // Clear from pending-upload set on both stores (the CAS server
+    // store and the action upload store may track different digests;
+    // they share the failed_slow_writes set under the hood).
+    if let Some(cas_store) = cas_store {
+        cas_store.ack_digests(&acked_digests);
+    }
+    // Clean up mirror blobs from the CAS server's FastSlowStore — the
+    // server has confirmed it persisted these, so the worker no longer
+    // needs to hold the in-memory copies.
+    if let Some(cas_fss) = state.cas_server_fss.as_ref() {
+        let before = cas_fss.mirror_blob_count();
+        cas_fss.remove_mirror_blobs(&acked_digests);
+        let removed = before - cas_fss.mirror_blob_count();
+        if removed > 0 {
+            info!(
+                removed,
+                remaining = cas_fss.mirror_blob_count(),
+                "BlobsInStableStorage: removed mirror blobs from memory"
+            );
+        }
+    }
+    info!(
+        unpinned,
+        digest_count,
+        "BlobsInStableStorage: unpinned digests from local CAS"
+    );
 }
 
 struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> {
@@ -1270,52 +1352,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             }
                         }
                         Update::BlobsInStableStorage(blobs) => {
-                            // Server confirms these blobs are persisted to stable storage.
-                            // Unpin them from the local FilesystemStore so they become
-                            // eligible for eviction again, and clear them from the
-                            // pending-upload set so they won't be re-uploaded on reconnect.
                             let digest_count = blobs.digests.len();
                             if let Some(ref state) = self.blobs_available_state {
-                                let fs_store = &state.fs_store;
-                                let mut unpinned = 0usize;
-                                let mut acked_digests = Vec::with_capacity(digest_count);
-                                for proto_digest in &blobs.digests {
-                                    if let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) {
-                                        fs_store.unpin_digest(&digest);
-                                        acked_digests.push(digest);
-                                        unpinned += 1;
-                                    } else {
-                                        warn!(
-                                            ?proto_digest,
-                                            "BlobsInStableStorage: invalid digest, skipping unpin"
-                                        );
-                                    }
-                                }
-                                // Clear from pending-upload set on both stores
-                                // (the CAS server store and the action upload store
-                                // may track different digests).
-                                if let Some(cas_store) = self.running_actions_manager.get_cas_store() {
-                                    cas_store.ack_digests(&acked_digests);
-                                }
-                                // Clean up mirror blobs from the CAS server's
-                                // FastSlowStore — the server has confirmed it
-                                // persisted these, so we no longer need memory copies.
-                                if let Some(ref cas_fss) = state.cas_server_fss {
-                                    let before = cas_fss.mirror_blob_count();
-                                    cas_fss.remove_mirror_blobs(&acked_digests);
-                                    let removed = before - cas_fss.mirror_blob_count();
-                                    if removed > 0 {
-                                        info!(
-                                            removed,
-                                            remaining = cas_fss.mirror_blob_count(),
-                                            "BlobsInStableStorage: removed mirror blobs from memory"
-                                        );
-                                    }
-                                }
-                                info!(
-                                    unpinned,
-                                    digest_count,
-                                    "BlobsInStableStorage: unpinned digests from local CAS"
+                                let cas_store_for_ack =
+                                    self.running_actions_manager.get_cas_store();
+                                handle_blobs_in_stable_storage(
+                                    state,
+                                    cas_store_for_ack.as_ref(),
+                                    &blobs.digests,
                                 );
                             } else {
                                 trace!(
