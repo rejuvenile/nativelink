@@ -530,8 +530,18 @@ impl StoreDriver for CompletenessCheckingStore {
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
+        // Composite registration is not atomic — see FastSlowStore for the
+        // contract notes. No unregister API; warn loudly on partial failure.
         self.ac_store.register_item_callback(callback.clone())?;
-        self.cas_store.register_item_callback(callback)?;
+        if let Err(err) = self.cas_store.register_item_callback(callback) {
+            warn!(
+                ?err,
+                "CompletenessCheckingStore: cas_store register_item_callback failed AFTER \
+                 ac_store succeeded — composite is in an asymmetric state. Trait has no \
+                 unregister API; restart to recover."
+            );
+            return Err(err);
+        }
         Ok(())
     }
 }

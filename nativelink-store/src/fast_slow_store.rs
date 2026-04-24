@@ -2662,8 +2662,24 @@ impl StoreDriver for FastSlowStore {
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
+        // Composite registration is not atomic: if the second register fails
+        // after the first succeeds, the inner stores are left in an asymmetric
+        // state (one has the callback, the other doesn't). The StoreDriver
+        // trait does not currently expose `unregister_item_callback`, so we
+        // cannot roll back the partial registration. Most impls are infallible
+        // (Vec::push under a lock), so this rarely fires in practice. If it
+        // does, log loudly so the operator can detect the asymmetry and
+        // restart the process.
         self.fast_store.register_item_callback(callback.clone())?;
-        self.slow_store.register_item_callback(callback)?;
+        if let Err(err) = self.slow_store.register_item_callback(callback) {
+            warn!(
+                ?err,
+                "FastSlowStore: slow_store register_item_callback failed AFTER fast_store \
+                 succeeded — composite is in an asymmetric state (fast has the callback, \
+                 slow does not). Trait has no unregister API; restart to recover."
+            );
+            return Err(err);
+        }
         Ok(())
     }
 

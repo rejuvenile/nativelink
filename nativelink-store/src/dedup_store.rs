@@ -379,9 +379,20 @@ impl StoreDriver for DedupStore {
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
+        // Composite registration is not atomic — see FastSlowStore for the
+        // contract notes. No unregister API to roll back; warn loudly on
+        // partial failure so the operator can detect the asymmetry.
         self.index_store
             .register_item_callback(callback.clone())?;
-        self.content_store.register_item_callback(callback)?;
+        if let Err(err) = self.content_store.register_item_callback(callback) {
+            warn!(
+                ?err,
+                "DedupStore: content_store register_item_callback failed AFTER index_store \
+                 succeeded — composite is in an asymmetric state. Trait has no unregister \
+                 API; restart to recover."
+            );
+            return Err(err);
+        }
         Ok(())
     }
 }

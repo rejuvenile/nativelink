@@ -3483,6 +3483,7 @@ dependencies = [
 name = "nativelink-store"
 version = "1.0.0"
 dependencies = [
+ "arc-swap",
  "async-lock",
  "async-trait",
  "aws-config",
