@@ -406,6 +406,9 @@ impl FastSlowStore {
     /// Test-only: override the mirror-blob byte cap so cap-exceeded paths
     /// can be exercised without allocating gigabytes. Production code MUST
     /// NOT call this — the cap is sized for production memory budgets.
+    /// Gated on `cfg(test)` (in-crate use) and the `test-utils` feature
+    /// (external integration tests) so it cannot leak into release builds.
+    #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn set_mirror_blobs_max_bytes_for_test(&self, cap: u64) {
         self.mirror_blobs_max_bytes.store(cap, Ordering::Relaxed);
