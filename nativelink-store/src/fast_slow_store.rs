@@ -26,6 +26,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::join;
+use futures::stream::{FuturesUnordered, StreamExt};
 use nativelink_config::stores::{FastSlowSpec, StoreDirection};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
@@ -61,6 +62,14 @@ type Loader = Arc<()>;
 /// `insert_mirror_blob` returns `Err(ResourceExhausted)` so the mirror
 /// writer can record a per-peer failure and route the next attempt elsewhere.
 const DEFAULT_MIRROR_BLOBS_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Concurrency cap on the per-key fan-out used by `batch_get_part_unchunked`
+/// when `local_only_reads` is enabled. Each in-flight `get_part_unchunked`
+/// reserves a `BytesMut` plus a buf_channel pair (~3 MiB chunks × 24 slots
+/// ≈ 72 MiB peak), so an unbounded fan-out on a 100-key batch could commit
+/// ~7 GiB. 16 keeps the worst-case footprint near 1 GiB while still
+/// overlapping enough I/O to saturate the local filesystem tier.
+const LOCAL_ONLY_READS_BATCH_CONCURRENCY: usize = 16;
 
 // TODO(palfrey) We should consider copying the data in the background to allow the
 // client to hang up while the data is buffered. An alternative is to possibly make a
@@ -131,6 +140,31 @@ pub struct FastSlowStore {
     /// Notified on every mirror-blob insert/remove so the worker's
     /// `BlobsAvailable` loop can wake immediately.
     mirror_changes_notify: Arc<Notify>,
+    /// When true, reads NEVER fall through to the slow store on local miss.
+    /// Mirror blobs and the local fast store are still consulted; if the
+    /// blob is absent from both (and from the in-flight slow-write buffer),
+    /// `get_part`, `has_with_results`, and `batch_get_part_unchunked` return
+    /// `NotFound` instead of forwarding to `slow_store`.
+    ///
+    /// Hard-coded on by the worker's public CAS server wiring (see
+    /// [`FastSlowStore::with_local_only_reads`] and `local_worker.rs`) to
+    /// prevent a recursive wedge: server asks worker B for digest D → B's
+    /// local CAS misses → B's slow tier (`GrpcStore`→server) asks the
+    /// server → server's locality map says B has D → server proxies back
+    /// to B → indefinite mutual stream-blocking. Workers must answer
+    /// `NotFound` on a peer-fetch local miss; the server then routes to a
+    /// different peer or serves from its own CAS.
+    ///
+    /// Writes (mirror inserts, action-execution updates) are unaffected —
+    /// only the read fallthrough to the slow tier is suppressed.
+    ///
+    /// Stored as `AtomicBool` so [`FastSlowStore::with_local_only_reads`]
+    /// can flip it through a shared `Arc` without needing `Arc::get_mut`
+    /// (`Arc::new_cyclic` leaves a `Weak<Self>` outstanding, which would
+    /// make `Arc::get_mut` always return `None`). Writers set it once at
+    /// construction; readers see it via `Ordering::Relaxed` since it is
+    /// not synchronizing other state.
+    local_only_reads: AtomicBool,
 }
 
 /// Pending mirror-blob deltas. `added` and `removed` are mutually exclusive
@@ -215,6 +249,7 @@ impl FastSlowStore {
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
             mirror_changes: Mutex::new(MirrorChanges::default()),
             mirror_changes_notify: Arc::new(Notify::new()),
+            local_only_reads: AtomicBool::new(false),
         })
     }
 
@@ -397,7 +432,26 @@ impl FastSlowStore {
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
             mirror_changes: Mutex::new(MirrorChanges::default()),
             mirror_changes_notify: Arc::new(Notify::new()),
+            local_only_reads: AtomicBool::new(false),
         })
+    }
+
+    /// Flip on `local_only_reads` mode. See the field-level comment for the
+    /// rationale. Intended as a one-shot construction-time flip; chain
+    /// directly off the constructor at `local_worker.rs` callsite. Stored
+    /// as an atomic so this works on a freshly-built `Arc<Self>` (which
+    /// already has a `Weak<Self>` outstanding from `Arc::new_cyclic`).
+    #[must_use]
+    pub fn with_local_only_reads(self: Arc<Self>) -> Arc<Self> {
+        self.local_only_reads.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// Returns `true` if this instance is configured to refuse slow-store
+    /// fallback on local miss (worker public CAS server variant).
+    #[inline]
+    pub fn local_only_reads(&self) -> bool {
+        self.local_only_reads.load(Ordering::Relaxed)
     }
 
     /// Remove mirror blobs that the server has confirmed are in stable storage.
@@ -1586,6 +1640,39 @@ impl StoreDriver for FastSlowStore {
         if slow_store.optimized_for(StoreOptimizations::NoopDownloads) {
             return self.fast_store.has_with_results(key, results).await;
         }
+        if self.local_only_reads.load(Ordering::Relaxed) {
+            // Worker public CAS server variant — see `local_only_reads`
+            // field comment. Consult fast → in-flight → mirror; never the
+            // slow tier. Note the ordering differs from `get_part` (which
+            // checks mirror first); for content-addressed CAS the sizes
+            // are identical so either order is correct, but the divergence
+            // is non-obvious and worth flagging.
+            self.fast_store.has_with_results(key, results).await?;
+            {
+                let in_flight = self.in_flight_slow_writes.lock();
+                for (k, result) in key.iter().zip(results.iter_mut()) {
+                    if result.is_none() {
+                        let owned = k.borrow().into_owned();
+                        if let Some(chunks) = in_flight.get(&owned) {
+                            let total_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+                            *result = Some(total_len);
+                        }
+                    }
+                }
+            }
+            {
+                let mirror = self.mirror_blobs.lock();
+                for (k, result) in key.iter().zip(results.iter_mut()) {
+                    if result.is_none() {
+                        let digest = k.borrow().into_digest();
+                        if let Some((data, _)) = mirror.get(&digest) {
+                            *result = Some(data.len() as u64);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
         // Only check the slow store because if it's not there, then something
         // down stream might be unable to get it.  This should not affect
         // workers as they only use get() and a CAS can use an
@@ -2445,6 +2532,22 @@ impl StoreDriver for FastSlowStore {
             }
         }
 
+        // Worker public CAS server variant — see `local_only_reads` field
+        // comment for the recursive-wedge rationale. Mirror + fast +
+        // in-flight have all missed; returning NotFound forces the asking
+        // server to try a different peer rather than looping the request
+        // back through this worker's slow tier.
+        if self.local_only_reads.load(Ordering::Relaxed) {
+            debug!(
+                ?key,
+                "local_only_reads: returning NotFound instead of falling through to slow store"
+            );
+            return Err(make_err!(
+                Code::NotFound,
+                "FastSlowStore local_only_reads: blob not present on this worker"
+            ));
+        }
+
         // If the fast store is noop or read only or update only then bypass it.
         if self
             .fast_store
@@ -2617,6 +2720,46 @@ impl StoreDriver for FastSlowStore {
         keys: Vec<StoreKey<'_>>,
         length: Option<u64>,
     ) -> Vec<Result<Bytes, Error>> {
+        // Worker public CAS server variant — see `local_only_reads` field
+        // comment. Route per-key through `get_part_unchunked` so each
+        // fetch consults mirror + fast + in-flight before short-circuiting
+        // to NotFound (no slow-store fallthrough). The fast-batch shortcut
+        // below would skip the mirror map and fan out to the slow tier on
+        // miss, both of which we must avoid here. The Semaphore caps
+        // memory committed to concurrent fetches: each `get_part_unchunked`
+        // can hold ~72 MiB of in-flight buffers (24-slot buf_channel × ~3
+        // MiB chunks plus a `BytesMut`), so an unbounded fan-out on a
+        // 100-key batch could commit ~7 GiB.
+        if self.local_only_reads.load(Ordering::Relaxed) {
+            let n = keys.len();
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(
+                LOCAL_ONLY_READS_BATCH_CONCURRENCY,
+            ));
+            let futs: FuturesUnordered<_> = keys
+                .into_iter()
+                .enumerate()
+                .map(|(idx, key)| {
+                    let semaphore = Arc::clone(&semaphore);
+                    async move {
+                        // Permit acquisition cannot fail: we never close
+                        // the semaphore.
+                        let _permit = semaphore.acquire_owned().await.expect(
+                            "LOCAL_ONLY_READS_BATCH_CONCURRENCY semaphore is never closed",
+                        );
+                        let result = self.get_part_unchunked(key, 0, length).await;
+                        (idx, result)
+                    }
+                })
+                .collect();
+            let mut results: Vec<Result<Bytes, Error>> =
+                vec![Err(make_err!(Code::Internal, "batch slot not filled")); n];
+            let mut stream = futs;
+            while let Some((idx, result)) = stream.next().await {
+                results[idx] = result;
+            }
+            return results;
+        }
+
         // Try the fast store batch first.
         let mut results = Pin::new(self.fast_store.as_store_driver())
             .batch_get_part_unchunked(keys.iter().map(|k| k.borrow()).collect(), length)
