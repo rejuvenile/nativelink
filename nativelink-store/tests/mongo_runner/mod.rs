@@ -15,7 +15,7 @@ use extractor::extract;
 use mongodb::bson::doc;
 use nativelink_error::{Error, ResultExt, make_err};
 use process::MongoProcess;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 use tonic::Code;
 use tracing::{debug, info};
 
@@ -40,6 +40,7 @@ pub(crate) struct MongoEmbedded {
     pub bind_ip: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    _db_dir: TempDir,
 }
 
 static CURRENTLY_DOWNLOADING: LazyLock<(Mutex<bool>, Condvar)> =
@@ -50,10 +51,8 @@ impl MongoEmbedded {
         let cache_dir = dirs::cache_dir()
             .expect("Failed to find cache directory")
             .join("mongo");
-        let db_path = tempdir()
-            .expect("Failed to create temporary directory")
-            .keep()
-            .join("db");
+        let db_dir = tempdir().expect("Failed to create temporary directory");
+        let db_path = db_dir.path().join("db");
 
         Self {
             version: version.to_string(),
@@ -64,6 +63,7 @@ impl MongoEmbedded {
             bind_ip: "127.0.0.1".to_string(),
             username: None,
             password: None,
+            _db_dir: db_dir,
         }
     }
 
