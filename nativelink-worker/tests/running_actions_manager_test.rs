@@ -5578,4 +5578,159 @@ exit 1
 
         Ok(())
     }
+
+    #[nativelink_test]
+    async fn missing_command_attaches_precondition_failure_detail()
+    -> Result<(), Box<dyn core::error::Error>> {
+        // REAPI v2 §2.2.4: when the worker fails to fetch the action's
+        // Command from CAS, the resulting NotFound error MUST carry a
+        // PreconditionFailure detail (MISSING violation for the command
+        // digest) so Bazel can re-upload and recover. The original code
+        // only attached the detail for missing input files, leaving the
+        // command-fetch path bare.
+        const WORKER_ID: &str = "foo_worker_id";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, _, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                peer_locality_map: None,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Synthesize a command_digest that is NOT uploaded to CAS so the
+        // command-fetch path returns NotFound.
+        let missing_command_digest = DigestInfo::new([0xCD; 32], 256);
+
+        // Upload an empty input root so input fetch succeeds (we only want
+        // the command-fetch branch to fail).
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(missing_command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id,
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    peer_hints: Vec::new(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        let prepare_err = running_action
+            .clone()
+            .prepare_action()
+            .await
+            .err()
+            .expect("prepare_action must fail when command is missing from CAS");
+
+        assert_eq!(
+            prepare_err.code,
+            Code::NotFound,
+            "missing-command path should surface as NotFound, got {:?}: {}",
+            prepare_err.code,
+            prepare_err.message_string(),
+        );
+        assert!(
+            !prepare_err.details.is_empty(),
+            "command-fetch NotFound must attach a PreconditionFailure detail (REAPI §2.2.4); details was empty (messages={:?})",
+            prepare_err.messages,
+        );
+        let any = prepare_err
+            .details
+            .iter()
+            .find(|d| d.type_url == "type.googleapis.com/google.rpc.PreconditionFailure")
+            .expect("expected a PreconditionFailure detail");
+
+        // Decode and verify the MISSING violation references the missing
+        // command digest in canonical `blobs/<hash>/<size>` form.
+        #[derive(prost::Message)]
+        struct PfViolation {
+            #[prost(string, tag = "1")]
+            r#type: String,
+            #[prost(string, tag = "2")]
+            subject: String,
+            #[prost(string, tag = "3")]
+            description: String,
+        }
+        #[derive(prost::Message)]
+        struct PfFailure {
+            #[prost(message, repeated, tag = "1")]
+            violations: Vec<PfViolation>,
+        }
+        let decoded = PfFailure::decode(any.value.as_slice())
+            .expect("PreconditionFailure must decode");
+        assert!(
+            !decoded.violations.is_empty(),
+            "PreconditionFailure must contain at least one violation",
+        );
+        let v = &decoded.violations[0];
+        assert_eq!(v.r#type, "MISSING");
+        assert_eq!(
+            v.subject,
+            format!(
+                "blobs/{}/{}",
+                missing_command_digest.packed_hash(),
+                missing_command_digest.size_bytes()
+            ),
+            "MISSING violation subject must reference the missing command digest",
+        );
+
+        running_action.cleanup().await?;
+        Ok(())
+    }
 }

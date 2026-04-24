@@ -890,6 +890,157 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
 }
 
 #[nativelink_test]
+async fn cas_not_found_translation_preserves_details_test() -> Result<(), Error> {
+    // REAPI v2 §2.2.4: a FAILED_PRECONDITION returned to Bazel for a missing
+    // blob MUST carry the corresponding google.rpc.PreconditionFailure detail
+    // (with a MISSING violation) so Bazel can re-upload the blob and recover.
+    // The worker's NotFound→FailedPrecondition translation must preserve any
+    // details attached to the source error rather than dropping them on the
+    // floor by going through `make_err!`.
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_eq!(props, ConnectWorkerRequest::default());
+    }
+
+    let expected_worker_id = "foobar".to_string();
+
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: String::new(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                        peer_hints: Vec::new(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+
+                        missing_digests: Vec::new(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let running_action = Arc::new(MockRunningAction::new());
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+
+    // Build a PreconditionFailure detail (MISSING violation) and attach it
+    // to a NotFound error — same shape produced by the input-fetch path.
+    // The proto types are defined locally to mirror the worker's helper
+    // (`make_precondition_failure_any` in running_actions_manager.rs).
+    #[derive(prost::Message)]
+    struct PfViolation {
+        #[prost(string, tag = "1")]
+        r#type: String,
+        #[prost(string, tag = "2")]
+        subject: String,
+        #[prost(string, tag = "3")]
+        description: String,
+    }
+    #[derive(prost::Message)]
+    struct PfFailure {
+        #[prost(message, repeated, tag = "1")]
+        violations: Vec<PfViolation>,
+    }
+
+    let missing_digest = DigestInfo::new([0xAB; 32], 42);
+    let detail = PfFailure {
+        violations: vec![PfViolation {
+            r#type: "MISSING".into(),
+            subject: format!(
+                "blobs/{}/{}",
+                missing_digest.packed_hash(),
+                missing_digest.size_bytes()
+            ),
+            description: String::new(),
+        }],
+    };
+    let any = prost_types::Any {
+        type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+        value: detail.encode_to_vec(),
+    };
+    let mut source_err = make_err!(
+        Code::NotFound,
+        "Hash abababab not found in either fast or slow store"
+    );
+    source_err.details.push(any.clone());
+
+    running_action.expect_prepare_action(Err(source_err)).await?;
+    running_action.cleanup(Ok(())).await?;
+
+    let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+
+    let response = match execution_response.result {
+        Some(execute_result::Result::ExecuteResponse(resp)) => resp,
+        other => panic!("expected ExecuteResponse, got {other:?}"),
+    };
+    // ExecuteResponse.status is the google.rpc.Status that carries the
+    // PreconditionFailure detail to Bazel (REAPI v2 §2.2.4).
+    let status = response.status.expect("ExecuteResponse missing status");
+    assert_eq!(
+        status.code,
+        Code::FailedPrecondition as i32,
+        "expected FAILED_PRECONDITION, got {}",
+        status.code,
+    );
+    assert_eq!(
+        status.details.len(),
+        1,
+        "PreconditionFailure detail must survive NotFound→FailedPrecondition translation",
+    );
+    assert_eq!(status.details[0].type_url, any.type_url);
+    assert_eq!(status.details[0].value, any.value);
+
+    Ok(())
+}
+
+#[nativelink_test]
 async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
     let mut test_context = setup_local_worker(HashMap::new()).await;
     let streaming_response = test_context.maybe_streaming_response.take().unwrap();

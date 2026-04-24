@@ -2724,7 +2724,18 @@ impl RunningActionImpl {
                     command_digest.into(),
                 )
                 .await
-                .err_tip(|| "Converting command_digest to Command");
+                .err_tip(|| "Converting command_digest to Command")
+                .map_err(|mut e| {
+                    // REAPI v2 §2.2.4: a missing Command must be surfaced
+                    // with a PreconditionFailure MISSING violation so Bazel
+                    // can re-upload the blob. Input files get this detail
+                    // attached in download_to_directory; the command path
+                    // previously returned NotFound with empty details.
+                    if e.code == Code::NotFound {
+                        e.details.push(make_precondition_failure_any(command_digest));
+                    }
+                    e
+                });
                 info!(
                     %op_id_for_cmd,
                     ?command_digest,

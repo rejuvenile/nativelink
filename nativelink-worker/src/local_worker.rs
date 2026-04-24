@@ -1676,12 +1676,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                     ?e,
                                                     "Missing CAS inputs, returning FAILED_PRECONDITION"
                                                 );
+                                                // Re-stamp the code without losing the
+                                                // attached PreconditionFailure details —
+                                                // `make_err!` would drop them, breaking
+                                                // Bazel's REAPI v2 §2.2.4 recovery path.
+                                                let mut translated = e;
+                                                translated.code = Code::FailedPrecondition;
                                                 let action_result = ActionResult {
-                                                    error: Some(make_err!(
-                                                        Code::FailedPrecondition,
-                                                        "{}",
-                                                        e.message_string()
-                                                    )),
+                                                    error: Some(translated),
                                                     ..ActionResult::default()
                                                 };
                                                 let action_stage = ActionStage::Completed(action_result);
