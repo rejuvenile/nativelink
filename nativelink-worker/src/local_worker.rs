@@ -621,6 +621,29 @@ const CONNECTION_RETRY_DELAY_S: f32 = 0.5;
 /// `cas_server.rs` must also be updated.
 const DEFAULT_ENDPOINT_TIMEOUT_S: f32 = 5.;
 
+/// Maximum decoded message size for the scheduler→worker `WorkerApi` stream.
+///
+/// Tonic's generated client default is 4 MiB. The worker receives the
+/// `UpdateForWorker` oneof which today carries:
+///   * `StartExecute` with up to `MAX_PEER_HINTS = 16384` `PeerHint` entries
+///     (each ~250 bytes worst case → potentially > 4 MiB on its own), plus
+///     pre-resolved directory trees up to 32 MiB
+///     (`api_worker_scheduler::MAX_TREE_PROTO_BYTES`).
+///   * `BlobsInStableStorage` with an unbounded `repeated Digest` list
+///     (one entry per blob the server just persisted; a write burst of
+///     thousands of blobs in a single message is plausible).
+///
+/// At the default 4 MiB limit, a large `StartExecute` or
+/// `BlobsInStableStorage` would be silently rejected by the worker's tonic
+/// decoder, breaking the connect_worker stream and forcing reconnection
+/// (which in turn delays mirror unpinning and stalls dispatches).
+///
+/// 64 MiB matches the server-side listener default
+/// (`DEFAULT_MAX_DECODING_MESSAGE_SIZE` in `src/bin/nativelink.rs`) and the
+/// worker's CAS server (`WORKER_CAS_MAX_DECODING_MESSAGE_SIZE`), keeping
+/// the cross-tier ceiling consistent.
+pub const WORKER_API_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Default maximum amount of time a task is allowed to run for.
 /// If this value gets modified the documentation in `cas_server.rs` must also be updated.
 const DEFAULT_MAX_ACTION_TIMEOUT: Duration = Duration::from_secs(1200); // 20 mins.
@@ -2206,9 +2229,12 @@ pub async fn new_local_worker(
                         ))?;
                     info!(
                         uri = %config.worker_api_endpoint.uri,
-                        "Worker API: using QUIC/HTTP3 transport"
+                        decode_limit_mib = WORKER_API_MAX_DECODING_MESSAGE_SIZE / (1024 * 1024),
+                        "Worker API: using QUIC/HTTP3 transport with explicit decode limit"
                     );
-                    return Ok(WorkerApiClient::new(quic_channel).into());
+                    return Ok(WorkerApiClient::new(quic_channel)
+                        .max_decoding_message_size(WORKER_API_MAX_DECODING_MESSAGE_SIZE)
+                        .into());
                 }
 
                 let timeout = config
@@ -2232,7 +2258,14 @@ pub async fn new_local_worker(
                         config.worker_api_endpoint.uri
                     )
                 })?;
-                Ok(WorkerApiClient::new(transport).into())
+                info!(
+                    uri = %config.worker_api_endpoint.uri,
+                    decode_limit_mib = WORKER_API_MAX_DECODING_MESSAGE_SIZE / (1024 * 1024),
+                    "Worker API: using TCP/HTTP2 transport with explicit decode limit"
+                );
+                Ok(WorkerApiClient::new(transport)
+                    .max_decoding_message_size(WORKER_API_MAX_DECODING_MESSAGE_SIZE)
+                    .into())
             })
         }),
         Box::new(move |d| Box::pin(sleep(d))),
