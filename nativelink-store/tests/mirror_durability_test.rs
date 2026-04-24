@@ -19,6 +19,7 @@
 
 use bytes::Bytes;
 use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
+use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
@@ -166,7 +167,7 @@ async fn try_write_mirror(
     fss: &std::sync::Arc<FastSlowStore>,
     digest: DigestInfo,
     data: Bytes,
-) -> Result<(), nativelink_error::Error> {
+) -> Result<(), Error> {
     let store: Store = Store::new(fss.clone());
     IS_MIRROR_REQUEST
         .scope(true, async move { store.update_oneshot(digest, data).await })
@@ -195,7 +196,7 @@ async fn mirror_blob_dropped_when_cap_exceeded() {
         .expect_err("cap-exceeded must Err");
     assert_eq!(
         err.code,
-        nativelink_error::Code::ResourceExhausted,
+        Code::ResourceExhausted,
         "cap-exceeded must use ResourceExhausted, got {:?}",
         err
     );
@@ -383,4 +384,84 @@ async fn mirror_only_digest_visible_via_wrapper() {
         .await
         .expect("get_part_unchunked");
     assert_eq!(read_back, data, "wrapper reads mirror-only blob bytes");
+}
+
+/// Lock-ordering regression test (review #2): the canonical acquisition
+/// order is `mirror_blobs` BEFORE `mirror_changes`. A previous version of
+/// `snapshot_and_reset_mirror_changes` took the locks in the inverted
+/// order and could AB/BA-deadlock with a concurrent insert/remove.
+///
+/// The test runs many iterations of producer (insert), consumer (remove),
+/// and snapshotter (drain+snapshot) tasks in parallel. With the inverted
+/// order, on a multi-core runtime this wedges the test runtime within a
+/// few iterations. With the correct order, all three tasks complete
+/// promptly. We bound completion with a generous wall-clock timeout so a
+/// regression surfaces as a test timeout rather than a hang. Multi-thread
+/// tokio flavor is required: a single-threaded runtime serializes the
+/// tasks and cannot exhibit AB/BA on `parking_lot::Mutex`.
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_ordering_no_deadlock_under_contention() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::time::{Duration, timeout};
+
+    let fss = make_fss();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+    // Inserter: bursts mirror writes for a series of digests.
+    let inserter = {
+        let fss = fss.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            for i in 0..200u8 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let digest = d(i, 1);
+                // Best-effort: cap-exceeded is fine, we only care about
+                // exercising the lock acquisition order.
+                let _ = try_write_mirror(&fss, digest, Bytes::from_static(b"x")).await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    // Remover: removes a rolling subset of digests.
+    let remover = {
+        let fss = fss.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            for i in 0..200u8 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                fss.remove_mirror_blobs(&[d(i, 1)]);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    // Snapshotter: drives `snapshot_and_reset_mirror_changes` (the site of
+    // the AB/BA risk) under contention.
+    let snapshotter = {
+        let fss = fss.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = fss.snapshot_and_reset_mirror_changes();
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    let all = async {
+        let _ = tokio::join!(inserter, remover, snapshotter);
+    };
+    let res = timeout(Duration::from_secs(15), all).await;
+    stop.store(true, Ordering::Relaxed);
+    res.expect(
+        "lock-ordering AB/BA regression: snapshot+insert+remove wedged within 15s",
+    );
 }

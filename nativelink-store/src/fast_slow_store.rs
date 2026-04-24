@@ -108,6 +108,9 @@ pub struct FastSlowStore {
     /// the pin on a TTL would lose data. The 2 GiB cap (see
     /// `MIRROR_BLOBS_MAX_BYTES`) is the only bound; the server is expected to
     /// reclaim entries promptly via stable-storage acks.
+    ///
+    /// Lock acquisition order: `mirror_blobs` BEFORE `mirror_changes`. See
+    /// the comment on `mirror_changes` for the deadlock rationale.
     mirror_blobs: Mutex<HashMap<DigestInfo, (Bytes, Instant)>>,
     /// Total bytes currently held in `mirror_blobs`. Tracked separately to
     /// enforce `mirror_blobs_max_bytes` without iterating the map.
@@ -119,6 +122,11 @@ pub struct FastSlowStore {
     /// Tracks added/removed mirror digests since the last `drain_mirror_changes`
     /// call so the worker's `BlobsAvailable` loop can send incremental updates
     /// without re-snapshotting the whole map.
+    ///
+    /// Lock acquisition order: `mirror_blobs` BEFORE `mirror_changes`. All
+    /// sites that take both locks (including `snapshot_and_reset_mirror_changes`)
+    /// MUST acquire `mirror_blobs` first. Inverting the order risks an AB/BA
+    /// deadlock with `insert_mirror_blob` / `remove_mirror_blobs`.
     mirror_changes: Mutex<MirrorChanges>,
     /// Notified on every mirror-blob insert/remove so the worker's
     /// `BlobsAvailable` loop can wake immediately.
@@ -431,12 +439,19 @@ impl FastSlowStore {
         // Hold both locks across the swap+snapshot so neither an inserter
         // nor a remover can interleave and split a single change across
         // the boundary. The snapshot reflects exactly the post-drain state.
-        let mut changes_guard = self.mirror_changes.lock();
+        //
+        // Acquisition order: `mirror_blobs` BEFORE `mirror_changes` to match
+        // the canonical order documented on the field declarations and used
+        // by `insert_mirror_blob` / `remove_mirror_blobs`. Inverting the
+        // order here would AB/BA-deadlock with concurrent inserters under
+        // load (regression test:
+        // `lock_ordering_no_deadlock_under_contention`).
         let blobs_guard = self.mirror_blobs.lock();
+        let mut changes_guard = self.mirror_changes.lock();
         let drained = core::mem::take(&mut *changes_guard);
         let snapshot: Vec<DigestInfo> = blobs_guard.keys().copied().collect();
-        drop(blobs_guard);
         drop(changes_guard);
+        drop(blobs_guard);
         (drained, snapshot)
     }
 
