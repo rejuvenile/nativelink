@@ -19,6 +19,7 @@
 /// See `docs/streaming-blob-pipeline-design.md` for the full design.
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,9 +28,23 @@ use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::common::DigestInfo;
+
+/// Maximum time `StreamingBlobReader::next_chunk` will block on a single
+/// `Notified` await before declaring the producer wedged. Generous enough
+/// that legitimately slow producers (multi-second backpressure, large-blob
+/// network stalls) do not trip it; short enough that a missing-wakeup bug
+/// surfaces as a `DeadlineExceeded` error in seconds rather than a 120 s
+/// gRPC stream wedge. Defense-in-depth — the pin+enable fix at 646d7623
+/// closed the known race; this guards against the next one.
+const STREAMING_BLOB_NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Threshold above which a single `next_chunk` notify wait is logged at
+/// `warn!` and counted in `notify_waits_over_5s`. Lets us verify in
+/// production whether the lost-wakeup wedge actually went away.
+const SLOW_NOTIFY_THRESHOLD: Duration = Duration::from_secs(5);
 
 /// Inner shared state for a streaming blob.
 ///
@@ -69,6 +84,12 @@ pub struct StreamingBlobInner {
     /// Construction timestamp — used by debug logs to report
     /// elapsed-since-creation for any state transition. Pure observability.
     created_at: Instant,
+
+    /// Count of `next_chunk` notify waits that exceeded
+    /// `SLOW_NOTIFY_THRESHOLD`. Exposed via
+    /// `notify_waits_over_5s_total()` for production scraping; lets us
+    /// verify whether the 646d7623 fix eliminated the lost-wakeup wedge.
+    notify_waits_over_5s: AtomicU64,
 }
 
 impl fmt::Debug for StreamingBlobInner {
@@ -99,7 +120,14 @@ impl StreamingBlobInner {
             max_buffer_bytes,
             earliest_chunk_idx: AtomicU64::new(0),
             created_at: Instant::now(),
+            notify_waits_over_5s: AtomicU64::new(0),
         }
+    }
+
+    /// Total `next_chunk` notify waits observed exceeding
+    /// `SLOW_NOTIFY_THRESHOLD` (5 s). Monotonic; safe to scrape.
+    pub fn notify_waits_over_5s_total(&self) -> u64 {
+        self.notify_waits_over_5s.load(Ordering::Relaxed)
     }
 
     /// Elapsed since construction (for diagnostic logging).
@@ -455,20 +483,64 @@ impl StreamingBlobReader {
             // BEFORE the predicate check, so any notify_waiters()
             // that fired since then is captured here and the
             // await returns immediately.
-            let wait_start = Instant::now();
+            //
+            // Defense-in-depth: bound the wait with
+            // STREAMING_BLOB_NOTIFY_TIMEOUT so the next missing-wakeup
+            // bug surfaces as a logged DeadlineExceeded in seconds
+            // rather than a 120 s gRPC stream wedge. The pinned
+            // Notified is still passed through (preserves the
+            // pin+enable correctness from 646d7623) — tokio::time::
+            // timeout takes any future, including a pinned one.
+            // Use tokio::time::Instant so paused-time tests can drive
+            // the slow-wait + deadline branches deterministically; in
+            // production it forwards to std::time::Instant.
+            let wait_start = tokio::time::Instant::now();
             debug!(
                 digest = %self.inner.digest,
                 cursor_chunk_idx = self.cursor_chunk_idx,
                 "streaming blob reader awaiting pre-registered notify"
             );
-            notified.await;
+            let timeout_result =
+                tokio::time::timeout(STREAMING_BLOB_NOTIFY_TIMEOUT, notified.as_mut()).await;
+            let wait_elapsed = wait_start.elapsed();
             let terminal_present = self.inner.terminal.lock().is_some();
-            debug!(
-                digest = %self.inner.digest,
-                wait_ms = wait_start.elapsed().as_millis() as u64,
-                terminal_present,
-                "streaming blob reader notify wakeup"
-            );
+            if timeout_result.is_err() {
+                let chunk_count = self.inner.chunk_count.load(Ordering::Acquire);
+                let earliest = self.inner.earliest_chunk_idx.load(Ordering::Acquire);
+                error!(
+                    digest = %self.inner.digest,
+                    age_ms = self.inner.age_ms(),
+                    cursor_chunk_idx = self.cursor_chunk_idx,
+                    chunk_count,
+                    earliest,
+                    terminal_present,
+                    wait_ms = wait_elapsed.as_millis() as u64,
+                    "streaming blob reader notify deadline exceeded — suspected lost wakeup"
+                );
+                return Err(make_err!(
+                    Code::DeadlineExceeded,
+                    "streaming blob next_chunk: notify deadline exceeded"
+                ));
+            }
+            if wait_elapsed >= SLOW_NOTIFY_THRESHOLD {
+                self.inner
+                    .notify_waits_over_5s
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    digest = %self.inner.digest,
+                    wait_ms = wait_elapsed.as_millis() as u64,
+                    terminal_present,
+                    cursor_chunk_idx = self.cursor_chunk_idx,
+                    "streaming blob reader slow notify wakeup"
+                );
+            } else {
+                debug!(
+                    digest = %self.inner.digest,
+                    wait_ms = wait_elapsed.as_millis() as u64,
+                    terminal_present,
+                    "streaming blob reader notify wakeup"
+                );
+            }
         }
     }
 }
@@ -1303,5 +1375,97 @@ mod tests {
                 "pair {i}: expected terminal Err, got {chunk_res:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Defense-in-depth: notify_await deadline + slow-wait counter
+    // ---------------------------------------------------------------
+
+    /// Spec: when the writer never notifies (lost wakeup or stuck
+    /// producer), `next_chunk` MUST return `DeadlineExceeded` within
+    /// `STREAMING_BLOB_NOTIFY_TIMEOUT` (30 s) instead of wedging
+    /// indefinitely. Uses paused virtual time so the test runs in <1 s.
+    #[tokio::test(start_paused = true)]
+    async fn next_chunk_deadline_exceeded_on_stuck_writer() {
+        // Hold the writer alive but never send / EOF / error.
+        let (_writer, mut reader) = StreamingBlob::new(test_digest(99), 1024 * 1024);
+
+        let read_fut = reader.next_chunk();
+        tokio::pin!(read_fut);
+
+        // Advance virtual time past the 30 s deadline.
+        let result = tokio::time::timeout(
+            STREAMING_BLOB_NOTIFY_TIMEOUT + Duration::from_secs(5),
+            &mut read_fut,
+        )
+        .await
+        .expect("reader did not return within deadline + slack");
+
+        let err = result.expect_err("expected DeadlineExceeded, got Ok");
+        assert_eq!(
+            err.code,
+            Code::DeadlineExceeded,
+            "expected Code::DeadlineExceeded, got {err:?}"
+        );
+    }
+
+    /// Spec: a single `next_chunk` wait that exceeds
+    /// `SLOW_NOTIFY_THRESHOLD` (5 s) but completes before the deadline
+    /// MUST increment `notify_waits_over_5s_total`. A wait that
+    /// completes quickly MUST NOT increment it.
+    #[tokio::test(start_paused = true)]
+    async fn slow_notify_wait_increments_counter() {
+        let (mut writer, mut reader) = StreamingBlob::new(test_digest(100), 1024 * 1024);
+        let inner = Arc::clone(&reader.inner);
+        assert_eq!(inner.notify_waits_over_5s_total(), 0);
+
+        // Reader parks on notified.await.
+        let reader_task = tokio::spawn(async move {
+            let res = reader.next_chunk().await;
+            (reader, res)
+        });
+
+        // Let the reader register + park.
+        tokio::task::yield_now().await;
+
+        // Advance past the slow threshold but well under the deadline.
+        tokio::time::advance(SLOW_NOTIFY_THRESHOLD + Duration::from_secs(2)).await;
+
+        // Now wake the reader cleanly with EOF.
+        writer.send_eof().unwrap();
+
+        let (_reader, res) = reader_task.await.unwrap();
+        let chunk = res.expect("reader returned err on EOF wakeup");
+        assert!(chunk.is_empty(), "expected EOF chunk, got {chunk:?}");
+
+        assert_eq!(
+            inner.notify_waits_over_5s_total(),
+            1,
+            "expected slow-wait counter to increment exactly once"
+        );
+    }
+
+    /// Spec: a fast wakeup MUST NOT bump the slow-wait counter.
+    #[tokio::test]
+    async fn fast_notify_wait_does_not_increment_counter() {
+        let (mut writer, mut reader) = StreamingBlob::new(test_digest(101), 1024 * 1024);
+        let inner = Arc::clone(&reader.inner);
+
+        let reader_task = tokio::spawn(async move {
+            let res = reader.next_chunk().await;
+            (reader, res)
+        });
+
+        // Wake immediately.
+        tokio::task::yield_now().await;
+        writer.send(Bytes::from_static(b"x")).await.unwrap();
+
+        let (_reader, res) = reader_task.await.unwrap();
+        assert_eq!(res.unwrap(), Bytes::from_static(b"x"));
+        assert_eq!(
+            inner.notify_waits_over_5s_total(),
+            0,
+            "fast wakeup must not bump slow-wait counter"
+        );
     }
 }
