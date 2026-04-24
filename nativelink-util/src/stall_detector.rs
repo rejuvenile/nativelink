@@ -27,8 +27,78 @@ const MIN_DUMP_INTERVAL_SECS: u64 = 30;
 /// Unix epoch seconds of the last dump. Used for rate-limiting.
 static LAST_DUMP_EPOCH: AtomicU64 = AtomicU64::new(0);
 
+/// Force-dump rate-limit: dumps marked "force" still get rate-limited
+/// to avoid flooding /tmp during a sustained wedge, but use a separate
+/// (much shorter) interval so a critical event can produce a dump even
+/// if a generic StallGuard fired moments before. Without this separate
+/// budget, two unrelated stalls within 30s would silently drop the
+/// second (more interesting) dump because the first burned the slot.
+const MIN_FORCE_DUMP_INTERVAL_SECS: u64 = 10;
+
+/// Unix epoch seconds of the last force-dump. Tracked separately from
+/// `LAST_DUMP_EPOCH` so a force dump and a normal dump have independent
+/// rate-limits.
+static LAST_FORCE_DUMP_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// Default stall threshold for store operations.
 pub const DEFAULT_STALL_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Decide whether a force-dump request should proceed, given the
+/// current and previous force-dump unix-epoch seconds. Pure function;
+/// extracted from `force_dump_thread_stacks` to keep the rate-limit
+/// rule unit-testable without touching the process-global `/tmp` dump
+/// path. Returns `true` iff the gap is at or above
+/// `MIN_FORCE_DUMP_INTERVAL_SECS`.
+const fn force_dump_should_proceed(now_secs: u64, prev_secs: u64) -> bool {
+    now_secs.saturating_sub(prev_secs) >= MIN_FORCE_DUMP_INTERVAL_SECS
+}
+
+/// Force a thread-stack dump for a critical event (e.g. streaming-blob
+/// deadline exceeded), bypassing the normal `MIN_DUMP_INTERVAL_SECS`
+/// rate-limit but still applying a much shorter
+/// `MIN_FORCE_DUMP_INTERVAL_SECS` floor so a tight wedge loop can't
+/// flood `/tmp`.
+///
+/// Use this for events that are themselves diagnostic (i.e. a
+/// targeted-detector tripped) rather than generic stall guards. The
+/// resulting `/tmp/nativelink-stall-*.txt` lets the operator see who
+/// was wedged at the exact moment the upstream detector fired, even if
+/// a generic StallGuard already burned the normal rate-limit slot.
+///
+/// Returns `true` if a dump was actually triggered, `false` if
+/// suppressed by the force-rate-limit.
+pub fn force_dump_thread_stacks(label: &str) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let prev = LAST_FORCE_DUMP_EPOCH.load(Ordering::Relaxed);
+    if !force_dump_should_proceed(now, prev) {
+        eprintln!(
+            "FORCE THREAD DUMP requested ({label}) — suppressed by rate-limit \
+             (last force dump {}s ago)",
+            now.saturating_sub(prev)
+        );
+        return false;
+    }
+    if LAST_FORCE_DUMP_EPOCH
+        .compare_exchange(prev, now, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        eprintln!(
+            "FORCE THREAD DUMP requested ({label}) — lost CAS race with concurrent dump"
+        );
+        return false;
+    }
+    // Also bump LAST_DUMP_EPOCH so a normal StallGuard firing 1s after
+    // this force dump doesn't immediately re-dump on top of us.
+    LAST_DUMP_EPOCH.store(now, Ordering::Relaxed);
+    eprintln!(
+        "FORCE THREAD DUMP: {label} — dumping thread stacks (rate-limit bypassed)"
+    );
+    dump_thread_stacks(label);
+    true
+}
 
 /// A guard that spawns a background task to detect stalls. When the
 /// guarded operation completes (i.e., the guard is dropped), the
@@ -912,4 +982,60 @@ fn cleanup_old_stall_dumps() {
         }
     }
     eprintln!("stall dump cleanup: removed {to_remove} old dump files, kept {MAX_STALL_DUMPS} newest pairs");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_FORCE_DUMP_INTERVAL_SECS, force_dump_should_proceed};
+
+    /// Spec: force-dump must proceed when `now - prev` is at or beyond
+    /// `MIN_FORCE_DUMP_INTERVAL_SECS`. The exact boundary value MUST be
+    /// allowed (>=, not >) so a dump exactly N seconds later still fires.
+    #[test]
+    fn force_dump_proceeds_at_or_above_threshold() {
+        let prev = 1_000u64;
+        // Below threshold — must NOT proceed.
+        assert!(!force_dump_should_proceed(prev, prev));
+        assert!(!force_dump_should_proceed(prev + 1, prev));
+        assert!(!force_dump_should_proceed(
+            prev + MIN_FORCE_DUMP_INTERVAL_SECS - 1,
+            prev,
+        ));
+        // At threshold — MUST proceed.
+        assert!(force_dump_should_proceed(
+            prev + MIN_FORCE_DUMP_INTERVAL_SECS,
+            prev,
+        ));
+        // Well past threshold — MUST proceed.
+        assert!(force_dump_should_proceed(
+            prev + MIN_FORCE_DUMP_INTERVAL_SECS + 1000,
+            prev,
+        ));
+    }
+
+    /// Spec: cold start (`prev == 0`) follows the same gap rule. In
+    /// production `now` is unix-epoch seconds (~1.7e9), so the gap is
+    /// always far above the threshold; the function does not special-
+    /// case zero. This test pins the documented semantics so a future
+    /// "cold-start exemption" cannot silently bypass the rate-limit.
+    #[test]
+    fn force_dump_cold_start_follows_gap_rule() {
+        // Tiny `now` values < threshold are suppressed even when prev=0.
+        assert!(!force_dump_should_proceed(1, 0));
+        // At the exact threshold — proceeds (consistent with the
+        // boundary semantics tested above).
+        assert!(force_dump_should_proceed(MIN_FORCE_DUMP_INTERVAL_SECS, 0));
+        // Real-world unix-epoch values — always proceed.
+        assert!(force_dump_should_proceed(1_700_000_000, 0));
+        assert!(force_dump_should_proceed(u64::MAX, 0));
+    }
+
+    /// Spec: clock-skew negative deltas (now < prev) MUST be treated as
+    /// "still in cooldown" — no dump. `saturating_sub` makes the diff
+    /// 0, which is below the threshold.
+    #[test]
+    fn force_dump_suppressed_on_clock_skew() {
+        assert!(!force_dump_should_proceed(500, 1000));
+        assert!(!force_dump_should_proceed(0, 1000));
+    }
 }

@@ -21,7 +21,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -90,6 +90,30 @@ pub struct StreamingBlobInner {
     /// `notify_waits_over_5s_total()` for production scraping; lets us
     /// verify whether the 646d7623 fix eliminated the lost-wakeup wedge.
     notify_waits_over_5s: AtomicU64,
+
+    /// Tokio task ID of the producer, captured **on first writer
+    /// `send`/`send_eof`/`send_error` call** — NOT at construction.
+    ///
+    /// Constructing the `Inner` happens on the *consumer's* task in
+    /// some code paths (e.g. `FastSlowStore::spawn_populate_producer_with_role`
+    /// builds the writer on the calling task and then `tokio::spawn`s
+    /// it onto a fresh task). Capturing at construction would name the
+    /// consumer instead of the producer — exactly the wrong task for
+    /// an operator chasing a wedged upload. Capturing on first send
+    /// names the task that actually owns the writer at the moment
+    /// data starts flowing, which matches every deployed code path.
+    ///
+    /// `tokio::task::try_id()` returns `None` outside a tokio task
+    /// (e.g. unit tests using `block_on` directly); in that case the
+    /// `OnceLock` simply stays empty and the deadline log emits
+    /// `<none>` for the producer.
+    ///
+    /// When the next-chunk deadline fires with `terminal_present:
+    /// false`, this names the task to grep for in the worker
+    /// journal/log: the producer that is wedged upstream of
+    /// streaming_blob (e.g. blocked on a gRPC read with no per-frame
+    /// deadline).
+    producer_task_id: OnceLock<String>,
 }
 
 impl fmt::Debug for StreamingBlobInner {
@@ -104,6 +128,7 @@ impl fmt::Debug for StreamingBlobInner {
             )
             .field("max_buffer_bytes", &self.max_buffer_bytes)
             .field("terminal", &self.terminal.lock().is_some())
+            .field("producer_task_id", &self.producer_task_id.get())
             .finish()
     }
 }
@@ -121,7 +146,33 @@ impl StreamingBlobInner {
             earliest_chunk_idx: AtomicU64::new(0),
             created_at: Instant::now(),
             notify_waits_over_5s: AtomicU64::new(0),
+            producer_task_id: OnceLock::new(),
         }
+    }
+
+    /// Capture the current tokio task ID as the producer if not
+    /// already set. Called from each `StreamingBlobWriter` send path
+    /// so the producer is recorded the first time data (or terminal
+    /// state) flows through the writer — which always runs on the
+    /// producer task by the time data is being sent. `OnceLock::set`
+    /// is a single atomic CAS; subsequent calls are a no-op
+    /// (`Result::Err` ignored).
+    fn record_producer_task_id(&self) {
+        if self.producer_task_id.get().is_some() {
+            return;
+        }
+        if let Some(id) = tokio::task::try_id() {
+            let _ = self.producer_task_id.set(id.to_string());
+        }
+    }
+
+    /// Tokio task ID of the producer, captured on the writer's first
+    /// `send`/`send_eof`/`send_error` call. See the
+    /// [`StreamingBlobInner::producer_task_id`] field doc for
+    /// rationale on why this is captured on first send rather than
+    /// at construction.
+    pub fn producer_task_id(&self) -> Option<&str> {
+        self.producer_task_id.get().map(String::as_str)
     }
 
     /// Total `next_chunk` notify waits observed exceeding
@@ -225,6 +276,8 @@ impl StreamingBlobWriter {
             ));
         }
 
+        self.inner.record_producer_task_id();
+
         let chunk_len = chunk.len() as u64;
 
         {
@@ -257,6 +310,7 @@ impl StreamingBlobWriter {
     /// Signal successful end-of-file.  After this, readers that have
     /// consumed all chunks will see EOF.
     pub fn send_eof(&mut self) -> Result<(), Error> {
+        self.inner.record_producer_task_id();
         let mut terminal = self.inner.terminal.lock();
         if terminal.is_some() {
             return Err(make_err!(
@@ -281,6 +335,7 @@ impl StreamingBlobWriter {
 
     /// Signal a write error.  All readers will observe this error.
     pub fn send_error(&mut self, err: Error) {
+        self.inner.record_producer_task_id();
         let mut terminal = self.inner.terminal.lock();
         if terminal.is_some() {
             return;
@@ -517,6 +572,7 @@ impl StreamingBlobReader {
                 //            streaming_blob (e.g. blocked on a gRPC read with
                 //            no per-frame deadline, holding a lock, or the
                 //            tokio task is starved). Bug lives upstream.
+                let producer_tid = self.inner.producer_task_id().unwrap_or("<none>");
                 if terminal_present {
                     error!(
                         digest = %self.inner.digest,
@@ -525,6 +581,7 @@ impl StreamingBlobReader {
                         chunk_count,
                         earliest,
                         wait_ms = wait_elapsed.as_millis() as u64,
+                        producer_task_id = %producer_tid,
                         "streaming blob reader notify deadline exceeded — \
                          terminal IS set, this is a genuine lost wakeup"
                     );
@@ -536,10 +593,24 @@ impl StreamingBlobReader {
                         chunk_count,
                         earliest,
                         wait_ms = wait_elapsed.as_millis() as u64,
+                        producer_task_id = %producer_tid,
                         "streaming blob reader notify deadline exceeded — \
                          terminal NOT set, producer is wedged upstream \
                          (e.g. gRPC read with no deadline, or task starvation)"
                     );
+                    // Force a thread-stack dump at the EXACT moment of the
+                    // wedge — this is the most decisive single artifact for
+                    // diagnosing what the producer task is parked on. The
+                    // standard StallGuard rate-limit is bypassed because the
+                    // streaming_blob deadline is itself a targeted-detector
+                    // signal (not a generic guard); without this, the dump
+                    // is suppressed if a sibling guard fired moments before.
+                    let label = format!(
+                        "streaming_blob_deadline digest={} producer_task={}",
+                        self.inner.digest,
+                        producer_tid,
+                    );
+                    crate::stall_detector::force_dump_thread_stacks(&label);
                 }
                 return Err(make_err!(
                     Code::DeadlineExceeded,
@@ -1467,6 +1538,124 @@ mod tests {
             1,
             "expected slow-wait counter to increment exactly once"
         );
+    }
+
+    /// Spec: outside a tokio task, `producer_task_id` MUST stay
+    /// `None` and the writer MUST NOT panic when sending.
+    #[test]
+    fn producer_task_id_none_outside_runtime() {
+        let inner = Arc::new(StreamingBlobInner::new(test_digest(123), 1024));
+        // Pre-send: empty.
+        assert!(
+            inner.producer_task_id().is_none(),
+            "producer_task_id must be None before any send, got {:?}",
+            inner.producer_task_id()
+        );
+        // Even with a writer outside a runtime, send_error doesn't crash
+        // and stays empty (no try_id available).
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        writer.send_error(make_err!(Code::Internal, "outside-runtime"));
+        assert!(
+            inner.producer_task_id().is_none(),
+            "producer_task_id must remain None outside a tokio task, got {:?}",
+            inner.producer_task_id()
+        );
+    }
+
+    /// Spec: a writer that has never sent has no producer_task_id —
+    /// capture is on first send, not at construction. Construction can
+    /// happen on any task (including the consumer's task in the
+    /// populate-spawn path); the producer task is only knowable once it
+    /// owns the writer and sends data.
+    #[tokio::test]
+    async fn producer_task_id_unset_until_first_send() {
+        let tid = tokio::spawn(async {
+            let (writer, _reader) = StreamingBlob::new(test_digest(124), 1024);
+            writer.inner.producer_task_id().map(str::to_string)
+        })
+        .await
+        .unwrap();
+        assert!(
+            tid.is_none(),
+            "producer_task_id must remain None until the writer's first \
+             send/send_eof/send_error fires; constructing the inner alone \
+             must NOT capture, otherwise the populate-spawn path captures \
+             the consumer instead of the producer. got {tid:?}"
+        );
+    }
+
+    /// Spec: producer_task_id is captured by the writer's first send,
+    /// from whichever task is running the writer at that moment. This
+    /// is the property the operator relies on — a wedge log line names
+    /// the task that owns the writer (and is presumably stuck), not
+    /// some unrelated upstream caller.
+    #[tokio::test]
+    async fn producer_task_id_captures_first_send_task() {
+        let (writer, reader) = StreamingBlob::new(test_digest(125), 1024);
+        let inner_for_assert = Arc::clone(&reader.inner);
+
+        // Send from a SPAWNED task; that's the producer.
+        let producer_handle = tokio::spawn(async move {
+            let producer_real_id = tokio::task::try_id().unwrap().to_string();
+            writer.send(Bytes::from_static(b"x")).await.unwrap();
+            producer_real_id
+        });
+        let producer_real_id = producer_handle.await.unwrap();
+
+        let captured = inner_for_assert
+            .producer_task_id()
+            .expect("first send must capture")
+            .to_string();
+        assert_eq!(
+            producer_real_id, captured,
+            "producer_task_id MUST match the task that ran the first send. \
+             constructor task and producer task may differ — only the \
+             producer is meaningful for wedge diagnosis."
+        );
+    }
+
+    /// Regression for the populate-spawn misattribution that #126's
+    /// review caught. Simulates `FastSlowStore::spawn_populate_producer_with_role`:
+    /// inner is constructed on the CONSUMER task, then the writer is
+    /// `tokio::spawn`'d onto a fresh PRODUCER task. The captured task
+    /// id MUST be the producer's, NOT the consumer's.
+    #[tokio::test]
+    async fn producer_task_id_in_populate_spawn_path_is_producer_not_consumer() {
+        // 1. Build the inner + writer on the consumer task (this test body's task).
+        let consumer_task_id = tokio::task::try_id().map(|id| id.to_string());
+        let (writer, reader) = StreamingBlob::new(test_digest(126), 1024);
+        let inner_for_assert = Arc::clone(&reader.inner);
+
+        // 2. Spawn the producer onto a fresh task — this is the bug
+        //    scenario. The producer task is a different id than the
+        //    consumer task.
+        let producer_handle = tokio::spawn(async move {
+            let producer_real_id = tokio::task::try_id().unwrap().to_string();
+            writer.send(Bytes::from_static(b"y")).await.unwrap();
+            producer_real_id
+        });
+        let producer_real_id = producer_handle.await.unwrap();
+
+        let captured = inner_for_assert
+            .producer_task_id()
+            .expect("first send must capture")
+            .to_string();
+        assert_eq!(
+            producer_real_id, captured,
+            "REGRESSION: in the populate-spawn path the captured \
+             producer_task_id matched the consumer task instead of the \
+             producer task. Operator chasing a wedge greps the wrong \
+             task ID. Pre-fix this test would assert consumer_task_id \
+             == captured; post-fix it must equal producer_real_id."
+        );
+        if let Some(consumer_id) = consumer_task_id {
+            assert_ne!(
+                consumer_id, captured,
+                "captured id must NOT be the consumer's task id — \
+                 the populate-spawn bug pattern is the consumer's id \
+                 leaking into producer_task_id"
+            );
+        }
     }
 
     /// Spec: a fast wakeup MUST NOT bump the slow-wait counter.

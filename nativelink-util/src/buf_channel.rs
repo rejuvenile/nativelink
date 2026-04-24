@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::Poll;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
@@ -33,6 +33,69 @@ const ZERO_DATA: Bytes = Bytes::new();
 /// size and write pipeline depth so the channel never bottlenecks the
 /// I/O pipeline.
 const DEFAULT_BUF_CHANNEL_CAPACITY: usize = 1024;
+
+/// Shared diagnostic state between a buf_channel's writer and reader
+/// halves. Lets the reader's slow-producer warn (`recv > 5s`) name the
+/// specific producer task and report when it last made progress —
+/// which transforms the warn from "something upstream is slow" into
+/// "task <N> hasn't sent a chunk in <Ms>". The information is cheap
+/// to maintain (one atomic write per send) and the operator can grep
+/// the worker journal for the producer task id to find what the
+/// producer was doing when it stalled.
+#[derive(Debug, Default)]
+struct ChannelDiag {
+    /// First producer task id that called `send`. `String` rather than
+    /// `tokio::task::Id` so we don't need that type to be `Display` in
+    /// every consumer (it is, but this avoids the dep). Lazily set on
+    /// the first `send` because the channel is often constructed in a
+    /// different task than the one that ultimately produces. Uses
+    /// `OnceLock` so the steady-state hot path (every chunk after the
+    /// first) is a single atomic load + early return — no mutex.
+    producer_task_id: OnceLock<String>,
+    /// Unix-epoch milliseconds of the most recent successful send.
+    /// `0` means "no successful send yet" — distinguishable from a
+    /// real send because we record `1` when t==0 happens to land at
+    /// the epoch (extremely unlikely, but cheap to handle).
+    last_send_at_epoch_ms: AtomicU64,
+    /// Total number of successful sends so far. Pure counter; lets the
+    /// slow-recv warn distinguish "channel empty since construction"
+    /// from "channel was active and then stopped".
+    sends_total: AtomicU64,
+}
+
+impl ChannelDiag {
+    fn record_send(&self) {
+        // Lazily capture the producer task id on first send. After the
+        // first set, this is a single atomic load + early return — no
+        // mutex, no allocation. Per-chunk hot path stays branch-cheap.
+        if self.producer_task_id.get().is_none() {
+            if let Some(tid) = tokio::task::try_id() {
+                let _ = self.producer_task_id.set(tid.to_string());
+            }
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        self.last_send_at_epoch_ms.store(now_ms, Ordering::Relaxed);
+        self.sends_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ChannelDiagSnapshot {
+        ChannelDiagSnapshot {
+            producer_task_id: self.producer_task_id.get().cloned(),
+            last_send_at_epoch_ms: self.last_send_at_epoch_ms.load(Ordering::Relaxed),
+            sends_total: self.sends_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ChannelDiagSnapshot {
+    producer_task_id: Option<String>,
+    last_send_at_epoch_ms: u64,
+    sends_total: u64,
+}
 
 /// Create a channel pair that can be used to transport buffer objects around to
 /// different components. This wrapper is used because the streams give some
@@ -62,11 +125,13 @@ pub fn make_buf_channel_pair_with_size(
 ) -> (DropCloserWriteHalf, DropCloserReadHalf) {
     let (tx, rx) = mpsc::channel(capacity);
     let eof_sent = Arc::new(AtomicBool::new(false));
+    let diag = Arc::new(ChannelDiag::default());
     (
         DropCloserWriteHalf {
             tx: Some(tx),
             bytes_written: 0,
             eof_sent: eof_sent.clone(),
+            diag: diag.clone(),
         },
         DropCloserReadHalf {
             rx,
@@ -76,6 +141,7 @@ pub fn make_buf_channel_pair_with_size(
             bytes_received: 0,
             recent_data: Vec::new(),
             max_recent_data_size: 0,
+            diag,
         },
     )
 }
@@ -86,6 +152,10 @@ pub struct DropCloserWriteHalf {
     tx: Option<mpsc::Sender<Bytes>>,
     bytes_written: u64,
     eof_sent: Arc<AtomicBool>,
+    /// Shared with the reader half; updated on every successful send so
+    /// the reader can attribute slow-recv warns to a specific producer
+    /// task and report the time since the last successful send.
+    diag: Arc<ChannelDiag>,
 }
 
 impl DropCloserWriteHalf {
@@ -139,6 +209,10 @@ impl DropCloserWriteHalf {
             ));
         }
         self.bytes_written += buf_len;
+        // Record producer task id (lazy on first send) and last-send
+        // timestamp so the reader's slow-recv warn can name the producer
+        // and report the gap.
+        self.diag.record_send();
         Ok(())
     }
 
@@ -168,6 +242,7 @@ impl DropCloserWriteHalf {
         match tx.try_send(buf) {
             Ok(()) => {
                 self.bytes_written += buf_len;
+                self.diag.record_send();
                 Ok(())
             }
             Err(TrySendError::Full(buf)) => Err(TrySendError::Full(buf)),
@@ -276,6 +351,10 @@ pub struct DropCloserReadHalf {
     /// Amount of data to keep in the `recent_data` buffer before clearing it
     /// and no longer populating it.
     max_recent_data_size: u64,
+    /// Shared with the writer half; on a slow recv, snapshot this to
+    /// attribute the wait to the producer task and report the gap
+    /// since its last send.
+    diag: Arc<ChannelDiag>,
 }
 
 impl DropCloserReadHalf {
@@ -323,8 +402,25 @@ impl DropCloserReadHalf {
             let data = self.rx.recv().await.unwrap_or(ZERO_DATA);
             let recv_elapsed = recv_start.elapsed();
             if recv_elapsed.as_secs() >= 5 {
+                let snap = self.diag.snapshot();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default();
+                let gap_since_last_send_ms = if snap.last_send_at_epoch_ms == 0 {
+                    // No send ever happened on this channel — distinguish
+                    // "channel was always empty" from "channel went silent
+                    // after producing N chunks".
+                    None
+                } else {
+                    Some(now_ms.saturating_sub(snap.last_send_at_epoch_ms))
+                };
                 warn!(
                     recv_ms = recv_elapsed.as_millis() as u64,
+                    producer_task_id = %snap.producer_task_id.as_deref().unwrap_or("<none>"),
+                    sends_total = snap.sends_total,
+                    gap_since_last_send_ms = ?gap_since_last_send_ms,
+                    bytes_received = self.bytes_received,
                     "buf_channel::recv: slow producer (>5s wait)",
                 );
             }
@@ -511,5 +607,134 @@ impl Stream for DropCloserReadHalf {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    /// Spec: a freshly-constructed channel reports `last_send_at_epoch_ms == 0`
+    /// and `sends_total == 0`; the producer task id is unset until the first
+    /// successful `send`. The reader-side slow-recv warn relies on this to
+    /// distinguish "channel never produced" from "producer went silent".
+    #[tokio::test]
+    async fn diag_default_state_has_no_sends() {
+        let (_tx, rx) = make_buf_channel_pair();
+        let snap = rx.diag.snapshot();
+        assert!(
+            snap.producer_task_id.is_none(),
+            "producer_task_id MUST be None before any send"
+        );
+        assert_eq!(
+            snap.last_send_at_epoch_ms, 0,
+            "last_send_at_epoch_ms MUST be 0 before any send"
+        );
+        assert_eq!(
+            snap.sends_total, 0,
+            "sends_total MUST be 0 before any send"
+        );
+    }
+
+    /// Spec: after a successful `send`, the diag snapshot MUST report the
+    /// producer task id, a positive last-send timestamp, and incremented
+    /// sends_total. This is the data the slow-recv warn formats into the
+    /// log line.
+    #[tokio::test]
+    async fn diag_records_first_send() {
+        let (mut tx, rx) = make_buf_channel_pair();
+        // Move the writer into a spawned task so the captured task id
+        // refers to a different task than the test's main task — proves
+        // the capture is task-local to the *sender*, not whoever
+        // constructed the pair.
+        let producer_id = tokio::spawn(async move {
+            let pid = tokio::task::try_id().unwrap().to_string();
+            tx.send(Bytes::from_static(b"hi")).await.unwrap();
+            pid
+        })
+        .await
+        .unwrap();
+
+        let snap = rx.diag.snapshot();
+        assert_eq!(
+            snap.producer_task_id.as_deref(),
+            Some(producer_id.as_str()),
+            "diag MUST record the spawned producer task id, not the constructor's task"
+        );
+        assert!(
+            snap.last_send_at_epoch_ms > 0,
+            "last_send_at_epoch_ms MUST be set after a successful send"
+        );
+        assert_eq!(
+            snap.sends_total, 1,
+            "sends_total MUST be 1 after one successful send"
+        );
+    }
+
+    /// Spec: subsequent sends MUST keep the FIRST producer's task id (so
+    /// switching tasks mid-stream does not erase the original attribution),
+    /// and MUST advance last_send_at_epoch_ms / sends_total.
+    ///
+    /// Note: this test runs the producer inside a `tokio::spawn` rather
+    /// than directly in the `#[tokio::test]` body because
+    /// `tokio::task::try_id()` returns `None` from `block_on` futures —
+    /// i.e. the test body itself is not a "task" in tokio's sense. In
+    /// production every send originates from a spawned task (gRPC
+    /// handler, `tokio::spawn` worker, etc.), so this is the realistic
+    /// path.
+    #[tokio::test]
+    async fn diag_keeps_first_producer_across_sends() {
+        let (tx, rx) = make_buf_channel_pair();
+        // Two-way handshake so the producer waits for the test driver
+        // to snapshot snap1 before issuing send "b". Without this gate
+        // the producer can race ahead of the snapshot — sends_total
+        // would be 2 by the time we look. Per CLAUDE.md "no sleep as
+        // synchronization": use channels, not timing, to serialize.
+        let (after_first, mut wait_first) = tokio::sync::mpsc::channel::<()>(1);
+        let (proceed_to_second, mut wait_to_proceed) = tokio::sync::mpsc::channel::<()>(1);
+        let (after_second, mut wait_second) = tokio::sync::mpsc::channel::<()>(1);
+
+        let producer = tokio::spawn(async move {
+            let pid = tokio::task::try_id().unwrap().to_string();
+            let mut tx = tx;
+            tx.send(Bytes::from_static(b"a")).await.unwrap();
+            after_first.send(()).await.unwrap();
+            // Block until the test driver has read snap1, then proceed.
+            wait_to_proceed.recv().await.unwrap();
+            tx.send(Bytes::from_static(b"b")).await.unwrap();
+            after_second.send(()).await.unwrap();
+            pid
+        });
+
+        // Snapshot after the first send (producer is blocked on
+        // `wait_to_proceed.recv` so sends_total is exactly 1).
+        wait_first.recv().await.unwrap();
+        let snap1 = rx.diag.snapshot();
+        assert_eq!(snap1.sends_total, 1);
+        let ts1 = snap1.last_send_at_epoch_ms;
+        let first_id = snap1.producer_task_id.clone().unwrap();
+
+        // Release the producer to issue the second send.
+        proceed_to_second.send(()).await.unwrap();
+
+        // Snapshot after the second send.
+        wait_second.recv().await.unwrap();
+        let snap2 = rx.diag.snapshot();
+        assert_eq!(
+            snap2.producer_task_id.as_deref(),
+            Some(first_id.as_str()),
+            "first producer attribution MUST persist across subsequent sends"
+        );
+        assert!(
+            snap2.last_send_at_epoch_ms >= ts1,
+            "last_send_at_epoch_ms MUST advance (or stay equal under coarse clock)"
+        );
+        assert_eq!(
+            snap2.sends_total, 2,
+            "sends_total MUST count every successful send"
+        );
+
+        let final_pid = producer.await.unwrap();
+        assert_eq!(final_pid, first_id);
     }
 }
