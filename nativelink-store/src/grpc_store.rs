@@ -912,17 +912,29 @@ impl GrpcStore {
         // and propagates through the GrpcStore to become an RPC header.
         let is_mirror = IS_MIRROR_REQUEST.try_with(|v| *v).unwrap_or(false);
 
-        let local_state = Arc::new(Mutex::new(WriteState::new(
+        // Per-chunk no-progress timeout. Configured via `rpc_timeout_s`
+        // but applied per-chunk: each WriteRequest delivered from the
+        // upstream stream resets the timer. If no chunk arrives for
+        // `rpc_timeout`, the wrapper aborts the RPC with DeadlineExceeded.
+        //
+        // The previous whole-RPC `tokio::time::timeout` killed legitimate
+        // slow-but-progressing mirror writes (a 50 MB blob through a slow
+        // Bazel client at 2 MB/s legitimately takes 25s end-to-end). Each
+        // such kill broke the >=2-replica durability invariant for the
+        // affected blob (641 events on 2026-04-23). Per-chunk progress
+        // detects stuck transports without aborting in-flight work.
+        let rpc_timeout = self.rpc_timeout;
+        let local_state = Arc::new(Mutex::new(WriteState::with_progress_timeout(
             self.instance_name.clone(),
             stream,
+            rpc_timeout,
         )));
 
         let write_start = std::time::Instant::now();
         let instance_name = self.instance_name.clone();
-        let rpc_timeout = self.rpc_timeout;
         trace!(
             instance_name = %instance_name,
-            rpc_timeout_s = rpc_timeout.as_secs(),
+            progress_timeout_s = rpc_timeout.as_secs(),
             is_mirror,
             "GrpcStore::write: starting ByteStream write",
         );
@@ -1056,27 +1068,14 @@ impl GrpcStore {
                         }
                     };
 
-                    let result = if rpc_timeout > Duration::ZERO {
-                        match tokio::time::timeout(rpc_timeout, rpc_fut).await {
-                            Ok(res) => res,
-                            Err(_elapsed) => {
-                                warn!(
-                                    instance_name = %instance_name,
-                                    attempt,
-                                    rpc_timeout_s = rpc_timeout.as_secs(),
-                                    "GrpcStore::write: per-RPC timeout exceeded, cancelling",
-                                );
-                                #[allow(unused_qualifications)]
-                                Err(nativelink_error::make_err!(
-                                    nativelink_error::Code::DeadlineExceeded,
-                                    "GrpcStore::write RPC timed out after {}s",
-                                    rpc_timeout.as_secs()
-                                ))
-                            }
-                        }
-                    } else {
-                        rpc_fut.await
-                    };
+                    // Per-chunk progress timeout is enforced inside
+                    // WriteStateWrapper::poll_next via WriteState's
+                    // progress_deadline; it aborts the RPC by ending the
+                    // stream with `read_stream_error` set. No outer
+                    // whole-RPC deadline here — that was killing
+                    // slow-but-progressing mirror writes and breaking the
+                    // >=2-replica durability invariant.
+                    let result = rpc_fut.await;
 
                     // Get the state back from StateWrapper, this should be
                     // uncontended since write has returned.
@@ -1122,12 +1121,25 @@ impl GrpcStore {
             }))
             .await?;
 
-        let total_elapsed_ms = u64::try_from(write_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let total_elapsed = write_start.elapsed();
+        let total_elapsed_ms = u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX);
         trace!(
             instance_name = %self.instance_name,
             total_elapsed_ms,
             "GrpcStore::write: completed successfully",
         );
+        // The per-chunk progress timer hides whole-RPC duration from the
+        // operator (the previous whole-RPC timeout used to surface it as
+        // a cancellation). Keep the long-RPC signal as a warn on success
+        // so we can still detect "the transport is healthy but extremely
+        // slow" — e.g. WAN clients streaming large blobs.
+        if total_elapsed > Duration::from_secs(60) {
+            warn!(
+                instance_name = %self.instance_name,
+                total_elapsed_ms,
+                "GrpcStore::write succeeded but took > 60s; chunks were progressing but transport is slow",
+            );
+        }
         Ok(result)
     }
 
