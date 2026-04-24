@@ -259,6 +259,38 @@ fn is_definitive_unreachable(e: &Error) -> bool {
     })
 }
 
+/// Classification of a mirror-write failure for `record_mirror_failure`.
+///
+/// Quarantine policy depends on the kind:
+///   * `DefinitiveUnreachable` — fast-quarantine on the first failure
+///     (the peer is provably gone; round-robin to it is wasted I/O).
+///   * `Generic` — only quarantine after `MIRROR_FAILURE_THRESHOLD`
+///     failures inside `MIRROR_FAILURE_WINDOW` (transient errors recover
+///     on retry; one or two failures must NOT quarantine).
+///   * `Saturated` — the peer's mirror cap is full. The peer is healthy
+///     but cannot accept this blob right now; the picker should route the
+///     next attempt elsewhere. Saturation must NOT count toward the
+///     consecutive-failure streak — it is not evidence the peer is broken.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum MirrorFailureKind {
+    Generic,
+    DefinitiveUnreachable,
+    Saturated,
+}
+
+/// Classifies an Error from a mirror write into a quarantine policy
+/// signal. Centralized so call sites cannot accidentally treat a
+/// ResourceExhausted (cap-full) response the same as a generic transient.
+fn classify_mirror_failure(e: &Error) -> MirrorFailureKind {
+    if e.code == Code::ResourceExhausted {
+        return MirrorFailureKind::Saturated;
+    }
+    if is_definitive_unreachable(e) {
+        return MirrorFailureKind::DefinitiveUnreachable;
+    }
+    MirrorFailureKind::Generic
+}
+
 impl WorkerProxyStore {
     pub fn new(inner: Store, locality_map: SharedBlobLocalityMap) -> Arc<Self> {
         Arc::new(Self {
@@ -1237,40 +1269,62 @@ impl WorkerProxyStore {
         }
     }
 
-    /// Increment failure count for `endpoint`. With `definitive=false`,
-    /// quarantine fires only after `MIRROR_FAILURE_THRESHOLD` failures
-    /// inside `MIRROR_FAILURE_WINDOW`. With `definitive=true`, quarantine
-    /// fires immediately on the first failure — `MIRROR_FAILURE_WINDOW` is
-    /// bypassed because a transport-level `ConnectionRefused` /
-    /// `NetworkUnreachable` / `HostUnreachable` is sufficient evidence
-    /// that the peer is gone, and we want to stop round-robin routing to
-    /// the dead worker for the ~1s it would take to accumulate 5 failures.
-    /// In both cases the quarantine itself lasts `MIRROR_QUARANTINE_DURATION`.
-    fn record_mirror_failure(&self, endpoint: &str, definitive: bool) {
+    /// Record a mirror-write failure against `endpoint` according to its
+    /// classification:
+    ///   * [`MirrorFailureKind::Generic`] — quarantine fires only after
+    ///     `MIRROR_FAILURE_THRESHOLD` failures inside `MIRROR_FAILURE_WINDOW`.
+    ///   * [`MirrorFailureKind::DefinitiveUnreachable`] — quarantine fires
+    ///     immediately. A transport-level `ConnectionRefused` /
+    ///     `NetworkUnreachable` / `HostUnreachable` is sufficient evidence
+    ///     that the peer is gone; we want to stop round-robin routing to
+    ///     the dead worker rather than burn the ~1s it would take to
+    ///     accumulate 5 failures.
+    ///   * [`MirrorFailureKind::Saturated`] — the peer's mirror cap is full.
+    ///     This is NOT evidence the peer is broken — it is healthy and
+    ///     responding, just out of room. Skip the streak update entirely
+    ///     so a peer that fills up first does not get quarantined out of
+    ///     the rotation; the picker filters saturated peers via the
+    ///     capacity pre-check (review #1) so this path is a fallback for
+    ///     the small remaining race window only.
+    /// In all cases the quarantine itself lasts `MIRROR_QUARANTINE_DURATION`.
+    fn record_mirror_failure(&self, endpoint: &str, kind: MirrorFailureKind) {
         let now = Instant::now();
         let mut state = self.mirror_state.write();
         let entry = state
             .entry(Arc::from(endpoint))
             .or_insert_with(MirrorEndpointState::new);
-        if definitive {
-            entry.consecutive_failures = MIRROR_FAILURE_THRESHOLD;
-            if entry.first_failure_at.is_none() {
-                entry.first_failure_at = Some(now);
+        match kind {
+            MirrorFailureKind::Saturated => {
+                // Healthy peer, just full. Do not perturb the failure
+                // streak — quarantining a full peer would compound a
+                // transient memory-pressure issue into a hard outage.
+                debug!(
+                    endpoint,
+                    "mirror: peer saturated (ResourceExhausted); skipping quarantine streak update"
+                );
+                return;
             }
-        } else {
-            // Reset the streak if the previous failure was outside the window —
-            // a slow drip of unrelated failures shouldn't trigger quarantine.
-            match entry.first_failure_at {
-                Some(t) if now.duration_since(t) > MIRROR_FAILURE_WINDOW => {
-                    entry.consecutive_failures = 1;
+            MirrorFailureKind::DefinitiveUnreachable => {
+                entry.consecutive_failures = MIRROR_FAILURE_THRESHOLD;
+                if entry.first_failure_at.is_none() {
                     entry.first_failure_at = Some(now);
                 }
-                None => {
-                    entry.consecutive_failures = 1;
-                    entry.first_failure_at = Some(now);
-                }
-                _ => {
-                    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+            }
+            MirrorFailureKind::Generic => {
+                // Reset the streak if the previous failure was outside the window —
+                // a slow drip of unrelated failures shouldn't trigger quarantine.
+                match entry.first_failure_at {
+                    Some(t) if now.duration_since(t) > MIRROR_FAILURE_WINDOW => {
+                        entry.consecutive_failures = 1;
+                        entry.first_failure_at = Some(now);
+                    }
+                    None => {
+                        entry.consecutive_failures = 1;
+                        entry.first_failure_at = Some(now);
+                    }
+                    _ => {
+                        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+                    }
                 }
             }
         }
@@ -1282,7 +1336,7 @@ impl WorkerProxyStore {
                 endpoint,
                 consecutive_failures = entry.consecutive_failures,
                 quarantine_secs = MIRROR_QUARANTINE_DURATION.as_secs(),
-                definitive,
+                ?kind,
                 "mirror: quarantining endpoint after consecutive failures"
             );
         }
@@ -1344,7 +1398,10 @@ impl WorkerProxyStore {
                     attempt,
                     "mirror: failed to connect to worker"
                 );
-                self.record_mirror_failure(&endpoint, true);
+                self.record_mirror_failure(
+                    &endpoint,
+                    MirrorFailureKind::DefinitiveUnreachable,
+                );
                 last_endpoint = Some(endpoint);
                 continue;
             };
@@ -1393,7 +1450,7 @@ impl WorkerProxyStore {
                     return;
                 }
                 Err(e) => {
-                    self.record_mirror_failure(&endpoint, is_definitive_unreachable(&e));
+                    self.record_mirror_failure(&endpoint, classify_mirror_failure(&e));
                     let retry = attempt == 0 && is_connection_error(&e);
                     warn!(
                         %digest,
@@ -1462,7 +1519,10 @@ impl WorkerProxyStore {
                 endpoint = endpoint.as_ref(),
                 "mirror_stream: failed to connect to worker"
             );
-            self.record_mirror_failure(&endpoint, true);
+            self.record_mirror_failure(
+                &endpoint,
+                MirrorFailureKind::DefinitiveUnreachable,
+            );
             drop(reader);
             return;
         };
@@ -1489,7 +1549,7 @@ impl WorkerProxyStore {
                 );
             }
             Err(e) => {
-                self.record_mirror_failure(&endpoint, is_definitive_unreachable(&e));
+                self.record_mirror_failure(&endpoint, classify_mirror_failure(&e));
                 warn!(
                     %digest,
                     size_bytes,
@@ -1880,6 +1940,114 @@ mod tests {
         // Wrong code class must not match even with definitive substring.
         let e = make_err!(Code::NotFound, "ConnectionRefused but wrong code");
         assert!(!is_definitive_unreachable(&e));
+    }
+
+    // ---------------------------------------------------------------
+    // Review #4: ResourceExhausted classifies as Saturated, NOT as a
+    // quarantine-eligible failure. A peer that fills up first must not
+    // get pulled out of rotation as if it were broken.
+    // ---------------------------------------------------------------
+    #[test]
+    fn test_classify_mirror_failure_resource_exhausted_is_saturated() {
+        let e = make_err!(Code::ResourceExhausted, "mirror cap exceeded");
+        assert_eq!(classify_mirror_failure(&e), MirrorFailureKind::Saturated);
+    }
+
+    #[test]
+    fn test_classify_mirror_failure_definitive_takes_precedence_over_generic() {
+        let e = make_err!(
+            Code::Unavailable,
+            "tcp connect error: ConnectionRefused (os error 111)"
+        );
+        assert_eq!(
+            classify_mirror_failure(&e),
+            MirrorFailureKind::DefinitiveUnreachable
+        );
+    }
+
+    #[test]
+    fn test_classify_mirror_failure_other_codes_are_generic() {
+        for code in [
+            Code::Unknown,
+            Code::Unavailable, // bare, no transport substring
+            Code::Internal,
+            Code::DeadlineExceeded,
+        ] {
+            let e = make_err!(code, "generic transient");
+            assert_eq!(
+                classify_mirror_failure(&e),
+                MirrorFailureKind::Generic,
+                "unexpected classification for {code:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Review #4: a stream of Saturated failures must NOT quarantine the
+    // endpoint, regardless of count — saturation is not evidence of a
+    // broken peer. With the pre-fix bool API every failure (including
+    // the cap-exceeded Err returned by `insert_mirror_blob`) bumped the
+    // streak; this would quarantine a healthy peer that just filled up.
+    //
+    // We assert the underlying state rather than just the picker outcome
+    // — `pick_mirror_endpoint` falls back to the full set when every
+    // endpoint is quarantined (degraded > nothing), so a single-endpoint
+    // pool would still return `a` even if it were quarantined.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_saturated_failures_do_not_quarantine() -> Result<(), Error> {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy = WorkerProxyStore::new(inner, locality_map);
+        let endpoints: Vec<Arc<str>> = vec!["a".into(), "b".into()];
+
+        // First, quarantine "b" so the picker has a real preference path.
+        for _ in 0..MIRROR_FAILURE_THRESHOLD {
+            proxy.record_mirror_failure("b", MirrorFailureKind::Generic);
+        }
+
+        // Hammer "a" with saturated failures.
+        for _ in 0..(MIRROR_FAILURE_THRESHOLD * 4) {
+            proxy.record_mirror_failure("a", MirrorFailureKind::Saturated);
+        }
+
+        // Direct state check: "a" must NOT be quarantined and must NOT
+        // have accumulated any consecutive_failures.
+        {
+            let st = proxy.mirror_state.read();
+            match st.get("a") {
+                Some(entry) => {
+                    assert!(
+                        entry.quarantined_until.is_none(),
+                        "saturated peer must not be quarantined; quarantined_until={:?}",
+                        entry.quarantined_until
+                    );
+                    assert_eq!(
+                        entry.consecutive_failures, 0,
+                        "saturated failures must not bump consecutive_failures, got {}",
+                        entry.consecutive_failures
+                    );
+                }
+                None => {
+                    // Either no entry was ever inserted (also acceptable —
+                    // proves we did not perturb the streak) or the impl
+                    // chose to record under a different key. Both are
+                    // fine for this assertion's intent.
+                }
+            }
+        }
+
+        // Picker must prefer "a" (the only non-quarantined eligible peer).
+        let (chosen, _) = proxy
+            .pick_mirror_endpoint(&endpoints, None)
+            .expect("at least one eligible endpoint");
+        assert_eq!(
+            chosen.as_ref(),
+            "a",
+            "saturated 'a' must be preferred over quarantined 'b'"
+        );
+
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -2374,7 +2542,7 @@ mod tests {
 
         // Drive endpoint "a" past the failure threshold.
         for _ in 0..MIRROR_FAILURE_THRESHOLD {
-            proxy.record_mirror_failure("a", false);
+            proxy.record_mirror_failure("a", MirrorFailureKind::Generic);
         }
 
         // pick_mirror_endpoint must skip "a" while it's quarantined.
@@ -2403,13 +2571,13 @@ mod tests {
 
         // Accumulate failures, then succeed before crossing the threshold.
         for _ in 0..(MIRROR_FAILURE_THRESHOLD - 1) {
-            proxy.record_mirror_failure("a", false);
+            proxy.record_mirror_failure("a", MirrorFailureKind::Generic);
         }
         proxy.record_mirror_success("a");
 
         // One more failure must NOT trigger quarantine because the streak
         // was cleared.
-        proxy.record_mirror_failure("a", false);
+        proxy.record_mirror_failure("a", MirrorFailureKind::Generic);
         let (chosen, _) = proxy
             .pick_mirror_endpoint(&endpoints, None)
             .expect("endpoint should be eligible");
@@ -2431,7 +2599,7 @@ mod tests {
 
         for ep in ["a", "b"] {
             for _ in 0..MIRROR_FAILURE_THRESHOLD {
-                proxy.record_mirror_failure(ep, false);
+                proxy.record_mirror_failure(ep, MirrorFailureKind::Generic);
             }
         }
 
