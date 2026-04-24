@@ -992,6 +992,10 @@ async fn execute_batch_read(
         .err_tip(|| "In execute_batch_read")?
         .into_inner();
 
+    // Write directly to the fast store: these blobs were just fetched from
+    // the slow (server) store via BatchReadBlobs, so routing the writeback
+    // through the FastSlowStore wrapper would loop them back upstream.
+    #[allow(clippy::disallowed_methods)]
     let fast_store = cas_store.fast_store();
 
     // Parse all valid responses first, then write to fast store concurrently.
@@ -1387,7 +1391,13 @@ pub fn download_to_directory<'a>(
             const HAS_CHECK_CHUNK: usize = 2000;
             for start in (0..store_keys.len()).step_by(HAS_CHECK_CHUNK) {
                 let end = (start + HAS_CHECK_CHUNK).min(store_keys.len());
-                Pin::new(cas_store.fast_store())
+                // Query the fast store directly: we are deciding which blobs
+                // to *download* from slow, so going through the wrapper (which
+                // would also report slow-store hits) would short-circuit the
+                // download we are about to schedule.
+                #[allow(clippy::disallowed_methods)]
+                let fast_store_pin = Pin::new(cas_store.fast_store());
+                fast_store_pin
                     .has_with_results(&store_keys[start..end], &mut has_results[start..end])
                     .await
                     .err_tip(|| "Batch has_with_results on fast store")?;
@@ -4432,6 +4442,10 @@ impl RunningActionsManagerImpl {
         callbacks: Callbacks,
     ) -> Result<Self, Error> {
         // Sadly because of some limitations of how Any works we need to clone more times than optimal.
+        // Concrete FilesystemStore needed for hardlink and pin operations on
+        // the action sandbox; the FastSlowStore wrapper hides the concrete
+        // type so the downcast must reach into the inner store directly.
+        #[allow(clippy::disallowed_methods)]
         let filesystem_store = args
             .cas_store
             .fast_store()
@@ -4484,6 +4498,11 @@ impl RunningActionsManagerImpl {
         &self,
         action_result: &ActionResult,
     ) -> Vec<DigestInfo> {
+        // Read tree protos from the local fast store only: the action just
+        // produced these on this worker, so consulting slow (server) on miss
+        // would block the locality-registration hot path on a network round
+        // trip for a blob that is supposed to be local.
+        #[allow(clippy::disallowed_methods)]
         let fast_store = self.cas_store.fast_store();
         let mut file_digests = Vec::new();
         for folder in &action_result.output_folders {

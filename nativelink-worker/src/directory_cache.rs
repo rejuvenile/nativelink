@@ -466,6 +466,10 @@ impl DirectoryCache {
         })?;
 
         // Try to extract the FilesystemStore from the FastSlowStore if provided.
+        // Concrete FilesystemStore needed for hardlink operations into the
+        // cache directory; the wrapper hides the concrete type so the
+        // downcast must reach into the inner store directly.
+        #[allow(clippy::disallowed_methods)]
         let filesystem_store = fast_slow_store.as_ref().and_then(|fss| {
             fss.fast_store()
                 .downcast_ref::<FilesystemStore>(None)
@@ -2104,6 +2108,10 @@ impl DirectoryCache {
         let fast_path_result = if let (Some(fss), Some(_fs_store)) =
             (&self.fast_slow_store, &self.filesystem_store)
         {
+            // Concrete FilesystemStore needed for download_to_directory's
+            // hardlink path; the wrapper hides the concrete type so the
+            // downcast must reach into the inner store directly.
+            #[allow(clippy::disallowed_methods)]
             let fs_pin = Pin::new(
                 fss.fast_store()
                     .downcast_ref::<FilesystemStore>(None)
@@ -2373,6 +2381,10 @@ impl DirectoryCache {
                 return Ok::<(), Error>(());
             }
             if let (Some(fss), Some(_fs_store)) = (&self.fast_slow_store, &self.filesystem_store) {
+                // Concrete FilesystemStore needed for hardlink operations
+                // into the cache directory; the wrapper hides the concrete
+                // type so the downcast must reach into the inner store.
+                #[allow(clippy::disallowed_methods)]
                 let fs_store_pin = Pin::new(
                     fss.fast_store()
                         .downcast_ref::<FilesystemStore>(None)
@@ -2392,7 +2404,12 @@ impl DirectoryCache {
                 let store_keys: Vec<StoreKey<'_>> =
                     unique_digests.iter().map(|d| (*d).into()).collect();
                 let mut has_results = vec![None; store_keys.len()];
-                Pin::new(fss.fast_store())
+                // Local-only check: we are deciding which blobs to *download*
+                // into the fast store, so going through the wrapper would
+                // count slow-store hits and skip the populate we need.
+                #[allow(clippy::disallowed_methods)]
+                let fast_for_has = Pin::new(fss.fast_store());
+                fast_for_has
                     .has_with_results(&store_keys, &mut has_results)
                     .await
                     .err_tip(|| "Batch has_with_results in subtree construction")?;
@@ -2507,6 +2524,11 @@ impl DirectoryCache {
                             // that will leave trailing digests unpinned — the
                             // verify-and-retry in populate_fast_store_unchecked
                             // stays as the safety net for those.
+                            // Pin on the inner FilesystemStore directly: this
+                            // is the eviction tier we are guarding against,
+                            // and the FastSlowStore wrapper would also forward
+                            // the pin to the slow GrpcStore where it is a no-op.
+                            #[allow(clippy::disallowed_methods)]
                             fss.fast_store().pin_digests(&[digest]);
                             Ok::<(), Error>(())
                         });
@@ -2858,6 +2880,10 @@ impl DirectoryCache {
         // Download files (same logic as construct_with_subtrees)
         if !files_to_download.is_empty() {
             if let (Some(fss), Some(_fs_store)) = (&self.fast_slow_store, &self.filesystem_store) {
+                // Concrete FilesystemStore needed for hardlink operations
+                // into the cache directory; the wrapper hides the concrete
+                // type so the downcast must reach into the inner store.
+                #[allow(clippy::disallowed_methods)]
                 let fs_store_pin = Pin::new(
                     fss.fast_store()
                         .downcast_ref::<FilesystemStore>(None)
@@ -2877,7 +2903,12 @@ impl DirectoryCache {
                 let store_keys: Vec<StoreKey<'_>> =
                     unique_digests.iter().map(|d| (*d).into()).collect();
                 let mut has_results = vec![None; store_keys.len()];
-                Pin::new(fss.fast_store())
+                // Local-only check: we are deciding which blobs to populate
+                // into the fast store, so going through the wrapper would
+                // count slow-store hits and skip the populate we need.
+                #[allow(clippy::disallowed_methods)]
+                let fast_for_has = Pin::new(fss.fast_store());
+                fast_for_has
                     .has_with_results(&store_keys, &mut has_results)
                     .await
                     .err_tip(|| "Batch has_with_results in direct-use subtree construction")?;
