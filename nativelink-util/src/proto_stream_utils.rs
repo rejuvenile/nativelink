@@ -251,12 +251,14 @@ where
     T: Stream<Item = Result<WriteRequest, E>> + Unpin + Send + 'static,
     E: Into<Error> + 'static,
 {
-    pub const fn new(instance_name: String, read_stream: WriteRequestStreamWrapper<T>) -> Self {
-        Self::with_progress_timeout(instance_name, read_stream, Duration::ZERO)
-    }
-
-    /// Construct a `WriteState` with a per-chunk no-progress timeout. A
-    /// zero duration disables the timer (equivalent to `new`).
+    /// Construct a `WriteState` with a per-chunk no-progress timeout.
+    ///
+    /// `progress_timeout = Duration::ZERO` disables the timer entirely
+    /// (the inner stream is then bounded only by transport-level
+    /// keepalives). Every caller must make a deliberate choice — there
+    /// is no convenience `new` constructor — because the right answer
+    /// depends on whether the upstream producer can legitimately stall
+    /// (e.g. a slow Bazel client mirroring through the server) or not.
     pub const fn with_progress_timeout(
         instance_name: String,
         read_stream: WriteRequestStreamWrapper<T>,
@@ -302,8 +304,23 @@ where
     pub fn resume(&mut self) {
         self.resume_queue.clone_from(&self.cached_messages);
         self.is_resumed = true;
+        // Drop any stale Sleep from the previous attempt. Harmless if left
+        // (next non-cached chunk re-arms it), but explicit clearing avoids
+        // surprising state retained across the retry boundary.
+        self.progress_deadline = None;
     }
 
+    /// Take any `read_stream_error` recorded by the wrapper.
+    ///
+    /// **Retry semantics.** A `DeadlineExceeded` set by the per-chunk
+    /// progress timer is intentionally non-resumable: `can_resume()`
+    /// returns false because the error is recorded *here*, not on the
+    /// inner stream. Retrying a stuck transport with the same WriteState
+    /// is unlikely to succeed — the upstream caller should issue a
+    /// fresh `write()` if it wants to try again. This is a behaviour
+    /// change from the pre-2026-04-23 whole-RPC `tokio::time::timeout`
+    /// path, which left `read_stream_error == None` and let the retrier
+    /// loop in GrpcStore::write replay against the same channel.
     pub const fn take_read_stream_error(&mut self) -> Option<Error> {
         self.read_stream_error.take()
     }
@@ -354,11 +371,21 @@ where
                 // Make progress: arm the no-progress timer for the NEXT
                 // chunk. The current chunk's wait time is bounded by the
                 // arrival just observed, so we reset rather than carry a
-                // partially-elapsed deadline.
+                // partially-elapsed deadline. Reuse the existing `Sleep`
+                // allocation when present — `Sleep::reset` is the
+                // standard tokio idiom for re-armable timers and avoids
+                // a fresh `Box::pin` per chunk (~17 fewer allocs per
+                // 50MB blob at 3MiB chunks).
                 if !local_state.progress_timeout.is_zero() {
                     let timeout = local_state.progress_timeout;
-                    local_state.progress_deadline =
-                        Some(Box::pin(tokio::time::sleep(timeout)));
+                    let new_deadline = tokio::time::Instant::now() + timeout;
+                    match local_state.progress_deadline.as_mut() {
+                        Some(d) => d.as_mut().reset(new_deadline),
+                        None => {
+                            local_state.progress_deadline =
+                                Some(Box::pin(tokio::time::sleep(timeout)));
+                        }
+                    }
                 }
                 // Update the instance name in the write request and forward it on.
                 let result = match maybe_message {

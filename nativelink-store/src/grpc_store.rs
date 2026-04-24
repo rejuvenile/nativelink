@@ -934,7 +934,7 @@ impl GrpcStore {
         let instance_name = self.instance_name.clone();
         trace!(
             instance_name = %instance_name,
-            rpc_timeout_s = rpc_timeout.as_secs(),
+            progress_timeout_s = rpc_timeout.as_secs(),
             is_mirror,
             "GrpcStore::write: starting ByteStream write",
         );
@@ -1121,12 +1121,25 @@ impl GrpcStore {
             }))
             .await?;
 
-        let total_elapsed_ms = u64::try_from(write_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let total_elapsed = write_start.elapsed();
+        let total_elapsed_ms = u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX);
         trace!(
             instance_name = %self.instance_name,
             total_elapsed_ms,
             "GrpcStore::write: completed successfully",
         );
+        // The per-chunk progress timer hides whole-RPC duration from the
+        // operator (the previous whole-RPC timeout used to surface it as
+        // a cancellation). Keep the long-RPC signal as a warn on success
+        // so we can still detect "the transport is healthy but extremely
+        // slow" — e.g. WAN clients streaming large blobs.
+        if total_elapsed > Duration::from_secs(60) {
+            warn!(
+                instance_name = %self.instance_name,
+                total_elapsed_ms,
+                "GrpcStore::write succeeded but took > 60s; chunks were progressing but transport is slow",
+            );
+        }
         Ok(result)
     }
 

@@ -68,9 +68,10 @@ async fn ensure_no_errors_if_only_first_message_has_resource_name_set() -> Resul
         drop(tx); // Close the channel.
     }
 
-    let local_state = Arc::new(Mutex::new(WriteState::new(
+    let local_state = Arc::new(Mutex::new(WriteState::with_progress_timeout(
         INSTANCE_NAME.to_string(),
         WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?,
+        Duration::ZERO,
     )));
     let mut write_state_wrapper = WriteStateWrapper::new(local_state.clone());
 
@@ -361,5 +362,139 @@ async fn write_state_progress_timeout_resets_on_each_chunk() -> Result<(), Error
         state.lock().take_read_stream_error().is_none(),
         "timer must reset per chunk; no error expected",
     );
+    Ok(())
+}
+
+/// A producer that sends a single `finish_write=true` chunk and immediately
+/// drops the channel must complete cleanly: the per-chunk timer must not
+/// fire even if wall-clock time is later advanced past the timeout window.
+/// (`write_finished` short-circuits `WriteRequestStreamWrapper::poll_next`
+/// to `Ready(None)` before the inner stream is polled again, so the timer
+/// is never armed for a chunk that will never come.)
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn write_state_progress_timeout_does_not_fire_on_immediate_eof()
+-> Result<(), Error> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"data", true, Some(4)))).unwrap();
+    drop(tx);
+
+    let state = make_state(rx, Duration::from_secs(15)).await?;
+    let mut wrapper = WriteStateWrapper::new(state.clone());
+
+    let first = wrapper.next().await.expect("single chunk");
+    assert!(first.finish_write, "chunk must carry finish_write=true");
+    assert_eq!(wrapper.next().await, None, "EOF immediately after finish_write");
+
+    // Advance well beyond the 15s budget: nothing should happen because the
+    // wrapper has already emitted its final EOF.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert!(
+        state.lock().take_read_stream_error().is_none(),
+        "no progress timeout should fire after clean EOF",
+    );
+    Ok(())
+}
+
+/// `progress_timeout = Duration::ZERO` is the documented "no timer"
+/// configuration. Even when the producer stalls indefinitely and wall-clock
+/// time advances by a large amount, no `read_stream_error` may be set.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn write_state_progress_timeout_disabled_when_zero() -> Result<(), Error> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"data", false, Some(8)))).unwrap();
+
+    let state = make_state(rx, Duration::ZERO).await?;
+    let mut wrapper = WriteStateWrapper::new(state.clone());
+
+    let first = wrapper.next().await.expect("first chunk");
+    assert_eq!(first.write_offset, 0);
+
+    // Race the wrapper's next poll against an aggressive time advance. The
+    // wrapper must remain Pending — it can only resolve when a new chunk
+    // arrives or the channel closes.
+    let next_fut = wrapper.next();
+    tokio::pin!(next_fut);
+    tokio::select! {
+        biased;
+        () = async {
+            // Walk forward 1 hour in 1-minute steps. With timer disabled
+            // there is nothing armed to fire on these advances.
+            for _ in 0..60 {
+                tokio::time::advance(Duration::from_secs(60)).await;
+            }
+        } => {}
+        msg = &mut next_fut => panic!("unexpected wrapper message with timer disabled: {msg:?}"),
+    }
+
+    // After 1h of silence, deliver the final chunk so the wrapper drains
+    // cleanly. This also confirms the wrapper was genuinely just waiting.
+    tx.send(Ok(chunk(4, b"data", true, None))).unwrap();
+    drop(tx);
+    let last = (&mut next_fut).await.expect("final chunk after long stall");
+    assert!(last.finish_write);
+    assert_eq!(wrapper.next().await, None);
+    assert!(
+        state.lock().take_read_stream_error().is_none(),
+        "disabled timer must never fire",
+    );
+    Ok(())
+}
+
+/// After a transport error and `WriteState::resume`, the per-chunk timer
+/// must re-arm correctly: drain the resume_queue (cached chunks replayed
+/// without consulting the inner stream), then a stall on the inner stream
+/// must trip DeadlineExceeded just as it would on the first attempt.
+///
+/// Guards against (a) a stale `Sleep` from the previous attempt firing
+/// spuriously during the cached replay, and (b) the timer never re-arming
+/// once the resume_queue drains.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn write_state_progress_timeout_survives_resume() -> Result<(), Error> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"data", false, Some(20)))).unwrap();
+    tx.send(Ok(chunk(4, b"data", false, None))).unwrap();
+    let state = make_state(rx, Duration::from_secs(15)).await?;
+    {
+        let mut wrapper = WriteStateWrapper::new(state.clone());
+        // Drain both chunks into cached_messages. (cached_messages is a
+        // 2-slot ring filled by push_message on every successful chunk.)
+        assert!(wrapper.next().await.is_some());
+        assert!(wrapper.next().await.is_some());
+        // Drop the wrapper — simulate the GrpcStore::write retry loop
+        // discarding the in-flight ByteStream client mid-RPC.
+    }
+
+    // Caller-side resume: equivalent to GrpcStore::write's retry path
+    // calling `local_state_locked.resume()` after a transport-level error.
+    state.lock().resume();
+
+    let mut wrapper = WriteStateWrapper::new(state.clone());
+    // resume_queue replays the two cached chunks without polling the
+    // inner stream, so the per-chunk timer must NOT fire on these even if
+    // a stale `Sleep` was carried over from the previous attempt.
+    tokio::time::advance(Duration::from_secs(20)).await;
+    let r0 = wrapper.next().await.expect("replayed chunk 0");
+    assert_eq!(r0.write_offset, 0);
+    let r1 = wrapper.next().await.expect("replayed chunk 1");
+    assert_eq!(r1.write_offset, 4);
+
+    // Now the resume_queue is drained — the next poll falls through to
+    // the inner stream, and the producer (`tx` still alive but silent)
+    // never sends another chunk. The timer must re-arm and fire.
+    let next = wrapper.next().await;
+    assert_eq!(next, None, "wrapper must end on no-progress timeout post-resume");
+
+    let err = state
+        .lock()
+        .take_read_stream_error()
+        .expect("DeadlineExceeded must be recorded after resume");
+    assert_eq!(err.code, Code::DeadlineExceeded, "wrong code: {err:?}");
+    assert!(
+        err.messages.iter().any(|m| m.contains("no progress")),
+        "expected 'no progress' wording, got: {:?}",
+        err.messages
+    );
+
+    drop(tx);
     Ok(())
 }
