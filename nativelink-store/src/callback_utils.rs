@@ -51,4 +51,10 @@ where
         let store_key: &StoreKey<'_> = Borrow::<StoreKey<'_>>::borrow(store_key);
         self.callback.on_get(store_key.borrow().into_owned());
     }
+
+    fn on_pin_expired(&self, store_key: &Q, size: u64) {
+        let store_key: &StoreKey<'_> = Borrow::<StoreKey<'_>>::borrow(store_key);
+        self.callback
+            .on_pin_expired(store_key.borrow().into_owned(), size);
+    }
 }

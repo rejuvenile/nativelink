@@ -14,6 +14,7 @@
 
 use core::borrow::BorrowMut;
 use core::cmp::{max, min};
+use core::future::Future;
 use core::ops::Range;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,6 +71,75 @@ const DEFAULT_MIRROR_BLOBS_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// ~7 GiB. 16 keeps the worst-case footprint near 1 GiB while still
 /// overlapping enough I/O to saturate the local filesystem tier.
 const LOCAL_ONLY_READS_BATCH_CONCURRENCY: usize = 16;
+
+/// Wall-clock deadline for the background slow-store write task. If the
+/// spawn has not produced a terminal Ok/Err result within this window,
+/// the watchdog records the digest in `failed_slow_writes` so a worker
+/// reconnect retries the upload. The spawn is NOT aborted — if it
+/// eventually succeeds, the next `BlobsInStableStorage` ack drops the
+/// retry entry. Set lower than `PIN_TIMEOUT_SECS = 120` (in
+/// `MokaEvictingMap`) so the failed-set insert lands BEFORE the pin
+/// auto-unpins; without that ordering, an auto-unpin could quietly
+/// downgrade the blob to evictable while the watchdog has not yet
+/// fired. The pin-expiry callback (registered on the fast store) is the
+/// secondary safety net for hangs longer than 120s.
+const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
+
+/// Listener registered on the fast store's eviction map so the
+/// `on_pin_expired` hook lands the digest in `failed_slow_writes`. The
+/// pin TTL firing without an explicit unpin means we have no
+/// confirmation that the slow-store write completed; queueing a retry
+/// is the safe default. False positives (e.g. `DirectoryCache` pins
+/// that auto-expired but whose blobs are already on the server) cost a
+/// single existence RPC per digest on reconnect — far cheaper than
+/// permanent data loss from a missed failure.
+#[derive(Debug)]
+struct PinExpireFailedWritesListener {
+    failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
+}
+
+impl ItemCallback for PinExpireFailedWritesListener {
+    fn callback<'a>(
+        &'a self,
+        _store_key: StoreKey<'a>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        // Eviction is unrelated to pin-expiry; nothing to do.
+        Box::pin(core::future::ready(()))
+    }
+
+    fn on_pin_expired(&self, store_key: StoreKey<'_>, _size: u64) {
+        if let StoreKey::Digest(digest) = store_key {
+            self.failed_slow_writes.lock().insert(digest);
+            warn!(
+                ?digest,
+                "fast-store pin auto-expired; queueing digest for slow-write retry on reconnect"
+            );
+        }
+    }
+}
+
+/// Best-effort registration of the pin-expiry listener on the fast
+/// store. Stores that don't implement `register_item_callback` (e.g.
+/// `NoopStore` in unit tests) silently no-op. A registration failure
+/// here is logged but not fatal — the slow-write path's other
+/// failed_slow_writes inserts still cover the in-band error case; the
+/// pin-expiry listener is the safety net for the SILENT-hang case
+/// (slow-write neither succeeds nor errors before pin TTL fires).
+fn register_pin_expire_listener(
+    fast_store: &Store,
+    failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
+) {
+    let listener: Arc<dyn ItemCallback> = Arc::new(PinExpireFailedWritesListener {
+        failed_slow_writes,
+    });
+    if let Err(err) = fast_store.register_item_callback(listener) {
+        warn!(
+            ?err,
+            "FastSlowStore: failed to register pin-expire callback on fast store; \
+             slow-write hangs that exceed PIN_TIMEOUT_SECS will not auto-queue retries"
+        );
+    }
+}
 
 // TODO(palfrey) We should consider copying the data in the background to allow the
 // client to hang up while the data is buffered. An alternative is to possibly make a
@@ -230,6 +300,9 @@ impl Drop for LoaderGuard {
 
 impl FastSlowStore {
     pub fn new(spec: &FastSlowSpec, fast_store: Store, slow_store: Store) -> Arc<Self> {
+        let failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        register_pin_expire_listener(&fast_store, failed_slow_writes.clone());
         Arc::new_cyclic(|weak_self| Self {
             fast_store,
             fast_direction: spec.fast_direction,
@@ -243,7 +316,7 @@ impl FastSlowStore {
             stable_digests: Arc::new(Mutex::new(Vec::new())),
             stable_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
-            failed_slow_writes: Arc::new(Mutex::new(HashSet::new())),
+            failed_slow_writes,
             mirror_blobs: Mutex::new(HashMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
@@ -413,6 +486,7 @@ impl FastSlowStore {
         other: &Arc<Self>,
     ) -> Arc<Self> {
         let shared = other.failed_slow_writes.clone();
+        register_pin_expire_listener(&fast_store, shared.clone());
         Arc::new_cyclic(|weak_self| Self {
             fast_store,
             fast_direction: spec.fast_direction,
@@ -1955,7 +2029,50 @@ impl StoreDriver for FastSlowStore {
                 )?;
                 Result::<(), Error>::Ok(())
             };
+            // Watchdog: if the slow-write hasn't terminated by
+            // SLOW_WRITE_WATCHDOG_SECS, queue the digest for retry on
+            // reconnect WITHOUT aborting the in-flight write. The
+            // GrpcStore default has `rpc_timeout_s = 0` (disabled), so
+            // a stuck transport can block this spawn indefinitely; the
+            // pin-expiry callback only fires at PIN_TIMEOUT_SECS=120,
+            // so without the watchdog there's a 60s+ window where the
+            // failure is invisible. Spawned task is aborted on terminal
+            // result via the `completed` flag so a watchdog firing
+            // microseconds after the join completes doesn't double-
+            // insert (the existing failure recovery below would already
+            // have).
+            let completed = Arc::new(AtomicBool::new(false));
+            let watchdog_handle = {
+                let completed = completed.clone();
+                let key_for_watchdog = key_for_bg.clone();
+                let failed_writes_ref = failed_writes_ref.clone();
+                let fast_store_ref = fast_store_ref.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(SLOW_WRITE_WATCHDOG_SECS)).await;
+                    if completed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let StoreKey::Digest(digest) = &key_for_watchdog {
+                        warn!(
+                            ?digest,
+                            watchdog_secs = SLOW_WRITE_WATCHDOG_SECS,
+                            total_bytes = bytes_sent,
+                            "FastSlowStore: background slow write exceeded watchdog \
+                             deadline; queueing for retry-on-reconnect (write task NOT \
+                             aborted — may still complete)"
+                        );
+                        failed_writes_ref.lock().insert(*digest);
+                        // Re-pin so the blob survives PIN_TIMEOUT_SECS even
+                        // if the original pin was the only thing keeping it
+                        // alive. pin_keys refreshes the deadline on an
+                        // already-pinned entry.
+                        fast_store_ref.pin_digests(&[*digest]);
+                    }
+                })
+            };
             let (write_result, send_result) = tokio::join!(write_fut, send_fut);
+            completed.store(true, Ordering::Release);
+            watchdog_handle.abort();
 
             let slow_ms = slow_start.elapsed().as_millis();
             let mut result = send_result.and(write_result);
@@ -2163,9 +2280,41 @@ impl StoreDriver for FastSlowStore {
                 );
             }
             let slow_start = std::time::Instant::now();
+            // Watchdog: see streaming `update` path for full rationale.
+            // GrpcStore default has rpc_timeout_s = 0 (disabled) so a
+            // stuck transport blocks indefinitely; this watchdog records
+            // the digest in `failed_slow_writes` after
+            // SLOW_WRITE_WATCHDOG_SECS without aborting the spawn.
+            let completed = Arc::new(AtomicBool::new(false));
+            let watchdog_handle = {
+                let completed = completed.clone();
+                let key_for_watchdog = key_for_bg.clone();
+                let failed_writes_ref = failed_writes_ref.clone();
+                let fast_store_ref = fast_store_ref.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(SLOW_WRITE_WATCHDOG_SECS)).await;
+                    if completed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let StoreKey::Digest(digest) = &key_for_watchdog {
+                        warn!(
+                            ?digest,
+                            watchdog_secs = SLOW_WRITE_WATCHDOG_SECS,
+                            data_len,
+                            "FastSlowStore: background slow oneshot write exceeded \
+                             watchdog deadline; queueing for retry-on-reconnect \
+                             (write task NOT aborted — may still complete)"
+                        );
+                        failed_writes_ref.lock().insert(*digest);
+                        fast_store_ref.pin_digests(&[*digest]);
+                    }
+                })
+            };
             let mut result = slow_store
                 .update_oneshot(key_for_bg.borrow(), data)
                 .await;
+            completed.store(true, Ordering::Release);
+            watchdog_handle.abort();
 
             // Failpoint: force background slow-write failure (matches the
             // failpoint in the streaming `update` path). Tests use this to

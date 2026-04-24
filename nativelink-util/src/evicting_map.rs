@@ -76,6 +76,16 @@ pub trait ItemCallback<Q>: Debug + Send + Sync {
     /// the internal `cache.get` used to capture replaced values inside
     /// `insert_inner`. Default is a no-op.
     fn on_get(&self, _store_key: &Q) {}
+
+    /// Fired when a pin auto-expires (the pinned entry crossed the
+    /// `PIN_TIMEOUT_SECS` deadline without being explicitly unpinned).
+    /// Distinct from `callback` (eviction): the blob is NOT removed
+    /// from the map, just demoted from "pinned" back to LRU-evictable.
+    /// `FastSlowStore` listens on this hook so a slow-write that hangs
+    /// past the pin deadline still gets recorded in `failed_slow_writes`
+    /// for retry-on-reconnect — closing the durability gap that an
+    /// auto-unpin would otherwise silently open. Default is a no-op.
+    fn on_pin_expired(&self, _store_key: &Q, _size: u64) {}
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -89,4 +99,6 @@ impl<Q> ItemCallback<Q> for NoopCallback {
     fn on_insert(&self, _store_key: &Q, _size: u64) {}
 
     fn on_get(&self, _store_key: &Q) {}
+
+    fn on_pin_expired(&self, _store_key: &Q, _size: u64) {}
 }

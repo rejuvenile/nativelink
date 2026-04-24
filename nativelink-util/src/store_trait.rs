@@ -1008,6 +1008,15 @@ pub trait ItemCallback: Debug + Send + Sync {
     /// recent read activity per digest (worker-side LRU heat signal that
     /// flows back to the server's locality_map via BlobsAvailable).
     fn on_get(&self, _store_key: StoreKey<'_>) {}
+
+    /// Fired when a pin auto-expires after `PIN_TIMEOUT_SECS` without
+    /// being explicitly unpinned. Distinct from `callback` (eviction):
+    /// the blob is still in the map, just demoted to LRU-evictable.
+    /// `FastSlowStore` listens on this hook to record digests in
+    /// `failed_slow_writes` so a slow-write that hangs past the pin
+    /// deadline is still retried on reconnect — closing the durability
+    /// gap that an auto-unpin would otherwise silently open.
+    fn on_pin_expired(&self, _store_key: StoreKey<'_>, _size: u64) {}
 }
 
 /// The instructions on how to decode a value from a Bytes & version into

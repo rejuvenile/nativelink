@@ -899,6 +899,23 @@ where
         self.pinned_bytes.load(Ordering::Relaxed)
     }
 
+    /// Test hook: rewind a pinned entry's `pinned_at` past the
+    /// `PIN_TIMEOUT_SECS` deadline so the next `expire_stale_pins` sweep
+    /// treats it as stale. Returns `true` if the key was pinned and was
+    /// rewound, `false` otherwise. Doc-hidden because it bypasses the
+    /// pin-refresh contract; integration tests use it to deterministically
+    /// drive auto-unpin without waiting 120s of wall-clock.
+    #[doc(hidden)]
+    pub fn test_force_pin_expired(&self, key: &Q) -> bool {
+        if let Some(mut entry) = self.pinned.get_mut(key) {
+            entry.pinned_at = Instant::now()
+                .checked_sub(Duration::from_secs(PIN_TIMEOUT_SECS + 1))
+                .unwrap_or(entry.pinned_at);
+            return true;
+        }
+        false
+    }
+
     // ---------------------------------------------------------------
     // filtering / range
     // ---------------------------------------------------------------
@@ -1072,7 +1089,14 @@ where
         drop(event);
     }
 
-    async fn expire_stale_pins(&self) {
+    /// Sweep the `pinned` map and demote any entries whose
+    /// `pinned_at + PIN_TIMEOUT_SECS` has elapsed back into the LRU
+    /// cache. Public-but-doc-hidden so integration tests can drive the
+    /// sweep deterministically without waiting on the 10s background
+    /// ticker. The background loop in `start_background_eviction` calls
+    /// this once per tick.
+    #[doc(hidden)]
+    pub async fn expire_stale_pins(&self) {
         let mut expired_keys = Vec::new();
         for entry in self.pinned.iter() {
             if entry.pinned_at.elapsed().as_secs() >= PIN_TIMEOUT_SECS {
@@ -1109,7 +1133,24 @@ where
                 // entry for it.
                 self.cache.insert(key.clone(), entry.data);
                 self.fire_on_insert_callbacks(&key, size);
+                // Also fire the pin-expiry hook so durability listeners
+                // (FastSlowStore) can record a pending-write retry. The
+                // pin TTL firing means we have NO confirmation that the
+                // slow-store write completed — the safe default is to
+                // queue the digest for retry. Even if the slow-write
+                // ultimately succeeds, the retry will see "already
+                // present" via existence check and no-op. The cost of a
+                // false positive is a single existence RPC; the cost of
+                // a false negative is permanent data loss.
+                self.fire_on_pin_expired_callbacks(&key, size);
             }
+        }
+    }
+
+    fn fire_on_pin_expired_callbacks(&self, key: &K, size: u64) {
+        let callbacks = self.callbacks.read();
+        for cb in callbacks.iter() {
+            cb.on_pin_expired(key.borrow(), size);
         }
     }
 }
@@ -1167,6 +1208,7 @@ mod tests {
         get_count: Arc<AtomicU64>,
         insert_count: Arc<AtomicU64>,
         removal_count: Arc<AtomicU64>,
+        pin_expired_count: Arc<AtomicU64>,
     }
 
     impl CountingCallback {
@@ -1175,6 +1217,7 @@ mod tests {
                 get_count: Arc::new(AtomicU64::new(0)),
                 insert_count: Arc::new(AtomicU64::new(0)),
                 removal_count: Arc::new(AtomicU64::new(0)),
+                pin_expired_count: Arc::new(AtomicU64::new(0)),
             }
         }
     }
@@ -1194,6 +1237,10 @@ mod tests {
 
         fn on_get(&self, _key: &u64) {
             self.get_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_pin_expired(&self, _key: &u64, _size: u64) {
+            self.pin_expired_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1445,6 +1492,7 @@ mod tests {
         let cb = CountingCallback::new();
         let insert_count = Arc::clone(&cb.insert_count);
         let removal_count = Arc::clone(&cb.removal_count);
+        let pin_expired_count = Arc::clone(&cb.pin_expired_count);
         map.add_item_callback(cb);
 
         // Insert + pin.
@@ -1490,6 +1538,54 @@ mod tests {
             removal_count.load(Ordering::Relaxed),
             0,
             "pin-expiry must NOT fire the removal callback",
+        );
+        // Durability hook: pin auto-expiry MUST fire on_pin_expired so
+        // FastSlowStore can record the digest as failed_slow_writes.
+        // Without this, a slow-write that hangs longer than the pin TTL
+        // silently downgrades the blob from "pending upload retry" to
+        // "evictable / no retry tracking" — the original bug at
+        // worker-08 2026-04-23T00:08:53.
+        assert_eq!(
+            pin_expired_count.load(Ordering::Relaxed),
+            1,
+            "pin-expiry MUST fire on_pin_expired exactly once",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // 7. on_pin_expired fires ONLY on pin-expiry (not on insert/get/
+    //    eviction). Guards the durability invariant: false positives
+    //    cause spurious reuploads; false negatives cause data loss.
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_pin_expired_fires_only_on_pin_expiry() {
+        let cfg = policy(64, 0); // tiny: forces eviction
+        let map = Arc::new(make_map_cb(&cfg));
+        let cb = CountingCallback::new();
+        let pin_expired_count = Arc::clone(&cb.pin_expired_count);
+        map.add_item_callback(cb);
+
+        // Insert → must NOT fire on_pin_expired.
+        map.insert(1, BytesEntry(8)).await;
+        assert_eq!(pin_expired_count.load(Ordering::Relaxed), 0);
+
+        // get → must NOT fire on_pin_expired.
+        let _ = map.get(&1).await;
+        assert_eq!(pin_expired_count.load(Ordering::Relaxed), 0);
+
+        // Force eviction by overflowing capacity. Insert several entries
+        // larger than the map's max_bytes (64) so moka evicts.
+        for k in 2..=10 {
+            map.insert(k, BytesEntry(32)).await;
+        }
+        // Allow moka's internal pending tasks to drain.
+        map.cache.run_pending_tasks();
+        // Eviction must NOT fire on_pin_expired.
+        assert_eq!(
+            pin_expired_count.load(Ordering::Relaxed),
+            0,
+            "eviction must NOT fire on_pin_expired",
         );
     }
 }

@@ -137,6 +137,17 @@ test-utils = []
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
 fail = { version = "0.5", features = ["failpoints"] }
+# Layered on top of the regular tokio dep to add the `test-util` feature
+# (gates `tokio::time::pause`/`advance`). Required by the slow-write
+# watchdog test in `pin_expire_failed_writes_test.rs` to advance the
+# 60s watchdog timer without wall-clock waits.
+tokio = { version = "1.44.1", features = [
+  "fs",
+  "io-util",
+  "rt-multi-thread",
+  "signal",
+  "test-util",
+], default-features = false }
 
 aws-sdk-s3 = { version = "1.82.0", features = [
   "http-1x",
