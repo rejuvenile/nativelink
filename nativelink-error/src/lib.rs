@@ -313,7 +313,22 @@ impl From<tonic::Status> for Error {
 
 impl From<Error> for tonic::Status {
     fn from(val: Error) -> Self {
-        Self::new(val.code, val.messages.join(" : "))
+        // Without preserving details, REAPI v2 §2.2.4 PreconditionFailure
+        // entries are dropped on the wire. Bazel relies on the
+        // `grpc-status-details-bin` trailer (an encoded `google.rpc.Status`)
+        // to recover from missing-blob errors by re-uploading.
+        if val.details.is_empty() {
+            return Self::new(val.code, val.messages.join(" : "));
+        }
+        let code = val.code;
+        let message = val.messages.join(" : ");
+        let rpc_status = nativelink_proto::google::rpc::Status {
+            code: code as i32,
+            message: message.clone(),
+            details: val.details,
+        };
+        let encoded = prost::Message::encode_to_vec(&rpc_status);
+        Self::with_details(code, message, tonic::codegen::Bytes::from(encoded))
     }
 }
 
@@ -592,5 +607,51 @@ mod tests {
     fn make_err_macro_has_empty_details() {
         let err = make_err!(Code::Internal, "something failed");
         assert!(err.details.is_empty());
+    }
+
+    #[test]
+    fn error_to_tonic_status_preserves_details() {
+        use prost::Message;
+
+        let detail = prost_types::Any {
+            type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+            value: vec![1, 2, 3],
+        };
+        let err = Error {
+            code: Code::FailedPrecondition,
+            messages: vec!["blob missing".into()],
+            details: vec![detail.clone()],
+        };
+        let status: tonic::Status = err.into();
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        let details_bytes = status.details();
+        assert!(
+            !details_bytes.is_empty(),
+            "tonic::Status::details() should be non-empty when Error has details",
+        );
+        // The details bytes are the encoded google.rpc.Status proto, which
+        // gets sent via the grpc-status-details-bin trailer. Decode and
+        // verify our PreconditionFailure detail round-tripped.
+        let decoded = nativelink_proto::google::rpc::Status::decode(details_bytes)
+            .expect("status details should decode as google.rpc.Status");
+        assert_eq!(decoded.code, Code::FailedPrecondition as i32);
+        assert_eq!(decoded.details.len(), 1);
+        assert_eq!(decoded.details[0].type_url, detail.type_url);
+        assert_eq!(decoded.details[0].value, detail.value);
+    }
+
+    #[test]
+    fn error_to_tonic_status_no_details_when_empty() {
+        let err = Error {
+            code: Code::Internal,
+            messages: vec!["boom".into()],
+            details: Vec::new(),
+        };
+        let status: tonic::Status = err.into();
+        assert_eq!(status.code(), Code::Internal);
+        assert!(
+            status.details().is_empty(),
+            "tonic::Status::details() should stay empty when Error has no details",
+        );
     }
 }
