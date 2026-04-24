@@ -1444,13 +1444,33 @@ fn get_config() -> Result<CasConfig, Error> {
     CasConfig::try_from_json5_file(&args.config_file)
 }
 
+/// Path to the runtime watchdog heartbeat file.
+///
+/// On Linux this lives in `/dev/shm` (tmpfs RAM-disk) so the heartbeat
+/// write bypasses the tracing-appender backlog, the journald socket, and
+/// any disk-tier stall — making it a reliable forensic signal during
+/// journald-pressure events or txg sync stalls.
+///
+/// macOS has no `/dev/shm`; workers fall back to `/tmp/`. The macOS
+/// workers don't run under journald pressure, so the disk-backed path
+/// is acceptable. (Without this fallback the watchdog's `open()` fails
+/// at startup on every Mac worker and runtime-stall stack dumps are
+/// never captured — see task #101.)
+#[cfg(target_os = "linux")]
+const HEARTBEAT_FILE: &str = "/dev/shm/nativelink-heartbeat";
+#[cfg(target_os = "macos")]
+const HEARTBEAT_FILE: &str = "/tmp/nativelink-heartbeat";
+
 /// Dump all thread stacks to a timestamped file for post-mortem analysis.
 /// Reads /proc/self/task/*/comm, status, wchan, and stack (if permitted).
 fn dump_thread_stacks() {
     nativelink_util::stall_detector::dump_thread_stacks("runtime-watchdog");
 }
 
-/// Write one line to the watchdog heartbeat file in /dev/shm.
+/// Write one line to the watchdog heartbeat file.
+/// On Linux this lives in `/dev/shm` (tmpfs RAM-disk) so the write
+/// bypasses the tracing-appender backlog and any disk-tier stall.
+/// On macOS there is no `/dev/shm`; we fall back to `/tmp`.
 /// Errors are ignored — the heartbeat is a best-effort forensic signal.
 fn write_heartbeat(
     file: Option<&mut std::fs::File>,
@@ -1622,7 +1642,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         .spawn(move || {
             let stall_threshold = Duration::from_secs(2);
             let check_interval = Duration::from_secs(1);
-            // Heartbeat written to /dev/shm bypasses tracing-appender,
+            // Heartbeat written to HEARTBEAT_FILE bypasses tracing-appender,
             // systemd-journald, and stdio. During a journald-pressure event
             // (e.g. a co-tenant filling the journal socket) the in-band
             // logs go silent for minutes; this file's mtime + last line
@@ -1630,7 +1650,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             // - heartbeat updating, app logs missing -> appender blocked
             // - heartbeat frozen too -> OS thread starvation / process
             //   reclaim / mimalloc lockup
-            const HEARTBEAT_FILE: &str = "/dev/shm/nativelink-heartbeat";
+            // See module-level HEARTBEAT_FILE for the per-OS path choice.
             let mut heartbeat_file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -1740,4 +1760,29 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         })
         .err_tip(|| "main() function failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HEARTBEAT_FILE;
+
+    /// Guards against regressing the macOS watchdog fix from task #101.
+    /// Linux must keep the `/dev/shm` tmpfs path so the heartbeat write
+    /// bypasses tracing-appender; macOS has no `/dev/shm` and must use
+    /// `/tmp` so `open()` does not fail at startup.
+    #[test]
+    fn heartbeat_file_path_is_per_os() {
+        #[cfg(target_os = "linux")]
+        assert!(
+            HEARTBEAT_FILE.starts_with("/dev/shm/"),
+            "Linux heartbeat path must live on tmpfs (/dev/shm/...), got {HEARTBEAT_FILE}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            HEARTBEAT_FILE.starts_with("/tmp/"),
+            "macOS heartbeat path must live under /tmp/ (no /dev/shm on macOS), got {HEARTBEAT_FILE}"
+        );
+        // Sanity: never empty, never relative.
+        assert!(HEARTBEAT_FILE.starts_with('/'), "must be absolute");
+    }
 }
