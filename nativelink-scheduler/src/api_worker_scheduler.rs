@@ -2641,6 +2641,25 @@ async fn resolve_tree_from_cas(
     /// How long individual directory digest failures are cached.
     const DIR_FAILURE_TTL: Duration = Duration::from_secs(60);
 
+    /// Per-fetch wall-time threshold above which we log a `warn!` for the
+    /// individual directory read. Anything below this is silent — typical
+    /// Redis/MemoryStore hits return in <10ms. The whole BFS budget is 60s
+    /// (`TREE_RESOLUTION_TIMEOUT`), so an individual fetch exceeding 1s is
+    /// already a serious anomaly.
+    const SLOW_DIR_FETCH_THRESHOLD: Duration = Duration::from_secs(1);
+
+    /// Per-level wall-time threshold above which we log a `warn!` for the
+    /// entire BFS level. A single level with a small dir count should
+    /// complete in <100ms; >5s means contention or a hung backend.
+    const SLOW_BFS_LEVEL_THRESHOLD: Duration = Duration::from_secs(5);
+
+    let bfs_start = Instant::now();
+    debug!(
+        target: "nativelink::tree_resolution",
+        %root_digest,
+        "tree resolution BFS starting"
+    );
+
     let mut file_digests: Vec<(DigestInfo, u64)> = Vec::new();
     let mut seen_files: HashSet<DigestInfo> = HashSet::new();
     let mut dirs_to_visit: Vec<DigestInfo> = vec![root_digest];
@@ -2655,7 +2674,20 @@ async fn resolve_tree_from_cas(
     // BFS order — used for bottom-up traversal (reverse of BFS = leaves first).
     let mut bfs_order: Vec<DigestInfo> = vec![root_digest];
 
+    let mut bfs_level: u32 = 0;
     while !dirs_to_visit.is_empty() {
+        bfs_level += 1;
+        let level_start = Instant::now();
+        let level_dir_count = dirs_to_visit.len();
+        debug!(
+            target: "nativelink::tree_resolution",
+            %root_digest,
+            level = bfs_level,
+            dirs_in_level = level_dir_count,
+            seen_dirs_total = seen_dirs.len(),
+            elapsed_ms = bfs_start.elapsed().as_millis() as u64,
+            "tree resolution BFS level entry"
+        );
         // Check subdirectory negative cache before fetching this BFS level.
         {
             let mut cache = failed_dir_digests.lock().await;
@@ -2687,6 +2719,7 @@ async fn resolve_tree_from_cas(
                 let cas_store = cas_store.clone();
                 let failed_dirs = failed_dir_digests_clone.clone();
                 async move {
+                    let fetch_start = Instant::now();
                     let key: StoreKey<'_> = dir_digest.into();
                     let result = cas_store
                         .get_part_unchunked(key, 0, None)
@@ -2696,6 +2729,16 @@ async fn resolve_tree_from_cas(
                                 "Reading directory {dir_digest} from CAS for tree resolution"
                             )
                         });
+                    let fetch_elapsed = fetch_start.elapsed();
+                    if fetch_elapsed >= SLOW_DIR_FETCH_THRESHOLD {
+                        warn!(
+                            target: "nativelink::tree_resolution",
+                            %dir_digest,
+                            elapsed_ms = fetch_elapsed.as_millis() as u64,
+                            ok = result.is_ok(),
+                            "tree resolution slow directory fetch"
+                        );
+                    }
                     match result {
                         Ok(bytes) => {
                             let directory = Directory::decode(bytes).map_err(|e| {
@@ -2719,7 +2762,22 @@ async fn resolve_tree_from_cas(
             })
             .collect();
 
+        let collect_start = Instant::now();
         let results: Vec<Result<(DigestInfo, Directory), Error>> = fetches.collect().await;
+        let collect_elapsed = collect_start.elapsed();
+        if collect_elapsed >= SLOW_BFS_LEVEL_THRESHOLD {
+            warn!(
+                target: "nativelink::tree_resolution",
+                %root_digest,
+                level = bfs_level,
+                dirs_in_level = level_dir_count,
+                level_elapsed_ms = level_start.elapsed().as_millis() as u64,
+                collect_elapsed_ms = collect_elapsed.as_millis() as u64,
+                bfs_total_elapsed_ms = bfs_start.elapsed().as_millis() as u64,
+                results = results.len(),
+                "tree resolution BFS level slow"
+            );
+        }
         for result in results {
             let (parent_digest, directory) = result?;
 
@@ -2757,7 +2815,26 @@ async fn resolve_tree_from_cas(
             dir_children.insert(parent_digest, children);
             directories.insert(parent_digest, directory);
         }
+        debug!(
+            target: "nativelink::tree_resolution",
+            %root_digest,
+            level = bfs_level,
+            level_elapsed_ms = level_start.elapsed().as_millis() as u64,
+            seen_dirs_total = seen_dirs.len(),
+            seen_files_total = seen_files.len(),
+            next_level_dirs = dirs_to_visit.len(),
+            "tree resolution BFS level exit"
+        );
     }
+    debug!(
+        target: "nativelink::tree_resolution",
+        %root_digest,
+        levels = bfs_level,
+        total_dirs = seen_dirs.len(),
+        total_files = seen_files.len(),
+        bfs_total_elapsed_ms = bfs_start.elapsed().as_millis() as u64,
+        "tree resolution BFS complete"
+    );
 
     // Bottom-up pass: compute total file bytes and file count under each subtree.
     // Reverse BFS order gives us leaves-first, so children are always
