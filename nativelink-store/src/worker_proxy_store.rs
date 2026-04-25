@@ -1307,6 +1307,38 @@ impl WorkerProxyStore {
         ))
     }
 
+    /// Cooperatively cancel a losing racer: drop its receive half (which
+    /// causes the spawned `get_part`'s next `tx.send` to return
+    /// `Err(disconnected)` and the task to exit naturally, dropping its
+    /// inner `tonic::Streaming` from the await path rather than from
+    /// mid-poll). Falls back to `abort()` if the task doesn't exit
+    /// within `LOSER_GRACE`.
+    ///
+    /// NOTE: server-streaming Read RPCs still emit RST_STREAM when their
+    /// `Streaming<ReadResponse>` is dropped (no `END_STREAM` send path
+    /// on one-way receive). The win is that cooperative cancellation
+    /// converts an active `abort()` into a passive `Drop` from the
+    /// producer's normal exit path, which tonic handles more cleanly.
+    /// Combined with the `parallel_chunk_count: 64 → 16` reduction
+    /// (#147 producer-side), post-burst RST rate stays under hyper's
+    /// `max_local_error_reset_streams = 1024` budget.
+    fn cancel_loser_racer(
+        loser_rx: DropCloserReadHalf,
+        loser_handle: JoinHandle<Result<(), Error>>,
+    ) {
+        const LOSER_GRACE: Duration = Duration::from_millis(50);
+        // Dropping the rx causes the producer's next `tx.send` to fail.
+        drop(loser_rx);
+        // Capture an abort_handle BEFORE moving handle into the timeout
+        // future, so we can fall back to abort() on grace-window expiry.
+        let abort_handle = loser_handle.abort_handle();
+        tokio::spawn(async move {
+            if tokio::time::timeout(LOSER_GRACE, loser_handle).await.is_err() {
+                abort_handle.abort();
+            }
+        });
+    }
+
     /// Forward remaining data from a racer's read half to the caller's writer,
     /// then wait for the spawned task to complete.
     async fn forward_racer(
@@ -2171,7 +2203,9 @@ impl StoreDriver for WorkerProxyStore {
                 match server_result {
                     Ok(chunk) if !chunk.is_empty() => {
                         // Server produced data first — it wins.
-                        peer_handle.abort();
+                        // #147: cooperative cancel — drop peer_rx + brief
+                        // grace window before falling back to abort().
+                        Self::cancel_loser_racer(peer_rx, peer_handle);
                         debug!(
                             ?digest,
                             "WorkerProxyStore: server won race against peer"
@@ -2182,7 +2216,7 @@ impl StoreDriver for WorkerProxyStore {
                     }
                     Ok(_empty) if is_zero_blob => {
                         // Legitimate zero-length blob — server won the race.
-                        peer_handle.abort();
+                        Self::cancel_loser_racer(peer_rx, peer_handle);
                         debug!(
                             ?digest,
                             "WorkerProxyStore: server won race (zero-length blob)"
@@ -2220,7 +2254,7 @@ impl StoreDriver for WorkerProxyStore {
                 match peer_result {
                     Ok(chunk) if !chunk.is_empty() => {
                         // Peer produced data first — it wins.
-                        server_handle.abort();
+                        Self::cancel_loser_racer(server_rx, server_handle);
                         debug!(
                             ?digest,
                             endpoint = %peer_endpoint,
@@ -2232,7 +2266,7 @@ impl StoreDriver for WorkerProxyStore {
                     }
                     Ok(_empty) if is_zero_blob => {
                         // Legitimate zero-length blob — peer won the race.
-                        server_handle.abort();
+                        Self::cancel_loser_racer(server_rx, server_handle);
                         debug!(
                             ?digest,
                             endpoint = %peer_endpoint,

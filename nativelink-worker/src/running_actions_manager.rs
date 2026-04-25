@@ -316,8 +316,22 @@ pub async fn resolve_directory_tree(
                 let mut stream = response.into_inner();
                 // Collect all directories from the stream into a flat list.
                 let mut all_dirs: Vec<ProtoDirectory> = Vec::new();
-                while let Some(resp) = stream.message().await.err_tip(|| "In GetTree stream")? {
-                    all_dirs.extend(resp.directories);
+                loop {
+                    match stream.message().await {
+                        Ok(None) => break,
+                        Ok(Some(resp)) => all_dirs.extend(resp.directories),
+                        Err(status) => {
+                            // #147: GetTree streams over the same pooled
+                            // h2 channel that #147 wedges. If the body
+                            // errs with a transport-shaped status,
+                            // evict one idle channel before the caller
+                            // surfaces the error so the next attempt
+                            // gets a fresh channel.
+                            let err: Error = status.into();
+                            grpc_store.evict_pool_on_transport_err(&err);
+                            return Err(err.append("In GetTree stream"));
+                        }
+                    }
                 }
                 let stream_elapsed = tree_start.elapsed();
 

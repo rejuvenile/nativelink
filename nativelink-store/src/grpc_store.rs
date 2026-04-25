@@ -130,34 +130,28 @@ enum ChunkAttemptOutcome {
     AmbiguousEarlyBreak,
 }
 
-/// Returns `true` if `err` looks like the connection-level h2/transport
-/// failure that #147 traces to a stale pooled `Channel`: the originating
-/// h2 server sent `GOAWAY(too_many_internal_resets, ENHANCE_YOUR_CALM)`
-/// (or comparable pull-the-plug shape) and the next request that picked
-/// up the dead clone fails synchronously before any bytes flow.
+/// Returns `true` if `err` looks like a transport-level h2 failure
+/// (post-GOAWAY stale-channel shape, #147). The production signature
+/// (verified in buildcache journal 2026-04-25):
+/// `Error { code: Internal, messages: ["Tried to send while stream is closed", ...] }`.
+/// `Unavailable` / `Unknown` cover RST_STREAM / catch-all h2 mappings.
+/// `ResourceExhausted` covers the rare case where tonic surfaces
+/// `ENHANCE_YOUR_CALM` directly (server's GOAWAY reason).
 ///
-/// The signal we have at this layer is the gRPC code + message; we do
-/// NOT see the underlying `h2::Reason`. Codes that match the wedge
-/// shape:
-///   * `Code::Internal` — what tonic produces for `"Tried to send while
-///                         stream is closed"` (the production wedge).
-///   * `Code::Unavailable` — connection refused / RST_STREAM /
-///                            transport blip.
-///   * `Code::Unknown` — tonic's catch-all for h2 errors it doesn't
-///                       have a specific mapping for; same shape from
-///                       the caller's view.
-///
-/// Codes deliberately excluded: `NotFound` / `DataLoss` / `OutOfRange` /
-/// `InvalidArgument` / `PermissionDenied` / `Unauthenticated` /
-/// `FailedPrecondition` / `AlreadyExists` / `Cancelled` /
-/// `DeadlineExceeded` / `Aborted` / `ResourceExhausted` /
-/// `Unimplemented` — these are application-level outcomes that say
-/// nothing about whether the underlying channel is healthy.
+/// `Internal` is gated on a message check to avoid evicting on
+/// server-app `make_err!(Internal, ...)` from valid RPCs.
 fn looks_like_dead_channel(err: &Error) -> bool {
-    matches!(
-        err.code,
-        Code::Internal | Code::Unavailable | Code::Unknown
-    )
+    match err.code {
+        Code::Unavailable | Code::Unknown | Code::ResourceExhausted => true,
+        Code::Internal => err.messages.iter().any(|m| {
+            m.contains("Tried to send while stream is closed")
+                || m.contains("h2 protocol error")
+                || m.contains("buffer's worker closed unexpectedly")
+                || m.contains("connection error")
+                || m.contains("broken pipe")
+        }),
+        _ => false,
+    }
 }
 
 /// Pure-function classifier for `get_part_parallel`'s per-chunk attempt
@@ -394,33 +388,22 @@ impl GrpcStore {
         }
     }
 
-    /// Best-effort: if `err` looks like a transport-level h2 failure
-    /// (post-GOAWAY stream-closed shape per `looks_like_dead_channel`),
-    /// evict one idle channel from the TCP pool so the next acquisition
-    /// is more likely to get a freshly-built channel. No-op for QUIC
-    /// transports (the QUIC `Channel` is a single shared instance with
-    /// its own connection_manager loop) and for non-transport-shaped
-    /// errors. Safe to call from any retry path.
-    fn evict_pool_on_transport_err(&self, err: &Error) {
+    /// Best-effort: if `err` is transport-shaped (#147), evict one
+    /// idle TCP channel and queue a reconnect. No-op for QUIC.
+    /// Public so external streaming callers (e.g.
+    /// `running_actions_manager::resolve_directory_tree` consuming a
+    /// `Streaming<GetTreeResponse>`) can apply the same recovery.
+    pub fn evict_pool_on_transport_err(&self, err: &Error) {
         if !looks_like_dead_channel(err) {
             return;
         }
+        let reason = format!("transport-shaped err in retry: code={:?}", err.code);
         match &self.transport {
-            Transport::Tcp(cm) => {
-                cm.evict_idle_channel(format!(
-                    "transport-shaped err in retry: code={:?}",
-                    err.code
-                ));
-            }
+            Transport::Tcp(cm) => cm.evict_idle_channel(None, reason),
             #[cfg(feature = "quic")]
             Transport::Quic(_) => {}
             #[cfg(feature = "quic")]
-            Transport::Dual { tcp, .. } => {
-                tcp.evict_idle_channel(format!(
-                    "transport-shaped err in retry (dual/tcp): code={:?}",
-                    err.code
-                ));
-            }
+            Transport::Dual { tcp, .. } => tcp.evict_idle_channel(None, reason),
         }
     }
 
@@ -1163,13 +1146,7 @@ impl GrpcStore {
                                         can_resume = local_state_locked.can_resume(),
                                         "GrpcStore::write: RPC failed",
                                     );
-                                    // #147: evict any stale pooled
-                                    // channel before the next attempt.
-                                    // Belt-and-suspenders alongside
-                                    // ResponseFuture::poll's automatic
-                                    // Err-path eviction — covers cases
-                                    // where the failure surfaced after
-                                    // the request future returned.
+                                    // #147: belt-and-suspenders eviction.
                                     self.evict_pool_on_transport_err(err);
                                     if local_state_locked.can_resume() {
                                         local_state_locked.resume();
@@ -1479,21 +1456,7 @@ impl GrpcStore {
                             code = ?err.code,
                             "GrpcStore::get_part_single_stream read_internal failed",
                         );
-                        // #147: pooled `Channel`s with stale h2 state
-                        // (post-GOAWAY) fail synchronously here on
-                        // attempt 1 with `Code::Internal "Tried to send
-                        // while stream is closed"`. The non-streaming
-                        // `ResponseFuture::poll` Err path in
-                        // connection_manager already evicts on any Err
-                        // from the response future, but for streaming
-                        // RPCs the failure shape can be ambiguous
-                        // depending on whether tonic surfaced it from
-                        // the request future or the response stream.
-                        // Belt-and-suspenders: explicitly evict one
-                        // idle channel from the pool when the error
-                        // looks transport-shaped, so the retry's
-                        // `cm.connection().await` is more likely to
-                        // get a freshly-built channel.
+                        // #147: post-GOAWAY pool may hold dead clones; evict.
                         self.evict_pool_on_transport_err(&err);
                         return Some((RetryResult::Retry(err), local_state))
                     }
@@ -1510,14 +1473,7 @@ impl GrpcStore {
                         None => Bytes::new(),
                         Some(Ok(message)) => message.data,
                         Some(Err(status)) => {
-                            // #147: errors surfacing inside the
-                            // streaming response body never reach
-                            // `ResponseFuture::poll`, so the
-                            // connection_manager's automatic Err-path
-                            // eviction does not fire here. Force an
-                            // idle-channel eviction so the next attempt
-                            // gets a freshly-built channel rather than
-                            // re-pulling the same dead clone.
+                            // #147: streaming-body errs bypass ResponseFuture::poll; evict here.
                             let err: Error = status.into();
                             self.evict_pool_on_transport_err(&err);
                             return Some((
@@ -1802,11 +1758,7 @@ impl GrpcStore {
                                             {
                                                 Ok(s) => s,
                                                 Err(err) => {
-                                                    // #147: parallel-chunk
-                                                    // path mirrors single-stream:
-                                                    // evict an idle channel on
-                                                    // transport-shaped errors
-                                                    // before the next retry.
+                                                    // #147: same as single-stream path.
                                                     self.evict_pool_on_transport_err(&err);
                                                     return Some((
                                                         RetryResult::Retry(err.append(format!(
@@ -1907,11 +1859,7 @@ impl GrpcStore {
                                                                 state,
                                                             ));
                                                         }
-                                                        // #147: streaming-body
-                                                        // status errors don't
-                                                        // reach ResponseFuture::poll;
-                                                        // evict an idle channel
-                                                        // before the retry.
+                                                        // #147: streaming-body err.
                                                         self.evict_pool_on_transport_err(&err);
                                                         return Some((
                                                             RetryResult::Retry(err),
@@ -2405,7 +2353,76 @@ default_health_status_indicator!(GrpcStore);
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkAttemptOutcome, classify_chunk_attempt};
+    use nativelink_error::{Code, Error, make_err};
+
+    use super::{ChunkAttemptOutcome, classify_chunk_attempt, looks_like_dead_channel};
+
+    /// #147 classifier: codes that DO indicate a stale/transport-broken
+    /// channel must return true; application-level codes must return false.
+    /// `Internal` is special-cased on message content to avoid evicting on
+    /// healthy server-app `make_err!(Internal, ...)` errors.
+    #[test]
+    fn looks_like_dead_channel_classifies_codes() {
+        // True for the transport-shaped non-Internal codes.
+        for code in [Code::Unavailable, Code::Unknown, Code::ResourceExhausted] {
+            let err = make_err!(code, "some transport-ish failure");
+            assert!(
+                looks_like_dead_channel(&err),
+                "{code:?} should be classified as transport-shaped"
+            );
+        }
+
+        // True for the production Internal signature.
+        let production_err: Error = make_err!(Code::Internal, "Tried to send while stream is closed");
+        assert!(
+            looks_like_dead_channel(&production_err),
+            "the production wedge message must classify as dead channel"
+        );
+
+        // True for the other h2-shaped Internal messages we cover.
+        for msg in [
+            "h2 protocol error: connection error received",
+            "buffer's worker closed unexpectedly",
+            "broken pipe while sending h2 frame",
+            "connection error: the server sent GOAWAY",
+        ] {
+            let err = make_err!(Code::Internal, "{msg}");
+            assert!(
+                looks_like_dead_channel(&err),
+                "Internal+message {msg:?} should classify as dead channel"
+            );
+        }
+
+        // FALSE for application-Internal (e.g. server-side make_err!).
+        let app_internal = make_err!(Code::Internal, "verify size mismatch in CAS upload");
+        assert!(
+            !looks_like_dead_channel(&app_internal),
+            "Internal with app-level message must NOT evict (false-positive guard)"
+        );
+
+        // FALSE for application-level codes.
+        for code in [
+            Code::NotFound,
+            Code::DeadlineExceeded,
+            Code::FailedPrecondition,
+            Code::Cancelled,
+            Code::Aborted,
+            Code::InvalidArgument,
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::AlreadyExists,
+            Code::OutOfRange,
+            Code::DataLoss,
+            Code::Unimplemented,
+        ] {
+            let err = make_err!(code, "application-level outcome");
+            assert!(
+                !looks_like_dead_channel(&err),
+                "{code:?} must NOT classify as dead channel"
+            );
+        }
+    }
+
 
     /// Bug B regression: a clean `Status::OK` trailer (`clean_eof = true`)
     /// with `bytes_received < chunk_length` must classify as

@@ -1282,7 +1282,12 @@ fn default_parallel_chunk_read_threshold() -> u64 {
 }
 
 fn default_parallel_chunk_count() -> u64 {
-    64
+    // 64 stream-per-blob multipliers × race-mode `JoinHandle::abort()` on
+    // the loser produced enough RST_STREAMs (>1024/sec) to trip hyper's
+    // `max_local_error_reset_streams` and emit `GOAWAY(ENHANCE_YOUR_CALM)`
+    // (#147 producer-side root cause). 16 keeps useful parallelism for
+    // large blobs (4x vs single-stream) while shrinking the abort multiplier 4x.
+    16
 }
 
 fn default_max_concurrent_batch_rpcs() -> u64 {
