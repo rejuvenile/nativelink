@@ -336,10 +336,14 @@ impl ByteStream for TinyBlobByteStream {
         let payload = self.payload.clone();
         let blob_size = payload.len() as i64;
         let offset = req.read_offset;
+        let read_limit = req.read_limit;
 
         // Build the response stream. Clean Status::OK trailer in all
         // cases (we do not synthesize errors), modeling a healthy peer
-        // that has the blob in full.
+        // that has the blob in full and honors REAPI ByteStream
+        // semantics: serve up to `read_limit` bytes starting at
+        // `read_offset`, where `read_limit == 0` means "to end of
+        // resource."
         let stream: Self::ReadStream = if offset >= blob_size {
             // Past the blob — return immediate clean EOF (no data
             // frames). This is what a real worker does when the peer
@@ -347,11 +351,15 @@ impl ByteStream for TinyBlobByteStream {
             // an empty body.
             Box::pin(futures::stream::empty())
         } else {
-            // Slice the blob from `offset` (clamped to its bounds) and
-            // return a single ReadResponse with that slice, then
-            // implicit Status::OK trailer.
+            // Honor the caller's read_limit (REAPI: 0 == read to end).
             let start = offset as usize;
-            let end = payload.len();
+            let max_end = payload.len();
+            let end = if read_limit == 0 {
+                max_end
+            } else {
+                let limited = start + read_limit as usize;
+                limited.min(max_end)
+            };
             let slice = payload.slice(start..end);
             Box::pin(futures::stream::iter(vec![Ok(ReadResponse {
                 data: slice,
@@ -422,15 +430,19 @@ async fn grpc_store_tiny_blob_with_oversized_length_does_not_wedge_parallel()
             .await;
     });
 
-    // Construct a GrpcStore that mirrors production-relevant settings:
-    // small parallel_chunk_read_threshold so a 10 MiB caller-supplied
-    // length triggers the parallel path, parallel_chunk_count=8 (the
-    // pre-#147-tightening default that produced the wedge in production),
-    // zero retries to keep failure modes crisp.
+    // Construct a GrpcStore mirroring the production config that
+    // produced the wedge: parallel_chunk_read_threshold = 8 MiB
+    // (default) and parallel_chunk_count = 8. The pre-fix
+    // `effective_length = length.unwrap_or(...)` = 10 MiB DOES exceed
+    // the 8 MiB threshold → routes into parallel and shreds the
+    // 183-byte blob into 8 sub-ranges. The post-fix `effective_length
+    // = min(length, blob_remaining) = min(10 MiB, 183) = 183` does
+    // NOT exceed 8 MiB → stays on the single-stream path → exactly 1
+    // ReadRequest RPC. Zero retries to keep failure modes crisp.
     let mut spec = make_test_spec();
     spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
     spec.rpc_timeout_s = 0;
-    spec.parallel_chunk_read_threshold = 64; // tiny so we route to parallel
+    spec.parallel_chunk_read_threshold = 8 * 1024 * 1024; // production default
     spec.parallel_chunk_count = 8;
     spec.retry = Retry {
         max_retries: 0,

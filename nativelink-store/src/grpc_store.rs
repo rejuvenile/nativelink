@@ -1591,8 +1591,34 @@ impl GrpcStore {
         writer: &mut DropCloserWriteHalf,
         offset: u64,
         total_length: u64,
+        blob_size: u64,
     ) -> Result<(), Error> {
-        let chunk_count = self.parallel_chunk_count;
+        // Bug B clamp: never request more chunks than the blob has
+        // bytes when split into `parallel_chunk_read_threshold`-sized
+        // pieces. Without this, a caller that passes a too-large
+        // `length` (e.g. the audited 10 MiB caller-supplied limit on
+        // a 183-byte blob) would split the request into N chunks all
+        // pointing past EOF except chunk 0. The peer correctly EOFs
+        // those chunks immediately; the post-`CleanShort` reader
+        // recovers the data, but the splitter still issues N-1
+        // wasted RPCs per read and creates contention fodder for
+        // race-loser-abort h2 RST_STREAM bursts (#147 producer side)
+        // and the "Tried to send while stream is closed" wedge shape
+        // observed in production logs on 2026-04-25.
+        //
+        // Formula (per audit fix shape): cap `chunk_count` so the
+        // splitter never produces a chunk that lies entirely past the
+        // blob's last byte. We use `parallel_chunk_read_threshold`
+        // as the natural minimum chunk size — the same number that
+        // gates the parallel-vs-single-stream decision at the call
+        // site, so a blob smaller than the threshold collapses to
+        // chunk_count=1 (and would normally have stayed on the
+        // single-stream path; this is defense in depth).
+        let blob_remaining = blob_size.saturating_sub(offset);
+        let max_useful_chunks = blob_remaining
+            .div_ceil(self.parallel_chunk_read_threshold.max(1))
+            .max(1);
+        let chunk_count = self.parallel_chunk_count.min(max_useful_chunks);
         let base_chunk_size = total_length / chunk_count;
         let remainder = total_length % chunk_count;
         let read_start = std::time::Instant::now();
@@ -1600,7 +1626,9 @@ impl GrpcStore {
             %resource_name,
             offset,
             total_length,
+            blob_size,
             chunk_count,
+            requested_chunk_count = self.parallel_chunk_count,
             "GrpcStore::get_part_parallel entry",
         );
 
@@ -2296,9 +2324,21 @@ impl StoreDriver for GrpcStore {
         );
 
         // Determine the effective read length for parallel chunking.
-        let effective_length = length.unwrap_or_else(|| {
-            digest.size_bytes().saturating_sub(offset)
-        });
+        // Bug B (audit 2026-04-25): production callers occasionally
+        // pass an over-large `length` (e.g. `Some(10 MiB)` for a
+        // 183-byte blob — the value of the bytestream `read_limit`
+        // forwarded from a Bazel client RPC). The pre-fix code took
+        // that value at face value, exceeded the
+        // `parallel_chunk_read_threshold` (8 MiB by default), and
+        // shredded a 183-byte read into 8 parallel chunk RPCs all
+        // pointing past EOF except chunk 0. Clamp to the actual
+        // remaining bytes — `length` was always semantically "at most
+        // N bytes from this offset" — so a tiny blob stays on the
+        // single-stream path regardless of what the caller asked for.
+        let blob_remaining = digest.size_bytes().saturating_sub(offset);
+        let effective_length = length
+            .unwrap_or(blob_remaining)
+            .min(blob_remaining);
 
         // Use parallel chunked reads for large blobs.
         if self.parallel_chunk_read_threshold > 0
@@ -2311,6 +2351,7 @@ impl StoreDriver for GrpcStore {
                     writer,
                     offset,
                     effective_length,
+                    digest.size_bytes(),
                 )
                 .await;
         }
