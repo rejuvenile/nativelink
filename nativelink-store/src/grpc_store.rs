@@ -1461,6 +1461,29 @@ impl GrpcStore {
                         // the source-side invariants in place an empty
                         // stream genuinely means "blob is empty" and we
                         // forward EOF without inferring stale-worker.
+                        //
+                        // Observability: log when this stream attempt
+                        // received zero bytes total. With the source-side
+                        // validation in place (insert_mirror_blob +
+                        // get_part defensive guards) this should be rare —
+                        // the legitimate case is reading a zero-digest blob
+                        // OR resuming a read at exactly offset == size.
+                        // Anything else suggests a producer that bypasses
+                        // insert_mirror_blob, which is the upstream bug
+                        // we're hunting. The resource_name encodes the
+                        // digest+size so an operator can decode whether
+                        // the empty stream was legitimate.
+                        if local_state.bytes_received_this_stream == 0 {
+                            warn!(
+                                resource_name = %local_state.resource_name,
+                                read_offset = local_state.read_offset,
+                                attempt = local_state.attempt,
+                                "GrpcStore::get_part: peer returned 0-byte success \
+                                 for this stream attempt — legitimate only if \
+                                 zero-digest or offset==size; otherwise an upstream \
+                                 invariant violation (see fast_slow_store.rs::insert_mirror_blob)"
+                            );
+                        }
                         let eof_result = local_state
                             .writer
                             .send_eof()

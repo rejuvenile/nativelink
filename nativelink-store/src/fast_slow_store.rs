@@ -2633,10 +2633,12 @@ impl StoreDriver for FastSlowStore {
             if let Some(data) = maybe_data {
                 // Defensive guard against a phantom-positive entry: by the
                 // insert_mirror_blob invariant, data.len() must equal
-                // digest.size_bytes(). If it doesn't (corrupted/legacy entry),
-                // remove it and return NotFound so the caller routes to a
-                // different source — better than silently serving Ok+EOF
-                // (the grpc_store.rs:1469 workaround's trigger pattern).
+                // digest.size_bytes(). If it doesn't (corrupted/legacy entry
+                // pre-dating the source-side validation), remove it and
+                // return NotFound so the caller routes to a different
+                // source — better than silently serving Ok+EOF (which
+                // a previous workaround in grpc_store.rs translated into a
+                // retryable NotFound; that workaround has been removed).
                 let expected = digest.size_bytes() as usize;
                 if data.len() != expected {
                     warn!(
@@ -2645,7 +2647,13 @@ impl StoreDriver for FastSlowStore {
                         expected_size = expected,
                         "mirror_blobs entry size mismatch — removing phantom + returning NotFound"
                     );
-                    self.mirror_blobs.lock().remove(&digest);
+                    // Use the canonical remove path so total-bytes accounting,
+                    // mirror_changes (server-eviction notify), and the
+                    // mirror_changes_notify wake-up all stay consistent. A
+                    // raw HashMap.remove here would leak `mirror_blobs_total_bytes`
+                    // and silently leave the server's locality_map pointing
+                    // at this worker for a digest the worker has just discarded.
+                    self.remove_mirror_blobs(&[digest]);
                     return Err(make_err!(
                         Code::NotFound,
                         "mirror_blobs entry for {digest} had wrong size \
@@ -2753,7 +2761,17 @@ impl StoreDriver for FastSlowStore {
                             "in_flight entry size mismatch — returning NotFound \
                              instead of serving short stream"
                         );
-                        self.in_flight_slow_writes.lock().remove(&owned_key);
+                        // Match the canonical bg-write completion path
+                        // (line ~2199): remove + notify if empty so any
+                        // graceful-shutdown waiter on `in_flight_empty_notify`
+                        // doesn't miss its wake-up.
+                        {
+                            let mut guard = self.in_flight_slow_writes.lock();
+                            guard.remove(&owned_key);
+                            if guard.is_empty() {
+                                self.in_flight_empty_notify.notify_waiters();
+                            }
+                        }
                         return Err(make_err!(
                             Code::NotFound,
                             "in_flight_slow_writes entry for {d} had wrong total \
