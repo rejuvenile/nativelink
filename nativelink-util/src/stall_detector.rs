@@ -152,12 +152,12 @@ impl StallGuard {
                 } else {
                     format!("{label}{ctx_suffix}")
                 };
-                // dump_thread_stacks may invoke a sync subprocess wait
-                // (macOS `sample`) that blocks the calling thread for up to
-                // 30s. Run on the blocking pool so we don't stall a tokio
-                // worker — the cascading runtime starvation it caused on
-                // worker-02 was worse than the wedge it was trying to
-                // diagnose.
+                // dump_thread_stacks does in-process work (signal
+                // dispatch + symbol resolution + file I/O) bounded at
+                // 5s. We still run it on the blocking pool because the
+                // 1ms polling sleep would otherwise consume a tokio
+                // worker for the duration of the dump, and the file
+                // I/O is sync.
                 let _ = tokio::task::spawn_blocking(move || {
                     dump_thread_stacks(&dump_label);
                 });
@@ -179,12 +179,17 @@ impl Drop for StallGuard {
 
 /// Dump all thread stacks to `/tmp/nativelink-stall-<timestamp>.txt`.
 ///
-/// On Linux, reads `/proc/self/task/` to enumerate threads and collects
-/// thread name, wait channel, state, context switches, and kernel stack.
+/// On Linux, reads `/proc/self/task/` to enumerate threads, collects
+/// kernel-level info (comm, wchan, state, context switches, kernel
+/// stack), and dispatches `SIGRTMIN+1` to each thread for cooperative
+/// in-process userspace backtraces.
 ///
 /// On macOS, enumerates threads via Mach APIs (`task_threads`,
-/// `thread_info`) and captures the calling thread's Rust backtrace.
-/// Optionally runs the `sample` tool for full userspace stack traces.
+/// `thread_info`) and dispatches `SIGUSR2` via `pthread_kill` for
+/// cooperative in-process userspace backtraces. The previous
+/// `sample(1)` invocation was removed in commit f6779f3a — it
+/// whole-process suspended the target for 30s and triggered a
+/// runtime-starvation feedback loop on workers.
 ///
 /// On other platforms, this is a no-op (logs a message).
 pub fn dump_thread_stacks(label: &str) {
@@ -531,6 +536,393 @@ mod signal_dumper {
     }
 }
 
+/// Cooperative signal-based thread stack dumper for macOS.
+///
+/// macOS analog of the Linux [`signal_dumper`]. Differences:
+/// 1. Threads are enumerated via Mach `task_threads()` (not `/proc`).
+/// 2. Each thread is identified by its **mach port**, not a `tid`.
+/// 3. The signal is delivered with `pthread_kill(pthread_t, SIGUSR2)` —
+///    we look up `pthread_t` from the mach port via the private-but-
+///    stable `pthread_from_mach_thread_np` API. This is what async-
+///    profiler does and what Apple's own tooling relies on.
+/// 4. Inside the handler, we MUST use `mach_thread_self()` (an actual
+///    syscall) to identify the running thread — NOT
+///    `pthread_mach_thread_np()`, which is *not* async-signal-safe
+///    (it walks pthread internal data and can deadlock against
+///    pthread library locks). See:
+///    <https://github.com/async-profiler/async-profiler/discussions/1557>
+///
+/// Bounded wall-clock budget:
+/// - 5s outer timeout for the whole dump (matches Linux).
+/// - The collector polls every 1ms; if a thread is wedged in a
+///   signal-blocked state, we time out and report a `<no response>`
+///   for that slot rather than hanging the watchdog.
+#[cfg(target_os = "macos")]
+mod signal_dumper_macos {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+    /// Maximum number of threads a single dump can capture. Pre-allocated
+    /// at compile time to avoid any allocation in the signal handler.
+    /// Workers typically run with ~50–300 OS threads (tokio multi-thread
+    /// runtime + blocking pool + assorted helper threads); 1024 is a
+    /// generous ceiling.
+    const MAX_THREADS: usize = 1024;
+
+    /// Signal used for cooperative stack capture on macOS.
+    ///
+    /// We deliberately pick `SIGUSR2` (not `SIGUSR1`) because:
+    /// - SIGUSR1 is widely conventionalized by libraries (e.g., Go runtime,
+    ///   crash reporters) and reserving it for our use risks collisions.
+    /// - SIGPROF is what setitimer-based samplers use; on macOS it is not
+    ///   reliably delivered to the running thread (Russ Cox's note on
+    ///   Go's macOS profiler). We avoid it to side-step that family of
+    ///   issues, even though our `pthread_kill` direct delivery does not
+    ///   suffer the setitimer path's bug.
+    /// - SIGUSR2 is less commonly hijacked and its semantics are a clean
+    ///   "user-defined" channel, ideal for in-process diagnostics.
+    const DUMP_SIGNAL: libc::c_int = libc::SIGUSR2;
+
+    /// One slot per thread. Pre-allocated; never resized; written to by
+    /// exactly one signal handler invocation per dump round.
+    struct BacktraceSlot {
+        /// Mach port of the thread that owns this slot during a dump.
+        /// The handler matches by calling `mach_thread_self()` and
+        /// linearly searching `slots[].mach_port`. `0` means unused.
+        mach_port: AtomicU32,
+        /// Raw instruction pointers captured by the handler.
+        ips: [usize; 128],
+        /// Number of valid entries in `ips`.
+        count: usize,
+        /// Set to `true` by the handler once the capture is complete.
+        captured: AtomicBool,
+    }
+
+    impl BacktraceSlot {
+        const fn empty() -> Self {
+            Self {
+                mach_port: AtomicU32::new(0),
+                ips: [0; 128],
+                count: 0,
+                captured: AtomicBool::new(false),
+            }
+        }
+
+        fn reset(&mut self, mach_port: u32) {
+            self.count = 0;
+            self.captured.store(false, Ordering::Release);
+            // mach_port is stored last so the handler observing this
+            // slot also observes a clean `captured=false`.
+            self.mach_port.store(mach_port, Ordering::Release);
+        }
+    }
+
+    struct Collector {
+        slots: [core::cell::UnsafeCell<BacktraceSlot>; MAX_THREADS],
+    }
+
+    // SAFETY: Each slot is exclusively owned by exactly one signal handler
+    // per dump round (the one whose `mach_thread_self()` matches the slot's
+    // `mach_port`). The collector reads slots only after
+    // `captured.load(Acquire)` returns `true`, providing the synchronization
+    // barrier between the handler's writes and the collector's reads.
+    unsafe impl Sync for Collector {}
+    unsafe impl Send for Collector {}
+
+    impl Collector {
+        const fn new() -> Self {
+            const EMPTY_CELL: core::cell::UnsafeCell<BacktraceSlot> =
+                core::cell::UnsafeCell::new(BacktraceSlot::empty());
+            Self {
+                slots: [EMPTY_CELL; MAX_THREADS],
+            }
+        }
+    }
+
+    static COLLECTOR: Collector = Collector::new();
+    static SIGNAL_INSTALLED: Once = Once::new();
+    static DUMP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+    /// Number of slots populated for the current dump round. Read by the
+    /// signal handler to bound its linear search.
+    static SLOT_COUNT: AtomicU32 = AtomicU32::new(0);
+    /// Number of handlers that have completed in the current round.
+    static DONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Look up the slot index for a given mach port. Called only from the
+    /// signal handler; must be async-signal-safe.
+    ///
+    /// The implementation is a simple linear scan over `[0, SLOT_COUNT)`.
+    /// With MAX_THREADS=1024 and typical thread counts of 50–300 it costs
+    /// well under a microsecond, which is acceptable inside a handler that
+    /// itself runs unwinding.
+    fn find_slot_for_mach_port(port: u32) -> Option<usize> {
+        let count = SLOT_COUNT.load(Ordering::Acquire) as usize;
+        for i in 0..count {
+            // SAFETY: We only read the atomic mach_port field. The slot
+            // was initialized by the collector before the signal was sent.
+            let slot = unsafe { &*COLLECTOR.slots[i].get() };
+            if slot.mach_port.load(Ordering::Acquire) == port {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Async-signal-safe signal handler. Captures raw IPs into the
+    /// thread's pre-allocated slot.
+    ///
+    /// SAFETY / async-signal-safety:
+    /// - `mach_thread_self()` is a real syscall and is documented as
+    ///   safe to call from any context (including signal handlers).
+    /// - We do NOT call `pthread_mach_thread_np()`; that one walks
+    ///   pthread internals and is *not* async-signal-safe. async-profiler
+    ///   shipped this exact bug and fixed it by switching to
+    ///   `mach_thread_self()`.
+    /// - `backtrace::trace_unsynchronized` walks the stack via frame
+    ///   pointers (or libunwind in the fallback path) without taking
+    ///   any locks. Frame pointers are enabled across our build via
+    ///   `.cargo/config.toml`'s `-C force-frame-pointers=yes` and
+    ///   aarch64-apple-darwin's compiler default.
+    /// - All writes target either stack-local variables or the slot's
+    ///   pre-allocated `ips` array. No allocator calls.
+    unsafe extern "C" fn signal_handler(
+        _sig: libc::c_int,
+        _info: *mut libc::siginfo_t,
+        _ctx: *mut libc::c_void,
+    ) {
+        // SAFETY: mach_thread_self() is async-signal-safe by design — it
+        // is a real syscall and the only correct way to get the running
+        // Mach thread's port from inside a handler. The libc deprecation
+        // suggests routing through the `mach2` crate, but `mach2` simply
+        // wraps the same syscall; pulling in a new crate dependency is
+        // not justified for a single FFI call. allow(deprecated)
+        // documents the intentional choice.
+        #[allow(deprecated)]
+        let port = unsafe { libc::mach_thread_self() };
+        let Some(idx) = find_slot_for_mach_port(port) else {
+            // Not our signal (or stale/cancelled dump). Don't touch any
+            // slot; just return.
+            return;
+        };
+        // SAFETY: This slot is exclusively owned by the current thread for
+        // the duration of this handler invocation. The collector won't
+        // read until `captured.store(true)` below.
+        let slot = unsafe { &mut *COLLECTOR.slots[idx].get() };
+
+        let mut count = 0usize;
+        let max = slot.ips.len();
+        // SAFETY: trace_unsynchronized is the non-locking variant of
+        // backtrace::trace, intended for signal-handler context. It
+        // writes only to caller-provided memory.
+        unsafe {
+            backtrace::trace_unsynchronized(|frame| {
+                if count < max {
+                    slot.ips[count] = frame.ip() as usize;
+                    count += 1;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        slot.count = count;
+        slot.captured.store(true, Ordering::Release);
+        DONE_COUNT.fetch_add(1, Ordering::Release);
+    }
+
+    /// Install the SIGUSR2 handler exactly once for the lifetime of the
+    /// process. Subsequent `capture_all_backtraces` calls reuse it.
+    fn install_signal_handler() {
+        SIGNAL_INSTALLED.call_once(|| {
+            // SAFETY: sigaction is the standard POSIX install path. We
+            // zero-initialize the struct and only set the documented
+            // fields. SA_SIGINFO matches the 3-arg handler signature;
+            // SA_RESTART asks the kernel to restart interrupted syscalls
+            // so we don't trip up application code that wasn't expecting
+            // EINTR from us.
+            unsafe {
+                let mut sa: libc::sigaction = core::mem::zeroed();
+                sa.sa_sigaction = signal_handler as *const () as usize;
+                sa.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
+                libc::sigemptyset(&mut sa.sa_mask);
+                let ret = libc::sigaction(DUMP_SIGNAL, &sa, core::ptr::null_mut());
+                if ret != 0 {
+                    eprintln!(
+                        "failed to install macOS backtrace signal handler: {}",
+                        std::io::Error::last_os_error(),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Resolved backtrace for one thread.
+    pub(super) struct ThreadBacktrace {
+        pub mach_port: u32,
+        pub symbols: Vec<ResolvedFrame>,
+        /// `false` if the thread did not respond before the timeout fired.
+        pub responded: bool,
+    }
+
+    /// A single resolved stack frame.
+    pub(super) struct ResolvedFrame {
+        pub ip: usize,
+        pub name: Option<String>,
+        pub filename: Option<String>,
+        pub lineno: Option<u32>,
+    }
+
+    /// Request a per-thread backtrace for every `(mach_port, pthread_t)`
+    /// in `targets`, except for `self_mach_port` (the calling thread is
+    /// dumped synchronously by the caller via `Backtrace::force_capture`).
+    ///
+    /// Returns one [`ThreadBacktrace`] per target. Threads that did not
+    /// respond before the 5s outer deadline get an entry with
+    /// `responded=false` and an empty `symbols` vec.
+    pub(super) fn capture_all_backtraces(
+        targets: &[(u32, libc::pthread_t)],
+        self_mach_port: u32,
+    ) -> Vec<ThreadBacktrace> {
+        install_signal_handler();
+
+        if DUMP_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+            eprintln!("macOS cooperative stack dump already in progress, skipping");
+            return Vec::new();
+        }
+        struct DumpGuard;
+        impl Drop for DumpGuard {
+            fn drop(&mut self) {
+                DUMP_IN_PROGRESS.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = DumpGuard;
+
+        // Filter out the calling thread; we already have its backtrace.
+        // Truncate to MAX_THREADS — extreme thread counts get the first N
+        // covered. The output formatter notes the truncation.
+        let active: Vec<(u32, libc::pthread_t)> = targets
+            .iter()
+            .copied()
+            .filter(|(port, _)| *port != self_mach_port)
+            .take(MAX_THREADS)
+            .collect();
+        let n = active.len();
+
+        SLOT_COUNT.store(u32::try_from(n).unwrap_or(u32::MAX), Ordering::Release);
+        DONE_COUNT.store(0, Ordering::Release);
+
+        for (i, &(port, _)) in active.iter().enumerate() {
+            // SAFETY: No handler is running for this slot yet because we
+            // have not sent any signal. We hold exclusive write access.
+            unsafe {
+                (*COLLECTOR.slots[i].get()).reset(port);
+            }
+        }
+
+        // Send SIGUSR2 to each target via pthread_kill. pthread_kill targets
+        // the specific pthread (vs. process-wide kill(PID, sig)), which is
+        // exactly what we want for per-thread sampling.
+        let mut signaled = 0usize;
+        for &(_, pthread) in &active {
+            // pthread_kill returns 0 on success, errno on failure. The
+            // most common failure is ESRCH (thread already exited between
+            // enumeration and signal delivery) — that's expected and
+            // benign, the corresponding slot will simply time out and
+            // report `<no response>`.
+            // SAFETY: pthread is a valid pthread_t obtained from
+            // pthread_from_mach_thread_np in the caller. DUMP_SIGNAL is
+            // a valid signal number.
+            let ret = unsafe { libc::pthread_kill(pthread, DUMP_SIGNAL) };
+            if ret == 0 {
+                signaled += 1;
+            }
+        }
+
+        // Wait for all signaled threads to respond, with a hard 5s outer
+        // deadline. Per-slot per-iteration cost is ~1ms (the poll
+        // interval); the deadline stops a single hung thread from
+        // wedging the dump.
+        const OUTER_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
+        const POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(1);
+        let deadline = std::time::Instant::now() + OUTER_TIMEOUT;
+
+        while DONE_COUNT.load(Ordering::Acquire) < signaled {
+            if std::time::Instant::now() >= deadline {
+                let done = DONE_COUNT.load(Ordering::Acquire);
+                eprintln!(
+                    "macOS backtrace capture timeout: {done}/{signaled} threads responded in {OUTER_TIMEOUT:.0?}",
+                );
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        // Resolve symbols outside the handler. resolve()/resolve_unsynchronized
+        // both allocate; doing this on the collector thread is safe.
+        let mut results = Vec::with_capacity(n);
+        for (i, &(port, _)) in active.iter().enumerate() {
+            // SAFETY: All handlers have either completed (captured=true)
+            // or timed out. We don't dereference `ips` for non-captured
+            // slots.
+            let slot = unsafe { &*COLLECTOR.slots[i].get() };
+            let captured = slot.captured.load(Ordering::Acquire);
+            if !captured {
+                results.push(ThreadBacktrace {
+                    mach_port: port,
+                    symbols: Vec::new(),
+                    responded: false,
+                });
+                continue;
+            }
+
+            let mut frames = Vec::with_capacity(slot.count);
+            for j in 0..slot.count {
+                let ip = slot.ips[j];
+                let mut resolved = ResolvedFrame {
+                    ip,
+                    name: None,
+                    filename: None,
+                    lineno: None,
+                };
+                backtrace::resolve(ip as *mut core::ffi::c_void, |symbol| {
+                    if resolved.name.is_none() {
+                        resolved.name = symbol.name().map(|n| n.to_string());
+                    }
+                    if resolved.filename.is_none() {
+                        resolved.filename =
+                            symbol.filename().map(|p| p.display().to_string());
+                    }
+                    if resolved.lineno.is_none() {
+                        resolved.lineno = symbol.lineno();
+                    }
+                });
+                frames.push(resolved);
+            }
+            results.push(ThreadBacktrace {
+                mach_port: port,
+                symbols: frames,
+                responded: true,
+            });
+        }
+
+        // Clear slot mach ports so a stale signal arriving after this
+        // dump completes (e.g., from a thread that woke up post-deadline)
+        // doesn't write into a slot the next dump round may have re-keyed.
+        for i in 0..n {
+            // SAFETY: The dump is over; no handler should be running
+            // against these slots. Even if a late handler arrives, the
+            // mach_port=0 store makes find_slot_for_mach_port return None.
+            unsafe {
+                (*COLLECTOR.slots[i].get())
+                    .mach_port
+                    .store(0, Ordering::Release);
+            }
+        }
+
+        results
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn dump_thread_stacks_linux(label: &str) {
     use std::fmt::Write as _;
@@ -686,20 +1078,34 @@ fn dump_thread_stacks_linux(label: &str) {
     cleanup_old_stall_dumps();
 }
 
-/// Dump thread info on macOS using Mach APIs and `std::backtrace`.
+/// Dump thread info on macOS using Mach APIs, `pthread_kill(SIGUSR2)`, and
+/// in-process libunwind via the `backtrace` crate.
 ///
-/// Enumerates all threads via `task_threads()`, retrieves thread names
-/// via `pthread_from_mach_thread_np` + `pthread_getname_np`, and collects
-/// CPU usage and run state from `thread_info(THREAD_BASIC_INFO)`.
+/// Pipeline:
+/// 1. Enumerate all threads in this task via `task_threads()`.
+/// 2. For each thread, look up its `pthread_t` (for signaling),
+///    `pthread_getname_np` (for the dump label), and
+///    `thread_info(THREAD_BASIC_INFO)` (for CPU usage / run state).
+/// 3. Capture the calling thread's backtrace synchronously via
+///    `std::backtrace::Backtrace::force_capture()` (we already own it,
+///    no need to signal ourselves).
+/// 4. Send `SIGUSR2` to every other thread via `pthread_kill`. Each
+///    signal handler captures its own raw IPs into a pre-allocated slot
+///    (see [`signal_dumper_macos`]).
+/// 5. Wait up to 5s for handlers to complete, then resolve symbols off
+///    the handler thread (resolve() allocates and is not signal-safe).
+/// 6. Format everything to `/tmp/nativelink-stall-<ts>.txt` and clean
+///    up old dump files.
 ///
-/// The calling thread's Rust backtrace is captured via
-/// `std::backtrace::Backtrace::force_capture()`. For full userspace
-/// stack traces of all threads, the `sample` command is invoked (the
-/// macOS equivalent of `eu-stack`).
+/// This is the macOS analog of [`dump_thread_stacks_linux`]. The
+/// previous implementation invoked `sample(1)`; it was removed in
+/// commit f6779f3a because `sample` whole-process suspended the target
+/// for 30s and put workers into runtime-starvation feedback loops.
 #[cfg(target_os = "macos")]
 fn dump_thread_stacks_macos(label: &str) {
     use std::fmt::Write as _;
 
+    let start = std::time::Instant::now();
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -714,41 +1120,58 @@ fn dump_thread_stacks_macos(label: &str) {
     let _ = writeln!(output, "PID: {pid}");
     let _ = writeln!(output);
 
-    // Capture the calling thread's backtrace (typically the runtime-watchdog
-    // or a tokio worker that triggered the stall guard).
-    let bt = std::backtrace::Backtrace::force_capture();
+    // Capture the calling thread's backtrace synchronously. We are the
+    // dump driver, so we already have the right context — no need to
+    // signal ourselves (and async-profiler-style self-signal would race
+    // with the slot bookkeeping).
+    let calling_bt = std::backtrace::Backtrace::force_capture();
     let _ = writeln!(output, "=== Calling thread backtrace ===");
-    let _ = writeln!(output, "{bt}");
+    let _ = writeln!(output, "{calling_bt}");
     let _ = writeln!(output);
 
-    // Enumerate threads via Mach APIs
-    enumerate_mach_threads(&mut output);
+    // Per-thread enumeration + signal dispatch + formatting all happen
+    // inside enumerate_mach_threads_with_backtraces. It owns the mach
+    // port lifetimes, which is important: ports must remain live until
+    // after pthread_kill, then deallocated.
+    let (responded, total, capture_elapsed) =
+        enumerate_mach_threads_with_backtraces(&mut output);
+
+    let total_elapsed = start.elapsed();
+    let _ = writeln!(
+        output,
+        "=== Dump complete: {responded}/{total} threads responded, capture: {capture_elapsed:.1?}, total: {total_elapsed:.1?} ===",
+    );
 
     match std::fs::write(&path, &output) {
-        Ok(()) => eprintln!("Thread dump written to {path}"),
+        Ok(()) => eprintln!(
+            "Thread dump written to {path} ({responded}/{total} threads, {total_elapsed:.1?})",
+        ),
         Err(err) => eprintln!("Failed to write thread dump to {path}: {err}"),
     }
-
-    // Intentionally do NOT invoke macOS `sample` here. Empirically (worker-02,
-    // 2026-04-25) `sample <pid> 1 -mayDie` against this binary fails to
-    // complete within 30s in ~80% of attempts, and during that window it
-    // suspends the entire target process (sample uses task_for_pid + per-
-    // thread suspend/resume; on a busy multi-threaded program the round trip
-    // can wedge). The result was every dump turning into a 33s whole-process
-    // freeze that the runtime-watchdog then re-flagged as a stall, generating
-    // more dumps in a feedback loop. Mach thread enumeration above gives
-    // names + states + per-thread CPU without suspending; that's enough for
-    // diagnosis. Re-enable sample only if it can be made non-suspending and
-    // bounded, or replaced with an in-process unwinder (e.g. `backtrace` per
-    // thread via a signal handler).
 
     cleanup_old_stall_dumps();
 }
 
-/// Enumerate all threads in the current task using Mach APIs and write
-/// their names and basic info to the output buffer.
+/// Enumerate all threads in the current task using Mach APIs, dispatch
+/// per-thread backtrace capture via SIGUSR2, and write the formatted
+/// output (per-thread name + run state + CPU + backtrace) to `output`.
+///
+/// Returns `(responded, total, capture_elapsed)` where:
+/// - `responded` is the number of non-calling threads that produced a
+///   backtrace before the 5s outer timeout.
+/// - `total` is the total Mach-enumerated thread count (including the
+///   calling thread).
+/// - `capture_elapsed` is the wall-clock spent inside
+///   [`signal_dumper_macos::capture_all_backtraces`].
+///
+/// Thread-port lifetime: Mach allocates a send right per thread on
+/// `task_threads()`. We must hold the right until after `pthread_kill`,
+/// then deallocate. We therefore deallocate at function exit, after the
+/// signal round trip.
 #[cfg(target_os = "macos")]
-fn enumerate_mach_threads(output: &mut String) {
+fn enumerate_mach_threads_with_backtraces(
+    output: &mut String,
+) -> (usize, usize, core::time::Duration) {
     use std::fmt::Write as _;
 
     // Mach types and constants
@@ -772,7 +1195,7 @@ fn enumerate_mach_threads(output: &mut String) {
         user_time_usec: i32,
         system_time_sec: i32,
         system_time_usec: i32,
-        cpu_usage: i32,   // scaled to TH_USAGE_SCALE (1000)
+        cpu_usage: i32, // scaled to TH_USAGE_SCALE (1000)
         policy: i32,
         run_state: i32,
         flags: i32,
@@ -794,7 +1217,11 @@ fn enumerate_mach_threads(output: &mut String) {
             count: *mut u32,
         ) -> KernReturn;
         // Returns the pthread_t for the given Mach thread port, or 0 if
-        // the port does not correspond to a known pthread.
+        // the port does not correspond to a known pthread. This is a
+        // private-but-stable API exposed by Apple's pthread library and
+        // documented in the open-sourced Libc / libpthread sources. It
+        // is what async-profiler, sample(1), and lldb all use under the
+        // hood; safe to call outside a signal handler.
         fn pthread_from_mach_thread_np(thread: MachPort) -> libc::pthread_t;
         fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
         fn vm_deallocate(task: MachPort, address: usize, size: usize) -> KernReturn;
@@ -807,23 +1234,49 @@ fn enumerate_mach_threads(output: &mut String) {
     let kr = unsafe { task_threads(task, &mut thread_list, &mut thread_count) };
     if kr != KERN_SUCCESS {
         let _ = writeln!(output, "Failed to enumerate threads: mach error {kr}");
-        return;
+        return (0, 0, core::time::Duration::ZERO);
     }
 
     let _ = writeln!(output, "Thread count: {thread_count}");
     let _ = writeln!(output);
 
+    // SAFETY: Mach guarantees the returned thread_list is valid for
+    // thread_count entries until we vm_deallocate it.
     let threads =
         unsafe { core::slice::from_raw_parts(thread_list, thread_count as usize) };
 
-    for (idx, &thread_port) in threads.iter().enumerate() {
-        let _ = write!(output, "--- Thread {idx} (mach port {thread_port}) ---");
+    // Pre-collect (port, pthread_t, name, info) for every enumerated
+    // thread. We need pthread_t to call pthread_kill, so do this BEFORE
+    // signaling. pthread_from_mach_thread_np is safe to call here (we
+    // are not in a signal handler).
+    struct EnumeratedThread {
+        port: MachPort,
+        pthread: libc::pthread_t,
+        name: String,
+        info: Option<ThreadBasicInfo>,
+        info_kr: KernReturn,
+    }
 
-        // Get thread name via pthread. pthread_from_mach_thread_np returns
-        // 0 (null pthread_t) if the Mach thread has no associated pthread.
+    // SAFETY: mach_thread_self() returns the calling thread's mach
+    // port. We use this port number to identify which slot belongs to
+    // us (so the dispatcher does not signal itself). See the
+    // signal_dumper_macos handler for the deprecation rationale.
+    #[allow(deprecated)]
+    let self_port = unsafe { libc::mach_thread_self() };
+
+    let mut enumerated = Vec::with_capacity(thread_count as usize);
+    let mut signal_targets: Vec<(MachPort, libc::pthread_t)> =
+        Vec::with_capacity(thread_count as usize);
+
+    for &thread_port in threads {
+        // SAFETY: pthread_from_mach_thread_np is safe outside signal
+        // handlers; it walks the pthread library's bookkeeping.
         let pthread = unsafe { pthread_from_mach_thread_np(thread_port) };
+        let mut name = String::new();
         if pthread != 0 {
             let mut name_buf = [0u8; 64];
+            // SAFETY: pthread is valid (returned by libpthread API),
+            // name_buf is a valid mutable pointer of length 64.
             let ret = unsafe {
                 libc::pthread_getname_np(
                     pthread,
@@ -832,20 +1285,18 @@ fn enumerate_mach_threads(output: &mut String) {
                 )
             };
             if ret == 0 {
-                let name = std::ffi::CStr::from_bytes_until_nul(&name_buf)
-                    .map(|c| c.to_string_lossy())
-                    .unwrap_or_default();
-                if !name.is_empty() {
-                    let _ = write!(output, "  name: {name}");
+                if let Ok(c) = core::ffi::CStr::from_bytes_until_nul(&name_buf) {
+                    name = c.to_string_lossy().into_owned();
                 }
             }
         }
-        let _ = writeln!(output);
 
-        // Get thread basic info (CPU time, run state)
         let mut info = ThreadBasicInfo::default();
         let mut count = THREAD_BASIC_INFO_COUNT;
-        let kr = unsafe {
+        // SAFETY: thread_port is a live mach port (we received it from
+        // task_threads and have not deallocated). info points to a
+        // properly sized stack-local struct.
+        let info_kr = unsafe {
             thread_info(
                 thread_port,
                 THREAD_BASIC_INFO,
@@ -853,11 +1304,60 @@ fn enumerate_mach_threads(output: &mut String) {
                 &mut count,
             )
         };
-        if kr == KERN_SUCCESS {
+
+        // Only add to signal_targets if we have a valid pthread AND the
+        // thread is not the calling (collector) thread. pthread==0 means
+        // the Mach thread has no associated pthread (e.g., kernel-only
+        // helper) — we cannot pthread_kill it.
+        if pthread != 0 && thread_port != self_port {
+            signal_targets.push((thread_port, pthread));
+        }
+
+        enumerated.push(EnumeratedThread {
+            port: thread_port,
+            pthread,
+            name,
+            info: if info_kr == KERN_SUCCESS {
+                Some(info)
+            } else {
+                None
+            },
+            info_kr,
+        });
+    }
+
+    // Dispatch SIGUSR2 to all eligible threads, wait for handlers, and
+    // resolve the captured IPs. capture_all_backtraces filters out
+    // self_port a second time as a defense in depth, but we already
+    // filtered above so the cost is negligible.
+    let capture_start = std::time::Instant::now();
+    let backtraces =
+        signal_dumper_macos::capture_all_backtraces(&signal_targets, self_port);
+    let capture_elapsed = capture_start.elapsed();
+
+    let bt_map: std::collections::HashMap<MachPort, &signal_dumper_macos::ThreadBacktrace> =
+        backtraces.iter().map(|bt| (bt.mach_port, bt)).collect();
+
+    let responded = backtraces.iter().filter(|bt| bt.responded).count();
+
+    for (idx, et) in enumerated.iter().enumerate() {
+        let is_self = et.port == self_port;
+        let label = if is_self { " [calling thread]" } else { "" };
+        let _ = write!(
+            output,
+            "--- Thread {idx} (mach port {}){label}",
+            et.port,
+        );
+        if !et.name.is_empty() {
+            let _ = write!(output, "  name: {}", et.name);
+        }
+        let _ = writeln!(output);
+
+        if let Some(info) = &et.info {
             let user_ms =
                 i64::from(info.user_time_sec) * 1000 + i64::from(info.user_time_usec) / 1000;
-            let sys_ms = i64::from(info.system_time_sec) * 1000
-                + i64::from(info.system_time_usec) / 1000;
+            let sys_ms =
+                i64::from(info.system_time_sec) * 1000 + i64::from(info.system_time_usec) / 1000;
             let state_str = match info.run_state {
                 TH_STATE_RUNNING => "running",
                 TH_STATE_STOPPED => "stopped",
@@ -872,18 +1372,60 @@ fn enumerate_mach_threads(output: &mut String) {
                 f64::from(info.cpu_usage) / 10.0,
                 info.suspend_count,
             );
+        } else {
+            let _ = writeln!(output, "  thread_info failed: mach error {}", et.info_kr);
         }
 
-        // Deallocate the thread port send right
-        unsafe {
-            mach_port_deallocate(task, thread_port);
+        // Userspace backtrace: calling thread's bt is already in the
+        // file header; non-calling threads come from the cooperative
+        // signal capture; threads without a pthread are unsignalable.
+        if is_self {
+            let _ = writeln!(output, "  userspace backtrace: see calling-thread section above");
+        } else if et.pthread == 0 {
+            let _ = writeln!(
+                output,
+                "  userspace backtrace: <skipped — no pthread for this Mach thread>"
+            );
+        } else if let Some(bt) = bt_map.get(&et.port) {
+            if !bt.responded {
+                let _ = writeln!(output, "  userspace backtrace: <no response within timeout>");
+            } else if bt.symbols.is_empty() {
+                let _ = writeln!(output, "  userspace backtrace: <empty>");
+            } else {
+                let _ = writeln!(output, "  userspace backtrace:");
+                for (i, frame) in bt.symbols.iter().enumerate() {
+                    let name = frame.name.as_deref().unwrap_or("<unknown>");
+                    if let (Some(file), Some(line)) =
+                        (frame.filename.as_ref(), frame.lineno)
+                    {
+                        let _ = writeln!(output, "    #{i:>3} {:#018x} {name}", frame.ip);
+                        let _ = writeln!(output, "         at {file}:{line}");
+                    } else {
+                        let _ = writeln!(output, "    #{i:>3} {:#018x} {name}", frame.ip);
+                    }
+                }
+            }
+        } else {
+            let _ = writeln!(output, "  userspace backtrace: <not dispatched>");
         }
 
         let _ = writeln!(output);
     }
 
+    // Deallocate per-thread send rights AFTER capture_all_backtraces
+    // returns. Premature deallocation would race with pthread_kill.
+    for et in &enumerated {
+        // SAFETY: Each port was returned by task_threads with a refcount
+        // of 1; matching deallocate is required.
+        unsafe {
+            mach_port_deallocate(task, et.port);
+        }
+    }
+
     // Deallocate the thread list memory (allocated by Mach)
     if !thread_list.is_null() && thread_count > 0 {
+        // SAFETY: thread_list and thread_count came from task_threads;
+        // matching vm_deallocate is required.
         unsafe {
             vm_deallocate(
                 task,
@@ -892,6 +1434,8 @@ fn enumerate_mach_threads(output: &mut String) {
             );
         }
     }
+
+    (responded, thread_count as usize, capture_elapsed)
 }
 
 /// Maximum number of stall dump file pairs to retain. Older dumps are
