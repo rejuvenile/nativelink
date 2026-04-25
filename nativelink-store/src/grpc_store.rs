@@ -1450,33 +1450,17 @@ impl GrpcStore {
                     local_state.last_frame_at = std::time::Instant::now();
                     let length = data.len() as i64;
                     if length == 0 {
-                        // BUG NOTE: 0-byte successful responses from workers
-                        //
-                        // When a worker's store layer has a digest in its
-                        // existence cache but the actual blob data was evicted,
-                        // get_part() may send EOF without any data. The
-                        // ByteStream server produces a successful empty gRPC
-                        // stream (0 ReadResponse messages). On the client side,
-                        // read_internal() calls message().await which returns
-                        // Ok(None), and FirstStream yields an empty stream.
-                        // We land here having written 0 bytes in this stream
-                        // attempt — a silent data loss.
-                        //
-                        // If no bytes were received in this stream attempt,
-                        // this is almost certainly a stale worker response,
-                        // not a legitimate empty blob. Return a retryable
-                        // error. This correctly handles retries at offset > 0.
-                        if local_state.bytes_received_this_stream == 0 {
-                            return Some((
-                                RetryResult::Retry(make_err!(
-                                    Code::NotFound,
-                                    "GrpcStore: ByteStream returned 0 bytes \
-                                     for non-empty blob (stale worker data?) — \
-                                     not found in remote store"
-                                )),
-                                local_state,
-                            ));
-                        }
+                        // 0-byte chunk == EOF marker from the server. Source
+                        // sides are now responsible for rejecting non-zero
+                        // digests with empty data at insert time (see
+                        // fast_slow_store.rs::insert_mirror_blob and the
+                        // defensive guards in get_part for mirror_blobs +
+                        // in_flight_slow_writes). The previous workaround
+                        // here that translated empty-stream into a retryable
+                        // NotFound was a downstream symptom-catcher; with
+                        // the source-side invariants in place an empty
+                        // stream genuinely means "blob is empty" and we
+                        // forward EOF without inferring stale-worker.
                         let eof_result = local_state
                             .writer
                             .send_eof()

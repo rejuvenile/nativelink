@@ -677,6 +677,29 @@ impl FastSlowStore {
     /// the mirror succeeded.
     fn insert_mirror_blob(&self, digest: DigestInfo, data: Bytes) -> Result<(), Error> {
         let data_len = data.len() as u64;
+        // LOAD-BEARING INVARIANT: mirror_blobs entries MUST satisfy
+        // data.len() == digest.size_bytes() because the read path slices by
+        // offset/length without re-validating, and serves Ok+EOF (no NotFound)
+        // when offset >= data.len(). An entry with data.len() < digest.size_bytes()
+        // for a non-zero digest produces a 0-byte successful gRPC stream that
+        // the grpc_store.rs:1453 workaround was previously catching by inferring
+        // "stale worker." With this guard the bug is observable here at the
+        // source instead of propagating silently across the network.
+        let expected = digest.size_bytes();
+        if data_len != expected {
+            warn!(
+                %digest,
+                data_len,
+                expected_size = expected,
+                "insert_mirror_blob: rejected — data size does not match digest \
+                 (would create a phantom positive that produces 0-byte streams)"
+            );
+            return Err(make_err!(
+                Code::Internal,
+                "insert_mirror_blob: data.len()={data_len} != digest.size_bytes()={expected} \
+                 for {digest}"
+            ));
+        }
         let now = Instant::now();
         // Single critical section across blobs + change tracker so an
         // intervening drain/snapshot cannot split the bookkeeping for one
@@ -2608,6 +2631,28 @@ impl StoreDriver for FastSlowStore {
             let digest = key.borrow().into_digest();
             let maybe_data = self.mirror_blobs.lock().get(&digest).map(|(d, _)| d.clone());
             if let Some(data) = maybe_data {
+                // Defensive guard against a phantom-positive entry: by the
+                // insert_mirror_blob invariant, data.len() must equal
+                // digest.size_bytes(). If it doesn't (corrupted/legacy entry),
+                // remove it and return NotFound so the caller routes to a
+                // different source — better than silently serving Ok+EOF
+                // (the grpc_store.rs:1469 workaround's trigger pattern).
+                let expected = digest.size_bytes() as usize;
+                if data.len() != expected {
+                    warn!(
+                        %digest,
+                        data_len = data.len(),
+                        expected_size = expected,
+                        "mirror_blobs entry size mismatch — removing phantom + returning NotFound"
+                    );
+                    self.mirror_blobs.lock().remove(&digest);
+                    return Err(make_err!(
+                        Code::NotFound,
+                        "mirror_blobs entry for {digest} had wrong size \
+                         ({} != {expected}) — entry removed",
+                        data.len()
+                    ));
+                }
                 let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
                 if offset_usize < data.len() {
                     let end = length
@@ -2693,6 +2738,29 @@ impl StoreDriver for FastSlowStore {
             let maybe_chunks = self.in_flight_slow_writes.lock().get(&owned_key).cloned();
             if let Some(chunks) = maybe_chunks {
                 let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+                // Defensive guard analogous to the mirror_blobs branch above:
+                // for a non-zero digest, the in-flight entry MUST sum to the
+                // digest's full size — it's a snapshot of the chunks just
+                // written to the fast store. If it's short, prefer NotFound
+                // over silently serving an empty/truncated stream.
+                if let StoreKey::Digest(d) = key.borrow() {
+                    let expected = d.size_bytes() as usize;
+                    if total_len != expected {
+                        warn!(
+                            digest = %d,
+                            total_len,
+                            expected_size = expected,
+                            "in_flight entry size mismatch — returning NotFound \
+                             instead of serving short stream"
+                        );
+                        self.in_flight_slow_writes.lock().remove(&owned_key);
+                        return Err(make_err!(
+                            Code::NotFound,
+                            "in_flight_slow_writes entry for {d} had wrong total \
+                             size ({total_len} != {expected}) — entry removed"
+                        ));
+                    }
+                }
                 let offset_usize = usize::try_from(offset)
                     .err_tip(|| "Could not convert offset to usize")?;
                 let end = length
