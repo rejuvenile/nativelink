@@ -845,7 +845,11 @@ async fn test_sentinel_connect_with_url_specified_master() {
             "redis+sentinel://127.0.0.1:{port}/?sentinelServiceName=specific_master"
         )],
         mode: RedisMode::Sentinel,
-        connection_timeout_ms: 100,
+        // Was 100ms — too tight for cold cargo cache. The other sentinel
+        // tests use 5_000ms; this test exists to verify URL-based
+        // master-name parsing, not to enforce a connect-timeout cap.
+        // See testing-czar FLAKY-TESTS in the valkey-pool-521c13d1 review.
+        connection_timeout_ms: 5_000,
         ..Default::default()
     };
     RedisStore::new_standard(spec).await.expect("Working spec");
@@ -1424,8 +1428,12 @@ fn pool_connect_func() -> Box<
 
 #[nativelink_test]
 async fn connection_pool_size_creates_n_connections() -> Result<(), Error> {
-    let manager =
-        StandardRedisManager::new_with_pool_size(pool_connect_func(), 5).await?;
+    let manager = timeout(
+        Duration::from_secs(5),
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), 5),
+    )
+    .await
+    .expect("pool init must not deadlock — connect contract violated")?;
     assert_eq!(
         manager.pool_size(),
         5,
