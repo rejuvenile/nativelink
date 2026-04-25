@@ -1707,6 +1707,79 @@ async fn pick_slot_concurrent_distribution_under_stampede() -> Result<(), Error>
     Ok(())
 }
 
+/// `try_join_all` semantics: if any one of the parallel dials fails,
+/// the entire `new_with_pool_size` future resolves to Err with that
+/// failure's details. Per testing-czar MISSING-COVERAGE #6.
+///
+/// We construct a connect_func that succeeds twice and fails the third
+/// time (simulating, for example, a partial DNS resolution failure on
+/// the third address attempt). With `pool_size: 3`, the constructor
+/// must return Err containing the simulated failure tip.
+///
+/// Mutation: change `try_join_all` to `join_all` (which collects all
+/// results regardless of failure). The `new_with_pool_size` would then
+/// silently swallow the failure (panic on the unwrap inside the map
+/// closure if there were any). Test asserts Err return AND the error
+/// tip — wrong-error-with-Err would not pass.
+#[nativelink_test]
+async fn pool_partial_dial_failure_returns_err_fast() -> Result<(), Error> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let attempt_counter = Arc::new(AtomicUsize::new(0));
+
+    let counter_for_closure = Arc::clone(&attempt_counter);
+    let connect_func: Box<
+        dyn Fn() -> core::pin::Pin<
+                Box<dyn Future<Output = Result<MockRedisConnection, Error>> + Send>,
+            > + Send
+            + Sync,
+    > = Box::new(move || {
+        let counter = Arc::clone(&counter_for_closure);
+        Box::pin(async move {
+            let attempt_idx = counter.fetch_add(1, Ordering::SeqCst);
+            // Fail the THIRD attempt (index 2). Note: try_join_all spawns
+            // all N futures concurrently, so the order in which the
+            // counter sees them is racy — what matters is that ONE attempt
+            // fails out of N.
+            if attempt_idx == 2 {
+                Err(make_err!(
+                    Code::Unavailable,
+                    "simulated dial failure on attempt 2 (test partial-failure semantics)"
+                ))
+            } else {
+                Ok(MockRedisConnection::new(vec![MockCmd::new(
+                    redis::cmd("SCRIPT").arg("LOAD").arg(LUA_VERSION_SET_SCRIPT),
+                    Ok(Value::SimpleString(
+                        "b22b9926cbce9dd9ba97fa7ba3626f89feea1ed5".to_owned(),
+                    )),
+                )]))
+            }
+        })
+    });
+
+    let result = timeout(
+        Duration::from_secs(5),
+        StandardRedisManager::new_with_pool_size(connect_func, 3),
+    )
+    .await
+    .expect("partial-failure test must not deadlock — try_join_all contract");
+
+    let err = result.expect_err(
+        "new_with_pool_size must return Err when any single dial in the parallel \
+         try_join_all fails — got Ok",
+    );
+    let err_message_join: String = err
+        .messages
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        err_message_join.contains("simulated dial failure"),
+        "expected to see propagated dial-failure tip in error messages; got {err:?}"
+    );
+    Ok(())
+}
+
 /// Cluster mode does NOT honor `connection_pool_size` — `redis-rs`
 /// maintains its own per-node connection routing internally
 /// (`ClusterRedisManager` wraps a single `ClusterConnection`). This test
