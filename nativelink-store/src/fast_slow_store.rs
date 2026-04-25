@@ -2783,7 +2783,14 @@ impl StoreDriver for FastSlowStore {
                     "fast store miss, falling through to slow store"
                 );
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // Non-NotFound err OR NotFound-with-partial-bytes: terminate
+                // the writer before returning so callers (e.g. VerifyStore's
+                // tokio::join! over a tx/rx pair) don't deadlock awaiting
+                // EOF/error.
+                writer.send_error(err.clone());
+                return Err(err);
+            }
         }
 
         // Check in-flight slow writes: the blob may have been evicted from the
@@ -3072,6 +3079,10 @@ impl StoreDriver for FastSlowStore {
                         // prior `loader.get_or_try_init(populate).await?`
                         // behavior so existing failpoint tests and
                         // user-visible error contracts hold.
+                        // Terminate the writer before returning so callers
+                        // (e.g. VerifyStore's tokio::join! over a tx/rx
+                        // pair) don't deadlock awaiting EOF/error.
+                        writer.send_error(err.clone());
                         return Err(err).err_tip(|| {
                             "populate failed for the requesting caller"
                         });
