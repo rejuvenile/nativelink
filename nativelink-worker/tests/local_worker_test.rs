@@ -65,6 +65,23 @@ use utils::mock_running_actions_manager::MockRunningAction;
 
 const INSTANCE_NAME: &str = "foo";
 
+/// Asserts that the captured `ConnectWorkerRequest` matches the default
+/// shape (no properties, empty endpoint, etc.) IGNORING the worker's
+/// `boot_epoch_id`. The epoch is process-lifetime random per #141 so
+/// it cannot be hard-coded; the test still verifies it is populated
+/// (non-zero).
+fn assert_default_connect_request(actual: ConnectWorkerRequest) {
+    assert_ne!(
+        actual.boot_epoch_id, 0,
+        "worker must populate boot_epoch_id (#141)"
+    );
+    let stripped = ConnectWorkerRequest {
+        boot_epoch_id: 0,
+        ..actual
+    };
+    assert_eq!(stripped, ConnectWorkerRequest::default());
+}
+
 /// Get temporary path from either `TEST_TMPDIR` or best effort temp directory if
 /// not set.
 fn make_temp_path(data: &str) -> String {
@@ -104,6 +121,14 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
     connect_worker_request
         .properties
         .sort_by_key(Message::encode_to_vec);
+    // boot_epoch_id is generated lazily at process start (#141) and
+    // therefore non-zero. Verify it then strip it before comparing to
+    // the structural expected request.
+    assert_ne!(
+        connect_worker_request.boot_epoch_id, 0,
+        "worker must populate boot_epoch_id (#141)"
+    );
+    connect_worker_request.boot_epoch_id = 0;
     assert_eq!(
         connect_worker_request,
         ConnectWorkerRequest {
@@ -128,6 +153,7 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
             ],
             max_inflight_tasks: 0,
             cas_endpoint: String::new(),
+            boot_epoch_id: 0,
         }
     );
 
@@ -145,7 +171,7 @@ async fn reconnect_on_server_disconnect_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     // Disconnect our grpc stream.
@@ -158,7 +184,7 @@ async fn reconnect_on_server_disconnect_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     Ok(())
@@ -175,7 +201,7 @@ async fn kill_all_called_on_disconnect() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     // Handle registration (kill_all not called unless registered).
@@ -214,7 +240,7 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -309,7 +335,7 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -773,7 +799,7 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -864,7 +890,7 @@ async fn kill_action_request_kills_action() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -966,7 +992,7 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -1087,7 +1113,7 @@ async fn cas_not_found_translation_preserves_details_test() -> Result<(), Error>
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -1232,7 +1258,7 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -1351,7 +1377,7 @@ async fn worker_translates_not_found_to_failed_precondition_test() -> Result<(),
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -1523,7 +1549,7 @@ async fn peer_hints_passed_to_action_manager_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -1644,7 +1670,7 @@ async fn empty_peer_hints_action_starts_normally_test() -> Result<(), Error> {
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
@@ -1784,7 +1810,7 @@ async fn multiple_peer_hints_with_multiple_endpoints_test() -> Result<(), Error>
             .client
             .expect_connect_worker(Ok(streaming_response))
             .await;
-        assert_eq!(props, ConnectWorkerRequest::default());
+        assert_default_connect_request(props);
     }
 
     let expected_worker_id = "foobar".to_string();
