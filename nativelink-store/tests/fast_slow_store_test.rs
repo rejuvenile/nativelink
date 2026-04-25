@@ -2644,3 +2644,363 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_populator_notfound()
 
     Ok(())
 }
+
+/// Sibling-bug regression: when `VerifyStore` wraps `FastSlowStore`, a
+/// `mirror_blobs` size-mismatch early return in `FastSlowStore::get_part`
+/// (the `data.len() != digest.size_bytes()` defensive guard) returns
+/// `Err(NotFound)` WITHOUT terminating the borrowed `tx`, deadlocking
+/// `VerifyStore::get_part`'s `tokio::join!(get_fut, check_fut)` on
+/// `rx.recv()`. Same mechanism as the populator-NotFound case fixed in
+/// commit a384e2e8; this regression test guards the sibling site at
+/// `fast_slow_store.rs` ~2657.
+#[nativelink_test]
+async fn verify_store_around_fast_slow_does_not_deadlock_on_mirror_blobs_size_mismatch()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_config::stores::VerifySpec;
+    use nativelink_store::verify_store::VerifyStore;
+    use nativelink_util::store_trait::Store;
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+
+    // Install a phantom-positive mirror entry: digest claims 100 bytes,
+    // but stored data is only 5 bytes. The defensive guard at the top
+    // of `get_part` notices the mismatch, removes the entry, and
+    // returns `Err(NotFound)` — the early return that pre-fix did
+    // NOT terminate the writer.
+    fast_slow_store.test_insert_mirror_blob_unchecked(
+        digest,
+        Bytes::from_static(b"short"),
+    );
+
+    let verify_store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(fast_slow_store),
+    );
+
+    let timed = tokio::time::timeout(
+        Duration::from_secs(5),
+        verify_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — mirror_blobs size mismatch: \
+         FastSlowStore::get_part early-returned Err(NotFound) but did \
+         not terminate the writer, so VerifyStore's tokio::join! over \
+         the tx/rx pair blocks forever on rx.recv()",
+    );
+
+    let err = timed.err().expect("expected NotFound, not Ok");
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "expected NotFound from mirror_blobs size-mismatch path, got: {err:?}",
+    );
+
+    Ok(())
+}
+
+/// Sibling-bug regression: when `VerifyStore` wraps `FastSlowStore`, a
+/// fast-store truncation early return in `FastSlowStore::get_part`
+/// (`bytes_written < expected_size && offset == 0 && length.is_none()`)
+/// returns `Err(Internal)` WITHOUT calling `writer.send_error`, leaving
+/// any bytes already-written orphaned in the channel and deadlocking
+/// `VerifyStore::get_part`'s `tokio::join!(get_fut, check_fut)` because
+/// the writer's `tx` was borrowed from the outer scope and is never
+/// dropped. Same mechanism as the populator-NotFound case; this guards
+/// the sibling site at `fast_slow_store.rs` ~2719.
+///
+/// Subtle: bytes WERE sent into the writer before the truncation was
+/// detected. Calling `send_error` is still correct — the receiver
+/// observes the structured Internal error rather than an
+/// ambiguously-truncated stream.
+///
+/// Reproducer requires a fast store that sends partial bytes and
+/// returns `Ok(())` WITHOUT sending EOF. `MemoryStore` always sends
+/// EOF on Ok return, which would mask the deadlock; so we use a
+/// `TruncatingFastStore` test fake. In production this corresponds
+/// to a producer (e.g. peer-fetch path) that returns Ok but with
+/// fewer bytes than the digest claims and does not terminate the
+/// writer cleanly — the FastSlowStore guard then early-returns Err
+/// without terminating the writer, deadlocking the VerifyStore join.
+#[nativelink_test]
+async fn verify_store_around_fast_slow_does_not_deadlock_on_fast_store_truncation()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_config::stores::VerifySpec;
+    use nativelink_store::verify_store::VerifyStore;
+    use nativelink_util::store_trait::Store;
+
+    /// Fast store that sends fewer bytes than the digest claims and
+    /// returns `Ok(())` WITHOUT calling `writer.send_eof()`. Triggers
+    /// the FastSlowStore truncation guard at line ~2719 with the
+    /// writer in an un-terminated state.
+    #[derive(MetricsComponent)]
+    struct TruncatingFastStore {
+        truncated_payload: Bytes,
+    }
+
+    #[async_trait]
+    impl StoreDriver for TruncatingFastStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            // Report present so callers (if they probe) think this
+            // store has the blob; not strictly needed for get_part
+            // but mirrors the production fast-store invariant.
+            for r in results.iter_mut().take(digests.len()) {
+                *r = Some(self.truncated_payload.len() as u64);
+            }
+            Ok(())
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            _digest: StoreKey<'_>,
+            _reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            _size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            _key: StoreKey<'_>,
+            writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> Result<(), Error> {
+            // Send the truncated payload but do NOT send EOF. Returning
+            // Ok(()) here lets FastSlowStore's `Ok` arm execute the
+            // bytes_written < expected_size truncation guard. The
+            // writer's tx remains alive; the paired reader (inside
+            // VerifyStore's join!) blocks forever on rx.recv() unless
+            // the early return calls writer.send_error.
+            writer
+                .send(self.truncated_payload.clone())
+                .await
+                .err_tip(|| "TruncatingFastStore: send failed")?;
+            Ok(())
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    default_health_status_indicator!(TruncatingFastStore);
+
+    // Digest claims 100 bytes; fast store sends only 50.
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+    let truncated = Bytes::from(vec![0xAB_u8; 50]);
+
+    let fast_store = Store::new(Arc::new(TruncatingFastStore {
+        truncated_payload: truncated.clone(),
+    }));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+
+    let verify_store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(fast_slow_store),
+    );
+
+    let timed = tokio::time::timeout(
+        Duration::from_secs(5),
+        verify_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — fast_store truncation: \
+         FastSlowStore::get_part early-returned Err(Internal) after \
+         partial write but did not terminate the writer, so VerifyStore's \
+         tokio::join! blocks forever on rx.recv()",
+    );
+
+    let err = timed.err().expect("expected Internal/DataLoss, not Ok");
+    assert!(
+        err.code == Code::Internal || err.code == Code::DataLoss,
+        "expected Internal or DataLoss from fast_store truncation path, got: {err:?}",
+    );
+
+    Ok(())
+}
+
+/// Sibling-bug regression: when `VerifyStore` wraps `FastSlowStore`, an
+/// `in_flight_slow_writes` size-mismatch early return in
+/// `FastSlowStore::get_part` returns `Err(NotFound)` WITHOUT terminating
+/// the borrowed `tx`, deadlocking `VerifyStore::get_part`'s
+/// `tokio::join!(get_fut, check_fut)` on `rx.recv()`. Same mechanism as
+/// the populator-NotFound case; this guards the sibling site at
+/// `fast_slow_store.rs` ~2775.
+#[nativelink_test]
+async fn verify_store_around_fast_slow_does_not_deadlock_on_in_flight_size_mismatch()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_config::stores::VerifySpec;
+    use nativelink_store::verify_store::VerifyStore;
+    use nativelink_util::store_trait::Store;
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Digest claims 100 bytes; install an in-flight entry whose chunks
+    // sum to only 12 bytes ("hello world!" is 12) so the size-mismatch
+    // guard fires.
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+    let owned_key: StoreKey<'static> = StoreKey::from(digest);
+    fast_slow_store
+        .test_insert_in_flight(owned_key, vec![Bytes::from_static(b"hello world!")]);
+
+    let verify_store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(fast_slow_store),
+    );
+
+    let timed = tokio::time::timeout(
+        Duration::from_secs(5),
+        verify_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — in_flight_slow_writes size mismatch: \
+         FastSlowStore::get_part early-returned Err(NotFound) but did \
+         not terminate the writer, so VerifyStore's tokio::join! over \
+         the tx/rx pair blocks forever on rx.recv()",
+    );
+
+    let err = timed.err().expect("expected NotFound, not Ok");
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "expected NotFound from in_flight size-mismatch path, got: {err:?}",
+    );
+
+    Ok(())
+}
+
+/// Sibling-bug regression: with `local_only_reads` enabled (worker
+/// public CAS server variant), a missing blob causes
+/// `FastSlowStore::get_part` to return `Err(NotFound)` WITHOUT
+/// terminating the borrowed `tx`, deadlocking
+/// `VerifyStore::get_part`'s `tokio::join!(get_fut, check_fut)` on
+/// `rx.recv()`. Same mechanism as the populator-NotFound case; this
+/// guards the sibling site at `fast_slow_store.rs` ~2831.
+#[nativelink_test]
+async fn verify_store_around_fast_slow_does_not_deadlock_on_local_only_reads()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_config::stores::VerifySpec;
+    use nativelink_store::verify_store::VerifyStore;
+    use nativelink_util::store_trait::Store;
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    )
+    .with_local_only_reads();
+
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+
+    let verify_store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(fast_slow_store),
+    );
+
+    let timed = tokio::time::timeout(
+        Duration::from_secs(5),
+        verify_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — local_only_reads NotFound: \
+         FastSlowStore::get_part early-returned Err(NotFound) but did \
+         not terminate the writer, so VerifyStore's tokio::join! over \
+         the tx/rx pair blocks forever on rx.recv()",
+    );
+
+    let err = timed.err().expect("expected NotFound, not Ok");
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "expected NotFound from local_only_reads path, got: {err:?}",
+    );
+
+    Ok(())
+}

@@ -388,6 +388,31 @@ impl FastSlowStore {
             .insert(key, (loader, streaming_inner));
     }
 
+    /// Test-only: insert a `mirror_blobs` entry without the size-validation
+    /// invariant that `insert_mirror_blob` enforces. Used by the
+    /// writer-termination regression tests to install a phantom-positive
+    /// (data.len() != digest.size_bytes()) entry and exercise the
+    /// `mirror_blobs` size-mismatch early return at `get_part`.
+    #[doc(hidden)]
+    pub fn test_insert_mirror_blob_unchecked(&self, digest: DigestInfo, data: Bytes) {
+        let now = Instant::now();
+        let data_len = data.len() as u64;
+        let mut blobs = self.mirror_blobs.lock();
+        if let Some((old, _)) = blobs.insert(digest, (data, now)) {
+            let old_len = old.len() as u64;
+            if data_len > old_len {
+                self.mirror_blobs_total_bytes
+                    .fetch_add(data_len - old_len, Ordering::Relaxed);
+            } else if old_len > data_len {
+                self.mirror_blobs_total_bytes
+                    .fetch_sub(old_len - data_len, Ordering::Relaxed);
+            }
+        } else {
+            self.mirror_blobs_total_bytes
+                .fetch_add(data_len, Ordering::Relaxed);
+        }
+    }
+
     /// Diagnostic / test-only counter: every `tokio::spawn` performed by the
     /// populate machinery in `spawn_populate_producer_with_role` increments
     /// this counter. The inline-fast-path in [`copy_slow_to_fast`] leaves
@@ -2654,12 +2679,21 @@ impl StoreDriver for FastSlowStore {
                     // and silently leave the server's locality_map pointing
                     // at this worker for a digest the worker has just discarded.
                     self.remove_mirror_blobs(&[digest]);
-                    return Err(make_err!(
+                    let err = make_err!(
                         Code::NotFound,
                         "mirror_blobs entry for {digest} had wrong size \
                          ({} != {expected}) — entry removed",
                         data.len()
-                    ));
+                    );
+                    // Terminate the writer with the structured error
+                    // BEFORE returning so a paired reader (e.g.
+                    // VerifyStore::get_part's tokio::join! over
+                    // (get_fut, check_fut)) unblocks instead of awaiting
+                    // bytes that never arrive. Same writer-termination
+                    // requirement as the populator-NotFound short-circuit
+                    // at line ~2922 (commit a384e2e8).
+                    writer.send_error(err.clone());
+                    return Err(err);
                 }
                 let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
                 if offset_usize < data.len() {
@@ -2716,10 +2750,23 @@ impl StoreDriver for FastSlowStore {
                     );
                     // Bytes were already written — we cannot fall through to slow store.
                     // Return an error so the caller retries the whole operation.
-                    return Err(make_err!(
+                    let err = make_err!(
                         Code::Internal,
                         "Fast store returned {bytes_written} bytes but expected {expected_size}"
-                    ));
+                    );
+                    // Subtle: the inner fast store may have returned
+                    // Ok(()) WITHOUT sending EOF (the canonical case
+                    // for an upstream that produced fewer bytes than
+                    // the digest claims and exited cleanly). The writer
+                    // is still live — without explicit termination, a
+                    // paired reader inside VerifyStore::get_part's
+                    // tokio::join! blocks forever on rx.recv(). Even
+                    // if the inner store DID send EOF, propagating the
+                    // structured Internal error here is preferable to
+                    // an ambiguously-truncated stream the receiver
+                    // would otherwise observe as a clean EOF.
+                    writer.send_error(err.clone());
+                    return Err(err);
                 }
                 self.metrics
                     .fast_store_hit_count
@@ -2772,11 +2819,17 @@ impl StoreDriver for FastSlowStore {
                                 self.in_flight_empty_notify.notify_waiters();
                             }
                         }
-                        return Err(make_err!(
+                        let err = make_err!(
                             Code::NotFound,
                             "in_flight_slow_writes entry for {d} had wrong total \
                              size ({total_len} != {expected}) — entry removed"
-                        ));
+                        );
+                        // Terminate the writer with the structured error
+                        // BEFORE returning. Same writer-termination
+                        // requirement as the populator-NotFound
+                        // short-circuit at line ~2922 (commit a384e2e8).
+                        writer.send_error(err.clone());
+                        return Err(err);
                     }
                 }
                 let offset_usize = usize::try_from(offset)
@@ -2828,10 +2881,19 @@ impl StoreDriver for FastSlowStore {
                 ?key,
                 "local_only_reads: returning NotFound instead of falling through to slow store"
             );
-            return Err(make_err!(
+            let err = make_err!(
                 Code::NotFound,
                 "FastSlowStore local_only_reads: blob not present on this worker"
-            ));
+            );
+            // Terminate the writer with the structured error BEFORE
+            // returning. Same writer-termination requirement as the
+            // populator-NotFound short-circuit at line ~2922 (commit
+            // a384e2e8). Without this, a paired reader inside
+            // VerifyStore::get_part's tokio::join! over (get_fut,
+            // check_fut) blocks forever on rx.recv() — wedging
+            // worker-public-CAS reads of missing blobs.
+            writer.send_error(err.clone());
+            return Err(err);
         }
 
         // If the fast store is noop or read only or update only then bypass it.
