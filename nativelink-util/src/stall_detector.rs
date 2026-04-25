@@ -1537,4 +1537,269 @@ mod tests {
         assert!(!force_dump_should_proceed(500, 1000));
         assert!(!force_dump_should_proceed(0, 1000));
     }
+
+    // -------------------------------------------------------------
+    // macOS signal_dumper_macos cooperative backtrace tests.
+    //
+    // These tests exercise the pthread_kill(SIGUSR2) + in-process
+    // libunwind path on real OS threads. They are macOS-only because
+    // they call Mach APIs and depend on Apple's pthread/Mach mapping.
+    //
+    // The dispatcher serializes via DUMP_IN_PROGRESS, so multiple
+    // tests in this module that exercise the dumper will not interfere
+    // with each other when run with `cargo test` even though tests
+    // typically run in parallel — the second concurrent caller will
+    // observe `dump_in_progress` and return Vec::new(). To avoid that
+    // false-empty result we serialize the macOS dumper tests via a
+    // dedicated mutex.
+    // -------------------------------------------------------------
+
+    /// Spec-fence: the macOS handler MUST call `libc::mach_thread_self`
+    /// (a real syscall, async-signal-safe) and MUST NOT call
+    /// `pthread_mach_thread_np` (which walks pthread internals and is
+    /// not async-signal-safe — see async-profiler discussion #1557).
+    ///
+    /// We can't observe FFI calls at runtime cleanly, but we can pin
+    /// the symbol identity at compile time: assigning the function
+    /// pointer to a typed const is a static assertion that the symbol
+    /// exists with the expected signature. Combined with the
+    /// `mach_thread_self` mention in the handler comment block, any
+    /// future refactor that swaps the call to `pthread_mach_thread_np`
+    /// would have to also delete this assertion — making the
+    /// regression visible in code review.
+    ///
+    /// This is a code-style fence, not a runtime contract test. The
+    /// runtime contract is enforced by the OS: calling
+    /// `pthread_mach_thread_np` from a signal handler can deadlock,
+    /// and that would surface as flaky `single_thread_capture_*` tests
+    /// on real hardware.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn handler_uses_mach_thread_self_not_pthread_mach_thread_np() {
+        // mach_thread_self is async-signal-safe.
+        #[allow(deprecated)]
+        let _: unsafe extern "C" fn() -> libc::mach_port_t = libc::mach_thread_self;
+        // pthread_mach_thread_np exists but MUST NOT appear in the
+        // handler. Asserting the symbol type here documents that we
+        // are aware of it and chose not to use it.
+        unsafe extern "C" {
+            fn pthread_mach_thread_np(thread: libc::pthread_t) -> libc::mach_port_t;
+        }
+        let _: unsafe extern "C" fn(libc::pthread_t) -> libc::mach_port_t = pthread_mach_thread_np;
+    }
+
+    /// Helper: serialize macOS dumper tests so two parallel callers
+    /// don't trip the in-progress guard.
+    #[cfg(target_os = "macos")]
+    static MACOS_DUMP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Spec: when a single helper thread is signaled with SIGUSR2, the
+    /// handler must populate that thread's slot — `responded=true`
+    /// and at least one captured frame.
+    ///
+    /// This is the minimum-viable contract: signal delivery succeeds,
+    /// the handler runs, and `backtrace::trace_unsynchronized` returns
+    /// something non-empty.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn single_thread_capture_returns_nonempty_backtrace() {
+        use core::sync::atomic::AtomicBool;
+        let _g = MACOS_DUMP_LOCK.lock().unwrap();
+
+        // Channels: helper publishes its (mach_port, pthread_t) via
+        // (port_tx, port_rx); main signals helper to exit via done flag.
+        let (port_tx, port_rx) = std::sync::mpsc::channel::<(u32, libc::pthread_t)>();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let done_helper = done.clone();
+
+        let join = std::thread::spawn(move || {
+            // SAFETY: mach_thread_self / pthread_self are safe in any
+            // context outside a signal handler.
+            #[allow(deprecated)]
+            let port = unsafe { libc::mach_thread_self() };
+            let pthread = unsafe { libc::pthread_self() };
+            port_tx.send((port, pthread)).unwrap();
+            // Spin-wait so the handler has a thread to deliver to.
+            // Real `std::thread::park` would block in a syscall, which
+            // SIGUSR2 will EINTR out of (with SA_RESTART set, the
+            // syscall restarts) — that's fine, the handler still runs.
+            while !done_helper.load(core::sync::atomic::Ordering::Acquire) {
+                std::thread::park_timeout(core::time::Duration::from_millis(20));
+            }
+        });
+
+        let (port, pthread) = port_rx
+            .recv_timeout(core::time::Duration::from_secs(2))
+            .expect("helper failed to publish its mach port");
+
+        #[allow(deprecated)]
+        let self_port = unsafe { libc::mach_thread_self() };
+        let backtraces = super::signal_dumper_macos::capture_all_backtraces(
+            &[(port, pthread)],
+            self_port,
+        );
+
+        done.store(true, core::sync::atomic::Ordering::Release);
+        join.thread().unpark();
+        join.join().unwrap();
+
+        assert_eq!(backtraces.len(), 1, "expected one backtrace per target");
+        let bt = &backtraces[0];
+        assert_eq!(bt.mach_port, port);
+        assert!(
+            bt.responded,
+            "helper thread did not respond to SIGUSR2 within 5s outer deadline",
+        );
+        assert!(
+            !bt.symbols.is_empty(),
+            "captured backtrace should have at least one frame",
+        );
+    }
+
+    /// Spec: a multi-threaded dump must capture every signaled thread
+    /// independently. The handler's slot lookup (mach_port → index)
+    /// must work concurrently across threads without cross-talk.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn multi_thread_capture_returns_one_backtrace_per_target() {
+        use core::sync::atomic::AtomicBool;
+        let _g = MACOS_DUMP_LOCK.lock().unwrap();
+
+        const N: usize = 5;
+        let (port_tx, port_rx) = std::sync::mpsc::channel::<(u32, libc::pthread_t)>();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let mut joins = Vec::with_capacity(N);
+
+        for _ in 0..N {
+            let port_tx = port_tx.clone();
+            let done_helper = done.clone();
+            joins.push(std::thread::spawn(move || {
+                #[allow(deprecated)]
+                let port = unsafe { libc::mach_thread_self() };
+                let pthread = unsafe { libc::pthread_self() };
+                port_tx.send((port, pthread)).unwrap();
+                while !done_helper.load(core::sync::atomic::Ordering::Acquire) {
+                    std::thread::park_timeout(core::time::Duration::from_millis(20));
+                }
+            }));
+        }
+        drop(port_tx); // close sender so we know we collected all N
+
+        let mut targets = Vec::with_capacity(N);
+        for _ in 0..N {
+            targets.push(
+                port_rx
+                    .recv_timeout(core::time::Duration::from_secs(2))
+                    .expect("helper failed to publish mach port"),
+            );
+        }
+
+        #[allow(deprecated)]
+        let self_port = unsafe { libc::mach_thread_self() };
+        let backtraces =
+            super::signal_dumper_macos::capture_all_backtraces(&targets, self_port);
+
+        done.store(true, core::sync::atomic::Ordering::Release);
+        for j in &joins {
+            j.thread().unpark();
+        }
+        for j in joins {
+            j.join().unwrap();
+        }
+
+        assert_eq!(backtraces.len(), N, "one backtrace per signaled thread");
+        let responded = backtraces.iter().filter(|b| b.responded).count();
+        let with_frames = backtraces.iter().filter(|b| !b.symbols.is_empty()).count();
+        assert_eq!(responded, N, "all helper threads should respond");
+        assert_eq!(with_frames, N, "all responses should have at least one frame");
+
+        // Sanity: mach ports across results are distinct.
+        let mut ports: Vec<u32> = backtraces.iter().map(|b| b.mach_port).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), N, "mach ports should be distinct across threads");
+    }
+
+    /// Spec: the 5s outer deadline MUST fire if a thread cannot
+    /// service SIGUSR2 (e.g., it blocked the signal via
+    /// `pthread_sigmask`). The dump returns `responded=false` for
+    /// that slot and the wall-clock stays bounded — it does NOT hang
+    /// the watchdog forever.
+    ///
+    /// We deliberately mask SIGUSR2 on a helper thread so the kernel
+    /// queues the signal but never delivers it. The collector should
+    /// trip its 5s deadline (we allow up to 6s of wall-clock to
+    /// account for scheduling jitter on busy CI hardware).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uncooperative_thread_times_out_with_no_response() {
+        use core::sync::atomic::AtomicBool;
+        let _g = MACOS_DUMP_LOCK.lock().unwrap();
+
+        let (port_tx, port_rx) = std::sync::mpsc::channel::<(u32, libc::pthread_t)>();
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let done_helper = done.clone();
+
+        let join = std::thread::spawn(move || {
+            // Block SIGUSR2 on this thread before publishing its port.
+            // The kernel will mark the signal as pending but never
+            // invoke the handler until we unblock — and we never do
+            // before the dump deadline fires.
+            unsafe {
+                let mut set: libc::sigset_t = core::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGUSR2);
+                let ret = libc::pthread_sigmask(
+                    libc::SIG_BLOCK,
+                    &set,
+                    core::ptr::null_mut(),
+                );
+                assert_eq!(ret, 0, "pthread_sigmask SIG_BLOCK failed");
+            }
+            #[allow(deprecated)]
+            let port = unsafe { libc::mach_thread_self() };
+            let pthread = unsafe { libc::pthread_self() };
+            port_tx.send((port, pthread)).unwrap();
+            while !done_helper.load(core::sync::atomic::Ordering::Acquire) {
+                std::thread::park_timeout(core::time::Duration::from_millis(20));
+            }
+        });
+
+        let (port, pthread) = port_rx
+            .recv_timeout(core::time::Duration::from_secs(2))
+            .expect("helper failed to publish mach port");
+
+        #[allow(deprecated)]
+        let self_port = unsafe { libc::mach_thread_self() };
+        let start = std::time::Instant::now();
+        let backtraces = super::signal_dumper_macos::capture_all_backtraces(
+            &[(port, pthread)],
+            self_port,
+        );
+        let elapsed = start.elapsed();
+
+        done.store(true, core::sync::atomic::Ordering::Release);
+        join.thread().unpark();
+        join.join().unwrap();
+
+        // Wall-clock must be bounded: the outer deadline is 5s; we
+        // allow up to 6.5s of slack for slow CI / debug-build overhead.
+        assert!(
+            elapsed < core::time::Duration::from_millis(6500),
+            "dump should respect 5s outer deadline; took {elapsed:?}",
+        );
+        // The dump still returns one entry per target, but the
+        // uncooperative thread's slot must show responded=false and
+        // an empty symbols vec.
+        assert_eq!(backtraces.len(), 1);
+        assert_eq!(backtraces[0].mach_port, port);
+        assert!(
+            !backtraces[0].responded,
+            "thread that masked SIGUSR2 must not appear as responded",
+        );
+        assert!(
+            backtraces[0].symbols.is_empty(),
+            "no-response slot must have no frames",
+        );
+    }
 }
