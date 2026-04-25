@@ -3015,7 +3015,13 @@ impl StoreDriver for FastSlowStore {
                         .get_part(key.borrow(), &mut *writer, offset, length)
                         .await
                 }
-                Err(err) => Err(err),
+                Err(err) => {
+                    // Terminate the writer before returning so callers
+                    // (e.g. VerifyStore's tokio::join! over a tx/rx pair)
+                    // don't deadlock awaiting EOF/error.
+                    writer.send_error(err.clone());
+                    Err(err)
+                }
             };
         }
 
