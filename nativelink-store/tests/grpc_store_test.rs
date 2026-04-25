@@ -1,4 +1,6 @@
 use core::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use nativelink_config::stores::{GrpcEndpoint, GrpcSpec, Retry, StoreType};
@@ -15,7 +17,10 @@ use nativelink_proto::google::bytestream::{
     WriteRequest, WriteResponse,
 };
 use nativelink_store::grpc_store::GrpcStore;
+use nativelink_util::buf_channel::make_buf_channel_pair;
+use nativelink_util::common::DigestInfo;
 use nativelink_util::proto_stream_utils::WriteRequestStreamWrapper;
+use nativelink_util::store_trait::{StoreKey, StoreLike};
 use tokio::time::timeout;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Request;
@@ -257,6 +262,293 @@ async fn grpc_store_write_returns_deadline_exceeded_when_transport_stalls()
         "expected 'no progress' wording, got: {:?}",
         err.messages,
     );
+    Ok(())
+}
+
+// --- Bug B regression: parallel-chunk read of a tiny blob ---
+//
+// Forensic context (from `.claude/reviews/wedge-mechanism-mirror-blobs/audit.md`,
+// digests f479989b...-183 and ddb73a...-183, 2026-04-25):
+//
+// The server's CAS read path called `GrpcStore::get_part` with `length:
+// Some(10_485_760)` (10 MiB) on a 183-byte blob. Because the caller
+// passed `length` rather than letting `get_part` derive it from the
+// digest, `effective_length` jumped to 10 MiB, exceeded the 8 MiB
+// `parallel_chunk_read_threshold`, and routed into `get_part_parallel`
+// with `chunk_count=8`. The math then split the request into 8
+// sub-ranges of ~1.25 MiB each:
+//
+//   chunk 0: offset=0,        length=1310720
+//   chunk 1: offset=1310720,  length=1310720
+//   ...
+//   chunk 7: offset=9175040,  length=1310720
+//
+// The peer worker (which legitimately had the 183-byte blob on disk)
+// served chunk 0 with 183 bytes + clean `Status::OK` trailer, and EOFed
+// chunks 1-7 immediately (offset past blob size). Even with the
+// post-2fe4b1cb `CleanShort` classifier folding the EOF chunks back
+// into `Ok`, the parallel splitter still issues 8 RPCs for a 183-byte
+// payload — wasteful, and the wedge wording in production logs
+// (`"Tried to send while stream is closed", "while writing parallel
+// chunk data", "in GrpcStore::get_part_parallel write"`) shows the
+// path remains failure-prone under concurrent load (race-loser
+// `JoinHandle::abort()`, h2 RST_STREAM bursts, GOAWAY-stuck channels
+// per #147).
+//
+// The fix: clamp `effective_length` to the actual remaining bytes in
+// the blob (`digest.size_bytes() - offset`) before the parallel-vs-
+// single-stream gate. This keeps tiny blobs on the single-stream path
+// regardless of what `length` the caller passes. As defense in depth,
+// `get_part_parallel` itself also clamps `chunk_count` so the splitter
+// never produces more chunks than the requested range has bytes.
+//
+// This regression test wraps an in-process tonic ByteStream worker that
+// faithfully serves a 183-byte blob. Pre-fix code path enters
+// `get_part_parallel` with chunk_count=8 (verified by the
+// `read_request_count` assertion below); post-fix it stays on the
+// single-stream path and issues exactly 1 RPC.
+//
+// Mutation evidence: revert the `effective_length` clamp at
+// `grpc_store.rs:get_part` AND the `chunk_count` clamp at
+// `grpc_store.rs:get_part_parallel`; this test must FAIL on the
+// `read_request_count <= 2` assertion (counting 8 RPCs).
+struct TinyBlobByteStream {
+    /// 183-byte payload returned for chunk 0 (offset=0).
+    payload: Bytes,
+    /// Counts the number of read requests received, so the test can
+    /// assert that the server actually got fewer requests after the fix.
+    read_request_count: Arc<AtomicU64>,
+}
+
+#[tonic::async_trait]
+impl ByteStream for TinyBlobByteStream {
+    type ReadStream = futures::stream::BoxStream<
+        'static,
+        Result<ReadResponse, tonic::Status>,
+    >;
+
+    async fn read(
+        &self,
+        request: tonic::Request<ReadRequest>,
+    ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+        self.read_request_count.fetch_add(1, Ordering::SeqCst);
+        let req = request.into_inner();
+        let payload = self.payload.clone();
+        let blob_size = payload.len() as i64;
+        let offset = req.read_offset;
+
+        // Build the response stream. Clean Status::OK trailer in all
+        // cases (we do not synthesize errors), modeling a healthy peer
+        // that has the blob in full.
+        let stream: Self::ReadStream = if offset >= blob_size {
+            // Past the blob — return immediate clean EOF (no data
+            // frames). This is what a real worker does when the peer
+            // requests an offset >= the blob size: `Status::OK` with
+            // an empty body.
+            Box::pin(futures::stream::empty())
+        } else {
+            // Slice the blob from `offset` (clamped to its bounds) and
+            // return a single ReadResponse with that slice, then
+            // implicit Status::OK trailer.
+            let start = offset as usize;
+            let end = payload.len();
+            let slice = payload.slice(start..end);
+            Box::pin(futures::stream::iter(vec![Ok(ReadResponse {
+                data: slice,
+            })]))
+        };
+        Ok(tonic::Response::new(stream))
+    }
+
+    async fn write(
+        &self,
+        _request: tonic::Request<tonic::Streaming<WriteRequest>>,
+    ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("write not used in this test"))
+    }
+
+    async fn query_write_status(
+        &self,
+        _request: tonic::Request<QueryWriteStatusRequest>,
+    ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "query_write_status not used in this test",
+        ))
+    }
+}
+
+/// Bug B regression: `GrpcStore::get_part` for a 183-byte blob with
+/// `length: Some(10 MiB)` must NOT shred itself across 8 parallel
+/// chunk RPCs. Pre-fix this routed into `get_part_parallel` with
+/// `chunk_count=8`, issuing 7 wasted RPCs for offsets past the blob
+/// size and creating production wedge fodder ("Tried to send while
+/// stream is closed" / "in GrpcStore::get_part_parallel write" under
+/// concurrent contention per the audit). Post-fix the request stays
+/// on the single-stream path (or, if it does enter parallel, clamps
+/// chunk_count to 1) and returns the 183 bytes + clean EOF using ≤2
+/// RPCs.
+///
+/// Mutation step (per CLAUDE.md): comment out the `effective_length`
+/// clamp at `grpc_store.rs:get_part` AND the `chunk_count` clamp at
+/// `grpc_store.rs:get_part_parallel`; this test MUST FAIL on the
+/// `read_request_count <= 2` assertion (counting 8 RPCs). A passing
+/// test after mutation means the clamps are not load-bearing.
+#[nativelink_test]
+async fn grpc_store_tiny_blob_with_oversized_length_does_not_wedge_parallel()
+-> Result<(), Error> {
+    // 183-byte payload — same size as the production wedge digests
+    // f479989b...-183 and ddb73a...-183.
+    const PAYLOAD_LEN: usize = 183;
+    let payload_vec: Vec<u8> = (0..PAYLOAD_LEN).map(|i| i as u8).collect();
+    let payload = Bytes::from(payload_vec.clone());
+
+    let read_request_count = Arc::new(AtomicU64::new(0));
+    let server_impl = TinyBlobByteStream {
+        payload: payload.clone(),
+        read_request_count: read_request_count.clone(),
+    };
+
+    // Bind on a free port and serve the in-process ByteStream.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ByteStreamServer::new(server_impl))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    // Construct a GrpcStore that mirrors production-relevant settings:
+    // small parallel_chunk_read_threshold so a 10 MiB caller-supplied
+    // length triggers the parallel path, parallel_chunk_count=8 (the
+    // pre-#147-tightening default that produced the wedge in production),
+    // zero retries to keep failure modes crisp.
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.rpc_timeout_s = 0;
+    spec.parallel_chunk_read_threshold = 64; // tiny so we route to parallel
+    spec.parallel_chunk_count = 8;
+    spec.retry = Retry {
+        max_retries: 0,
+        delay: 0.0,
+        jitter: 0.0,
+        ..Default::default()
+    };
+    let store = GrpcStore::new(&spec).await?;
+
+    // Build the digest. The 32-byte zero hash is fine — the in-process
+    // server doesn't validate the hash, only honors the offset/limit
+    // semantics. Size = 183 (matches the wedge digests).
+    let digest = DigestInfo::try_new(
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        PAYLOAD_LEN as u64,
+    )?;
+    let key: StoreKey<'_> = digest.into();
+
+    // The wedge shape: caller passes length=Some(10 MiB) for a 183-byte
+    // blob. Pre-fix this triggers parallel path with chunk_count=8.
+    let oversized_length = 10 * 1024 * 1024_u64;
+
+    let (writer, mut reader) = make_buf_channel_pair();
+
+    let store_clone = store.clone();
+    let key_owned: StoreKey<'static> = key.borrow().into_owned();
+    let get_part_fut = async move {
+        let mut writer_mut = writer;
+        store_clone
+            .get_part(key_owned, &mut writer_mut, 0, Some(oversized_length))
+            .await
+        // Mirror the production composition: WorkerProxyStore wraps the
+        // peer's get_part with a `tokio::join!` between the get_part
+        // future and a forward future reading from the writer's paired
+        // reader. If the implementation early-returns Err without
+        // terminating the writer, that join deadlocks — exactly the
+        // class of bug CLAUDE.md "Test in production composition"
+        // warns about. Here the writer drops on function exit.
+    };
+
+    let collect_fut = async move {
+        let mut total = bytes::BytesMut::new();
+        loop {
+            // Bounded chunk size: large enough to receive the whole
+            // 183-byte payload in one or two recvs.
+            let chunk = reader.consume(Some(8192)).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            total.extend_from_slice(&chunk);
+        }
+        Ok::<Bytes, Error>(total.freeze())
+    };
+
+    // 5s outer timeout per CLAUDE.md template — the deadlock detector.
+    // A `tokio::time::Elapsed` would convert to an error; combined with
+    // the specific assertion message it makes a hang surface clearly.
+    let outcome = timeout(
+        Duration::from_secs(5),
+        async move { tokio::join!(get_part_fut, collect_fut) },
+    )
+    .await
+    .expect(
+        "must not deadlock — Bug B writer-termination contract violated, \
+         or get_part_parallel hangs on shredded chunks",
+    );
+
+    server_handle.abort();
+
+    let (get_res, collect_res) = outcome;
+
+    // The receive side's bytes arrive whether or not get_part errors,
+    // but we want both: a clean Ok return AND the right bytes received
+    // AND no parallel-path error wording in the failure message.
+    let received = collect_res.expect(
+        "collect must read 183 bytes from the writer cleanly; \
+         parallel-path stream-closed wedges produce buf_channel errors here",
+    );
+
+    if let Err(err) = get_res {
+        // Surface diagnostic: print the production wedge wording so a
+        // failing run on pre-fix code points at exactly the audit error.
+        let messages = err.messages.join(" / ");
+        panic!(
+            "Bug B regression — get_part failed with code={:?}, messages: {messages}\n\n\
+             Pre-fix wedge wording: \"Tried to send while stream is closed\" / \
+             \"in GrpcStore::get_part_parallel write\". The fix clamps \
+             effective_length and chunk_count so a 183-byte blob never enters \
+             the 8-way parallel path.",
+            err.code,
+        );
+    }
+
+    assert_eq!(
+        received.len(),
+        PAYLOAD_LEN,
+        "expected to receive exactly {PAYLOAD_LEN} bytes from the writer, got {} \
+         (this asserts the writer was correctly EOF-terminated and not aborted \
+         mid-stream by the parallel-collector failure)",
+        received.len(),
+    );
+    assert_eq!(
+        received.as_ref(),
+        payload.as_ref(),
+        "received bytes must equal the 183-byte payload",
+    );
+
+    // Sanity: after the fix, the server should see at most 1 read
+    // request (single-stream path), not 8. We accept ≤ 2 to allow for
+    // the chunk_count=1 defense-in-depth path inside get_part_parallel.
+    let count = read_request_count.load(Ordering::SeqCst);
+    assert!(
+        count <= 2,
+        "expected ≤2 ReadRequest RPCs for a 183-byte blob (single-stream or \
+         clamped-to-1 parallel), got {count}. Pre-fix the parallel path \
+         issued 8 RPCs."
+    );
+
     Ok(())
 }
 
