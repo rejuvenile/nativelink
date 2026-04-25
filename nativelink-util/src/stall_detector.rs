@@ -318,12 +318,17 @@ pub fn spawn_external_dump_listener() {
                 );
                 continue;
             }
-            // Drain any additional pending wakes to coalesce a burst
-            // of pthread_kill SIGUSR2's from one internal round into
-            // one decision point. The internal capture is what
-            // produces those rapid wakes; if `internal_active` was
-            // false above, those came from external sources only.
-            force_dump_thread_stacks("external SIGUSR2");
+            // force_dump_thread_stacks ultimately calls
+            // capture_all_backtraces, which polls for handler completion
+            // via `std::thread::sleep(1ms)` for up to 5s. Running this
+            // inline on the listener task would block one tokio worker
+            // for the full dump duration — exactly the runtime-starvation
+            // anti-pattern the deleted `sample`-subprocess wedge
+            // represented. Wrap in spawn_blocking to mirror the
+            // StallGuard pattern (see `new_inner` above).
+            let _ = tokio::task::spawn_blocking(|| {
+                force_dump_thread_stacks("external SIGUSR2");
+            });
         }
     });
 }
@@ -513,6 +518,13 @@ mod signal_dumper {
     /// is unsafe in production for the same reason as macOS SIGUSR2.
     pub(super) fn install_signal_handler() {
         SIGNAL_INSTALLED.call_once(|| {
+            // SAFETY: sigaction is the standard POSIX install path. We
+            // zero-initialize the struct and only set the documented
+            // fields. SA_SIGINFO matches the 3-arg handler signature;
+            // SA_RESTART asks the kernel to restart interrupted syscalls
+            // so we don't trip up application code that wasn't expecting
+            // EINTR from us. signal_handler is a static function pointer
+            // with the C ABI signature sigaction expects.
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
                 sa.sa_sigaction = signal_handler as *const () as usize;
@@ -594,6 +606,14 @@ mod signal_dumper {
         let sig = dump_signal();
         let mut signaled = 0u32;
         for &tid in tids.iter().take(thread_count) {
+            // SAFETY: tgkill is a Linux syscall that targets a specific
+            // thread within a thread group. pid/tid come from
+            // /proc/self/task enumeration and process::id(), both safe
+            // to use as syscall arguments. dump_signal() returns a
+            // valid realtime signal number. ESRCH (thread exited
+            // between enumeration and signal) is the documented benign
+            // failure and is silently dropped — that thread will
+            // simply time out in the polling loop.
             let ret = unsafe {
                 libc::syscall(libc::SYS_tgkill, pid, tid as i32, sig)
             };
@@ -667,6 +687,19 @@ mod signal_dumper {
                 tid: slot.tid,
                 symbols: frames,
             });
+        }
+
+        // Clear slot tids so a stale signal arriving after this dump
+        // completes (e.g., from a thread that woke up post-deadline)
+        // doesn't write into a slot the next dump round may have re-keyed.
+        // Mirrors the macOS dispatcher's mach_port=0 defensive pattern.
+        for i in 0..thread_count {
+            // SAFETY: The dump is over; no handler should be running
+            // against these slots. Even if a late handler arrives,
+            // tid=0 makes find_slot_for_tid return None.
+            unsafe {
+                (*COLLECTOR.slots[i].get()).tid = 0;
+            }
         }
 
         results
@@ -785,6 +818,20 @@ mod signal_dumper_macos {
     /// Number of handlers that have completed in the current round.
     static DONE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+    // Mach FFI for the signal handler's port-deallocate path. Both
+    // mach_task_self() (a port-name fetch — no refcount mutation) and
+    // mach_port_deallocate() (a Mach trap that decrements a send-right
+    // refcount) are async-signal-safe. They are declared here in the
+    // module scope so the signal handler can call them without reaching
+    // into the `enumerate_mach_threads_with_backtraces` function-local
+    // extern block.
+    type MachPortName = u32;
+    type KernReturnT = i32;
+    unsafe extern "C" {
+        fn mach_task_self() -> MachPortName;
+        fn mach_port_deallocate(task: MachPortName, name: MachPortName) -> KernReturnT;
+    }
+
     /// Look up the slot index for a given mach port. Called only from the
     /// signal handler; must be async-signal-safe.
     ///
@@ -822,6 +869,30 @@ mod signal_dumper_macos {
     ///   aarch64-apple-darwin's compiler default.
     /// - All writes target either stack-local variables or the slot's
     ///   pre-allocated `ips` array. No allocator calls.
+    /// - `mach_port_deallocate` is a Mach trap (kernel-side syscall),
+    ///   not a userspace pthread function — it does not take any
+    ///   userspace locks and is safe from a signal handler. Every
+    ///   `mach_thread_self()` call MUST be paired with deallocate to
+    ///   avoid leaking send rights, which on a 24/7 worker accumulates
+    ///   port-table pressure (each external SIGUSR2 with no matching
+    ///   slot would otherwise leak one send right).
+    ///
+    /// TODO(#145 follow-up): the `dump_in_progress` flag protects the
+    /// LISTENER from launching a second dump; it does NOT prevent
+    /// kernel-driven SIGUSR2 delivery to a thread that's already
+    /// targeted by an internal `pthread_kill` round. If a stray
+    /// external `kill -USR2 $pid` lands on a tokio worker mid-internal
+    /// round (the kernel routes it to the first non-blocking thread),
+    /// the handler may run twice on the same slot — the second
+    /// invocation overwrites `count`/`ips` (idempotent in practice
+    /// because the same thread captures the same backtrace) and
+    /// double-increments `DONE_COUNT` (causes the polling loop to
+    /// exit slightly early, dropping a few late responders). A
+    /// generation counter on the slot (handler bails when it
+    /// observes `slot.gen != round.gen`) would close this. Low
+    /// severity: the dump still completes, the duplicated frames
+    /// match, and external SIGUSR2 mid-internal round is a corner
+    /// case (operator + automatic dump colliding within ~5s).
     unsafe extern "C" fn signal_handler(
         _sig: libc::c_int,
         _info: *mut libc::siginfo_t,
@@ -836,9 +907,30 @@ mod signal_dumper_macos {
         // documents the intentional choice.
         #[allow(deprecated)]
         let port = unsafe { libc::mach_thread_self() };
+
+        // RAII guard: deallocate the send right on every exit path from
+        // this handler (slot-not-found early return, capture completion,
+        // or any future panic-safe exit). Mach trap, async-signal-safe.
+        struct PortGuard(u32);
+        impl Drop for PortGuard {
+            fn drop(&mut self) {
+                // SAFETY: self.0 is a send right we obtained from
+                // mach_thread_self() in this handler invocation. The
+                // matching deallocate is required to balance the
+                // refcount; doing it in Drop ensures it runs on every
+                // exit path. mach_task_self() is a port name (no
+                // refcount mutation), so it's safe to fetch each time.
+                unsafe {
+                    let task = mach_task_self();
+                    let _ = mach_port_deallocate(task, self.0);
+                }
+            }
+        }
+        let _port_guard = PortGuard(port);
+
         let Some(idx) = find_slot_for_mach_port(port) else {
             // Not our signal (or stale/cancelled dump). Don't touch any
-            // slot; just return.
+            // slot; the PortGuard deallocates the send right on return.
             return;
         };
         // SAFETY: This slot is exclusively owned by the current thread for
@@ -865,6 +957,7 @@ mod signal_dumper_macos {
         slot.count = count;
         slot.captured.store(true, Ordering::Release);
         DONE_COUNT.fetch_add(1, Ordering::Release);
+        // _port_guard runs here, deallocating the send right.
     }
 
     /// Install the SIGUSR2 handler exactly once for the lifetime of the
@@ -1221,7 +1314,7 @@ fn dump_thread_stacks_linux(label: &str) {
         tids.len()
     );
 
-    match std::fs::write(&path, &output) {
+    match write_dump_owner_only(&path, &output) {
         Ok(()) => eprintln!(
             "Thread dump written to {path} ({responded}/{} threads, {total_elapsed:.1?})",
             tids.len()
@@ -1296,7 +1389,7 @@ fn dump_thread_stacks_macos(label: &str) {
         "=== Dump complete: {responded}/{total} threads responded, capture: {capture_elapsed:.1?}, total: {total_elapsed:.1?} ===",
     );
 
-    match std::fs::write(&path, &output) {
+    match write_dump_owner_only(&path, &output) {
         Ok(()) => eprintln!(
             "Thread dump written to {path} ({responded}/{total} threads, {total_elapsed:.1?})",
         ),
@@ -1415,8 +1508,35 @@ fn enumerate_mach_threads_with_backtraces(
     // port. We use this port number to identify which slot belongs to
     // us (so the dispatcher does not signal itself). See the
     // signal_dumper_macos handler for the deprecation rationale.
+    //
+    // Each mach_thread_self() invocation increments the port refcount;
+    // the matching deallocate is required at function exit to avoid
+    // leaking one send right per dump round (24/7 worker would
+    // accumulate port-table pressure over weeks). The Drop guard runs
+    // on every exit path including the early-return below from
+    // task_threads failure isn't relevant (we already returned), but
+    // any future early-return after this point is covered.
     #[allow(deprecated)]
     let self_port = unsafe { libc::mach_thread_self() };
+
+    struct SelfPortGuard {
+        task: MachPort,
+        port: MachPort,
+    }
+    impl Drop for SelfPortGuard {
+        fn drop(&mut self) {
+            // SAFETY: self.port is a send right we obtained from
+            // mach_thread_self() above. Matching deallocate is
+            // required to balance the refcount.
+            unsafe extern "C" {
+                fn mach_port_deallocate(task: u32, name: u32) -> i32;
+            }
+            unsafe {
+                let _ = mach_port_deallocate(self.task, self.port);
+            }
+        }
+    }
+    let _self_port_guard = SelfPortGuard { task, port: self_port };
 
     let mut enumerated = Vec::with_capacity(thread_count as usize);
     let mut signal_targets: Vec<(MachPort, libc::pthread_t)> =
@@ -1590,6 +1710,25 @@ fn enumerate_mach_threads_with_backtraces(
     }
 
     (responded, thread_count as usize, capture_elapsed)
+}
+
+/// Write a stall dump to `path` with mode 0o600 (owner read/write only).
+///
+/// Default `std::fs::write` honors the process umask and typically
+/// produces 0o644 (world-readable). Stall dumps include thread names,
+/// in-process backtraces, and kernel state — defensive narrowing to
+/// owner-only avoids leaking that to other local users on multi-tenant
+/// hosts. Returns the I/O error if either open or write fails.
+fn write_dump_owner_only(path: &str, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
 }
 
 /// Maximum number of stall dump file pairs to retain. Older dumps are
