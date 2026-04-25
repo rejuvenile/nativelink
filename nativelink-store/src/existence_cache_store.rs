@@ -489,9 +489,12 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 // (Unavailable, DeadlineExceeded, etc.) leave the cache
                 // alone — re-evicting on every blip would force re-uploads.
                 if debug_digest_match(&digest) {
-                    info!(?digest, code = ?err.code, source = "get_part_remove_unrecoverable", "DEBUG: ExistenceCacheStore removing wedge digest (get_part path: inner unrecoverable error)");
+                    info!(?digest, code = ?err.code, source = "get_part_remove_unrecoverable", "DEBUG: ExistenceCacheStore PRE-remove wedge digest (get_part path: inner unrecoverable error)");
                 }
                 self.existence_cache.remove(&digest).await;
+                if debug_digest_match(&digest) {
+                    info!(?digest, code = ?err.code, source = "get_part_remove_unrecoverable", "DEBUG: ExistenceCacheStore POST-remove wedge digest (cache.remove returned, about to return Err to caller)");
+                }
             }
             Err(_) => {}
         }
