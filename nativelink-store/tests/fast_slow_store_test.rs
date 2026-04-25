@@ -3139,36 +3139,11 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
     Ok(())
 }
 
-/// Structural-fix regression: proves that `WriteHalfGuard::Drop` is the
-/// load-bearing piece that prevents the writer-termination class of bug —
-/// not just the explicit `guard.fail(err)` calls inside `FastSlowStore::get_part`.
-///
-/// Setup: a `ForgetfulStore` whose `get_part` uses `WriteHalfGuard` but
-/// DELIBERATELY does NOT call `commit_eof` / `commit_delegated` /
-/// `fail` before returning `Err`. This simulates a developer adding a new
-/// early-return path and overlooking the explicit-commit verb — the exact
-/// failure mode the structural fix is designed to make impossible.
-///
-/// With the Drop fallback in place: the guard's `Drop` impl synthesizes an
-/// Internal error and calls `writer.send_error(...)`, unblocking any paired
-/// reader. The wrapping `VerifyStore.get_part_unchunked` returns within
-/// milliseconds.
-///
-/// Without the Drop fallback (mutation step — comment out the
-/// `self.writer.send_error(synthesized);` line in `WriteHalfGuard::drop` and
-/// re-run): the borrowed writer's `tx` is never closed, so VerifyStore's
-/// `tokio::join!(get_fut, check_fut)` blocks forever on `rx.recv()`. The
-/// `tokio::time::timeout` fires; the `.expect("must not deadlock — ...")`
-/// panics with the explicit message. **This is the falsification proof
-/// that the Drop fallback is what's enforcing the contract.**
-///
-/// Why this test matters more than the per-site regression tests above:
-/// the per-site tests verify the FIVE historical bug sites are fixed via
-/// `guard.fail(...)`. This test verifies the SIXTH-and-beyond hypothetical
-/// bug — a developer-introduced new early-return that "forgets" the
-/// explicit commit — is also defended. Without this test, a regression
-/// in the Drop fallback would not surface until it shipped to production
-/// and someone wrote a new early-return.
+/// Falsification: builds a guard, returns Err WITHOUT committing. With the
+/// Drop fallback the wrapping VerifyStore unblocks within milliseconds;
+/// remove `self.writer.send_error(synthesized);` from `WriteHalfGuard::drop`
+/// and the timeout below fires — the only test that genuinely guards the
+/// Drop fallback (per-site tests cover the explicit `guard.fail(...)` calls).
 #[nativelink_test]
 async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
 -> Result<(), Error> {
@@ -3179,15 +3154,8 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
     use nativelink_util::buf_channel::WriteHalfGuard;
     use nativelink_util::store_trait::Store;
 
-    /// Store whose `get_part` builds a `WriteHalfGuard` and returns `Err`
-    /// without committing — exercises the Drop fallback as the sole
-    /// termination mechanism. Mirrors the historical bug pattern exactly:
-    /// the developer wrote `return Err(...)` from a function with `&mut
-    /// writer` and overlooked the explicit `writer.send_error(...)`.
     #[derive(MetricsComponent)]
     struct ForgetfulStore {
-        // MetricsComponent derive requires at least one field; this is a
-        // marker so the proc-macro doesn't panic on a unit struct.
         _marker: (),
     }
 
@@ -3203,65 +3171,44 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
             }
             Ok(())
         }
-
         async fn update(
             self: Pin<&Self>,
-            _digest: StoreKey<'_>,
-            _reader: nativelink_util::buf_channel::DropCloserReadHalf,
-            _size_info: nativelink_util::store_trait::UploadSizeInfo,
+            _: StoreKey<'_>,
+            _: nativelink_util::buf_channel::DropCloserReadHalf,
+            _: nativelink_util::store_trait::UploadSizeInfo,
         ) -> Result<(), Error> {
             Ok(())
         }
-
         async fn get_part(
             self: Pin<&Self>,
-            _key: StoreKey<'_>,
+            _: StoreKey<'_>,
             writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
-            _offset: u64,
-            _length: Option<u64>,
+            _: u64,
+            _: Option<u64>,
         ) -> Result<(), Error> {
-            // Build the guard exactly as the structural pattern prescribes.
             let _guard = WriteHalfGuard::new(writer);
-            // DELIBERATELY return Err WITHOUT committing the guard. With
-            // the structural fix in place, the `_guard` Drop impl fires on
-            // function exit and synthesizes an Internal error that
-            // unblocks the paired reader.
-            //
-            // Without the Drop fallback (mutation step), the writer's tx
-            // is never closed and the wrapping VerifyStore.tokio::join!
-            // deadlocks forever on rx.recv() — the `tokio::time::timeout`
-            // below catches it and panics with "must not deadlock".
-            Err(make_err!(
-                Code::NotFound,
-                "ForgetfulStore: deliberately uncommitted return — \
-                 structural fix MUST cover this via Drop fallback"
-            ))
+            // Deliberately uncommitted — Drop fallback MUST terminate the writer.
+            Err(make_err!(Code::NotFound, "uncommitted-return"))
         }
-
-        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+        fn inner_store(&self, _: Option<StoreKey>) -> &'_ dyn StoreDriver {
             self
         }
-
         fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
             self
         }
-
         fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
             self
         }
-
         fn register_item_callback(
             self: Arc<Self>,
-            _callback: Arc<dyn ItemCallback>,
+            _: Arc<dyn ItemCallback>,
         ) -> Result<(), Error> {
             Ok(())
         }
     }
-
     default_health_status_indicator!(ForgetfulStore);
 
     let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
-
     let verify_store = VerifyStore::new(
         &VerifySpec {
             backend: StoreSpec::Memory(MemorySpec::default()),
@@ -3270,7 +3217,6 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
         },
         Store::new(Arc::new(ForgetfulStore { _marker: () })),
     );
-
     let timed = tokio::time::timeout(
         Duration::from_secs(5),
         verify_store.get_part_unchunked(digest, 0, None),
@@ -3278,29 +3224,16 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
     .await
     .expect(
         "must not deadlock — WriteHalfGuard::Drop fallback MUST terminate \
-         the writer when an early-return path forgot to commit. Without \
-         the Drop fallback, VerifyStore's tokio::join! over the tx/rx pair \
-         blocks forever on rx.recv() and this timeout fires. \
-         If you see this panic, the structural fix has regressed: check \
-         that `WriteHalfGuard::drop` still calls `writer.send_error(synthesized)` \
-         when `committed == false`.",
+         the writer when an early-return path forgot to commit. If this \
+         panics, check that WriteHalfGuard::drop still calls \
+         writer.send_error(synthesized) when committed == false.",
     );
-
-    // The Drop fallback synthesizes Code::Internal; VerifyStore's join
-    // semantics propagate it. The exact code may be Internal or NotFound
-    // depending on which side of the join surfaces first. What matters is
-    // that we got an Err (not a deadlock) and that we surfaced the
-    // structural-fix terminator OR the original NotFound.
-    let err = timed.err().expect(
-        "expected Err, not Ok — ForgetfulStore deliberately fails",
-    );
-    // Either the function's NotFound (which propagated through the read
-    // future) or the Drop fallback's Internal (which propagated through
-    // the writer-side check future) is acceptable. Both prove the
-    // structural fix worked: the wrapping join! unblocked.
+    let err = timed.err().expect("ForgetfulStore deliberately fails");
+    // Either NotFound (function's err propagated through get-side) or
+    // Internal (Drop fallback propagated through check-side) is acceptable.
     assert!(
         err.code == Code::Internal || err.code == Code::NotFound,
-        "expected Internal (Drop fallback) or NotFound (function's err), got: {err:?}",
+        "expected Internal or NotFound, got: {err:?}",
     );
 
     Ok(())
