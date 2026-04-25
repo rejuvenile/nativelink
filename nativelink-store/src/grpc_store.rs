@@ -130,6 +130,36 @@ enum ChunkAttemptOutcome {
     AmbiguousEarlyBreak,
 }
 
+/// Returns `true` if `err` looks like the connection-level h2/transport
+/// failure that #147 traces to a stale pooled `Channel`: the originating
+/// h2 server sent `GOAWAY(too_many_internal_resets, ENHANCE_YOUR_CALM)`
+/// (or comparable pull-the-plug shape) and the next request that picked
+/// up the dead clone fails synchronously before any bytes flow.
+///
+/// The signal we have at this layer is the gRPC code + message; we do
+/// NOT see the underlying `h2::Reason`. Codes that match the wedge
+/// shape:
+///   * `Code::Internal` — what tonic produces for `"Tried to send while
+///                         stream is closed"` (the production wedge).
+///   * `Code::Unavailable` — connection refused / RST_STREAM /
+///                            transport blip.
+///   * `Code::Unknown` — tonic's catch-all for h2 errors it doesn't
+///                       have a specific mapping for; same shape from
+///                       the caller's view.
+///
+/// Codes deliberately excluded: `NotFound` / `DataLoss` / `OutOfRange` /
+/// `InvalidArgument` / `PermissionDenied` / `Unauthenticated` /
+/// `FailedPrecondition` / `AlreadyExists` / `Cancelled` /
+/// `DeadlineExceeded` / `Aborted` / `ResourceExhausted` /
+/// `Unimplemented` — these are application-level outcomes that say
+/// nothing about whether the underlying channel is healthy.
+fn looks_like_dead_channel(err: &Error) -> bool {
+    matches!(
+        err.code,
+        Code::Internal | Code::Unavailable | Code::Unknown
+    )
+}
+
 /// Pure-function classifier for `get_part_parallel`'s per-chunk attempt
 /// loop. Encapsulated so it can be unit-tested without standing up a
 /// real gRPC bytestream server. Inputs:
@@ -361,6 +391,36 @@ impl GrpcStore {
                     .await
             }
             None => cm.connection(ctx.into()).await,
+        }
+    }
+
+    /// Best-effort: if `err` looks like a transport-level h2 failure
+    /// (post-GOAWAY stream-closed shape per `looks_like_dead_channel`),
+    /// evict one idle channel from the TCP pool so the next acquisition
+    /// is more likely to get a freshly-built channel. No-op for QUIC
+    /// transports (the QUIC `Channel` is a single shared instance with
+    /// its own connection_manager loop) and for non-transport-shaped
+    /// errors. Safe to call from any retry path.
+    fn evict_pool_on_transport_err(&self, err: &Error) {
+        if !looks_like_dead_channel(err) {
+            return;
+        }
+        match &self.transport {
+            Transport::Tcp(cm) => {
+                cm.evict_idle_channel(format!(
+                    "transport-shaped err in retry: code={:?}",
+                    err.code
+                ));
+            }
+            #[cfg(feature = "quic")]
+            Transport::Quic(_) => {}
+            #[cfg(feature = "quic")]
+            Transport::Dual { tcp, .. } => {
+                tcp.evict_idle_channel(format!(
+                    "transport-shaped err in retry (dual/tcp): code={:?}",
+                    err.code
+                ));
+            }
         }
     }
 
@@ -1103,6 +1163,14 @@ impl GrpcStore {
                                         can_resume = local_state_locked.can_resume(),
                                         "GrpcStore::write: RPC failed",
                                     );
+                                    // #147: evict any stale pooled
+                                    // channel before the next attempt.
+                                    // Belt-and-suspenders alongside
+                                    // ResponseFuture::poll's automatic
+                                    // Err-path eviction — covers cases
+                                    // where the failure surfaced after
+                                    // the request future returned.
+                                    self.evict_pool_on_transport_err(err);
                                     if local_state_locked.can_resume() {
                                         local_state_locked.resume();
                                         RetryResult::Retry(err.clone())
@@ -1411,6 +1479,22 @@ impl GrpcStore {
                             code = ?err.code,
                             "GrpcStore::get_part_single_stream read_internal failed",
                         );
+                        // #147: pooled `Channel`s with stale h2 state
+                        // (post-GOAWAY) fail synchronously here on
+                        // attempt 1 with `Code::Internal "Tried to send
+                        // while stream is closed"`. The non-streaming
+                        // `ResponseFuture::poll` Err path in
+                        // connection_manager already evicts on any Err
+                        // from the response future, but for streaming
+                        // RPCs the failure shape can be ambiguous
+                        // depending on whether tonic surfaced it from
+                        // the request future or the response stream.
+                        // Belt-and-suspenders: explicitly evict one
+                        // idle channel from the pool when the error
+                        // looks transport-shaped, so the retry's
+                        // `cm.connection().await` is more likely to
+                        // get a freshly-built channel.
+                        self.evict_pool_on_transport_err(&err);
                         return Some((RetryResult::Retry(err), local_state))
                     }
                 };
@@ -1426,9 +1510,19 @@ impl GrpcStore {
                         None => Bytes::new(),
                         Some(Ok(message)) => message.data,
                         Some(Err(status)) => {
+                            // #147: errors surfacing inside the
+                            // streaming response body never reach
+                            // `ResponseFuture::poll`, so the
+                            // connection_manager's automatic Err-path
+                            // eviction does not fire here. Force an
+                            // idle-channel eviction so the next attempt
+                            // gets a freshly-built channel rather than
+                            // re-pulling the same dead clone.
+                            let err: Error = status.into();
+                            self.evict_pool_on_transport_err(&err);
                             return Some((
                                 RetryResult::Retry(
-                                    Into::<Error>::into(status).append(
+                                    err.append(
                                         "While fetching message in \
                                          GrpcStore::get_part()",
                                     ),
@@ -1708,6 +1802,12 @@ impl GrpcStore {
                                             {
                                                 Ok(s) => s,
                                                 Err(err) => {
+                                                    // #147: parallel-chunk
+                                                    // path mirrors single-stream:
+                                                    // evict an idle channel on
+                                                    // transport-shaped errors
+                                                    // before the next retry.
+                                                    self.evict_pool_on_transport_err(&err);
                                                     return Some((
                                                         RetryResult::Retry(err.append(format!(
                                                             "in GrpcStore::get_part_parallel chunk {idx} (attempt {})",
@@ -1807,6 +1907,12 @@ impl GrpcStore {
                                                                 state,
                                                             ));
                                                         }
+                                                        // #147: streaming-body
+                                                        // status errors don't
+                                                        // reach ResponseFuture::poll;
+                                                        // evict an idle channel
+                                                        // before the retry.
+                                                        self.evict_pool_on_transport_err(&err);
                                                         return Some((
                                                             RetryResult::Retry(err),
                                                             state,

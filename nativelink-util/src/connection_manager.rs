@@ -86,6 +86,12 @@ impl ReconnectBackoff {
 pub struct ConnectionManager {
     // The channel to request connections from the worker.
     worker_tx: mpsc::Sender<(String, oneshot::Sender<Connection>)>,
+    // Side channel for caller-driven pool maintenance (e.g. eviction
+    // of a stale channel after a streaming-body h2 transport error).
+    // Shares the worker's `connection_rx` recv loop with `Connection`'s
+    // own Drop / poll_ready notifications, so the worker doesn't need a
+    // separate select arm. Cloned from `connection_tx` at construction.
+    connection_tx: mpsc::UnboundedSender<ConnectionRequest>,
 }
 
 /// The index into `ConnectionManagerWorker::endpoints`.
@@ -118,6 +124,20 @@ enum ConnectionRequest {
     /// specifies whether the connection was in the process of being established
     /// or not (i.e. whether it's been returned to available channels yet).
     Error((ChannelIdentifier, bool)),
+    /// Caller-driven eviction of any one currently-idle channel and an
+    /// immediate reconnect of its endpoint slot. Used after a streaming
+    /// RPC reports an h2 transport-level failure (e.g. `GOAWAY` /
+    /// `"stream is closed"`) which the per-request `ResponseFuture::poll`
+    /// path cannot observe — the response future itself succeeded; the
+    /// failure surfaced inside the streaming body. Without this hook a
+    /// pooled-but-dead `Channel` would be reused by the next caller and
+    /// fail identically. Bounded to one channel per call so a burst of
+    /// errors progressively replaces the bad channels rather than
+    /// flushing the entire pool at once. See #147 for the production
+    /// wedge that motivated this. The String is a free-form caller
+    /// reason logged at `warn!` so operators can correlate the eviction
+    /// to the originating RPC.
+    EvictIdle(String),
 }
 
 /// The result of a Future that connects to a given Endpoint.  This is a tuple
@@ -192,6 +212,7 @@ impl ConnectionManager {
         if connections_per_endpoint == 0 {
             connections_per_endpoint = 1;
         }
+        let evict_tx = connection_tx.clone();
         let worker = ConnectionManagerWorker {
             endpoints,
             available_connections: max_concurrent_requests,
@@ -210,7 +231,7 @@ impl ConnectionManager {
                 .service_requests(connections_per_endpoint, worker_rx, connection_rx)
                 .await;
         });
-        Self { worker_tx }
+        Self { worker_tx, connection_tx: evict_tx }
     }
 
     /// Get a Connection that can be used as a `tonic::Channel`, except it
@@ -250,6 +271,37 @@ impl ConnectionManager {
                 timeout.as_millis(),
             )),
         }
+    }
+
+    /// Evict one currently-idle channel from the pool and queue a fresh
+    /// reconnect for that endpoint slot. No-op if the pool has no idle
+    /// channels (every channel is either in use — and any transport error
+    /// it produces will already evict via `ResponseFuture::poll` — or
+    /// already in the reconnecting state).
+    ///
+    /// **Why coarse (drop-any vs drop-by-identifier):** the streaming RPC
+    /// retry path (`get_part_single_stream`) cannot identify which pooled
+    /// channel was the source of an `h2 GOAWAY` / `"stream is closed"` /
+    /// `Code::Internal` error: the originating `Connection` was already
+    /// dropped at the end of `read_internal`'s acquisition statement, so
+    /// its `ChannelIdentifier` is no longer in scope. Production wedge
+    /// #147: an h2 server sent `GOAWAY(too_many_internal_resets,
+    /// ENHANCE_YOUR_CALM)` to a worker; the worker's pooled `Channel`
+    /// clones share the closed h2 connection but the per-request
+    /// `ResponseFuture::poll` Err path only fires for non-streaming
+    /// failures (the streaming body errors are invisible to it). The
+    /// next caller pulled the same dead channel and got the same
+    /// failure. Calling `evict_idle_channel` from the streaming retry
+    /// loop ensures the next acquisition gets a freshly-built channel.
+    /// Repeated calls (one per failed retry) progressively replace
+    /// every dead clone in the pool without flushing healthy ones.
+    pub fn evict_idle_channel(&self, reason: impl Into<String>) {
+        // The worker's connection_rx is unbounded so this never blocks.
+        // If the receiver is gone (manager shutdown) the send fails silently —
+        // there's nothing useful to do at the call site in that case.
+        let _ = self
+            .connection_tx
+            .send(ConnectionRequest::EvictIdle(reason.into()));
     }
 }
 
@@ -439,6 +491,7 @@ impl ConnectionManagerWorker {
             tx: self.connection_tx.clone(),
             pending_channel: Some(channel.channel.clone()),
             channel,
+            transport_error: false,
         }));
     }
 
@@ -489,6 +542,35 @@ impl ConnectionManagerWorker {
                     self.connect_endpoint(identifier.endpoint_index, None);
                 }
             }
+            // Drop one currently-idle channel and reconnect its slot. See
+            // `ConnectionManager::evict_idle_channel` doc for the
+            // motivation. Only touches `available_channels` (idle pool);
+            // a channel currently leased to a `Connection` is untouched
+            // and will go through the normal `Error` path if it surfaces
+            // a transport failure.
+            ConnectionRequest::EvictIdle(reason) => {
+                if let Some(victim) = self.available_channels.pop_front() {
+                    let endpoint_index = victim.identifier.endpoint_index;
+                    let connection_index = victim.identifier.connection_index;
+                    drop(victim); // Release the tonic Channel handle.
+                    warn!(
+                        %reason,
+                        ?endpoint_index,
+                        ?connection_index,
+                        "ConnectionManager: evicting idle channel and reconnecting (caller-driven, see #147)"
+                    );
+                    // Reconnect with `Some(connection_index)` so the
+                    // backoff schedule kicks in — we treat this as a
+                    // failure-induced reconnect rather than a fresh
+                    // initial connect.
+                    self.connect_endpoint(endpoint_index, Some(connection_index));
+                } else {
+                    debug!(
+                        %reason,
+                        "ConnectionManager: evict_idle_channel requested but no idle channel available"
+                    );
+                }
+            }
         }
     }
 }
@@ -510,6 +592,29 @@ pub struct Connection {
     pending_channel: Option<Channel>,
     /// The identifier to send to `tx`.
     channel: EstablishedChannel,
+    /// If set, on Drop we send `Error` instead of `Dropped` so the
+    /// `ConnectionManagerWorker` removes this channel from the pool and
+    /// queues a reconnect. Set by `notify_transport_error` when the
+    /// caller observes a transport-level failure that the per-request
+    /// `ResponseFuture::poll` path cannot detect (e.g. an h2 GOAWAY or
+    /// `"stream is closed"` surfacing inside a streaming response body).
+    /// Without this, the channel would be silently returned to the pool
+    /// and the next caller would inherit the same dead handle. See #147.
+    transport_error: bool,
+}
+
+impl Connection {
+    /// Mark this Connection as having observed a transport-level error.
+    /// The channel will be evicted from the pool on Drop and the endpoint
+    /// will queue a fresh reconnect.
+    ///
+    /// Use this when an error surfaces *after* the request future has
+    /// returned `Ok` — typically inside a streaming response body. The
+    /// non-streaming case (request future itself returns `Err`) is
+    /// handled automatically by `ResponseFuture::poll`.
+    pub fn notify_transport_error(&mut self) {
+        self.transport_error = true;
+    }
 }
 
 impl Drop for Connection {
@@ -521,7 +626,24 @@ impl Drop for Connection {
                 channel,
                 identifier: self.channel.identifier,
             });
-        drop(self.tx.send(ConnectionRequest::Dropped(pending_channel)));
+        if self.transport_error {
+            // Two notifications: (1) `Error` removes the channel from
+            // the pool (or marks the pending one for re-establishment)
+            // and queues a reconnect; (2) `Dropped` releases the
+            // concurrency slot. Without (2) the leased slot would leak
+            // and `available_connections` would drift down on every
+            // unhealthy drop, eventually wedging the pool. The
+            // `Dropped` carries `None` because the channel is dead and
+            // must not be put back into `available_channels`.
+            let was_pending = pending_channel.is_some();
+            drop(
+                self.tx
+                    .send(ConnectionRequest::Error((self.channel.identifier, was_pending))),
+            );
+            drop(self.tx.send(ConnectionRequest::Dropped(None)));
+        } else {
+            drop(self.tx.send(ConnectionRequest::Dropped(pending_channel)));
+        }
     }
 }
 
@@ -700,5 +822,223 @@ mod tests {
             "expected message to start with 'ConnectionRefused', got: {:?}",
             err.messages
         );
+    }
+
+    /// #147 regression: after a pooled `Channel` becomes stale (h2
+    /// GOAWAY post-`too_many_internal_resets`), `evict_idle_channel`
+    /// removes one currently-idle channel from the pool and queues a
+    /// reconnect for that endpoint slot. Verified end-to-end against a
+    /// real local TCP server: count the distinct TCP accepts on the
+    /// listener and assert that one extra `accept()` happens after the
+    /// eviction call.
+    ///
+    /// **Why count TCP accepts and not channel identifiers:** the
+    /// `EstablishedChannel` identifier is private and the `Connection`
+    /// itself doesn't expose it. The observable side-effect of
+    /// `evict_idle_channel` is "kill the underlying tonic Channel and
+    /// replace it" — and replacing involves a fresh `Endpoint::connect`,
+    /// which translates to a new TCP `accept()` on the server side.
+    #[tokio::test]
+    async fn evict_idle_channel_triggers_reconnect_against_real_endpoint() {
+        // Bind an ephemeral TCP listener and count accepts. We don't run
+        // a real h2/grpc handshake — `Endpoint::connect` is lazy in
+        // tonic 0.13 (the channel is created but the underlying TCP
+        // dial happens on first request), so for our purpose we want a
+        // listener that accepts and immediately closes the socket. The
+        // ConnectionManager's `Endpoint::connect().await` will succeed
+        // (the TCP handshake completes) and then sit idle in the pool
+        // until we either issue a request or evict.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let accept_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accept_count_for_task = Arc::clone(&accept_count);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        accept_count_for_task
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Hold the connection open briefly so the client's
+                        // h2 handshake can begin / fail, then drop it.
+                        // We don't speak h2 — that's fine; the client's
+                        // pool just needs the TCP connect to complete to
+                        // populate `available_channels`. Subsequent
+                        // request attempts will fail at h2 layer, but
+                        // this test only cares about the reconnect count.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        drop(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let endpoint =
+            Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                .expect("valid endpoint")
+                .connect_timeout(Duration::from_secs(2));
+        // Single connection so we can pin down "before vs after" accept count.
+        let cm = ConnectionManager::new(
+            std::iter::once(endpoint),
+            /* connections_per_endpoint */ 1,
+            /* max_concurrent_requests */ 1,
+            Retry {
+                max_retries: 0,
+                delay: 0.0,
+                jitter: 0.0,
+                ..Default::default()
+            },
+            Arc::new(|d| d),
+        );
+
+        // Wait for the initial connection to land in the pool. We do
+        // this by polling `accept_count` until it advances past the
+        // initial value, with a hard cap so the test can't hang.
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if accept_count.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            if tokio::time::Instant::now() > initial_deadline {
+                panic!(
+                    "initial TCP accept did not happen within 3s — \
+                     ConnectionManager failed to dial the test listener"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let baseline_accepts =
+            accept_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            baseline_accepts >= 1,
+            "expected at least 1 initial accept, got {baseline_accepts}"
+        );
+
+        // Trigger eviction. This MUST cause exactly one fresh TCP dial
+        // (after the per-endpoint backoff sleep, jittered around 1s
+        // for the first reconnect cycle).
+        cm.evict_idle_channel("test: simulate stale channel after GOAWAY");
+
+        // Wait for the reconnect TCP dial. With a 1s base backoff +
+        // 25% jitter, the dial happens between ~0.75s and ~1.25s after
+        // the eviction call. Allow a generous 4s window for CI.
+        let reconnect_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let now = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+            if now > baseline_accepts {
+                break;
+            }
+            if tokio::time::Instant::now() > reconnect_deadline {
+                panic!(
+                    "expected a fresh TCP accept after evict_idle_channel; \
+                     accept_count is still {now} (baseline {baseline_accepts}). \
+                     Without the fix from #147 (idle channel never evicted, \
+                     reconnect never queued), accept_count would stay at \
+                     baseline forever."
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        accept_task.abort();
+    }
+
+    /// #147 regression for the Drop-side eviction: a `Connection`
+    /// returned by the pool, when marked unhealthy via
+    /// `notify_transport_error` and dropped, MUST trigger a fresh TCP
+    /// dial — proving the channel was evicted from the pool and a
+    /// reconnect was queued, instead of being silently returned to
+    /// the pool as healthy.
+    ///
+    /// This is the streaming-RPC mitigation path: the call site (e.g.
+    /// `read_internal`) holds the Connection while the streaming
+    /// response body errors out, marks it bad, and drops it. Without
+    /// the Drop-side eviction, the dead channel would be reused by
+    /// the next caller and the wedge would persist.
+    #[tokio::test]
+    async fn notify_transport_error_evicts_channel_on_drop() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let accept_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accept_count_for_task = Arc::clone(&accept_count);
+        let accept_task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        accept_count_for_task
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        drop(stream);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let endpoint =
+            Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+                .expect("valid endpoint")
+                .connect_timeout(Duration::from_secs(2));
+        let cm = ConnectionManager::new(
+            std::iter::once(endpoint),
+            /* connections_per_endpoint */ 1,
+            /* max_concurrent_requests */ 1,
+            Retry {
+                max_retries: 0,
+                delay: 0.0,
+                jitter: 0.0,
+                ..Default::default()
+            },
+            Arc::new(|d| d),
+        );
+
+        // Wait for the initial dial.
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if accept_count.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            if tokio::time::Instant::now() > initial_deadline {
+                panic!("initial TCP accept did not happen within 3s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let baseline_accepts =
+            accept_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Acquire the connection, mark it bad, drop it. The Drop must
+        // queue a reconnect (which we observe via the next TCP accept).
+        let mut conn = cm
+            .connection("test-acquire".to_string())
+            .await
+            .expect("acquire");
+        conn.notify_transport_error();
+        drop(conn);
+
+        let reconnect_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let now = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+            if now > baseline_accepts {
+                break;
+            }
+            if tokio::time::Instant::now() > reconnect_deadline {
+                panic!(
+                    "expected a fresh TCP accept after \
+                     Connection::notify_transport_error + drop; accept_count \
+                     is still {now} (baseline {baseline_accepts}). Without \
+                     the Drop-side eviction (transport_error flag), the \
+                     channel would be silently re-pooled as healthy."
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        accept_task.abort();
     }
 }
