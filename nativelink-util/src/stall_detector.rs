@@ -729,71 +729,18 @@ fn dump_thread_stacks_macos(label: &str) {
         Err(err) => eprintln!("Failed to write thread dump to {path}: {err}"),
     }
 
-    // Capture full userspace backtraces via `sample` (macOS built-in).
-    // `sample <pid> 1` captures a 1-second sampling profile of all threads
-    // including symbolicated call stacks. This is the macOS equivalent of
-    // eu-stack on Linux.
-    let bt_path = format!("/tmp/nativelink-stall-{timestamp_ms}-bt.txt");
-    match std::process::Command::new("sample")
-        .args([&pid.to_string(), "1", "-mayDie"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(mut child) => {
-            const SAMPLE_TIMEOUT: Duration = Duration::from_secs(30);
-            const POLL_INTERVAL: Duration = Duration::from_millis(250);
-            let deadline = std::time::Instant::now() + SAMPLE_TIMEOUT;
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Some(status),
-                    Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
-                            eprintln!(
-                                "sample timed out after {SAMPLE_TIMEOUT:.0?}, killing child process"
-                            );
-                            drop(child.kill());
-                            drop(child.wait());
-                            break None;
-                        }
-                        std::thread::sleep(POLL_INTERVAL);
-                    }
-                    Err(err) => {
-                        eprintln!("sample wait error: {err}");
-                        drop(child.kill());
-                        drop(child.wait());
-                        break None;
-                    }
-                }
-            };
-            if status.is_some() {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|mut r| {
-                        let mut buf = Vec::new();
-                        std::io::Read::read_to_end(&mut r, &mut buf).ok();
-                        buf
-                    })
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|mut r| {
-                        let mut buf = Vec::new();
-                        std::io::Read::read_to_end(&mut r, &mut buf).ok();
-                        buf
-                    })
-                    .unwrap_or_default();
-                let combined = [&stdout[..], b"\n--- stderr ---\n", &stderr[..]].concat();
-                match std::fs::write(&bt_path, &combined) {
-                    Ok(()) => eprintln!("Userspace sample written to {bt_path}"),
-                    Err(err) => eprintln!("Failed to write sample to {bt_path}: {err}"),
-                }
-            }
-        }
-        Err(err) => eprintln!("Failed to run sample: {err}"),
-    }
+    // Intentionally do NOT invoke macOS `sample` here. Empirically (worker-02,
+    // 2026-04-25) `sample <pid> 1 -mayDie` against this binary fails to
+    // complete within 30s in ~80% of attempts, and during that window it
+    // suspends the entire target process (sample uses task_for_pid + per-
+    // thread suspend/resume; on a busy multi-threaded program the round trip
+    // can wedge). The result was every dump turning into a 33s whole-process
+    // freeze that the runtime-watchdog then re-flagged as a stall, generating
+    // more dumps in a feedback loop. Mach thread enumeration above gives
+    // names + states + per-thread CPU without suspending; that's enough for
+    // diagnosis. Re-enable sample only if it can be made non-suspending and
+    // bounded, or replaced with an in-process unwinder (e.g. `backtrace` per
+    // thread via a signal handler).
 
     cleanup_old_stall_dumps();
 }
