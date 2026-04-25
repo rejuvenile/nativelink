@@ -2009,20 +2009,20 @@ mod tests {
         };
         assert_eq!(ret, 0, "sigaction(SIGUSR2, NULL, &out) must succeed");
 
-        // SIG_DFL is 0 on every Unix tokio supports. Reading back a
-        // null sa_sigaction means we never installed (or some
-        // library reverted us) — the field-test bug.
+        // SIG_DFL means the kernel default (terminate). The field-test
+        // bug: if our install never ran, an external `kill -USR2 $pid`
+        // hits SIG_DFL and kills the worker.
         assert_ne!(
-            after.sa_sigaction, 0,
+            after.sa_sigaction, libc::SIG_DFL,
             "SIGUSR2 disposition is SIG_DFL after install_dump_signal_handler — \
              external `kill -USR2 $pid` would terminate the worker (field-test \
              a367ed2d3e3f1610c regression)",
         );
-        // SIG_IGN is 1 on every Unix tokio supports. SIG_IGN would
-        // mean the signal is silently dropped — the process would
-        // survive but external triggers would never produce a dump.
+        // SIG_IGN means the signal is silently dropped — the process
+        // would survive but external triggers would never produce a
+        // dump (no handler runs).
         assert_ne!(
-            after.sa_sigaction, 1,
+            after.sa_sigaction, libc::SIG_IGN,
             "SIGUSR2 disposition is SIG_IGN after install_dump_signal_handler — \
              external triggers would never produce a dump",
         );
@@ -2153,21 +2153,21 @@ mod tests {
     fn install_dump_signal_handler_replaces_sigrtmin_default_linux() {
         super::install_dump_signal_handler();
 
-        let sig = unsafe { libc::SIGRTMIN() } + 1;
+        let sig = libc::SIGRTMIN() + 1;
         let mut after: libc::sigaction = unsafe { core::mem::zeroed() };
         let ret = unsafe {
             libc::sigaction(sig, core::ptr::null(), &mut after)
         };
         assert_eq!(ret, 0, "sigaction(SIGRTMIN+1, NULL, &out) must succeed");
         assert_ne!(
-            after.sa_sigaction, 0,
+            after.sa_sigaction, libc::SIG_DFL,
             "SIGRTMIN+1 disposition is SIG_DFL after \
              install_dump_signal_handler — internal pthread_kill rounds \
              would terminate the worker on Linux (mirror of worker-03 \
              field-test regression)",
         );
         assert_ne!(
-            after.sa_sigaction, 1,
+            after.sa_sigaction, libc::SIG_IGN,
             "SIGRTMIN+1 disposition is SIG_IGN — handler never called",
         );
         assert!(
