@@ -1292,39 +1292,69 @@ impl FastSlowStore {
         arc_self: Arc<Self>,
         key: StoreKey<'_>,
     ) -> (Arc<StreamingBlobInner>, bool) {
-        let loader_guard = arc_self.get_loader(key);
-        let streaming_inner = loader_guard.streaming_inner.clone();
-        let is_new = loader_guard.is_new;
-        if is_new {
-            // We're the first caller — spawn the producer with the guard.
-            // The guard's Drop removes the populating_digests entry when
-            // the producer finishes. Holding it for the producer's full
-            // lifetime allows late-arriving waiters to find this populate
-            // in the map and join in.
-            //
-            // tokio::spawn is synchronous; no awaits between
-            // construct-writer and spawn, so caller cancellation cannot
-            // slip in and drop the writer un-EOF'd.
-            let writer = StreamingBlobWriter::new(streaming_inner.clone());
-            let arc_for_producer = Arc::clone(&arc_self);
-            arc_self
-                .metrics
-                .populate_spawn_count
-                .fetch_add(1, Ordering::Release);
-            // The JoinHandle is intentionally dropped — the producer is
-            // detached and runs to completion regardless of caller
-            // lifetime. Dropping the JoinHandle does NOT abort the task.
-            // The producer's terminal Result is discarded here; waiters
-            // observe terminal state via the streaming buffer.
-            drop(tokio::spawn(async move {
-                drop(Self::run_producer(arc_for_producer, loader_guard, writer).await);
-            }));
-        } else {
-            // Another caller spawned the producer; nothing to do. Drop
-            // the guard — the producer's guard keeps the entry alive.
-            drop(loader_guard);
+        // CRITICAL ORDERING: we hold `populating_digests` ACROSS the
+        // `tokio::spawn` so the producer task is enqueued BEFORE the entry
+        // is publicly observable. Without this, a concurrent caller could
+        // (a) acquire the lock between our `insert` and our `spawn`,
+        // (b) find the entry, clone the streaming_inner, drop the lock,
+        // (c) attach a reader and start awaiting on the streaming buffer,
+        // (d) all before the producer task even hits the runqueue.
+        // Under runtime contention the producer might then sit unscheduled
+        // for >60s (the reader's notify deadline), surfacing as a wedge
+        // with `producer_task=<none>` because the OnceLock for
+        // producer_task_id is set on first send. tokio::spawn is sync
+        // (just enqueues), so holding the parking_lot Mutex across it is
+        // a brief critical-section extension, not a hazard.
+        //
+        // copy_slow_to_fast (the inline-producer caller) is unaffected
+        // because it runs the producer in the same task synchronously
+        // after get_loader returns; there's no spawn-then-publish gap.
+        let owned_key = key.borrow().into_owned();
+        let key_for_guard = owned_key.clone();
+        let digest = match key.borrow() {
+            StoreKey::Digest(d) => d,
+            _ => DigestInfo::zero_digest(),
+        };
+        let mut guard = arc_self.populating_digests.lock();
+        if let Some((_l, s)) = guard.get(&owned_key) {
+            // Late-arriving waiter: another caller already inserted the
+            // entry AND (by virtue of this same lock) already spawned the
+            // producer. Safe to drop the lock and observe the producer
+            // via the returned streaming_inner.
+            let streaming_inner = Arc::clone(s);
+            drop(guard);
+            return (streaming_inner, false);
         }
-        (streaming_inner, is_new)
+        // First caller: build inner + writer + LoaderGuard, spawn the
+        // producer, then publish the entry — all under the lock.
+        let inner = Arc::new(StreamingBlobInner::new(
+            digest,
+            Self::POPULATE_STREAM_BUFFER_BYTES,
+        ));
+        let loader: Loader = Arc::new(());
+        let writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let arc_for_producer = Arc::clone(&arc_self);
+        let loader_guard = LoaderGuard {
+            weak_store: arc_self.weak_self.clone(),
+            key: key_for_guard,
+            loader: Some(Arc::clone(&loader)),
+            streaming_inner: Arc::clone(&inner),
+            is_new: true,
+        };
+        arc_self
+            .metrics
+            .populate_spawn_count
+            .fetch_add(1, Ordering::Release);
+        // The JoinHandle is intentionally dropped — the producer is
+        // detached and runs to completion regardless of caller lifetime.
+        // The producer's terminal Result is discarded here; waiters
+        // observe terminal state via the streaming buffer.
+        drop(tokio::spawn(async move {
+            drop(Self::run_producer(arc_for_producer, loader_guard, writer).await);
+        }));
+        guard.insert(owned_key, (loader, Arc::clone(&inner)));
+        drop(guard);
+        (inner, true)
     }
 
     /// If `key` is currently held in the in-memory `mirror_blobs` map,
