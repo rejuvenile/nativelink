@@ -359,13 +359,39 @@ impl Drop for StreamingBlobWriter {
         if !self.eof_sent {
             let mut terminal = self.inner.terminal.lock();
             if terminal.is_none() {
-                warn!(
-                    digest = %self.inner.digest,
-                    bytes_written = self.inner.bytes_written.load(std::sync::atomic::Ordering::Relaxed),
-                    expected_size = self.inner.digest.size_bytes(),
-                    age_ms = self.inner.age_ms(),
-                    "streaming blob writer dropped without eof, notify_waiters firing"
-                );
+                let bytes_written = self
+                    .inner
+                    .bytes_written
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let expected_size = self.inner.digest.size_bytes();
+                let age_ms = self.inner.age_ms();
+                // Known-by-design: full-byte writer-drop happens when the
+                // inline copy_slow_to_fast populate path is cancelled
+                // mid-await between data_stream finishing and
+                // fast_store.update.await resolving. This Drop is the
+                // safety net that converts the cancellation into a
+                // terminal Internal error so readers don't block forever;
+                // a follow-up populate succeeds shortly after. Demote to
+                // debug to avoid alarming on benign cancellation; keep
+                // warn for the partial/zero-byte cases where the producer
+                // actually wedged.
+                if bytes_written == expected_size && age_ms < 5000 {
+                    debug!(
+                        digest = %self.inner.digest,
+                        bytes_written,
+                        expected_size,
+                        age_ms,
+                        "streaming blob writer dropped without eof (full-byte, likely cancelled populate), notify_waiters firing"
+                    );
+                } else {
+                    warn!(
+                        digest = %self.inner.digest,
+                        bytes_written,
+                        expected_size,
+                        age_ms,
+                        "streaming blob writer dropped without eof, notify_waiters firing"
+                    );
+                }
                 *terminal = Some(Err(make_err!(
                     Code::Internal,
                     "writer dropped without sending EOF"

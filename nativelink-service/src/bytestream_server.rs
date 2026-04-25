@@ -1720,10 +1720,10 @@ impl ByteStreamServer {
             // Single per-blob summary so we can correlate mirror gaps to specific
             // digests without spamming once per chunk. The chunk-level counter
             // mirror_chunks_dropped_backpressure tells us how many chunks were lost.
-            warn!(
+            info!(
                 %digest,
                 expected_size,
-                "mirror tee incomplete: one or more chunks dropped due to backpressure"
+                "mirror tee best-effort skipped (chunks dropped to backpressure); receiver will re-fetch on demand"
             );
         }
 
