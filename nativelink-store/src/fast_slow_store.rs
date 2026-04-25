@@ -87,15 +87,43 @@ const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
 
 /// Listener registered on the fast store's eviction map so the
 /// `on_pin_expired` hook lands the digest in `failed_slow_writes`. The
-/// pin TTL firing without an explicit unpin means we have no
-/// confirmation that the slow-store write completed; queueing a retry
-/// is the safe default. False positives (e.g. `DirectoryCache` pins
-/// that auto-expired but whose blobs are already on the server) cost a
-/// single existence RPC per digest on reconnect — far cheaper than
-/// permanent data loss from a missed failure.
+/// pin TTL firing without an explicit unpin would, by itself, be
+/// ambiguous: it could mean (a) a real silent slow-write hang we MUST
+/// retry, or (b) a `DirectoryCache` download-pin that auto-expired
+/// because the action took longer than `PIN_TIMEOUT_SECS` (no slow-write
+/// ever existed for that digest — the blob came in via download).
+///
+/// To distinguish, the listener consults `in_flight_slow_writes` of its
+/// owning `FastSlowStore`. Only digests that have an outstanding
+/// background slow-write spawn (populated by `update` /
+/// `update_oneshot`) are queued for retry. Download-pin expiries are
+/// silently skipped — no warn, no failed-set entry — which both
+/// eliminates the spurious "queueing digest for slow-write retry"
+/// log churn (5774 events / 10 min observed on workers from
+/// `directory_cache.rs` pins) AND prevents `failed_slow_writes` from
+/// accumulating dead-weight entries that, on reconnect, would attempt
+/// to re-upload blobs the server already has.
+///
+/// As a side-effect this also dedupes the multi-listener fan-out:
+/// `local_worker.rs` registers three `PinExpireFailedWritesListener`
+/// instances against the SAME underlying fast store (one per
+/// `FastSlowStore::new` / `new_with_shared_failed_writes` site). Each
+/// listener carries its OWNING wrapper's `in_flight_slow_writes` Arc
+/// (every wrapper has its own in-flight map; only `failed_slow_writes`
+/// is shared). A real silent slow-write hang shows up in the in-flight
+/// of ONLY the wrapper that owned the spawn, so exactly one of the
+/// three listeners fires the warn + insert per pin expiry — collapsing
+/// the previously observed 3× warn amplification to 1×.
 #[derive(Debug)]
 struct PinExpireFailedWritesListener {
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
+    /// Per-wrapper in-flight slow-write set. Used as the "is this pin
+    /// associated with a slow-write owned by *this* wrapper?" gate.
+    /// Skipping the warn + failed-set insert when the digest is absent
+    /// from this map is what makes the listener idempotent across the
+    /// 3-wrapper composition AND scopes the durability path to actual
+    /// uploads (vs `DirectoryCache` download pins).
+    in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
 }
 
 impl ItemCallback for PinExpireFailedWritesListener {
@@ -109,10 +137,25 @@ impl ItemCallback for PinExpireFailedWritesListener {
 
     fn on_pin_expired(&self, store_key: StoreKey<'_>, _size: u64) {
         if let StoreKey::Digest(digest) = store_key {
+            // Only act when *this* wrapper has a slow-write outstanding
+            // for the digest. The two skip cases are:
+            //   1. `DirectoryCache` download pin (no slow-write ever
+            //      created — blob came in via download).
+            //   2. Slow-write was initiated by a sibling wrapper
+            //      sharing the fast store (the sibling's listener is
+            //      the one that should fire).
+            // In either case, queueing the digest into `failed_slow_writes`
+            // would produce a dead-weight reconnect retry for a blob the
+            // server already has.
+            let owned_key = StoreKey::Digest(digest);
+            if !self.in_flight_slow_writes.lock().contains_key(&owned_key) {
+                return;
+            }
             self.failed_slow_writes.lock().insert(digest);
             warn!(
                 ?digest,
-                "fast-store pin auto-expired; queueing digest for slow-write retry on reconnect"
+                "fast-store pin auto-expired with in-flight slow-write; \
+                 queueing digest for slow-write retry on reconnect"
             );
         }
     }
@@ -125,12 +168,20 @@ impl ItemCallback for PinExpireFailedWritesListener {
 /// failed_slow_writes inserts still cover the in-band error case; the
 /// pin-expiry listener is the safety net for the SILENT-hang case
 /// (slow-write neither succeeds nor errors before pin TTL fires).
+///
+/// Registers a listener that carries BOTH the `failed_slow_writes`
+/// Arc (typically shared across wrappers) AND the `in_flight_slow_writes`
+/// Arc (per-wrapper). The in-flight gate is what makes the
+/// listener safe to register multiple times against the same fast
+/// store — see the listener's doc comment for the rationale.
 fn register_pin_expire_listener(
     fast_store: &Store,
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
+    in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
 ) {
     let listener: Arc<dyn ItemCallback> = Arc::new(PinExpireFailedWritesListener {
         failed_slow_writes,
+        in_flight_slow_writes,
     });
     if let Err(err) = fast_store.register_item_callback(listener) {
         warn!(
@@ -302,7 +353,13 @@ impl FastSlowStore {
     pub fn new(spec: &FastSlowSpec, fast_store: Store, slow_store: Store) -> Arc<Self> {
         let failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>> =
             Arc::new(Mutex::new(HashSet::new()));
-        register_pin_expire_listener(&fast_store, failed_slow_writes.clone());
+        let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        register_pin_expire_listener(
+            &fast_store,
+            failed_slow_writes.clone(),
+            in_flight_slow_writes.clone(),
+        );
         Arc::new_cyclic(|weak_self| Self {
             fast_store,
             fast_direction: spec.fast_direction,
@@ -311,7 +368,7 @@ impl FastSlowStore {
             weak_self: weak_self.clone(),
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
-            in_flight_slow_writes: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_slow_writes,
             in_flight_empty_notify: Arc::new(Notify::new()),
             stable_digests: Arc::new(Mutex::new(Vec::new())),
             stable_notify: Arc::new(Notify::new()),
@@ -529,7 +586,9 @@ impl FastSlowStore {
         other: &Arc<Self>,
     ) -> Arc<Self> {
         let shared = other.failed_slow_writes.clone();
-        register_pin_expire_listener(&fast_store, shared.clone());
+        let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        register_pin_expire_listener(&fast_store, shared.clone(), in_flight_slow_writes.clone());
         Arc::new_cyclic(|weak_self| Self {
             fast_store,
             fast_direction: spec.fast_direction,
@@ -538,7 +597,7 @@ impl FastSlowStore {
             weak_self: weak_self.clone(),
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
-            in_flight_slow_writes: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_slow_writes,
             in_flight_empty_notify: Arc::new(Notify::new()),
             stable_digests: Arc::new(Mutex::new(Vec::new())),
             stable_notify: Arc::new(Notify::new()),

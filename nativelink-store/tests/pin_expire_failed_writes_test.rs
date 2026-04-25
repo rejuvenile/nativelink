@@ -370,3 +370,257 @@ async fn slow_write_watchdog_inserts_into_failed_slow_writes() -> Result<(), Err
     h.release_update.notify_waiters();
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// Test C — Fix B regression (download-pin does NOT populate
+// failed_slow_writes).
+//
+// Scenario: `directory_cache.rs` pins blobs that arrived via DOWNLOAD
+// (not via a slow-store write). When the pin TTL fires (~120s for
+// long actions), the pin-expiry listener used to unconditionally insert
+// the digest into `failed_slow_writes` — producing dead-weight entries
+// that, on next worker reconnect, would attempt to re-upload blobs the
+// server already has. The fix gates the listener on the wrapper's own
+// `in_flight_slow_writes`: only digests with an outstanding slow-write
+// spawn get queued for retry. This test pins a digest WITHOUT a
+// preceding `update`/`update_oneshot`, runs the sweep, and asserts the
+// failed set stays empty.
+//
+// Mutation step (not in test code — to verify the test guards
+// behavior): comment out the `if !self.in_flight_slow_writes.lock()
+// .contains_key(&owned_key) { return; }` early-return in
+// `PinExpireFailedWritesListener::on_pin_expired`. The test must then
+// FAIL because the digest gets inserted unconditionally.
+// ---------------------------------------------------------------------
+
+#[nativelink_test]
+async fn download_pin_does_not_populate_failed_slow_writes() -> Result<(), Error> {
+    let h = make_harness().await?;
+    let digest = DigestInfo::try_new(VALID_HASH, 1024).unwrap();
+
+    // Stage the blob into the fast store directly via the FilesystemStore
+    // (NOT via the FastSlowStore::update path — we don't want a slow-write
+    // to populate `in_flight_slow_writes`). This mirrors how
+    // `populate_fast_store_unchecked` lands a downloaded blob: the bytes
+    // arrive via `copy_slow_to_fast` → `fast_store.update`, never
+    // touching the wrapper's in-flight bookkeeping.
+    let data = Bytes::from(vec![0xC3; 1024]);
+    Pin::new(h.fs_store.as_ref())
+        .update_oneshot(digest.into(), data)
+        .await
+        .err_tip(|| "fs_store.update_oneshot direct seed")?;
+
+    // Pin via the FilesystemStore directly — same call shape as
+    // `directory_cache.rs:2553` (`fss.fast_store().pin_digests(&[digest])`).
+    Pin::new(h.fs_store.as_ref()).pin_digests(&[digest]);
+
+    // Sanity: the pin landed.
+    assert!(
+        h.fs_store.test_force_pin_expired(&digest),
+        "digest must be pinned via direct fs_store.pin_digests"
+    );
+
+    // Sanity: no slow-write went through the FastSlowStore for this
+    // digest, so in_flight is empty for this wrapper.
+    assert_eq!(
+        h.fss.in_flight_slow_write_count(),
+        0,
+        "no FastSlowStore::update call was made; in_flight must be empty",
+    );
+
+    // Trigger the pin-expiry sweep. With the fix, the listener consults
+    // in_flight, sees nothing for this digest, and skips both the warn
+    // AND the failed_slow_writes insert.
+    h.fs_store.test_expire_stale_pins().await;
+
+    let failed = h.fss.drain_failed_digests();
+    assert!(
+        !failed.iter().any(|d| *d == digest),
+        "download-only pin must NOT populate failed_slow_writes — \
+         no slow-write was outstanding for this digest. Got: {failed:?}",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Test D — Fix A regression (pin-expire listener registration is
+// idempotent across multiple FastSlowStore wrappers sharing the same
+// fast store).
+//
+// Scenario: `local_worker.rs` constructs THREE `FastSlowStore`
+// wrappers around the SAME underlying fast store (one per
+// `FastSlowStore::new` / `new_with_shared_failed_writes` site). Each
+// registers a `PinExpireFailedWritesListener` on the shared fast
+// store. Without dedup, every pin expiry fires N callbacks (observed:
+// 3× warn amplification, 5774 events / 10 min on workers).
+//
+// The fix gates each listener on its OWNING wrapper's
+// `in_flight_slow_writes`. A real silent slow-write hang shows up in
+// the in-flight of ONLY the wrapper that owned the spawn, so exactly
+// one listener fires the warn + insert.
+//
+// Test shape: build TWO FastSlowStore wrappers around the SAME
+// FilesystemStore. Use `FastSlowStore::new` (separate failed sets) so
+// we can directly count per-wrapper inserts. Issue an `update_oneshot`
+// via wrapper A only; the slow-write hangs. Force the pin to expire,
+// sweep, assert:
+//   - A's failed_slow_writes contains the digest (A owned the
+//     in-flight).
+//   - B's failed_slow_writes does NOT contain the digest (B's
+//     in-flight is empty for it; the listener skipped).
+//
+// Without the fix, both listeners would insert into their respective
+// failed sets and the assertion on B would fail.
+//
+// Mutation step: same as Test C — comment out the `contains_key` gate
+// in `on_pin_expired`. B's failed_slow_writes will then contain the
+// digest, failing the test.
+// ---------------------------------------------------------------------
+
+#[nativelink_test]
+async fn pin_expire_listener_registration_is_idempotent() -> Result<(), Error> {
+    let temp = tempfile::Builder::new()
+        .prefix("pin_expire_idempotent_")
+        .tempdir()
+        .expect("tempdir");
+    let content_path = temp.path().join("content");
+    let temp_path = temp.path().join("temp");
+    tokio::fs::create_dir_all(&content_path).await.unwrap();
+    tokio::fs::create_dir_all(&temp_path).await.unwrap();
+    let fs_store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.to_string_lossy().into_owned(),
+        temp_path: temp_path.to_string_lossy().into_owned(),
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+    let fast_store_handle = Store::new(fs_store.clone());
+
+    // Slow store A: hangs (mirrors the production silent-hang case).
+    let inner_slow_a = MemoryStore::new(&MemorySpec::default());
+    let update_entered_a = Arc::new(Notify::new());
+    let release_update_a = Arc::new(Notify::new());
+    let hanging_a = Arc::new(HangingSlowStore {
+        inner: inner_slow_a,
+        update_entered: Arc::clone(&update_entered_a),
+        release_update: Arc::clone(&release_update_a),
+    });
+
+    // Slow store B: regular MemoryStore — never actually used in this
+    // test because we don't issue any update via wrapper B for the
+    // shared digest, but it must be a valid Store.
+    let inner_slow_b = MemoryStore::new(&MemorySpec::default());
+
+    // Build two FastSlowStore wrappers around the SAME fast_store.
+    // Use `::new` (NOT `new_with_shared_failed_writes`) so each has its
+    // own failed_slow_writes — letting us count per-wrapper inserts
+    // directly via `drain_failed_digests`.
+    let fss_a = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store_handle.clone(),
+        Store::new(hanging_a),
+    );
+    let fss_b = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store_handle.clone(),
+        Store::new(inner_slow_b),
+    );
+
+    let digest = DigestInfo::try_new(VALID_HASH, 1024).unwrap();
+    let data = Bytes::from(vec![0xA5; 1024]);
+
+    // Issue update_oneshot via wrapper A — this populates A's
+    // in_flight_slow_writes AND pins the digest in the shared fast
+    // store. The hanging slow store causes the spawn to park.
+    let entered = update_entered_a.notified();
+    fss_a
+        .clone()
+        .as_store()
+        .update_oneshot(digest, data.clone())
+        .await
+        .err_tip(|| "fss_a.update_oneshot")?;
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .map_err(|_| make_err!(Code::DeadlineExceeded, "slow write A never entered"))?;
+
+    // Sanity: A has the digest in flight; B does not.
+    assert!(
+        fss_a.in_flight_slow_write_count() > 0,
+        "wrapper A must have an outstanding in-flight slow-write"
+    );
+    assert_eq!(
+        fss_b.in_flight_slow_write_count(),
+        0,
+        "wrapper B must NOT have any in-flight slow-write for this digest"
+    );
+
+    // Sanity: digest is pinned (by A's slow-write spawn).
+    assert!(
+        fs_store.test_force_pin_expired(&digest),
+        "digest must be pinned in the shared fast store after A's update"
+    );
+
+    // Run the pin-expiry sweep. Both listeners (A's and B's) fire on
+    // pin expiry. With the fix:
+    //   - A's listener: in_flight_A contains digest → inserts into
+    //     A's failed_slow_writes.
+    //   - B's listener: in_flight_B is EMPTY → returns early without
+    //     warn or insert.
+    fs_store.test_expire_stale_pins().await;
+
+    let failed_a = fss_a.drain_failed_digests();
+    let failed_b = fss_b.drain_failed_digests();
+    assert!(
+        failed_a.iter().any(|d| *d == digest),
+        "wrapper A (the in-flight owner) MUST insert digest into its \
+         failed_slow_writes. Got A: {failed_a:?}",
+    );
+    assert!(
+        !failed_b.iter().any(|d| *d == digest),
+        "wrapper B (not the in-flight owner) MUST NOT insert digest \
+         into its failed_slow_writes — the per-wrapper in_flight gate \
+         dedupes the listener fan-out. Got B: {failed_b:?}",
+    );
+
+    // The original bug was 3× warn amplification (5774 events / 10 min on
+    // workers). With the fix, exactly ONE wrapper's listener fires its
+    // warn per pin expiry. Without the fix, BOTH wrappers' listeners
+    // would fire, producing two of these warns. Asserting the count
+    // guards the warn-amplification regression directly (not just the
+    // failed_slow_writes side effect).
+    logs_assert(|lines: &[&str]| {
+        let warn_count = lines
+            .iter()
+            .filter(|l| l.contains("fast-store pin auto-expired with in-flight slow-write"))
+            .count();
+        if warn_count == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected exactly 1 pin-auto-expire warn (one per wrapper \
+                 with the digest in its in_flight set; only A qualifies). \
+                 Got {warn_count} warns. The fix gates each listener on \
+                 its OWN in_flight; without the fix, both A's and B's \
+                 listeners fire and produce 2 warns."
+            ))
+        }
+    });
+
+    // Release so the hung spawn unwinds cleanly.
+    release_update_a.notify_waiters();
+    drop(temp);
+    Ok(())
+}
