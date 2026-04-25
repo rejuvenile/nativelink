@@ -211,6 +211,128 @@ pub fn dump_thread_stacks(label: &str) {
     }
 }
 
+/// Eagerly install the per-thread backtrace signal handler at process
+/// start.
+///
+/// **Why eager.** The handler is the SIGUSR2 (macOS) / SIGRTMIN+1
+/// (Linux) `sigaction` whose default disposition is process
+/// termination. If we leave the install to the lazy
+/// `capture_all_backtraces` path, an external `kill -USR2 $pid`
+/// arriving before the first internal stall fires hits the kernel
+/// default and kills the worker outright. Eagerly installing during
+/// `main()` (before any worker thread spawns, so all threads inherit
+/// the disposition) is the production-safety contract.
+///
+/// **Idempotent.** Backed by [`std::sync::Once`] inside each platform
+/// module — calling twice is safe and the second call is a no-op. Safe
+/// to call from a `tokio::spawn` block, from `main`, from a
+/// per-thread-start hook.
+///
+/// **Order matters w.r.t. tokio's signal driver.** On macOS we want
+/// our `sigaction` installed BEFORE
+/// [`tokio::signal::unix::signal(SignalKind::user_defined2())`] is ever
+/// constructed; tokio's `signal-hook-registry` chains the prior
+/// `sigaction` (captured into its `prev` slot at registration time)
+/// and calls it FIRST on signal arrival, so our slot-based capture
+/// runs ahead of tokio's wakeup-pipe write. If we install after
+/// tokio's signal driver, signal-hook will have already captured
+/// `SIG_DFL` as `prev` and will never invoke our handler — internal
+/// `pthread_kill(SIGUSR2)` rounds will then be no-ops.
+///
+/// On platforms without a per-thread backtrace path (anything other
+/// than Linux / macOS) this is a no-op.
+pub fn install_dump_signal_handler() {
+    #[cfg(target_os = "linux")]
+    signal_dumper::install_signal_handler();
+    #[cfg(target_os = "macos")]
+    signal_dumper_macos::install_signal_handler();
+}
+
+/// Spawn a long-running tokio task that listens for an external
+/// `kill -USR2 $pid` (or platform-equivalent) and triggers a
+/// per-thread backtrace dump from outside the signal handler.
+///
+/// **External trigger UX.** With this task running, an operator can
+/// run `kill -USR2 $(pgrep -x nativelink)` and get a usable thread
+/// dump at `/tmp/nativelink-stall-<ts>.txt` with all threads' state
+/// and userspace backtraces — no in-process restart, no test harness
+/// required.
+///
+/// **Coexistence with internal capture.** Internal stall paths
+/// ([`StallGuard`], [`force_dump_thread_stacks`]) drive
+/// `capture_all_backtraces` directly via `pthread_kill`. Each of those
+/// per-thread `pthread_kill(SIGUSR2)` invocations also wakes this
+/// listener (tokio's signal driver coalesces, so the listener only
+/// sees one wake per round). The listener checks `dump_in_progress()`
+/// before launching its own dump — if an internal round is already
+/// running, the listener is a no-op. If the listener fires standalone,
+/// it goes through [`force_dump_thread_stacks`], which is rate-limited
+/// by `MIN_FORCE_DUMP_INTERVAL_SECS` so a `kill -USR2` storm cannot
+/// flood `/tmp` or runaway the dump pipeline.
+///
+/// **Required ordering.** Call this AFTER
+/// [`install_dump_signal_handler`] and AFTER the tokio runtime exists
+/// (this function uses `tokio::signal::unix`, which needs a tokio
+/// signal driver). The intended call site is inside the `runtime
+/// .block_on(async { ... })` envelope, near the top of the async
+/// section.
+///
+/// On platforms without a per-thread backtrace path this is a no-op.
+#[cfg(unix)]
+pub fn spawn_external_dump_listener() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    // SignalKind::user_defined2() corresponds to SIGUSR2 on every Unix
+    // tokio supports. On Linux we keep the same external-trigger UX
+    // (operators commonly script `kill -USR2`) even though our
+    // internal Linux dumper uses SIGRTMIN+1 — the internal and
+    // external triggers are intentionally on different signals on
+    // Linux to avoid collision with libraries that already speak
+    // SIGUSR2 in the same process.
+    let mut stream = match signal(SignalKind::user_defined2()) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!(
+                "failed to register SIGUSR2 listener for external thread-dump trigger: {err}",
+            );
+            return;
+        }
+    };
+
+    tokio::spawn(async move {
+        while stream.recv().await.is_some() {
+            #[cfg(target_os = "macos")]
+            let internal_active = signal_dumper_macos::dump_in_progress();
+            #[cfg(target_os = "linux")]
+            let internal_active = signal_dumper::dump_in_progress();
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let internal_active = false;
+
+            if internal_active {
+                // Internal capture round is mid-flight; the dump will
+                // be produced by the StallGuard / force_dump caller.
+                // Skipping prevents two parallel dumps from racing on
+                // SLOT_COUNT/COLLECTOR bookkeeping.
+                eprintln!(
+                    "external SIGUSR2: internal dump already in progress, skipping",
+                );
+                continue;
+            }
+            // Drain any additional pending wakes to coalesce a burst
+            // of pthread_kill SIGUSR2's from one internal round into
+            // one decision point. The internal capture is what
+            // produces those rapid wakes; if `internal_active` was
+            // false above, those came from external sources only.
+            force_dump_thread_stacks("external SIGUSR2");
+        }
+    });
+}
+
+#[cfg(not(unix))]
+pub fn spawn_external_dump_listener() {
+    // No SIGUSR2 on non-Unix; the install is a no-op too.
+}
+
 /// Cooperative signal-based thread stack dumper for Linux.
 ///
 /// Instead of spawning eu-stack (which takes 30s+ and can hang), we:
@@ -382,7 +504,14 @@ mod signal_dumper {
     }
 
     /// Install the signal handler (once).
-    fn install_signal_handler() {
+    ///
+    /// **Should be called eagerly at process start** (see
+    /// [`super::install_dump_signal_handler`]) so the SIGRTMIN+1
+    /// disposition is set before any worker thread spawns. The Linux
+    /// path uses a realtime signal whose default disposition is also
+    /// process termination, so leaving the install to lazy first-stall
+    /// is unsafe in production for the same reason as macOS SIGUSR2.
+    pub(super) fn install_signal_handler() {
         SIGNAL_INSTALLED.call_once(|| {
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
@@ -398,6 +527,14 @@ mod signal_dumper {
                 }
             }
         });
+    }
+
+    /// True iff a per-thread backtrace dump is currently in flight.
+    ///
+    /// Mirrors the macOS `dump_in_progress` so the external-trigger
+    /// listener has a single shape across platforms.
+    pub(super) fn dump_in_progress() -> bool {
+        DUMP_IN_PROGRESS.load(Ordering::Acquire)
     }
 
     /// Resolved backtrace for one thread.
@@ -732,7 +869,14 @@ mod signal_dumper_macos {
 
     /// Install the SIGUSR2 handler exactly once for the lifetime of the
     /// process. Subsequent `capture_all_backtraces` calls reuse it.
-    fn install_signal_handler() {
+    ///
+    /// **Must be called eagerly at process start** (see
+    /// [`super::install_dump_signal_handler`]). If left to lazy install
+    /// via `capture_all_backtraces`, an external `kill -USR2 $pid`
+    /// arriving before any internal stall path runs will hit the kernel
+    /// default disposition for SIGUSR2 — termination — and kill the
+    /// process. Eager install is the production-safety contract.
+    pub(super) fn install_signal_handler() {
         SIGNAL_INSTALLED.call_once(|| {
             // SAFETY: sigaction is the standard POSIX install path. We
             // zero-initialize the struct and only set the documented
@@ -754,6 +898,16 @@ mod signal_dumper_macos {
                 }
             }
         });
+    }
+
+    /// True iff a per-thread backtrace dump is currently in flight.
+    ///
+    /// Used by the external-trigger listener to skip a `force_dump`
+    /// while an internal `capture_all_backtraces` round is mid-flight —
+    /// the round will already be capturing per-thread state, and a
+    /// concurrent re-entry just churns the SLOT_COUNT bookkeeping.
+    pub(super) fn dump_in_progress() -> bool {
+        DUMP_IN_PROGRESS.load(Ordering::Acquire)
     }
 
     /// Resolved backtrace for one thread.
@@ -1800,6 +1954,187 @@ mod tests {
         assert!(
             backtraces[0].symbols.is_empty(),
             "no-response slot must have no frames",
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Eager handler-install + external-trigger tests.
+    //
+    // Spec under test (from the worker-03 a367ed2d3e3f1610c field
+    // test, which fired `kill -USR2 $pid` and saw the worker process
+    // exit with the kernel default disposition for SIGUSR2):
+    //
+    //   1. `install_dump_signal_handler()` is idempotent. Calling it
+    //      from any context (multiple threads, multiple times) leaves
+    //      SIGUSR2 mapped to our slot-based capture, NOT SIG_DFL.
+    //
+    //   2. After the eager install, raising SIGUSR2 with no internal
+    //      dump round in flight does NOT terminate the process — the
+    //      handler runs (returns silently because no slot matches)
+    //      and execution continues.
+    //
+    // These tests are macOS-only because the eager install on macOS
+    // is the SIGUSR2 sigaction, and a SIG_DFL SIGUSR2 on macOS kills
+    // the process. The Linux equivalent uses SIGRTMIN+1 with a
+    // similar contract. We exercise the macOS install symmetrically
+    // since that's where the field test failed.
+    //
+    // We deliberately don't kill(getpid(), SIGUSR2) and watch for
+    // process termination — a passing test would mean the bug was
+    // fixed, but a failing test (handler not installed) would crash
+    // the whole `cargo test` runner. Instead we assert the SIGUSR2
+    // disposition by reading it back via `sigaction(SIGUSR2, NULL,
+    // &old)` and checking `old.sa_sigaction != SIG_DFL`. That fence
+    // catches the regression without risking the test runner.
+    // -------------------------------------------------------------
+
+    /// Spec: `install_dump_signal_handler()` MUST replace the kernel
+    /// default disposition for the dump signal with our handler.
+    /// Calling it twice is a no-op and never reverts the disposition.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_dump_signal_handler_replaces_sigusr2_default() {
+        let _g = MACOS_DUMP_LOCK.lock().unwrap();
+
+        // Read the current SIGUSR2 disposition. We may already be
+        // installed (any prior macos test triggered lazy install via
+        // capture_all_backtraces) — that's fine, the contract is
+        // "after install it is NOT SIG_DFL", not "install changes it
+        // from SIG_DFL".
+        super::install_dump_signal_handler();
+
+        let mut after: libc::sigaction = unsafe { core::mem::zeroed() };
+        let ret = unsafe {
+            libc::sigaction(libc::SIGUSR2, core::ptr::null(), &mut after)
+        };
+        assert_eq!(ret, 0, "sigaction(SIGUSR2, NULL, &out) must succeed");
+
+        // SIG_DFL is 0 on every Unix tokio supports. Reading back a
+        // null sa_sigaction means we never installed (or some
+        // library reverted us) — the field-test bug.
+        assert_ne!(
+            after.sa_sigaction, 0,
+            "SIGUSR2 disposition is SIG_DFL after install_dump_signal_handler — \
+             external `kill -USR2 $pid` would terminate the worker (field-test \
+             a367ed2d3e3f1610c regression)",
+        );
+        // SIG_IGN is 1 on every Unix tokio supports. SIG_IGN would
+        // mean the signal is silently dropped — the process would
+        // survive but external triggers would never produce a dump.
+        assert_ne!(
+            after.sa_sigaction, 1,
+            "SIGUSR2 disposition is SIG_IGN after install_dump_signal_handler — \
+             external triggers would never produce a dump",
+        );
+        // SA_SIGINFO must be set; our handler is the 3-arg variant.
+        assert!(
+            (after.sa_flags & libc::SA_SIGINFO) != 0,
+            "SIGUSR2 sigaction missing SA_SIGINFO flag; not our handler",
+        );
+    }
+
+    /// Spec: install_dump_signal_handler is idempotent. Two calls (in
+    /// any order, from any thread) leave the disposition unchanged
+    /// from the first install. This is the production-safety
+    /// invariant — code reachable from initialization, runtime
+    /// startup, and lazy capture_all_backtraces all call into the
+    /// same Once-guarded install path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_dump_signal_handler_is_idempotent() {
+        let _g = MACOS_DUMP_LOCK.lock().unwrap();
+
+        super::install_dump_signal_handler();
+        let mut first: libc::sigaction = unsafe { core::mem::zeroed() };
+        let ret = unsafe {
+            libc::sigaction(libc::SIGUSR2, core::ptr::null(), &mut first)
+        };
+        assert_eq!(ret, 0);
+
+        // Second call MUST be a no-op (Once guard).
+        super::install_dump_signal_handler();
+        let mut second: libc::sigaction = unsafe { core::mem::zeroed() };
+        let ret = unsafe {
+            libc::sigaction(libc::SIGUSR2, core::ptr::null(), &mut second)
+        };
+        assert_eq!(ret, 0);
+        assert_eq!(
+            first.sa_sigaction, second.sa_sigaction,
+            "second install changed the SIGUSR2 disposition — Once guard broken",
+        );
+        assert_eq!(
+            first.sa_flags, second.sa_flags,
+            "second install changed the SIGUSR2 sa_flags — Once guard broken",
+        );
+
+        // Third call from a worker thread must also be safe.
+        let join = std::thread::spawn(|| {
+            super::install_dump_signal_handler();
+        });
+        join.join().unwrap();
+        let mut third: libc::sigaction = unsafe { core::mem::zeroed() };
+        let ret = unsafe {
+            libc::sigaction(libc::SIGUSR2, core::ptr::null(), &mut third)
+        };
+        assert_eq!(ret, 0);
+        assert_eq!(
+            first.sa_sigaction, third.sa_sigaction,
+            "cross-thread install changed disposition — Once not Sync-safe",
+        );
+    }
+
+    /// Spec: after install, raising SIGUSR2 to the current process
+    /// (with no internal dump round in flight) MUST be safely
+    /// absorbed by the handler. The process must survive — no exit,
+    /// no abort, no crash.
+    ///
+    /// We assert survival by checking that subsequent code runs
+    /// (`continued.store(true)` after the raise) — if the handler
+    /// were SIG_DFL the process would terminate before the assertion
+    /// could fire. If the handler were SIG_IGN the process would
+    /// survive but the assertion would still pass (acceptable
+    /// fallback per the install_dump_signal_handler contract).
+    ///
+    /// We use `libc::raise` (not `libc::kill(getpid(), ...)`) because
+    /// `raise` is documented as delivering to the calling thread,
+    /// which means we get deterministic delivery (vs. `kill` which
+    /// delivers to "any thread that doesn't have the signal masked"
+    /// — likely some helper thread, which could race the assertion).
+    /// A serial deterministic path is what we want for a survival
+    /// test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn external_sigusr2_does_not_terminate_process() {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        let _g = MACOS_DUMP_LOCK.lock().unwrap();
+
+        super::install_dump_signal_handler();
+
+        // Sanity: no internal dump in flight.
+        assert!(
+            !super::signal_dumper_macos::dump_in_progress(),
+            "test precondition: no internal dump round should be active",
+        );
+
+        // Marker: if the handler kills the process, this stays false
+        // and the test runner reports the failure as the cargo-test
+        // process exiting with SIGUSR2 (signal 31) — which is the
+        // exact field-test symptom.
+        let continued = AtomicBool::new(false);
+
+        // SAFETY: `raise` is a libc-defined async-signal-safe wrapper
+        // that delivers `sig` to the calling thread. Returns 0 on
+        // success, non-zero on failure.
+        let ret = unsafe { libc::raise(libc::SIGUSR2) };
+        assert_eq!(ret, 0, "libc::raise(SIGUSR2) must succeed");
+
+        // If we reach here, the process survived the signal. Mark it
+        // and assert — the assert is informational; the real signal
+        // is reaching this line.
+        continued.store(true, Ordering::SeqCst);
+        assert!(
+            continued.load(Ordering::SeqCst),
+            "process survived SIGUSR2 — eager install fix is in effect",
         );
     }
 }

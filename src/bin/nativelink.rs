@@ -1523,6 +1523,18 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     // and other rustls APIs that need a process-level provider can find it.
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    // Install the per-thread backtrace signal handler BEFORE the tokio
+    // runtime spawns worker threads. The default disposition for the
+    // dump signal (SIGUSR2 on macOS, SIGRTMIN+1 on Linux) is process
+    // termination — without this eager install, an external
+    // `kill -USR2 $pid` (or any errant SIGUSR2) would kill the
+    // process. We also need to install before
+    // `spawn_external_dump_listener` so tokio's signal-hook chains our
+    // sigaction as `prev` and invokes it on signal arrival; if tokio
+    // installs first, signal-hook captures `SIG_DFL` as `prev` and our
+    // slot-based capture is never called.
+    nativelink_util::stall_detector::install_dump_signal_handler();
+
     // Set QoS before runtime creation so tokio worker threads inherit
     // P-core scheduling preference via pthread_create QoS inheritance.
     set_qos_user_initiated();
@@ -1743,6 +1755,15 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     #[expect(clippy::disallowed_methods, reason = "waiting on everything to finish")]
     runtime
         .block_on(async {
+            // Spawn the external SIGUSR2 listener inside the runtime
+            // (tokio::signal::unix needs a tokio signal driver). The
+            // sigaction was already installed pre-runtime; tokio's
+            // signal-hook chains it as `prev`, so external SIGUSR2
+            // wakes the listener AND lets our slot-based capture run
+            // in the handler when an internal pthread_kill round is
+            // active.
+            nativelink_util::stall_detector::spawn_external_dump_listener();
+
             trace_span!("main")
                 .in_scope(|| async {
                     inner_main(
