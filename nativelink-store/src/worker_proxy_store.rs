@@ -69,9 +69,12 @@ pub struct WorkerProxyStore {
     /// Round-robin counter for mirror endpoint selection.
     mirror_counter: AtomicU64,
     /// When true, race peer fetches against server fetches in get_part.
-    /// Only workers should enable this — servers should use the sequential
-    /// path which generates redirects for workers. AtomicBool so the toggle
-    /// can be flipped after the proxy is wrapped in Arc.
+    /// Only workers enable this — servers use the sequential path which
+    /// (a) consults the locality map directly to proxy data for non-worker
+    /// callers, or (b) returns a `Code::FailedPrecondition` `REDIRECT_PREFIX`
+    /// error to worker callers so the worker can fetch directly from peers
+    /// without server-side bandwidth amplification. `AtomicBool` so the
+    /// toggle can be flipped after the proxy is wrapped in `Arc`.
     race_peers: AtomicBool,
     /// When true, the bytestream_write fast path consults the locality map
     /// after the inner-store check fails: if any worker is reported as
@@ -1051,15 +1054,54 @@ impl WorkerProxyStore {
         }
 
         if is_worker {
-            // When a worker asks the server for a blob that the server doesn't
-            // have, return NotFound directly. Do NOT generate a redirect to
-            // other workers — that creates a loop: worker → server → redirect
-            // to workers → workers ask server → redirect → ...
-            // Workers handle their own peer fetching via WorkerProxyStore on
-            // the worker side with race_peers enabled.
+            // Worker asked the server for a blob that the server's inner
+            // store doesn't have. Consult the server-side locality map: if
+            // any peer worker has the blob, return a `REDIRECT_PREFIX`
+            // error so the worker fetches the bytes directly from those
+            // peers (saving server bandwidth + RAM). If no peer has it,
+            // fall through to NotFound.
+            //
+            // Loop safety: workers handle a redirect by calling
+            // `try_read_from_endpoints`, which invokes
+            // `peer_store.get_part(...)` WITHOUT setting `IS_WORKER_REQUEST`
+            // (see `get_part_and_cache` at the call site, and
+            // `grpc_store.rs::read_internal` only adds the
+            // `x-nativelink-worker` header when the task-local is set).
+            // So peer-to-peer hops can never trigger another redirect
+            // generation — this is a single-hop redirect.
+            //
+            // Self-redirect risk: the server-side locality map may include
+            // the requesting worker's own endpoint. The existing per-digest
+            // peer-failure eviction in `try_read_from_worker` /
+            // `try_read_from_endpoints`
+            // (`should_evict_locality_on_peer_error`, narrowed to
+            // NotFound/DataLoss) cleans up stale self-entries on first
+            // failed connection. A future iteration may add an explicit
+            // self-filter via gRPC metadata.
             let digest = key.borrow().into_digest();
+            let peers: Vec<String> = self
+                .locality_map
+                .read()
+                .lookup_workers(&digest)
+                .iter()
+                .map(|p| p.to_string())
+                .collect();
+            if !peers.is_empty() {
+                let ep_str = peers.join(",");
+                debug!(
+                    ?digest,
+                    endpoints = ep_str.as_str(),
+                    "WorkerProxyStore: returning redirect to is_worker caller"
+                );
+                return Err(make_err!(
+                    Code::FailedPrecondition,
+                    "{REDIRECT_PREFIX}{ep_str}|"
+                ));
+            }
             return Err(Error::not_found_with_detail(
-                format!("Blob {digest:?} not found in inner store (worker request, no redirect)"),
+                format!(
+                    "Blob {digest:?} not found in inner store or any peer (worker request)"
+                ),
                 make_precondition_failure_any(digest),
             ));
         }
@@ -2878,13 +2920,14 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // 10. IS_WORKER_REQUEST=true gets NotFound (no redirect to avoid loops).
-    //     Workers handle peer fetching via their own WorkerProxyStore with
-    //     race_peers enabled. Generating redirects from the server to other
-    //     workers creates a loop: worker → server → redirect → workers → ...
+    // 10. IS_WORKER_REQUEST=true with a peer in locality => redirect.
+    //     Server returns `Code::FailedPrecondition` carrying
+    //     `REDIRECT_PREFIX{peer-endpoint}|` so the worker fetches the
+    //     blob directly from peers. Loop safety: see comment in
+    //     `get_part_sequential` near the redirect-generation site.
     // ---------------------------------------------------------------
     #[nativelink_test]
-    async fn test_worker_request_gets_not_found_no_redirect() -> Result<(), Error> {
+    async fn test_worker_request_returns_redirect_with_peer() -> Result<(), Error> {
         let (store, locality_map) = make_proxy_store();
 
         let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
@@ -2898,19 +2941,93 @@ mod tests {
             .scope(true, store.get_part_unchunked(digest, 0, None))
             .await;
 
+        assert!(result.is_err(), "Expected redirect error");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code,
+            Code::FailedPrecondition,
+            "Worker request with a peer in locality should get FailedPrecondition redirect, got: {err:?}"
+        );
+        let msg = err.message_string();
+        assert!(
+            msg.contains(REDIRECT_PREFIX),
+            "Worker redirect message should contain REDIRECT_PREFIX: {msg}"
+        );
+        assert!(
+            msg.contains(peer_endpoint),
+            "Worker redirect message should contain peer endpoint: {msg}"
+        );
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // 10b. IS_WORKER_REQUEST=true with NO peer in locality => NotFound.
+    //      Confirms the redirect-or-NotFound branch falls back to the
+    //      NotFound path when locality has nothing to offer.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_worker_request_with_no_peers_gets_not_found() -> Result<(), Error> {
+        let (store, _locality_map) = make_proxy_store();
+
+        let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+
+        let result = IS_WORKER_REQUEST
+            .scope(true, store.get_part_unchunked(digest, 0, None))
+            .await;
+
         assert!(result.is_err(), "Expected NotFound error");
         let err = result.unwrap_err();
         assert_eq!(
             err.code,
             Code::NotFound,
-            "Worker request should get NotFound (not redirect), got: {err:?}"
+            "Worker request with no peers should get NotFound, got: {err:?}"
         );
         let msg = err.message_string();
         assert!(
             !msg.contains(REDIRECT_PREFIX),
-            "Worker request should NOT contain redirect prefix: {msg}"
+            "NotFound path must NOT contain redirect prefix: {msg}"
         );
 
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // 10c. IS_WORKER_REQUEST=true with MULTIPLE peers => redirect lists ALL.
+    //      Mutation guard: if the implementation only includes the first
+    //      peer (e.g. via `.next()` instead of `.collect()`), this test
+    //      goes red.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_worker_request_redirect_includes_all_peers() -> Result<(), Error> {
+        let (store, locality_map) = make_proxy_store();
+
+        let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+        let endpoints = [
+            "grpc://peer-a:50071",
+            "grpc://peer-b:50071",
+            "grpc://peer-c:50071",
+        ];
+
+        for ep in endpoints {
+            locality_map
+                .write()
+                .register_blobs(ep, &[digest]);
+        }
+
+        let result = IS_WORKER_REQUEST
+            .scope(true, store.get_part_unchunked(digest, 0, None))
+            .await;
+
+        let err = result.expect_err("Expected redirect error");
+        assert_eq!(err.code, Code::FailedPrecondition);
+        let msg = err.message_string();
+        for ep in endpoints {
+            assert!(
+                msg.contains(ep),
+                "Redirect should include peer endpoint {ep}: got {msg}"
+            );
+        }
         Ok(())
     }
 
