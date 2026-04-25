@@ -17,6 +17,7 @@ use core::str::from_utf8;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor};
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use futures::future::try_join_all;
 use nativelink_config::cas_server::WorkerProperty;
@@ -25,6 +26,31 @@ use nativelink_proto::build::bazel::remote::execution::v2::platform::Property;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ConnectWorkerRequest;
 use tokio::process;
 use tracing::info;
+use uuid::Uuid;
+
+/// Process-lifetime identifier for this worker, generated lazily on
+/// first request and stable for the life of the process. Surviving
+/// reconnects within a single run lets the scheduler distinguish a
+/// transient stream drop (same epoch) from a fresh process taking over
+/// the same CAS endpoint after a crash (different epoch). See #141.
+///
+/// The first 8 bytes of a UUIDv4 give us 64 bits of randomness — enough
+/// that two distinct processes choosing the same epoch is astronomically
+/// unlikely (birthday-attack regime is roughly 2^32 processes per
+/// scheduler endpoint).
+static BOOT_EPOCH_ID: OnceLock<u64> = OnceLock::new();
+
+/// Returns this worker process's boot epoch id, initializing it on
+/// first call. Subsequent calls always return the same value.
+pub fn boot_epoch_id() -> u64 {
+    *BOOT_EPOCH_ID.get_or_init(|| {
+        let bytes = *Uuid::new_v4().as_bytes();
+        u64::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
+    })
+}
 
 #[expect(clippy::future_not_send)] // TODO(jhpratt) remove this
 pub async fn make_connect_worker_request<S: BuildHasher>(
@@ -108,5 +134,6 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
         properties: try_join_all(futures).await?.into_iter().flatten().collect(),
         max_inflight_tasks,
         cas_endpoint,
+        boot_epoch_id: boot_epoch_id(),
     })
 }

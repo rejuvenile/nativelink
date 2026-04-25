@@ -68,6 +68,34 @@ pub struct WorkerApiServer {
     /// picker's pre-check filter. None for tests / standalone runs
     /// without peer mirroring.
     worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
+    /// Per-endpoint connection state used by the #141 boot_epoch wipe
+    /// path. For each CAS endpoint we track:
+    ///   - `boot_epoch_id` from the worker's most recent
+    ///     ConnectWorkerRequest (used to decide whether the next
+    ///     reconnect needs a wipe), and
+    ///   - the WorkerId of the connection that owns the endpoint right
+    ///     now (used by the disconnect-cleanup task to suppress its
+    ///     own remove_endpoint when a newer connection has taken over).
+    ///
+    /// Co-located with the locality_map field rather than living in
+    /// the scheduler because the wipe needs to be ordered with the
+    /// `locality_map.write()` lock and with each `WorkerConnection`'s
+    /// disconnect-cleanup task — both of which operate inside this
+    /// server, not the scheduler.
+    endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
+}
+
+/// Per-endpoint state for the #141 boot_epoch wipe path. See
+/// `WorkerApiServer::endpoint_state` for design.
+#[derive(Debug, Clone)]
+struct EndpointState {
+    boot_epoch: u64,
+    /// Worker ID of the connection that currently owns the endpoint.
+    /// The disconnect-cleanup task only fires its `remove_endpoint`
+    /// when this matches its own worker ID — otherwise a newer
+    /// connection has taken over and the cleanup must be suppressed
+    /// to avoid wiping the new worker's just-registered entries.
+    owner_worker_id: WorkerId,
 }
 
 impl core::fmt::Debug for WorkerApiServer {
@@ -160,6 +188,7 @@ impl WorkerApiServer {
             locality_map,
             cas_store,
             worker_proxy,
+            endpoint_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
 
@@ -188,6 +217,7 @@ impl WorkerApiServer {
         };
 
         let worker_cas_endpoint = connect_worker_request.cas_endpoint.clone();
+        let new_boot_epoch = connect_worker_request.boot_epoch_id;
 
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -211,13 +241,66 @@ impl WorkerApiServer {
         // (e.g. UploadMissingBlobs requests) independently of the scheduler.
         let worker_tx = tx.clone();
 
-        // Now register the worker with the scheduler.
-        let worker_id = {
-            let worker_id = WorkerId(format!(
-                "{}{}",
-                connect_worker_request.worker_id_prefix,
-                Uuid::now_v6(&self.node_id).hyphenated()
-            ));
+        // Allocate the worker_id BEFORE the #141 wipe so the new owner
+        // can be recorded atomically with the wipe.
+        let worker_id = WorkerId(format!(
+            "{}{}",
+            connect_worker_request.worker_id_prefix,
+            Uuid::now_v6(&self.node_id).hyphenated()
+        ));
+
+        // #141: boot_epoch_id one-way wipe. Detect a new worker process
+        // taking over the same CAS endpoint and clear its prior locality
+        // entries before the worker can send any BlobsAvailable. The
+        // wipe MUST happen here — before `add_worker` (which triggers
+        // ConnectionResult that the worker waits on before sending
+        // BlobsAvailable) — so the new worker's incoming registrations
+        // cannot interleave with or precede the wipe.
+        //
+        // Atomicity vs. the OLD WorkerConnection's disconnect-cleanup
+        // task: the cleanup task suppresses its own remove_endpoint
+        // when `endpoint_state.owner_worker_id` no longer matches its
+        // own (a newer connection has taken over). Holding the
+        // endpoint_state mutex across the locality_map.write() wipe +
+        // the owner_worker_id update guarantees the OLD task cannot
+        // observe a half-applied state where the old owner is still
+        // recorded but the locality_map has already been mutated.
+        if !worker_cas_endpoint.is_empty() {
+            let mut state = self.endpoint_state.lock();
+            let prev = state.get(&worker_cas_endpoint).cloned();
+            // Wipe whenever the new epoch differs from the prev epoch,
+            // OR when the new epoch is 0 (legacy worker — we cannot
+            // distinguish "transient reconnect" from "fresh process").
+            // If there is no prev (first connect ever from this
+            // endpoint) the locality_map is already empty for this
+            // endpoint, so the wipe is a no-op but still safe.
+            let needs_wipe = prev
+                .as_ref()
+                .is_some_and(|p| p.boot_epoch != new_boot_epoch || new_boot_epoch == 0);
+            if needs_wipe {
+                if let Some(ref locality_map) = self.locality_map {
+                    locality_map.write().remove_endpoint(&worker_cas_endpoint);
+                }
+                info!(
+                    endpoint = %worker_cas_endpoint,
+                    prev_epoch = prev.as_ref().map(|p| p.boot_epoch),
+                    new_epoch = new_boot_epoch,
+                    "wiped locality_map on worker boot_epoch_id change"
+                );
+            }
+            state.insert(
+                worker_cas_endpoint.clone(),
+                EndpointState {
+                    boot_epoch: new_boot_epoch,
+                    owner_worker_id: worker_id.clone(),
+                },
+            );
+        }
+
+        // Now register the worker with the scheduler. This triggers
+        // ConnectionResult — and only then will the worker begin
+        // sending BlobsAvailable.
+        {
             let worker = Worker::new_with_cas_endpoint(
                 worker_id.clone(),
                 platform_properties,
@@ -230,8 +313,7 @@ impl WorkerApiServer {
                 .add_worker(worker)
                 .await
                 .err_tip(|| "Failed to add worker in inner_connect_worker()")?;
-            worker_id
-        };
+        }
 
         WorkerConnection::start(
             self.scheduler.clone(),
@@ -241,6 +323,8 @@ impl WorkerApiServer {
             self.cas_store.clone(),
             self.worker_proxy.clone(),
             worker_cas_endpoint,
+            new_boot_epoch,
+            self.endpoint_state.clone(),
             worker_tx,
             update_stream,
         );
@@ -320,6 +404,16 @@ struct WorkerConnection {
     /// capacity reports (review #1).
     worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
     cas_endpoint: String,
+    /// `boot_epoch_id` reported by this connection. Logged on cleanup
+    /// for #141 traceability.
+    boot_epoch: u64,
+    /// Shared per-endpoint connection state — owned by
+    /// `WorkerApiServer`. The disconnect-cleanup task reads this to
+    /// decide whether its `remove_endpoint` is still authoritative
+    /// (the entry's `owner_worker_id` must match this connection's
+    /// `worker_id`; otherwise a newer connection has already taken
+    /// over the endpoint and our cleanup would erase its entries).
+    endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
     /// Channel to send messages back to this worker.
     worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
     /// Epoch seconds of the last backfill check for this worker.
@@ -341,6 +435,8 @@ impl WorkerConnection {
         cas_store: Option<Store>,
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         cas_endpoint: String,
+        boot_epoch: u64,
+        endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
         worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
         mut connection: impl Stream<Item = Result<UpdateForScheduler, Status>> + Unpin + Send + 'static,
     ) {
@@ -352,6 +448,8 @@ impl WorkerConnection {
             cas_store,
             worker_proxy,
             cas_endpoint,
+            boot_epoch,
+            endpoint_state,
             worker_tx,
             last_backfill_epoch_secs: AtomicU64::new(0),
             backfill_inflight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -417,14 +515,45 @@ impl WorkerConnection {
             }
             tracing::debug!(worker_id=?instance.worker_id, "Update for scheduler dropped");
 
-            // Clean up locality map on disconnect.
+            // Clean up locality map on disconnect — but ONLY if the
+            // endpoint is still owned by THIS connection. A newer
+            // connection that landed since we registered will have
+            // overwritten `endpoint_state[endpoint].owner_worker_id`;
+            // in that case our cleanup would wipe the NEW worker's
+            // just-registered entries (the production race documented
+            // in #141 — a same-epoch reconnect is the worst case
+            // because epoch alone cannot distinguish old vs. new
+            // connection). Hold the endpoint_state mutex across the
+            // locality_map.write() so no other thread can flip the
+            // owner out from under us between the check and the wipe.
             if !instance.cas_endpoint.is_empty() {
-                if let Some(ref locality_map) = instance.locality_map {
-                    locality_map.write().remove_endpoint(&instance.cas_endpoint);
+                let mut state = instance.endpoint_state.lock();
+                let current_owner = state
+                    .get(&instance.cas_endpoint)
+                    .map(|s| s.owner_worker_id.clone());
+                if current_owner.as_ref() == Some(&instance.worker_id) {
+                    if let Some(ref locality_map) = instance.locality_map {
+                        locality_map.write().remove_endpoint(&instance.cas_endpoint);
+                    }
+                    // Drop the per-endpoint state: with no live
+                    // connection on this endpoint, any future connect
+                    // will hit the "no prev" branch and skip the wipe
+                    // (the locality_map is already empty for this
+                    // endpoint after the line above).
+                    state.remove(&instance.cas_endpoint);
                     info!(
                         worker_id=?instance.worker_id,
                         endpoint=%instance.cas_endpoint,
+                        boot_epoch=instance.boot_epoch,
                         "Removed worker from blob locality map on disconnect"
+                    );
+                } else {
+                    info!(
+                        worker_id=?instance.worker_id,
+                        endpoint=%instance.cas_endpoint,
+                        my_epoch=instance.boot_epoch,
+                        ?current_owner,
+                        "Skipped locality_map wipe on disconnect — endpoint has been claimed by a newer connection"
                     );
                 }
             }

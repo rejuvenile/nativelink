@@ -1474,3 +1474,350 @@ pub async fn blobs_evicted_is_noop_for_wire_compat_test()
 
     Ok(())
 }
+
+// ----- #141 boot_epoch_id one-way wipe tests --------------------------
+//
+// Background: when a worker process dies (OOM / kill -9 / panic) and a
+// fresh process restarts on the same CAS endpoint, locality_map entries
+// from the old process point to `mirror_blobs` that lived only in the
+// dead process's memory. A new worker that has none of those blobs
+// must NOT inherit the old entries — otherwise the server will route
+// reads to the new worker for blobs it doesn't have.
+//
+// boot_epoch_id is generated fresh at process start. The scheduler:
+//   - same epoch on reconnect (transient stream drop) → preserve entries
+//   - different epoch on reconnect (fresh process) → wipe entries
+//   - missing/zero epoch (legacy worker) → wipe (conservative)
+
+/// Helper that creates a `WorkerApiServer` once and lets tests open
+/// multiple consecutive `connect_worker` streams against it.
+struct MultiConnectContext {
+    worker_api_server: WorkerApiServer,
+    locality_map: SharedBlobLocalityMap,
+}
+
+async fn setup_multi_connect() -> Result<MultiConnectContext, Error> {
+    const SCHEDULER_NAME: &str = "DUMMY_SCHEDULE_NAME";
+
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager::new());
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager.clone(),
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+
+    let locality_map = new_shared_blob_locality_map();
+
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert(SCHEDULER_NAME.to_string(), scheduler.clone());
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: SCHEDULER_NAME.to_string(),
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [1u8; 6],
+        Some(locality_map.clone()),
+        None,
+        None,
+    )
+    .err_tip(|| "Error creating WorkerApiServer")?;
+
+    Ok(MultiConnectContext {
+        worker_api_server,
+        locality_map,
+    })
+}
+
+/// Open one connect_worker stream with the given endpoint+boot_epoch and
+/// drive it to the point where the ConnectionResult has been received.
+async fn open_worker_connection(
+    server: &WorkerApiServer,
+    cas_endpoint: &str,
+    boot_epoch_id: u64,
+) -> Result<(mpsc::Sender<Update>, ConnectWorkerStream), Error> {
+    let connect_worker_request = ConnectWorkerRequest {
+        cas_endpoint: cas_endpoint.to_string(),
+        boot_epoch_id,
+        ..Default::default()
+    };
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(Update::ConnectWorkerRequest(connect_worker_request))
+        .await
+        .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut connection_worker_stream = server
+        .inner_connect_worker_for_testing(update_stream)
+        .await?
+        .into_inner();
+    // Consume the ConnectionResult so callers see post-handshake state.
+    let first = connection_worker_stream
+        .next()
+        .await
+        .err_tip(|| "expected ConnectionResult")?
+        .err_tip(|| "stream error before ConnectionResult")?
+        .update
+        .err_tip(|| "ConnectionResult update missing")?;
+    assert!(
+        matches!(first, update_for_worker::Update::ConnectionResult(_)),
+        "first update must be ConnectionResult, got {first:?}"
+    );
+    Ok((tx, connection_worker_stream))
+}
+
+/// Send `BlobsAvailable` with the given digests on a connected worker
+/// stream. Uses a polling loop bounded by `deadline` to wait until at
+/// least `expected_total` digests are visible in the locality map.
+async fn send_blobs_and_wait(
+    worker_stream: &mpsc::Sender<Update>,
+    locality_map: &SharedBlobLocalityMap,
+    cas_endpoint: &str,
+    digests: Vec<DigestInfo>,
+    is_full_snapshot: bool,
+    expected_for_endpoint: usize,
+) -> Result<(), Error> {
+    worker_stream
+        .send(Update::BlobsAvailable(BlobsAvailableNotification {
+            worker_cas_endpoint: cas_endpoint.to_string(),
+            digests: digests.iter().copied().map(Into::into).collect(),
+            is_full_snapshot,
+            evicted_digests: vec![],
+            digest_infos: vec![],
+            cpu_load_pct: 0,
+            cached_directory_digests: vec![],
+            added_subtree_digests: vec![],
+            removed_subtree_digests: vec![],
+            is_full_subtree_snapshot: false,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
+        }))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
+
+    // Poll until the digests appear (or fail loudly after a deadline).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let count = {
+            let map = locality_map.read();
+            digests
+                .iter()
+                .filter(|d| {
+                    map.lookup_workers(d)
+                        .iter()
+                        .any(|ep| &**ep == cas_endpoint)
+                })
+                .count()
+        };
+        if count >= expected_for_endpoint {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Err(make_err!(
+        tonic::Code::DeadlineExceeded,
+        "BlobsAvailable did not propagate to locality_map within 2s"
+    ))
+}
+
+/// Reconnecting with the SAME boot_epoch_id (transient drop, same
+/// process) MUST preserve locality_map entries from the prior connection.
+///
+/// Production race scenario: a transient stream drop fires the OLD
+/// WorkerConnection's disconnect cleanup task, which BLINDLY calls
+/// `remove_endpoint` and wipes the entries. After the fix, the cleanup
+/// task must skip the wipe when the current epoch entry no longer
+/// belongs to its own connection (the new connection re-registered with
+/// the same epoch, so the cleanup task should be a no-op).
+#[nativelink_test]
+pub async fn boot_epoch_same_preserves_locality_entries_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.30:50081";
+    let ctx = setup_multi_connect().await?;
+    let d1 = DigestInfo::new([0xA1u8; 32], 100);
+    let d2 = DigestInfo::new([0xA2u8; 32], 200);
+
+    // First boot.
+    let (tx1, stream1) = open_worker_connection(&ctx.worker_api_server, cas_endpoint, 7777)
+        .await?;
+    send_blobs_and_wait(&tx1, &ctx.locality_map, cas_endpoint, vec![d1, d2], true, 2)
+        .await?;
+
+    // Disconnect: drop both ends so WorkerConnection cleanup task fires.
+    drop(tx1);
+    drop(stream1);
+
+    // Reconnect with the SAME epoch — registration MUST NOT wipe, AND
+    // the now-fired cleanup task from the old connection MUST be
+    // suppressed (it sees the endpoint's epoch is still 7777 = its own
+    // epoch, but the connection identity is no longer this one).
+    let (_tx2, _stream2) =
+        open_worker_connection(&ctx.worker_api_server, cas_endpoint, 7777).await?;
+
+    // Give the disconnect-cleanup background task generous time to
+    // run AFTER reconnect (this is the race window).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let map = ctx.locality_map.read();
+    assert_eq!(
+        map.lookup_workers(&d1).len(),
+        1,
+        "d1 must survive same-epoch reconnect"
+    );
+    assert_eq!(
+        map.lookup_workers(&d2).len(),
+        1,
+        "d2 must survive same-epoch reconnect"
+    );
+    assert_eq!(&*map.lookup_workers(&d1)[0], cas_endpoint);
+    Ok(())
+}
+
+/// Reconnecting with a DIFFERENT boot_epoch_id (fresh process after
+/// crash) MUST wipe the prior locality_map entries on registration —
+/// they referenced blobs only the dead process held in memory.
+///
+/// Test mechanic: hold the OLD stream alive across the reconnect to
+/// prevent the disconnect cleanup task from contributing to the wipe.
+/// If entries disappear, it is the registration path that wiped them,
+/// not the cleanup task. Without the fix, the entries persist (the
+/// wipe-on-register isn't there) and this test fails.
+#[nativelink_test]
+pub async fn boot_epoch_different_wipes_locality_entries_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.31:50081";
+    let ctx = setup_multi_connect().await?;
+    let d1 = DigestInfo::new([0xB1u8; 32], 100);
+    let d2 = DigestInfo::new([0xB2u8; 32], 200);
+
+    let (tx1, stream1) = open_worker_connection(&ctx.worker_api_server, cas_endpoint, 1111)
+        .await?;
+    send_blobs_and_wait(&tx1, &ctx.locality_map, cas_endpoint, vec![d1, d2], true, 2)
+        .await?;
+
+    // Reconnect with a NEW epoch WHILE the old stream is still open.
+    // The wipe in this scenario can ONLY come from the registration
+    // path — it would falsely pass if we let the old cleanup run.
+    let (_tx2, _stream2) =
+        open_worker_connection(&ctx.worker_api_server, cas_endpoint, 2222).await?;
+
+    let map = ctx.locality_map.read();
+    assert!(
+        map.lookup_workers(&d1).is_empty(),
+        "d1 must be wiped on different-epoch reconnect (d1 -> {:?})",
+        map.lookup_workers(&d1)
+    );
+    assert!(
+        map.lookup_workers(&d2).is_empty(),
+        "d2 must be wiped on different-epoch reconnect (d2 -> {:?})",
+        map.lookup_workers(&d2)
+    );
+
+    // Tidy up the still-open old stream.
+    drop(tx1);
+    drop(stream1);
+    Ok(())
+}
+
+/// A legacy worker that omits boot_epoch_id (proto3 default 0) MUST
+/// trigger the conservative wipe path on every reconnect — we cannot
+/// distinguish a legacy reconnect from a fresh process.
+///
+/// Same mechanic: hold the old stream alive so the wipe must come from
+/// the registration path, not from the disconnect cleanup.
+#[nativelink_test]
+pub async fn boot_epoch_zero_legacy_wipes_locality_entries_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.32:50081";
+    let ctx = setup_multi_connect().await?;
+    let d1 = DigestInfo::new([0xC1u8; 32], 100);
+
+    // First boot with a real epoch (e.g. the new binary).
+    let (tx1, stream1) = open_worker_connection(&ctx.worker_api_server, cas_endpoint, 99)
+        .await?;
+    send_blobs_and_wait(&tx1, &ctx.locality_map, cas_endpoint, vec![d1], true, 1)
+        .await?;
+
+    // Reconnect with epoch 0 (legacy / unset) WHILE the old stream is
+    // still open — wipe must come from registration.
+    let (_tx2, _stream2) =
+        open_worker_connection(&ctx.worker_api_server, cas_endpoint, 0).await?;
+
+    let map = ctx.locality_map.read();
+    assert!(
+        map.lookup_workers(&d1).is_empty(),
+        "legacy boot_epoch_id (0) must trigger wipe (d1 -> {:?})",
+        map.lookup_workers(&d1)
+    );
+
+    drop(tx1);
+    drop(stream1);
+    Ok(())
+}
+
+/// New worker after wipe must be able to register its own blobs on the
+/// same endpoint without the OLD WorkerConnection's disconnect cleanup
+/// task wiping them. The OLD task fires at a non-deterministic time
+/// after the new connection lands; if its `remove_endpoint` runs
+/// unguarded it will erase the new worker's just-registered entries.
+///
+/// This test exercises the disconnect-suppression contract: after a
+/// different-epoch reconnect, the new worker registers a new digest
+/// and we wait long enough that any straggling cleanup from the old
+/// connection would have run, then assert the new digest is still
+/// present.
+#[nativelink_test]
+pub async fn boot_epoch_new_blobs_survive_old_disconnect_cleanup_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.33:50081";
+    let ctx = setup_multi_connect().await?;
+    let d_old = DigestInfo::new([0xD1u8; 32], 100);
+    let d_new = DigestInfo::new([0xD2u8; 32], 200);
+
+    let (tx1, stream1) = open_worker_connection(&ctx.worker_api_server, cas_endpoint, 100)
+        .await?;
+    send_blobs_and_wait(&tx1, &ctx.locality_map, cas_endpoint, vec![d_old], true, 1)
+        .await?;
+
+    // Connect new worker BEFORE dropping the old one — establishes the
+    // new boot_epoch entry, so the OLD cleanup task (when it fires)
+    // sees a stale epoch and must skip its remove_endpoint.
+    let (tx2, _stream2) =
+        open_worker_connection(&ctx.worker_api_server, cas_endpoint, 200).await?;
+    send_blobs_and_wait(&tx2, &ctx.locality_map, cas_endpoint, vec![d_new], true, 1)
+        .await?;
+
+    // NOW drop the old connection — its cleanup task should be a
+    // no-op because the endpoint's current epoch (200) is not its
+    // own (100).
+    drop(tx1);
+    drop(stream1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let map = ctx.locality_map.read();
+    assert!(
+        map.lookup_workers(&d_old).is_empty(),
+        "d_old must remain wiped"
+    );
+    assert_eq!(
+        map.lookup_workers(&d_new).len(),
+        1,
+        "d_new must survive — old cleanup must not wipe new entries"
+    );
+    Ok(())
+}
