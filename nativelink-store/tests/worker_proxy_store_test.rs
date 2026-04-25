@@ -125,8 +125,8 @@ async fn has_returns_size_when_inner_has_blob() -> Result<(), Error> {
 }
 
 // -------------------------------------------------------------------
-// 4. has returns None when inner does not have blob
-//    (locality map is NOT consulted for existence checks)
+// 4. has falls back to the locality map when inner misses
+//    (locality-aware FMB; commit d3399e48, 2026-04-22).
 // -------------------------------------------------------------------
 #[nativelink_test]
 async fn has_falls_back_to_locality_map_when_inner_missing() -> Result<(), Error> {
@@ -139,24 +139,29 @@ async fn has_falls_back_to_locality_map_when_inner_missing() -> Result<(), Error
         .write()
         .register_blobs("worker-a:50081", &[digest]);
 
-    // has() must NOT report locality-only blobs as present.
-    // Worker blobs may be evicted at any time; reporting them in
-    // has() causes clients to skip uploads, leading to NotFound later.
+    // has() consults the locality_map after the inner store misses and
+    // reports `Some(digest.size_bytes())` if any worker holds the blob.
+    // This keeps Bazel's FindMissingBlobs coherent with the bytestream
+    // sync-confirm fast path (the blob lives only on the worker).
     let size = proxy.has(digest).await?;
     assert_eq!(
         size,
-        None,
-        "has() should not find digest via locality map (locality map not used in existence checks)"
+        Some(100),
+        "has() should fall back to locality map and report the digest \
+         size_bytes when a worker is registered for the blob"
     );
 
     Ok(())
 }
 
 // -------------------------------------------------------------------
-// 5. has_with_results delegates to inner store only, not locality map
+// 5. has_with_results delegates to inner store and then falls back to
+//    the locality map for digests still missing after the inner check
+//    (locality-aware FMB; commit d3399e48, 2026-04-22).
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn has_with_results_delegates_to_inner_and_locality_map() -> Result<(), Error> {
+async fn has_with_results_falls_back_to_locality_map_when_inner_missing()
+-> Result<(), Error> {
     let (proxy, _inner, locality_map) = make_proxy_store();
 
     let value = b"test data";
@@ -169,9 +174,11 @@ async fn has_with_results_delegates_to_inner_and_locality_map() -> Result<(), Er
         .update_oneshot(d1, Bytes::from_static(value))
         .await?;
 
-    // Register d2 and d3 on workers — has_with_results must NOT report
-    // them as present. Locality map is only for read optimization in
-    // get_part(), not for existence checks that drive upload decisions.
+    // Register d2 and d3 on workers — has_with_results consults the
+    // locality_map for digests still missing after the inner check and
+    // reports them as `Some(digest.size_bytes())`. This keeps Bazel's
+    // FindMissingBlobs coherent with the worker-side bytestream
+    // sync-confirm fast path.
     {
         let mut map = locality_map.write();
         map.register_blobs("worker-a:50081", &[d2]);
@@ -189,13 +196,50 @@ async fn has_with_results_delegates_to_inner_and_locality_map() -> Result<(), Er
     );
     assert_eq!(
         results[1],
-        None,
-        "d2 should not be found (locality map not used in has_with_results)"
+        Some(999),
+        "d2 should be found via locality_map fallback (digest size_bytes)"
     );
     assert_eq!(
         results[2],
+        Some(50),
+        "d3 should be found via locality_map fallback (digest size_bytes)"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 5b. Kill-switch: disable_locality_in_has() bypasses the locality_map
+//     fallback in has_with_results, returning inner-store-only results.
+//     Guards the operator escape hatch at worker_proxy_store.rs:454.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn has_with_results_skips_locality_after_disable_locality_in_has()
+-> Result<(), Error> {
+    let (proxy_arc, _inner, locality_map) = make_proxy_store_with_arc();
+    let proxy = Store::new(proxy_arc.clone());
+
+    let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+
+    // Register the digest on a worker — by default this would make
+    // has_with_results return Some(100) via the locality fallback.
+    locality_map
+        .write()
+        .register_blobs("worker-a:50081", &[digest]);
+
+    // Operator kill-switch: disables the locality-aware fast path so
+    // has_with_results reflects only what the inner (server) store holds.
+    proxy_arc.disable_locality_in_has();
+
+    let keys: Vec<StoreKey<'_>> = vec![digest.into()];
+    let mut results = vec![None; 1];
+    proxy.has_with_results(&keys, &mut results).await?;
+
+    assert_eq!(
+        results[0],
         None,
-        "d3 should not be found (locality map not used in has_with_results)"
+        "disable_locality_in_has() must bypass the locality_map fallback; \
+         the inner store is empty so has_with_results must report None"
     );
 
     Ok(())
