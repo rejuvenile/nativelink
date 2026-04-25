@@ -2122,5 +2122,95 @@ async fn psubscribe_pins_to_subscriber_slot_only() -> Result<(), Error> {
 
         drop(held);
     }
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Writer-termination contract regression tests (#148 sibling-bug audit).
+//
+// `RedisStore` is the slow tier of `SMALL_CAS_CACHED` (≤16KB CAS blobs on
+// Valkey db=1) AND `AC_BACKEND_CACHED` (action cache on db=0). In production:
+//   `cas_STORE → VerifyStore → ExistenceCacheStore → SizePartitioningStore`
+//     `→ SMALL_CAS_CACHED (FastSlowStore { fast: MemoryStore, slow: RedisStore })`
+//   `AC_STORE → CompletenessCheckingStore → AC_BACKEND_CACHED`
+//     `(FastSlowStore { fast: MemoryStore, slow: RedisStore })`
+//
+// `VerifyStore::get_part` (with verify_size=true) runs
+// `tokio::join!(get_fut, check_fut)` over a borrowed channel. If
+// `RedisStore::get_part` returns `Err(NotFound)` WITHOUT terminating the
+// writer (no `send_eof` / `send_error`), VerifyStore's `check_fut` blocks
+// forever on `rx.recv()` — multi-hour Bazel build wedges historically.
+// Per CLAUDE.md "Test in production composition, not in isolation": the
+// regression below wraps RedisStore in VerifyStore (with verify_size=true)
+// and uses `tokio::time::timeout(5s, ...)` as the deadlock detector. The
+// `.expect` message is specific enough to attribute a failure quickly.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn verify_store_around_redis_does_not_deadlock_on_get_part_notfound()
+-> Result<(), Error> {
+    use nativelink_config::stores::{MemorySpec, StoreSpec, VerifySpec};
+    use nativelink_store::verify_store::VerifyStore;
+    use nativelink_util::store_trait::Store;
+
+    // Mock RedisStore configured to return NotFound for the chosen digest:
+    // GETRANGE returns empty BulkString (TOCTOU-empty), then EXISTS returns 0
+    // → triggers the explicit `Err(NotFound)` exit at redis_store.rs:1361.
+    // This is the same shape the existing `zero_len_items_exist_check` test
+    // uses; here we reuse it under a production wrapper to exercise the
+    // writer-termination contract.
+    let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+    let real_key = format!("{digest}");
+    let commands = vec![
+        MockCmd::new(
+            redis::cmd("GETRANGE")
+                .arg(real_key.clone())
+                .arg(0)
+                .arg(DEFAULT_READ_CHUNK_SIZE as i64 - 1),
+            Ok(Value::BulkString(vec![])),
+        ),
+        MockCmd::new(redis::cmd("EXISTS").arg(real_key), Ok(Value::Int(0))),
+    ];
+    let redis_store = make_mock_store(commands).await;
+    let inner = Store::new(Arc::new(redis_store));
+
+    // VerifyStore with verify_size=true forces the `tokio::join!(get_fut,
+    // check_fut)` branch (the `should_verify=false` bypass at
+    // verify_store.rs only fires when both verify_size and verify_hash
+    // are off; we need the join branch to reproduce the deadlock).
+    let verify_store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        inner,
+    );
+
+    // Pre-fix RedisStore returns Err(NotFound) at line 1361 without calling
+    // `writer.send_eof()` or `writer.send_error(...)`. VerifyStore's
+    // `tokio::join!` then blocks on `rx.recv()` forever (the bug). The
+    // 5s timeout is the deadlock detector. A healthy NotFound round-trip
+    // through VerifyStore is sub-millisecond; 5s leaves headroom for a
+    // slow CI runner without masking real deadlocks.
+    let timed = timeout(
+        Duration::from_secs(5),
+        verify_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — writer-termination contract violated: \
+         RedisStore::get_part returned Err(NotFound) without calling \
+         writer.send_eof / send_error, so VerifyStore's tokio::join! \
+         over the tx/rx pair blocks forever on rx.recv()",
+    );
+
+    let err = timed.err().expect("expected NotFound, not Ok");
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "expected NotFound to propagate through VerifyStore; got: {err:?}",
+    );
+
     Ok(())
 }

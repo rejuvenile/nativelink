@@ -1633,6 +1633,26 @@ where
         Ok(())
     }
 
+    // LINT: writer-termination contract for `get_part`.
+    //
+    // `RedisStore` is a leaf (own-bytes producer) and is wrapped by
+    // `FastSlowStore` as the slow tier of `SMALL_CAS_CACHED` (≤16KB CAS
+    // blobs on Valkey db=1) AND `AC_BACKEND_CACHED` (AC on db=0). The
+    // wrapper layer (FastSlowStore) opens its own `get_part` with
+    // `WriteHalfGuard::new(writer)` (active) and uses
+    // `commit_delegated_if_ok(&res)` so that any leaf-level contract
+    // violation is caught at the wrapper's Drop fallback (synthesized
+    // Internal terminator unblocks the paired reader).
+    //
+    // Per the WriteHalfGuard #148 wave: leaf-side migrations were
+    // explicitly REVERTED (commit `69bf59b2`: "WriteHalfGuard: revert
+    // leaf-store migrations (decoration not load-bearing)") and the
+    // `new_subordinate` constructor was DELETED (commit `d636b66f`),
+    // because the wrapper's active guard is the load-bearing protection
+    // and a leaf-level subordinate guard would be decorative noise.
+    // See `nativelink-store/tests/redis_store_test.rs::
+    // verify_store_around_redis_does_not_deadlock_on_get_part_notfound`
+    // (the production-composition lock-in test for this property).
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,
@@ -1755,6 +1775,12 @@ where
                 }
 
                 if !exists {
+                    // Leaf-level Err exit: writer NOT terminated. The wrapper
+                    // layer (FastSlowStore -> VerifyStore in production)
+                    // catches this contract violation via its outer
+                    // WriteHalfGuard's Drop fallback. See the function-level
+                    // LINT comment + `redis_store_test.rs::
+                    // verify_store_around_redis_does_not_deadlock_on_get_part_notfound`.
                     return Err(make_err!(
                         Code::NotFound,
                         "Data not found in Redis store for digest: {key:?}"
