@@ -29,7 +29,7 @@ mod utils {
 }
 
 use hyper::body::Frame;
-use nativelink_config::cas_server::{LocalWorkerConfig, WorkerProperty};
+use nativelink_config::cas_server::{EndpointConfig, LocalWorkerConfig, WorkerProperty};
 use nativelink_config::stores::{
     FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
 };
@@ -429,6 +429,188 @@ async fn simple_worker_start_action_test() -> Result<(), Error> {
                 ActionStage::Completed(action_result).into()
             )),
         }
+    );
+
+    Ok(())
+}
+
+/// External-consistency invariant: by the time the client sees an action's
+/// `ExecuteResult`, every blob digest the action produced MUST already be
+/// observable from the server (either in the server's CAS or registered in
+/// the locality_map so the server can proxy-fetch from the worker).
+///
+/// The server populates its `locality_map` from `BlobsAvailableNotification`
+/// messages from the worker. The worker→scheduler stream is a single
+/// bidirectional gRPC channel that the server processes in arrival order
+/// (`worker_api_server.rs` per-stream `while let Some(maybe_update)
+/// connection.next().await` loop). So if the worker sends `ExecuteResult`
+/// BEFORE `BlobsAvailable`, the server forwards the result to the client
+/// and STILL has not registered the worker as holder for those digests.
+/// A client reading any output blob inside that race window can hit a
+/// `NotFound` because (a) the slow-tier upload is fire-and-forget and may
+/// not have completed yet, and (b) the locality_map has no peer yet.
+///
+/// This test asserts the worker sends `BlobsAvailable` BEFORE
+/// `ExecuteResult` on the same stream, so server-side sequential
+/// processing guarantees the locality_map is populated before the
+/// client sees the result.
+#[nativelink_test]
+async fn worker_sends_blobs_available_before_execute_result_test() -> Result<(), Error> {
+    const ARBITRARY_LARGE_TIMEOUT: f32 = 10000.;
+    // cas_server_port must be Some(_) so the worker has an advertised CAS
+    // endpoint and actually sends BlobsAvailable. With None the worker
+    // skips the BlobsAvailable send entirely (peer-fetch disabled) and
+    // there is nothing to order.
+    let local_worker_config = LocalWorkerConfig {
+        worker_api_endpoint: EndpointConfig {
+            timeout: Some(ARBITRARY_LARGE_TIMEOUT),
+            ..Default::default()
+        },
+        cas_server_port: Some(50081),
+        ..Default::default()
+    };
+    let mut test_context = setup_local_worker_with_config(local_worker_config).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        let _props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+    }
+
+    let expected_worker_id = "ordering_test_worker".to_string();
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: String::new(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                        peer_hints: Vec::new(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+                        missing_digests: Vec::new(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    // Action result with stdout/stderr so that BlobsAvailable's output_digests
+    // is non-empty and the worker actually sends the notification.
+    let action_result = ActionResult {
+        output_files: vec![],
+        output_folders: vec![],
+        output_file_symlinks: vec![],
+        output_directory_symlinks: vec![],
+        exit_code: 0,
+        stdout_digest: DigestInfo::new([21u8; 32], 10),
+        stderr_digest: DigestInfo::new([22u8; 32], 10),
+        execution_metadata: ExecutionMetadata {
+            worker: expected_worker_id.clone(),
+            queued_timestamp: SystemTime::UNIX_EPOCH,
+            worker_start_timestamp: SystemTime::UNIX_EPOCH,
+            worker_completed_timestamp: SystemTime::UNIX_EPOCH,
+            input_fetch_start_timestamp: SystemTime::UNIX_EPOCH,
+            input_fetch_completed_timestamp: SystemTime::UNIX_EPOCH,
+            execution_start_timestamp: SystemTime::UNIX_EPOCH,
+            execution_completed_timestamp: SystemTime::UNIX_EPOCH,
+            output_upload_start_timestamp: SystemTime::UNIX_EPOCH,
+            output_upload_completed_timestamp: SystemTime::UNIX_EPOCH,
+        },
+        server_logs: HashMap::new(),
+        error: None,
+        message: String::new(),
+    };
+    let running_action = Arc::new(MockRunningAction::new());
+
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+
+    running_action
+        .simple_expect_get_finished_result(Ok(action_result.clone()))
+        .await?;
+
+    // The KEY assertion: BlobsAvailable must be the FIRST call seen by the
+    // grpc client mock — before ExecuteResult. The mock's call channel is
+    // ordered (FIFO mpsc), so calling `expect_blobs_available` first will
+    // receive the first call made; if ExecuteResult was made first, the
+    // expect_blobs_available helper will panic with "expected
+    // BlobsAvailable, got: ExecutionResponse(...)".
+    let notification = test_context.client.expect_blobs_available(Ok(())).await;
+    // Sanity: contains the stdout + stderr digests.
+    assert!(
+        notification
+            .digests
+            .iter()
+            .any(|d| d.hash == DigestInfo::new([21u8; 32], 10).packed_hash().to_string()),
+        "Expected BlobsAvailable to include stdout digest, got: {:?}",
+        notification.digests,
+    );
+    assert!(
+        notification
+            .digests
+            .iter()
+            .any(|d| d.hash == DigestInfo::new([22u8; 32], 10).packed_hash().to_string()),
+        "Expected BlobsAvailable to include stderr digest, got: {:?}",
+        notification.digests,
+    );
+
+    // After the ordering invariant: ExecuteResult comes second.
+    // cache_action_result is also called somewhere in this flow, but goes
+    // through the running_actions_manager mock channel, not the gRPC mock.
+    // We don't assert ordering against it here.
+    let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+    assert_eq!(
+        execution_response.operation_id,
+        String::new(),
+    );
+
+    // Drain cache_action_result so the test cleans up gracefully.
+    drop(
+        test_context
+            .actions_manager
+            .expect_cache_action_result()
+            .await,
     );
 
     Ok(())

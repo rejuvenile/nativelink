@@ -21,8 +21,8 @@ use hyper::body::Frame;
 use nativelink_config::cas_server::{EndpointConfig, LocalWorkerConfig, WorkerProperty};
 use nativelink_error::Error;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    ConnectWorkerRequest, ExecuteComplete, ExecuteResult, GoingAwayRequest, KeepAliveRequest,
-    UpdateForWorker,
+    BlobsAvailableNotification, ConnectWorkerRequest, ExecuteComplete, ExecuteResult,
+    GoingAwayRequest, KeepAliveRequest, UpdateForWorker,
 };
 use nativelink_util::channel_body_for_tests::ChannelBody;
 use nativelink_util::shutdown_guard::ShutdownGuard;
@@ -51,6 +51,7 @@ const BROADCAST_CAPACITY: usize = 1;
 enum WorkerClientApiCalls {
     ConnectWorker(ConnectWorkerRequest),
     ExecutionResponse(ExecuteResult),
+    BlobsAvailable(BlobsAvailableNotification),
 }
 
 #[derive(Debug)]
@@ -61,6 +62,7 @@ enum WorkerClientApiCalls {
 enum WorkerClientApiReturns {
     ConnectWorker(Result<Response<Streaming<UpdateForWorker>>, Status>),
     ExecutionResponse(Result<(), Error>),
+    BlobsAvailable(Result<(), Error>),
 }
 
 #[derive(Clone)]
@@ -102,9 +104,7 @@ impl MockWorkerApiClient {
             .expect("Could not receive msg in mpsc")
         {
             WorkerClientApiCalls::ConnectWorker(req) => req,
-            req @ WorkerClientApiCalls::ExecutionResponse(_) => {
-                panic!("expect_connect_worker expected ConnectWorker, got : {req:?}")
-            }
+            other => panic!("expect_connect_worker expected ConnectWorker, got : {other:?}"),
         };
         self.tx_resp
             .send(WorkerClientApiReturns::ConnectWorker(result))
@@ -123,12 +123,34 @@ impl MockWorkerApiClient {
             .expect("Could not receive msg in mpsc")
         {
             WorkerClientApiCalls::ExecutionResponse(req) => req,
-            req @ WorkerClientApiCalls::ConnectWorker(_) => {
-                panic!("expect_execution_response expected ExecutionResponse, got : {req:?}")
-            }
+            other => panic!("expect_execution_response expected ExecutionResponse, got : {other:?}"),
         };
         self.tx_resp
             .send(WorkerClientApiReturns::ExecutionResponse(result))
+            .expect("Could not send request to mpsc");
+        req
+    }
+
+    /// Receive the next call as a BlobsAvailable, returning the notification
+    /// payload. Used by ordering tests that need to assert BlobsAvailable
+    /// arrives at the worker→scheduler stream BEFORE ExecuteResult so the
+    /// server's locality_map is fully populated by the time the client sees
+    /// the action result.
+    pub(crate) async fn expect_blobs_available(
+        &self,
+        result: Result<(), Error>,
+    ) -> BlobsAvailableNotification {
+        let mut rx_call_lock = self.rx_call.lock().await;
+        let req = match rx_call_lock
+            .recv()
+            .await
+            .expect("Could not receive msg in mpsc")
+        {
+            WorkerClientApiCalls::BlobsAvailable(req) => req,
+            other => panic!("expect_blobs_available expected BlobsAvailable, got : {other:?}"),
+        };
+        self.tx_resp
+            .send(WorkerClientApiReturns::BlobsAvailable(result))
             .expect("Could not send request to mpsc");
         req
     }
@@ -149,9 +171,7 @@ impl WorkerApiClientTrait for MockWorkerApiClient {
             .expect("Could not receive msg in mpsc")
         {
             WorkerClientApiReturns::ConnectWorker(result) => result,
-            resp @ WorkerClientApiReturns::ExecutionResponse(_) => {
-                panic!("connect_worker expected ConnectWorker response, received {resp:?}")
-            }
+            resp => panic!("connect_worker expected ConnectWorker response, received {resp:?}"),
         }
     }
 
@@ -174,9 +194,7 @@ impl WorkerApiClientTrait for MockWorkerApiClient {
             .expect("Could not receive msg in mpsc")
         {
             WorkerClientApiReturns::ExecutionResponse(result) => result,
-            resp @ WorkerClientApiReturns::ConnectWorker(_) => {
-                panic!("execution_response expected ExecutionResponse response, received {resp:?}")
-            }
+            resp => panic!("execution_response expected ExecutionResponse response, received {resp:?}"),
         }
     }
 
@@ -186,9 +204,20 @@ impl WorkerApiClientTrait for MockWorkerApiClient {
 
     async fn blobs_available(
         &mut self,
-        _request: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsAvailableNotification,
+        request: BlobsAvailableNotification,
     ) -> Result<(), Error> {
-        Ok(())
+        self.tx_call
+            .send(WorkerClientApiCalls::BlobsAvailable(request))
+            .expect("Could not send request to mpsc");
+        let mut rx_resp_lock = self.rx_resp.lock().await;
+        match rx_resp_lock
+            .recv()
+            .await
+            .expect("Could not receive msg in mpsc")
+        {
+            WorkerClientApiReturns::BlobsAvailable(result) => result,
+            resp => panic!("blobs_available expected BlobsAvailable response, received {resp:?}"),
+        }
     }
 }
 
