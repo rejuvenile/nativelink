@@ -2137,4 +2137,42 @@ mod tests {
             "process survived SIGUSR2 — eager install fix is in effect",
         );
     }
+
+    /// Spec (Linux mirror): the eager install on Linux must replace
+    /// the SIGRTMIN+1 default disposition. Same contract shape as
+    /// the macOS test, on the corresponding signal — SIGRTMIN+1's
+    /// default disposition is also process termination, so the same
+    /// "kill the worker" failure mode applies if the install path
+    /// regresses on Linux.
+    ///
+    /// Running this test on Linux gives us a real mutation-testable
+    /// fence: comment out the `install_dump_signal_handler` body and
+    /// the assertion fires immediately.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_dump_signal_handler_replaces_sigrtmin_default_linux() {
+        super::install_dump_signal_handler();
+
+        let sig = unsafe { libc::SIGRTMIN() } + 1;
+        let mut after: libc::sigaction = unsafe { core::mem::zeroed() };
+        let ret = unsafe {
+            libc::sigaction(sig, core::ptr::null(), &mut after)
+        };
+        assert_eq!(ret, 0, "sigaction(SIGRTMIN+1, NULL, &out) must succeed");
+        assert_ne!(
+            after.sa_sigaction, 0,
+            "SIGRTMIN+1 disposition is SIG_DFL after \
+             install_dump_signal_handler — internal pthread_kill rounds \
+             would terminate the worker on Linux (mirror of worker-03 \
+             field-test regression)",
+        );
+        assert_ne!(
+            after.sa_sigaction, 1,
+            "SIGRTMIN+1 disposition is SIG_IGN — handler never called",
+        );
+        assert!(
+            (after.sa_flags & libc::SA_SIGINFO) != 0,
+            "SIGRTMIN+1 sigaction missing SA_SIGINFO flag; not our handler",
+        );
+    }
 }
