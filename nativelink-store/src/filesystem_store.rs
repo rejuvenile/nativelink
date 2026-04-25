@@ -1558,6 +1558,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             return Ok(());
         }
         let owned_key = key.into_owned();
+        let owned_key_for_check = owned_key.borrow().into_owned();
         let entry = self.evicting_map.get(&owned_key).await.ok_or_else(|| {
             make_err!(
                 Code::NotFound,
@@ -1606,11 +1607,46 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // other and keeping them in page cache avoids redundant disk I/O
         // (measured: 76% of read I/O is re-reads). On RAM-constrained
         // deployments, enable fadvise_dontneed to drop pages after each read.
+        let bytes_before_read = writer.get_bytes_written();
         let file_slot = fs::read_file_to_channel(
             temp_file, writer, read_limit, self.read_buffer_size, offset,
         )
         .await
         .err_tip(|| "Failed to read data in filesystem store")?;
+        // Disk-corruption guard: if the file is zero-bytes on disk for a
+        // non-zero digest (ZFS corruption, partial write recovery, wrong
+        // inode after disk swap), `read_file_to_channel` returns Ok with
+        // no bytes written. Sending EOF here would emit an Ok+EOF gRPC
+        // stream — the same silent-data-loss class previously caught by
+        // the workaround in grpc_store.rs (now removed). Detect, evict
+        // the corrupt entry from the evicting_map so the upper layer
+        // re-fetches from a different source, and return NotFound.
+        let bytes_written = writer.get_bytes_written() - bytes_before_read;
+        if bytes_written == 0 {
+            let expected_size = match owned_key_for_check.borrow() {
+                StoreKey::Digest(d) => d.size_bytes(),
+                StoreKey::Str(_) => 0,
+            };
+            // Only flag the case where the caller asked for the full blob
+            // from the start. A range read with offset >= file size or
+            // length=Some(0) legitimately returns no bytes and we must not
+            // treat that as corruption.
+            if expected_size > 0 && offset == 0 && length.is_none() {
+                warn!(
+                    key = ?owned_key_for_check,
+                    expected_size,
+                    "FilesystemStore: file on disk is empty for non-zero digest \
+                     (likely corruption) — removing entry + returning NotFound"
+                );
+                self.evicting_map.remove(&owned_key_for_check).await;
+                return Err(make_err!(
+                    Code::NotFound,
+                    "FilesystemStore: file for {} was empty on disk \
+                     (expected {expected_size} bytes) — entry removed",
+                    owned_key_for_check.as_str()
+                ));
+            }
+        }
         if self.fadvise_dontneed {
             file_slot.advise_dontneed();
         }

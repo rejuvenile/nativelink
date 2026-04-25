@@ -718,9 +718,45 @@ impl WorkerProxyStore {
             );
             match attempt_res {
                 Ok(()) => {
+                    // Defensive guard: a peer can finish a Read RPC with
+                    // Ok+EOF and zero bytes for a non-zero digest (see the
+                    // bug class previously caught by grpc_store.rs:1453,
+                    // now removed in favor of source-side fixes in
+                    // fast_slow_store.rs::insert_mirror_blob + get_part
+                    // size guards). If THIS peer is on an old build that
+                    // still has the bug — or some other path produces an
+                    // empty stream — accepting Ok+0-bytes here would
+                    // pollute the consumer with a silent empty response
+                    // and leave the locality_map pointing at the broken
+                    // peer. Treat 0-bytes-on-full-read as a peer failure:
+                    // evict locality and try the next peer.
+                    let bytes_written_this_peer =
+                        writer.get_bytes_written() - bytes_before_proxy;
+                    let expected_size = digest.size_bytes();
+                    let was_full_read = current_offset == offset
+                        && remaining_length == length
+                        && length.is_none();
+                    if bytes_written_this_peer == 0
+                        && expected_size > 0
+                        && was_full_read
+                    {
+                        warn!(
+                            ?digest,
+                            endpoint = %endpoint,
+                            expected_size,
+                            "WorkerProxyStore: peer returned Ok+0-bytes for \
+                             non-zero digest — treating as stale-positive, \
+                             evicting locality and trying next peer"
+                        );
+                        self.locality_map
+                            .write()
+                            .evict_blobs(endpoint, &[digest]);
+                        continue;
+                    }
                     info!(
                         ?digest,
                         endpoint = %endpoint,
+                        bytes_written_this_peer,
                         "WorkerProxyStore: successfully proxied blob from worker"
                     );
                     return Ok(true);
