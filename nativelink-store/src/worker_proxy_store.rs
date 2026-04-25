@@ -992,7 +992,15 @@ impl WorkerProxyStore {
                         e.message_string()
                     ));
                 }
-                trace!(
+                // Promoted to info! to verify the client-cancellation hypothesis
+                // for digests that show inner-NotFound but never reach
+                // try_read_from_worker (e.g. a7fd12e4...-242504 across 11 reads
+                // / 12 hours: producer logs but no worker_proxy_store logs).
+                // If this line ALSO doesn't appear post-deploy for those
+                // digests, the get_part future is being cancelled by the
+                // gRPC client before the inner-await returns. If it DOES
+                // appear, look at why try_read_from_worker is then skipped.
+                info!(
                     key = ?key.borrow().into_digest(),
                     code = ?e.code,
                     "WorkerProxyStore: inner store miss, consulting locality map"
@@ -1054,31 +1062,51 @@ impl WorkerProxyStore {
         }
 
         if is_worker {
-            // Worker asked the server for a blob that the server's inner
-            // store doesn't have. Consult the server-side locality map: if
-            // any peer worker has the blob, return a `REDIRECT_PREFIX`
-            // error so the worker fetches the bytes directly from those
-            // peers (saving server bandwidth + RAM). If no peer has it,
-            // fall through to NotFound.
+            // The reader's role splits two ways at this point:
             //
-            // Loop safety: workers handle a redirect by calling
-            // `try_read_from_endpoints`, which invokes
-            // `peer_store.get_part(...)` WITHOUT setting `IS_WORKER_REQUEST`
-            // (see `get_part_and_cache` at the call site, and
-            // `grpc_store.rs::read_internal` only adds the
-            // `x-nativelink-worker` header when the task-local is set).
-            // So peer-to-peer hops can never trigger another redirect
-            // generation — this is a single-hop redirect.
+            // - **Server-side WorkerProxyStore** (`race_peers=false`): the
+            //   server is responding to a worker's incoming Read.
+            //   Consult the server-side locality_map: if any peer worker
+            //   has the blob, return a `REDIRECT_PREFIX` error so the
+            //   requesting worker fetches the bytes directly from those
+            //   peers (saving server bandwidth + RAM). If no peer has it,
+            //   fall through to NotFound.
             //
-            // Self-redirect risk: the server-side locality map may include
-            // the requesting worker's own endpoint. The existing per-digest
-            // peer-failure eviction in `try_read_from_worker` /
-            // `try_read_from_endpoints`
-            // (`should_evict_locality_on_peer_error`, narrowed to
-            // NotFound/DataLoss) cleans up stale self-entries on first
-            // failed connection. A future iteration may add an explicit
-            // self-filter via gRPC metadata.
+            // - **Worker-side WorkerProxyStore** (`race_peers=true`): the
+            //   worker is responding to an incoming external Read (from
+            //   another host, e.g. server's proxy or a peer following a
+            //   redirect). A worker MUST NEVER chain external RPCs while
+            //   responding to someone else's request — that's the loop-
+            //   terminator invariant: chains can never propagate past the
+            //   first hop because responders refuse to chain. Just return
+            //   NotFound; do not generate a redirect (workers don't have
+            //   authority to redirect anyone), and do not try peers
+            //   (race_peers is for INITIATOR-mode reads when the worker
+            //   is satisfying its own action-input needs).
             let digest = key.borrow().into_digest();
+            if self.race_peers.load(Ordering::Relaxed) {
+                // Worker side, responder mode. No chain.
+                debug!(
+                    ?digest,
+                    "WorkerProxyStore (worker side): incoming Read for missing blob — \
+                     returning NotFound without chaining (responder mode never RPCs out)"
+                );
+                return Err(Error::not_found_with_detail(
+                    format!(
+                        "Blob {digest:?} not found in this worker's inner store \
+                         (responder mode, no external RPCs)"
+                    ),
+                    make_precondition_failure_any(digest),
+                ));
+            }
+            // Server side: generate a single-hop redirect to peers in
+            // locality_map. Workers handle the redirect by calling
+            // `try_read_from_endpoints` which invokes
+            // `peer_store.get_part(...)` WITHOUT setting
+            // `IS_WORKER_REQUEST` (peers see is_worker=false → no further
+            // redirect generation). Combined with the responder-mode gate
+            // above (which makes worker-side responders return NotFound),
+            // chains terminate at depth 1.
             let peers: Vec<String> = self
                 .locality_map
                 .read()
@@ -1919,6 +1947,32 @@ impl StoreDriver for WorkerProxyStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        // Responder-mode short-circuit (worker side serving an incoming
+        // external Read for another host).
+        //
+        // Loop terminator invariant: a worker MUST NEVER chain external
+        // RPCs while responding to someone else's request. Chains can
+        // never propagate past the first hop because responders refuse
+        // to chain. race_peers / try_read_from_worker / redirect-
+        // generation are all INITIATOR-mode behavior — only when the
+        // worker is satisfying its OWN action-input needs.
+        //
+        // This gate fires when both:
+        //   - race_peers=true (worker side)
+        //   - IS_WORKER_REQUEST=true (incoming external Read; set by the
+        //     worker's bytestream_server when servicing a remote caller)
+        //
+        // Pass straight through to inner — local stores only, no
+        // network. inner returns Ok if local has it, NotFound otherwise.
+        // The matching gate at line ~1057 in get_part_sequential is
+        // defense in depth for the "no peers in locality_map" path.
+        if self.race_peers.load(Ordering::Relaxed) {
+            let is_responder = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
+            if is_responder {
+                return self.inner.get_part(key, writer, offset, length).await;
+            }
+        }
+
         // Only race when explicitly enabled (worker side). Server-side
         // WorkerProxyStore uses the sequential path which generates
         // redirects for workers and proxies for non-worker callers.
@@ -3028,6 +3082,59 @@ mod tests {
                 "Redirect should include peer endpoint {ep}: got {msg}"
             );
         }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // 10d. Worker-side responder mode (race_peers=true) MUST NOT generate
+    //      a redirect on incoming external Reads — only servers can
+    //      redirect. The worker gets the same is_worker=true signal when
+    //      its bytestream_server receives a remote Read, but its job is
+    //      to serve from local stores or return NotFound. NEVER chain.
+    //      This is the loop-terminator invariant.
+    //
+    //      Mutation guard: removing the `if self.race_peers.load(...)`
+    //      gate (i.e. the worker generates a redirect like a server)
+    //      makes this test go red.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_worker_responder_mode_returns_notfound_no_redirect() -> Result<(), Error> {
+        // Build the proxy by hand so we can flip race_peers BEFORE
+        // wrapping in a Store. `enable_race_peers` requires the
+        // Arc<WorkerProxyStore>, not the trait-object Store.
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
+        proxy_arc.enable_race_peers();
+        let store = Store::new(proxy_arc);
+
+        let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+        let peer_endpoint = "grpc://peer-worker:40081";
+
+        // Locality_map HAS a peer for this digest. On the SERVER side
+        // this would generate a redirect. On the WORKER side
+        // (race_peers=true), the worker is in RESPONDER mode and MUST
+        // return NotFound without any external RPC or redirect.
+        locality_map.write().register_blobs(peer_endpoint, &[digest]);
+
+        let result = IS_WORKER_REQUEST
+            .scope(true, store.get_part_unchunked(digest, 0, None))
+            .await;
+
+        let err = result.expect_err("Expected NotFound, not Ok or redirect");
+        assert_eq!(
+            err.code,
+            Code::NotFound,
+            "Worker-side responder MUST return NotFound, not redirect or other code; \
+             chaining responders into external RPCs would form loops. Got: {err:?}"
+        );
+        let msg = err.message_string();
+        assert!(
+            !msg.contains(REDIRECT_PREFIX),
+            "Worker-side responder MUST NOT generate REDIRECT_PREFIX (only servers redirect). \
+             Got msg: {msg}"
+        );
+
         Ok(())
     }
 
