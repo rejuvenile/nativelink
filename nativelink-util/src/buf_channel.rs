@@ -126,12 +126,14 @@ pub fn make_buf_channel_pair_with_size(
     let (tx, rx) = mpsc::channel(capacity);
     let eof_sent = Arc::new(AtomicBool::new(false));
     let diag = Arc::new(ChannelDiag::default());
+    let terminal_error = Arc::new(OnceLock::new());
     (
         DropCloserWriteHalf {
             tx: Some(tx),
             bytes_written: 0,
             eof_sent: eof_sent.clone(),
             diag: diag.clone(),
+            terminal_error: terminal_error.clone(),
         },
         DropCloserReadHalf {
             rx,
@@ -142,6 +144,7 @@ pub fn make_buf_channel_pair_with_size(
             recent_data: Vec::new(),
             max_recent_data_size: 0,
             diag,
+            terminal_error,
         },
     )
 }
@@ -156,6 +159,14 @@ pub struct DropCloserWriteHalf {
     /// the reader can attribute slow-recv warns to a specific producer
     /// task and report the time since the last successful send.
     diag: Arc<ChannelDiag>,
+    /// Shared with the reader half. When the producer terminates early
+    /// with a structured error (via `send_error`), the error is stored
+    /// here so the reader's next `recv` returns the producer's error
+    /// instead of the generic "Sender dropped before sending EOF"
+    /// fallback that triggers when `tx` is dropped without `send_eof`.
+    /// `OnceLock` because the producer can only terminate-with-error
+    /// once: subsequent `send_error` calls are no-ops.
+    terminal_error: Arc<OnceLock<Error>>,
 }
 
 impl DropCloserWriteHalf {
@@ -313,6 +324,40 @@ impl DropCloserWriteHalf {
         Ok(())
     }
 
+    /// Terminates the stream early with a structured producer error.
+    /// Stores `err` in a slot shared with the reader and closes the
+    /// channel. The reader's next `recv` returns the stored error
+    /// instead of the generic "Sender dropped before sending EOF"
+    /// `Code::Internal` fallback that would otherwise fire if `tx` were
+    /// merely dropped.
+    ///
+    /// Use this whenever a producer's `get_part`/`update`-style function
+    /// is about to return `Err(...)` from a path that owns a
+    /// `&mut DropCloserWriteHalf` it did not personally construct
+    /// (i.e. the writer is borrowed from a caller's outer scope). If the
+    /// caller paired this writer with a reader inside a `tokio::join!`
+    /// (e.g. `VerifyStore::get_part`'s `(get_fut, check_fut)` pattern),
+    /// failing to terminate the writer leaves the paired reader blocked
+    /// on `rx.recv().await` forever — the join deadlocks. Calling
+    /// `send_error` (or `send_eof`) before the early return is mandatory.
+    ///
+    /// Idempotent: subsequent calls (or `send_eof` after `send_error`)
+    /// are no-ops; only the first error is stored.
+    pub fn send_error(&mut self, err: Error) {
+        // Record the error first so the receiver can observe it on its
+        // next recv (which will see the channel closed and consult this
+        // slot). OnceLock::set returns Err if already set; ignore — only
+        // the first terminal error is meaningful.
+        let _ = self.terminal_error.set(err);
+        // Mark eof_sent so the receiver does NOT synthesize a
+        // "Sender dropped before sending EOF" Internal — instead it
+        // returns the stored terminal_error (or, if for some reason the
+        // OnceLock set raced and lost, a clean EOF).
+        self.eof_sent.store(true, Ordering::Release);
+        // Drop tx to wake the receiver's `rx.recv().await`.
+        self.tx = None;
+    }
+
     /// Returns the number of bytes written so far. This does not mean the receiver received
     /// all of the bytes written to the stream so far.
     #[must_use]
@@ -355,6 +400,12 @@ pub struct DropCloserReadHalf {
     /// attribute the wait to the producer task and report the gap
     /// since its last send.
     diag: Arc<ChannelDiag>,
+    /// Shared with the writer half. Set by `DropCloserWriteHalf::send_error`
+    /// when the producer terminates early with a structured error. On
+    /// EOF (rx returns None), the receiver consults this slot first; if
+    /// populated, returns the producer's structured error rather than the
+    /// generic "Sender dropped before sending EOF" Internal fallback.
+    terminal_error: Arc<OnceLock<Error>>,
 }
 
 impl DropCloserReadHalf {
@@ -366,6 +417,20 @@ impl DropCloserReadHalf {
     fn recv_inner(&mut self, chunk: Bytes) -> Result<Bytes, Error> {
         // `queued_data` is allowed to have empty bytes that represent EOF
         if chunk.is_empty() {
+            // Producer terminated early with a structured error (via
+            // `DropCloserWriteHalf::send_error`) — surface it instead of
+            // either the generic "Sender dropped" Internal or a clean
+            // EOF. This is checked BEFORE the eof_sent fallback because
+            // `send_error` deliberately sets `eof_sent = true` (to
+            // prevent the synthesized Internal) AND populates this slot.
+            if let Some(err) = self.terminal_error.get() {
+                let err = err.clone();
+                self.queued_data.clear();
+                self.recent_data.clear();
+                self.bytes_received = 0;
+                self.last_err = Some(err.clone());
+                return Err(err);
+            }
             if !self.eof_sent.load(Ordering::Acquire) {
                 let err = make_err!(Code::Internal, "Sender dropped before sending EOF");
                 self.queued_data.clear();

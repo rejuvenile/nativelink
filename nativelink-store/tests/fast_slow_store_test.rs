@@ -2478,7 +2478,7 @@ async fn terminal_internal_err_falls_back_to_slow_store() -> Result<(), Error> {
     // so the fallback can succeed on the second call.
     let slow_memory = MemoryStore::new(&MemorySpec::default());
     slow_memory
-        .update_oneshot(digest.into(), payload.clone().into())
+        .update_oneshot(StoreKey::from(digest), payload.clone().into())
         .await?;
 
     let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
@@ -2522,6 +2522,124 @@ async fn terminal_internal_err_falls_back_to_slow_store() -> Result<(), Error> {
          falling back to slow_store. The Code::NotFound gate at \
          fast_slow_store.rs is missing or broken — non-NotFound terminal \
          errors must fall through so recoverable reads succeed.",
+    );
+
+    Ok(())
+}
+
+/// Production wedge: when `VerifyStore` wraps `FastSlowStore`, a NotFound
+/// terminal-Err short-circuit in `FastSlowStore::get_part` returns
+/// `Err(NotFound)` WITHOUT terminating the `tx` half of the channel that
+/// the outer caller borrowed. `VerifyStore::get_part` then deadlocks on
+/// `tokio::join!(get_fut, check_fut)` because:
+///
+///   - `get_fut` (FastSlowStore.get_part) returned `Err(NotFound)`, but
+///     `tx` lives in the outer scope and is NOT dropped.
+///   - `check_fut` (inner_check_get_part) blocks forever on `rx.recv()`
+///     waiting for either a chunk or for `tx` to drop.
+///
+/// In production this manifests as worker builds wedging on
+/// medium/large blobs that miss in both fast and slow tiers — peer
+/// fall-through (`try_read_from_worker`) is never reached because the
+/// wrapping `WorkerProxyStore.get_part` never returns from its inner
+/// VerifyStore call. Bug introduced by commit f87359511 (#124 follow-up
+/// — gating terminal-Err short-circuit on NotFound). The existing test
+/// `terminal_internal_err_falls_back_to_slow_store` covers the
+/// non-NotFound path (which falls through to slow_store and naturally
+/// terminates the writer); only this composition hits the
+/// writer-not-terminated path.
+///
+/// The test deliberately uses `tokio::time::timeout` with `.expect`
+/// (not `?`) so a deadlock surfaces as a panic with an explicit
+/// "must not deadlock" message rather than a generic timeout error.
+#[nativelink_test]
+async fn verify_store_around_fast_slow_does_not_deadlock_on_populator_notfound()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_config::stores::VerifySpec;
+    use nativelink_store::verify_store::VerifyStore;
+    use nativelink_util::store_trait::Store;
+    use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
+
+    // Build an empty FastSlowStore (both tiers miss for the test
+    // digest) and wrap it in VerifyStore with verify_size=true so the
+    // get_part path takes the `tokio::join!` branch (the bypass at
+    // verify_store.rs:308 returns `false` for `should_verify` only when
+    // both verify_size and verify_hash are off; we need it `true` to
+    // reproduce the deadlock).
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+
+    // Pre-arm the FastSlowStore terminal-Err NotFound branch: inject a
+    // `populating_digests` entry whose `StreamingBlobInner` is already
+    // in terminal-Err state with `Code::NotFound`. A subsequent
+    // `get_part` will become a waiter, see `is_terminal() == true`,
+    // and execute the early-return at fast_slow_store.rs ~2912 — which
+    // pre-fix did NOT terminate the writer (the wedge).
+    {
+        let inner = Arc::new(StreamingBlobInner::new(digest, 64 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        writer.send_error(make_err!(
+            Code::NotFound,
+            "synthetic terminal-error reproducing slow_store NotFound from run_producer"
+        ));
+        drop(writer);
+        assert!(inner.is_terminal(), "writer.send_error must mark terminal");
+        assert!(inner.has_error(), "terminal must be Err");
+        fast_slow_store.test_install_terminal_populate(digest.into(), inner);
+    }
+
+    let verify_store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(fast_slow_store),
+    );
+
+    // Wrap the read in a 5s timeout. With the bug present, this hangs
+    // forever inside `tokio::join!` in `VerifyStore::get_part` because
+    // `FastSlowStore::get_part` returns `Err(NotFound)` without
+    // terminating the `tx` that VerifyStore's outer scope owns; the
+    // paired `check_fut` blocks on `rx.recv()` indefinitely.
+    //
+    // The post-fix path terminates the writer (via `send_error` /
+    // dropped tx), so `check_fut` unblocks and `join!` completes within
+    // milliseconds. We use `.expect` so a deadlock is reported with
+    // an explicit "must not deadlock" message rather than a generic
+    // `Elapsed`.
+    let timed = tokio::time::timeout(
+        Duration::from_secs(5),
+        verify_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — this is the bug we're fixing: \
+         FastSlowStore::get_part early-returned Err(NotFound) but did \
+         not terminate the writer, so VerifyStore's tokio::join! over \
+         the tx/rx pair blocks forever on rx.recv()",
+    );
+
+    let err = timed.err().expect("expected NotFound, not Ok");
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "expected NotFound to propagate through VerifyStore (via merge \
+         semantics: get_res = Err(NotFound), check_res may be Internal/EOF, \
+         merge takes get_res's code), got: {err:?}",
     );
 
     Ok(())

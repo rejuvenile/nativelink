@@ -2889,7 +2889,11 @@ impl StoreDriver for FastSlowStore {
         //   misleading "fast store item evicted after populate" warn,
         //   which fired for every waiter on every failed-populate digest
         //   (1825 fires / 3 stale-positive digests / 20 min observed in
-        //   production on 2026-04-24).
+        //   production on 2026-04-24). The early return MUST also
+        //   terminate `writer` (via `send_error`) so callers that
+        //   paired this writer with a reader inside `tokio::join!` (e.g.
+        //   `VerifyStore::get_part`'s `(get_fut, check_fut)` pattern)
+        //   don't deadlock awaiting EOF/error.
         //
         // - Producer Err non-NotFound (Internal "writer dropped",
         //   Aborted, Unavailable): transient stream-level failure where
@@ -2909,6 +2913,13 @@ impl StoreDriver for FastSlowStore {
                         code = ?producer_err.code,
                         "populate already failed with NotFound, returning producer error directly"
                     );
+                    // Terminate the writer with the producer error
+                    // BEFORE returning so a paired reader (see
+                    // VerifyStore::get_part's tokio::join! pattern)
+                    // unblocks instead of awaiting bytes that never
+                    // arrive. Cloned because the original is consumed
+                    // by the return value below.
+                    writer.send_error(producer_err.clone());
                     return Err(producer_err);
                 }
                 // Non-NotFound terminal Err (Code::Internal "writer
