@@ -2730,29 +2730,14 @@ impl StoreDriver for FastSlowStore {
     // historically been multi-hour Bazel build wedges (see CLAUDE.md
     // "Test in production composition, not in isolation").
     //
-    // STRUCTURAL ENFORCEMENT: the entire body wraps `writer` in a
-    // `WriteHalfGuard` (`guard` below). Use ONE of these verbs at every
-    // exit point — never raw `writer.send_eof()` / `writer.send_error()`
-    // followed by `return`:
-    //   * `guard.commit_eof()?` — happy path: send EOF + suppress Drop fallback
-    //   * `guard.commit_already_terminated()` — sub-call already terminated
-    //     the writer (e.g. delegated to `slow_store.get_part(&mut *guard,...)`)
-    //   * `return Err(guard.fail(err))` — explicit failure: send `err` +
-    //     suppress Drop fallback
-    //
-    // Any `?` propagation that escapes WITHOUT one of the above will be
-    // caught by `WriteHalfGuard::Drop`, which sends a synthesized Internal
-    // error to unblock the paired reader. The Drop fallback IS a safety
-    // net, not a license — every Drop-fallback fire indicates a missed
-    // explicit commit and should be fixed.
-    //
-    // If you add a new `return` to this function:
-    //   1. If returning Ok, prefix it with `guard.commit_eof()?;` (or
-    //      `guard.commit_already_terminated();` if a sub-call did it)
-    //   2. If returning Err, write `return Err(guard.fail(err));`
-    //   3. If you want Drop to handle it (e.g. lazy `?` propagation), do
-    //      nothing — but verify in review that the Drop-synthesized
-    //      Internal error is acceptable for the path
+    // STRUCTURAL ENFORCEMENT: wrap `writer` in `WriteHalfGuard` (`guard`).
+    // Verbs: `commit_eof()?` (happy path, send EOF), `commit_delegated()`
+    // (sub-call terminated the writer), `commit_delegated_if_ok(&res)`
+    // (only suppress Drop on Ok — preferred for sub-store delegation so
+    // a sub-store contract violation is caught by the Drop fallback),
+    // `return Err(guard.fail(err))` (explicit failure). Any uncommitted
+    // exit fires the Drop fallback (synthesized Internal) so paired
+    // readers can't deadlock. See `WriteHalfGuard` rustdoc.
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,
@@ -2878,7 +2863,7 @@ impl StoreDriver for FastSlowStore {
                 // The inner fast_store's get_part contract terminates the
                 // writer on success (sends its own EOF). Suppress Drop
                 // fallback so we don't double-terminate.
-                guard.commit_already_terminated();
+                guard.commit_delegated();
                 return Ok(());
             }
             Err(err) if err.code == Code::NotFound && guard.get_bytes_written() == bytes_before => {
@@ -3002,20 +2987,16 @@ impl StoreDriver for FastSlowStore {
                 .slow_store_hit_count
                 .fetch_add(1, Ordering::Acquire);
             // The slow_store's get_part contract terminates the writer on
-            // both Ok (EOF) and Err (the inner store's `?` chain calls
-            // send_error on its way out). Use ? to propagate; on Err the
-            // sub-store has already terminated `guard`, so suppress the
-            // Drop fallback to avoid double-termination. On Ok we likewise
-            // suppress (the sub-store sent EOF).
-            //
-            // Subtle: we must `commit_already_terminated()` BEFORE `?`
-            // propagation could fire the Drop fallback. So we await
-            // separately and bind the result.
+            // Ok (EOF). On Err the contract is also termination, but a
+            // sub-store contract violation (Err without send_error) would
+            // silently deadlock paired readers without the Drop fallback.
+            // Use commit_delegated_if_ok so the safety net stays armed
+            // on Err — caught by the synthesized Internal at Drop time.
             let res = self
                 .slow_store
                 .get_part(key, &mut *guard, offset, length)
                 .await;
-            guard.commit_already_terminated();
+            guard.commit_delegated_if_ok(&res);
             res?;
             self.metrics
                 .slow_store_downloaded_bytes
@@ -3086,9 +3067,9 @@ impl StoreDriver for FastSlowStore {
                 // be present even though the producer's stream failed.
             }
             let bytes_before = guard.get_bytes_written();
-            // Sub-call terminates the writer (EOF on Ok, send_error on Err
-            // via its own contract). Bind the result so we can suppress the
-            // Drop fallback before propagating.
+            // Sub-call terminates the writer on Ok; commit_delegated_if_ok
+            // keeps the Drop fallback armed on Err so a sub-store contract
+            // violation (Err without send_error) is caught at Drop time.
             let res = match self
                 .fast_store
                 .get_part(key.borrow(), &mut *guard, offset, length)
@@ -3114,7 +3095,7 @@ impl StoreDriver for FastSlowStore {
                     Err(guard.fail(err))
                 }
             };
-            guard.commit_already_terminated();
+            guard.commit_delegated_if_ok(&res);
             return res;
         }
 
@@ -3132,7 +3113,7 @@ impl StoreDriver for FastSlowStore {
                 .slow_store
                 .get_part(key.borrow(), &mut *guard, offset, length)
                 .await;
-            guard.commit_already_terminated();
+            guard.commit_delegated_if_ok(&res);
             return res;
         }
 
@@ -3209,7 +3190,7 @@ impl StoreDriver for FastSlowStore {
                         .slow_store
                         .get_part(key.borrow(), &mut *guard, new_offset, new_length)
                         .await;
-                    guard.commit_already_terminated();
+                    guard.commit_delegated_if_ok(&res);
                     return res;
                 }
             }

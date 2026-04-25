@@ -25,7 +25,7 @@ use nativelink_config::stores::VerifySpec;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
-    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair_with_size,
+    DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
 use nativelink_util::common::{DigestInfo, PackedHash};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
@@ -333,9 +333,32 @@ impl StoreDriver for VerifyStore {
         // The hasher processes at memory speed (~GB/s), so the channel
         // never needs deep buffering. 4 slots keeps memory low and avoids
         // excess context-switch overhead from a 256-slot channel.
-        let (mut tx, rx) = make_buf_channel_pair_with_size(4);
+        let (tx, rx) = make_buf_channel_pair_with_size(4);
 
-        let get_fut = self.inner_store.get_part(digest, &mut tx, 0, None);
+        // Writer-termination contract for `tokio::join!(get_fut, check_fut)`:
+        // if `inner_store.get_part` returns Err WITHOUT terminating `tx`,
+        // `check_fut`'s `rx.recv().await` blocks forever and the join
+        // deadlocks (multi-hour Bazel build wedges historically).
+        //
+        // We MOVE `tx` INTO `get_fut` (so it drops when get_fut completes,
+        // not at outer-scope end after join) AND wrap with `WriteHalfGuard`
+        // owned by the future. The move alone is enough to break the
+        // deadlock (mpsc Sender drop wakes the receiver with a generic
+        // "Sender dropped" Internal); the guard upgrades that to a
+        // structured "WriteHalfGuard fired Drop fallback" Internal that
+        // operators can grep for to identify the missing-commit-site.
+        // See `WriteHalfGuard` rustdoc and the composability harness in
+        // `nativelink-store/tests/composability_test.rs`.
+        let get_fut = async move {
+            let mut tx = tx;
+            let mut tx_guard = WriteHalfGuard::new(&mut tx);
+            let res = self
+                .inner_store
+                .get_part(digest, &mut *tx_guard, 0, None)
+                .await;
+            tx_guard.commit_delegated_if_ok(&res);
+            res
+        };
         let check_fut = self.inner_check_get_part(
             writer,
             rx,

@@ -374,91 +374,59 @@ impl DropCloserWriteHalf {
     }
 }
 
-/// RAII guard that enforces the "every exit path of a `*Store::get_part`-style
-/// function MUST terminate the borrowed writer" contract at the type level.
+/// RAII guard enforcing that every exit of a `*Store::get_part`-style function
+/// terminates its borrowed writer. Without termination, a wrapping layer that
+/// joins two futures over a borrowed channel (e.g. [`crate::buf_channel`] tx/rx
+/// inside `VerifyStore::get_part`) deadlocks because the receiver never observes
+/// EOF or an error. The guard fires a synthesized Internal error from `Drop`
+/// when the owning function returns without explicitly committing, breaking
+/// that deadlock class at the type level.
 ///
-/// ## Why this exists (verbatim from the bug it prevents)
+/// ## Verbs
+/// - [`commit_eof`](Self::commit_eof): happy path — send EOF, suppress Drop.
+/// - [`commit_delegated`](Self::commit_delegated): suppress Drop because a
+///   sub-call (e.g. `inner.get_part(&mut *guard, ...)`) already terminated
+///   the writer.
+/// - [`fail`](Self::fail): explicit failure — send `err`, suppress Drop, return
+///   the same `Error` for `return Err(guard.fail(err));`.
+/// - [`commit_delegated_if_ok`](Self::commit_delegated_if_ok): conditional
+///   variant for `let res = sub.get_part(&mut *guard, ...).await; guard.commit_delegated_if_ok(&res); res?;`.
+///   On Err the Drop fallback still fires, catching sub-store contract
+///   violations (a sub-store that returns Err WITHOUT terminating the writer).
 ///
-/// When a store's `get_part` / `update` writes into a `&mut DropCloserWriteHalf`
-/// borrowed from a wrapping layer (e.g. `VerifyStore::get_part`'s
-/// `tokio::join!(get_fut, check_fut)` over a freshly-built `tx`/`rx` pair), the
-/// wrapping layer's `check_fut` blocks on `rx.recv().await`. If the inner
-/// `get_part` returns `Err(...)` early WITHOUT first calling `writer.send_eof()`
-/// or `writer.send_error(err)`, the wrapping `tx` (owned by the wrapper's outer
-/// scope) is never closed — `check_fut` blocks forever and `tokio::join!`
-/// deadlocks. Bazel builds wedge for hours.
+/// ## Where to apply this guard
 ///
-/// Manual discipline (`writer.send_error(err.clone()); return Err(err);` at
-/// every callsite) is fragile: between 2026-04-24 and 2026-04-25, FIVE separate
-/// omissions of this pair shipped to production across THREE deploys, all
-/// passing reviewer eyes because each callsite looked correct in isolation.
-///
-/// ## How it solves the problem
-///
-/// `WriteHalfGuard` wraps `&mut DropCloserWriteHalf` and tracks whether the
-/// owning function has explicitly committed a terminal state (EOF or error).
-/// On `Drop` (which fires unconditionally on every exit path — `?` propagation,
-/// explicit `return`, panic), if the function did NOT commit, the guard calls
-/// `writer.send_error(synthesized)` so the paired reader is unblocked.
-///
-/// The guard derefs to the inner writer, so all existing `writer.send(...)`,
-/// `writer.send_eof()`, `writer.borrow_mut()`, `&mut *writer` callers continue
-/// to compile unchanged. New verbs:
-///   - [`WriteHalfGuard::commit_eof`] — happy path: send EOF + suppress Drop fallback
-///   - [`WriteHalfGuard::commit_already_terminated`] — sub-call already terminated
-///     the writer (e.g. delegated to `slow_store.get_part(&mut *writer, ...)`);
-///     just suppress the Drop fallback
-///   - [`WriteHalfGuard::fail`] — explicit failure: send `err` + suppress Drop fallback
-///     and return the same `Error` for use in `return Err(guard.fail(err));`
-///
-/// ## Why Option A (RAII guard) over alternatives
-///
-/// Considered alternatives (see commit message and PR discussion):
-/// - **Modify `DropCloserWriteHalf::Drop` to auto-`send_error`**: too broad. Many
-///   producers across the codebase intentionally rely on the existing "Sender
-///   dropped before sending EOF" Internal-error fallback as a signal of producer
-///   bug; flipping that semantics for ALL writers would mask real bugs in
-///   unrelated paths.
-/// - **Combinator `with_writer_termination(writer, async move { ... })`**:
-///   requires the function body to be a captured closure, fights the borrow
-///   checker on `Pin<&Self>` trait methods, and forces every existing
-///   `&mut *writer` reborrow to thread through the closure's environment.
-/// - **Macro that wraps every `return`**: relies on author discipline at every
-///   callsite — exactly the failure mode we're trying to eliminate.
-///
-/// Option A (this implementation) keeps the surface area minimal, maps to the
-/// canonical Rust "Drop must do something unless explicitly committed" pattern,
-/// and is compile-time-impossible to bypass on `?` propagation.
+/// The guard MUST be applied at the layer that joins a future over a
+/// borrowed `&mut writer` with another future over the paired `rx` (e.g.
+/// `VerifyStore::get_part`'s `tokio::join!(get_fut, check_fut)`). Sub-stores
+/// called as fall-throughs (e.g. `MemoryStore` inside `FastSlowStore::get_part`'s
+/// "try fast then slow" pattern) MUST NOT add their own guard — doing so fires
+/// `send_error` on a borrowed writer that the WRAPPER expected to be untouched
+/// for the slow-store fallback. The guard belongs on the WRAPPER's local
+/// channel pair, not on every leaf store.
 ///
 /// ## Usage
 ///
 /// ```ignore
-/// async fn get_part(
-///     self: Pin<&Self>,
-///     key: StoreKey<'_>,
-///     writer: &mut DropCloserWriteHalf,
-///     offset: u64,
-///     length: Option<u64>,
-/// ) -> Result<(), Error> {
-///     let mut guard = WriteHalfGuard::new(writer);
-///     // ... arbitrary work, including `?` propagation ...
-///     if some_failure {
-///         return Err(guard.fail(make_err!(Code::NotFound, "not here")));
-///     }
-///     // Delegated to a sub-call that terminates the writer itself:
-///     self.inner.get_part(key, &mut *guard, offset, length).await?;
-///     guard.commit_already_terminated();
-///     Ok(())
-///     // Or, on a happy path that produced bytes itself:
-///     // guard.commit_eof()?;
-///     // Ok(())
-/// }
+/// // Inside VerifyStore::get_part (the wrapper):
+/// let (mut tx, rx) = make_buf_channel_pair();
+/// let get_fut = async move {
+///     // Move tx INTO the future so the guard drops the moment get_fut
+///     // finishes — without this, the guard waits on the outer scope and
+///     // the joined check_fut blocks forever on the never-closed rx.
+///     let mut tx = tx;
+///     let mut guard = WriteHalfGuard::new(&mut tx);
+///     let res = inner_store.get_part(key, &mut *guard, offset, length).await;
+///     guard.commit_delegated_if_ok(&res);
+///     res
+/// };
+/// let check_fut = self.check_get_part(writer, rx, ...);
+/// let (get_res, check_res) = tokio::join!(get_fut, check_fut);
 /// ```
 ///
-/// If neither `commit_eof`, `commit_already_terminated`, nor `fail` is called
-/// before the guard drops (e.g. early `return Err(...)` via `?`), the Drop
-/// impl unblocks the reader by sending a synthesized Internal error.
-#[must_use = "WriteHalfGuard MUST be committed (commit_eof / commit_already_terminated / fail) \
+/// See `nativelink-store/src/verify_store.rs::get_part` and the composability
+/// harness in `nativelink-store/tests/composability_test.rs`.
+#[must_use = "WriteHalfGuard MUST be committed (commit_eof / commit_delegated / fail) \
               before the function returns Ok; otherwise Drop fires the synthesized fallback error"]
 #[derive(Debug)]
 pub struct WriteHalfGuard<'a> {
@@ -467,12 +435,9 @@ pub struct WriteHalfGuard<'a> {
 }
 
 impl<'a> WriteHalfGuard<'a> {
-    /// Wraps a borrowed writer in a termination guard. Until one of
-    /// [`commit_eof`](Self::commit_eof),
-    /// [`commit_already_terminated`](Self::commit_already_terminated), or
-    /// [`fail`](Self::fail) is called, the guard's `Drop` will terminate the
-    /// writer with a synthesized Internal error so paired readers (e.g.
-    /// `VerifyStore`'s `tokio::join!` over a tx/rx pair) cannot deadlock.
+    /// Wraps a borrowed writer in a termination guard. The `Drop` fallback
+    /// fires `send_error(synthesized)` unless one of `commit_eof`,
+    /// `commit_delegated`, `commit_delegated_if_ok`, or `fail` is called first.
     pub fn new(writer: &'a mut DropCloserWriteHalf) -> Self {
         Self {
             writer,
@@ -482,46 +447,56 @@ impl<'a> WriteHalfGuard<'a> {
 
     /// Happy-path commit: send EOF and suppress the Drop fallback.
     ///
-    /// Returns the underlying `send_eof` Result so the caller can `?`-propagate
-    /// the rare case where EOF cannot be delivered (channel already closed by
-    /// the receiver). The guard is marked committed regardless — the receiver
-    /// is observably terminated by the closed `tx`, and a Drop-time
-    /// `send_error` after a failed `send_eof` would be a no-op anyway.
+    /// Returns the `send_eof` Result so the caller can `?`-propagate the rare
+    /// case where the channel is already closed. The guard is marked committed
+    /// regardless — a Drop-time `send_error` after a failed `send_eof` would
+    /// be a no-op on the closed channel anyway.
+    #[must_use = "the EOF Result indicates whether the receiver was still listening; \
+                  ignoring it loses the diagnostic for downstream cancellation"]
     pub fn commit_eof(&mut self) -> Result<(), Error> {
         self.committed = true;
         self.writer.send_eof()
     }
 
-    /// Suppress the Drop fallback when a sub-call has already terminated the
-    /// writer (e.g. the function delegated to `inner.get_part(&mut *guard, ...)`
-    /// and the inner store sent its own EOF or `send_error`).
-    ///
-    /// Use this on paths where you know the sub-call's contract guarantees
-    /// termination on every exit (Ok or Err). Most existing `*Store::get_part`
-    /// implementations satisfy this contract — but if you're not sure, prefer
-    /// `commit_eof()` after a redundant explicit `send_eof` on Ok, and let
-    /// the Drop fallback handle Err.
-    pub fn commit_already_terminated(&mut self) {
+    /// Suppress the Drop fallback because a sub-call already terminated the
+    /// writer (e.g. `inner.get_part(&mut *guard, ...)` sent its own EOF or
+    /// `send_error`). Use only when the sub-call's contract guarantees
+    /// termination on every exit; otherwise prefer
+    /// [`commit_delegated_if_ok`](Self::commit_delegated_if_ok), which leaves
+    /// the Drop fallback armed on Err and catches sub-store contract
+    /// violations.
+    pub fn commit_delegated(&mut self) {
         self.committed = true;
     }
 
-    /// Explicit failure commit: terminate the writer with `err` and return
-    /// the same `Error` so the caller can `return Err(guard.fail(err));`.
+    /// Conditional delegated commit: suppress the Drop fallback only if the
+    /// sub-call's `Result` is `Ok`. On `Err` the fallback stays armed, so a
+    /// sub-store that returned an error WITHOUT calling `send_error` (a
+    /// contract violation) is caught by the synthesized Internal at Drop time
+    /// rather than silently producing a deadlocked paired reader.
     ///
-    /// The receiver's next `recv()` returns the structured `err` (via the
-    /// `terminal_error` slot) instead of the generic "Sender dropped before
-    /// sending EOF" Internal that would fire if the writer were merely
-    /// dropped. This is the preferred verb when the function knows the
-    /// concrete error to propagate; the Drop fallback is the safety net for
-    /// paths that overlook termination.
+    /// ```ignore
+    /// let res = self.slow_store.get_part(key, &mut *guard, offset, length).await;
+    /// guard.commit_delegated_if_ok(&res);
+    /// res?;
+    /// ```
+    pub fn commit_delegated_if_ok<T, E>(&mut self, res: &Result<T, E>) {
+        if res.is_ok() {
+            self.committed = true;
+        }
+    }
+
+    /// Explicit failure commit: terminate the writer with `err` and return it
+    /// unchanged for `return Err(guard.fail(err));`. The receiver's next
+    /// `recv()` observes the structured `err` rather than the generic
+    /// "Sender dropped" Internal that the bare-Drop fallback would emit.
     pub fn fail(&mut self, err: Error) -> Error {
         self.committed = true;
         self.writer.send_error(err.clone());
         err
     }
 
-    /// Returns the number of bytes written so far. Convenience accessor that
-    /// avoids dereferencing the guard explicitly. Equivalent to
+    /// Returns the number of bytes written so far. Equivalent to
     /// `(*guard).get_bytes_written()`.
     #[must_use]
     pub const fn get_bytes_written(&self) -> u64 {
@@ -558,9 +533,9 @@ impl Drop for WriteHalfGuard<'_> {
         let synthesized = make_err!(
             Code::Internal,
             "WriteHalfGuard fired Drop fallback: function exited without explicit \
-             commit_eof / commit_already_terminated / fail. This is a bug — the \
-             owning function returned without terminating the writer, which would \
-             have deadlocked any paired reader. The Drop fallback unblocked the \
+             commit_eof / commit_delegated / fail. This is a bug — the owning \
+             function returned without terminating the writer, which would have \
+             deadlocked any paired reader. The Drop fallback unblocked the \
              reader, but the underlying logic error should be fixed."
         );
         self.writer.send_error(synthesized);
@@ -941,7 +916,7 @@ mod diag_tests {
     /// handler, `tokio::spawn` worker, etc.), so this is the realistic
     /// path.
     /// Spec: dropping a `WriteHalfGuard` without calling
-    /// `commit_eof` / `commit_already_terminated` / `fail` MUST terminate the
+    /// `commit_eof` / `commit_delegated` / `fail` MUST terminate the
     /// underlying writer with a synthesized Internal error so a paired reader
     /// unblocks. This is the contract the guard exists to enforce — without
     /// it, the producer-deadlock class of bug ships every time someone
@@ -953,7 +928,7 @@ mod diag_tests {
         // exits without committing. Lifetime block forces Drop.
         {
             let _guard = WriteHalfGuard::new(&mut tx);
-            // No commit_eof, no commit_already_terminated, no fail.
+            // No commit_eof, no commit_delegated, no fail.
         }
         let recv_result = rx.recv().await;
         let err = recv_result.expect_err(
@@ -1007,22 +982,117 @@ mod diag_tests {
         );
     }
 
-    /// Spec: `commit_already_terminated()` MUST suppress the Drop fallback
-    /// without further interacting with the writer. Used when a sub-call has
-    /// already terminated the writer (e.g. by sending its own EOF or error)
-    /// — firing a second Drop fallback would corrupt the receiver's state.
+    /// Spec: `commit_delegated()` MUST suppress the Drop fallback without
+    /// further interacting with the writer. Used when a sub-call has already
+    /// terminated the writer (e.g. by sending its own EOF or error) — firing
+    /// a second Drop fallback would corrupt the receiver's state.
     #[tokio::test]
-    async fn write_half_guard_commit_already_terminated_does_not_double_terminate() {
+    async fn write_half_guard_commit_delegated_does_not_double_terminate() {
         let (mut tx, mut rx) = make_buf_channel_pair();
         {
             let mut guard = WriteHalfGuard::new(&mut tx);
             // Pretend a sub-call sent EOF.
             guard.send_eof().expect("send_eof must succeed");
             // Now mark committed without sending another terminator.
-            guard.commit_already_terminated();
+            guard.commit_delegated();
         }
         let chunk = rx.recv().await.expect("clean EOF must surface as Ok(empty)");
         assert!(chunk.is_empty(), "expected EOF (empty bytes), got: {} bytes", chunk.len());
+    }
+
+    /// Spec: `commit_delegated_if_ok(&Ok(()))` MUST suppress the Drop fallback;
+    /// `commit_delegated_if_ok(&Err(...))` MUST leave it armed so a sub-store
+    /// contract violation (returned Err without `send_error`-ing the writer)
+    /// is caught by the synthesized Internal at Drop time.
+    #[tokio::test]
+    async fn write_half_guard_commit_delegated_if_ok_arms_drop_on_err() {
+        // Ok branch: clean EOF surfaces, no Drop fallback.
+        let (mut tx_ok, mut rx_ok) = make_buf_channel_pair();
+        {
+            let mut guard = WriteHalfGuard::new(&mut tx_ok);
+            guard.send_eof().expect("send_eof must succeed");
+            let res: Result<(), Error> = Ok(());
+            guard.commit_delegated_if_ok(&res);
+        }
+        let chunk = rx_ok.recv().await.expect("Ok branch must surface clean EOF");
+        assert!(chunk.is_empty(), "Ok branch expected EOF, got {} bytes", chunk.len());
+
+        // Err branch (sub-store contract violation: returned Err but never
+        // called send_error / send_eof on the writer). Drop fallback MUST fire.
+        let (mut tx_err, mut rx_err) = make_buf_channel_pair();
+        {
+            let mut guard = WriteHalfGuard::new(&mut tx_err);
+            // Sub-store "returned" Err WITHOUT terminating the writer:
+            let res: Result<(), Error> = Err(make_err!(Code::Internal, "sub-store err"));
+            guard.commit_delegated_if_ok(&res);
+            // guard drops here, uncommitted because res is Err -> Drop fires.
+        }
+        let err = rx_err
+            .recv()
+            .await
+            .expect_err("Err branch MUST surface Drop fallback (sub-store didn't terminate)");
+        assert_eq!(err.code, Code::Internal);
+        assert!(
+            err.messages
+                .iter()
+                .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
+            "Err branch MUST surface the synthesized Internal, got: {err:?}"
+        );
+    }
+
+    /// Spec: `commit_eof()` followed by `Drop` MUST produce exactly one
+    /// terminator — a clean EOF — never a clean EOF immediately followed by
+    /// the synthesized Internal. Without the `committed = true` flip in
+    /// `commit_eof`, the receiver would see EOF then a corrupting Internal.
+    #[tokio::test]
+    async fn commit_eof_then_drop_produces_exactly_one_terminator() {
+        let (mut tx, mut rx) = make_buf_channel_pair();
+        {
+            let mut guard = WriteHalfGuard::new(&mut tx);
+            guard.commit_eof().expect("send_eof must succeed on a fresh channel");
+            // guard drops here. If `committed = true` were not flipped, the
+            // Drop fallback would fire `send_error` on top of the EOF.
+        }
+        let chunk = rx.recv().await.expect("clean EOF must surface");
+        assert!(chunk.is_empty(), "first recv MUST be EOF, got {} bytes", chunk.len());
+        // Second recv: must be terminal-EOF (not an error). The contract is
+        // that EOF is final and idempotent.
+        let chunk2 = rx.recv().await.expect("post-EOF recv MUST stay EOF, not surface a synthesized Internal");
+        assert!(chunk2.is_empty(), "post-EOF recv MUST stay EOF, got {} bytes", chunk2.len());
+    }
+
+    /// Spec: dropping the guard while a `tx.send().await` is in flight (e.g.
+    /// the writer is mid-send and the holder of the guard panics or aborts)
+    /// MUST surface a coherent terminal error to the reader, not a partial
+    /// chunk followed by an unrelated Internal that mixes byte data with the
+    /// fallback message.
+    #[tokio::test]
+    async fn drop_during_active_send_does_not_corrupt_stream() {
+        let (mut tx, mut rx) = make_buf_channel_pair_with_size(1);
+        // Pre-fill the single slot so the next send would block.
+        tx.send(Bytes::from_static(b"first-chunk"))
+            .await
+            .expect("first send into 1-slot channel must succeed");
+        // Now drop the guard immediately. The Drop fallback fires
+        // send_error; the reader pulls the queued chunk, then must see
+        // either the synthesized Internal or a clean error — not a mash-up.
+        {
+            let _guard = WriteHalfGuard::new(&mut tx);
+            // No commit — Drop fires immediately on this scope exit.
+        }
+        let first = rx.recv().await.expect("first chunk must arrive intact");
+        assert_eq!(&first[..], b"first-chunk", "in-flight chunk MUST NOT be corrupted by Drop");
+        let err = rx
+            .recv()
+            .await
+            .expect_err("post-Drop recv MUST surface the synthesized Internal");
+        assert_eq!(err.code, Code::Internal, "post-Drop err.code MUST be Internal");
+        assert!(
+            err.messages
+                .iter()
+                .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
+            "post-Drop err MUST be the synthesized Internal, got: {err:?}"
+        );
     }
 
     #[tokio::test]
