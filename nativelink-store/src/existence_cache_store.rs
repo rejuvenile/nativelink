@@ -23,6 +23,19 @@ use tokio::sync::Notify;
 use tracing::{debug, error, info, trace};
 
 use nativelink_config::stores::{EvictionPolicy, ExistenceCacheSpec};
+
+// DEBUG INSTRUMENTATION (remove after wedge root cause confirmed):
+// Targets the cover.o wedge digest to expose which path repopulates
+// the existence cache for a blob the inner store does not actually have.
+const DEBUG_DIGEST_HASH_HEX: &str =
+    "3418dec2ac048e354993d688bc4cba02660d523f15a148f090a99f79d5adedaa";
+const DEBUG_DIGEST_SIZE: u64 = 1_726_208;
+
+#[inline]
+fn debug_digest_match(d: &DigestInfo) -> bool {
+    d.size_bytes() == DEBUG_DIGEST_SIZE
+        && format!("{d}").starts_with(DEBUG_DIGEST_HASH_HEX)
+}
 use nativelink_error::{Code, Error, ResultExt, error_if};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
@@ -98,6 +111,9 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheStore<I> {
         debug!(?store_key, "ExistenceCacheStore: eviction callback received");
         let digest = store_key.borrow().into_digest();
         Box::pin(async move {
+            if debug_digest_match(&digest) {
+                info!(?digest, source = "callback_inner_eviction", "DEBUG: ExistenceCacheStore removing wedge digest");
+            }
             let deleted_key = self.existence_cache.remove(&digest).await;
             if deleted_key {
                 debug!(?store_key, "ExistenceCacheStore: eviction callback removed key from cache");
@@ -209,7 +225,11 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
             let mut inserts = Vec::with_capacity(not_cached_keys.len());
             for (key, result) in not_cached_keys.iter().zip(inner_results.iter()) {
                 if let Some(size) = result {
-                    inserts.push((key.borrow().into_digest(), ExistenceItem(*size)));
+                    let digest = key.borrow().into_digest();
+                    if debug_digest_match(&digest) {
+                        info!(?digest, size = *size, source = "inner_has_with_results", "DEBUG: ExistenceCacheStore inserting wedge digest (inner.has returned Some)");
+                    }
+                    inserts.push((digest, ExistenceItem(*size)));
                 }
             }
             drop(self.existence_cache.insert_many(inserts).await);
@@ -280,6 +300,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 .await
                 .err_tip(|| "In ExistenceCacheStore::update")?;
             // Refresh the existence cache since we verified it exists.
+            if debug_digest_match(&digest) {
+                info!(?digest, size = exists[0].unwrap(), source = "update_refresh_after_inner_has_some", "DEBUG: ExistenceCacheStore inserting wedge digest (update path: inner says present)");
+            }
             let _ = self
                 .existence_cache
                 .insert(digest, ExistenceItem(exists[0].unwrap()))
@@ -287,6 +310,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             return Ok(());
         }
         // If the existence cache had a stale entry, remove it now.
+        if debug_digest_match(&digest) {
+            info!(?digest, source = "update_remove_stale", "DEBUG: ExistenceCacheStore removing wedge digest (update path: inner.has=None)");
+        }
         self.existence_cache.remove(&digest).await;
         // Track that an update is in progress. Eviction callbacks fire
         // normally (no queuing) — they just remove from the existence
@@ -331,6 +357,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 UploadSizeInfo::ExactSize(size) => size,
                 UploadSizeInfo::MaxSize(_) => digest.size_bytes(),
             };
+            if debug_digest_match(&digest) {
+                info!(?digest, size, source = "update_after_successful_write", "DEBUG: ExistenceCacheStore inserting wedge digest (update path: inner.update succeeded)");
+            }
             let _ = self
                 .existence_cache
                 .insert(digest, ExistenceItem(size))
@@ -358,6 +387,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             .err_tip(|| "In ExistenceCacheStore::update_oneshot")?;
         if exists[0].is_some() {
             // Blob genuinely exists in the inner store — safe to skip.
+            if debug_digest_match(&digest) {
+                info!(?digest, size = exists[0].unwrap(), source = "update_oneshot_refresh_after_inner_has_some", "DEBUG: ExistenceCacheStore inserting wedge digest (update_oneshot path: inner says present)");
+            }
             let _ = self
                 .existence_cache
                 .insert(digest, ExistenceItem(exists[0].unwrap()))
@@ -365,6 +397,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             return Ok(());
         }
         // If the existence cache had a stale entry, remove it now.
+        if debug_digest_match(&digest) {
+            info!(?digest, source = "update_oneshot_remove_stale", "DEBUG: ExistenceCacheStore removing wedge digest (update_oneshot path: inner.has=None)");
+        }
         self.existence_cache.remove(&digest).await;
 
         // Failpoint: simulate inner store oneshot write failure. Verifies
@@ -399,6 +434,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         }
         if result.is_ok() {
             trace!(?digest, "Inserting into existence cache via update_oneshot");
+            if debug_digest_match(&digest) {
+                info!(?digest, size, source = "update_oneshot_after_successful_write", "DEBUG: ExistenceCacheStore inserting wedge digest (update_oneshot path: inner.update_oneshot succeeded)");
+            }
             let _ = self
                 .existence_cache
                 .insert(digest, ExistenceItem(size))
@@ -434,6 +472,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             .await;
         match &result {
             Ok(()) => {
+                if debug_digest_match(&digest) {
+                    info!(?digest, size = digest.size_bytes(), source = "get_part_after_successful_inner", "DEBUG: ExistenceCacheStore inserting wedge digest (get_part path: inner.get_part succeeded)");
+                }
                 let _ = self
                     .existence_cache
                     .insert(digest, ExistenceItem(digest.size_bytes()))
@@ -447,6 +488,9 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 // fault), and OutOfRange (truncation). Transient codes
                 // (Unavailable, DeadlineExceeded, etc.) leave the cache
                 // alone — re-evicting on every blip would force re-uploads.
+                if debug_digest_match(&digest) {
+                    info!(?digest, code = ?err.code, source = "get_part_remove_unrecoverable", "DEBUG: ExistenceCacheStore removing wedge digest (get_part path: inner unrecoverable error)");
+                }
                 self.existence_cache.remove(&digest).await;
             }
             Err(_) => {}
@@ -470,10 +514,18 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         let mut removals = Vec::new();
         for (digest, result) in digests.iter().zip(results.iter()) {
             match result {
-                Ok(_) => inserts.push((*digest, ExistenceItem(digest.size_bytes()))),
+                Ok(_) => {
+                    if debug_digest_match(digest) {
+                        info!(?digest, size = digest.size_bytes(), source = "batch_get_part_unchunked_after_successful", "DEBUG: ExistenceCacheStore inserting wedge digest (batch_get_part_unchunked path)");
+                    }
+                    inserts.push((*digest, ExistenceItem(digest.size_bytes())));
+                }
                 Err(err) if is_unrecoverable_read_error(err.code) => {
                     // Same eviction policy as get_part: widen beyond just
                     // NotFound to include DataLoss / Internal / OutOfRange.
+                    if debug_digest_match(digest) {
+                        info!(?digest, code = ?err.code, source = "batch_get_part_unchunked_remove_unrecoverable", "DEBUG: ExistenceCacheStore removing wedge digest (batch_get_part_unchunked: unrecoverable)");
+                    }
                     removals.push(*digest);
                 }
                 Err(_) => {}

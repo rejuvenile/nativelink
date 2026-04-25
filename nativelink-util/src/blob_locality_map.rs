@@ -19,6 +19,20 @@ use std::time::Duration;
 
 use crate::common::DigestInfo;
 use parking_lot::RwLock;
+use tracing::info;
+
+// DEBUG INSTRUMENTATION (remove after wedge root cause confirmed):
+// Targets the cover.o wedge digest to expose every locality_map mutation
+// touching it (insert, evict, full-endpoint remove).
+const DEBUG_DIGEST_HASH_HEX: &str =
+    "3418dec2ac048e354993d688bc4cba02660d523f15a148f090a99f79d5adedaa";
+const DEBUG_DIGEST_SIZE: u64 = 1_726_208;
+
+#[inline]
+fn debug_digest_match(d: &DigestInfo) -> bool {
+    d.size_bytes() == DEBUG_DIGEST_SIZE
+        && format!("{d}").starts_with(DEBUG_DIGEST_HASH_HEX)
+}
 
 /// A hasher that uses the first 8 bytes of a DigestInfo's packed SHA-256 hash
 /// directly as the hash value. Since SHA-256 output is uniformly distributed,
@@ -234,10 +248,12 @@ impl BlobLocalityMap {
 
         for digest in digests {
             digest_set.insert(digest);
-            self.blobs
-                .entry(digest)
-                .or_default()
-                .insert(&ep);
+            let entry = self.blobs.entry(digest).or_default();
+            entry.insert(&ep);
+            if debug_digest_match(&digest) {
+                let endpoints: Vec<String> = entry.iter().map(|s| s.as_ref().to_string()).collect();
+                info!(?digest, %ep, after_endpoints = ?endpoints, "DEBUG: locality_map register_blobs_iter for wedge digest");
+            }
         }
     }
 
@@ -247,10 +263,20 @@ impl BlobLocalityMap {
             for digest in digests {
                 digest_set.remove(digest);
                 if let Some(endpoints) = self.blobs.get_mut(digest) {
+                    let before: Vec<String> = endpoints.iter().map(|s| s.as_ref().to_string()).collect();
                     endpoints.remove(endpoint);
+                    let after: Vec<String> = endpoints.iter().map(|s| s.as_ref().to_string()).collect();
+                    if debug_digest_match(digest) {
+                        info!(?digest, %endpoint, before_endpoints = ?before, after_endpoints = ?after, "DEBUG: locality_map evict_blobs for wedge digest");
+                    }
                     if endpoints.is_empty() {
                         self.blobs.remove(digest);
+                        if debug_digest_match(digest) {
+                            info!(?digest, "DEBUG: locality_map evict_blobs removed wedge digest entry entirely (no endpoints left)");
+                        }
                     }
+                } else if debug_digest_match(digest) {
+                    info!(?digest, %endpoint, "DEBUG: locality_map evict_blobs for wedge digest — no entry existed");
                 }
             }
             if digest_set.is_empty() {
@@ -264,9 +290,17 @@ impl BlobLocalityMap {
         if let Some(digests) = self.endpoint_blobs.remove(endpoint) {
             for digest in &digests {
                 if let Some(endpoints) = self.blobs.get_mut(digest) {
+                    let before: Vec<String> = endpoints.iter().map(|s| s.as_ref().to_string()).collect();
                     endpoints.remove(endpoint);
+                    let after: Vec<String> = endpoints.iter().map(|s| s.as_ref().to_string()).collect();
+                    if debug_digest_match(digest) {
+                        info!(?digest, %endpoint, before_endpoints = ?before, after_endpoints = ?after, "DEBUG: locality_map remove_endpoint touched wedge digest");
+                    }
                     if endpoints.is_empty() {
                         self.blobs.remove(digest);
+                        if debug_digest_match(digest) {
+                            info!(?digest, "DEBUG: locality_map remove_endpoint removed wedge digest entry entirely");
+                        }
                     }
                 }
             }
