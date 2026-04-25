@@ -1132,19 +1132,20 @@ fn assert_precondition_failure_for_digest(err: &Error, digest: DigestInfo) {
     );
 }
 
-/// Asserts that the worker-request, no-redirect NotFound path at
-/// `worker_proxy_store.rs:985` attaches a `PreconditionFailure` detail
-/// with the missing digest as `subject`. This is the path Bazel
-/// observes when a worker asks the server-side proxy for a blob the
-/// inner store doesn't have and the server refuses to redirect (to
-/// avoid the worker→server→worker redirect loop).
+/// Asserts that the worker-request NotFound path attaches a
+/// `PreconditionFailure` detail with the missing digest as `subject`.
+/// This is the path Bazel observes when a worker asks the server-side
+/// proxy for a blob that neither the inner store nor any peer in the
+/// locality map has — the server returns NotFound (instead of the
+/// REDIRECT_PREFIX response that fires when locality has at least one
+/// peer).
 #[nativelink_test]
 async fn worker_request_no_redirect_not_found_carries_precondition_detail() -> Result<(), Error> {
     let (proxy, _inner, _locality_map) = make_proxy_store();
     let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
 
-    // IS_WORKER_REQUEST=true with no locality entries → hits the
-    // construction site at line 985 directly.
+    // IS_WORKER_REQUEST=true with no locality entries → falls through
+    // the redirect-or-NotFound branch into the NotFound construction.
     let result = IS_WORKER_REQUEST
         .scope(true, proxy.get_part_unchunked(digest, 0, None))
         .await;
