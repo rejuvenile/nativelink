@@ -801,8 +801,15 @@ impl WorkerProxyStore {
             && digest.size_bytes() <= Self::MAX_CACHE_BLOB_SIZE;
 
         if !should_cache {
-            return peer_store
-                .get_part(key, &mut *writer, offset, length)
+            // Loop-terminator propagation: set IS_WORKER_REQUEST=true on
+            // peer→peer calls so the receiving worker enters responder
+            // mode (race_peers + IS_WORKER_REQUEST gate at top of
+            // `get_part`) and refuses to chain externally. This makes
+            // the user's invariant "workers NEVER try to satisfy a read
+            // from another host by issuing an external RPC" enforced
+            // at depth 1, not just bounded at depth 2.
+            return IS_WORKER_REQUEST
+                .scope(true, peer_store.get_part(key, &mut *writer, offset, length))
                 .await;
         }
 
@@ -813,11 +820,17 @@ impl WorkerProxyStore {
 
         // Run the peer's get_part concurrently with forwarding, because the
         // buf_channel has limited capacity and the producer will block if
-        // we don't consume data as it arrives.
+        // we don't consume data as it arrives. IS_WORKER_REQUEST=true
+        // propagates to the peer (loop-terminator: peer enters responder
+        // mode and won't chain).
         let owned_key = key.borrow().into_owned();
         let peer = peer_store.clone();
         let get_part_fut = async move {
-            peer.get_part(owned_key.borrow(), &mut proxy_tx, offset, length)
+            IS_WORKER_REQUEST
+                .scope(
+                    true,
+                    peer.get_part(owned_key.borrow(), &mut proxy_tx, offset, length),
+                )
                 .await
         };
 
@@ -1100,13 +1113,15 @@ impl WorkerProxyStore {
                 ));
             }
             // Server side: generate a single-hop redirect to peers in
-            // locality_map. Workers handle the redirect by calling
-            // `try_read_from_endpoints` which invokes
-            // `peer_store.get_part(...)` WITHOUT setting
-            // `IS_WORKER_REQUEST` (peers see is_worker=false → no further
-            // redirect generation). Combined with the responder-mode gate
-            // above (which makes worker-side responders return NotFound),
-            // chains terminate at depth 1.
+            // locality_map. The receiving worker handles the redirect by
+            // calling `try_read_from_endpoints` → `get_part_and_cache` →
+            // `peer.get_part(...)` WITH `IS_WORKER_REQUEST.scope(true, ...)`
+            // wrapping (added so the propagation reaches the next peer via
+            // `grpc_store.rs:827`'s `x-nativelink-worker` header). The
+            // peer's `WorkerProxyStore.get_part` top-of-function gate
+            // (race_peers && IS_WORKER_REQUEST) then enters responder
+            // mode and returns inner-only — no further peer chaining.
+            // Loop terminates at depth 1: server → worker.
             let peers: Vec<String> = self
                 .locality_map
                 .read()
@@ -2021,10 +2036,16 @@ impl StoreDriver for WorkerProxyStore {
                 .await
         });
 
-        // Spawn peer fetch.
+        // Spawn peer fetch with IS_WORKER_REQUEST=true so the peer enters
+        // responder mode and refuses to chain. Note: tokio::spawn does NOT
+        // inherit task-locals, so the scope must be set INSIDE the spawned
+        // task — outside the spawn is a no-op.
         let peer_handle: JoinHandle<Result<(), Error>> = tokio::spawn(async move {
-            peer_store
-                .get_part(peer_key.borrow(), &mut peer_tx, offset, length)
+            IS_WORKER_REQUEST
+                .scope(
+                    true,
+                    peer_store.get_part(peer_key.borrow(), &mut peer_tx, offset, length),
+                )
                 .await
         });
 
