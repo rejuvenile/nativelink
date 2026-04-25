@@ -64,6 +64,20 @@ pub struct ConnectWorkerRequest {
     /// / Example: "grpc://192.168.100.5:50081"
     #[prost(string, tag = "5")]
     pub cas_endpoint: ::prost::alloc::string::String,
+    /// / Process-lifetime identifier for this worker, generated fresh at
+    /// / process start and stable across reconnects within a single run.
+    /// / The scheduler uses this to detect a NEW process registering on
+    /// / a recycled CAS endpoint (e.g. after OOM / kill -9 / panic) and
+    /// / wipe its prior locality_map entries — those entries point to
+    /// / `mirror_blobs` that lived only in the dead process's memory.
+    /// /
+    /// / Backward compatibility: workers built before this field exists
+    /// / will leave it as the proto3 default `0`. The scheduler treats
+    /// / `0` as "always different" (conservative wipe on reconnect) so
+    /// / stale locality data from the old binary cannot survive.
+    /// / (#141: boot_epoch_id one-way wipe on worker restart)
+    #[prost(uint64, tag = "7")]
+    pub boot_epoch_id: u64,
 }
 /// / Per-digest info reported by workers in BlobsAvailableNotification.
 /// / The previous `last_access_timestamp` field has been retired now that the

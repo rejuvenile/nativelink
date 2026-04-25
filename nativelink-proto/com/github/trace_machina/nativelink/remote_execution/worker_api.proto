@@ -89,6 +89,20 @@ message ConnectWorkerRequest {
     /// Example: "grpc://192.168.100.5:50081"
     string cas_endpoint = 5;
 
+    /// Process-lifetime identifier for this worker, generated fresh at
+    /// process start and stable across reconnects within a single run.
+    /// The scheduler uses this to detect a NEW process registering on
+    /// a recycled CAS endpoint (e.g. after OOM / kill -9 / panic) and
+    /// wipe its prior locality_map entries — those entries point to
+    /// `mirror_blobs` that lived only in the dead process's memory.
+    ///
+    /// Backward compatibility: workers built before this field exists
+    /// will leave it as the proto3 default `0`. The scheduler treats
+    /// `0` as "always different" (conservative wipe on reconnect) so
+    /// stale locality data from the old binary cannot survive.
+    /// (#141: boot_epoch_id one-way wipe on worker restart)
+    uint64 boot_epoch_id = 7;
+
     reserved 4;
     reserved 6;
 }
