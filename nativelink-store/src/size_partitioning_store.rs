@@ -20,7 +20,7 @@ use bytes::Bytes;
 use nativelink_config::stores::SizePartitioningSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
     ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
@@ -131,23 +131,41 @@ impl StoreDriver for SizePartitioningStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        // Subordinate guard: SizePartitioningStore is a sequential
+        // delegation wrapper — exactly one inner store handles the call,
+        // and the inner is responsible for terminating the writer on its
+        // Ok path (it calls `commit_eof`). On the inner's Err, this layer
+        // must NOT call `send_error` because the outer wrapper (e.g.
+        // FastSlowStore wrapping this as fast_store) may legitimately
+        // fall through to a sibling store on the same writer. The
+        // subordinate guard provides the verb hygiene without the
+        // side-effect that would poison the fall-through.
+        let mut guard = WriteHalfGuard::new_subordinate(writer);
+
         let digest = match key {
             StoreKey::Digest(digest) => digest,
             other @ StoreKey::Str(_) => {
-                return Err(make_input_err!(
+                return Err(guard.fail(make_input_err!(
                     "SizePartitioningStore only supports Digest keys, got {other:?}"
-                ));
+                )));
             }
         };
-        if digest.size_bytes() < self.partition_size {
-            return self
-                .lower_store
-                .get_part(digest, writer, offset, length)
-                .await;
-        }
-        self.upper_store
-            .get_part(digest, writer, offset, length)
-            .await
+        let res = if digest.size_bytes() < self.partition_size {
+            self.lower_store
+                .get_part(digest, &mut *guard, offset, length)
+                .await
+        } else {
+            self.upper_store
+                .get_part(digest, &mut *guard, offset, length)
+                .await
+        };
+        // Inner store contract: on Ok the writer is EOF-terminated; on Err
+        // the writer is left in indeterminate state for the outer wrapper.
+        // The subordinate `commit_delegated_if_ok` is essentially cosmetic
+        // here (Drop is no-op already) but documents intent at the call
+        // site for future audits.
+        guard.commit_delegated_if_ok(&res);
+        res
     }
 
     async fn batch_get_part_unchunked(

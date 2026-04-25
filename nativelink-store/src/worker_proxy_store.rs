@@ -34,7 +34,7 @@ use nativelink_metric::{
 };
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::buf_channel::{
-    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
+    DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair,
 };
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
@@ -885,6 +885,14 @@ impl WorkerProxyStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        // Subordinate guard: WorkerProxyStore is a wrapper that may itself
+        // be wrapped (e.g. as the slow store of a FastSlowStore on the
+        // server CAS chain). Active Drop / fail would `send_error` on
+        // Err and poison the outer wrapper's fall-through. The outer
+        // wrapper's own active guard catches contract violations via
+        // `commit_delegated_if_ok(&res)`.
+        let mut guard = WriteHalfGuard::new_subordinate(writer);
+
         let digest = key.borrow().into_digest();
 
         // Only cache full-blob reads for blobs within the size limit.
@@ -900,9 +908,11 @@ impl WorkerProxyStore {
             // the user's invariant "workers NEVER try to satisfy a read
             // from another host by issuing an external RPC" enforced
             // at depth 1, not just bounded at depth 2.
-            return IS_WORKER_REQUEST
-                .scope(true, peer_store.get_part(key, &mut *writer, offset, length))
+            let res = IS_WORKER_REQUEST
+                .scope(true, peer_store.get_part(key, &mut *guard, offset, length))
                 .await;
+            guard.commit_delegated_if_ok(&res);
+            return res;
         }
 
         // Create an intermediate channel so we can tee the data to both the
@@ -936,11 +946,15 @@ impl WorkerProxyStore {
         };
 
         let mut total_bytes: u64 = 0;
+        // Reborrow the guard's writer for the forward_fut closure. The
+        // subordinate guard's Drop is no-op so the outer wrapper's
+        // fall-through (if any) is preserved when forward_fut returns Err.
+        let writer_for_forward = &mut *guard;
         let forward_fut = async {
             loop {
                 match proxy_rx.recv().await {
                     Ok(chunk) if chunk.is_empty() => {
-                        writer
+                        writer_for_forward
                             .send_eof()
                             .err_tip(|| "get_part_and_cache: forwarding EOF")?;
                         cache_tx
@@ -962,20 +976,20 @@ impl WorkerProxyStore {
                             // Drop the cache writer so the cache_write_fut finishes.
                             drop(cache_tx);
                             // Forward remaining data without caching.
-                            writer
+                            writer_for_forward
                                 .send(chunk)
                                 .await
                                 .err_tip(|| "get_part_and_cache: forwarding chunk")?;
                             loop {
                                 match proxy_rx.recv().await {
                                     Ok(c) if c.is_empty() => {
-                                        writer.send_eof().err_tip(
+                                        writer_for_forward.send_eof().err_tip(
                                             || "get_part_and_cache: forwarding EOF (no cache)",
                                         )?;
                                         return Ok::<(), Error>(());
                                     }
                                     Ok(c) => {
-                                        writer.send(c).await.err_tip(
+                                        writer_for_forward.send(c).await.err_tip(
                                             || "get_part_and_cache: forwarding chunk (no cache)",
                                         )?;
                                     }
@@ -987,7 +1001,7 @@ impl WorkerProxyStore {
                                 }
                             }
                         }
-                        writer
+                        writer_for_forward
                             .send(chunk)
                             .await
                             .err_tip(|| "get_part_and_cache: forwarding chunk")?;
@@ -1024,11 +1038,16 @@ impl WorkerProxyStore {
         if let Err(get_err) = get_part_result {
             // Peer's get_part errored — surface that. forward/cache
             // results are derivative and would only confuse the caller.
-            return Err(get_err);
+            // `guard.fail` is no-op for subordinate guard (does not
+            // poison the outer wrapper's fall-through writer); it just
+            // marks committed and returns the err unchanged.
+            return Err(guard.fail(get_err));
         }
         // Peer's get_part returned Ok. If forwarding failed (e.g.
         // caller's writer broken), propagate that error.
-        forward_result?;
+        if let Err(forward_err) = forward_result {
+            return Err(guard.fail(forward_err));
+        }
 
         // Log cache write result (non-fatal).
         match cache_result {
@@ -1049,6 +1068,11 @@ impl WorkerProxyStore {
             }
         }
 
+        // Happy path: forward_fut already sent EOF on the writer; signal
+        // delegated termination to the guard so the cosmetic-only Drop
+        // path stays consistent with the active-guard idiom used at
+        // wrapper layers.
+        guard.commit_delegated();
         Ok(())
     }
 
@@ -1374,17 +1398,22 @@ impl WorkerProxyStore {
         peer_endpoint: &Arc<str>,
         is_zero_blob: bool,
     ) -> Result<(), Error> {
+        // Subordinate guard: this helper writes to a borrowed writer that
+        // a wrapping layer owns; on Err, the wrapper may legitimately
+        // fall through. Active `send_error` would poison that path.
+        let mut guard = WriteHalfGuard::new_subordinate(writer);
+
         let peer_chunk = peer_rx.recv().await
             .err_tip(|| "WorkerProxyStore: peer recv after server failure/empty")?;
         if peer_chunk.is_empty() {
             if is_zero_blob {
-                writer.send_eof()
+                guard.commit_eof()
                     .err_tip(|| "WorkerProxyStore: peer EOF for zero-length blob")?;
                 return peer_handle.await
                     .map_err(|e| make_err!(Code::Internal, "peer task join: {e}"))?;
             }
             // Non-zero digest, no data from either racer — surface NotFound.
-            return Err(Error::not_found_with_detail(
+            return Err(guard.fail(Error::not_found_with_detail(
                 format!(
                     "WorkerProxyStore: both server and peer {} returned empty EOF for non-zero digest {:?} (size_bytes={})",
                     peer_endpoint,
@@ -1392,16 +1421,18 @@ impl WorkerProxyStore {
                     digest.size_bytes(),
                 ),
                 make_precondition_failure_any(*digest),
-            ));
+            )));
         }
         debug!(
             ?digest,
             endpoint = %peer_endpoint,
             "WorkerProxyStore: peer won race (server empty/failed)"
         );
-        writer.send(peer_chunk).await
+        guard.send(peer_chunk).await
             .err_tip(|| "WorkerProxyStore: sending peer fallback chunk")?;
-        Self::forward_racer("peer", writer, peer_rx, peer_handle).await
+        let res = Self::forward_racer("peer", &mut *guard, peer_rx, peer_handle).await;
+        guard.commit_delegated_if_ok(&res);
+        res
     }
 
     /// Peer racer either errored or returned an empty-EOF for a non-zero
@@ -1415,31 +1446,37 @@ impl WorkerProxyStore {
         digest: &DigestInfo,
         is_zero_blob: bool,
     ) -> Result<(), Error> {
+        // Subordinate guard: same fall-through-preservation rationale as
+        // `await_peer_after_empty_server`.
+        let mut guard = WriteHalfGuard::new_subordinate(writer);
+
         let server_chunk = server_rx.recv().await
             .err_tip(|| "WorkerProxyStore: server recv after peer failure/empty")?;
         if server_chunk.is_empty() {
             if is_zero_blob {
-                writer.send_eof()
+                guard.commit_eof()
                     .err_tip(|| "WorkerProxyStore: server EOF for zero-length blob")?;
                 return server_handle.await
                     .map_err(|e| make_err!(Code::Internal, "server task join: {e}"))?;
             }
-            return Err(Error::not_found_with_detail(
+            return Err(guard.fail(Error::not_found_with_detail(
                 format!(
                     "WorkerProxyStore: both peer and server returned empty EOF for non-zero digest {:?} (size_bytes={})",
                     digest,
                     digest.size_bytes(),
                 ),
                 make_precondition_failure_any(*digest),
-            ));
+            )));
         }
         debug!(
             ?digest,
             "WorkerProxyStore: server won race (peer empty/failed)"
         );
-        writer.send(server_chunk).await
+        guard.send(server_chunk).await
             .err_tip(|| "WorkerProxyStore: sending server fallback chunk")?;
-        Self::forward_racer("server", writer, server_rx, server_handle).await
+        let res = Self::forward_racer("server", &mut *guard, server_rx, server_handle).await;
+        guard.commit_delegated_if_ok(&res);
+        res
     }
 
     /// Mirror a blob to a random connected worker for OOM redundancy.

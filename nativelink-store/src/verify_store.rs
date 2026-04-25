@@ -162,6 +162,16 @@ impl VerifyStore {
         original_hash: &PackedHash,
         mut maybe_hasher: Option<&mut D>,
     ) -> Result<(), Error> {
+        // Subordinate guard: VerifyStore is itself a wrapper that may be
+        // wrapped further (e.g. an outer FastSlowStore on a non-default
+        // composition, or an ExistenceCacheStore in front of a custom
+        // VerifyStore-rooted chain). Active `send_error` from `fail` /
+        // Drop here would poison such an outer wrapper's fall-through.
+        // The outer wrapper's own active guard (or the bytestream
+        // server's tx-Move-Drop fallback when there is no outer wrapper)
+        // signals the receiver of the unfinished stream.
+        let mut guard = WriteHalfGuard::new_subordinate(writer);
+
         let mut sum_size: u64 = 0;
         loop {
             let chunk = rx
@@ -179,12 +189,12 @@ impl VerifyStore {
                             actual_size = sum_size,
                             "size mismatch on read in verify store"
                         );
-                        return Err(make_err!(
+                        return Err(guard.fail(make_err!(
                             Code::DataLoss,
                             "Expected size {} but got size {} on read",
                             expected_size,
                             sum_size
-                        ));
+                        )));
                     }
                 }
                 if let Some(hasher) = maybe_hasher.as_mut() {
@@ -197,14 +207,14 @@ impl VerifyStore {
                             %hash_result,
                             "hash mismatch on read in verify store"
                         );
-                        return Err(make_err!(
+                        return Err(guard.fail(make_err!(
                             Code::DataLoss,
                             "Hash mismatch on read: expected {original_hash} but got {hash_result}",
-                        ));
+                        )));
                     }
                 }
-                writer
-                    .send_eof()
+                guard
+                    .commit_eof()
                     .err_tip(|| "In verify_store::check_get_part sending eof")?;
                 break;
             }
@@ -212,7 +222,7 @@ impl VerifyStore {
             sum_size += chunk.len() as u64;
 
             // Hash while forwarding to the caller's writer.
-            let write_future = writer.send(chunk.clone());
+            let write_future = guard.send(chunk.clone());
 
             if let Some(hasher) = maybe_hasher.as_mut() {
                 hasher.update(chunk.as_ref());

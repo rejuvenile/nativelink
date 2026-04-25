@@ -22,7 +22,7 @@ use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
 use nativelink_config::stores::DedupSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::fastcdc::FastCDC;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
@@ -254,12 +254,22 @@ impl StoreDriver for DedupStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        // Subordinate guard: DedupStore is a wrapper that may itself be
+        // wrapped by a fall-through layer (e.g. FastSlowStore as fast or
+        // slow store, or a future composition). Active Drop / fail
+        // would `send_error` on Err and poison the outer fall-through.
+        // The inner stores are accessed via `get_part_unchunked` (own
+        // channel) and `content_store.get_part_unchunked` for content
+        // chunks — so this layer owns its own writer's terminal state on
+        // happy path (`commit_eof`) and propagates Err to the outer
+        // wrapper without side-effecting the borrowed writer.
+        let mut guard = WriteHalfGuard::new_subordinate(writer);
+
         // Special case for if a client tries to read zero bytes.
         if length == Some(0) {
-            writer
-                .send_eof()
-                .err_tip(|| "Failed to write EOF out from get_part dedup")?;
-            return Ok(());
+            return guard
+                .commit_eof()
+                .err_tip(|| "Failed to write EOF out from get_part dedup");
         }
         // First we need to download the index that contains where the individual parts actually
         // can be fetched from.
@@ -348,7 +358,7 @@ impl StoreDriver for DedupStore {
             if bytes_to_skip != 0 || data.len() > bytes_to_send {
                 data = data.slice(bytes_to_skip..end_pos);
             }
-            writer
+            guard
                 .send(data)
                 .await
                 .err_tip(|| "Failed to write data to get_part dedup")?;
@@ -357,8 +367,8 @@ impl StoreDriver for DedupStore {
         }
 
         // Finish our stream by writing our EOF and shutdown the stream.
-        writer
-            .send_eof()
+        guard
+            .commit_eof()
             .err_tip(|| "Failed to write EOF out from get_part dedup")?;
         Ok(())
     }

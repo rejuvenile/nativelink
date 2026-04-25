@@ -26,7 +26,7 @@ use nativelink_config::stores::CompressionSpec;
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
-    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
+    DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair,
 };
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::spawn;
@@ -424,11 +424,20 @@ impl StoreDriver for CompressionStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        // Subordinate guard: CompressionStore is a wrapper that may itself
+        // be wrapped by a fall-through layer (e.g. FastSlowStore as fast
+        // or slow store). Active Drop / fail would `send_error` on Err
+        // and poison the outer fall-through. The inner `tx`/`rx` pair
+        // owned by `get_part_fut` is self-cleaning — `tx` is moved into
+        // the spawn task and dropped on completion, which wakes the
+        // paired `rx` consume() in `read_fut` (no separate guard needed
+        // there, no deadlock class).
+        let mut guard = WriteHalfGuard::new_subordinate(writer);
+
         if is_zero_digest(key.borrow()) {
-            writer
-                .send_eof()
-                .err_tip(|| "Failed to send zero EOF in filesystem store get_part")?;
-            return Ok(());
+            return guard
+                .commit_eof()
+                .err_tip(|| "Failed to send zero EOF in compression store get_part");
         }
 
         let (tx, mut rx) = make_buf_channel_pair();
@@ -449,6 +458,11 @@ impl StoreDriver for CompressionStore {
                 Err(e) => Err(e),
             },
         );
+        // `read_fut` is the layer that writes uncompressed bytes to the
+        // outer borrowed writer. Capture `&mut *guard` so the verbs flow
+        // through without changing the join shape; the subordinate guard
+        // ensures Err exits do not poison the outer wrapper's fall-through.
+        let writer_for_read = &mut *guard;
         let read_fut = async move {
             let header = {
                 // Read header.
@@ -553,7 +567,7 @@ impl StoreDriver for CompressionStore {
                         );
                         if end_pos != start_pos {
                             // Make sure we don't send an EOF by accident.
-                            writer
+                            writer_for_read
                                 .send(uncompressed_data.freeze().slice(start_pos..end_pos))
                                 .await
                                 .err_tip(|| "Failed sending chunk in compression store")?;
@@ -623,7 +637,7 @@ impl StoreDriver for CompressionStore {
                 );
             }
 
-            writer
+            writer_for_read
                 .send_eof()
                 .err_tip(|| "Failed to send eof in compression store write")?;
             Ok(())

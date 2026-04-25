@@ -432,16 +432,86 @@ impl DropCloserWriteHalf {
 pub struct WriteHalfGuard<'a> {
     writer: &'a mut DropCloserWriteHalf,
     committed: bool,
+    /// True when constructed via [`Self::new_subordinate`]. Subordinate
+    /// guards never side-effect on the writer: `Drop` is a no-op (no
+    /// synthesized `send_error`), and `fail()` only marks committed
+    /// without sending the error. The owning wrapper layer's
+    /// non-subordinate guard is the single source of truth for writer
+    /// termination — necessary because a leaf store cannot know whether
+    /// its caller plans to fall through to a sibling store on Err.
+    subordinate: bool,
 }
 
 impl<'a> WriteHalfGuard<'a> {
     /// Wraps a borrowed writer in a termination guard. The `Drop` fallback
     /// fires `send_error(synthesized)` unless one of `commit_eof`,
     /// `commit_delegated`, `commit_delegated_if_ok`, or `fail` is called first.
+    ///
+    /// Use this in a layer that owns the deadlock risk — typically a
+    /// wrapping store that joins two futures over a borrowed channel pair
+    /// (`tokio::join!(get_fut, check_fut)` in `VerifyStore`,
+    /// `CompressionStore`, `WorkerProxyStore::get_part_and_cache`). The
+    /// active Drop fallback synthesises a structured Internal error so a
+    /// paired reader cannot block on `rx.recv().await` forever when a
+    /// sub-call returned Err without terminating the writer.
     pub fn new(writer: &'a mut DropCloserWriteHalf) -> Self {
         Self {
             writer,
             committed: false,
+            subordinate: false,
+        }
+    }
+
+    /// Variant for **leaf stores and non-deadlocking sub-callees** that
+    /// borrow a writer from a wrapper which already owns the deadlock-risk
+    /// guard. Constructed in the pre-committed state — the `Drop` fallback
+    /// is suppressed, and `fail()` does NOT call `send_error`. Provides
+    /// the same verb-style API (`commit_eof`, `commit_delegated`,
+    /// `commit_delegated_if_ok`, `fail`) for hygiene and consistency
+    /// without the side-effects that would poison the wrapper's
+    /// fall-through path.
+    ///
+    /// ## Why a no-op variant exists
+    ///
+    /// When a leaf store (e.g. `MemoryStore`) is wrapped by
+    /// `FastSlowStore`, FastSlowStore's "try fast then slow" pattern calls
+    /// `fast_store.get_part(&mut *outer_guard, ...)` and, on
+    /// NotFound-with-no-bytes-written, falls through to
+    /// `slow_store.get_part(&mut *outer_guard, ...)`. If the leaf's guard
+    /// fires `send_error` from Drop on the borrowed writer, `tx` is
+    /// dropped and `terminal_error` is set — the slow-store fallback's
+    /// `send` calls then fail with a broken-pipe error, even though the
+    /// slow_store has the data. The fall-through is poisoned.
+    ///
+    /// `new_subordinate` decouples the verb hygiene (clear `commit_eof`
+    /// at the success site, `fail` at error sites) from the side-effect
+    /// (Drop sends synthesized error). The wrapper's outer
+    /// `WriteHalfGuard::new` (active Drop) catches contract violations
+    /// at the wrapper level via `commit_delegated_if_ok(&res)` — keeping
+    /// the safety net armed exactly once, at the right layer.
+    ///
+    /// ## When to use which
+    ///
+    /// | Use | Constructor | Drop fallback | `fail` side-effect |
+    /// |-----|-------------|---------------|--------------------|
+    /// | Wrapper layer with `tokio::join!` over borrowed writer + internal channel | `new` | active | sends `err` |
+    /// | Wrapper layer with sequential delegation that does not fall through | `new` | active | sends `err` |
+    /// | Wrapper layer with sequential delegation that may fall through | `new` | active (caught by `commit_delegated_if_ok`) | n/a — use `commit_delegated_if_ok` |
+    /// | Leaf store (own-bytes producer) wrapped under FastSlowStore-style fall-through | `new_subordinate` | no-op | marks committed only |
+    ///
+    /// ## Independence from any specific wrapper
+    ///
+    /// The "wrapper guard catches contract violations" property holds
+    /// for ANY wrapper that uses `WriteHalfGuard::new` —
+    /// `VerifyStore`, `CompressionStore`, `WorkerProxyStore`,
+    /// `FastSlowStore`, `SizePartitioningStore`, `DedupStore`, or a
+    /// future composition. There is no dependency on a specific layer
+    /// (e.g. VerifyStore) being present.
+    pub fn new_subordinate(writer: &'a mut DropCloserWriteHalf) -> Self {
+        Self {
+            writer,
+            committed: true,
+            subordinate: true,
         }
     }
 
@@ -486,13 +556,23 @@ impl<'a> WriteHalfGuard<'a> {
         }
     }
 
-    /// Explicit failure commit: terminate the writer with `err` and return it
-    /// unchanged for `return Err(guard.fail(err));`. The receiver's next
-    /// `recv()` observes the structured `err` rather than the generic
-    /// "Sender dropped" Internal that the bare-Drop fallback would emit.
+    /// Explicit failure commit. Returns the `err` unchanged so callers can
+    /// write `return Err(guard.fail(err));`.
+    ///
+    /// Behaviour depends on the constructor:
+    /// - `new` (active): calls `writer.send_error(err.clone())` so the
+    ///   paired reader observes the structured `err` rather than the
+    ///   generic "Sender dropped" Internal a bare-Drop fallback would emit.
+    /// - `new_subordinate` (no-op): only marks committed; does NOT call
+    ///   `send_error`. A leaf store cannot terminate a borrowed writer
+    ///   without poisoning a wrapping layer's fall-through path (e.g.
+    ///   FastSlowStore's "try fast then slow"). The wrapper's outer
+    ///   active guard catches the contract via `commit_delegated_if_ok(&res)`.
     pub fn fail(&mut self, err: Error) -> Error {
         self.committed = true;
-        self.writer.send_error(err.clone());
+        if !self.subordinate {
+            self.writer.send_error(err.clone());
+        }
         err
     }
 
@@ -1092,6 +1172,101 @@ mod diag_tests {
                 .iter()
                 .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
             "post-Drop err MUST be the synthesized Internal, got: {err:?}"
+        );
+    }
+
+    /// Spec: `WriteHalfGuard::new_subordinate` MUST NOT side-effect the
+    /// writer in `Drop` — leaf stores rely on this so that a wrapping
+    /// layer's fall-through path (e.g. `FastSlowStore`'s "try fast then
+    /// slow") sees the writer in its original state when the leaf returns
+    /// Err. If Drop fired `send_error`, the slow-store fallback's `send`
+    /// would fail with broken-pipe even though the slow store has the
+    /// data. Mutation point: removing `committed: true` from
+    /// `new_subordinate` MUST make this test fail (the receiver would
+    /// observe the synthesized Internal instead of "no terminator").
+    #[tokio::test]
+    async fn new_subordinate_drop_is_noop() {
+        let (mut tx, mut rx) = make_buf_channel_pair();
+        // Lifetime block forces Drop on the subordinate guard. No commit.
+        {
+            let _guard = WriteHalfGuard::new_subordinate(&mut tx);
+        }
+        // The subordinate guard must NOT have terminated the writer.
+        // tx is still alive (held by `tx`, not the guard), so the receiver
+        // should NOT have observed any terminator yet. Write something to
+        // confirm the writer is still usable.
+        tx.send(Bytes::from_static(b"after-subordinate-drop"))
+            .await
+            .expect(
+                "subordinate Drop MUST NOT terminate the writer — \
+                 send after Drop must succeed",
+            );
+        let chunk = rx.recv().await.expect("post-subordinate-drop recv must see the chunk");
+        assert_eq!(
+            &chunk[..],
+            b"after-subordinate-drop",
+            "subordinate Drop must not corrupt the channel state",
+        );
+    }
+
+    /// Spec: `WriteHalfGuard::new_subordinate(...).fail(err)` MUST NOT call
+    /// `writer.send_error`. The leaf is allowed to surface a structured
+    /// error via Result, but the wrapper's outer guard owns termination —
+    /// calling send_error here would poison the wrapper's fall-through.
+    /// Mutation point: removing the `if !self.subordinate` check in `fail()`
+    /// MUST make this test fail.
+    #[tokio::test]
+    async fn new_subordinate_fail_does_not_send_error() {
+        let (mut tx, mut rx) = make_buf_channel_pair();
+        let returned_err = {
+            let mut guard = WriteHalfGuard::new_subordinate(&mut tx);
+            guard.fail(make_err!(Code::NotFound, "leaf-level not found"))
+        };
+        assert_eq!(
+            returned_err.code,
+            Code::NotFound,
+            "fail() MUST return the err unchanged for `return Err(guard.fail(err));`",
+        );
+        // The writer was NOT terminated — confirm by sending another chunk.
+        tx.send(Bytes::from_static(b"after-subordinate-fail"))
+            .await
+            .expect(
+                "subordinate fail() MUST NOT terminate the writer — \
+                 a wrapping fall-through layer must still be able to send",
+            );
+        let chunk = rx
+            .recv()
+            .await
+            .expect("post-subordinate-fail recv must see the post-fail chunk");
+        assert_eq!(
+            &chunk[..],
+            b"after-subordinate-fail",
+            "subordinate fail() must not poison the channel for the wrapping fall-through",
+        );
+    }
+
+    /// Spec: `WriteHalfGuard::new_subordinate(...).commit_eof()` MUST still
+    /// send the EOF on the writer — leaf-level happy paths (e.g. MemoryStore
+    /// finished sending all chunks) genuinely terminate the channel cleanly,
+    /// and the wrapper's outer `commit_delegated` correctly observes that
+    /// EOF and suppresses its own Drop fallback. Without this, EOF would
+    /// be silently dropped and the wrapper's `commit_delegated_if_ok(&Ok(()))`
+    /// would still suppress Drop, leaving the channel un-terminated.
+    #[tokio::test]
+    async fn new_subordinate_commit_eof_still_sends_eof() {
+        let (mut tx, mut rx) = make_buf_channel_pair();
+        {
+            let mut guard = WriteHalfGuard::new_subordinate(&mut tx);
+            guard.commit_eof().expect("send_eof must succeed on a fresh channel");
+        }
+        let chunk = rx
+            .recv()
+            .await
+            .expect("subordinate commit_eof MUST surface a clean EOF");
+        assert!(
+            chunk.is_empty(),
+            "expected EOF (empty bytes), got: {} bytes",
+            chunk.len(),
         );
     }
 
