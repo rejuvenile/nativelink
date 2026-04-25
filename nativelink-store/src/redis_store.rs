@@ -73,7 +73,7 @@ const DEFAULT_READ_CHUNK_SIZE: usize = 64 * 1024;
 
 /// The default size of the connection pool if not specified.
 /// Note: If this changes it should be updated in the config documentation.
-const DEFAULT_CONNECTION_POOL_SIZE: usize = 3;
+pub const DEFAULT_CONNECTION_POOL_SIZE: usize = 3;
 
 /// The default delay between retries if not specified.
 /// Note: If this changes it should be updated in the config documentation.
@@ -613,6 +613,18 @@ where
     // Only used by tests, because we need to make a real redis connection, then fix this to get fixed values
     pub fn replace_temp_name_generator(&mut self, replacement: fn() -> String) {
         self.temp_name_generator_fn = replacement;
+    }
+}
+
+impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
+    /// Test/observability helper: returns the size of the underlying
+    /// connection pool. The store exposes this so callers can verify
+    /// `set_spec_defaults` produced the right pool size end-to-end (the
+    /// only path that fills `connection_pool_size` when the spec value
+    /// was 0). Hot-path callers should NOT use this in steady state — the
+    /// pool size is fixed at construction.
+    pub fn connection_manager_pool_size(&self) -> usize {
+        self.connection_manager.pool_size()
     }
 }
 

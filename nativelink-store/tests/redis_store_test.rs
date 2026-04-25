@@ -28,8 +28,9 @@ use nativelink_redis_tester::{
 };
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
 use nativelink_store::redis_store::{
-    ClusterRedisManager, DEFAULT_MAX_CHUNK_UPLOADS_PER_UPDATE, DEFAULT_MAX_COUNT_PER_CURSOR,
-    LUA_VERSION_SET_SCRIPT, RedisStore, RedisSubscriptionManager, StandardRedisManager,
+    ClusterRedisManager, DEFAULT_CONNECTION_POOL_SIZE, DEFAULT_MAX_CHUNK_UPLOADS_PER_UPDATE,
+    DEFAULT_MAX_COUNT_PER_CURSOR, LUA_VERSION_SET_SCRIPT, RedisStore, RedisSubscriptionManager,
+    StandardRedisManager,
 };
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
@@ -1433,56 +1434,106 @@ async fn connection_pool_size_creates_n_connections() -> Result<(), Error> {
     Ok(())
 }
 
+/// `set_spec_defaults` is the only path that fills `connection_pool_size`
+/// when callers pass a bare 0 (the serde default for absent fields). This
+/// test exercises the FULL default chain: build a `RedisSpec` with
+/// `connection_pool_size: 0`, run it through `RedisStore::new_standard`,
+/// and assert the resulting manager's pool reflects `DEFAULT_CONNECTION_POOL_SIZE`.
+///
+/// Mutation: change `set_spec_defaults` to default to 1 (or 7, or 99) and
+/// this test must fail with the actual vs expected pool size. The previous
+/// version of this test asserted `new_with_pool_size(_, 3)` produces 3,
+/// which is identical to test #1 and would silently pass any wrong default.
 #[nativelink_test]
-async fn connection_pool_size_default_3() -> Result<(), Error> {
-    // The default-fill happens in RedisStore::set_spec_defaults — verifying
-    // here that the constructor honors a passed-in 3 (which is what
-    // set_spec_defaults rewrites a bare 0 to).
-    let manager =
-        StandardRedisManager::new_with_pool_size(pool_connect_func(), 3).await?;
+async fn pool_size_default_applied_when_spec_value_is_zero() -> Result<(), Error> {
+    let port = make_fake_redis().await;
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        // Explicit 0 — set_spec_defaults must rewrite to DEFAULT_CONNECTION_POOL_SIZE.
+        connection_pool_size: 0,
+        ..Default::default()
+    };
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("pool default test must not deadlock — set_spec_defaults contract")
+        .expect("Working spec");
+    let actual_pool = store.connection_manager_pool_size();
     assert_eq!(
-        manager.pool_size(),
-        3,
-        "default pool_size of 3 should produce 3 slots"
+        actual_pool, DEFAULT_CONNECTION_POOL_SIZE,
+        "set_spec_defaults must rewrite pool_size=0 to DEFAULT_CONNECTION_POOL_SIZE \
+         ({DEFAULT_CONNECTION_POOL_SIZE}); got {actual_pool}"
     );
     Ok(())
 }
 
+/// `set_spec_defaults` rewrites 0 -> DEFAULT_CONNECTION_POOL_SIZE before
+/// calling new_with_pool_size, so production never reaches here with
+/// pool_size=0. But defense-in-depth: a 0 must clamp to >=1, never
+/// panic with "div by zero" inside `pick_slot`.
+///
+/// Mutation: move the `pool_size.max(1)` clamp inside `Vec::with_capacity`
+/// only and leave `pick_slot`'s modulo unchanged. Construction would still
+/// succeed, but the `pick_slot()` call below would panic with "attempt to
+/// calculate the remainder with a divisor of zero" — caught by this test.
 #[nativelink_test]
 async fn connection_pool_size_zero_uses_at_least_one() -> Result<(), Error> {
-    // `set_spec_defaults` rewrites 0 -> DEFAULT_CONNECTION_POOL_SIZE before
-    // calling new_with_pool_size, so production never reaches here with
-    // pool_size=0. But defense-in-depth: a 0 must clamp to >=1, never
-    // panic with "div by zero" inside `pick_slot`.
-    let manager =
-        StandardRedisManager::new_with_pool_size(pool_connect_func(), 0).await?;
+    let manager = timeout(
+        Duration::from_secs(5),
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), 0),
+    )
+    .await
+    .expect("clamp test must not deadlock — new_with_pool_size contract")?;
     assert!(
         manager.pool_size() >= 1,
         "pool_size(0) must clamp to >=1 to avoid % 0 panic in pick_slot, got {}",
         manager.pool_size()
     );
+    // CRITICAL: actually exercise pick_slot to defend against a regression
+    // where the clamp is in `new_with_pool_size` but `pick_slot` keeps the
+    // raw `pool_size: 0` (would panic on `% 0`).
+    let _ = manager.pick_slot();
     Ok(())
 }
 
+/// Asserts (a) every slot in a 5-slot pool is served at least once across 100
+/// picks AND (b) the per-pick sequence is *exactly* `(prev + 1) % pool_size`.
+/// The (b) assertion is what locks down round-robin specifically — a mutation
+/// to `pick_slot → fastrand::usize(0..pool_size)` (random rather than RR)
+/// would still produce a roughly uniform distribution that passed the loose
+/// ±5 tolerance check, but would fail (b) on the very first non-monotone
+/// pick.
+///
+/// Mutation: replace the body of `pick_slot` with `fastrand::usize(0..self.connections.len())`.
+/// (b)'s exact-sequence assertion fails on the first pick that doesn't match
+/// `(prev + 1) % pool_size`. Without (b), the test would pass under random.
+///
+/// Mutation #2: replace `pick_slot` with `|| 0`. (a) catches it (only 1
+/// distinct slot, not POOL_SIZE).
 #[nativelink_test]
 async fn round_robin_distributes_load_across_connections() -> Result<(), Error> {
     const POOL_SIZE: usize = 5;
     const CALLS: usize = 100;
-    const EXPECTED_PER_SLOT: usize = CALLS / POOL_SIZE; // 20
-    const TOLERANCE: usize = 5;
 
-    let manager =
-        StandardRedisManager::new_with_pool_size(pool_connect_func(), POOL_SIZE).await?;
+    let manager = timeout(
+        Duration::from_secs(5),
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), POOL_SIZE),
+    )
+    .await
+    .expect("round-robin test must not deadlock — pool init contract violated")?;
 
-    // Each slot was created with its own Uuid::new_v4(), so UUIDs uniquely
-    // identify slots. Bucket the get_connection_generic() returns by uuid
-    // and assert each slot served roughly CALLS/POOL_SIZE requests.
-    let mut counts: HashMap<uuid::Uuid, usize> = HashMap::new();
-    for _ in 0..CALLS {
-        let (_conn, uuid) = manager.get_connection_generic().await?;
-        *counts.entry(uuid).or_insert(0) += 1;
+    // Use pick_slot() exclusively here — get_connection_generic internally
+    // calls pick_slot, and double-incrementing would break the
+    // exact-sequence assertion below. We separately verify uuid uniqueness
+    // through pool_size (each new_v4 collision is ~zero probability).
+    let picks: Vec<usize> = (0..CALLS).map(|_| manager.pick_slot()).collect();
+    // Convert pick indices to uuids by inspecting one read per slot index.
+    // We only need to verify all POOL_SIZE distinct slots are reachable.
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for &slot in &picks {
+        *counts.entry(slot).or_insert(0) += 1;
     }
 
+    // (a) Each of POOL_SIZE distinct slots must have been touched.
     assert_eq!(
         counts.len(),
         POOL_SIZE,
@@ -1490,24 +1541,51 @@ async fn round_robin_distributes_load_across_connections() -> Result<(), Error> 
         counts.len()
     );
 
-    for (uuid, count) in &counts {
-        assert!(
-            (EXPECTED_PER_SLOT.saturating_sub(TOLERANCE)..=EXPECTED_PER_SLOT + TOLERANCE)
-                .contains(count),
-            "slot {uuid} served {count} requests, expected {EXPECTED_PER_SLOT}±{TOLERANCE}"
+    // (b) Exact RR sequence assertion: pick_slot must advance by exactly 1
+    // (modulo pool_size) on each call. This kills the "random uniform"
+    // mutation that the loose tolerance check would let pass.
+    //
+    // pick_slot starts from 0 (next_slot init), so picks[0] == 0, picks[1]
+    // == 1, etc.
+    for (i, &actual) in picks.iter().enumerate() {
+        let expected = i % POOL_SIZE;
+        assert_eq!(
+            actual, expected,
+            "pick_slot must advance round-robin: at index {i}, expected slot {expected}, got {actual}; \
+             full sequence prefix = {:?}",
+            &picks[..=i]
         );
     }
+
+    // Sanity: also verify get_connection_generic returns POOL_SIZE distinct
+    // uuids when polled enough times. This catches a regression where
+    // get_connection_generic stopped using pick_slot to route requests.
+    let mut uuids: HashMap<uuid::Uuid, usize> = HashMap::new();
+    for _ in 0..(POOL_SIZE * 4) {
+        let (_conn, uuid) = manager.get_connection_generic().await?;
+        *uuids.entry(uuid).or_insert(0) += 1;
+    }
+    assert_eq!(
+        uuids.len(),
+        POOL_SIZE,
+        "get_connection_generic must reach every slot — saw {} distinct uuids out of {POOL_SIZE}",
+        uuids.len()
+    );
     Ok(())
 }
 
+/// Direct test of the round-robin selector — the building block underneath
+/// `get_connection`. With pool_size=4, 12 successive picks must yield
+/// `0,1,2,3,0,1,2,3,0,1,2,3`. Single-threaded; the multi-task contention
+/// case is in `pick_slot_concurrent_distribution_under_stampede` below.
 #[nativelink_test]
 async fn pick_slot_advances_round_robin_modulo_pool_size() -> Result<(), Error> {
-    // Direct test of the round-robin selector — the building block underneath
-    // get_connection. With pool_size=4, 12 successive picks must yield
-    // 0,1,2,3,0,1,2,3,0,1,2,3 (modulo wrap of the AtomicUsize counter
-    // starting from 0).
-    let manager =
-        StandardRedisManager::new_with_pool_size(pool_connect_func(), 4).await?;
+    let manager = timeout(
+        Duration::from_secs(5),
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), 4),
+    )
+    .await
+    .expect("modulo test must not deadlock — pool init contract")?;
     let picks: Vec<usize> = (0..12).map(|_| manager.pick_slot()).collect();
     assert_eq!(
         picks,
