@@ -1397,7 +1397,9 @@ pub struct GrpcSpec {
     /// `ceil(remaining / parallel_chunk_count)` bytes. More chunks
     /// increase parallelism but also RPC overhead.
     ///
-    /// Default: 64
+    /// Default: 16 (lowered from 64 in #147 to keep h2 RST_STREAM emission
+    /// per connection well under hyper's `max_local_error_reset_streams=1024`
+    /// budget when race-loser tasks drop in-flight streams).
     #[serde(
         default = "default_parallel_chunk_count",
         deserialize_with = "convert_numeric_with_shellexpand"

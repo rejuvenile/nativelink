@@ -147,7 +147,7 @@ fn looks_like_dead_channel(err: &Error) -> bool {
             m.contains("Tried to send while stream is closed")
                 || m.contains("h2 protocol error")
                 || m.contains("buffer's worker closed unexpectedly")
-                || m.contains("connection error")
+                || m.contains("h2 connection error")
                 || m.contains("broken pipe")
         }),
         _ => false,
