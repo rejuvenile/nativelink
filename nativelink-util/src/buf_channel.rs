@@ -382,34 +382,18 @@ impl DropCloserWriteHalf {
 /// when the owning function returns without explicitly committing, breaking
 /// that deadlock class at the type level.
 ///
-/// ## Verbs
-/// - [`commit_eof`](Self::commit_eof): happy path — send EOF, suppress Drop.
-/// - [`commit_delegated`](Self::commit_delegated): suppress Drop because a
-///   sub-call (e.g. `inner.get_part(&mut *guard, ...)`) already terminated
-///   the writer.
-/// - [`fail`](Self::fail): explicit failure — send `err`, suppress Drop, return
-///   the same `Error` for `return Err(guard.fail(err));`.
-/// - [`commit_delegated_if_ok`](Self::commit_delegated_if_ok): conditional
-///   variant for `let res = sub.get_part(&mut *guard, ...).await; guard.commit_delegated_if_ok(&res); res?;`.
-///   On Err the Drop fallback still fires, catching sub-store contract
-///   violations (a sub-store that returns Err WITHOUT terminating the writer).
-///
-/// ## Where to apply this guard
-///
-/// The guard MUST be applied at the layer that joins a future over a
-/// borrowed `&mut writer` with another future over the paired `rx` (e.g.
-/// `VerifyStore::get_part`'s `tokio::join!(get_fut, check_fut)`). Sub-stores
-/// called as fall-throughs (e.g. `MemoryStore` inside `FastSlowStore::get_part`'s
-/// "try fast then slow" pattern) MUST NOT add their own guard — doing so fires
-/// `send_error` on a borrowed writer that the WRAPPER expected to be untouched
-/// for the slow-store fallback. The guard belongs on the WRAPPER's local
-/// channel pair, not on every leaf store.
+/// Apply this guard ONLY at a wrapper that joins a future over a borrowed
+/// `&mut writer` with another future over the paired `rx` (e.g.
+/// `VerifyStore::get_part`'s `tokio::join!(get_fut, check_fut)`). Leaf
+/// stores wrapped under FastSlowStore-style fall-through patterns MUST NOT
+/// add their own guard — the wrapper's guard is sufficient and the leaf's
+/// `Drop` would poison the fall-through path.
 ///
 /// ## Usage
 ///
 /// ```ignore
 /// // Inside VerifyStore::get_part (the wrapper):
-/// let (mut tx, rx) = make_buf_channel_pair();
+/// let (tx, rx) = make_buf_channel_pair();
 /// let get_fut = async move {
 ///     // Move tx INTO the future so the guard drops the moment get_fut
 ///     // finishes — without this, the guard waits on the outer scope and
@@ -423,104 +407,25 @@ impl DropCloserWriteHalf {
 /// let check_fut = self.check_get_part(writer, rx, ...);
 /// let (get_res, check_res) = tokio::join!(get_fut, check_fut);
 /// ```
-///
-/// See `nativelink-store/src/verify_store.rs::get_part` and the composability
-/// harness in `nativelink-store/tests/composability_test.rs`.
-#[must_use = "WriteHalfGuard MUST be committed (commit_eof / commit_delegated / fail) \
+#[must_use = "WriteHalfGuard MUST be committed (commit_eof / commit_delegated_if_ok / fail) \
               before the function returns Ok; otherwise Drop fires the synthesized fallback error"]
 #[derive(Debug)]
 pub struct WriteHalfGuard<'a> {
     writer: &'a mut DropCloserWriteHalf,
     committed: bool,
-    /// True when constructed via [`Self::new_subordinate`]. Subordinate
-    /// guards never side-effect on the writer: `Drop` is a no-op (no
-    /// synthesized `send_error`), and `fail()` only marks committed
-    /// without sending the error. The owning wrapper layer's
-    /// non-subordinate guard is the single source of truth for writer
-    /// termination — necessary because a leaf store cannot know whether
-    /// its caller plans to fall through to a sibling store on Err.
-    subordinate: bool,
 }
 
 impl<'a> WriteHalfGuard<'a> {
-    /// Wraps a borrowed writer in a termination guard. The `Drop` fallback
-    /// fires `send_error(synthesized)` unless one of `commit_eof`,
-    /// `commit_delegated`, `commit_delegated_if_ok`, or `fail` is called first.
-    ///
-    /// Use this in a layer that owns the deadlock risk — typically a
-    /// wrapping store that joins two futures over a borrowed channel pair
-    /// (`tokio::join!(get_fut, check_fut)` in `VerifyStore`,
-    /// `CompressionStore`, `WorkerProxyStore::get_part_and_cache`). The
-    /// active Drop fallback synthesises a structured Internal error so a
-    /// paired reader cannot block on `rx.recv().await` forever when a
-    /// sub-call returned Err without terminating the writer.
+    /// Wraps a borrowed writer. `Drop` fires `send_error(synthesized)` unless
+    /// one of the commit verbs is called first.
     pub fn new(writer: &'a mut DropCloserWriteHalf) -> Self {
         Self {
             writer,
             committed: false,
-            subordinate: false,
-        }
-    }
-
-    /// Variant for **leaf stores and non-deadlocking sub-callees** that
-    /// borrow a writer from a wrapper which already owns the deadlock-risk
-    /// guard. Constructed in the pre-committed state — the `Drop` fallback
-    /// is suppressed, and `fail()` does NOT call `send_error`. Provides
-    /// the same verb-style API (`commit_eof`, `commit_delegated`,
-    /// `commit_delegated_if_ok`, `fail`) for hygiene and consistency
-    /// without the side-effects that would poison the wrapper's
-    /// fall-through path.
-    ///
-    /// ## Why a no-op variant exists
-    ///
-    /// When a leaf store (e.g. `MemoryStore`) is wrapped by
-    /// `FastSlowStore`, FastSlowStore's "try fast then slow" pattern calls
-    /// `fast_store.get_part(&mut *outer_guard, ...)` and, on
-    /// NotFound-with-no-bytes-written, falls through to
-    /// `slow_store.get_part(&mut *outer_guard, ...)`. If the leaf's guard
-    /// fires `send_error` from Drop on the borrowed writer, `tx` is
-    /// dropped and `terminal_error` is set — the slow-store fallback's
-    /// `send` calls then fail with a broken-pipe error, even though the
-    /// slow_store has the data. The fall-through is poisoned.
-    ///
-    /// `new_subordinate` decouples the verb hygiene (clear `commit_eof`
-    /// at the success site, `fail` at error sites) from the side-effect
-    /// (Drop sends synthesized error). The wrapper's outer
-    /// `WriteHalfGuard::new` (active Drop) catches contract violations
-    /// at the wrapper level via `commit_delegated_if_ok(&res)` — keeping
-    /// the safety net armed exactly once, at the right layer.
-    ///
-    /// ## When to use which
-    ///
-    /// | Use | Constructor | Drop fallback | `fail` side-effect |
-    /// |-----|-------------|---------------|--------------------|
-    /// | Wrapper layer with `tokio::join!` over borrowed writer + internal channel | `new` | active | sends `err` |
-    /// | Wrapper layer with sequential delegation that does not fall through | `new` | active | sends `err` |
-    /// | Wrapper layer with sequential delegation that may fall through | `new` | active (caught by `commit_delegated_if_ok`) | n/a — use `commit_delegated_if_ok` |
-    /// | Leaf store (own-bytes producer) wrapped under FastSlowStore-style fall-through | `new_subordinate` | no-op | marks committed only |
-    ///
-    /// ## Independence from any specific wrapper
-    ///
-    /// The "wrapper guard catches contract violations" property holds
-    /// for ANY wrapper that uses `WriteHalfGuard::new` —
-    /// `VerifyStore`, `CompressionStore`, `WorkerProxyStore`,
-    /// `FastSlowStore`, `SizePartitioningStore`, `DedupStore`, or a
-    /// future composition. There is no dependency on a specific layer
-    /// (e.g. VerifyStore) being present.
-    pub fn new_subordinate(writer: &'a mut DropCloserWriteHalf) -> Self {
-        Self {
-            writer,
-            committed: true,
-            subordinate: true,
         }
     }
 
     /// Happy-path commit: send EOF and suppress the Drop fallback.
-    ///
-    /// Returns the `send_eof` Result so the caller can `?`-propagate the rare
-    /// case where the channel is already closed. The guard is marked committed
-    /// regardless — a Drop-time `send_error` after a failed `send_eof` would
-    /// be a no-op on the closed channel anyway.
     #[must_use = "the EOF Result indicates whether the receiver was still listening; \
                   ignoring it loses the diagnostic for downstream cancellation"]
     pub fn commit_eof(&mut self) -> Result<(), Error> {
@@ -528,22 +433,11 @@ impl<'a> WriteHalfGuard<'a> {
         self.writer.send_eof()
     }
 
-    /// Suppress the Drop fallback because a sub-call already terminated the
-    /// writer (e.g. `inner.get_part(&mut *guard, ...)` sent its own EOF or
-    /// `send_error`). Use only when the sub-call's contract guarantees
-    /// termination on every exit; otherwise prefer
-    /// [`commit_delegated_if_ok`](Self::commit_delegated_if_ok), which leaves
-    /// the Drop fallback armed on Err and catches sub-store contract
-    /// violations.
-    pub fn commit_delegated(&mut self) {
-        self.committed = true;
-    }
-
-    /// Conditional delegated commit: suppress the Drop fallback only if the
-    /// sub-call's `Result` is `Ok`. On `Err` the fallback stays armed, so a
-    /// sub-store that returned an error WITHOUT calling `send_error` (a
-    /// contract violation) is caught by the synthesized Internal at Drop time
-    /// rather than silently producing a deadlocked paired reader.
+    /// Suppress the Drop fallback only if the sub-call's `Result` is `Ok`. On
+    /// `Err` the fallback stays armed, so a sub-store that returned an error
+    /// WITHOUT calling `send_error` (a contract violation) is caught by the
+    /// synthesized Internal at Drop time rather than silently producing a
+    /// deadlocked paired reader.
     ///
     /// ```ignore
     /// let res = self.slow_store.get_part(key, &mut *guard, offset, length).await;
@@ -556,23 +450,13 @@ impl<'a> WriteHalfGuard<'a> {
         }
     }
 
-    /// Explicit failure commit. Returns the `err` unchanged so callers can
-    /// write `return Err(guard.fail(err));`.
-    ///
-    /// Behaviour depends on the constructor:
-    /// - `new` (active): calls `writer.send_error(err.clone())` so the
-    ///   paired reader observes the structured `err` rather than the
-    ///   generic "Sender dropped" Internal a bare-Drop fallback would emit.
-    /// - `new_subordinate` (no-op): only marks committed; does NOT call
-    ///   `send_error`. A leaf store cannot terminate a borrowed writer
-    ///   without poisoning a wrapping layer's fall-through path (e.g.
-    ///   FastSlowStore's "try fast then slow"). The wrapper's outer
-    ///   active guard catches the contract via `commit_delegated_if_ok(&res)`.
+    /// Explicit failure commit. Sends the structured `err` to the writer (so
+    /// the paired reader observes the specific Code instead of a generic
+    /// "Sender dropped" Internal) and returns the same `err` unchanged so
+    /// callers can write `return Err(guard.fail(err));`.
     pub fn fail(&mut self, err: Error) -> Error {
         self.committed = true;
-        if !self.subordinate {
-            self.writer.send_error(err.clone());
-        }
+        self.writer.send_error(err.clone());
         err
     }
 
@@ -613,7 +497,7 @@ impl Drop for WriteHalfGuard<'_> {
         let synthesized = make_err!(
             Code::Internal,
             "WriteHalfGuard fired Drop fallback: function exited without explicit \
-             commit_eof / commit_delegated / fail. This is a bug — the owning \
+             commit_eof / commit_delegated_if_ok / fail. This is a bug — the owning \
              function returned without terminating the writer, which would have \
              deadlocked any paired reader. The Drop fallback unblocked the \
              reader, but the underlying logic error should be fixed."

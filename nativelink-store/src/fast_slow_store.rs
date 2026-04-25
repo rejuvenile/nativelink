@@ -2731,8 +2731,7 @@ impl StoreDriver for FastSlowStore {
     // "Test in production composition, not in isolation").
     //
     // STRUCTURAL ENFORCEMENT: wrap `writer` in `WriteHalfGuard` (`guard`).
-    // Verbs: `commit_eof()?` (happy path, send EOF), `commit_delegated()`
-    // (sub-call terminated the writer), `commit_delegated_if_ok(&res)`
+    // Verbs: `commit_eof()?` (happy path, send EOF), `commit_delegated_if_ok(&res)`
     // (only suppress Drop on Ok — preferred for sub-store delegation so
     // a sub-store contract violation is caught by the Drop fallback),
     // `return Err(guard.fail(err))` (explicit failure). Any uncommitted
@@ -2863,7 +2862,7 @@ impl StoreDriver for FastSlowStore {
                 // The inner fast_store's get_part contract terminates the
                 // writer on success (sends its own EOF). Suppress Drop
                 // fallback so we don't double-terminate.
-                guard.commit_delegated();
+                guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
                 return Ok(());
             }
             Err(err) if err.code == Code::NotFound && guard.get_bytes_written() == bytes_before => {
