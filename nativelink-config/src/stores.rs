@@ -1561,7 +1561,17 @@ pub struct RedisSpec {
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub read_chunk_size: usize,
 
-    /// The number of connections to keep open to the redis server(s).
+    /// The number of multiplexed connections to keep open to the redis
+    /// server(s). For `Standard` and `Sentinel` modes, requests are
+    /// round-robin distributed across this many `ConnectionManager`
+    /// instances. Each entry is its own multiplexed connection — N
+    /// connections multiplies the in-flight queue capacity by N. Use
+    /// higher values when you observe Redis commands pipelining serially
+    /// behind a single connection (e.g. STRLEN+EXISTS taking seconds
+    /// under high concurrency).
+    ///
+    /// In `Cluster` mode the value is ignored — `redis-rs` maintains its
+    /// own per-node connection routing internally.
     ///
     /// Default: 3
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]

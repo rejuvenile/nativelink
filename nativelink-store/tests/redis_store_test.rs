@@ -29,7 +29,7 @@ use nativelink_redis_tester::{
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
 use nativelink_store::redis_store::{
     ClusterRedisManager, DEFAULT_MAX_CHUNK_UPLOADS_PER_UPDATE, DEFAULT_MAX_COUNT_PER_CURSOR,
-    LUA_VERSION_SET_SCRIPT, RedisStore, RedisSubscriptionManager,
+    LUA_VERSION_SET_SCRIPT, RedisStore, RedisSubscriptionManager, StandardRedisManager,
 };
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
@@ -1385,5 +1385,134 @@ async fn send_messages_to_subscription_channel() -> Result<(), Error> {
     // Because otherwise it gets dropped immediately, and we need it to live to do things
     drop(subscription_manager);
 
+    Ok(())
+}
+
+// -------- StandardRedisManager connection-pool tests ---------------------
+//
+// Production observed only 3 Valkey clients connected to the server (1 per
+// store + 1 pubsub) despite `connection_pool_size: 64` in prod-server.json5 —
+// the value was being parsed and defaulted but never consumed. With all
+// in-flight commands queueing serially behind a single multiplexed
+// connection, buildcache saw 47K WARN + 30K ERROR / 39 min for STRLEN+EXISTS
+// pipelines taking 1.4-5.1s. These tests guard the round-robin pool
+// behavior so the dead-config bug stays dead.
+
+/// Build a `connect_func` that hands back a fresh `MockRedisConnection`
+/// each call. Each mock answers exactly one `SCRIPT LOAD` (which
+/// `StandardRedisManager::configure` sends during construction) and then
+/// rejects further commands. Sufficient for `pool_size` and round-robin
+/// distribution tests where we never issue real Redis commands.
+fn pool_connect_func() -> Box<
+    dyn Fn() -> core::pin::Pin<
+        Box<dyn Future<Output = Result<MockRedisConnection, Error>> + Send>,
+    > + Send
+    + Sync,
+> {
+    Box::new(|| {
+        Box::pin(async {
+            Ok(MockRedisConnection::new(vec![MockCmd::new(
+                redis::cmd("SCRIPT").arg("LOAD").arg(LUA_VERSION_SET_SCRIPT),
+                Ok(Value::SimpleString(
+                    "b22b9926cbce9dd9ba97fa7ba3626f89feea1ed5".to_owned(),
+                )),
+            )]))
+        })
+    })
+}
+
+#[nativelink_test]
+async fn connection_pool_size_creates_n_connections() -> Result<(), Error> {
+    let manager =
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), 5).await?;
+    assert_eq!(
+        manager.pool_size(),
+        5,
+        "pool_size(5) should produce 5 underlying ConnectionManager slots"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn connection_pool_size_default_3() -> Result<(), Error> {
+    // The default-fill happens in RedisStore::set_spec_defaults — verifying
+    // here that the constructor honors a passed-in 3 (which is what
+    // set_spec_defaults rewrites a bare 0 to).
+    let manager =
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), 3).await?;
+    assert_eq!(
+        manager.pool_size(),
+        3,
+        "default pool_size of 3 should produce 3 slots"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn connection_pool_size_zero_uses_at_least_one() -> Result<(), Error> {
+    // `set_spec_defaults` rewrites 0 -> DEFAULT_CONNECTION_POOL_SIZE before
+    // calling new_with_pool_size, so production never reaches here with
+    // pool_size=0. But defense-in-depth: a 0 must clamp to >=1, never
+    // panic with "div by zero" inside `pick_slot`.
+    let manager =
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), 0).await?;
+    assert!(
+        manager.pool_size() >= 1,
+        "pool_size(0) must clamp to >=1 to avoid % 0 panic in pick_slot, got {}",
+        manager.pool_size()
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn round_robin_distributes_load_across_connections() -> Result<(), Error> {
+    const POOL_SIZE: usize = 5;
+    const CALLS: usize = 100;
+    const EXPECTED_PER_SLOT: usize = CALLS / POOL_SIZE; // 20
+    const TOLERANCE: usize = 5;
+
+    let manager =
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), POOL_SIZE).await?;
+
+    // Each slot was created with its own Uuid::new_v4(), so UUIDs uniquely
+    // identify slots. Bucket the get_connection_generic() returns by uuid
+    // and assert each slot served roughly CALLS/POOL_SIZE requests.
+    let mut counts: HashMap<uuid::Uuid, usize> = HashMap::new();
+    for _ in 0..CALLS {
+        let (_conn, uuid) = manager.get_connection_generic().await?;
+        *counts.entry(uuid).or_insert(0) += 1;
+    }
+
+    assert_eq!(
+        counts.len(),
+        POOL_SIZE,
+        "round-robin must touch every slot — saw {} distinct slots out of {POOL_SIZE}: {counts:?}",
+        counts.len()
+    );
+
+    for (uuid, count) in &counts {
+        assert!(
+            (EXPECTED_PER_SLOT.saturating_sub(TOLERANCE)..=EXPECTED_PER_SLOT + TOLERANCE)
+                .contains(count),
+            "slot {uuid} served {count} requests, expected {EXPECTED_PER_SLOT}±{TOLERANCE}"
+        );
+    }
+    Ok(())
+}
+
+#[nativelink_test]
+async fn pick_slot_advances_round_robin_modulo_pool_size() -> Result<(), Error> {
+    // Direct test of the round-robin selector — the building block underneath
+    // get_connection. With pool_size=4, 12 successive picks must yield
+    // 0,1,2,3,0,1,2,3,0,1,2,3 (modulo wrap of the AtomicUsize counter
+    // starting from 0).
+    let manager =
+        StandardRedisManager::new_with_pool_size(pool_connect_func(), 4).await?;
+    let picks: Vec<usize> = (0..12).map(|_| manager.pick_slot()).collect();
+    assert_eq!(
+        picks,
+        vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3],
+        "pick_slot must advance modulo pool_size starting from 0"
+    );
     Ok(())
 }

@@ -21,6 +21,7 @@ use core::str::FromStr;
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -183,6 +184,12 @@ where
 type RedisConnectFuture<C> = dyn Future<Output = Result<C, Error>> + Send;
 type RedisConnectFn<C> = dyn Fn() -> Pin<Box<RedisConnectFuture<C>>> + Send + Sync;
 
+/// The dedicated slot index used for pubsub subscriptions. Pubsub state is
+/// per-connection in Redis (subscribing on N connections would deliver each
+/// message N times), so we pin all psubscribe traffic to a single slot and
+/// re-apply the subscription set when that slot reconnects.
+const SUBSCRIBER_SLOT: usize = 0;
+
 pub struct StandardRedisManager<C>
 where
     C: ConnectionLike + Clone,
@@ -195,11 +202,21 @@ where
     /// data only if the version number matches the existing version number.
     update_if_version_matches_script: Script,
 
-    /// The client pool connecting to the backing Redis instance(s) and a Uuid
-    /// for this connection in order to avoid multiple reconnection attempts.
-    connection_manager: tokio::sync::RwLock<(C, Uuid)>,
+    /// Pool of connection managers. Each entry is its own multiplexed
+    /// connection with an independent Uuid (so reconnect can target the right
+    /// slot without disturbing others). Round-robin across the pool spreads
+    /// in-flight commands across N connections instead of pipelining
+    /// everything through one. Slot [`SUBSCRIBER_SLOT`] is the dedicated
+    /// pubsub subscriber connection — see the const doc for why.
+    connections: Vec<tokio::sync::RwLock<(C, Uuid)>>,
 
-    /// A list of subscription that should be performed on reconnect.
+    /// Round-robin selector for `get_connection`. Wraps via modulo and only
+    /// needs `Relaxed` ordering — distribution doesn't have to be exact, just
+    /// uniform on average.
+    next_slot: AtomicUsize,
+
+    /// A list of subscriptions that should be performed on reconnect of the
+    /// subscriber slot.
     subscriptions: Mutex<HashSet<String>>,
 }
 
@@ -213,6 +230,7 @@ where
                 "update_if_version_matches_script",
                 &self.update_if_version_matches_script,
             )
+            .field("pool_size", &self.connections.len())
             .field("subscriptions", &self.subscriptions)
             .finish()
     }
@@ -229,47 +247,97 @@ where
         Ok(())
     }
 
-    async fn new(connect_func: Box<RedisConnectFn<C>>) -> Result<Self, Error> {
-        let connection_manager = connect_func().await?;
+    /// Create a manager with a pool of `pool_size` connections. `pool_size`
+    /// is clamped to at least 1 so the manager always has a slot to serve.
+    /// Connections are dialed in parallel so total startup wall-clock equals
+    /// the slowest single dial, not N × dial time — important for large
+    /// pools (e.g. `connection_pool_size: 64` in production).
+    pub async fn new_with_pool_size(
+        connect_func: Box<RedisConnectFn<C>>,
+        pool_size: usize,
+    ) -> Result<Self, Error> {
+        let pool_size = pool_size.max(1);
+        let connect_futs = (0..pool_size).map(|_| connect_func());
+        let raw_connections = future::try_join_all(connect_futs).await?;
+        let connections = raw_connections
+            .into_iter()
+            .map(|c| tokio::sync::RwLock::new((c, Uuid::new_v4())))
+            .collect::<Vec<_>>();
         let update_if_version_matches_script = Script::new(LUA_VERSION_SET_SCRIPT);
-        let connection = Self {
+        let manager = Self {
             connect_func,
             update_if_version_matches_script,
-            connection_manager: tokio::sync::RwLock::new((connection_manager, Uuid::new_v4())),
+            connections,
+            next_slot: AtomicUsize::new(0),
             subscriptions: Mutex::new(HashSet::new()),
         };
-        {
-            let mut connection_manager = connection.connection_manager.write().await;
-            connection.configure(&mut connection_manager.0).await?;
+        // Configure (script preload) per slot. Sequential is fine here — the
+        // dials are done; this is just sending one SCRIPT LOAD per slot.
+        for slot in &manager.connections {
+            let mut guard = slot.write().await;
+            manager.configure(&mut guard.0).await?;
         }
-        Ok(connection)
+        Ok(manager)
+    }
+
+    /// Number of connections in the pool. Useful for assertions and metrics.
+    pub fn pool_size(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Atomically pick the next round-robin slot index.
+    ///
+    /// Exposed primarily so tests can assert distribution without depending on
+    /// the full `RedisManager` impl (which is `ConnectionManager`-specific
+    /// because it needs to call the inherent `psubscribe` method).
+    pub fn pick_slot(&self) -> usize {
+        let pool_size = self.connections.len();
+        // Modulo on usize wrap is safe — `Relaxed` is fine because we only
+        // need a uniform distribution on average, not a strict ordering.
+        self.next_slot.fetch_add(1, Ordering::Relaxed) % pool_size
+    }
+
+    /// Generic get_connection that works for any C; the trait impl below
+    /// just delegates to this. Tests use it directly to assert distribution.
+    pub async fn get_connection_generic(&self) -> Result<(C, Uuid), Error> {
+        let idx = self.pick_slot();
+        Ok(self.connections[idx].read().await.clone())
     }
 }
 
 impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager> {
     async fn get_connection(&self) -> Result<(ConnectionManager, Uuid), Error> {
-        Ok(self.connection_manager.read().await.clone())
+        self.get_connection_generic().await
     }
 
     async fn reconnect(&self, uuid: Uuid) -> Result<(ConnectionManager, Uuid), Error> {
-        let mut guard = self.connection_manager.write().await;
-        if guard.1 != uuid {
-            let connection = guard.clone();
-            drop(guard);
-            return Ok(connection);
+        // Find the slot that owns this uuid. Linear scan is fine — pool size
+        // is in the dozens at most.
+        for (slot_idx, slot) in self.connections.iter().enumerate() {
+            let mut guard = slot.write().await;
+            if guard.1 != uuid {
+                continue;
+            }
+            let mut connection_manager = (self.connect_func)().await?;
+            let new_uuid = Uuid::new_v4();
+            self.configure(&mut connection_manager).await?;
+            // Only the subscriber slot needs subscriptions re-applied. Other
+            // slots never carry pubsub traffic.
+            if slot_idx == SUBSCRIBER_SLOT {
+                let subscriptions = {
+                    let guard = self.subscriptions.lock();
+                    guard.iter().cloned().collect::<Vec<_>>()
+                };
+                for subscription in subscriptions {
+                    connection_manager.psubscribe(&subscription).await?;
+                }
+            }
+            *guard = (connection_manager.clone(), new_uuid);
+            return Ok((connection_manager, new_uuid));
         }
-        let mut connection_manager = (self.connect_func)().await?;
-        let uuid = Uuid::new_v4();
-        self.configure(&mut connection_manager).await?;
-        let subscriptions = {
-            let guard = self.subscriptions.lock();
-            guard.iter().map(Clone::clone).collect::<Vec<_>>()
-        };
-        for subscription in subscriptions {
-            connection_manager.psubscribe(&subscription).await?;
-        }
-        *guard = (connection_manager.clone(), uuid);
-        Ok((connection_manager, uuid))
+        // Uuid no longer matches any slot — caller's connection was already
+        // rotated by a prior reconnect. Hand back a fresh one via round-robin.
+        self.get_connection().await
     }
 
     fn update_script(&self, key: &str) -> redis::ScriptInvocation<'_> {
@@ -277,10 +345,11 @@ impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager>
     }
 
     async fn psubscribe(&self, pattern: &str) -> Result<(), Error> {
-        let mut connection = self.get_connection().await?.0;
+        // Pubsub is pinned to the subscriber slot — see SUBSCRIBER_SLOT doc.
         let new_subscription = self.subscriptions.lock().insert(String::from(pattern));
         if new_subscription {
-            let result = connection.psubscribe(pattern).await;
+            let mut guard = self.connections[SUBSCRIBER_SLOT].write().await;
+            let result = guard.0.psubscribe(pattern).await;
             if result.is_err() {
                 self.subscriptions.lock().remove(pattern);
             }
@@ -687,15 +756,15 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
                 .set_push_sender(tx)
         };
 
-        let mut connection_manager =
+        let connection_manager =
             ConnectionManager::new_with_config(client, connection_manager_config)
                 .await
                 .err_tip(|| format!("While connecting to redis with url: {addr}"))?;
 
-        if let Some(pub_sub_channel) = spec.experimental_pub_sub_channel {
-            connection_manager.psubscribe(pub_sub_channel).await?;
-        }
-
+        // NOTE: psubscribe is intentionally NOT applied here. The manager owns
+        // a pool of N connections, and pubsub is pinned to a single subscriber
+        // slot (see `SUBSCRIBER_SLOT`). Subscribing here would attach pubsub
+        // to every newly-connected slot and cause duplicate message delivery.
         Ok(connection_manager)
     }
 
@@ -712,6 +781,7 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
 
         let (tx, subscriber_channel) = unbounded_channel();
         let command_timeout = Duration::from_millis(spec.command_timeout_ms);
+        let pool_size = spec.connection_pool_size;
 
         Self::new_from_builder_and_parts(
             spec.experimental_pub_sub_channel.clone(),
@@ -724,9 +794,10 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
             spec.max_count_per_cursor,
             command_timeout * 2,
             subscriber_channel,
-            StandardRedisManager::new(Box::new(move || {
-                Box::pin(Self::connect(spec.clone(), tx.clone()))
-            }))
+            StandardRedisManager::new_with_pool_size(
+                Box::new(move || Box::pin(Self::connect(spec.clone(), tx.clone()))),
+                pool_size,
+            )
             .await?,
         )
         .await
