@@ -276,7 +276,7 @@ impl WorkerApiServer {
             // endpoint, so the wipe is a no-op but still safe.
             let needs_wipe = prev
                 .as_ref()
-                .map_or(false, |p| p.boot_epoch != new_boot_epoch || new_boot_epoch == 0);
+                .is_some_and(|p| p.boot_epoch != new_boot_epoch || new_boot_epoch == 0);
             if needs_wipe {
                 if let Some(ref locality_map) = self.locality_map {
                     locality_map.write().remove_endpoint(&worker_cas_endpoint);
