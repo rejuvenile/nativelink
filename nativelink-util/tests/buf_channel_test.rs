@@ -18,7 +18,9 @@ use bytes::{Bytes, BytesMut};
 use futures::poll;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
-use nativelink_util::buf_channel::{make_buf_channel_pair, make_buf_channel_pair_with_size};
+use nativelink_util::buf_channel::{
+    WriteHalfGuard, make_buf_channel_pair, make_buf_channel_pair_with_size,
+};
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::try_join;
@@ -422,4 +424,142 @@ async fn try_send_rejects_zero_length_buf_as_closed() {
     }
     // Counter must remain unchanged.
     assert_eq!(tx.get_bytes_written(), 0);
+}
+
+/// Spec: dropping a `WriteHalfGuard` without committing MUST surface a
+/// synthesized Internal on the reader side so a paired reader unblocks.
+/// This is the contract the guard exists to enforce.
+#[nativelink_test]
+async fn write_half_guard_uncommitted_drop_terminates_with_internal() {
+    let (mut tx, mut rx) = make_buf_channel_pair();
+    {
+        let _guard = WriteHalfGuard::new(&mut tx);
+        // No commit_eof, no commit_delegated_if_ok, no fail.
+    }
+    let err = rx.recv().await.expect_err(
+        "Drop fallback MUST surface as an error on the reader side; \
+         without it the paired reader would deadlock forever",
+    );
+    assert_eq!(err.code, Code::Internal, "fallback err.code MUST be Internal");
+    assert!(
+        err.messages
+            .iter()
+            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
+        "fallback err MUST identify itself so operators can grep for the missing commit site, got: {err:?}",
+    );
+}
+
+/// Spec: `commit_eof()` MUST suppress the Drop fallback AND deliver a
+/// clean EOF to the receiver.
+#[nativelink_test]
+async fn write_half_guard_commit_eof_delivers_clean_eof() {
+    let (mut tx, mut rx) = make_buf_channel_pair();
+    {
+        let mut guard = WriteHalfGuard::new(&mut tx);
+        guard.commit_eof().expect("send_eof must succeed on a fresh channel");
+    }
+    let chunk = rx.recv().await.expect("clean EOF must surface as Ok(empty)");
+    assert!(chunk.is_empty(), "expected EOF, got: {} bytes", chunk.len());
+}
+
+/// Spec: `fail(err)` MUST terminate the writer with the structured error
+/// AND return the same error so the caller can `return Err(guard.fail(err))`.
+#[nativelink_test]
+async fn write_half_guard_fail_propagates_structured_error() {
+    let (mut tx, mut rx) = make_buf_channel_pair();
+    let returned = {
+        let mut guard = WriteHalfGuard::new(&mut tx);
+        guard.fail(make_err!(Code::NotFound, "test-marker-NotFound"))
+    };
+    assert_eq!(returned.code, Code::NotFound);
+    assert!(returned.messages.iter().any(|m| m.contains("test-marker-NotFound")));
+
+    let err = rx.recv().await.expect_err("fail() must surface as Err");
+    assert_eq!(err.code, Code::NotFound, "receiver MUST see the structured Code");
+    assert!(
+        err.messages.iter().any(|m| m.contains("test-marker-NotFound")),
+        "receiver MUST see the structured message, got: {err:?}",
+    );
+}
+
+/// Spec: `commit_delegated_if_ok(&Ok(()))` MUST suppress Drop;
+/// `commit_delegated_if_ok(&Err(...))` MUST leave Drop armed so a sub-store
+/// that returned Err WITHOUT terminating is caught at Drop time.
+#[nativelink_test]
+async fn write_half_guard_commit_delegated_if_ok_arms_drop_on_err() {
+    // Ok branch: clean EOF surfaces, no Drop fallback.
+    let (mut tx_ok, mut rx_ok) = make_buf_channel_pair();
+    {
+        let mut guard = WriteHalfGuard::new(&mut tx_ok);
+        guard.send_eof().expect("send_eof must succeed");
+        let res: Result<(), Error> = Ok(());
+        guard.commit_delegated_if_ok(&res);
+    }
+    let chunk = rx_ok.recv().await.expect("Ok branch must surface clean EOF");
+    assert!(chunk.is_empty(), "Ok branch expected EOF, got {} bytes", chunk.len());
+
+    // Err branch: sub-store returned Err WITHOUT terminating; Drop fallback fires.
+    let (mut tx_err, mut rx_err) = make_buf_channel_pair();
+    {
+        let mut guard = WriteHalfGuard::new(&mut tx_err);
+        let res: Result<(), Error> = Err(make_err!(Code::Internal, "sub-store err"));
+        guard.commit_delegated_if_ok(&res);
+    }
+    let err = rx_err
+        .recv()
+        .await
+        .expect_err("Err branch MUST surface Drop fallback (sub-store didn't terminate)");
+    assert_eq!(err.code, Code::Internal);
+    assert!(
+        err.messages
+            .iter()
+            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
+        "Err branch MUST surface the synthesized Internal, got: {err:?}",
+    );
+}
+
+/// Spec: `commit_eof()` followed by `Drop` MUST produce exactly one
+/// terminator (a clean EOF) — never an EOF immediately followed by the
+/// synthesized Internal.
+#[nativelink_test]
+async fn commit_eof_then_drop_produces_exactly_one_terminator() {
+    let (mut tx, mut rx) = make_buf_channel_pair();
+    {
+        let mut guard = WriteHalfGuard::new(&mut tx);
+        guard.commit_eof().expect("send_eof must succeed on a fresh channel");
+    }
+    let chunk = rx.recv().await.expect("clean EOF must surface");
+    assert!(chunk.is_empty(), "first recv MUST be EOF, got {} bytes", chunk.len());
+    let chunk2 = rx
+        .recv()
+        .await
+        .expect("post-EOF recv MUST stay EOF, not surface a synthesized Internal");
+    assert!(chunk2.is_empty(), "post-EOF recv MUST stay EOF, got {} bytes", chunk2.len());
+}
+
+/// Spec: dropping the guard while a chunk is queued MUST surface a coherent
+/// terminal error to the reader, not corrupt the in-flight chunk.
+#[nativelink_test]
+async fn drop_during_active_send_does_not_corrupt_stream() {
+    let (mut tx, mut rx) = make_buf_channel_pair_with_size(1);
+    tx.send(Bytes::from_static(b"first-chunk"))
+        .await
+        .expect("first send into 1-slot channel must succeed");
+    {
+        let _guard = WriteHalfGuard::new(&mut tx);
+        // No commit — Drop fires immediately on this scope exit.
+    }
+    let first = rx.recv().await.expect("first chunk must arrive intact");
+    assert_eq!(&first[..], b"first-chunk", "in-flight chunk MUST NOT be corrupted by Drop");
+    let err = rx
+        .recv()
+        .await
+        .expect_err("post-Drop recv MUST surface the synthesized Internal");
+    assert_eq!(err.code, Code::Internal);
+    assert!(
+        err.messages
+            .iter()
+            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
+        "post-Drop err MUST be the synthesized Internal, got: {err:?}",
+    );
 }
