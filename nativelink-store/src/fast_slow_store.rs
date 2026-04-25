@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::borrow::BorrowMut;
 use core::cmp::{max, min};
 use core::future::Future;
 use core::ops::Range;
@@ -32,7 +31,7 @@ use nativelink_config::stores::{FastSlowSpec, StoreDirection};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
-    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair_with_size,
+    DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::fs;
@@ -2720,6 +2719,40 @@ impl StoreDriver for FastSlowStore {
         Ok(Some(file))
     }
 
+    // LINT: writer-termination policy for `get_part` (do NOT bypass).
+    //
+    // Every exit path of this function MUST terminate the borrowed `writer`
+    // (either with `send_eof` on success or `send_error` on failure) before
+    // returning. Failure to do so deadlocks any wrapping layer that paired
+    // this writer with a reader inside `tokio::join!` (e.g.
+    // `VerifyStore::get_part`'s `(get_fut, check_fut)` pattern over a
+    // freshly-built `tx`/`rx`). Production consequences of an omission have
+    // historically been multi-hour Bazel build wedges (see CLAUDE.md
+    // "Test in production composition, not in isolation").
+    //
+    // STRUCTURAL ENFORCEMENT: the entire body wraps `writer` in a
+    // `WriteHalfGuard` (`guard` below). Use ONE of these verbs at every
+    // exit point — never raw `writer.send_eof()` / `writer.send_error()`
+    // followed by `return`:
+    //   * `guard.commit_eof()?` — happy path: send EOF + suppress Drop fallback
+    //   * `guard.commit_already_terminated()` — sub-call already terminated
+    //     the writer (e.g. delegated to `slow_store.get_part(&mut *guard,...)`)
+    //   * `return Err(guard.fail(err))` — explicit failure: send `err` +
+    //     suppress Drop fallback
+    //
+    // Any `?` propagation that escapes WITHOUT one of the above will be
+    // caught by `WriteHalfGuard::Drop`, which sends a synthesized Internal
+    // error to unblock the paired reader. The Drop fallback IS a safety
+    // net, not a license — every Drop-fallback fire indicates a missed
+    // explicit commit and should be fixed.
+    //
+    // If you add a new `return` to this function:
+    //   1. If returning Ok, prefix it with `guard.commit_eof()?;` (or
+    //      `guard.commit_already_terminated();` if a sub-call did it)
+    //   2. If returning Err, write `return Err(guard.fail(err));`
+    //   3. If you want Drop to handle it (e.g. lazy `?` propagation), do
+    //      nothing — but verify in review that the Drop-synthesized
+    //      Internal error is acceptable for the path
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,
@@ -2727,6 +2760,8 @@ impl StoreDriver for FastSlowStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        let mut guard = WriteHalfGuard::new(writer);
+
         // Check mirror blob cache first — these are blobs the server pushed
         // to us that we hold in memory only.
         {
@@ -2756,21 +2791,12 @@ impl StoreDriver for FastSlowStore {
                     // and silently leave the server's locality_map pointing
                     // at this worker for a digest the worker has just discarded.
                     self.remove_mirror_blobs(&[digest]);
-                    let err = make_err!(
+                    return Err(guard.fail(make_err!(
                         Code::NotFound,
                         "mirror_blobs entry for {digest} had wrong size \
                          ({} != {expected}) — entry removed",
                         data.len()
-                    );
-                    // Terminate the writer with the structured error
-                    // BEFORE returning so a paired reader (e.g.
-                    // VerifyStore::get_part's tokio::join! over
-                    // (get_fut, check_fut)) unblocks instead of awaiting
-                    // bytes that never arrive. Same writer-termination
-                    // requirement as the populator-NotFound short-circuit
-                    // at line ~2922 (commit a384e2e8).
-                    writer.send_error(err.clone());
-                    return Err(err);
+                    )));
                 }
                 let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
                 if offset_usize < data.len() {
@@ -2780,14 +2806,14 @@ impl StoreDriver for FastSlowStore {
                         .unwrap_or(data.len());
                     let slice = data.slice(offset_usize..end);
                     if !slice.is_empty() {
-                        writer
+                        guard
                             .send(slice)
                             .await
                             .err_tip(|| "Failed to send mirror blob data")?;
                     }
                 }
-                writer
-                    .send_eof()
+                guard
+                    .commit_eof()
                     .err_tip(|| "Failed to send EOF for mirror blob")?;
                 return Ok(());
             }
@@ -2798,19 +2824,24 @@ impl StoreDriver for FastSlowStore {
         // which is critical for serving data when the local cache misses.
         #[cfg(feature = "failpoints")]
         fail::fail_point!("fast_slow_get_part_fast_store_not_found", |_| {
+            // Drop fallback on `guard` (we're inside the `async` body)
+            // synthesizes the Internal terminator if this branch fires.
+            // We don't have access to `guard` here because `fail_point!`
+            // returns from a closure — but `guard` is on the function
+            // stack frame and Drop fires when the function unwinds.
             Err(make_err!(Code::NotFound, "failpoint: fast store not found"))
         });
 
         // Try the fast store directly — avoids the extra has() round-trip.
         // On NotFound (with no bytes written), fall through to slow store.
-        let bytes_before = writer.get_bytes_written();
+        let bytes_before = guard.get_bytes_written();
         match self
             .fast_store
-            .get_part(key.borrow(), writer.borrow_mut(), offset, length)
+            .get_part(key.borrow(), &mut *guard, offset, length)
             .await
         {
             Ok(()) => {
-                let bytes_written = writer.get_bytes_written() - bytes_before;
+                let bytes_written = guard.get_bytes_written() - bytes_before;
                 // Validate full reads against digest size to detect truncated entries.
                 let expected_size = match key.borrow() {
                     StoreKey::Digest(d) => d.size_bytes(),
@@ -2825,25 +2856,18 @@ impl StoreDriver for FastSlowStore {
                         expected_size,
                         "fast store returned truncated data, cannot recover (bytes already sent)"
                     );
-                    // Bytes were already written — we cannot fall through to slow store.
-                    // Return an error so the caller retries the whole operation.
-                    let err = make_err!(
+                    // Bytes were already written — we cannot fall through
+                    // to slow store. Return an error so the caller retries
+                    // the whole operation. `guard.fail(...)` sends the
+                    // structured error to terminate any paired reader; even
+                    // if the inner fast store DID send EOF, surfacing the
+                    // structured Internal is preferable to an
+                    // ambiguously-truncated stream the receiver would
+                    // otherwise observe as a clean EOF.
+                    return Err(guard.fail(make_err!(
                         Code::Internal,
                         "Fast store returned {bytes_written} bytes but expected {expected_size}"
-                    );
-                    // Subtle: the inner fast store may have returned
-                    // Ok(()) WITHOUT sending EOF (the canonical case
-                    // for an upstream that produced fewer bytes than
-                    // the digest claims and exited cleanly). The writer
-                    // is still live — without explicit termination, a
-                    // paired reader inside VerifyStore::get_part's
-                    // tokio::join! blocks forever on rx.recv(). Even
-                    // if the inner store DID send EOF, propagating the
-                    // structured Internal error here is preferable to
-                    // an ambiguously-truncated stream the receiver
-                    // would otherwise observe as a clean EOF.
-                    writer.send_error(err.clone());
-                    return Err(err);
+                    )));
                 }
                 self.metrics
                     .fast_store_hit_count
@@ -2851,9 +2875,13 @@ impl StoreDriver for FastSlowStore {
                 self.metrics
                     .fast_store_downloaded_bytes
                     .fetch_add(bytes_written, Ordering::Acquire);
+                // The inner fast_store's get_part contract terminates the
+                // writer on success (sends its own EOF). Suppress Drop
+                // fallback so we don't double-terminate.
+                guard.commit_already_terminated();
                 return Ok(());
             }
-            Err(err) if err.code == Code::NotFound && writer.get_bytes_written() == bytes_before => {
+            Err(err) if err.code == Code::NotFound && guard.get_bytes_written() == bytes_before => {
                 // Fast store miss — no bytes written, safe to fall through.
                 debug!(
                     ?key,
@@ -2861,12 +2889,9 @@ impl StoreDriver for FastSlowStore {
                 );
             }
             Err(err) => {
-                // Non-NotFound err OR NotFound-with-partial-bytes: terminate
-                // the writer before returning so callers (e.g. VerifyStore's
-                // tokio::join! over a tx/rx pair) don't deadlock awaiting
-                // EOF/error.
-                writer.send_error(err.clone());
-                return Err(err);
+                // Non-NotFound err OR NotFound-with-partial-bytes: surface
+                // the structured error so paired readers don't deadlock.
+                return Err(guard.fail(err));
             }
         }
 
@@ -2897,23 +2922,17 @@ impl StoreDriver for FastSlowStore {
                         // graceful-shutdown waiter on `in_flight_empty_notify`
                         // doesn't miss its wake-up.
                         {
-                            let mut guard = self.in_flight_slow_writes.lock();
-                            guard.remove(&owned_key);
-                            if guard.is_empty() {
+                            let mut in_flight_guard = self.in_flight_slow_writes.lock();
+                            in_flight_guard.remove(&owned_key);
+                            if in_flight_guard.is_empty() {
                                 self.in_flight_empty_notify.notify_waiters();
                             }
                         }
-                        let err = make_err!(
+                        return Err(guard.fail(make_err!(
                             Code::NotFound,
                             "in_flight_slow_writes entry for {d} had wrong total \
                              size ({total_len} != {expected}) — entry removed"
-                        );
-                        // Terminate the writer with the structured error
-                        // BEFORE returning. Same writer-termination
-                        // requirement as the populator-NotFound
-                        // short-circuit at line ~2922 (commit a384e2e8).
-                        writer.send_error(err.clone());
-                        return Err(err);
+                        )));
                     }
                 }
                 let offset_usize = usize::try_from(offset)
@@ -2936,15 +2955,15 @@ impl StoreDriver for FastSlowStore {
                         }
                         let start_in_chunk = offset_usize.saturating_sub(pos);
                         let end_in_chunk = (end - pos).min(chunk.len());
-                        writer
+                        guard
                             .send(chunk.slice(start_in_chunk..end_in_chunk))
                             .await
                             .err_tip(|| "Failed to send in-flight data in fast_slow get_part")?;
                         pos = chunk_end;
                     }
                 }
-                writer
-                    .send_eof()
+                guard
+                    .commit_eof()
                     .err_tip(|| "Failed to send EOF for in-flight data")?;
                 debug!(
                     ?key,
@@ -2965,19 +2984,10 @@ impl StoreDriver for FastSlowStore {
                 ?key,
                 "local_only_reads: returning NotFound instead of falling through to slow store"
             );
-            let err = make_err!(
+            return Err(guard.fail(make_err!(
                 Code::NotFound,
                 "FastSlowStore local_only_reads: blob not present on this worker"
-            );
-            // Terminate the writer with the structured error BEFORE
-            // returning. Same writer-termination requirement as the
-            // populator-NotFound short-circuit at line ~2922 (commit
-            // a384e2e8). Without this, a paired reader inside
-            // VerifyStore::get_part's tokio::join! over (get_fut,
-            // check_fut) blocks forever on rx.recv() — wedging
-            // worker-public-CAS reads of missing blobs.
-            writer.send_error(err.clone());
-            return Err(err);
+            )));
         }
 
         // If the fast store is noop or read only or update only then bypass it.
@@ -2991,12 +3001,25 @@ impl StoreDriver for FastSlowStore {
             self.metrics
                 .slow_store_hit_count
                 .fetch_add(1, Ordering::Acquire);
-            self.slow_store
-                .get_part(key, writer.borrow_mut(), offset, length)
-                .await?;
+            // The slow_store's get_part contract terminates the writer on
+            // both Ok (EOF) and Err (the inner store's `?` chain calls
+            // send_error on its way out). Use ? to propagate; on Err the
+            // sub-store has already terminated `guard`, so suppress the
+            // Drop fallback to avoid double-termination. On Ok we likewise
+            // suppress (the sub-store sent EOF).
+            //
+            // Subtle: we must `commit_already_terminated()` BEFORE `?`
+            // propagation could fire the Drop fallback. So we await
+            // separately and bind the result.
+            let res = self
+                .slow_store
+                .get_part(key, &mut *guard, offset, length)
+                .await;
+            guard.commit_already_terminated();
+            res?;
             self.metrics
                 .slow_store_downloaded_bytes
-                .fetch_add(writer.get_bytes_written(), Ordering::Acquire);
+                .fetch_add(guard.get_bytes_written(), Ordering::Acquire);
             return Ok(());
         }
 
@@ -3035,11 +3058,7 @@ impl StoreDriver for FastSlowStore {
         //   misleading "fast store item evicted after populate" warn,
         //   which fired for every waiter on every failed-populate digest
         //   (1825 fires / 3 stale-positive digests / 20 min observed in
-        //   production on 2026-04-24). The early return MUST also
-        //   terminate `writer` (via `send_error`) so callers that
-        //   paired this writer with a reader inside `tokio::join!` (e.g.
-        //   `VerifyStore::get_part`'s `(get_fut, check_fut)` pattern)
-        //   don't deadlock awaiting EOF/error.
+        //   production on 2026-04-24).
         //
         // - Producer Err non-NotFound (Internal "writer dropped",
         //   Aborted, Unavailable): transient stream-level failure where
@@ -3059,47 +3078,44 @@ impl StoreDriver for FastSlowStore {
                         code = ?producer_err.code,
                         "populate already failed with NotFound, returning producer error directly"
                     );
-                    // Terminate the writer with the producer error
-                    // BEFORE returning so a paired reader (see
-                    // VerifyStore::get_part's tokio::join! pattern)
-                    // unblocks instead of awaiting bytes that never
-                    // arrive. Cloned because the original is consumed
-                    // by the return value below.
-                    writer.send_error(producer_err.clone());
-                    return Err(producer_err);
+                    return Err(guard.fail(producer_err));
                 }
                 // Non-NotFound terminal Err (Code::Internal "writer
                 // dropped", Aborted, Unavailable, etc.) — fall through
                 // to the slow-store fallback below; the blob may still
                 // be present even though the producer's stream failed.
             }
-            let bytes_before = writer.get_bytes_written();
-            return match self
+            let bytes_before = guard.get_bytes_written();
+            // Sub-call terminates the writer (EOF on Ok, send_error on Err
+            // via its own contract). Bind the result so we can suppress the
+            // Drop fallback before propagating.
+            let res = match self
                 .fast_store
-                .get_part(key.borrow(), &mut *writer, offset, length)
+                .get_part(key.borrow(), &mut *guard, offset, length)
                 .await
             {
                 Ok(()) => Ok(()),
                 Err(err)
                     if err.code == Code::NotFound
-                        && writer.get_bytes_written() == bytes_before =>
+                        && guard.get_bytes_written() == bytes_before =>
                 {
                     warn!(
                         ?key,
                         "fast store item evicted after populate, reading from slow store"
                     );
                     self.slow_store
-                        .get_part(key.borrow(), &mut *writer, offset, length)
+                        .get_part(key.borrow(), &mut *guard, offset, length)
                         .await
                 }
                 Err(err) => {
                     // Terminate the writer before returning so callers
                     // (e.g. VerifyStore's tokio::join! over a tx/rx pair)
                     // don't deadlock awaiting EOF/error.
-                    writer.send_error(err.clone());
-                    Err(err)
+                    Err(guard.fail(err))
                 }
             };
+            guard.commit_already_terminated();
+            return res;
         }
 
         // For blobs larger than the sliding window, early chunks may
@@ -3112,9 +3128,12 @@ impl StoreDriver for FastSlowStore {
                 earliest,
                 "streaming populate: chunks evicted, falling back to slow store"
             );
-            return self.slow_store
-                .get_part(key.borrow(), &mut *writer, offset, length)
+            let res = self
+                .slow_store
+                .get_part(key.borrow(), &mut *guard, offset, length)
                 .await;
+            guard.commit_already_terminated();
+            return res;
         }
 
         debug!(
@@ -3144,7 +3163,7 @@ impl StoreDriver for FastSlowStore {
                             chunk.len()
                         };
                         if start < stop {
-                            writer
+                            guard
                                 .send(chunk.slice(start..stop))
                                 .await
                                 .err_tip(|| "Failed to send streaming populate data")?;
@@ -3162,11 +3181,7 @@ impl StoreDriver for FastSlowStore {
                         // prior `loader.get_or_try_init(populate).await?`
                         // behavior so existing failpoint tests and
                         // user-visible error contracts hold.
-                        // Terminate the writer before returning so callers
-                        // (e.g. VerifyStore's tokio::join! over a tx/rx
-                        // pair) don't deadlock awaiting EOF/error.
-                        writer.send_error(err.clone());
-                        return Err(err).err_tip(|| {
+                        return Err(guard.fail(err)).err_tip(|| {
                             "populate failed for the requesting caller"
                         });
                     }
@@ -3180,7 +3195,7 @@ impl StoreDriver for FastSlowStore {
                     // no longer fire for caller cancellation (which was
                     // the production WARN flood); only genuine producer
                     // errors or sliding-window evictions reach it.
-                    let bytes_already_sent = writer.get_bytes_written();
+                    let bytes_already_sent = guard.get_bytes_written();
                     let new_offset = offset + bytes_already_sent;
                     let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
                     warn!(
@@ -3190,14 +3205,17 @@ impl StoreDriver for FastSlowStore {
                         new_offset,
                         "streaming populate reader error, falling back to slow store"
                     );
-                    return self.slow_store
-                        .get_part(key.borrow(), &mut *writer, new_offset, new_length)
+                    let res = self
+                        .slow_store
+                        .get_part(key.borrow(), &mut *guard, new_offset, new_length)
                         .await;
+                    guard.commit_already_terminated();
+                    return res;
                 }
             }
         }
-        writer
-            .send_eof()
+        guard
+            .commit_eof()
             .err_tip(|| "Failed to send EOF after streaming populate")?;
         Ok(())
     }
