@@ -1594,3 +1594,115 @@ async fn pick_slot_advances_round_robin_modulo_pool_size() -> Result<(), Error> 
     );
     Ok(())
 }
+
+/// Concurrency regression for the actual production bug shape (47K WARN +
+/// 30K ERROR / 39 min for STRLEN+EXISTS pipelines, all queued behind a
+/// single multiplexed connection). Spawn `STAMPEDE_TASKS` concurrent
+/// `pick_slot()` callers across `pool_size = STAMPEDE_POOL_SIZE`. The
+/// test asserts:
+///
+/// 1. Every slot is reached at least once. A regression where pick_slot
+///    serializes through a `Mutex<usize>` instead of the Relaxed
+///    fetch_add would still produce uniform distribution, but a
+///    regression where the next-slot counter were instead a per-task
+///    thread-local (or always returned 0) would not. The "must touch
+///    every slot under stampede" check catches both.
+///
+/// 2. The total pick count equals STAMPEDE_TASKS exactly (no dropped or
+///    repeated picks across concurrent fetch_add calls).
+///
+/// 3. Per-slot count is within ±20% of the uniform mean. Atomic fetch_add
+///    is monotone modulo pool_size, so the worst case is the last batch
+///    not completing the full cycle — well under the tolerance for the
+///    chosen STAMPEDE_TASKS / POOL_SIZE pair.
+///
+/// Wrapped in `tokio::time::timeout(5s)` per CLAUDE.md; if the pool's
+/// internal RwLocks deadlock under stampede, the timeout converts the
+/// hang into a specific test failure.
+///
+/// Mutation: replace `pick_slot` with `parking_lot::Mutex<usize>` and a
+/// .lock().await — the test would still pass (locks serialize but
+/// preserve order). Replace pick_slot with `|| 0` and assertion (1)
+/// catches it. Replace `next_slot.fetch_add(1, Ordering::Relaxed)` with
+/// `next_slot.swap(0, Ordering::Relaxed)` — assertion (1) catches (only
+/// slot 0 hit). Replace pick_slot's increment with `next_slot.load(Ordering::Relaxed)`
+/// (no advance) — assertion (1) catches.
+#[nativelink_test(flavor = "multi_thread", worker_threads = 8)]
+async fn pick_slot_concurrent_distribution_under_stampede() -> Result<(), Error> {
+    const STAMPEDE_POOL_SIZE: usize = 8;
+    const STAMPEDE_TASKS: usize = 1024;
+
+    let manager = Arc::new(
+        timeout(
+            Duration::from_secs(5),
+            StandardRedisManager::new_with_pool_size(
+                pool_connect_func(),
+                STAMPEDE_POOL_SIZE,
+            ),
+        )
+        .await
+        .expect("stampede test must not deadlock — pool init contract")?,
+    );
+
+    // Use a tokio::sync::Barrier so all tasks fire pick_slot at as close
+    // to the same instant as we can manage in user-space — this maximizes
+    // the chance of catching a non-atomic increment race.
+    let barrier = Arc::new(tokio::sync::Barrier::new(STAMPEDE_TASKS));
+    let mut handles = Vec::with_capacity(STAMPEDE_TASKS);
+    for _ in 0..STAMPEDE_TASKS {
+        let mgr = Arc::clone(&manager);
+        let bar = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            bar.wait().await;
+            mgr.pick_slot()
+        }));
+    }
+
+    let stampede_picks: Vec<usize> = timeout(Duration::from_secs(5), async {
+        let mut out = Vec::with_capacity(STAMPEDE_TASKS);
+        for h in handles {
+            out.push(h.await.expect("stampede task must not panic"));
+        }
+        out
+    })
+    .await
+    .expect("pool concurrency contract — stampede must not hang on pick_slot");
+
+    // (2) No drops/repeats: total picks == STAMPEDE_TASKS.
+    assert_eq!(
+        stampede_picks.len(),
+        STAMPEDE_TASKS,
+        "every spawned task must produce one pick"
+    );
+
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for &slot in &stampede_picks {
+        assert!(
+            slot < STAMPEDE_POOL_SIZE,
+            "pick_slot returned out-of-range index {slot} for pool {STAMPEDE_POOL_SIZE}"
+        );
+        *counts.entry(slot).or_insert(0) += 1;
+    }
+
+    // (1) All slots reachable.
+    assert_eq!(
+        counts.len(),
+        STAMPEDE_POOL_SIZE,
+        "stampede must spread across all slots — saw {} distinct slots out of {STAMPEDE_POOL_SIZE}: {counts:?}",
+        counts.len()
+    );
+
+    // (3) Distribution within ±20% of mean. STAMPEDE_TASKS / pool_size = 128;
+    // tolerance band is [102, 154]. fetch_add is monotone, so worst case
+    // (incomplete final cycle) is +/- pool_size, well inside tolerance.
+    let mean = STAMPEDE_TASKS / STAMPEDE_POOL_SIZE;
+    let tolerance = mean / 5;
+    for (slot, count) in &counts {
+        assert!(
+            (mean.saturating_sub(tolerance)..=mean + tolerance).contains(count),
+            "slot {slot} served {count} picks, expected {mean}±{tolerance}; \
+             distribution = {counts:?}"
+        );
+    }
+    Ok(())
+}
