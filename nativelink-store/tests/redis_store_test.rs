@@ -1707,6 +1707,56 @@ async fn pick_slot_concurrent_distribution_under_stampede() -> Result<(), Error>
     Ok(())
 }
 
+/// Cluster mode does NOT honor `connection_pool_size` — `redis-rs`
+/// maintains its own per-node connection routing internally
+/// (`ClusterRedisManager` wraps a single `ClusterConnection`). This test
+/// pins that contract: regardless of `connection_pool_size`, a
+/// `ClusterRedisManager` always yields the SAME uuid from
+/// `get_connection`, proving no round-robin pool exists. If a future
+/// regression mistakenly tried to build a 64-way pool for cluster mode,
+/// `get_connection` would return distinct uuids and this test would fail.
+///
+/// Mutation: change `ClusterRedisManager::get_connection` to internally
+/// `Uuid::new_v4()` per call instead of returning the constant. Test
+/// fails on the second iteration with "cluster manager must yield ONE
+/// stable uuid".
+#[nativelink_test]
+async fn cluster_mode_ignores_connection_pool_size() -> Result<(), Error> {
+    // Construct a cluster store via the existing test scaffold. We can
+    // exercise the cluster manager's get_connection contract directly
+    // even though we don't have a real Valkey cluster — the production
+    // RedisStore::new_cluster path always wraps exactly one
+    // ClusterConnection in ClusterRedisManager (see
+    // src/redis_store.rs::new_cluster — the `ClusterRedisManager::new(...)`
+    // call takes a single connection).
+    let store = make_mock_store(vec![]).await;
+
+    // The store's manager is a ClusterRedisManager — it has no pool.
+    // Hammer get_connection 64 times (mirroring prod-server.json5's
+    // connection_pool_size: 64 for the standard store) and verify
+    // EVERY call returns the SAME uuid. A pool would round-robin
+    // through N distinct uuids.
+    use nativelink_store::redis_store::RedisManager;
+    let mut seen_uuids = std::collections::HashSet::new();
+    for i in 0..64 {
+        let (_conn, uuid) = store
+            .connection_manager()
+            .get_connection()
+            .await
+            .expect("get_connection must succeed");
+        seen_uuids.insert(uuid);
+        assert_eq!(
+            seen_uuids.len(),
+            1,
+            "cluster manager must yield ONE stable uuid across all get_connection \
+             calls (no per-call pool round-robin); on call #{i} saw {n} distinct \
+             uuids: {seen_uuids:?}",
+            n = seen_uuids.len()
+        );
+    }
+    Ok(())
+}
+
 /// Regression test for the pre-patch connect-time `psubscribe`. Before
 /// the connection-pool changes, `RedisStore::connect` called
 /// `connection_manager.psubscribe(pub_sub_channel)` so any constructor

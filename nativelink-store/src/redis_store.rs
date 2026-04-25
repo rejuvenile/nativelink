@@ -698,6 +698,16 @@ where
     pub fn replace_temp_name_generator(&mut self, replacement: fn() -> String) {
         self.temp_name_generator_fn = replacement;
     }
+
+    /// Test/observability accessor for the underlying manager. Not for
+    /// production code paths — every store operation already routes
+    /// through the manager via the `M: RedisManager<C>` bound, this
+    /// accessor just exposes it for direct contract assertions in tests
+    /// (e.g. cluster-mode-ignores-pool, single-uuid-per-cluster-manager).
+    #[doc(hidden)]
+    pub fn connection_manager(&self) -> &M {
+        &self.connection_manager
+    }
 }
 
 impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
