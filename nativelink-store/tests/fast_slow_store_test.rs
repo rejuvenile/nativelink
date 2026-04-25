@@ -3004,3 +3004,137 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_local_only_reads()
 
     Ok(())
 }
+
+// ===================================================================
+// PHANTOM BLOB false-alarm regression (investigator: ae69e88918d055f5e).
+//
+// `head_was_ok` was set true whenever `head_result.is_ok()` — INCLUDING
+// the LazyExistenceOnSync branch which short-circuits to
+// `Ok(UploadSizeInfo::MaxSize(u64::MAX))` WITHOUT calling `slow.has()`.
+// The PHANTOM BLOB warn fired on every lazy-skip producer NotFound,
+// claiming `slow_store.has() returned Some` when in fact has() was
+// never called. 178 false-alarm events / 10 min on production workers
+// against 3 hot digests, classified HIGH-severity by the anomaly scan.
+//
+// The fix replaces the head_was_ok gate with a flag that is only set
+// inside the real has-then-Some branch, so the warn fires only on the
+// genuine invariant violation: has()=Some, populate=NotFound.
+// ===================================================================
+
+/// LazyExistenceOnSync slow-store + missing digest = producer NotFound,
+/// but PHANTOM BLOB must NOT fire because `has()` was never called.
+#[nativelink_test]
+async fn phantom_blob_warn_does_not_fire_on_lazy_existence_skip() -> Result<(), Error> {
+    let (fast_slow_store, _fast_store, _slow_store) = make_stores_with_lazy_slow();
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+
+    // Producer head_result short-circuits via LazyExistenceOnSync to
+    // Ok(MaxSize(u64::MAX)) without calling has(); slow_store.get
+    // then errors NotFound on the empty backing MemoryStore. Pre-fix,
+    // this would emit the PHANTOM BLOB warn.
+    let result = fast_slow_store.get_part_unchunked(digest, 0, None).await;
+    assert!(result.is_err(), "expected NotFound for missing blob");
+    assert_eq!(
+        result.unwrap_err().code,
+        Code::NotFound,
+        "expected NotFound code from missing blob",
+    );
+
+    assert!(
+        !logs_contain("PHANTOM BLOB"),
+        "PHANTOM BLOB warn fired on a LazyExistenceOnSync skip — \
+         has() was never called, so the slow-store-has-said-Some \
+         invariant cannot have been violated",
+    );
+
+    Ok(())
+}
+
+/// Companion: with a non-lazy slow store that returns Some for has(),
+/// then NotFound for get(), the PHANTOM BLOB warn MUST still fire.
+/// Guards against over-correction (gating the warn off entirely).
+#[nativelink_test]
+async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), Error> {
+    // Slow store that lies: has() reports Some, but get() reports NotFound.
+    // This is the genuine has-evict race the warn was designed to catch.
+    #[derive(MetricsComponent)]
+    struct LyingHasSlowStore {}
+
+    #[async_trait]
+    impl StoreDriver for LyingHasSlowStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            _digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            for r in results.iter_mut() {
+                *r = Some(100);
+            }
+            Ok(())
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            _digest: StoreKey<'_>,
+            _reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            _size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            _key: StoreKey<'_>,
+            _writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> Result<(), Error> {
+            Err(make_err!(Code::NotFound, "blob raced eviction between has and get"))
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    default_health_status_indicator!(LyingHasSlowStore);
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(Arc::new(LyingHasSlowStore {}));
+    let fast_slow_store = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    ));
+
+    let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
+    let result = fast_slow_store.get_part_unchunked(digest, 0, None).await;
+    assert!(result.is_err(), "expected NotFound for raced blob");
+
+    assert!(
+        logs_contain("PHANTOM BLOB"),
+        "PHANTOM BLOB warn must fire on the genuine has=Some,get=NotFound race",
+    );
+
+    Ok(())
+}

@@ -851,6 +851,15 @@ impl FastSlowStore {
             slow_store = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
             "populate run_producer entry",
         );
+        // Tracks whether `slow_store.has()` was actually called AND
+        // returned `Some(_)`. The PHANTOM BLOB invariant only applies
+        // to that case — the LazyExistenceOnSync branch short-circuits
+        // to `Ok(MaxSize(u64::MAX))` WITHOUT calling has(), so a
+        // subsequent NotFound from the populate path is a normal miss,
+        // not a has-said-Some-but-blob-vanished race. (Investigator
+        // ae69e88918d055f5e: 178 false-alarm warns / 10 min on
+        // production workers were all from this conflation.)
+        let mut has_actually_returned_some = false;
         let head_result: Result<UploadSizeInfo, Error> = async {
             // failpoint: simulate slow store being unavailable during populate.
             // exercises the error propagation path when the slow store cannot
@@ -896,11 +905,14 @@ impl FastSlowStore {
                             make_precondition_failure_any(digest),
                         )
                     })?;
+                // Only set on the true has-then-Some path so the
+                // PHANTOM BLOB warn fires only on the actual invariant
+                // violation (has=Some, populate=NotFound).
+                has_actually_returned_some = true;
                 Ok(UploadSizeInfo::ExactSize(size))
             }
         }
         .await;
-        let head_was_ok = head_result.is_ok();
         let head_elapsed_ms = producer_start.elapsed().as_millis() as u64;
         match &head_result {
             Ok(size) => info!(
@@ -1132,10 +1144,16 @@ impl FastSlowStore {
         // but the populate path (data stream / slow_store.get) reported
         // NotFound. This indicates a race or corruption between has() and
         // get() — the blob disappeared from the slow store between checks.
-        if head_was_ok {
+        // Gated on `has_actually_returned_some` (NOT `head_result.is_ok()`)
+        // because the LazyExistenceOnSync branch above returns Ok WITHOUT
+        // calling has(), and a downstream NotFound there is a normal miss,
+        // not a phantom. Demoted to `warn!` because the genuine has-evict
+        // race self-heals (the locality entry is dropped on the next
+        // try_read failure).
+        if has_actually_returned_some {
             if let Err(err) = &merged {
                 if err.code == Code::NotFound {
-                    error!(
+                    warn!(
                         %key,
                         slow_store = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
                         ?err,
