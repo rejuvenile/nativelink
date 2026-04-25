@@ -1,9 +1,55 @@
 [build]
 rustflags = ["-C", "target-cpu=native", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable"]
 
+# Linux-specific overrides. cargo concatenates [build] rustflags with the
+# matching [target.X] rustflags, so only put Linux-only flags here. Avoid
+# repeating cross-platform flags from [build] above; duplicate -C entries
+# can cause spurious cache invalidation on some cargo versions.
+#
+# - `-C link-arg=-fuse-ld=mold` cuts test-binary link wall-clock; mold is
+#   already a hard requirement on the deploy server.
+# - `-Z share-generics=y` collapses duplicate generic instantiations across
+#   crate boundaries. Big win when iterating on nativelink-store: the lib's
+#   30+ integration test binaries each used to monomorphize their own copy of
+#   tonic/prost/futures generics. After enabling, incremental
+#   `cargo build --tests -p nativelink-store` after a 1-file touch dropped
+#   from a noisy ~45-90s steady-state to ~11s in the agent benchmark.
+# - `-Z threads=64` runs the rustc front-end across up to 64 threads (cap,
+#   not target — rustc uses what it needs per invocation). Helps cold and
+#   warm builds on this 64-core box where individual rustc invocations on
+#   tonic-derived crates were single-threaded bottlenecks. Per-invocation
+#   parallelism × cargo's parallel-rustc count can theoretically
+#   oversubscribe; rustc's own work-stealing scheduler keeps it in check
+#   in practice.
+#
+# `-Z` flags require nightly; the workspace already runs nightly via the
+# rustup default. If a non-nightly toolchain is ever forced for this
+# workspace, drop the `-Z` lines below or guard them in a separate config.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable"]
+rustflags = [
+  "-C", "link-arg=-fuse-ld=mold",
+  "-Z", "share-generics=y",
+  "-Z", "threads=64",
+]
 
 [profile.release]
 lto = "thin"
 codegen-units = 8
+
+# Dev/test profile tuning: the workspace's pain point is incremental rebuilds
+# of nativelink-store + its 30+ integration test binaries. Each test binary
+# was emitting a 620MB+ ELF with full DWARF, which dominated link wall-clock.
+#
+# - `debug = "line-tables-only"` keeps backtraces useful (file:line via
+#   `addr2line`/eu-stack/panic handlers) but drops type/variable DWARF, the
+#   bulk of debug-info weight. Test binaries shrink ~5x on this workspace
+#   (620MB -> 122MB observed).
+# - `split-debuginfo = "unpacked"` writes debug info into separate `.dwo`
+#   files so re-linking doesn't re-pack it into the executable on every edit.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
