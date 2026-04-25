@@ -152,7 +152,15 @@ impl StallGuard {
                 } else {
                     format!("{label}{ctx_suffix}")
                 };
-                dump_thread_stacks(&dump_label);
+                // dump_thread_stacks may invoke a sync subprocess wait
+                // (macOS `sample`) that blocks the calling thread for up to
+                // 30s. Run on the blocking pool so we don't stall a tokio
+                // worker — the cascading runtime starvation it caused on
+                // worker-02 was worse than the wedge it was trying to
+                // diagnose.
+                let _ = tokio::task::spawn_blocking(move || {
+                    dump_thread_stacks(&dump_label);
+                });
             } else {
                 eprintln!(
                     "STORE OPERATION STALL: {label}{ctx_suffix} has been running for >{threshold:.0?} (dump rate-limited)",

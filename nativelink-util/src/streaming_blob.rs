@@ -610,7 +610,14 @@ impl StreamingBlobReader {
                         self.inner.digest,
                         producer_tid,
                     );
-                    crate::stall_detector::force_dump_thread_stacks(&label);
+                    // force_dump_thread_stacks may invoke a sync subprocess
+                    // wait (macOS `sample`) that blocks the calling thread
+                    // for up to 30s — running it on a tokio worker starves
+                    // the runtime and creates the very wedge we're trying
+                    // to diagnose. Always run on the blocking pool.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::stall_detector::force_dump_thread_stacks(&label);
+                    });
                 }
                 return Err(make_err!(
                     Code::DeadlineExceeded,
