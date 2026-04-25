@@ -1707,6 +1707,53 @@ async fn pick_slot_concurrent_distribution_under_stampede() -> Result<(), Error>
     Ok(())
 }
 
+/// Regression test for the pre-patch connect-time `psubscribe`. Before
+/// the connection-pool changes, `RedisStore::connect` called
+/// `connection_manager.psubscribe(pub_sub_channel)` so any constructor
+/// caller that set `experimental_pub_sub_channel` had a working pubsub
+/// without an explicit `subscription_manager()` call. The pool patch
+/// removed that line because re-issuing psubscribe on every newly-dialed
+/// slot would cause N-fold duplicate delivery. The fix (slot-pinned
+/// psubscribe in `new_standard` post-construction) restores the
+/// pre-patch contract WHILE respecting the pinning invariant.
+///
+/// This test verifies: a store constructed with `experimental_pub_sub_channel:
+/// Some("foo")` produces a manager whose `subscriptions` set contains "foo"
+/// AFTER `new_standard` returns and BEFORE `subscription_manager()` is
+/// called. (Asserting actual message arrival would require a real
+/// pubsub-aware fake; the structural assertion here is the appropriate
+/// scope — we trust the redis crate to actually deliver once subscribed.)
+///
+/// Mutation: remove the slot-0 `psubscribe` call from `new_standard`.
+/// Test fails with "subscriptions must contain pub_sub_channel after
+/// new_standard returns".
+#[nativelink_test]
+async fn pub_sub_channel_subscribed_at_construction_without_subscription_manager() -> Result<(), Error> {
+    let port = make_fake_redis().await;
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        experimental_pub_sub_channel: Some("test_channel".to_string()),
+        connection_pool_size: 3,
+        ..Default::default()
+    };
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("pubsub-at-construction test must not deadlock — connect contract")
+        .expect("Working spec");
+    // The store's manager should already track the pub_sub_channel as a
+    // subscription, even though we have not called `subscription_manager()`.
+    let subs = store.connection_manager_subscriptions();
+    assert!(
+        subs.iter().any(|s| s == "test_channel"),
+        "subscriptions must contain pub_sub_channel after new_standard returns; \
+         saw subscriptions = {subs:?}. \
+         Regression: connect-time psubscribe was removed; future RedisStore users \
+         that set experimental_pub_sub_channel but skip subscription_manager() get \
+         silent breakage. See red-team P3 in .claude/reviews/valkey-pool-521c13d1/red-team.md."
+    );
+    Ok(())
+}
+
 /// Pubsub-pinning structural test: `psubscribe_with` must acquire a
 /// `write()` lock on EXACTLY slot 0 (the SUBSCRIBER_SLOT) and no other
 /// slot. Verified by:

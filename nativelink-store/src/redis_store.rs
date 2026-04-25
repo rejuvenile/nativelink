@@ -317,6 +317,15 @@ where
         Some(slot.read().await)
     }
 
+    /// Test/observability helper: returns the set of subscription patterns
+    /// currently tracked for replay on subscriber-slot reconnect. Used to
+    /// verify that `RedisStore::new_standard` subscribed at construction
+    /// time when `experimental_pub_sub_channel` is configured.
+    #[doc(hidden)]
+    pub fn debug_subscriptions(&self) -> Vec<String> {
+        self.subscriptions.lock().iter().cloned().collect()
+    }
+
     /// Generic psubscribe that delegates the actual SUBSCRIBE-issuing call
     /// to the supplied async callback. The structural invariant — pubsub
     /// state is per-connection in Redis, so subscribing on N connections
@@ -700,6 +709,14 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
     /// pool size is fixed at construction.
     pub fn connection_manager_pool_size(&self) -> usize {
         self.connection_manager.pool_size()
+    }
+
+    /// Test/observability helper: returns the subscription patterns
+    /// currently tracked by the underlying manager. Used to verify
+    /// connect-time `psubscribe` ran for stores constructed with
+    /// `experimental_pub_sub_channel`.
+    pub fn connection_manager_subscriptions(&self) -> Vec<String> {
+        self.connection_manager.debug_subscriptions()
     }
 }
 
