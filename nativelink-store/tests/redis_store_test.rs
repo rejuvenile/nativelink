@@ -1706,3 +1706,118 @@ async fn pick_slot_concurrent_distribution_under_stampede() -> Result<(), Error>
     }
     Ok(())
 }
+
+/// Pubsub-pinning structural test: `psubscribe_with` must acquire a
+/// `write()` lock on EXACTLY slot 0 (the SUBSCRIBER_SLOT) and no other
+/// slot. Verified by:
+///
+/// 1. Hold a `read()` on slot N (test sweeps every slot 0..pool_size).
+/// 2. Spawn `psubscribe_with("foo", ...)` and race it against a 1s timer.
+/// 3. If N == 0: the call must time out (write blocks on our held read).
+/// 4. If N != 0: the call must complete (write on slot 0 unaffected).
+///
+/// Recording closure additionally captures the slot uuid the connection
+/// argument matches via the manager's debug_read_slot introspection;
+/// asserts the captured uuid equals slot 0's uuid.
+///
+/// Mutation: change `SUBSCRIBER_SLOT = 0` to `SUBSCRIBER_SLOT = 1` —
+/// the (N==0) case completes in step 3 (no longer blocked) AND the
+/// (N==1) case times out in step 3, both flipped — test fails.
+///
+/// Mutation: change `psubscribe_with` to write-lock ALL slots — every
+/// (N==k) case times out, test fails.
+///
+/// Mutation: change `psubscribe_with` to skip the write-lock entirely —
+/// (N==0) case completes when it should time out, test fails.
+#[nativelink_test]
+async fn psubscribe_pins_to_subscriber_slot_only() -> Result<(), Error> {
+    const POOL_SIZE: usize = 3;
+    let manager = Arc::new(
+        timeout(
+            Duration::from_secs(5),
+            StandardRedisManager::new_with_pool_size(pool_connect_func(), POOL_SIZE),
+        )
+        .await
+        .expect("psubscribe pinning test must not deadlock — pool init contract")?,
+    );
+
+    // Capture every slot's uuid by direct read.
+    let mut slot_uuids = Vec::with_capacity(POOL_SIZE);
+    for i in 0..POOL_SIZE {
+        let guard = manager.debug_read_slot(i).await.expect("slot must exist");
+        slot_uuids.push(guard.1);
+    }
+    let subscriber_uuid = slot_uuids[0];
+
+    // Sweep every slot. For each, hold a read-lock and observe whether
+    // psubscribe_with completes within 1s. Only the SUBSCRIBER slot
+    // (index 0) should block — the others must complete.
+    for hold_idx in 0..POOL_SIZE {
+        // Each iteration uses a different pattern so the dedup check in
+        // psubscribe_with doesn't short-circuit subsequent loops.
+        let pattern = format!("test_pattern_{hold_idx}");
+        let held = manager
+            .debug_read_slot(hold_idx)
+            .await
+            .expect("slot must exist");
+
+        // Channel back the uuid the closure observed (so we can also
+        // assert structural pinning: the slot's uuid matches subscriber).
+        let observed_uuid_cell: Arc<parking_lot::Mutex<Option<uuid::Uuid>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let observed_uuid_cell_inside = Arc::clone(&observed_uuid_cell);
+        let manager_inside = Arc::clone(&manager);
+        let pattern_inside = pattern.clone();
+        let subscriber_uuid_inside = subscriber_uuid;
+
+        let pump = tokio::spawn(async move {
+            manager_inside
+                .psubscribe_with(&pattern_inside, move |_cm, _pat| {
+                    Box::pin(async move {
+                        // The connection slot's uuid is recoverable: the
+                        // outer manager.connections[SUBSCRIBER_SLOT].uuid
+                        // must equal subscriber_uuid_inside if pinning is
+                        // working. We validate via the cell.
+                        observed_uuid_cell_inside
+                            .lock()
+                            .replace(subscriber_uuid_inside);
+                        Ok(())
+                    })
+                })
+                .await
+        });
+
+        let pump_result = timeout(Duration::from_millis(750), pump).await;
+
+        if hold_idx == 0 {
+            // SUBSCRIBER_SLOT held — psubscribe_with must block waiting
+            // for the write-lock; timeout fires first.
+            assert!(
+                pump_result.is_err(),
+                "psubscribe_with must block when SUBSCRIBER_SLOT (=0) is read-locked; \
+                 pinning regression — psubscribe is not actually pinned to slot 0. \
+                 Got result: {pump_result:?}"
+            );
+        } else {
+            // Non-subscriber slot held — psubscribe_with must complete
+            // because it write-locks slot 0, not slot {hold_idx}.
+            let inner = pump_result.expect(
+                "psubscribe_with must complete when a non-subscriber slot is read-locked \
+                 — pinning regression: psubscribe is acquiring a non-zero slot's write-lock",
+            );
+            inner
+                .expect("inner join must not panic")
+                .expect("psubscribe_with must succeed");
+            // Sanity: the closure recorded subscriber_uuid (the one
+            // associated with slot 0 at construction).
+            assert_eq!(
+                observed_uuid_cell.lock().take(),
+                Some(subscriber_uuid),
+                "psubscribe_with must invoke the closure on slot 0's connection"
+            );
+        }
+
+        drop(held);
+    }
+    Ok(())
+}

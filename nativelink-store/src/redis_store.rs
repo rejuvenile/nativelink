@@ -303,14 +303,75 @@ where
         let idx = self.pick_slot();
         Ok(self.connections[idx].read().await.clone())
     }
-}
 
-impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager> {
-    async fn get_connection(&self) -> Result<(ConnectionManager, Uuid), Error> {
-        self.get_connection_generic().await
+    /// Test-only: take a read-lock on a specific slot index. Used by
+    /// pubsub-pinning tests that observe which slot's write-lock
+    /// `psubscribe_with` acquires by detecting blocking on a held read.
+    /// Returns `None` if `slot_idx >= pool_size`.
+    #[doc(hidden)]
+    pub async fn debug_read_slot(
+        &self,
+        slot_idx: usize,
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, (C, Uuid)>> {
+        let slot = self.connections.get(slot_idx)?;
+        Some(slot.read().await)
     }
 
-    async fn reconnect(&self, uuid: Uuid) -> Result<(ConnectionManager, Uuid), Error> {
+    /// Generic psubscribe that delegates the actual SUBSCRIBE-issuing call
+    /// to the supplied async callback. The structural invariant — pubsub
+    /// state is per-connection in Redis, so subscribing on N connections
+    /// would deliver each message N times — is enforced here: only
+    /// [`SUBSCRIBER_SLOT`]'s write-lock is acquired, the callback is
+    /// invoked exactly once with that single slot's connection, and the
+    /// pattern is recorded in `subscriptions` for replay on reconnect of
+    /// that slot.
+    ///
+    /// `RedisManager<ConnectionManager>` calls this with a closure that
+    /// invokes the inherent `ConnectionManager::psubscribe` method. Tests
+    /// can pass a recording closure that observes which slot's connection
+    /// was passed in to verify the pinning.
+    pub async fn psubscribe_with<F>(
+        &self,
+        pattern: &str,
+        psubscribe_call: F,
+    ) -> Result<(), Error>
+    where
+        F: for<'a> FnOnce(
+                &'a mut C,
+                &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>
+            + Send,
+    {
+        // Pubsub is pinned to the subscriber slot — see SUBSCRIBER_SLOT doc.
+        let new_subscription = self.subscriptions.lock().insert(String::from(pattern));
+        if new_subscription {
+            let mut guard = self.connections[SUBSCRIBER_SLOT].write().await;
+            let result = psubscribe_call(&mut guard.0, pattern).await;
+            if result.is_err() {
+                self.subscriptions.lock().remove(pattern);
+            }
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Generic reconnect that delegates the per-pattern psubscribe replay
+    /// to the supplied async callback. Same structural invariant as
+    /// `psubscribe_with`: only [`SUBSCRIBER_SLOT`]'s reconnect path
+    /// re-applies subscriptions; all other slots never carry pubsub.
+    pub async fn reconnect_with<F>(
+        &self,
+        uuid: Uuid,
+        psubscribe_call: F,
+    ) -> Result<(C, Uuid), Error>
+    where
+        F: for<'a> Fn(
+                &'a mut C,
+                String,
+            ) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>
+            + Send
+            + Sync,
+    {
         // Find the slot that owns this uuid. Linear scan is fine — pool size
         // is in the dozens at most.
         for (slot_idx, slot) in self.connections.iter().enumerate() {
@@ -329,7 +390,7 @@ impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager>
                     guard.iter().cloned().collect::<Vec<_>>()
                 };
                 for subscription in subscriptions {
-                    connection_manager.psubscribe(&subscription).await?;
+                    psubscribe_call(&mut connection_manager, subscription).await?;
                 }
             }
             *guard = (connection_manager.clone(), new_uuid);
@@ -337,7 +398,24 @@ impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager>
         }
         // Uuid no longer matches any slot — caller's connection was already
         // rotated by a prior reconnect. Hand back a fresh one via round-robin.
-        self.get_connection().await
+        self.get_connection_generic().await
+    }
+}
+
+impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager> {
+    async fn get_connection(&self) -> Result<(ConnectionManager, Uuid), Error> {
+        self.get_connection_generic().await
+    }
+
+    async fn reconnect(&self, uuid: Uuid) -> Result<(ConnectionManager, Uuid), Error> {
+        self.reconnect_with(uuid, |cm, pattern| {
+            Box::pin(async move {
+                cm.psubscribe(&pattern)
+                    .await
+                    .err_tip(|| format!("psubscribe replay on reconnect for pattern {pattern}"))
+            })
+        })
+        .await
     }
 
     fn update_script(&self, key: &str) -> redis::ScriptInvocation<'_> {
@@ -345,17 +423,14 @@ impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager>
     }
 
     async fn psubscribe(&self, pattern: &str) -> Result<(), Error> {
-        // Pubsub is pinned to the subscriber slot — see SUBSCRIBER_SLOT doc.
-        let new_subscription = self.subscriptions.lock().insert(String::from(pattern));
-        if new_subscription {
-            let mut guard = self.connections[SUBSCRIBER_SLOT].write().await;
-            let result = guard.0.psubscribe(pattern).await;
-            if result.is_err() {
-                self.subscriptions.lock().remove(pattern);
-            }
-            result?;
-        }
-        Ok(())
+        self.psubscribe_with(pattern, |cm, pattern| {
+            Box::pin(async move {
+                cm.psubscribe(pattern)
+                    .await
+                    .err_tip(|| format!("psubscribe for pattern {pattern}"))
+            })
+        })
+        .await
     }
 }
 
