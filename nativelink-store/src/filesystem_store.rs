@@ -31,7 +31,7 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::background_spawn;
 use nativelink_util::buf_channel::{
-    DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair,
+    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::evicting_map::LenEntry;
@@ -1548,21 +1548,14 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        // Subordinate guard: FilesystemStore is a leaf and may be wrapped
-        // by FastSlowStore's "try fast then slow" fall-through. Active
-        // Drop would `send_error` on NotFound and poison the slow-store
-        // fallback. The wrapper layer's own active guard catches contract
-        // violations via `commit_delegated_if_ok(&res)`. See
-        // `WriteHalfGuard::new_subordinate` rustdoc.
-        let mut guard = WriteHalfGuard::new_subordinate(writer);
-
         if is_zero_digest(key.borrow()) {
             self.has(key.borrow())
                 .await
                 .err_tip(|| "Failed to check if zero digest exists in filesystem store")?;
-            return guard
-                .commit_eof()
-                .err_tip(|| "Failed to send zero EOF in filesystem store get_part");
+            writer
+                .send_eof()
+                .err_tip(|| "Failed to send zero EOF in filesystem store get_part")?;
+            return Ok(());
         }
         let owned_key = key.into_owned();
         let owned_key_for_check = owned_key.borrow().into_owned();
@@ -1614,9 +1607,9 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // other and keeping them in page cache avoids redundant disk I/O
         // (measured: 76% of read I/O is re-reads). On RAM-constrained
         // deployments, enable fadvise_dontneed to drop pages after each read.
-        let bytes_before_read = guard.get_bytes_written();
+        let bytes_before_read = writer.get_bytes_written();
         let file_slot = fs::read_file_to_channel(
-            temp_file, &mut *guard, read_limit, self.read_buffer_size, offset,
+            temp_file, writer, read_limit, self.read_buffer_size, offset,
         )
         .await
         .err_tip(|| "Failed to read data in filesystem store")?;
@@ -1628,7 +1621,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         // the workaround in grpc_store.rs (now removed). Detect, evict
         // the corrupt entry from the evicting_map so the upper layer
         // re-fetches from a different source, and return NotFound.
-        let bytes_written = guard.get_bytes_written() - bytes_before_read;
+        let bytes_written = writer.get_bytes_written() - bytes_before_read;
         if bytes_written == 0 {
             let expected_size = match owned_key_for_check.borrow() {
                 StoreKey::Digest(d) => d.size_bytes(),
@@ -1657,8 +1650,8 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         if self.fadvise_dontneed {
             file_slot.advise_dontneed();
         }
-        guard
-            .commit_eof()
+        writer
+            .send_eof()
             .err_tip(|| "Filed to send EOF in filesystem store get_part")?;
         Ok(())
     }

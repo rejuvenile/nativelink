@@ -26,7 +26,7 @@ use nativelink_config::stores::MemorySpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use tracing::{debug, error};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::health_utils::{
@@ -266,14 +266,6 @@ impl StoreDriver for MemoryStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        // Subordinate guard: MemoryStore is a leaf and may be wrapped by
-        // FastSlowStore's "try fast then slow" fall-through. Active Drop
-        // would `send_error` on NotFound and poison the slow-store
-        // fallback (broken pipe). The wrapper layer's own active guard
-        // catches contract violations via `commit_delegated_if_ok(&res)`.
-        // See `WriteHalfGuard::new_subordinate` rustdoc.
-        let mut guard = WriteHalfGuard::new_subordinate(writer);
-
         let mut offset =
             usize::try_from(offset).err_tip(|| "Could not convert offset to usize")?;
         let length = length
@@ -282,9 +274,10 @@ impl StoreDriver for MemoryStore {
 
         let owned_key = key.into_owned();
         if is_zero_digest(owned_key.clone()) {
-            return guard
-                .commit_eof()
-                .err_tip(|| "Failed to send zero EOF in memory store get_part");
+            writer
+                .send_eof()
+                .err_tip(|| "Failed to send zero EOF in memory store get_part")?;
+            return Ok(());
         }
 
         let value = self
@@ -331,7 +324,7 @@ impl StoreDriver for MemoryStore {
             remaining -= slice.len();
             bytes_sent_total += slice.len();
             offset = 0;
-            let send_result = guard.send(slice).await;
+            let send_result = writer.send(slice).await;
             if let Err(e) = send_result {
                 error!(
                     key = ?owned_key,
@@ -365,8 +358,8 @@ impl StoreDriver for MemoryStore {
                  (total_len={total_len}, actual_data={actual_data_len}, chunks={num_chunks}, sent={chunks_sent})"
             ));
         }
-        guard
-            .commit_eof()
+        writer
+            .send_eof()
             .err_tip(|| "Failed to write EOF in memory store get_part")?;
         Ok(())
     }
