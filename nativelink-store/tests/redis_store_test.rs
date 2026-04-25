@@ -23,8 +23,8 @@ use nativelink_config::stores::{RedisMode, RedisSpec};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_redis_tester::{
-    ReadOnlyRedis, add_lua_script, fake_redis_sentinel_master_stream, fake_redis_sentinel_stream,
-    fake_redis_stream, make_fake_redis_with_responses,
+    ReadOnlyRedis, add_lua_script, add_to_response_raw, fake_redis_sentinel_master_stream,
+    fake_redis_sentinel_stream, fake_redis_stream, make_fake_redis_with_responses,
 };
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
 use nativelink_store::redis_store::{
@@ -1729,7 +1729,17 @@ async fn pick_slot_concurrent_distribution_under_stampede() -> Result<(), Error>
 /// new_standard returns".
 #[nativelink_test]
 async fn pub_sub_channel_subscribed_at_construction_without_subscription_manager() -> Result<(), Error> {
-    let port = make_fake_redis().await;
+    // Build a fake-redis response set that handles PSUBSCRIBE on
+    // "test_channel" (the redis-rs crate's psubscribe sends this; we
+    // need a non-empty RESP3 push response so exec_async returns Ok).
+    let mut responses = add_lua_version_script(fake_redis_stream());
+    add_to_response_raw(
+        &mut responses,
+        &redis::cmd("PSUBSCRIBE").arg("test_channel"),
+        // RESP3 push: >3\r\n+psubscribe\r\n+test_channel\r\n:1\r\n
+        ">3\r\n+psubscribe\r\n+test_channel\r\n:1\r\n".to_string(),
+    );
+    let port = make_fake_redis_with_responses(responses).await;
     let spec = RedisSpec {
         addresses: vec![format!("redis://127.0.0.1:{port}/")],
         experimental_pub_sub_channel: Some("test_channel".to_string()),

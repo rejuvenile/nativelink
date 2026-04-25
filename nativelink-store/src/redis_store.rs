@@ -886,23 +886,49 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
         let (tx, subscriber_channel) = unbounded_channel();
         let command_timeout = Duration::from_millis(spec.command_timeout_ms);
         let pool_size = spec.connection_pool_size;
+        // Clone non-Copy spec fields BEFORE the `spec` value moves into the
+        // connect_func closure below.
+        let pub_sub_channel = spec.experimental_pub_sub_channel.clone();
+        let key_prefix = spec.key_prefix.clone();
+        let read_chunk_size = spec.read_chunk_size;
+        let max_chunk_uploads_per_update = spec.max_chunk_uploads_per_update;
+        let scan_count = spec.scan_count;
+        let max_client_permits = spec.max_client_permits;
+        let max_count_per_cursor = spec.max_count_per_cursor;
+
+        let manager = StandardRedisManager::new_with_pool_size(
+            Box::new(move || Box::pin(Self::connect(spec.clone(), tx.clone()))),
+            pool_size,
+        )
+        .await?;
+
+        // Restore pre-patch contract: if a pub-sub channel was configured,
+        // subscribe at construction time so callers that never invoke
+        // `subscription_manager()` still receive messages. Pinning to
+        // SUBSCRIBER_SLOT (slot 0) is enforced inside `psubscribe` — the
+        // connect-time call no longer goes through every newly-dialed slot
+        // (which would N-fold-deliver). See red-team P3 and
+        // `pub_sub_channel_subscribed_at_construction_*` test for the
+        // regression this guards against.
+        if let Some(channel) = pub_sub_channel.as_deref() {
+            manager
+                .psubscribe(channel)
+                .await
+                .err_tip(|| format!("connect-time psubscribe for pub_sub_channel {channel}"))?;
+        }
 
         Self::new_from_builder_and_parts(
-            spec.experimental_pub_sub_channel.clone(),
+            pub_sub_channel,
             || Uuid::new_v4().to_string(),
-            spec.key_prefix.clone(),
-            spec.read_chunk_size,
-            spec.max_chunk_uploads_per_update,
-            spec.scan_count,
-            spec.max_client_permits,
-            spec.max_count_per_cursor,
+            key_prefix,
+            read_chunk_size,
+            max_chunk_uploads_per_update,
+            scan_count,
+            max_client_permits,
+            max_count_per_cursor,
             command_timeout * 2,
             subscriber_channel,
-            StandardRedisManager::new_with_pool_size(
-                Box::new(move || Box::pin(Self::connect(spec.clone(), tx.clone()))),
-                pool_size,
-            )
-            .await?,
+            manager,
         )
         .await
         .map(Arc::new)
