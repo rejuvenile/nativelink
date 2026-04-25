@@ -685,8 +685,18 @@ impl WorkerProxyStore {
             return Ok(false);
         }
 
+        // Diagnostic: capture the caller's intent so we can correlate
+        // weird per-attempt offsets in the loop below against what was
+        // originally requested. The "0-byte success for non-zero blob"
+        // warns we've been chasing show offsets >> digest.size_bytes(),
+        // which can only originate from the resume-from-offset logic
+        // accumulating bytes_written_total wrongly across peer attempts.
+        let digest_size = digest.size_bytes();
         info!(
             ?digest,
+            digest_size,
+            caller_offset = offset,
+            caller_length = ?length,
             worker_count = workers.len(),
             "WorkerProxyStore: attempting to proxy blob from workers"
         );
@@ -698,7 +708,31 @@ impl WorkerProxyStore {
         let mut remaining_length = length;
 
         for endpoint in &workers {
-            info!(?digest, endpoint = %endpoint, "worker_proxy: peer attempt entered");
+            // Diagnostic: log the per-attempt offset and flag the
+            // smoking-gun pattern (offset already past EOF before the
+            // RPC even fires). When this warn triggers, the bug is
+            // upstream of the peer — bytes_written_total accumulated
+            // wrongly in a previous attempt.
+            if current_offset >= digest_size && digest_size > 0 {
+                warn!(
+                    ?digest,
+                    endpoint = %endpoint,
+                    digest_size,
+                    current_offset,
+                    bytes_before_proxy,
+                    bytes_written_so_far = writer.get_bytes_written() - bytes_before_proxy,
+                    "WorkerProxyStore: about to issue peer read with offset >= digest_size \
+                     — bytes_written_total accumulated wrongly in a prior attempt; \
+                     peer will return Ok+EOF (the 0-byte-success warn we've been chasing)"
+                );
+            }
+            info!(
+                ?digest,
+                endpoint = %endpoint,
+                current_offset,
+                remaining_length = ?remaining_length,
+                "worker_proxy: peer attempt entered"
+            );
             let Some(store) = self.get_or_create_connection(endpoint).await else {
                 info!(?digest, endpoint = %endpoint, "worker_proxy: peer attempt skipped (no connection)");
                 continue;
@@ -786,6 +820,28 @@ impl WorkerProxyStore {
                     );
                     let bytes_written_total =
                         writer.get_bytes_written() - bytes_before_proxy;
+                    let next_offset = offset + bytes_written_total;
+                    // Diagnostic: if the resume math produces an offset that
+                    // exceeds digest_size, the bytes_written_total has gone
+                    // wrong (peer responded with bytes from a DIFFERENT blob,
+                    // OR the writer inherited bytes from a prior call). This
+                    // is the upstream cause of the "0-byte success for
+                    // non-zero blob" warns we've been chasing — the next
+                    // peer attempt issues a Read at offset > size, gets EOF.
+                    if digest_size > 0 && next_offset > digest_size {
+                        warn!(
+                            ?digest,
+                            endpoint = %endpoint,
+                            digest_size,
+                            caller_offset = offset,
+                            bytes_written_total,
+                            next_offset,
+                            overshoot = next_offset - digest_size,
+                            "WorkerProxyStore: resume bump produced offset > digest_size — \
+                             bytes_written_total is wrong (writer accumulated unrelated bytes); \
+                             next peer will be asked for offset past EOF"
+                        );
+                    }
                     warn!(
                         ?digest,
                         endpoint = %endpoint,
@@ -793,10 +849,10 @@ impl WorkerProxyStore {
                         ?e,
                         "WorkerProxyStore: streaming get_part from peer failed, \
                          will resume from next peer at offset {}",
-                        offset + bytes_written_total,
+                        next_offset,
                     );
                     // Advance offset so the next peer picks up where this one left off.
-                    current_offset = offset + bytes_written_total;
+                    current_offset = next_offset;
                     if let Some(len) = remaining_length {
                         remaining_length =
                             Some(len.saturating_sub(bytes_written_total));
@@ -1017,13 +1073,30 @@ impl WorkerProxyStore {
         // post-peer-fallback bytes-written guard a few hundred lines below
         // (search for `bytes_written_by_workers`).
         let bytes_before_inner = writer.get_bytes_written();
-        match IS_WORKER_REQUEST
+        let inner_await_start = std::time::Instant::now();
+        let _digest_for_log = key.borrow().into_digest();
+        info!(
+            digest = ?_digest_for_log,
+            offset,
+            length = ?length,
+            "WorkerProxyStore::get_part_sequential: awaiting inner.get_part (will reveal whether NotFound returns or stream hangs)"
+        );
+        let inner_result = IS_WORKER_REQUEST
             .scope(
                 true,
                 self.inner.get_part(key.borrow(), &mut *writer, offset, length),
             )
-            .await
-        {
+            .await;
+        let inner_elapsed_ms = inner_await_start.elapsed().as_millis() as u64;
+        info!(
+            digest = ?_digest_for_log,
+            inner_elapsed_ms,
+            ok = inner_result.is_ok(),
+            code = ?inner_result.as_ref().err().map(|e| e.code),
+            bytes_written_by_inner = writer.get_bytes_written() - bytes_before_inner,
+            "WorkerProxyStore::get_part_sequential: inner.get_part returned"
+        );
+        match inner_result {
             Ok(()) => return Ok(()),
             Err(e) if should_try_peers(e.code) => {
                 let bytes_written_by_inner =
