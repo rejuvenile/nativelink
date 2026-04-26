@@ -139,7 +139,16 @@ enum ChunkAttemptOutcome {
 /// `ENHANCE_YOUR_CALM` directly (server's GOAWAY reason).
 ///
 /// `Internal` is gated on a message check to avoid evicting on
-/// server-app `make_err!(Internal, ...)` from valid RPCs.
+/// server-app `make_err!(Internal, ...)` from valid RPCs. The h2 GOAWAY
+/// shapes covered:
+///   * "Tried to send while stream is closed" — production wedge signature.
+///   * "h2 protocol error" — generic h2 framing/protocol failure.
+///   * "buffer's worker closed unexpectedly" — h2 buffer task died.
+///   * "h2 connection error" — the long-form h2 connection error message.
+///   * "connection error" — the short-form h2 connection error message
+///     (covers "connection error: the server sent GOAWAY" and similar
+///     hyper/h2 surfacings).
+///   * "broken pipe" — write to a half-closed socket.
 fn looks_like_dead_channel(err: &Error) -> bool {
     match err.code {
         Code::Unavailable | Code::Unknown | Code::ResourceExhausted => true,
@@ -148,6 +157,7 @@ fn looks_like_dead_channel(err: &Error) -> bool {
                 || m.contains("h2 protocol error")
                 || m.contains("buffer's worker closed unexpectedly")
                 || m.contains("h2 connection error")
+                || m.contains("connection error")
                 || m.contains("broken pipe")
         }),
         _ => false,
