@@ -807,3 +807,146 @@ impl Stream for DropCloserReadHalf {
     }
 }
 
+/// Inline `#[cfg(test)]` tests for the operator-facing slow-recv warn
+/// diagnostics. These tests probe the **private** `diag` field on
+/// `DropCloserReadHalf` and the **private** `ChannelDiagSnapshot` type, so
+/// they cannot live in the integration-test crate. Per CLAUDE.md
+/// "Integration tests in `tests/` directory; minimal inline `#[cfg(test)]`
+/// modules" — keeping these inline is the documented exception when the
+/// test needs private-field access.
+///
+/// Restored after a prior trim (commit `d79542e6`) deleted them on the
+/// mistaken assumption that `diag` was reachable from outside the crate.
+/// The diagnostic these tests guard (`producer_task_id`,
+/// `last_send_at_epoch_ms`, `sends_total` in the slow-recv warn at
+/// `recv()`) is operator-facing — without them, a refactor that silently
+/// breaks producer attribution would lose the most useful field in
+/// production stall investigations.
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    /// Spec: a freshly-constructed channel reports `last_send_at_epoch_ms == 0`
+    /// and `sends_total == 0`; the producer task id is unset until the first
+    /// successful `send`. The reader-side slow-recv warn relies on this to
+    /// distinguish "channel never produced" from "producer went silent".
+    #[tokio::test]
+    async fn diag_default_state_has_no_sends() {
+        let (_tx, rx) = make_buf_channel_pair();
+        let snap = rx.diag.snapshot();
+        assert!(
+            snap.producer_task_id.is_none(),
+            "producer_task_id MUST be None before any send"
+        );
+        assert_eq!(
+            snap.last_send_at_epoch_ms, 0,
+            "last_send_at_epoch_ms MUST be 0 before any send"
+        );
+        assert_eq!(
+            snap.sends_total, 0,
+            "sends_total MUST be 0 before any send"
+        );
+    }
+
+    /// Spec: after a successful `send`, the diag snapshot MUST report the
+    /// producer task id, a positive last-send timestamp, and incremented
+    /// sends_total. This is the data the slow-recv warn formats into the
+    /// log line at `recv()`.
+    #[tokio::test]
+    async fn diag_records_first_send() {
+        let (mut tx, rx) = make_buf_channel_pair();
+        // Move the writer into a spawned task so the captured task id
+        // refers to a different task than the test's main task — proves
+        // the capture is task-local to the *sender*, not whoever
+        // constructed the pair.
+        let producer_id = tokio::spawn(async move {
+            let pid = tokio::task::try_id().unwrap().to_string();
+            tx.send(Bytes::from_static(b"hi")).await.unwrap();
+            pid
+        })
+        .await
+        .unwrap();
+
+        let snap = rx.diag.snapshot();
+        assert_eq!(
+            snap.producer_task_id.as_deref(),
+            Some(producer_id.as_str()),
+            "diag MUST record the spawned producer task id, not the constructor's task"
+        );
+        assert!(
+            snap.last_send_at_epoch_ms > 0,
+            "last_send_at_epoch_ms MUST be set after a successful send"
+        );
+        assert_eq!(
+            snap.sends_total, 1,
+            "sends_total MUST be 1 after one successful send"
+        );
+    }
+
+    /// Spec: subsequent sends MUST keep the FIRST producer's task id (so
+    /// switching tasks mid-stream does not erase the original attribution),
+    /// and MUST advance last_send_at_epoch_ms / sends_total.
+    ///
+    /// Note: the producer runs inside a `tokio::spawn` rather than directly
+    /// in the `#[tokio::test]` body because `tokio::task::try_id()` returns
+    /// `None` from `block_on` futures — i.e. the test body itself is not a
+    /// "task" in tokio's sense. In production every send originates from a
+    /// spawned task (gRPC handler, `tokio::spawn` worker, etc.), so this is
+    /// the realistic path.
+    #[tokio::test]
+    async fn diag_keeps_first_producer_across_sends() {
+        let (tx, rx) = make_buf_channel_pair();
+        // Two-way handshake so the producer waits for the test driver to
+        // snapshot snap1 before issuing send "b". Without this gate the
+        // producer can race ahead of the snapshot — sends_total would be
+        // 2 by the time we look. Per CLAUDE.md "no sleep as
+        // synchronization": use channels, not timing, to serialize.
+        let (after_first, mut wait_first) = tokio::sync::mpsc::channel::<()>(1);
+        let (proceed_to_second, mut wait_to_proceed) = tokio::sync::mpsc::channel::<()>(1);
+        let (after_second, mut wait_second) = tokio::sync::mpsc::channel::<()>(1);
+
+        let producer = tokio::spawn(async move {
+            let pid = tokio::task::try_id().unwrap().to_string();
+            let mut tx = tx;
+            tx.send(Bytes::from_static(b"a")).await.unwrap();
+            after_first.send(()).await.unwrap();
+            // Block until the test driver has read snap1, then proceed.
+            wait_to_proceed.recv().await.unwrap();
+            tx.send(Bytes::from_static(b"b")).await.unwrap();
+            after_second.send(()).await.unwrap();
+            pid
+        });
+
+        // Snapshot after the first send (producer is blocked on
+        // `wait_to_proceed.recv` so sends_total is exactly 1).
+        wait_first.recv().await.unwrap();
+        let snap1 = rx.diag.snapshot();
+        assert_eq!(snap1.sends_total, 1);
+        let ts1 = snap1.last_send_at_epoch_ms;
+        let first_id = snap1.producer_task_id.clone().unwrap();
+
+        // Release the producer to issue the second send.
+        proceed_to_second.send(()).await.unwrap();
+
+        // Snapshot after the second send.
+        wait_second.recv().await.unwrap();
+        let snap2 = rx.diag.snapshot();
+        assert_eq!(
+            snap2.producer_task_id.as_deref(),
+            Some(first_id.as_str()),
+            "first producer attribution MUST persist across subsequent sends"
+        );
+        assert!(
+            snap2.last_send_at_epoch_ms >= ts1,
+            "last_send_at_epoch_ms MUST advance (or stay equal under coarse clock)"
+        );
+        assert_eq!(
+            snap2.sends_total, 2,
+            "sends_total MUST count every successful send"
+        );
+
+        let final_pid = producer.await.unwrap();
+        assert_eq!(final_pid, first_id);
+    }
+}
+
