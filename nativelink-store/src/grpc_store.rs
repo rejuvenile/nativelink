@@ -1585,6 +1585,15 @@ impl GrpcStore {
     /// channels. Peak memory is bounded to approximately
     /// `chunk_count × channel_size × frame_size` (~32 MiB for 4 chunks)
     /// regardless of total blob size.
+    ///
+    /// `total_length` is the post-offset byte count the caller wants
+    /// returned (already clamped to fit within the blob by the caller
+    /// at `get_part`). `blob_size` is the FULL declared blob size from
+    /// `digest.size_bytes()` and is used solely to bound `chunk_count`
+    /// so the splitter never produces a chunk that lies past EOF — the
+    /// distinction matters when a caller passes a small `length` from
+    /// a large blob (only `blob_size` is the right ceiling for chunk
+    /// math; `total_length` could be much smaller than the blob).
     async fn get_part_parallel(
         &self,
         resource_name: &str,
@@ -2357,12 +2366,18 @@ impl StoreDriver for GrpcStore {
         }
 
         // Single-stream path for small blobs or when parallel reads
-        // are disabled.
+        // are disabled. Forward the clamped `effective_length` (not
+        // the raw caller-supplied `length`) for symmetry with the
+        // parallel branch above. REAPI ByteStream `read_limit` is
+        // server-side clamped, so passing the un-clamped value would
+        // be harmless on the wire today; tightening here prevents a
+        // future refactor that uses `length` for client-side
+        // allocation/timing from inheriting the un-clamped value.
         self.get_part_single_stream(
             resource_name,
             writer,
             offset,
-            length,
+            Some(effective_length),
         )
         .await
     }
