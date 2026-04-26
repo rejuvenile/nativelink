@@ -80,8 +80,17 @@ pub fn nativelink_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #crate_ident::common::reseed_rng_for_test().unwrap();
                     let res = #fn_block;
                     logs_assert(|lines: &[&str]| {
+                        // Catch unredacted Bytes payloads emitted by OUR
+                        // tracing calls. Our structured-field convention is
+                        // `data=b"..."` (the Debug formatter for Bytes
+                        // produces `b"..."`). Free-form messages from
+                        // third-party crates (e.g. aws-runtime's
+                        // `tracing::trace!("remaining chunk data: {:#?}",
+                        // chunk)`) emit `data: b"..."` with a colon, NOT
+                        // `data=b"..."` — those are out-of-scope and would
+                        // trigger an unfixable false positive here.
                         for line in lines {
-                            if line.contains(" data: b") {
+                            if line.contains(" data=b\"") {
                                 return Err(format!("Non-redacted data in \"{line}\""));
                             }
                         }
