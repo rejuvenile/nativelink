@@ -23,8 +23,8 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation, Store, StoreDriver,
-    StoreKey, StoreLike, UploadSizeInfo,
+    DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
+    Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use tokio::join;
 use tracing::warn;
@@ -294,11 +294,11 @@ impl StoreDriver for SizePartitioningStore {
     /// this declaration the trait silently inherited noop defaults and the
     /// production `cas_STORE` chain dropped 458K+ digests/day for 31 days.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        let mut children = DelegationChildren::new();
+        children.push(self.lower_store.as_store_driver());
+        children.push(self.upper_store.as_store_driver());
         StableDigestDelegation::Many {
-            children: vec![
-                self.lower_store.as_store_driver(),
-                self.upper_store.as_store_driver(),
-            ],
+            children,
             merged_state: &self.merged_stable_notify,
         }
     }
@@ -311,10 +311,10 @@ impl StoreDriver for SizePartitioningStore {
     /// `pin_digests_with_results`; the OR-merge in the trait default
     /// surfaces the success.)
     fn pin_delegation(&self) -> PinDelegation<'_> {
-        PinDelegation::Many(vec![
-            self.lower_store.as_store_driver(),
-            self.upper_store.as_store_driver(),
-        ])
+        let mut children = DelegationChildren::new();
+        children.push(self.lower_store.as_store_driver());
+        children.push(self.upper_store.as_store_driver());
+        PinDelegation::Many(children)
     }
 }
 

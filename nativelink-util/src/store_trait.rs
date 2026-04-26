@@ -30,6 +30,7 @@ use bytes::Bytes;
 use futures::{Future, FutureExt, Stream, StreamExt, join, try_join};
 use futures::stream::FuturesUnordered;
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
+use smallvec::SmallVec;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -179,6 +180,14 @@ pub struct MergedNotifyState {
     pub aborters: Vec<AbortOnDrop>,
 }
 
+/// Inline-capacity for `Many`-arm child slices. Production wrappers are
+/// 2 children deep (SizePartitioning, Dedup, FastSlowStore). ShardStore
+/// can be larger but is typically 2-3 shards. Stack-allocate up to 4
+/// children — beyond that SmallVec spills to heap, identical to Vec
+/// behavior. Closes perf-optimizer Finding 2 (MAJOR — per-call Vec
+/// allocation on the worker hot path that runs ~500-1000×/sec).
+pub type DelegationChildren<'a> = SmallVec<[&'a (dyn StoreDriver + 'static); 4]>;
+
 /// Delegation strategy for stable-digest aggregation methods on a store.
 ///
 /// The `StoreDriver` trait once shipped silent no-op defaults for
@@ -213,7 +222,7 @@ pub enum StableDigestDelegation<'a> {
     /// captures the forwarder JoinHandles in the state so they get
     /// aborted when the wrapper drops (closes F2 task leak).
     Many {
-        children: Vec<&'a (dyn StoreDriver + 'static)>,
+        children: DelegationChildren<'a>,
         merged_state: &'a OnceLock<MergedNotifyState>,
     },
     /// Pure passthrough — same dispatch as [`Self::Inner`] but documents
@@ -254,7 +263,7 @@ pub enum PinDelegation<'a> {
     /// Multi-inner wrapper — fans out the pin to every inner store. For
     /// `pin_digests_with_results`, the per-digest result is the OR across
     /// inner results (any-store-pinned counts as success).
-    Many(Vec<&'a (dyn StoreDriver + 'static)>),
+    Many(DelegationChildren<'a>),
     /// Pure passthrough — same dispatch as [`Self::Inner`] but documents
     /// intent for resolved-by-name wrappers (e.g. `RefStore`).
     Passthrough(&'a (dyn StoreDriver + 'static)),

@@ -37,8 +37,9 @@ use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::fs;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    IS_MIRROR_REQUEST, ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver,
-    StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo, slow_update_store_with_file,
+    DelegationChildren, IS_MIRROR_REQUEST, ItemCallback, PinDelegation, StableDigestDelegation,
+    Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+    slow_update_store_with_file,
 };
 use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
 use parking_lot::Mutex;
@@ -3339,10 +3340,10 @@ impl StoreDriver for FastSlowStore {
     /// (the slow one because in worker `FastSlowStore { fast: Memory, slow:
     /// Filesystem }` the actual pin lives on the slow tier). Hence `Many`.
     fn pin_delegation(&self) -> PinDelegation<'_> {
-        PinDelegation::Many(vec![
-            self.fast_store.as_store_driver(),
-            self.slow_store.as_store_driver(),
-        ])
+        let mut children = DelegationChildren::new();
+        children.push(self.fast_store.as_store_driver());
+        children.push(self.slow_store.as_store_driver());
+        PinDelegation::Many(children)
     }
 
     fn drain_stable_digests(&self) -> Vec<DigestInfo> {

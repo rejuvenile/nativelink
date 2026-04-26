@@ -27,8 +27,8 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::fastcdc::FastCDC;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation, Store, StoreDriver,
-    StoreKey, StoreLike, UploadSizeInfo,
+    DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
+    Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::FramedRead;
@@ -425,11 +425,11 @@ impl StoreDriver for DedupStore {
     /// a FastSlowStore). Trait default concatenates drains and lazily
     /// builds a merged Notify woken by either inner.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        let mut children = DelegationChildren::new();
+        children.push(self.index_store.as_store_driver());
+        children.push(self.content_store.as_store_driver());
         StableDigestDelegation::Many {
-            children: vec![
-                self.index_store.as_store_driver(),
-                self.content_store.as_store_driver(),
-            ],
+            children,
             merged_state: &self.merged_stable_notify,
         }
     }
@@ -439,10 +439,10 @@ impl StoreDriver for DedupStore {
     /// dedup-original digest typically resolves to one or the other; the
     /// `Many` OR-merge surfaces success.)
     fn pin_delegation(&self) -> PinDelegation<'_> {
-        PinDelegation::Many(vec![
-            self.index_store.as_store_driver(),
-            self.content_store.as_store_driver(),
-        ])
+        let mut children = DelegationChildren::new();
+        children.push(self.index_store.as_store_driver());
+        children.push(self.content_store.as_store_driver());
+        PinDelegation::Many(children)
     }
 }
 

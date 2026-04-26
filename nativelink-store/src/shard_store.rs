@@ -24,8 +24,8 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation, Store, StoreDriver,
-    StoreKey, StoreLike, UploadSizeInfo,
+    DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
+    Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use tracing::warn;
 
@@ -298,12 +298,13 @@ impl StoreDriver for ShardStore {
     /// flagged ShardStore as the next time-bomb — this declaration closes
     /// that gap.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        let children: DelegationChildren<'_> = self
+            .weights_and_stores
+            .iter()
+            .map(|sw| sw.store.as_store_driver())
+            .collect();
         StableDigestDelegation::Many {
-            children: self
-                .weights_and_stores
-                .iter()
-                .map(|sw| sw.store.as_store_driver())
-                .collect(),
+            children,
             merged_state: &self.merged_stable_notify,
         }
     }
@@ -312,12 +313,12 @@ impl StoreDriver for ShardStore {
     /// shard but pin_digests has no key affinity at this layer; the OR-
     /// merge in the trait default surfaces success from the right shard.)
     fn pin_delegation(&self) -> PinDelegation<'_> {
-        PinDelegation::Many(
-            self.weights_and_stores
-                .iter()
-                .map(|sw| sw.store.as_store_driver())
-                .collect(),
-        )
+        let children: DelegationChildren<'_> = self
+            .weights_and_stores
+            .iter()
+            .map(|sw| sw.store.as_store_driver())
+            .collect();
+        PinDelegation::Many(children)
     }
 }
 

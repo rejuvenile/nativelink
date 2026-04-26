@@ -9,8 +9,8 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::default_health_status_indicator;
 use nativelink_util::health_utils::HealthStatusIndicator;
 use nativelink_util::store_trait::{
-    ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation, Store, StoreDriver,
-    StoreKey, StoreLike, UploadSizeInfo,
+    DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
+    Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use tokio::sync::Notify;
 use tonic::async_trait;
@@ -324,15 +324,21 @@ impl StoreDriver for ManyTestWrapper {
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {
         let lower: &dyn StoreDriver = self.lower.as_ref();
         let upper: &dyn StoreDriver = self.upper.as_ref();
+        let mut children = DelegationChildren::new();
+        children.push(lower);
+        children.push(upper);
         StableDigestDelegation::Many {
-            children: vec![lower, upper],
+            children,
             merged_state: &self.merged_state,
         }
     }
     fn pin_delegation(&self) -> PinDelegation<'_> {
         let lower: &dyn StoreDriver = self.lower.as_ref();
         let upper: &dyn StoreDriver = self.upper.as_ref();
-        PinDelegation::Many(vec![lower, upper])
+        let mut children = DelegationChildren::new();
+        children.push(lower);
+        children.push(upper);
+        PinDelegation::Many(children)
     }
 }
 
