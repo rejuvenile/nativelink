@@ -14,9 +14,12 @@
 
 use std::sync::Arc;
 
-use nativelink_config::stores::{MemorySpec, ShardSpec, StoreSpec};
+use nativelink_config::stores::{
+    FastSlowSpec, MemorySpec, ShardSpec, StoreDirection, StoreSpec,
+};
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::shard_store::ShardStore;
 use nativelink_util::common::DigestInfo;
@@ -307,4 +310,89 @@ async fn verify_weights_left_bias() -> Result<(), Error> {
 #[nativelink_test]
 async fn verify_weights_right_bias() -> Result<(), Error> {
     verify_weights(&[1, 1, 1, 1, 1, 100], &[5, 13, 12, 5, 11, 954], 1000, false).await
+}
+
+/// Regression for red-team F3 + #140: ShardStore must delegate
+/// `mark_stable` per-digest to the OWNING shard (not fan out to every
+/// shard, which would generate spurious BIS broadcasts to the worker
+/// for digests on other shards).
+///
+/// Builds 4 shards, each backed by a FastSlowStore. Calls mark_stable
+/// on the outer ShardStore for two digests. Drains each shard's
+/// stable_digests; verifies (a) every digest lands on EXACTLY ONE shard,
+/// and (b) the union covers both inputs (no digest lost).
+#[nativelink_test]
+async fn mark_stable_routes_per_digest_to_owning_shard_test() -> Result<(), Error> {
+    let memory_store_config = MemorySpec::default();
+    let store_config = StoreSpec::Memory(memory_store_config);
+
+    // Build 4 FastSlowStore shards. Each holds Stores so we can drain
+    // stable_digests on each one independently.
+    let shards: Vec<Store> = (0..4)
+        .map(|_| {
+            Store::new(FastSlowStore::new(
+                &FastSlowSpec {
+                    fast: StoreSpec::Memory(MemorySpec::default()),
+                    slow: StoreSpec::Memory(MemorySpec::default()),
+                    fast_direction: StoreDirection::default(),
+                    slow_direction: StoreDirection::default(),
+                },
+                Store::new(MemoryStore::new(&MemorySpec::default())),
+                Store::new(MemoryStore::new(&MemorySpec::default())),
+            ))
+        })
+        .collect();
+
+    let shard_store = ShardStore::new(
+        &ShardSpec {
+            stores: (0..4)
+                .map(|_| nativelink_config::stores::ShardConfig {
+                    store: store_config.clone(),
+                    weight: Some(1),
+                })
+                .collect(),
+        },
+        shards.clone(),
+    )?;
+
+    // Two distinct digests with different hashes — they will hash to
+    // different shard indices (probabilistically; the constants here are
+    // chosen to avoid collisions for the chosen 4-shard split).
+    let digest_a = DigestInfo::new([0x11; 32], 100);
+    let digest_b = DigestInfo::new([0xee; 32], 200);
+
+    let outer = Store::new(shard_store);
+    outer.as_store_driver().mark_stable(&[digest_a, digest_b]);
+
+    // Sum across shards. Each digest should land on EXACTLY ONE shard.
+    let mut all_drained: Vec<DigestInfo> = Vec::new();
+    let mut per_shard_counts: Vec<usize> = Vec::new();
+    for shard in &shards {
+        let drained = shard.as_store_driver().drain_stable_digests();
+        per_shard_counts.push(drained.len());
+        all_drained.extend(drained);
+    }
+
+    assert!(
+        all_drained.contains(&digest_a),
+        "digest_a missing from all shards' stable queues. \
+         ShardStore::mark_stable failed to route to ANY shard. \
+         per_shard_counts={per_shard_counts:?}, all_drained={all_drained:?}"
+    );
+    assert!(
+        all_drained.contains(&digest_b),
+        "digest_b missing from all shards' stable queues. \
+         per_shard_counts={per_shard_counts:?}, all_drained={all_drained:?}"
+    );
+    // Two digests in, two out total — proves no fan-out duplication.
+    assert_eq!(
+        all_drained.len(),
+        2,
+        "ShardStore::mark_stable must route each digest to ONE shard, not \
+         fan out. Total drained across shards: {}, per shard: {per_shard_counts:?}, \
+         drained: {all_drained:?}",
+        all_drained.len()
+    );
+
+    Ok(())
 }

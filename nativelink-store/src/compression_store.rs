@@ -25,6 +25,7 @@ use lz4_flex::block::{compress_into, decompress_into, get_maximum_output_size};
 use nativelink_config::stores::CompressionSpec;
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
 use nativelink_metric::MetricsComponent;
+use nativelink_util::common::DigestInfo;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
@@ -671,6 +672,14 @@ impl StoreDriver for CompressionStore {
 
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Inner(self.inner_store.as_store_driver())
+    }
+
+    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
+    /// Until then, wrappers must explicitly delegate so server-side
+    /// `mark_stable_on_blobs_available` doesn't silently no-op at the
+    /// CompressionStore layer (#140 / red-team F3).
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        self.inner_store.mark_stable(digests);
     }
 }
 

@@ -22,6 +22,7 @@ use nativelink_config::stores::ShardSpec;
 use nativelink_error::{Error, ResultExt, error_if};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
     DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
@@ -319,6 +320,35 @@ impl StoreDriver for ShardStore {
             .map(|sw| sw.store.as_store_driver())
             .collect();
         PinDelegation::Many(children)
+    }
+
+    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
+    /// Each input digest lives on exactly ONE shard; route per-digest using
+    /// the same `get_store_index` hash that the read/write paths use, so
+    /// each shard's mark_stable receives only the digests it actually owns.
+    /// (A `Many`-style fan-out would push each digest into every shard's
+    /// `stable_digests` queue, generating spurious BIS broadcasts to the
+    /// worker for digests on other shards. The per-digest routing here
+    /// preserves the existing shard's pin/release identity.)
+    /// (#140 / red-team F3.)
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        if digests.is_empty() {
+            return;
+        }
+        // Bucket by shard index. Vec<Vec<_>> avoids HashMap overhead at the
+        // small N (typical shard counts: 2-8).
+        let n = self.weights_and_stores.len();
+        let mut buckets: Vec<Vec<DigestInfo>> = (0..n).map(|_| Vec::new()).collect();
+        for digest in digests {
+            let key = StoreKey::Digest(*digest);
+            let idx = self.get_store_index(&key);
+            buckets[idx].push(*digest);
+        }
+        for (idx, bucket) in buckets.into_iter().enumerate() {
+            if !bucket.is_empty() {
+                self.weights_and_stores[idx].store.mark_stable(&bucket);
+            }
+        }
     }
 }
 

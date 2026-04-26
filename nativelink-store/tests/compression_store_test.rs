@@ -20,9 +20,12 @@ use std::sync::Arc;
 
 use bincode::serde::decode_from_slice;
 use bytes::Bytes;
-use nativelink_config::stores::{CompressionSpec, MemorySpec, StoreSpec};
+use nativelink_config::stores::{
+    CompressionSpec, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
+};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::compression_store::{
     CURRENT_STREAM_FORMAT_VERSION, CompressionStore, DEFAULT_BLOCK_SIZE, FOOTER_FRAME_TYPE, Footer,
     Lz4Config, SliceIndex,
@@ -638,6 +641,58 @@ async fn regression_test_range_start_not_greater_than_end() -> Result<(), Error>
             );
         }
     }
+
+    Ok(())
+}
+
+/// Regression for red-team F3 + #140: CompressionStore must delegate
+/// `mark_stable` to its inner store. Without an explicit override, the
+/// trait's silent no-op default would swallow the call, leaving the
+/// terminal FastSlowStore's `stable_digests` queue empty and the worker's
+/// pin (durable under v2) leaked forever.
+///
+/// Wraps a FastSlowStore (Memory→Memory) inside CompressionStore. Calls
+/// mark_stable on the outer compression layer. Drains the inner
+/// FastSlowStore's stable_digests via the outer store's
+/// `drain_stable_digests` chain — the digest must be present.
+#[nativelink_test]
+async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
+    let inner_fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+
+    let compression = CompressionStore::new(
+        &CompressionSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            compression_algorithm: nativelink_config::stores::CompressionAlgorithm::Lz4(
+                nativelink_config::stores::Lz4Config::default(),
+            ),
+        },
+        inner_fast_slow,
+    )
+    .err_tip(|| "Failed to create compression store")?;
+
+    let digest = DigestInfo::new([7u8; 32], 100);
+    let outer = Store::new(compression);
+    outer.as_store_driver().mark_stable(&[digest]);
+
+    // The compression layer should have forwarded the call to the inner
+    // FastSlowStore, which pushes into its `stable_digests` queue.
+    let drained = outer.as_store_driver().drain_stable_digests();
+    assert!(
+        drained.contains(&digest),
+        "CompressionStore::mark_stable must delegate to inner_store. \
+         Without this delegation the trait silent-default no-op swallows \
+         the call and BIS broadcast never wakes; worker pin leaks. \
+         Drained: {drained:?}"
+    );
 
     Ok(())
 }

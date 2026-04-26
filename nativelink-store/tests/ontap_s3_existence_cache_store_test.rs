@@ -21,11 +21,14 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use http::status::StatusCode;
 use nativelink_config::stores::{
-    CommonObjectSpec, ExperimentalOntapS3Spec, OntapS3ExistenceCacheSpec, Retry, StoreSpec,
+    CommonObjectSpec, ExperimentalOntapS3Spec, FastSlowSpec, MemorySpec,
+    OntapS3ExistenceCacheSpec, Retry, StoreDirection, StoreSpec,
 };
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_store::default_store_factory::store_factory;
+use nativelink_store::fast_slow_store::FastSlowStore;
+use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::ontap_s3_existence_cache_store::OntapS3ExistenceCache;
 use nativelink_store::ontap_s3_store::OntapS3Store;
 use nativelink_store::store_manager::StoreManager;
@@ -545,5 +548,68 @@ async fn test_empty_bucket_handling() -> Result<(), Error> {
         result, None,
         "Empty bucket should not add any objects to cache"
     );
+    Ok(())
+}
+
+/// Regression for red-team F3 + #140: OntapS3ExistenceCache must delegate
+/// `mark_stable` to its inner_store. Without an explicit override, the
+/// trait's silent no-op default would swallow the call, breaking the
+/// BIS pin-release pipeline at this layer.
+///
+/// Wraps a FastSlowStore (Memory→Memory) inside the existence cache.
+/// Calls mark_stable on the outer cache; drains the inner FastSlowStore.
+#[nativelink_test]
+async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
+    // Empty mock S3 client — the test never makes network calls because
+    // mark_stable does not touch the cache or S3 paths.
+    let mock_client = StaticReplayClient::new(vec![]);
+    let test_config = Builder::new()
+        .behavior_version(BehaviorVersion::v2025_08_07())
+        .region(Region::from_static("test-region"))
+        .http_client(mock_client.clone())
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(test_config);
+
+    let temp_dir = tempdir().expect("Failed to create temporary directory");
+    let cache_path = temp_dir
+        .path()
+        .join("cache_index.json")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let inner_fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+
+    let existence_cache = OntapS3ExistenceCache::new_for_testing(
+        inner_fast_slow.clone(),
+        Arc::new(s3_client),
+        cache_path,
+        std::collections::HashSet::new(),
+        10,
+        MockInstantWrapped::default,
+    );
+
+    let digest = DigestInfo::new([9u8; 32], 100);
+    let outer = Store::new(existence_cache);
+    outer.as_store_driver().mark_stable(&[digest]);
+
+    let drained = inner_fast_slow.as_store_driver().drain_stable_digests();
+    assert!(
+        drained.contains(&digest),
+        "OntapS3ExistenceCache::mark_stable must delegate to inner_store. \
+         Without this delegation the trait silent-default no-op swallows \
+         the call and the worker's pin (durable under v2) leaks. \
+         Drained: {drained:?}"
+    );
+
     Ok(())
 }

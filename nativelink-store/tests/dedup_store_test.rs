@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nativelink_config::stores::{DedupSpec, MemorySpec, StoreSpec};
+use nativelink_config::stores::{
+    DedupSpec, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
+};
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
 use nativelink_store::dedup_store::DedupStore;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{Store, StoreLike};
@@ -418,5 +421,51 @@ async fn has_with_zero_digest_returns_some_test() -> Result<(), Error> {
             size_info
         );
     }
+    Ok(())
+}
+
+/// Regression for red-team F3 + #140: DedupStore must delegate
+/// `mark_stable` to its `index_store`. The outer (dedup-original) digest
+/// lives in the index_store; per-chunk content digests are independent
+/// and have their own BlobsAvailable advertisements. Without an explicit
+/// override, the trait's silent no-op default would swallow the call.
+///
+/// Wraps a FastSlowStore as the index_store so its `stable_digests`
+/// queue can be drained as the assertion target.
+#[nativelink_test]
+async fn mark_stable_delegates_to_index_store_test() -> Result<(), Error> {
+    let index_fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let content_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+
+    let dedup = DedupStore::new(
+        &make_default_config(),
+        index_fast_slow.clone(),
+        content_store,
+    )?;
+
+    let digest = DigestInfo::new([8u8; 32], 100);
+    let outer = Store::new(dedup);
+    outer.as_store_driver().mark_stable(&[digest]);
+
+    // The dedup layer should have forwarded the call to index_store
+    // (a FastSlowStore), which pushes into its `stable_digests` queue.
+    let drained = index_fast_slow.as_store_driver().drain_stable_digests();
+    assert!(
+        drained.contains(&digest),
+        "DedupStore::mark_stable must delegate to index_store. \
+         Without this delegation the trait silent-default no-op swallows \
+         the call and the worker's pin (durable under v2) leaks. \
+         Drained: {drained:?}"
+    );
+
     Ok(())
 }

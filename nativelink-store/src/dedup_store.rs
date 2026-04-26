@@ -444,6 +444,17 @@ impl StoreDriver for DedupStore {
         children.push(self.content_store.as_store_driver());
         PinDelegation::Many(children)
     }
+
+    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
+    /// For DedupStore the outer (dedup-original) digest lives in the
+    /// index_store; per-chunk content digests have their own identity in
+    /// content_store and are independently advertised via BlobsAvailable.
+    /// Routing mark_stable to the index_store mirrors this layering — the
+    /// pin-release contract for the dedup-original digest is whatever
+    /// index_store's pin tier owns. (#140 / red-team F3.)
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        self.index_store.mark_stable(digests);
+    }
 }
 
 default_health_status_indicator!(DedupStore);
