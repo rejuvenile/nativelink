@@ -100,6 +100,32 @@ state exploration on large models; the bounded models here finish in
     #   "Invariant WarnFiresOnlyOnGenuineRace is violated" for the
     #   downstream false-alarm symptom.
 
+    # Pin listener multiplicity (3x FastSlowStore wrapper amplification):
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config PinListenerMultiplicityFixed.cfg PinListenerMultiplicity
+    #   Expected: "Model checking completed. No error has been found."
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config PinListenerMultiplicityBugged.cfg PinListenerMultiplicity
+    #   Expected: "Invariant EveryEventFiresAtMostOneListener is violated."
+    #   Trace shows: PickPinSourceSlowWrite(1) -> StartFiring -> RunListener
+    #   for w=1,2,3 -> firedCount=3 -> CompleteFiring (3x amplification).
+
+    # Trait-default noop wrapper inheritance:
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config TraitDefaultNoopFixed.cfg TraitDefaultNoop
+    #   Expected: "Model checking completed. No error has been found."
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config TraitDefaultNoopBugged.cfg TraitDefaultNoop
+    #   Expected: "Temporal property EventuallyWorkerUnpinned was violated."
+    #   Trace cycle: LeafRecordsDigest -> BroadcastStartDrain ->
+    #   WrapperNoopDrain (returns {}) -> BroadcastEmit (broadcasts nothing) ->
+    #   loop, worker permanently Pinned.
+
+    # failed_slow_writes retry-on-reconnect cycle:
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config FailedSlowWritesRetryFixed.cfg FailedSlowWritesRetry
+    #   Expected: "Model checking completed. No error has been found."
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config FailedSlowWritesRetryBugged.cfg FailedSlowWritesRetry
+    #   Expected: "Temporal property EventuallyConverges was violated."
+    #   Trace cycle: PinTtlInsertOnHang -> SlowWriteFailsInBand ->
+    #   DrainAndRetryUnbounded -> back to InFlight, failed_slow_writes
+    #   recurs forever under persistent failure.
+
 To run only static analysis (parser + name-resolution; useful when you
 want to verify a spec compiles without running model checking):
 
@@ -198,6 +224,82 @@ where the populate step then errors with NotFound and the gate
 opens, emitting a false-alarm warn — modeling the 178 false alarms
 per 10 minutes observed on production workers.
 
+### `PinListenerMultiplicity.tla`
+
+Models the 3× FastSlowStore listener registration + populate-pin
+scope mismatch documented at
+`project_pin_listener_multiplicity_2026_04_25.md` and the
+production fix in `nativelink-store/src/fast_slow_store.rs:87-160`.
+Production constructs THREE FastSlowStore wrappers against the
+SAME underlying FilesystemStore fast tier (one per
+`local_worker.rs` registration site); each registers a
+`PinExpireFailedWritesListener`. Pre-fix the listener had no
+in-flight gate, so a single pin-expire event fired all three
+listeners unconditionally — 3× warn fan-out + 3×
+`failed_slow_writes` insert per event, including for digests
+pinned by `DirectoryCache` downloads where no slow-write was ever
+outstanding.
+
+Two `.cfg` files toggle the in-flight gate (`BugMode`). Bugged
+(`NumWrappers=3, BugMode=TRUE`) violates
+`EveryEventFiresAtMostOneListener` with a 7-state trace; also
+violates `DownloadPinsDoNotFireWarn` and
+`NoAmplificationOverNumWrappers`. Fixed (`BugMode=FALSE`) holds
+all invariants — `firedCount <= 1` always, download-pin events
+fire zero listeners. Models the 5774 listener-fire events / 10 min
+observed on production workers.
+
+### `TraitDefaultNoop.tla`
+
+Models the silent no-op delegation bug class baked into
+`nativelink-util/src/store_trait.rs:954-991`. The trait
+declares `drain_stable_digests` / `stable_notify` / `pin_digests` /
+`drain_failed_digests` with NO-OP / EMPTY defaults. Wrappers
+(`VerifyStore`, `ExistenceCacheStore`, `RefStore`,
+`WorkerProxyStore`) MUST override all four to delegate to
+`inner_store`. A wrapper that forgets to override compiles
+cleanly, runs cleanly, and SILENTLY swallows the contract — the
+leaf store's contributions never reach the broadcast loop in
+`src/bin/nativelink.rs:382-416`. Rust's trait system is happy
+with the inherited default; `cargo check` and `cargo clippy` find
+nothing.
+
+Two `.cfg` files toggle `BugMode`. Bugged (`BugMode=TRUE`) violates
+the LIVENESS property `EventuallyWorkerUnpinned` with a 4-state
+cycle: `LeafRecordsDigest` → `BroadcastStartDrain` →
+`WrapperNoopDrain` (returns `{}` despite leaf queue=`{"D"}`) →
+`BroadcastEmit` (broadcasts nothing) → back to Idle, leaf still
+Recorded, worker permanently Pinned. Fixed (`BugMode=FALSE`)
+applies the explicit override and the worker eventually receives
+the BIS and unpins. The in-flight C+D refactor at
+`worktree-agent-aea1038e` addresses this class with a
+`StableDigestDelegation` enum that removes the trait-level default
+and forces every wrapper to declare its delegation strategy at
+the type level — killing the silent-failure mode at compile time.
+
+### `FailedSlowWritesRetry.tla`
+
+Models the worker-side retry protocol that drains
+`failed_slow_writes` on every reconnect and re-uploads the digests
+to the server. Bug class: under persistent slow-store failure
+(server-side store unreachable, or write rejected for a
+non-self-healing reason), the retry path forms an INFINITE CYCLE
+that never converges. Production today (`local_worker.rs:1327-1352`
++ `handle_upload_missing_blobs`'s "log warn and drop the result"
+arm) has no retry budget, no exponential backoff, no dead-letter
+queue.
+
+Two `.cfg` files toggle `BugMode`. Bugged (`BugMode=TRUE`) violates
+the LIVENESS property `EventuallyConverges` with a 4-state SCC
+cycle: `PinTtlInsertOnHang` (pin TTL fires while slow-write still
+in-flight) → `SlowWriteFailsInBand` (in-flight upload errors) →
+`DrainAndRetryUnbounded` (drain set, re-pin, re-spawn upload) →
+back to InFlight forever. Fixed (`BugMode=FALSE`) applies a
+hypothetical `MaxRetries`-bounded counter with dead-letter; the
+liveness property holds. Both pin-TTL re-insert
+(`fast_slow_store.rs:128-155`) and in-band failure
+(`fast_slow_store.rs:2033, :2370`) paths are modeled.
+
 ## Scope honesty
 
 Each spec includes an explicit ASSUMPTION block listing what is and
@@ -239,19 +341,35 @@ broader than the documented one. In particular:
 
 In rough priority order:
 
-1. **Pin listener multiplicity**
-   (`project_pin_listener_multiplicity_2026_04_25.md`): 3×
-   FastSlowStore listener registration + populate-pin scope mismatch.
-   Model multiple listeners over a single pin set.
-2. **Trait-default no-op wrapper inheritance**
-   (`store_trait.rs:954-991`): the `stable_notify`/`drain_stable_digests`
-   defaults are no-ops; wrappers that forget to override silently
-   swallow the contract delegation. Model a 2-level wrapper hierarchy
-   and check that delegation reaches the leaf.
-3. **failed_slow_writes retry-on-reconnect**: separate `failed_writes`
-   set, drained on worker reconnect. Model the worker disconnect /
-   reconnect cycle and check that no digest is permanently stuck in
-   the failed set.
+1. **Mirror-blobs in-memory replica accounting**
+   (`project_mirror_write_timeout_durability_hole.md` +
+   `project_cas_write_invariant.md`): the worker's mirror_blobs map
+   holds a digest in memory until BIS arrives, and counts as a
+   replica for the ≥2-in-memory invariant. Model the mirror_blobs
+   eviction (`MIRROR_BLOBS_MAX_BYTES` cap) racing against BIS
+   arrival; under cap pressure, the mirror copy can be silently
+   dropped while the server's fast tier is the only remaining
+   replica. A subsequent server eviction violates the invariant.
+2. **GOAWAY-then-reconnect race**: H2ConnectionPool models the
+   predicate gap; this would model the OPPOSITE failure — the
+   pool correctly evicts but races a fresh connection to the same
+   endpoint, leading to pool entry duplication and a stale entry
+   selected on the next checkout. Subtle interaction with the
+   `connections_per_endpoint=32` round-robin selector.
+3. **completeness_checking_store batch pin coverage**
+   (`completeness_checking_store.rs:309, 451`): batch verification
+   pins all "verified" digests, but the batch-result-merging path
+   has multiple early-return arms; model whether a batch with
+   mixed verified/unverified blobs always pins the verified ones
+   even on partial-batch failure. Sibling pattern to PinLifecycle
+   but at the batch-RPC layer.
+4. **worker-mirror eviction × eviction-listener race**
+   (`MokaEvictingMap` + `mirror_blobs.rs`): mirror_blobs has its
+   own eviction listener distinct from the FilesystemStore's
+   pin-expire listener. Model whether both listeners fire
+   correctly when a mirror entry is evicted at the moment a pin
+   is being released — the failure mode is double-counted
+   replicas in the BIS broadcast.
 
 ## Citations to production code
 
@@ -279,6 +397,17 @@ that time:
 - `PhantomBlobExistenceCacheBugged.cfg`: FAIL as designed
   (`GateFlagMatchesHasOutcome` violated; `WarnFiresOnlyOnGenuineRace`
    also violated on continued exploration)
+- `PinListenerMultiplicityFixed.cfg`: PASS (no violation)
+- `PinListenerMultiplicityBugged.cfg`: FAIL as designed
+  (`EveryEventFiresAtMostOneListener` violated; trace shows 3×
+   amplification across all `NumWrappers=3` listeners)
+- `TraitDefaultNoopFixed.cfg`: PASS (no violation)
+- `TraitDefaultNoopBugged.cfg`: FAIL as designed (LIVENESS property
+  `EventuallyWorkerUnpinned` violated; 4-state cycle with empty drain)
+- `FailedSlowWritesRetryFixed.cfg`: PASS (no violation)
+- `FailedSlowWritesRetryBugged.cfg`: FAIL as designed (LIVENESS property
+  `EventuallyConverges` violated; 4-state SCC cycle on the
+  drain-retry-fail loop)
 
 If a fix lands that changes one of the production code paths cited in
 a spec, re-run the corresponding bugged config to verify the spec
