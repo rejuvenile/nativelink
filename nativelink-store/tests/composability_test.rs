@@ -34,13 +34,14 @@ use core::time::Duration;
 use std::env;
 
 use nativelink_config::stores::{
-    CompressionAlgorithm, CompressionSpec, DedupSpec, EvictionPolicy, FilesystemSpec, Lz4Config,
-    MemorySpec, SizePartitioningSpec, StoreSpec, VerifySpec,
+    CompressionAlgorithm, CompressionSpec, DedupSpec, EvictionPolicy, FastSlowSpec, FilesystemSpec,
+    Lz4Config, MemorySpec, SizePartitioningSpec, StoreDirection, StoreSpec, VerifySpec,
 };
 use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_store::compression_store::CompressionStore;
 use nativelink_store::dedup_store::DedupStore;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
@@ -304,6 +305,96 @@ async fn verify_store_around_verify_store_does_not_deadlock_on_get_part_err() ->
         NO_DEADLOCK_TIMEOUT,
     )
     .await;
+    Ok(())
+}
+
+/// Production-composition coverage for FastSlowStore-specific
+/// `guard.fail(...)` exit paths. The 7 sibling `verify_store_around_*`
+/// tests cover memory, filesystem, worker_proxy, size_partitioning,
+/// compression, dedup, and verify-around-verify — but FastSlowStore was
+/// previously absent (testing-czar non-blocker on the simplified branch).
+///
+/// FastSlowStore::get_part has 3 explicit `guard.fail(...)` exit sites
+/// (`fast_slow_store.rs:2778, 2851, 2915`) — none of which are reachable
+/// via the wrapper-only `verify_store_around_memory` / `_filesystem`
+/// patterns above (those leaves never invoke FastSlowStore's outer
+/// guard). The ForgetfulStore unit test in `fast_slow_store_test.rs`
+/// catches Drop-fallback regressions but not the explicit `guard.fail`
+/// path.
+///
+/// This test trips the easiest reachable `guard.fail` site:
+/// `local_only_reads = true` + miss on every fast/mirror/in-flight path
+/// produces `Err(NotFound)` via `guard.fail(...)` at line 2986. Wrapping
+/// in VerifyStore exercises the same `tokio::join!(get_fut, check_fut)`
+/// composition that historically deadlocked Bazel builds for hours.
+///
+/// Mutation evidence (run manually to validate the test guards the
+/// behavior — DO NOT commit the mutation):
+///
+///   1. In `fast_slow_store.rs::get_part`, comment out the
+///      `guard.fail(...)` call at the `local_only_reads` branch
+///      (line ~2986) and replace with a bare
+///      `Err(make_err!(Code::NotFound, "..."))` Err return — i.e. drop
+///      the explicit writer-termination call entirely.
+///   2. `cargo test --features failpoints -p nativelink-store --test \
+///      composability_test verify_store_around_fast_slow_*`.
+///   3. The test MUST fail with: the merged err.messages now contains
+///      the synthesized "WriteHalfGuard fired Drop fallback" string —
+///      it does NOT under correct code (`guard.fail` puts the structured
+///      NotFound in `terminal_error`, so the check-side reader sees the
+///      same NotFound and the merged messages contain only the
+///      structured marker, never the Drop synthesized one).
+///   4. Restore the call and re-run to confirm the test passes again.
+///
+/// The non-deadlock detector (5s timeout) does NOT fire under this
+/// mutation because FastSlowStore's outer `WriteHalfGuard::new(writer)`
+/// at line 2747 catches via Drop fallback — that's defense-in-depth.
+/// The Drop-fallback string assertion below is what actually
+/// distinguishes "structured guard.fail call" from "fell through to
+/// Drop synthesizer".
+#[nativelink_test]
+async fn verify_store_around_fast_slow_does_not_deadlock_on_get_part_err()
+-> Result<(), Error> {
+    // Empty MemoryStore on both fast + slow tiers; local_only_reads
+    // forces FastSlowStore to take the `guard.fail(NotFound)` path
+    // at line ~2986 (worker public CAS server variant).
+    let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let spec = FastSlowSpec {
+        fast: StoreSpec::Memory(MemorySpec::default()),
+        slow: StoreSpec::Memory(MemorySpec::default()),
+        fast_direction: StoreDirection::Both,
+        slow_direction: StoreDirection::Both,
+    };
+    let fast_slow = FastSlowStore::new(&spec, fast, slow).with_local_only_reads();
+    let fast_slow_store = Store::new(fast_slow);
+    let digest = DigestInfo::try_new(MISSING_HASH, 100)?;
+    let err = assert_no_deadlock_under_verify_store(
+        "verify_store_around_fast_slow_does_not_deadlock_on_get_part_err",
+        fast_slow_store,
+        digest,
+        Code::NotFound,
+        NO_DEADLOCK_TIMEOUT,
+    )
+    .await;
+    // STRONGER ASSERTION: the structured `guard.fail(NotFound, ...)`
+    // path MUST put the err in `terminal_error` so the check-side reader
+    // sees the SAME structured err (no Drop-fallback synthesizer involved).
+    // If this assertion fires, the explicit `guard.fail` call at
+    // `fast_slow_store.rs::get_part`'s local_only_reads branch was
+    // bypassed (e.g. replaced with a bare `Err(make_err!(...))`) — the
+    // outer Drop fallback still prevents deadlock, but the synthesized
+    // identifier leaks into the wire-side err.
+    assert!(
+        !err.messages
+            .iter()
+            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
+        "merged Err MUST NOT carry the synthesized Drop-fallback identifier — \
+         that would mean the explicit `guard.fail(...)` at the local_only_reads \
+         branch was bypassed and the outer Drop fallback fired. The structured \
+         NotFound contract is broken: the wire-side err loses the structured \
+         message and gains a generic Internal-style fallback. Got: {err:?}",
+    );
     Ok(())
 }
 
