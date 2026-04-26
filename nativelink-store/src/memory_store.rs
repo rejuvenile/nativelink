@@ -217,6 +217,44 @@ impl StoreDriver for MemoryStore {
         let owned_key = key.into_owned();
         let total_bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
 
+        // Enforce `ExactSize` upfront — a truncated upstream (e.g.
+        // Redis timeout dropping the channel) would otherwise insert a
+        // partial entry and poison the cache. `MaxSize` is advisory:
+        // overruns are rejected, underruns are accepted (the caller
+        // declared a ceiling, not a floor). Be NOISY when the
+        // invariant fires so the bug is visible (per CLAUDE.md
+        // belt-and-suspenders policy).
+        match size_info {
+            UploadSizeInfo::ExactSize(declared) if total_bytes != declared => {
+                error!(
+                    key = ?owned_key,
+                    declared,
+                    received = total_bytes,
+                    "MemoryStore::update: ExactSize mismatch — rejecting partial write",
+                );
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "MemoryStore::update: ExactSize declared {declared} bytes but \
+                     received {total_bytes} — refusing to insert a partial entry \
+                     (would corrupt every future read)"
+                ));
+            }
+            UploadSizeInfo::MaxSize(max) if total_bytes > max => {
+                error!(
+                    key = ?owned_key,
+                    max,
+                    received = total_bytes,
+                    "MemoryStore::update: MaxSize exceeded — rejecting overrun",
+                );
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "MemoryStore::update: MaxSize declared {max} bytes but \
+                     received {total_bytes} — refusing to insert an oversized entry"
+                ));
+            }
+            _ => {}
+        }
+
         self.evicting_map
             .insert(owned_key.clone().into(), BytesWrapper::from_chunks(chunks))
             .await;
