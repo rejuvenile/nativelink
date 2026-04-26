@@ -196,89 +196,29 @@ async fn peer_data_loss_evicts_locality_entry() -> Result<(), Error> {
     .await
 }
 
-/// Bug A regression: peer returns `Code::Internal` → locality entry
-/// must be evicted. Internal errors indicate the peer cannot serve the
-/// blob; trusting the locality entry on retry just causes thrashing.
-#[nativelink_test]
-async fn peer_internal_error_evicts_locality_entry() -> Result<(), Error> {
-    assert_peer_evicted_after_failure(
-        Code::Internal,
-        Some(Code::NotFound),
-        "Internal peer",
-    )
-    .await
-}
-
-/// Bug A regression: peer returns `Code::Aborted` (a generic
-/// non-connection error) → locality entry must be evicted.
-#[nativelink_test]
-async fn peer_aborted_evicts_locality_entry() -> Result<(), Error> {
-    assert_peer_evicted_after_failure(
-        Code::Aborted,
-        Some(Code::NotFound),
-        "Aborted peer",
-    )
-    .await
-}
-
-/// Bug A regression: peer returns `Code::DeadlineExceeded` → locality
-/// entry must be evicted. Persistent timeouts on this digest mean the
-/// peer can't deliver; widen trust accordingly.
-#[nativelink_test]
-async fn peer_deadline_exceeded_evicts_locality_entry() -> Result<(), Error> {
-    assert_peer_evicted_after_failure(
-        Code::DeadlineExceeded,
-        Some(Code::NotFound),
-        "DeadlineExceeded peer",
-    )
-    .await
-}
-
-/// Negative-control: `Code::Unavailable` is a connection-level error —
-/// `is_connection_error()` matches it and the EXISTING behaviour
-/// removes the whole endpoint (a stricter action than locality
-/// eviction). The fix adds locality eviction on TOP of the existing
-/// endpoint removal so a future has_with_results lookup doesn't return
-/// a defunct endpoint that was just dropped.
-///
-/// Without the fix, only the endpoint was removed and the locality
-/// map kept pointing at a now-disconnected peer; a follow-up
-/// `lookup_workers` would still hand back the dead endpoint name and
-/// the upload-skip fast path would trust the lie.
-#[nativelink_test]
-async fn peer_unavailable_removes_endpoint_and_evicts_locality() -> Result<(), Error> {
-    let (proxy_arc, _inner, locality_map) = make_proxy_store_with_arc();
-    let proxy = Store::new(proxy_arc.clone());
-
-    let value = b"unused: peer always fails";
-    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
-
-    let peer_endpoint = "grpc://peer-a:50081";
-    let peer_store = Store::new(Arc::new(AlwaysFailStore {
-        fail_code: Code::Unavailable,
-    }));
-    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
-    locality_map
-        .write()
-        .register_blobs(peer_endpoint, &[digest]);
-
-    let _result = proxy.get_part_unchunked(digest, 0, None).await;
-
-    // The widened eviction branch in `try_read_from_worker` and
-    // `try_read_from_endpoints` calls `evict_blobs` AFTER the
-    // `is_connection_error` arm runs — so the locality entry is gone
-    // even though the cached connection was also dropped via
-    // `remove_worker_endpoint`. This double-cleanup is the point of
-    // the Bug A widening: never leave the locality map pointing at a
-    // peer the proxy can't reach.
-    let workers = locality_map.read().lookup_workers(&digest);
-    let workers_str: Vec<String> = workers.iter().map(|s| s.to_string()).collect();
-    assert!(
-        !workers_str.iter().any(|e| e == peer_endpoint),
-        "peer A should be gone from locality after Unavailable. workers={workers_str:?}"
-    );
-    Ok(())
-}
+// REMOVED 2026-04-26: the integration tests for `peer_internal_error_*`,
+// `peer_aborted_*`, `peer_deadline_exceeded_*`, and
+// `peer_unavailable_removes_endpoint_and_evicts_locality` asserted the
+// pre-380793fe WIDE locality-eviction policy (every peer-fetch failure
+// drops the locality entry). That policy was deliberately narrowed to
+// `NotFound | DataLoss` only by commit `380793fe (worker_proxy_store:
+// narrow locality eviction to NotFound/DataLoss only)`.
+//
+// Rationale (see `should_evict_locality_on_peer_error` doc comment in
+// `nativelink-store/src/worker_proxy_store.rs:325-347`): a transient
+// failure (DeadlineExceeded, Unavailable, Internal, Aborted, transport
+// blip) does not prove the peer no longer holds the blob — only that
+// THIS specific fetch attempt failed. Evicting on every transient
+// permanently destroys locality for blobs that only ONE peer holds, so
+// every future FindMissingBlobs misses the fast path even though the
+// peer still has the data.
+//
+// The narrow policy is covered by the pure-function unit tests in
+// `nativelink-store/src/worker_proxy_store.rs::tests` (the
+// `test_should_evict_on_*` / `test_should_keep_on_*` cluster) and by
+// `peer_data_loss_evicts_locality_entry` /
+// `peer_not_found_still_evicts_locality_entry` below, which retain
+// integration coverage for the codes that DO still evict.
 
 /// Bug A regression: peer returns `Code::NotFound` → locality entry
 /// must STILL be evicted (preserving the pre-fix behaviour for this
