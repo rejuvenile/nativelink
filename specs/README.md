@@ -412,3 +412,89 @@ that time:
 If a fix lands that changes one of the production code paths cited in
 a spec, re-run the corresponding bugged config to verify the spec
 still reproduces the bug class (i.e., the spec hasn't drifted).
+
+## Verification Gate (CI / pre-commit)
+
+A two-layer gate enforces "every protocol change is paired with a TLA+
+spec change." The gate scripts live at `scripts/verify_tla.sh` and
+`scripts/check_protocol_diff.sh`; their unit tests live at
+`scripts/tests/`. Run both layers locally with:
+
+    just verify-tla         # Layer 1: SANY + TLC over every spec here
+    just check-protocol     # Layer 2: changed-file × TLA-pair audit
+
+### Layer 1 — `verify_tla.sh` (correctness of specs)
+
+For every `<Name>.tla` in this directory:
+
+1. SANY (parser + name resolution) must succeed.
+2. For every accompanying `<Name>*.cfg`, TLC runs and the outcome must
+   match the filename suffix:
+   * `<Name>Bugged.cfg` / `<Name>Bug.cfg` / `<Name>V2.cfg` MUST
+     produce a violation (an invariant or temporal property is
+     violated). A clean run is a FAIL — the spec author labelled
+     this config as bug-reproducing but the bug doesn't repro.
+   * `<Name>Fixed.cfg` / `<Name>V1.cfg` MUST run clean
+     ("Model checking completed. No error has been found."). A
+     violation here is a FAIL — the spec author labelled this
+     config as the fixed model but TLC found a counter-example.
+   * Any other `.cfg` is run for informational purposes only.
+
+The gate is **skip-clean** by default: if `tla2tools.jar` is not at
+`/tmp/tla2tools.jar` (override via `TLA_TOOLS_JAR=...`), or if `specs/`
+is empty, the script exits 0 with an informational message. CI passes
+`--strict` to convert these into hard configuration errors.
+
+Per-spec wall-clock cap defaults to 120 s (set via `TLC_TIMEOUT=...`).
+
+### Layer 2 — `check_protocol_diff.sh` (specs accompany code)
+
+Reads a list of changed files on stdin (typical caller:
+`git diff --name-only origin/main..HEAD`) and asserts that any
+**protocol-relevant** change is accompanied by at least one `.tla`
+modification or a commit-message waiver.
+
+**Hard triggers** (any one alone fires the gate):
+
+* `nativelink-service/src/{worker_api_server,cas_server,bytestream_server}.rs`
+* `nativelink-worker/src/{local_worker,running_actions_manager}.rs`
+* any `*.proto` under `nativelink-proto/`
+* `nativelink-util/src/store_trait.rs`
+
+**Soft triggers** (WARN-only by default, escalate to HARD when
+`--diff-file PATH` shows a new `pub fn` or `pub trait`):
+
+* `nativelink-store/src/*_store.rs`
+
+**Waiver format** (in commit message body, parsed from the file at
+`$COMMIT_MSG_FILE`):
+
+    [no-tla-needed: <one-sentence rationale>]
+
+Acceptable rationales describe why the change does NOT cross a
+component boundary (e.g. "pure cosmetic — error message text only";
+"rename of a private helper"; "logging-only addition").
+
+### Why a two-layer split
+
+Layer 1 catches **broken specs** (the TLA+ author claimed Bugged.cfg
+demonstrates a bug, but TLC ran clean — the trace was lost or the
+spec drifted away from the production code path). Layer 2 catches
+**missing specs** (a code change crossed a component boundary but
+no `.tla` was touched). Either failure mode is enough to ship a bug
+that the protocol layer was supposed to prevent; the gate enforces
+both independently.
+
+### Adding a new spec
+
+1. Write `<Name>.tla` here. Use one of the existing specs as a
+   template; the "Why TLA+ for NativeLink" section above explains the
+   bug shape these specs target.
+2. Add `<Name>Bugged.cfg` (must violate at least one invariant) AND
+   `<Name>Fixed.cfg` (must run clean). The gate enforces both.
+3. Run Layer 1 locally:
+
+       TLA_TOOLS_JAR=/tmp/tla2tools.jar bash scripts/verify_tla.sh
+
+4. Document the spec in the "Catalog" section above (one bullet per
+   spec, naming the invariants and the bug class they cover).

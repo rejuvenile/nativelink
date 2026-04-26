@@ -85,3 +85,37 @@ launchd-load:
 launchd-unload:
 	launchctl bootout "gui/$(id -u)/com.tracemachina.nativelink"
 	launchctl bootout "gui/$(id -u)/com.tracemachina.nativelink.rotate-log"
+
+### Protocol verification gate (TLA+) -----------------------------------------
+### See specs/README.md "Verification Gate" for full rationale.
+
+# Layer 1: SANY + TLC sweep over every spec in specs/.
+# Pass --strict to convert "no tla2tools.jar" / "no specs/" into errors.
+verify-tla *ARGS:
+	bash scripts/verify_tla.sh {{ARGS}}
+
+# Layer 2: assert any protocol-relevant change comes with a .tla mod or
+# a [no-tla-needed: ...] waiver. Reads `git diff --name-only` against
+# the merge-base with origin/main on stdin.
+check-protocol *ARGS:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	BASE="$(git merge-base origin/main HEAD)"
+	DIFF_TMP="$(mktemp)"
+	trap 'rm -f "${DIFF_TMP}"' EXIT
+	git diff "${BASE}..HEAD" > "${DIFF_TMP}"
+	# Last-commit message is what reviewers see; pass it for waiver lookup.
+	COMMIT_MSG_TMP="$(mktemp)"
+	git log -1 --pretty=%B > "${COMMIT_MSG_TMP}"
+	trap 'rm -f "${DIFF_TMP}" "${COMMIT_MSG_TMP}"' EXIT
+	git diff --name-only "${BASE}..HEAD" \
+	    | COMMIT_MSG_FILE="${COMMIT_MSG_TMP}" \
+	      bash scripts/check_protocol_diff.sh --diff-file "${DIFF_TMP}" {{ARGS}}
+
+# Both layers — what CI runs end-to-end.
+verify-protocol-gate: check-protocol verify-tla
+
+# Self-tests for the gate scripts themselves.
+test-protocol-gate:
+	bash scripts/tests/test_check_protocol_diff.sh
+	bash scripts/tests/test_verify_tla.sh
