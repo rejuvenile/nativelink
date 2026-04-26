@@ -589,48 +589,6 @@ impl WorkerConnection {
         Ok(())
     }
 
-    fn register_action_result_digests(
-        locality_map: &SharedBlobLocalityMap,
-        endpoint: &str,
-        execute_response: &nativelink_proto::build::bazel::remote::execution::v2::ExecuteResponse,
-    ) {
-        let Some(ref action_result) = execute_response.result else {
-            return;
-        };
-        let mut digests = Vec::new();
-        for file in &action_result.output_files {
-            if let Some(ref d) = file.digest {
-                if let Ok(di) = DigestInfo::try_from(d.clone()) {
-                    digests.push(di);
-                }
-            }
-        }
-        for dir in &action_result.output_directories {
-            if let Some(ref d) = dir.tree_digest {
-                if let Ok(di) = DigestInfo::try_from(d.clone()) {
-                    digests.push(di);
-                }
-            }
-        }
-        if let Some(ref d) = action_result.stdout_digest {
-            if d.size_bytes > 0 {
-                if let Ok(di) = DigestInfo::try_from(d.clone()) {
-                    digests.push(di);
-                }
-            }
-        }
-        if let Some(ref d) = action_result.stderr_digest {
-            if d.size_bytes > 0 {
-                if let Ok(di) = DigestInfo::try_from(d.clone()) {
-                    digests.push(di);
-                }
-            }
-        }
-        if !digests.is_empty() {
-            locality_map.write().register_blobs(endpoint, &digests);
-        }
-    }
-
     async fn inner_execution_response(&self, execute_result: ExecuteResult) -> Result<(), Error> {
         let operation_id = OperationId::from(execute_result.operation_id);
 
@@ -639,18 +597,19 @@ impl WorkerConnection {
             .err_tip(|| "Expected result to exist in ExecuteResult")?
         {
             execute_result::Result::ExecuteResponse(finished_result) => {
-                // Register output digests in the locality map so the server
-                // can proxy blob reads back to the worker immediately, even
-                // before the BlobsAvailableNotification arrives.
-                if let Some(ref locality_map) = self.locality_map {
-                    if !self.cas_endpoint.is_empty() {
-                        Self::register_action_result_digests(
-                            locality_map,
-                            &self.cas_endpoint,
-                            &finished_result,
-                        );
-                    }
-                }
+                // Output-digest registration in the locality map happens
+                // exclusively via BlobsAvailable now (audit Path 2 at
+                // `.claude/audits/task-139-lost-eviction/audit.md`):
+                // the previous in-place `register_action_result_digests`
+                // raced `evicted_digests` on the same `mpsc::channel(1)`
+                // and could permanently stale the locality map. The
+                // worker's BlobsAvailable backstop is 100 ms with
+                // immediate Notify on insert, so the latency we lose by
+                // dropping the early registration is sub-100 ms. The
+                // mark_stable hook that covers already-cached outputs
+                // (BIS-coverage audit A1) lives on the BlobsAvailable
+                // handler now too — every pin path the worker reports
+                // through BlobsAvailable is covered.
                 let exit_code = finished_result.result.as_ref().map_or(-1, |r| r.exit_code);
                 let action_stage = finished_result
                     .try_into()
@@ -983,7 +942,13 @@ impl WorkerConnection {
     }
 
     /// Check which of `digests` are missing from the server CAS and send
-    /// UploadMissingBlobs requests to the worker for each batch.
+    /// UploadMissingBlobs requests to the worker for each batch. ALSO
+    /// `mark_stable` the present subset so the BIS broadcast loop tells
+    /// the worker it is safe to unpin those digests (see audit at
+    /// `.claude/audits/task-139-lost-eviction/audit.md` Path 2 +
+    /// `.claude/reviews/bis-coverage-for-already-cached-outputs/audit.md`):
+    /// every pin path the worker reports through BlobsAvailable is
+    /// covered here, replacing the deleted `register_action_result_digests`.
     ///
     /// Deduplicates against in-flight requests: digests that were requested
     /// within the last `BACKFILL_INFLIGHT_TIMEOUT_SECS` are skipped to avoid
@@ -1007,10 +972,14 @@ impl WorkerConnection {
             .collect();
         let mut results = vec![None; keys.len()];
         if let Err(err) = cas_store.has_with_results(&keys, &mut results).await {
-            warn!(
+            error!(
                 worker_id=?worker_id,
                 ?err,
-                "backfill: failed to check CAS existence"
+                count=digests.len(),
+                "backfill+mark_stable: failed to check CAS existence; \
+                 worker pins for present digests will not be acked this round \
+                 (next BlobsAvailable tick recovers) and missing digests will \
+                 not be requested for upload (next backfill tick recovers)"
             );
             return;
         }
@@ -1025,6 +994,21 @@ impl WorkerConnection {
             .zip(results.iter())
             .filter_map(|(d, r)| r.map(|_| *d))
             .collect();
+
+        // mark_stable for the present subset: the server has each of these
+        // digests in stable storage, so the worker's pin is no longer
+        // load-bearing. The BIS broadcast loop in `nativelink.rs` drains
+        // `stable_digests` and emits `BlobsInStableStorage` to every
+        // worker, which calls `unpin_digest` (`local_worker.rs:717`).
+        // The has_with_results check above guarantees we never tell the
+        // worker to unpin a digest the server doesn't actually have
+        // (which would lose the only durable copy of a `mirror_blob`).
+        // Idempotent: the broadcast loop dedups downstream and
+        // `unpin_digest` is itself idempotent.
+        if !present_in_cas.is_empty() {
+            let present_vec: Vec<DigestInfo> = present_in_cas.iter().copied().collect();
+            cas_store.mark_stable(&present_vec);
+        }
 
         // Collect missing digests, filtering out those already in-flight.
         let missing: Vec<DigestInfo> = {

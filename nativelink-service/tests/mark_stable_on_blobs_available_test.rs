@@ -43,7 +43,6 @@ use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_lock::Mutex as AsyncMutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::cas_server::WorkerApiConfig;
@@ -93,62 +92,31 @@ const fn static_now_fn() -> Result<Duration, Error> {
     Ok(Duration::from_secs(BASE_NOW_S))
 }
 
-// ----- MockWorkerStateManager (mirror of worker_api_server_test.rs) -----
-
-#[derive(Debug)]
-enum WorkerStateManagerCalls {
-    UpdateOperation((OperationId, WorkerId, UpdateOperationType)),
-}
-
-#[derive(Debug)]
-enum WorkerStateManagerReturns {
-    UpdateOperation(Result<(), Error>),
-}
-
+// ----- MockWorkerStateManager -----
+//
+// The BlobsAvailable handler does NOT call into the WorkerStateManager
+// for the new mark_stable path; the mock here exists only to satisfy
+// the `ApiWorkerScheduler::new` signature. We never receive any calls
+// on it during these tests. The `_unused` field is required because
+// `MetricsComponent` is not derivable for unit structs.
 #[derive(MetricsComponent)]
 struct MockWorkerStateManager {
-    rx_call: Arc<AsyncMutex<mpsc::UnboundedReceiver<WorkerStateManagerCalls>>>,
-    tx_call: mpsc::UnboundedSender<WorkerStateManagerCalls>,
-    rx_resp: Arc<AsyncMutex<mpsc::UnboundedReceiver<WorkerStateManagerReturns>>>,
-    tx_resp: mpsc::UnboundedSender<WorkerStateManagerReturns>,
-}
-
-impl MockWorkerStateManager {
-    fn new() -> Self {
-        let (tx_call, rx_call) = mpsc::unbounded_channel();
-        let (tx_resp, rx_resp) = mpsc::unbounded_channel();
-        Self {
-            rx_call: Arc::new(AsyncMutex::new(rx_call)),
-            tx_call,
-            rx_resp: Arc::new(AsyncMutex::new(rx_resp)),
-            tx_resp,
-        }
-    }
+    #[metric(help = "unused")]
+    _unused: u64,
 }
 
 #[async_trait]
 impl WorkerStateManager for MockWorkerStateManager {
     async fn update_operation(
         &self,
-        operation_id: &OperationId,
-        worker_id: &WorkerId,
-        update: UpdateOperationType,
+        _operation_id: &OperationId,
+        _worker_id: &WorkerId,
+        _update: UpdateOperationType,
     ) -> Result<(), Error> {
-        self.tx_call
-            .send(WorkerStateManagerCalls::UpdateOperation((
-                operation_id.clone(),
-                worker_id.clone(),
-                update,
-            )))
-            .expect("Could not send request to mpsc");
-        let mut rx_resp_lock = self.rx_resp.lock().await;
-        match rx_resp_lock
-            .recv()
-            .await
-            .expect("Could not receive msg in mpsc")
-        {
-            WorkerStateManagerReturns::UpdateOperation(result) => result,
-        }
+        unreachable!(
+            "BlobsAvailable handling does not invoke update_operation; \
+             mock should never be called from this test"
+        )
     }
 }
 
@@ -215,7 +183,7 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
 
     let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
     let tasks_or_worker_change_notify = Arc::new(Notify::new());
-    let state_manager = Arc::new(MockWorkerStateManager::new());
+    let state_manager = Arc::new(MockWorkerStateManager { _unused: 0 });
     let worker_registry = Arc::new(WorkerRegistry::new());
     let scheduler = ApiWorkerScheduler::new(
         state_manager,
