@@ -408,7 +408,7 @@ async fn grpc_store_tiny_blob_with_oversized_length_does_not_wedge_parallel()
     // f479989b...-183 and ddb73a...-183.
     const PAYLOAD_LEN: usize = 183;
     let payload_vec: Vec<u8> = (0..PAYLOAD_LEN).map(|i| i as u8).collect();
-    let payload = Bytes::from(payload_vec.clone());
+    let payload = Bytes::from(payload_vec);
 
     let read_request_count = Arc::new(AtomicU64::new(0));
     let server_impl = TinyBlobByteStream {
