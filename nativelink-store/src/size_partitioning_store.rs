@@ -23,11 +23,10 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
-    UploadSizeInfo,
+    ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
 };
 use tokio::join;
-use tokio::sync::Notify;
 use tracing::warn;
 
 #[derive(Debug, MetricsComponent)]
@@ -38,15 +37,13 @@ pub struct SizePartitioningStore {
     lower_store: Store,
     #[metric(group = "upper_store")]
     upper_store: Store,
-    /// Lazy-initialized merged Notify for the `Many` BIS chain. Populated
-    /// on first call to `stable_notify()` by the trait's default body
-    /// (`StableDigestDelegation::Many` arm). Each entry spawns ONE
-    /// background task per child notify that forwards wakes here. Must be
-    /// owned by the wrapper so subscribers see the same Notify across
-    /// repeated calls (returning a fresh Notify per call would orphan
-    /// existing subscribers). Not metric'd — `OnceLock<Arc<Notify>>` does
-    /// not implement `MetricsComponent`.
-    merged_stable_notify: OnceLock<Arc<Notify>>,
+    /// Lazy-initialized merged Notify state for the `Many` BIS chain.
+    /// Populated on first call to `stable_notify()` by the trait's default
+    /// body. Owns both the merged Notify and the AbortOnDrop forwarder
+    /// handles, so dropping the wrapper aborts the spawned forwarders
+    /// (closes F2 task leak). Must be owned by the wrapper so subscribers
+    /// see the same Notify across repeated calls; not metric'd.
+    merged_stable_notify: OnceLock<MergedNotifyState>,
 }
 
 impl SizePartitioningStore {
@@ -285,7 +282,7 @@ impl StoreDriver for SizePartitioningStore {
                 self.lower_store.as_store_driver(),
                 self.upper_store.as_store_driver(),
             ],
-            merged_notify: &self.merged_stable_notify,
+            merged_state: &self.merged_stable_notify,
         }
     }
 

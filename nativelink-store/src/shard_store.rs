@@ -24,10 +24,9 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
-    UploadSizeInfo,
+    ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
 };
-use tokio::sync::Notify;
 use tracing::warn;
 
 #[derive(Debug, MetricsComponent)]
@@ -47,10 +46,11 @@ pub struct ShardStore {
         help = "The weights and stores that are used to determine which store to use"
     )]
     weights_and_stores: Vec<StoreAndWeight>,
-    /// Lazy-initialized merged Notify backing the `Many` BIS chain across
-    /// shards. Populated on first `stable_notify()` call. Not metric'd —
-    /// `OnceLock<Arc<Notify>>` is not derive-able.
-    merged_stable_notify: OnceLock<Arc<Notify>>,
+    /// Lazy-initialized merged Notify state backing the `Many` BIS chain
+    /// across shards. Populated on first `stable_notify()` call. Owns the
+    /// AbortOnDrop forwarder handles so wrapper drop aborts the spawned
+    /// tasks (closes F2 task leak). Not metric'd.
+    merged_stable_notify: OnceLock<MergedNotifyState>,
 }
 
 impl ShardStore {
@@ -287,7 +287,7 @@ impl StoreDriver for ShardStore {
                 .iter()
                 .map(|sw| sw.store.as_store_driver())
                 .collect(),
-            merged_notify: &self.merged_stable_notify,
+            merged_state: &self.merged_stable_notify,
         }
     }
 

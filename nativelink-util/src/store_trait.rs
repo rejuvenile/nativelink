@@ -31,6 +31,7 @@ use futures::{Future, FutureExt, Stream, StreamExt, join, try_join};
 use futures::stream::FuturesUnordered;
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 tokio::task_local! {
     /// Set to `true` when the current CAS request originates from a worker
@@ -131,6 +132,53 @@ pub async fn slow_update_store_with_file<S: StoreDriver + ?Sized>(
     Ok(file)
 }
 
+/// RAII wrapper that aborts a tokio `JoinHandle` on drop.
+///
+/// Used by [`MergedNotifyState`] to ensure forwarder tasks spawned by the
+/// `Many` arm of [`StableDigestDelegation`] terminate when the wrapper
+/// store is dropped. Without this, `tokio::spawn`'d forwarder loops would
+/// hold strong `Arc<Notify>` references forever (one per child × stores
+/// × test runs), preventing the merged Notify and child Notifies from
+/// being deallocated.
+#[derive(Debug)]
+pub struct AbortOnDrop(JoinHandle<()>);
+
+impl AbortOnDrop {
+    pub fn new(handle: JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// State owned by a `Many`-position wrapper for its merged Notify and the
+/// per-child forwarder tasks that wake it.
+///
+/// The wrapper store holds `OnceLock<MergedNotifyState>`; the trait default
+/// for `stable_notify` lazily initializes both the Notify and the forwarder
+/// JoinHandles on first call. When the wrapper is dropped, the OnceLock
+/// drops the state, which drops each `AbortOnDrop`, which aborts the
+/// spawned forwarder task — releasing every Arc the forwarder held.
+///
+/// **Closes F2** (perf-optimizer): forwarder JoinHandles were previously
+/// discarded, leaking ~2-8 tasks per wrapper drop in tests and a fixed
+/// per-wrapper cost in production.
+#[derive(Debug)]
+pub struct MergedNotifyState {
+    pub notify: Arc<Notify>,
+    /// The field is only read on Drop (each `AbortOnDrop` calls
+    /// `JoinHandle::abort` from its `Drop` impl). Rust's dead-code lint
+    /// considers Drop-only fields "unused" because they are never
+    /// explicitly read; allow the warning here so the field's purpose
+    /// (preventing forwarder task leak via wrapper drop) stays visible.
+    #[allow(dead_code)]
+    pub aborters: Vec<AbortOnDrop>,
+}
+
 /// Delegation strategy for stable-digest aggregation methods on a store.
 ///
 /// The `StoreDriver` trait once shipped silent no-op defaults for
@@ -159,12 +207,14 @@ pub enum StableDigestDelegation<'a> {
     Inner(&'a (dyn StoreDriver + 'static)),
     /// Multi-inner wrapper — forwards to each inner store. For
     /// `drain_stable_digests`, results are concatenated. For
-    /// `stable_notify`, the wrapper MUST own a `OnceLock<Arc<Notify>>`
-    /// field and pass it via `merged_notify`; the trait default lazily
-    /// builds a merged Notify woken when ANY inner Notify fires.
+    /// `stable_notify`, the wrapper MUST own a `OnceLock<MergedNotifyState>`
+    /// field and pass it via `merged_state`; the trait default lazily
+    /// builds a merged Notify woken when ANY inner Notify fires AND
+    /// captures the forwarder JoinHandles in the state so they get
+    /// aborted when the wrapper drops (closes F2 task leak).
     Many {
         children: Vec<&'a (dyn StoreDriver + 'static)>,
-        merged_notify: &'a OnceLock<Arc<Notify>>,
+        merged_state: &'a OnceLock<MergedNotifyState>,
     },
     /// Pure passthrough — same dispatch as [`Self::Inner`] but documents
     /// intent for stores that resolve to an inner store dynamically
@@ -1056,10 +1106,21 @@ pub trait StoreDriver:
     /// available.
     ///
     /// The default body dispatches via [`Self::stable_delegation`]. For
-    /// `Many`, the wrapper-supplied `OnceLock` is lazily populated with a
-    /// merged Notify woken when any inner store's Notify fires. The
-    /// per-child watcher tasks live for the program's lifetime — same
-    /// pattern as `src/bin/nativelink.rs:367-380`.
+    /// `Many`, the wrapper-supplied `OnceLock<MergedNotifyState>` is
+    /// lazily populated with a merged Notify woken when any inner store's
+    /// Notify fires. The per-child forwarder tasks' JoinHandles are
+    /// retained as `AbortOnDrop` inside `MergedNotifyState`, so when the
+    /// wrapper store is dropped the OnceLock drops the state, the
+    /// `AbortOnDrop`s drop, and each forwarder task is aborted —
+    /// preventing the per-wrapper-drop task leak (F2).
+    ///
+    /// **Leaf safety note:** the static `NOOP_NOTIFY` is shared across
+    /// every Leaf store in every store tree. This is safe because no
+    /// code path ever calls `notify_one`/`notify_waiters` on a `Notify`
+    /// returned from a Leaf delegation — the contract is "never woken,"
+    /// callers only `.notified().await`. Sharing one static avoids
+    /// per-Leaf allocation; if a future change introduced a way to wake
+    /// it, the cascade across trees would be a real concern.
     fn stable_notify(&self) -> Arc<Notify> {
         match self.stable_delegation() {
             StableDigestDelegation::Leaf => {
@@ -1073,23 +1134,31 @@ pub trait StoreDriver:
             }
             StableDigestDelegation::Many {
                 children,
-                merged_notify,
-            } => merged_notify
-                .get_or_init(|| {
-                    let merged = Arc::new(Notify::new());
-                    for child in children {
-                        let child_notify = child.stable_notify();
-                        let merged_clone = merged.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                child_notify.notified().await;
-                                merged_clone.notify_one();
-                            }
-                        });
-                    }
-                    merged
-                })
-                .clone(),
+                merged_state,
+            } => {
+                merged_state
+                    .get_or_init(|| {
+                        let merged = Arc::new(Notify::new());
+                        let mut aborters = Vec::with_capacity(children.len());
+                        for child in children {
+                            let child_notify = child.stable_notify();
+                            let merged_clone = merged.clone();
+                            let handle = tokio::spawn(async move {
+                                loop {
+                                    child_notify.notified().await;
+                                    merged_clone.notify_one();
+                                }
+                            });
+                            aborters.push(AbortOnDrop::new(handle));
+                        }
+                        MergedNotifyState {
+                            notify: merged,
+                            aborters,
+                        }
+                    })
+                    .notify
+                    .clone()
+            }
         }
     }
 

@@ -27,11 +27,10 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::fastcdc::FastCDC;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
-    UploadSizeInfo,
+    ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
 use tokio_util::codec::FramedRead;
 use tokio_util::io::StreamReader;
 use tracing::warn;
@@ -66,10 +65,11 @@ pub struct DedupStore {
     #[metric(help = "Maximum number of concurrent fetches per get")]
     max_concurrent_fetch_per_get: usize,
     bincode_config: LegacyBincodeConfig,
-    /// Lazy-initialized merged Notify backing the `Many` BIS chain.
+    /// Lazy-initialized merged Notify state backing the `Many` BIS chain.
     /// Populated on first call to `stable_notify()` by the trait default
-    /// body. Not metric'd — `OnceLock<Arc<Notify>>` is not derive-able.
-    merged_stable_notify: OnceLock<Arc<Notify>>,
+    /// body. Owns AbortOnDrop forwarder handles so wrapper drop aborts
+    /// spawned tasks (closes F2 task leak). Not metric'd.
+    merged_stable_notify: OnceLock<MergedNotifyState>,
 }
 
 impl core::fmt::Debug for DedupStore {
@@ -413,7 +413,7 @@ impl StoreDriver for DedupStore {
                 self.index_store.as_store_driver(),
                 self.content_store.as_store_driver(),
             ],
-            merged_notify: &self.merged_stable_notify,
+            merged_state: &self.merged_stable_notify,
         }
     }
 

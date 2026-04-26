@@ -242,8 +242,8 @@ async fn outer_stable_notify_fires_when_inner_fastslow_completes_slow_write()
             "DEADLOCK DETECTED: outer stable_notify did not fire within timeout. \
              Production-composition contract violated — SizePartitioningStore is \
              not forwarding stable_notify from its inner FastSlowStore. Verify \
-             stable_delegation() returns Many { children, merged_notify } and that \
-             the wrapper owns OnceLock<Arc<Notify>> field.",
+             stable_delegation() returns Many { children, merged_state } and that \
+             the wrapper owns OnceLock<MergedNotifyState> field.",
         )?;
 
     Ok(())
