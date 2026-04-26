@@ -82,6 +82,14 @@ state exploration on large models; the bounded models here finish in
     java -cp /tmp/tla2tools.jar tlc2.TLC -config ReplicaInvariantBugged.cfg ReplicaInvariant
     #   Expected: "Invariant CachePositiveImpliesTwoReplicasAtInsert is violated."
 
+    # H2 connection-pool predicate gap:
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config H2ConnectionPoolFixed.cfg H2ConnectionPool
+    #   Expected: "Model checking completed. No error has been found."
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config H2ConnectionPoolBugged.cfg H2ConnectionPool
+    #   Expected: "Invariant ResourceExhaustedTriggersEviction is violated."
+    #   Trace shows: Goaway(c1) -> Fetch(c1) yielding code=ResourceExhausted ->
+    #   pendingReconnect still empty, EvictsErr=FALSE -> stuck.
+
 To run only static analysis (parser + name-resolution; useful when you
 want to verify a spec compiles without running model checking):
 
@@ -142,6 +150,24 @@ present, and a subsequent eviction produces a "blob missing" cascade.
 The `CachePositiveImpliesTwoReplicasAtInsert` and `NoLossyAckCascade`
 invariants both fire under the bugged config.
 
+### `H2ConnectionPool.tla`
+
+Models the h2 connection-pool stale-channel reuse bug at
+`grpc_store.rs:143-155` (`looks_like_dead_channel` predicate) and the
+post-GOAWAY ResourceExhausted surface code that escaped the historic
+predicate's allowlist. Two `.cfg` files toggle the predicate's
+inclusion of `Code::ResourceExhausted`. The bugged config exposes the
+trace where a `Draining` channel surfaces ResourceExhausted on every
+fetch but is never evicted from the pool, leading to unbounded fetch
+failure on subsequent checkouts. The race-loser-abort
+× `parallel_chunk_count = 64` amplification shape is captured by
+TLC's natural exploration of multiple in-flight fetches against the
+same channel.
+
+The `ResourceExhaustedTriggersEviction` invariant fires on the
+bugged config; the trace is the minimal:
+`Goaway(c1) -> Fetch(c1) [ResourceExhausted, no eviction]`.
+
 ## Scope honesty
 
 Each spec includes an explicit ASSUMPTION block listing what is and
@@ -183,26 +209,20 @@ broader than the documented one. In particular:
 
 In rough priority order:
 
-1. **H2 connection pool predicate gap**
-   (`project_h2_pool_stale_channel_2026_04_25.md`): GOAWAY'd channels
-   reused; predicate excludes ResourceExhausted; race-loser
-   `JoinHandle::abort` × `parallel_chunk_count = 64`. Model the pool's
-   per-channel state machine and the GOAWAY signal.
-2. **Phantom-blob false-alarm conflation**
+1. **Phantom-blob false-alarm conflation**
    (`project_phantom_blob_false_alarm_2026_04_25.md`): `head_was_ok`
    conflates `LazyExistenceOnSync skip` with `has-said-Some`. Spec the
-   ExistenceCacheStore's positive-insert gate vs. the head-decision
-   path.
-3. **Pin listener multiplicity**
+   FastSlowStore populate path's flag vs. the head-decision path.
+2. **Pin listener multiplicity**
    (`project_pin_listener_multiplicity_2026_04_25.md`): 3×
    FastSlowStore listener registration + populate-pin scope mismatch.
    Model multiple listeners over a single pin set.
-4. **Trait-default no-op wrapper inheritance**
-   (`store_trait.rs:954-966`): the `stable_notify`/`drain_stable_digests`
+3. **Trait-default no-op wrapper inheritance**
+   (`store_trait.rs:954-991`): the `stable_notify`/`drain_stable_digests`
    defaults are no-ops; wrappers that forget to override silently
    swallow the contract delegation. Model a 2-level wrapper hierarchy
    and check that delegation reaches the leaf.
-5. **failed_slow_writes retry-on-reconnect**: separate `failed_writes`
+4. **failed_slow_writes retry-on-reconnect**: separate `failed_writes`
    set, drained on worker reconnect. Model the worker disconnect /
    reconnect cycle and check that no digest is permanently stuck in
    the failed set.
@@ -226,6 +246,9 @@ that time:
 - `ReplicaInvariantFixed.cfg`: PASS
 - `ReplicaInvariantBugged.cfg`: FAIL as designed
   (`CachePositiveImpliesTwoReplicasAtInsert` violated)
+- `H2ConnectionPoolFixed.cfg`: PASS (no violation)
+- `H2ConnectionPoolBugged.cfg`: FAIL as designed
+  (`ResourceExhaustedTriggersEviction` violated)
 
 If a fix lands that changes one of the production code paths cited in
 a spec, re-run the corresponding bugged config to verify the spec
