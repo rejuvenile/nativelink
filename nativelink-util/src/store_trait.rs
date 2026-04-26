@@ -131,6 +131,75 @@ pub async fn slow_update_store_with_file<S: StoreDriver + ?Sized>(
     Ok(file)
 }
 
+/// Delegation strategy for stable-digest aggregation methods on a store.
+///
+/// The `StoreDriver` trait once shipped silent no-op defaults for
+/// `drain_stable_digests` / `stable_notify`, so wrapper stores added before
+/// the BlobsInStableStorage feature (e.g. `SizePartitioningStore`) silently
+/// returned empty drains and "never woken" notifies in production. The
+/// resulting BIS broadcast was wedged for 31 days
+/// (`.claude/reviews/why-bis-bug-not-caught/audit.md`).
+///
+/// To prevent that class of bug from recurring, every `StoreDriver` impl
+/// MUST implement [`StoreDriver::stable_delegation`] (no default body) and
+/// declare its position in the chain. The default bodies of
+/// `drain_stable_digests` and `stable_notify` then dispatch via this enum,
+/// which makes the wrapper-store author choose at compile time.
+///
+/// Reference: `src/bin/nativelink.rs:367-380` shows the production-side
+/// merged-Notify pattern used here for the `Many` variant.
+pub enum StableDigestDelegation<'a> {
+    /// Leaf store — no inner store contributes to the stable-digest stream
+    /// from this position. The default `drain_stable_digests` returns empty
+    /// and the default `stable_notify` returns a never-woken Notify. Stores
+    /// that produce digests directly (e.g. [`FastSlowStore`]) MUST also
+    /// override the methods to return their own state.
+    Leaf,
+    /// Single-inner wrapper — forwards unchanged to one inner store.
+    Inner(&'a (dyn StoreDriver + 'static)),
+    /// Multi-inner wrapper — forwards to each inner store. For
+    /// `drain_stable_digests`, results are concatenated. For
+    /// `stable_notify`, the wrapper MUST own a `OnceLock<Arc<Notify>>`
+    /// field and pass it via `merged_notify`; the trait default lazily
+    /// builds a merged Notify woken when ANY inner Notify fires.
+    Many {
+        children: Vec<&'a (dyn StoreDriver + 'static)>,
+        merged_notify: &'a OnceLock<Arc<Notify>>,
+    },
+    /// Pure passthrough — same dispatch as [`Self::Inner`] but documents
+    /// intent for stores that resolve to an inner store dynamically
+    /// (e.g. `RefStore`).
+    Passthrough(&'a (dyn StoreDriver + 'static)),
+}
+
+/// Delegation strategy for `pin_digests` / `pin_digests_with_results`.
+///
+/// Wrapper stores MUST declare which inner store(s) own the pin. The
+/// default impls of [`StoreDriver::pin_digests`] and
+/// [`StoreDriver::pin_digests_with_results`] dispatch via this enum so an
+/// author cannot ship a wrapper that silently drops pin requests (which
+/// would re-introduce eviction-during-fetch races).
+///
+/// Unlike [`StableDigestDelegation`], pinning is fire-and-forget so no
+/// merged-Notify wiring is needed for the multi-inner case.
+pub enum PinDelegation<'a> {
+    /// Leaf store — pins resolve here. If the leaf supports pinning
+    /// (e.g. [`FilesystemStore`]) it MUST override `pin_digests` and
+    /// `pin_digests_with_results`. The default body for `Leaf` is a no-op
+    /// that reports `true` for every digest (preserves prior semantics for
+    /// stores that don't pin).
+    Leaf,
+    /// Single-inner wrapper — forwards unchanged.
+    Inner(&'a (dyn StoreDriver + 'static)),
+    /// Multi-inner wrapper — fans out the pin to every inner store. For
+    /// `pin_digests_with_results`, the per-digest result is the OR across
+    /// inner results (any-store-pinned counts as success).
+    Many(Vec<&'a (dyn StoreDriver + 'static)>),
+    /// Pure passthrough — same dispatch as [`Self::Inner`] but documents
+    /// intent for resolved-by-name wrappers (e.g. `RefStore`).
+    Passthrough(&'a (dyn StoreDriver + 'static)),
+}
+
 /// Optimizations that stores may want to expose to the callers.
 /// This is useful for specific cases when the store can optimize the processing
 /// of the data being processed.
@@ -948,46 +1017,156 @@ pub trait StoreDriver:
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error>;
 
+    /// Declare how this store routes [`Self::drain_stable_digests`] /
+    /// [`Self::stable_notify`] / [`Self::drain_failed_digests`] requests.
+    ///
+    /// **No default body** — every store MUST implement this so the author
+    /// is forced at compile time to think about the BIS path. See
+    /// [`StableDigestDelegation`] for variants and rationale.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_>;
+
+    /// Declare how this store routes [`Self::pin_digests`] /
+    /// [`Self::pin_digests_with_results`] requests.
+    ///
+    /// **No default body** — every store MUST implement this so the author
+    /// is forced at compile time to think about pin propagation. See
+    /// [`PinDelegation`] for variants and rationale.
+    fn pin_delegation(&self) -> PinDelegation<'_>;
+
     /// Drain digests that have completed their write to stable storage
-    /// (e.g., FilesystemStore in a FastSlowStore). Wrapper stores should
-    /// delegate to their inner store. The default returns an empty Vec.
+    /// (e.g., FilesystemStore in a FastSlowStore).
+    ///
+    /// The default body dispatches via [`Self::stable_delegation`].
+    /// Stores that produce digests directly (e.g. [`FastSlowStore`])
+    /// declare `Leaf` and override this method to return their own state.
     fn drain_stable_digests(&self) -> Vec<DigestInfo> {
-        Vec::new()
+        match self.stable_delegation() {
+            StableDigestDelegation::Leaf => Vec::new(),
+            StableDigestDelegation::Inner(s) | StableDigestDelegation::Passthrough(s) => {
+                s.drain_stable_digests()
+            }
+            StableDigestDelegation::Many { children, .. } => children
+                .iter()
+                .flat_map(|s| s.drain_stable_digests())
+                .collect(),
+        }
     }
 
     /// Returns a [`Notify`] that is woken when new stable digests are
-    /// available. Wrapper stores should delegate to their inner store.
-    /// The default returns a static Notify that is never woken.
+    /// available.
+    ///
+    /// The default body dispatches via [`Self::stable_delegation`]. For
+    /// `Many`, the wrapper-supplied `OnceLock` is lazily populated with a
+    /// merged Notify woken when any inner store's Notify fires. The
+    /// per-child watcher tasks live for the program's lifetime — same
+    /// pattern as `src/bin/nativelink.rs:367-380`.
     fn stable_notify(&self) -> Arc<Notify> {
-        static NOOP_NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
-        NOOP_NOTIFY
-            .get_or_init(|| Arc::new(Notify::new()))
-            .clone()
+        match self.stable_delegation() {
+            StableDigestDelegation::Leaf => {
+                static NOOP_NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
+                NOOP_NOTIFY
+                    .get_or_init(|| Arc::new(Notify::new()))
+                    .clone()
+            }
+            StableDigestDelegation::Inner(s) | StableDigestDelegation::Passthrough(s) => {
+                s.stable_notify()
+            }
+            StableDigestDelegation::Many {
+                children,
+                merged_notify,
+            } => merged_notify
+                .get_or_init(|| {
+                    let merged = Arc::new(Notify::new());
+                    for child in children {
+                        let child_notify = child.stable_notify();
+                        let merged_clone = merged.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                child_notify.notified().await;
+                                merged_clone.notify_one();
+                            }
+                        });
+                    }
+                    merged
+                })
+                .clone(),
+        }
     }
 
     /// Pin digests to prevent eviction while a worker is fetching them.
-    /// Wrapper stores should delegate to their inner store. Stores that
-    /// support pinning (e.g., `FilesystemStore`) override this to call
-    /// `MokaEvictingMap::pin_key()`. The default is a no-op.
-    fn pin_digests(&self, _digests: &[DigestInfo]) {}
+    ///
+    /// The default body dispatches via [`Self::pin_delegation`]. Stores
+    /// that support pinning (e.g. [`FilesystemStore`]) declare `Leaf` and
+    /// override this to call `MokaEvictingMap::pin_keys()`.
+    fn pin_digests(&self, digests: &[DigestInfo]) {
+        match self.pin_delegation() {
+            PinDelegation::Leaf => {
+                // Leaves that don't pin (Memory, Noop) silently no-op.
+            }
+            PinDelegation::Inner(s) | PinDelegation::Passthrough(s) => {
+                s.pin_digests(digests);
+            }
+            PinDelegation::Many(children) => {
+                for child in children {
+                    child.pin_digests(digests);
+                }
+            }
+        }
+    }
 
     /// Like `pin_digests` but reports per-digest success. The returned
     /// vec has one entry per input digest, in order: `true` if the digest
     /// was present in the store and is now pinned, `false` if it was
     /// absent (e.g. already evicted) and so could not be pinned.
-    /// Default implementation calls `pin_digests` and reports `true` for
-    /// every input — stores that don't support pinning still appear to
-    /// succeed (existing semantics preserved).
+    ///
+    /// The default body dispatches via [`Self::pin_delegation`]. For
+    /// `Many`, the per-digest result is the OR across inner results
+    /// (any-store-pinned counts as success). Stores that support pinning
+    /// (e.g. [`FilesystemStore`]) declare `Leaf` and override this to
+    /// report per-key results from `MokaEvictingMap::pin_key()`.
     fn pin_digests_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
-        self.pin_digests(digests);
-        vec![true; digests.len()]
+        match self.pin_delegation() {
+            PinDelegation::Leaf => {
+                // Preserves prior semantics: stores that don't pin still
+                // appear to succeed for all digests.
+                self.pin_digests(digests);
+                vec![true; digests.len()]
+            }
+            PinDelegation::Inner(s) | PinDelegation::Passthrough(s) => {
+                s.pin_digests_with_results(digests)
+            }
+            PinDelegation::Many(children) => {
+                let mut combined = vec![false; digests.len()];
+                for child in children {
+                    let per_child = child.pin_digests_with_results(digests);
+                    debug_assert_eq!(per_child.len(), digests.len());
+                    for (slot, result) in combined.iter_mut().zip(per_child) {
+                        *slot |= result;
+                    }
+                }
+                combined
+            }
+        }
     }
 
     /// Drain digests whose background slow-store write failed.
-    /// Used by the worker to retry uploads on reconnect. Wrapper stores
-    /// should delegate to their inner store. The default returns an empty Vec.
+    /// Used by the worker to retry uploads on reconnect.
+    ///
+    /// The default body dispatches via [`Self::stable_delegation`] (the
+    /// failed-digest stream rides the same chain). Stores that own a
+    /// failed-write set (e.g. [`FastSlowStore`]) declare `Leaf` and
+    /// override this method.
     fn drain_failed_digests(&self) -> Vec<DigestInfo> {
-        Vec::new()
+        match self.stable_delegation() {
+            StableDigestDelegation::Leaf => Vec::new(),
+            StableDigestDelegation::Inner(s) | StableDigestDelegation::Passthrough(s) => {
+                s.drain_failed_digests()
+            }
+            StableDigestDelegation::Many { children, .. } => children
+                .iter()
+                .flat_map(|s| s.drain_failed_digests())
+                .collect(),
+        }
     }
 }
 
