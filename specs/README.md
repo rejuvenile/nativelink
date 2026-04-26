@@ -90,6 +90,16 @@ state exploration on large models; the bounded models here finish in
     #   Trace shows: Goaway(c1) -> Fetch(c1) yielding code=ResourceExhausted ->
     #   pendingReconnect still empty, EvictsErr=FALSE -> stuck.
 
+    # Phantom-blob false-alarm conflation:
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config PhantomBlobExistenceCacheFixed.cfg PhantomBlobExistenceCache
+    #   Expected: "Model checking completed. No error has been found."
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config PhantomBlobExistenceCacheBugged.cfg PhantomBlobExistenceCache
+    #   Expected: "Invariant GateFlagMatchesHasOutcome is violated."
+    #   Trace shows: HeadStepLazySkip -> flagSetByHead=TRUE while
+    #   realHasReturnedSome=FALSE -> conflation. Re-running may also surface
+    #   "Invariant WarnFiresOnlyOnGenuineRace is violated" for the
+    #   downstream false-alarm symptom.
+
 To run only static analysis (parser + name-resolution; useful when you
 want to verify a spec compiles without running model checking):
 
@@ -168,6 +178,26 @@ The `ResourceExhaustedTriggersEviction` invariant fires on the
 bugged config; the trace is the minimal:
 `Goaway(c1) -> Fetch(c1) [ResourceExhausted, no eviction]`.
 
+### `PhantomBlobExistenceCache.tla`
+
+Models the `head_was_ok` conflation in
+`fast_slow_store.rs::run_producer`. The HEAD step has THREE possible
+outcomes (`HasReturnedSome`, `HasReturnedNone`, `LazySkip`); the
+production code's flag must be set ONLY in the first case. Two
+`.cfg` files toggle the conflation: bugged sets the flag on BOTH
+`HasReturnedSome` AND `LazySkip` (the historic
+`head_was_ok = head_result.is_ok()` shape); fixed sets it only in
+the real-Some branch (the post-investigator
+`has_actually_returned_some` flag).
+
+The `GateFlagMatchesHasOutcome` invariant fires immediately on the
+bugged config: 2-state trace `HeadStepLazySkip` produces
+`flagSetByHead = TRUE` while `realHasReturnedSome = FALSE`. The
+`WarnFiresOnlyOnGenuineRace` invariant fires on a longer trace
+where the populate step then errors with NotFound and the gate
+opens, emitting a false-alarm warn — modeling the 178 false alarms
+per 10 minutes observed on production workers.
+
 ## Scope honesty
 
 Each spec includes an explicit ASSUMPTION block listing what is and
@@ -209,20 +239,16 @@ broader than the documented one. In particular:
 
 In rough priority order:
 
-1. **Phantom-blob false-alarm conflation**
-   (`project_phantom_blob_false_alarm_2026_04_25.md`): `head_was_ok`
-   conflates `LazyExistenceOnSync skip` with `has-said-Some`. Spec the
-   FastSlowStore populate path's flag vs. the head-decision path.
-2. **Pin listener multiplicity**
+1. **Pin listener multiplicity**
    (`project_pin_listener_multiplicity_2026_04_25.md`): 3×
    FastSlowStore listener registration + populate-pin scope mismatch.
    Model multiple listeners over a single pin set.
-3. **Trait-default no-op wrapper inheritance**
+2. **Trait-default no-op wrapper inheritance**
    (`store_trait.rs:954-991`): the `stable_notify`/`drain_stable_digests`
    defaults are no-ops; wrappers that forget to override silently
    swallow the contract delegation. Model a 2-level wrapper hierarchy
    and check that delegation reaches the leaf.
-4. **failed_slow_writes retry-on-reconnect**: separate `failed_writes`
+3. **failed_slow_writes retry-on-reconnect**: separate `failed_writes`
    set, drained on worker reconnect. Model the worker disconnect /
    reconnect cycle and check that no digest is permanently stuck in
    the failed set.
@@ -249,6 +275,10 @@ that time:
 - `H2ConnectionPoolFixed.cfg`: PASS (no violation)
 - `H2ConnectionPoolBugged.cfg`: FAIL as designed
   (`ResourceExhaustedTriggersEviction` violated)
+- `PhantomBlobExistenceCacheFixed.cfg`: PASS (no violation)
+- `PhantomBlobExistenceCacheBugged.cfg`: FAIL as designed
+  (`GateFlagMatchesHasOutcome` violated; `WarnFiresOnlyOnGenuineRace`
+   also violated on continued exploration)
 
 If a fix lands that changes one of the production code paths cited in
 a spec, re-run the corresponding bugged config to verify the spec
