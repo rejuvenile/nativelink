@@ -239,6 +239,13 @@ impl StoreDriver for RefStore {
         }
     }
 
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        if let Ok(store) = self.get_store() {
+            store.mark_stable(digests);
+        }
+        // Err: ref target unresolved — no-op, matches drain_stable_digests semantics.
+    }
+
     fn pin_digests(&self, digests: &[DigestInfo]) {
         if let Ok(store) = self.get_store() {
             store.pin_digests(digests);

@@ -3355,6 +3355,31 @@ impl StoreDriver for FastSlowStore {
         self.stable_notify.clone()
     }
 
+    /// Push the given digests into the BIS feeder queue and wake the
+    /// broadcast loop. Used by the worker API server's BlobsAvailable
+    /// handler to cover every path where the server has a digest
+    /// stably without the existing `update_oneshot` success-arm having
+    /// fired (deduplicated uploads, tree-children, mirror_blobs already
+    /// stably stored, etc.). Without this hook the worker's pin
+    /// (durable under pin v2) would leak forever for those paths.
+    /// Idempotent: the broadcast loop dedups downstream and the
+    /// worker's `unpin_digest` is itself idempotent.
+    ///
+    /// `mark_stable` is not yet covered by the C+D enum dispatch — task
+    /// #157 will fold it in once the per-digest size-routing question for
+    /// `SizePartitioningStore` is resolved.
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        if digests.is_empty() {
+            return;
+        }
+        {
+            let mut guard = self.stable_digests.lock();
+            guard.extend_from_slice(digests);
+        }
+        self.stable_notify.notify_one();
+    }
+
+
     fn drain_failed_digests(&self) -> Vec<DigestInfo> {
         let mut guard = self.failed_slow_writes.lock();
         guard.drain().collect()

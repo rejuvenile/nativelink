@@ -2344,6 +2344,14 @@ impl StoreDriver for WorkerProxyStore {
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Inner(self.inner.as_store_driver())
     }
+
+    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
+    /// Until then, wrappers must explicitly delegate so server-side
+    /// `mark_stable_on_blobs_available` doesn't silently no-op at the
+    /// WorkerProxyStore layer (#140).
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        self.inner.mark_stable(digests);
+    }
 }
 
 #[async_trait]

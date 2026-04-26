@@ -583,6 +583,17 @@ impl Store {
         self.inner.stable_notify()
     }
 
+    /// Externally mark digests as having reached stable storage. Used by
+    /// the worker API server's BlobsAvailable handler: when a worker
+    /// reports a digest it holds and the server has the same digest in
+    /// stable storage, the server marks it stable so the BIS broadcast
+    /// loop tells the worker it is safe to unpin.
+    /// Delegates to the inner [`StoreDriver::mark_stable`].
+    #[inline]
+    pub fn mark_stable(&self, digests: &[DigestInfo]) {
+        self.inner.mark_stable(digests);
+    }
+
     /// Pin digests to prevent eviction while a worker is fetching them.
     /// Delegates to the inner [`StoreDriver::pin_digests`].
     #[inline]
@@ -1206,6 +1217,42 @@ pub trait StoreDriver:
             }
         }
     }
+
+    /// Externally mark digests as having reached stable storage so the
+    /// next BIS broadcast covers them. Used by the worker API server's
+    /// BlobsAvailable handler: when a worker reports a digest it holds
+    /// and the server has the same digest stably, the server marks it
+    /// stable so the BIS broadcast loop tells the worker it is safe to
+    /// unpin (the worker's pin is no longer load-bearing).
+    ///
+    /// Why a separate hook (vs. the existing FastSlowStore success arm
+    /// in `update_oneshot`): the success arm only fires when the server
+    /// actually ran `update_oneshot` for the digest. The audit at
+    /// `.claude/reviews/bis-coverage-for-already-cached-outputs/audit.md`
+    /// quantifies all the paths where the server has a digest stably
+    /// without an `update_oneshot` having just run (deduplicated
+    /// uploads where the BatchUpdateBlobs / ByteStream::write
+    /// short-circuit, dedup hit on tree-children, mirror_blobs already
+    /// stably stored, etc.). Without this hook the worker's pin
+    /// (durable under pin v2, no TTL) leaks forever.
+    ///
+    /// The caller is responsible for verifying the server actually has
+    /// each digest (via `has_with_results`) before calling this; the
+    /// store cannot itself enforce that invariant cheaply on the hot
+    /// path. Calling `mark_stable` for a digest the server does NOT
+    /// have would tell the worker to unpin a digest whose only durable
+    /// copy is the worker's `mirror_blobs`, causing data loss.
+    ///
+    /// Wrapper stores MUST delegate to their inner store. The default is
+    /// a no-op so the trait stays object-safe; in production the BIS
+    /// pipeline relies on the override at FastSlowStore. A wrapper that
+    /// fails to delegate silently breaks the pipeline (cf. the
+    /// SizePartitioningStore stable_notify/drain_stable_digests bug).
+    ///
+    /// TODO(BIS-pipeline): fold into a forced-delegation enum mechanism
+    /// alongside `stable_notify` / `drain_stable_digests` once the
+    /// `aea1038e` (StableDigestDelegation) refactor lands.
+    fn mark_stable(&self, _digests: &[DigestInfo]) {}
 
     /// Pin digests to prevent eviction while a worker is fetching them.
     ///

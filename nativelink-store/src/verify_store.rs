@@ -436,6 +436,14 @@ impl StoreDriver for VerifyStore {
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Inner(self.inner_store.as_store_driver())
     }
+
+    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
+    /// Until then, wrappers must explicitly delegate so server-side
+    /// `mark_stable_on_blobs_available` doesn't silently no-op at the
+    /// VerifyStore layer (#140).
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        self.inner_store.mark_stable(digests);
+    }
 }
 
 default_health_status_indicator!(VerifyStore);

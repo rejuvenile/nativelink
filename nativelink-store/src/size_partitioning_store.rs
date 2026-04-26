@@ -21,6 +21,7 @@ use nativelink_config::stores::SizePartitioningSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
     DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
@@ -315,6 +316,37 @@ impl StoreDriver for SizePartitioningStore {
         children.push(self.lower_store.as_store_driver());
         children.push(self.upper_store.as_store_driver());
         PinDelegation::Many(children)
+    }
+
+    /// Route each digest to the inner store that owns it (by size partition)
+    /// so the digest lands in the correct stable-digests queue downstream.
+    /// If the inner store is itself a `FastSlowStore` it will push into its
+    /// own `stable_digests`; the BIS broadcast loop's drain visits each
+    /// terminal CAS store directly.
+    ///
+    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157);
+    /// `drain_stable_digests` / `stable_notify` ARE (via `stable_delegation`
+    /// above). Once #157 lands and the per-digest size-routing question is
+    /// resolved, this override can collapse into the enum.
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        if digests.is_empty() {
+            return;
+        }
+        let mut lower: Vec<DigestInfo> = Vec::new();
+        let mut upper: Vec<DigestInfo> = Vec::new();
+        for digest in digests {
+            if digest.size_bytes() < self.partition_size {
+                lower.push(*digest);
+            } else {
+                upper.push(*digest);
+            }
+        }
+        if !lower.is_empty() {
+            self.lower_store.mark_stable(&lower);
+        }
+        if !upper.is_empty() {
+            self.upper_store.mark_stable(&upper);
+        }
     }
 }
 
