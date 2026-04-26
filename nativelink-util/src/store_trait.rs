@@ -233,11 +233,21 @@ pub enum StableDigestDelegation<'a> {
 /// Unlike [`StableDigestDelegation`], pinning is fire-and-forget so no
 /// merged-Notify wiring is needed for the multi-inner case.
 pub enum PinDelegation<'a> {
-    /// Leaf store — pins resolve here. If the leaf supports pinning
-    /// (e.g. [`FilesystemStore`]) it MUST override `pin_digests` and
-    /// `pin_digests_with_results`. The default body for `Leaf` is a no-op
-    /// that reports `true` for every digest (preserves prior semantics for
-    /// stores that don't pin).
+    /// Leaf store — pins resolve here. Stores that actually pin (e.g.
+    /// [`FilesystemStore`]) MUST override `pin_digests_with_results` to
+    /// report real per-digest results. The default body for `Leaf` is a
+    /// no-op that reports `false` for every digest — "this store does
+    /// not pin so it cannot claim true."
+    ///
+    /// **Why default-false (CRIT-1 / F3 from c-plus-d/testing-czar.md and
+    /// c-plus-d/red-team.md):** the prior default returned
+    /// `vec![true; n]` to "preserve prior semantics," but the
+    /// [`Self::Many`] OR-merge then dominated the real per-digest
+    /// `false` from a pinning sibling (e.g. FastSlowStore's
+    /// MemoryStore-true masking FilesystemStore-false), silently
+    /// hiding eviction. Default-false makes non-pinning leaves
+    /// transparent in the OR-merge — only an actually-pinning child
+    /// can flip a slot to `true`.
     Leaf,
     /// Single-inner wrapper — forwards unchanged.
     Inner(&'a (dyn StoreDriver + 'static)),
@@ -1196,10 +1206,13 @@ pub trait StoreDriver:
     fn pin_digests_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
         match self.pin_delegation() {
             PinDelegation::Leaf => {
-                // Preserves prior semantics: stores that don't pin still
-                // appear to succeed for all digests.
+                // Default-false for non-pinning leaves (CRIT-1 / F3). Stores
+                // that actually pin override this method to report real
+                // per-digest results. The OR-merge in `Many` below treats
+                // non-pinning siblings as transparent — only a real
+                // pinning child can flip a slot to `true`.
                 self.pin_digests(digests);
-                vec![true; digests.len()]
+                vec![false; digests.len()]
             }
             PinDelegation::Inner(s) | PinDelegation::Passthrough(s) => {
                 s.pin_digests_with_results(digests)
