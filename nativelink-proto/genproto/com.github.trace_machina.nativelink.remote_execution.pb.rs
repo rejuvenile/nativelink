@@ -189,6 +189,78 @@ pub struct BlobsAvailableNotification {
     /// / this endpoint.
     #[prost(uint64, tag = "15")]
     pub mirror_max_bytes: u64,
+    /// / CURRENT snapshot of dispatcher-pushed mirror pins per source store.
+    /// / Sorted by `store_id` ASCII so the server can binary-search per
+    /// / FastSlowStore's `store_id` slice in `observe_pinned_mirror_ack`.
+    /// /
+    /// / DIFFERENT SEMANTICS from field 13 (`pinned_mirror_digests`).
+    /// / Field 13 carries the per-tick DELTA of newly-acquired mirror
+    /// / digests; the server reaction registers locality entries AND
+    /// / triggers `request_missing_blob_uploads` (BACKFILL_COOLDOWN
+    /// / bypass). Field 16 carries the FULL CURRENT snapshot of pins
+    /// / the dispatcher pushed; the server reaction broadcasts to all
+    /// / registered FastSlowStores via `observe_pinned_mirror_ack`,
+    /// / each of which binary-searches its own `store_id` region and
+    /// / removes server-side `EphemeralServerSidePin` entries that are
+    /// / now confirmed held on the worker.
+    /// /
+    /// / Both fields coexist on the wire and have distinct lifetimes —
+    /// / do NOT conflate.
+    #[prost(message, repeated, tag = "16")]
+    pub pinned_mirror_entries: ::prost::alloc::vec::Vec<MirrorPinEntry>,
+}
+/// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
+/// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
+/// / digest)`. The `store_id` matches the source FastSlowStore that
+/// / `SmallBlobDispatcher` pushed the blob from; the server's broadcast
+/// / to all registered FastSlowStores routes via this string.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MirrorPinEntry {
+    /// / The digest the worker now holds in its `mirror_blobs` map.
+    #[prost(message, optional, tag = "1")]
+    pub digest: ::core::option::Option<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / The source FastSlowStore identifier (matches the per-store config
+    /// / `store_id`). Used by `observe_pinned_mirror_ack` to scope the
+    /// / unpin to the SOURCE store. Validated server-side as non-empty +
+    /// / `[a-z][a-z0-9_]*`.
+    #[prost(string, tag = "2")]
+    pub store_id: ::prost::alloc::string::String,
+}
+/// / One blob entry in a `BatchWriteSmallBlobsRequest`. Carries the digest,
+/// / payload bytes, and source `store_id` so the worker can route the write
+/// / to the correct `mirror_blobs` slot keyed by `(store_id, digest)`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SmallBlobEntry {
+    /// / The digest of the blob being pushed. The worker MUST verify
+    /// / `data.len() == digest.size_bytes()` (the existing
+    /// / `insert_mirror_blob` invariant) before accepting.
+    #[prost(message, optional, tag = "1")]
+    pub digest: ::core::option::Option<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / The blob bytes. Capped at `SMALL_BLOB_THRESHOLD` per the
+    /// / dispatcher precondition (16 KiB by default).
+    #[prost(bytes = "bytes", tag = "2")]
+    pub data: ::prost::bytes::Bytes,
+    /// / The source FastSlowStore identifier so the worker can key the
+    /// / resulting `mirror_blobs` entry by `(store_id, digest)`. Empty or
+    /// / invalid `store_id` causes the worker to reject the entry.
+    #[prost(string, tag = "3")]
+    pub store_id: ::prost::alloc::string::String,
+}
+/// / A batch of small-blob writes pushed from the server's
+/// / `SmallBlobDispatcher` to a worker. The worker writes each entry into
+/// / `mirror_blobs` keyed by `(store_id, digest)`. The dispatcher uses
+/// / zero-window opportunistic coalesce, so a single batch may contain
+/// / 1..N entries from a short producer burst.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BatchWriteSmallBlobsRequest {
+    /// / The blob entries in this batch. Bounded by `max_batch_bytes`
+    /// / (default 256 KiB ⇒ ~16 entries at 16 KiB max).
+    #[prost(message, repeated, tag = "1")]
+    pub blobs: ::prost::alloc::vec::Vec<SmallBlobEntry>,
 }
 /// / Notification that blobs have been evicted from a worker.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -313,7 +385,7 @@ pub struct KillOperationRequest {
 /// / Communication from the scheduler to the worker.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateForWorker {
-    #[prost(oneof = "update_for_worker::Update", tags = "1, 2, 3, 4, 5, 7, 8, 9")]
+    #[prost(oneof = "update_for_worker::Update", tags = "1, 2, 3, 4, 5, 7, 8, 9, 10")]
     pub update: ::core::option::Option<update_for_worker::Update>,
 }
 /// Nested message and enum types in `UpdateForWorker`.
@@ -354,6 +426,22 @@ pub mod update_for_worker {
         /// / is missing from its CAS. Sent in response to BlobsAvailable.
         #[prost(message, tag = "9")]
         UploadMissingBlobs(super::UploadMissingBlobsRequest),
+        /// / Pushes a batch of small CAS/AC blobs from the server's
+        /// / `SmallBlobDispatcher` to the worker. The worker writes each
+        /// / `SmallBlobEntry` into `mirror_blobs` keyed by
+        /// / `(store_id, digest)`. The worker subsequently advertises the
+        /// / current snapshot via field 16 `pinned_mirror_entries` on the
+        /// / next `BlobsAvailableNotification`, which causes the server's
+        /// / per-store `EphemeralServerSidePin` set to release matching
+        /// / pins.
+        /// /
+        /// / Backward compatibility: workers built before this field
+        /// / exists treat unknown variants as ignorable warnings (the
+        /// / catch-all in `local_worker.rs` `Update::*` match returns
+        /// / `Ok(())` rather than `?`-propagating). NO capability flag
+        /// / is required.
+        #[prost(message, tag = "10")]
+        BatchWriteSmallBlobs(super::BatchWriteSmallBlobsRequest),
     }
 }
 /// / Communication from the worker to the scheduler.
