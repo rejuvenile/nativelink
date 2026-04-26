@@ -2808,11 +2808,16 @@ impl StoreDriver for FastSlowStore {
         // which is critical for serving data when the local cache misses.
         #[cfg(feature = "failpoints")]
         fail::fail_point!("fast_slow_get_part_fast_store_not_found", |_| {
-            // Drop fallback on `guard` (we're inside the `async` body)
-            // synthesizes the Internal terminator if this branch fires.
-            // We don't have access to `guard` here because `fail_point!`
-            // returns from a closure — but `guard` is on the function
-            // stack frame and Drop fires when the function unwinds.
+            // The `fail_point!` macro expands to roughly
+            //   `if let Some(res) = fail::eval(...) { return res; }`
+            // — the `return` is in the OUTER `get_part` fn body, NOT in
+            // this closure. So when this branch fires the outer fn
+            // unwinds and `guard`'s `Drop` runs from the outer fn's
+            // stack frame, synthesizing the Internal terminator that
+            // unblocks any paired reader. (The closure scope itself
+            // could capture `guard` if needed; we don't because the
+            // macro's outer-fn `return` already gives us correct
+            // unwinding without an explicit `guard.fail(...)`.)
             Err(make_err!(Code::NotFound, "failpoint: fast store not found"))
         });
 
@@ -2859,9 +2864,19 @@ impl StoreDriver for FastSlowStore {
                 self.metrics
                     .fast_store_downloaded_bytes
                     .fetch_add(bytes_written, Ordering::Acquire);
-                // The inner fast_store's get_part contract terminates the
-                // writer on success (sends its own EOF). Suppress Drop
-                // fallback so we don't double-terminate.
+                // We're already inside the `Ok(())` arm of the match —
+                // the inner fast_store's get_part contract guarantees it
+                // terminated the writer (sent its own EOF) on success.
+                // The `&Ok::<(), Error>(())` sentinel exists only to
+                // unconditionally suppress the Drop fallback; the
+                // `_if_ok` conditional is dead here (always true). Calling
+                // `guard.commit_eof()` instead would re-trigger
+                // `send_eof` against an already-EOF'd channel and emit a
+                // noisy "Stream already closed when eof already was sent"
+                // warn per request (see `buf_channel.rs::send_eof`).
+                // Re-adding a `commit()` no-arg helper for one site is
+                // below the bar (rust-crate-reviewer: "defer; one usage
+                // site is below the bar for adding a public verb").
                 guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
                 return Ok(());
             }
