@@ -43,6 +43,14 @@ const VALID_HASH1: &str = "0123456789abcdef0000000000000000000100000000000001234
 const VSERVER_NAME: &str = "testvserver";
 
 async fn create_test_store(mock_client: StaticReplayClient) -> Result<Store, Error> {
+    // Rustls 0.23 requires a process-level CryptoProvider to be installed
+    // before any TLS config is built (see `OntapS3Store::new` →
+    // `ClientConfig::builder()`). The production binary installs one in
+    // `src/bin/nativelink.rs:1068`; tests must do the same. Idempotent:
+    // returns Err(_) if a provider is already installed by another test
+    // running in parallel — that's fine, the existing one is used.
+    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+
     // Create a temporary directory for the cache file
     let temp_dir = tempdir().expect("Failed to create temporary directory");
     let cache_path = temp_dir
