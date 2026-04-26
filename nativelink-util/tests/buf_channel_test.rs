@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use core::task::Poll;
+use core::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures::poll;
@@ -24,6 +25,14 @@ use nativelink_util::buf_channel::{
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::try_join;
+
+/// Deadlock-detector timeout for WriteHalfGuard tests. Per CLAUDE.md
+/// "Test in production composition, not in isolation" — every `rx.recv()`
+/// after a guard exit MUST be wrapped in `tokio::time::timeout` with a
+/// SPECIFIC `.expect("must not deadlock — ...")` so a regression in the
+/// writer-termination contract fails fast (5s) rather than hanging the
+/// CI runner.
+const NO_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DATA1: &str = "foo";
 const DATA2: &str = "bar";
@@ -436,7 +445,10 @@ async fn write_half_guard_uncommitted_drop_terminates_with_internal() {
         let _guard = WriteHalfGuard::new(&mut tx);
         // No commit_eof, no commit_delegated_if_ok, no fail.
     }
-    let err = rx.recv().await.expect_err(
+    let recv_result = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx.recv())
+        .await
+        .expect("must not deadlock — writer-termination contract violated");
+    let err = recv_result.expect_err(
         "Drop fallback MUST surface as an error on the reader side; \
          without it the paired reader would deadlock forever",
     );
@@ -458,7 +470,10 @@ async fn write_half_guard_commit_eof_delivers_clean_eof() {
         let mut guard = WriteHalfGuard::new(&mut tx);
         guard.commit_eof().expect("send_eof must succeed on a fresh channel");
     }
-    let chunk = rx.recv().await.expect("clean EOF must surface as Ok(empty)");
+    let chunk = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx.recv())
+        .await
+        .expect("must not deadlock — writer-termination contract violated")
+        .expect("clean EOF must surface as Ok(empty)");
     assert!(chunk.is_empty(), "expected EOF, got: {} bytes", chunk.len());
 }
 
@@ -474,7 +489,10 @@ async fn write_half_guard_fail_propagates_structured_error() {
     assert_eq!(returned.code, Code::NotFound);
     assert!(returned.messages.iter().any(|m| m.contains("test-marker-NotFound")));
 
-    let err = rx.recv().await.expect_err("fail() must surface as Err");
+    let err = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx.recv())
+        .await
+        .expect("must not deadlock — writer-termination contract violated")
+        .expect_err("fail() must surface as Err");
     assert_eq!(err.code, Code::NotFound, "receiver MUST see the structured Code");
     assert!(
         err.messages.iter().any(|m| m.contains("test-marker-NotFound")),
@@ -495,7 +513,10 @@ async fn write_half_guard_commit_delegated_if_ok_arms_drop_on_err() {
         let res: Result<(), Error> = Ok(());
         guard.commit_delegated_if_ok(&res);
     }
-    let chunk = rx_ok.recv().await.expect("Ok branch must surface clean EOF");
+    let chunk = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx_ok.recv())
+        .await
+        .expect("must not deadlock — writer-termination contract violated")
+        .expect("Ok branch must surface clean EOF");
     assert!(chunk.is_empty(), "Ok branch expected EOF, got {} bytes", chunk.len());
 
     // Err branch: sub-store returned Err WITHOUT terminating; Drop fallback fires.
@@ -505,9 +526,9 @@ async fn write_half_guard_commit_delegated_if_ok_arms_drop_on_err() {
         let res: Result<(), Error> = Err(make_err!(Code::Internal, "sub-store err"));
         guard.commit_delegated_if_ok(&res);
     }
-    let err = rx_err
-        .recv()
+    let err = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx_err.recv())
         .await
+        .expect("must not deadlock — writer-termination contract violated")
         .expect_err("Err branch MUST surface Drop fallback (sub-store didn't terminate)");
     assert_eq!(err.code, Code::Internal);
     assert!(
@@ -528,11 +549,14 @@ async fn commit_eof_then_drop_produces_exactly_one_terminator() {
         let mut guard = WriteHalfGuard::new(&mut tx);
         guard.commit_eof().expect("send_eof must succeed on a fresh channel");
     }
-    let chunk = rx.recv().await.expect("clean EOF must surface");
-    assert!(chunk.is_empty(), "first recv MUST be EOF, got {} bytes", chunk.len());
-    let chunk2 = rx
-        .recv()
+    let chunk = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx.recv())
         .await
+        .expect("must not deadlock — writer-termination contract violated")
+        .expect("clean EOF must surface");
+    assert!(chunk.is_empty(), "first recv MUST be EOF, got {} bytes", chunk.len());
+    let chunk2 = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx.recv())
+        .await
+        .expect("must not deadlock — writer-termination contract violated")
         .expect("post-EOF recv MUST stay EOF, not surface a synthesized Internal");
     assert!(chunk2.is_empty(), "post-EOF recv MUST stay EOF, got {} bytes", chunk2.len());
 }
@@ -549,11 +573,14 @@ async fn drop_during_active_send_does_not_corrupt_stream() {
         let _guard = WriteHalfGuard::new(&mut tx);
         // No commit — Drop fires immediately on this scope exit.
     }
-    let first = rx.recv().await.expect("first chunk must arrive intact");
-    assert_eq!(&first[..], b"first-chunk", "in-flight chunk MUST NOT be corrupted by Drop");
-    let err = rx
-        .recv()
+    let first = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx.recv())
         .await
+        .expect("must not deadlock — writer-termination contract violated")
+        .expect("first chunk must arrive intact");
+    assert_eq!(&first[..], b"first-chunk", "in-flight chunk MUST NOT be corrupted by Drop");
+    let err = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, rx.recv())
+        .await
+        .expect("must not deadlock — writer-termination contract violated")
         .expect_err("post-Drop recv MUST surface the synthesized Internal");
     assert_eq!(err.code, Code::Internal);
     assert!(
