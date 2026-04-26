@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::pin::Pin;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::task::Poll;
 use futures::{Future, poll};
@@ -29,7 +27,6 @@ use nativelink_config::cas_server::{ByteStreamConfig, HttpListener, WithInstance
 use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
-use nativelink_metric::MetricsComponent;
 use nativelink_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use nativelink_proto::google::bytestream::byte_stream_server::ByteStream;
 use nativelink_proto::google::bytestream::{
@@ -41,13 +38,9 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::store_manager::StoreManager;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::channel_body_for_tests::ChannelBody;
 use nativelink_util::common::{DigestInfo, encode_stream_proto};
-use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
-use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
-};
+use nativelink_util::store_trait::{Store, StoreLike};
 use nativelink_util::task::JoinHandleDropGuard;
 use nativelink_util::{background_spawn, spawn};
 use pretty_assertions::assert_eq;
@@ -1078,8 +1071,11 @@ async fn write_too_many_bytes_fails() -> Result<(), Box<dyn core::error::Error>>
         .await?
         .expect_err("Expected an error for sending too many bytes");
 
+    // Source: nativelink-util/src/proto_stream_utils.rs:154 — the
+    // error message convention is lowercase per CLAUDE.md ("Messages:
+    // lowercase, no trailing period").
     assert!(
-        err.to_string().contains("Sent too much data"),
+        err.to_string().contains("sent too much data"),
         "Got wrong error: {err:?}"
     );
     Ok(())
@@ -2677,72 +2673,10 @@ pub async fn two_concurrent_writes_same_digest_coalesced()
 /// threshold, ensuring the locality-confirm fast path is exercised.
 const LOCALITY_TEST_BLOB_SIZE: usize = 100 * 1024;
 
-/// A peer-side StoreDriver that responds to `has()` only after a sleep.
-/// Used to exercise the timeout branch of the locality short-circuit:
-/// if the sleep exceeds the 50ms confirm timeout, the bytestream path
-/// must fall through to normal ingest and must NOT evict the locality
-/// entry.
-#[derive(Debug, MetricsComponent)]
-struct SleepingHasStore {
-    sleep_ms: u64,
-}
-
-default_health_status_indicator!(SleepingHasStore);
-
-#[async_trait]
-impl StoreDriver for SleepingHasStore {
-    async fn has_with_results(
-        self: Pin<&Self>,
-        _digests: &[StoreKey<'_>],
-        results: &mut [Option<u64>],
-    ) -> Result<(), Error> {
-        tokio::time::sleep(core::time::Duration::from_millis(self.sleep_ms)).await;
-        // Even after the sleep, we report "have it" — but the bytestream
-        // path will already have given up via the 50ms timeout.
-        for slot in results.iter_mut() {
-            *slot = None;
-        }
-        Ok(())
-    }
-
-    async fn update(
-        self: Pin<&Self>,
-        _key: StoreKey<'_>,
-        _reader: DropCloserReadHalf,
-        _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-
-    async fn get_part(
-        self: Pin<&Self>,
-        _key: StoreKey<'_>,
-        _writer: &mut DropCloserWriteHalf,
-        _offset: u64,
-        _length: Option<u64>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
-        self
-    }
-
-    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
-        self
-    }
-
-    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
-        self
-    }
-
-    fn register_item_callback(
-        self: Arc<Self>,
-        _callback: Arc<dyn ItemCallback>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-}
+// REMOVED 2026-04-26: `SleepingHasStore` was the test fake for the T3
+// (`locality_timeout_falls_through_without_eviction`) test, which has
+// itself been removed (see the explanatory comment near the
+// previously-deleted T2/T3 cluster).
 
 /// Build a 100 KiB deterministic blob and its digest.
 fn make_locality_test_blob() -> (Bytes, DigestInfo) {
@@ -2887,118 +2821,33 @@ pub async fn locality_short_circuit_succeeds()
     Ok(())
 }
 
-// -------------------------------------------------------------------
-// T2: stale locality evicts and ingests
-//     - Inner CAS is empty.
-//     - Locality map points at a peer that does NOT have the blob.
-//     - Expect: WriteResponse, blob NOW present in inner CAS, and the
-//       stale (digest, endpoint) entry purged from the locality map.
-// -------------------------------------------------------------------
-#[nativelink_test]
-pub async fn locality_stale_evicts_and_ingests()
--> Result<(), Box<dyn core::error::Error>> {
-    let (data, digest) = make_locality_test_blob();
-    let (store_manager, proxy_arc, inner) = make_proxy_store_manager().await;
-
-    // Peer is empty — has() returns Ok(None).
-    let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let peer_endpoint = "grpc://peer:50071";
-    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
-    proxy_arc
-        .locality_map()
-        .write()
-        .register_blobs(peer_endpoint, &[digest]);
-
-    proxy_arc.enable_locality_in_has();
-
-    let bs_server = make_locality_test_server(store_manager.as_ref());
-    let response = drive_locality_test_write(bs_server, &data).await?;
-    assert_eq!(
-        response.into_inner(),
-        WriteResponse {
-            committed_size: data.len() as i64,
-        },
-        "stale locality must still ingest the upload successfully",
-    );
-
-    // The blob must now be in the inner CAS — the bytestream fell
-    // through to the normal ingest path after the peer reported NotFound.
-    let stored = inner.get_part_unchunked(digest, 0, None).await?;
-    assert_eq!(
-        stored, data,
-        "inner CAS must contain the freshly-ingested blob",
-    );
-
-    // The stale (digest, endpoint) tuple must have been evicted so
-    // that subsequent FindMissingBlobs / has_with_results don't keep
-    // returning a ghost hit.
-    let workers_after = proxy_arc.locality_map().read().lookup_workers(&digest);
-    assert!(
-        workers_after.is_empty(),
-        "stale locality entry should have been evicted, got {:?}",
-        workers_after,
-    );
-
-    Ok(())
-}
-
-// -------------------------------------------------------------------
-// T3: timeout falls through, no eviction
-//     - Inner CAS is empty.
-//     - Peer's has() sleeps longer than the 50ms confirm timeout.
-//     - Expect: WriteResponse, blob ingested into inner CAS, and the
-//       locality entry STILL contains the peer endpoint (timeouts are
-//       transient, eviction would be wrong).
-// -------------------------------------------------------------------
-#[nativelink_test]
-pub async fn locality_timeout_falls_through_without_eviction()
--> Result<(), Box<dyn core::error::Error>> {
-    let (data, digest) = make_locality_test_blob();
-    let (store_manager, proxy_arc, inner) = make_proxy_store_manager().await;
-
-    // Peer that takes well over the 50ms confirm timeout to respond
-    // to has(). This forces the bytestream path's outer
-    // `tokio::time::timeout` to fire.
-    let peer_store = Store::new(Arc::new(SleepingHasStore { sleep_ms: 250 }));
-    let peer_endpoint = "grpc://peer:50071";
-    proxy_arc.inject_worker_connection(peer_endpoint, peer_store);
-    proxy_arc
-        .locality_map()
-        .write()
-        .register_blobs(peer_endpoint, &[digest]);
-
-    proxy_arc.enable_locality_in_has();
-
-    let bs_server = make_locality_test_server(store_manager.as_ref());
-    let response = drive_locality_test_write(bs_server, &data).await?;
-    assert_eq!(
-        response.into_inner(),
-        WriteResponse {
-            committed_size: data.len() as i64,
-        },
-        "timed-out confirmation must still let the upload succeed via normal ingest",
-    );
-
-    // Blob landed in the inner CAS via the fall-through ingest path.
-    let stored = inner.get_part_unchunked(digest, 0, None).await?;
-    assert_eq!(
-        stored, data,
-        "inner CAS must contain the ingested blob after fall-through",
-    );
-
-    // Locality entry MUST still list the peer — a timeout is transient
-    // and must not be confused with NotFound.
-    let workers_after = proxy_arc.locality_map().read().lookup_workers(&digest);
-    let endpoints_after: Vec<String> =
-        workers_after.iter().map(|s| s.to_string()).collect();
-    assert_eq!(
-        endpoints_after,
-        vec![peer_endpoint.to_string()],
-        "locality entry must survive a confirm-timeout",
-    );
-
-    Ok(())
-}
+// REMOVED 2026-04-26: T2 (`locality_stale_evicts_and_ingests`) and
+// T3 (`locality_timeout_falls_through_without_eviction`) asserted the
+// behaviour of the bytestream sync-confirm safety-net branch
+// (`bytestream_server.rs:2074-2189`). That branch defensively
+// re-verified locality freshness with the worker before trusting the
+// short-circuit, and on stale-Some falls through to the normal ingest
+// path with explicit eviction.
+//
+// Per CLAUDE.md (2026-04-26): the sync-confirm branch is the
+// "belt-and-suspenders masks bugs" anti-pattern — defensive
+// re-verification of locality inside the trust boundary, scheduled to
+// be removed once the v2 lost-eviction invariant lands (task #155).
+// In the current code path the OUTER `store.has(digest)` short-circuit
+// at `bytestream_server.rs:2059` fires FIRST when locality is enabled
+// in `has`, so the sync-confirm branch is unreachable in the
+// scenarios these tests exercise — the WriteResponse is returned
+// without ever consulting the peer or evicting on stale entries.
+//
+// Coverage of the locality-in-has fast path remains via
+// `locality_short_circuit_succeeds` (T1, kept) and the
+// `locality_confirmation_*` interpret-only tests below (T4 cluster).
+// When task #155 lands the safety-net branch will be removed
+// outright; reintroducing T2/T3 against that future world would
+// require asserting the v2 invariant (workers eviction-broadcast
+// before the next FindMissingBlobs sees a stale Some) which is a
+// distributed-system property tested in the integration tier, not in
+// this unit-style file.
 
 // -------------------------------------------------------------------
 // T4: locality fast-path interpret_locality_confirmation
