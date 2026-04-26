@@ -3476,6 +3476,7 @@ dependencies = [
  "tonic-prost",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "tracing-test",
  "uuid",
 ]

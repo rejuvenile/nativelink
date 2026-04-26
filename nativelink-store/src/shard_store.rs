@@ -25,8 +25,8 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
-    Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    DelegationChildren, ItemCallback, MarkStableDelegation, MergedNotifyState, PinDelegation,
+    StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use tracing::warn;
 
@@ -322,7 +322,18 @@ impl StoreDriver for ShardStore {
         PinDelegation::Many(children)
     }
 
-    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
+    /// ShardStore needs PER-DIGEST routing (each digest lives on exactly
+    /// ONE shard, picked via `get_store_index` hash), which the enum's
+    /// `Many` arm (broadcast-to-all) cannot express without generating
+    /// spurious BIS broadcasts to the worker for digests on other shards.
+    /// Declare `Leaf` and override `mark_stable` directly — same pattern
+    /// FastSlowStore uses to be the producer leaf for the BIS feeder.
+    /// (Task #157 / C+D folded mark_stable into the forced-delegation
+    /// enum mechanism; per-digest routers stay as Leaf+override.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+
     /// Each input digest lives on exactly ONE shard; route per-digest using
     /// the same `get_store_index` hash that the read/write paths use, so
     /// each shard's mark_stable receives only the digests it actually owns.

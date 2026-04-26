@@ -42,6 +42,7 @@ use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::operation_state_manager::UpdateOperationType;
 use nativelink_util::platform_properties::PlatformProperties;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
+use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use rand::RngCore;
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -56,6 +57,7 @@ pub type ConnectWorkerStream =
 
 pub type NowFn = Box<dyn Fn() -> Result<Duration, Error> + Send + Sync>;
 
+#[derive(MetricsComponent)]
 pub struct WorkerApiServer {
     scheduler: Arc<dyn WorkerScheduler>,
     now_fn: Arc<NowFn>,
@@ -85,9 +87,14 @@ pub struct WorkerApiServer {
     endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
     /// Counters for the BlobsAvailable mark_stable / backfill pipeline.
     /// Shared across every `WorkerConnection` and its background tasks
-    /// so a single counter aggregates server-wide.
+    /// so a single counter aggregates server-wide. Wired into the
+    /// metrics tree under `worker_api` so operators can alert on the
+    /// `mark_stable_has_with_results_failures` counter.
+    #[metric(group = "worker_api")]
     metrics: Arc<WorkerApiMetrics>,
 }
+
+impl RootMetricsComponent for WorkerApiServer {}
 
 /// Counters for the BlobsAvailable mark_stable / backfill pipeline.
 /// Wrapped in `Arc` so the per-worker `WorkerConnection` instances and the
@@ -99,12 +106,27 @@ pub struct WorkerApiServer {
 /// sustained problem (CLAUDE.md "Belt-and-suspenders masks bugs").
 /// Now we increment a counter alongside the log line so a sustained
 /// error rate is observable in the metric stream without grepping logs.
-#[derive(Debug, Default)]
+///
+/// `#[derive(MetricsComponent)]` + the `WorkerApiServer`-side
+/// `#[metric(group = "worker_api")]` wiring make these counters visible
+/// to the metrics tree (per the existing `metric` infra). Without the
+/// derive the AtomicU64 lives only in memory and can only be observed
+/// via the `WorkerApiServer::metrics()` accessor — defeats the
+/// "operator-alertable" purpose of the counter (red-team BLOCK-2 on
+/// agent-a4f84244 / task #157).
+#[derive(Debug, Default, MetricsComponent)]
 pub struct WorkerApiMetrics {
     /// Total times `cas_store.has_with_results` failed inside
     /// `request_missing_blob_uploads`. A sustained increase indicates
     /// either a CAS store outage or a bug; without this counter the only
     /// signal is `error!` log lines.
+    #[metric(
+        help = "Total `cas_store.has_with_results` failures during BlobsAvailable \
+                mark_stable / backfill. Sustained non-zero rate indicates a CAS \
+                outage or bug; firing means worker pins for present digests are \
+                not being acked and missing digests are not being requested for \
+                upload (each tick recovers, but the counter exposes the rate)."
+    )]
     pub mark_stable_has_with_results_failures: AtomicU64,
 }
 

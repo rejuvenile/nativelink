@@ -39,7 +39,7 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::spawn;
 use nativelink_util::store_trait::{
-    BoolValue, ItemCallback, PinDelegation, SchedulerCurrentVersionProvider,
+    BoolValue, ItemCallback, MarkStableDelegation, PinDelegation, SchedulerCurrentVersionProvider,
     SchedulerIndexProvider, SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo,
     SchedulerStoreKeyProvider, SchedulerSubscription, SchedulerSubscriptionManager,
     StableDigestDelegation, StoreDriver, StoreKey, UploadSizeInfo,
@@ -2048,6 +2048,12 @@ where
     /// store contract here (Redis has its own TTL semantics). No-op.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// RedisStore is a leaf — `mark_stable` is a no-op (the BIS pipeline
+    /// is owned by the wrapping `FastSlowStore`, not this leaf). (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

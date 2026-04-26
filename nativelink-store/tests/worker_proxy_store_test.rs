@@ -28,8 +28,9 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    IS_WORKER_REQUEST, ItemCallback, PinDelegation, REDIRECT_PREFIX, StableDigestDelegation, Store,
-    StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+    IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation, REDIRECT_PREFIX,
+    StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
+    UploadSizeInfo,
 };
 use pretty_assertions::assert_eq;
 
@@ -733,6 +734,10 @@ impl StoreDriver for PartialFailStore {
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Inner(self.inner.as_store_driver())
     }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Inner(self.inner.as_store_driver())
+    }
 }
 
 // -------------------------------------------------------------------
@@ -993,6 +998,10 @@ impl StoreDriver for StructuredFailStore {
 
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Inner(self.inner.as_store_driver())
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Inner(self.inner.as_store_driver())
     }
 }
 
@@ -1497,6 +1506,10 @@ impl StoreDriver for EmptyEofStore {
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
     }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
 }
 
 // ===================================================================
@@ -1592,6 +1605,10 @@ impl StoreDriver for PartialWriteThenErrorStore {
 
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

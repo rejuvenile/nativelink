@@ -286,6 +286,56 @@ pub enum PinDelegation<'a> {
     Passthrough(&'a (dyn StoreDriver + 'static)),
 }
 
+/// Delegation strategy for [`StoreDriver::mark_stable`] (BIS pipeline).
+///
+/// Used by the worker API server's BlobsAvailable handler to push
+/// already-stably-stored digests into the BIS broadcast feeder so the
+/// worker is told to release its pin. See
+/// `.claude/reviews/bis-coverage-for-already-cached-outputs/audit.md`
+/// for the pin-leak class this hook closes.
+///
+/// **No default body on [`StoreDriver::mark_stable_delegation`]** — every
+/// store MUST declare its arm explicitly. The previous code shipped a
+/// silent `_no-op` default on `mark_stable` itself; new wrappers
+/// (Compression, Dedup, Shard, OntapS3ExistenceCache) inherited that
+/// default and silently swallowed BIS-feeder pushes, exactly the silent-
+/// default-trap class C+D was created to abolish (see red-team finding 3
+/// in `.claude/reviews/a1-mark-stable/red-team.md`).
+///
+/// **Many-arm semantics (different from [`StableDigestDelegation::Many`]):**
+/// for `mark_stable`, the `Many` arm fans out the entire digest slice to
+/// every inner store. This is correct for wrappers whose inner stores all
+/// participate in the BIS chain symmetrically (e.g., wrapper that owns
+/// two equivalent backends). Wrappers that need per-digest routing
+/// (SizePartitioningStore by size, ShardStore by hash) or selective
+/// routing (DedupStore to index_store only) MUST declare [`Self::Leaf`]
+/// AND override [`StoreDriver::mark_stable`] manually — same pattern
+/// FastSlowStore uses to be the producer leaf for `drain_stable_digests`.
+pub enum MarkStableDelegation<'a> {
+    /// Leaf store — `mark_stable` is a no-op for stores that do not
+    /// participate in the BIS feeder chain (Memory, Noop, Redis, S3,
+    /// GCS, Mongo, Azure, Grpc, OntapS3, CompletenessChecking on the
+    /// AC-only path, Filesystem). Stores that PRODUCE stable-digest
+    /// notifications (e.g. [`FastSlowStore`]) ALSO declare `Leaf` here
+    /// and override [`StoreDriver::mark_stable`] manually to push into
+    /// their own queue. Per-digest-routing wrappers (SizePartitioning,
+    /// Shard, Dedup) likewise declare `Leaf` and override.
+    Leaf,
+    /// Single-inner wrapper — forwards the entire slice to one inner
+    /// store. Used by Compression, Verify, ExistenceCache,
+    /// OntapS3ExistenceCache, WorkerProxy, CompletenessChecking
+    /// (delegates to `ac_store`).
+    Inner(&'a (dyn StoreDriver + 'static)),
+    /// Multi-inner wrapper — fans the entire slice out to every inner
+    /// store. Suitable when all inner stores participate in the BIS
+    /// chain symmetrically. Wrappers that need per-digest routing or
+    /// selective forwarding declare `Leaf` and override `mark_stable`.
+    Many(DelegationChildren<'a>),
+    /// Pure passthrough — same dispatch as [`Self::Inner`] but documents
+    /// intent for resolved-by-name wrappers (e.g. `RefStore`).
+    Passthrough(&'a (dyn StoreDriver + 'static)),
+}
+
 /// Optimizations that stores may want to expose to the callers.
 /// This is useful for specific cases when the store can optimize the processing
 /// of the data being processed.
@@ -1130,6 +1180,20 @@ pub trait StoreDriver:
     /// [`PinDelegation`] for variants and rationale.
     fn pin_delegation(&self) -> PinDelegation<'_>;
 
+    /// Declare how this store routes [`Self::mark_stable`] requests
+    /// (BIS-feeder push from the worker API server's BlobsAvailable
+    /// handler).
+    ///
+    /// **No default body** — every store MUST implement this so the author
+    /// is forced at compile time to think about BIS coverage. The previous
+    /// silent `_no-op` default on `mark_stable` itself caused four wrapper
+    /// stores (Compression, Dedup, Shard, OntapS3ExistenceCache) to
+    /// silently swallow BIS-feeder pushes; this is the silent-default-trap
+    /// class C+D was created to abolish (see
+    /// `.claude/reviews/a1-mark-stable/red-team.md` finding 3 and task
+    /// #157). See [`MarkStableDelegation`] for variants and rationale.
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_>;
+
     /// Drain digests that have completed their write to stable storage
     /// (e.g., FilesystemStore in a FastSlowStore).
     ///
@@ -1243,16 +1307,35 @@ pub trait StoreDriver:
     /// have would tell the worker to unpin a digest whose only durable
     /// copy is the worker's `mirror_blobs`, causing data loss.
     ///
-    /// Wrapper stores MUST delegate to their inner store. The default is
-    /// a no-op so the trait stays object-safe; in production the BIS
-    /// pipeline relies on the override at FastSlowStore. A wrapper that
-    /// fails to delegate silently breaks the pipeline (cf. the
-    /// SizePartitioningStore stable_notify/drain_stable_digests bug).
+    /// The default body dispatches via [`Self::mark_stable_delegation`].
+    /// Stores that produce BIS-feeder digests directly (e.g.
+    /// [`FastSlowStore`]) declare `Leaf` and override this method to push
+    /// into their own queue. Wrappers that need per-digest routing
+    /// (SizePartitioning, Shard) or selective forwarding (Dedup) ALSO
+    /// declare `Leaf` and override; the trait default no-ops in that
+    /// arm because the override owns the dispatch.
     ///
-    /// TODO(BIS-pipeline): fold into a forced-delegation enum mechanism
-    /// alongside `stable_notify` / `drain_stable_digests` once the
-    /// `aea1038e` (StableDigestDelegation) refactor lands.
-    fn mark_stable(&self, _digests: &[DigestInfo]) {}
+    /// Closes task #157 (folds `mark_stable` into the C+D forced-
+    /// delegation enum mechanism). The previous silent no-op default
+    /// shipped the silent-default-trap class C+D was created to abolish.
+    fn mark_stable(&self, digests: &[DigestInfo]) {
+        match self.mark_stable_delegation() {
+            MarkStableDelegation::Leaf => {
+                // Non-producer leaves silently no-op; producer leaves and
+                // custom-router wrappers (FastSlow, SizePartitioning,
+                // Shard, Dedup) override this method to do their own
+                // routing.
+            }
+            MarkStableDelegation::Inner(s) | MarkStableDelegation::Passthrough(s) => {
+                s.mark_stable(digests);
+            }
+            MarkStableDelegation::Many(children) => {
+                for child in children {
+                    child.mark_stable(digests);
+                }
+            }
+        }
+    }
 
     /// Pin digests to prevent eviction while a worker is fetching them.
     ///

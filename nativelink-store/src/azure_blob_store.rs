@@ -46,8 +46,8 @@ use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthS
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
-    UploadSizeInfo,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+    StoreKey, StoreOptimizations, UploadSizeInfo,
 };
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -928,6 +928,12 @@ where
 
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// AzureBlobStore is a leaf — `mark_stable` is a no-op (Azure owns
+    /// object lifecycle; no BIS participation from this layer). (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

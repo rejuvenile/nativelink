@@ -33,8 +33,8 @@ use nativelink_util::health_utils::{
     HealthRegistryBuilder, HealthStatusIndicator, default_health_status_indicator,
 };
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreKeyBorrow,
-    StoreOptimizations, UploadSizeInfo,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+    StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
 };
 
 use crate::callback_utils::ItemCallbackHolder;
@@ -481,6 +481,12 @@ impl StoreDriver for MemoryStore {
     /// case the upper layer should re-fetch.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// MemoryStore is a leaf — `mark_stable` is a no-op (memory storage is
+    /// not stable, so no BIS-feeder push from this layer). (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

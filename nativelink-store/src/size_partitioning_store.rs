@@ -24,8 +24,8 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
-    Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    DelegationChildren, ItemCallback, MarkStableDelegation, MergedNotifyState, PinDelegation,
+    StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use tokio::join;
 use tracing::warn;
@@ -318,16 +318,22 @@ impl StoreDriver for SizePartitioningStore {
         PinDelegation::Many(children)
     }
 
+    /// SizePartitioningStore needs PER-DIGEST routing (each digest goes to
+    /// EITHER lower OR upper, not both), which the enum's `Many` arm
+    /// (broadcast-to-all) cannot express. Declare `Leaf` and override
+    /// `mark_stable` directly to do the size-based routing — same pattern
+    /// FastSlowStore uses to be the producer leaf for the BIS feeder.
+    /// (Task #157 / C+D folded mark_stable into the forced-delegation
+    /// enum mechanism; per-digest routers stay as Leaf+override.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+
     /// Route each digest to the inner store that owns it (by size partition)
     /// so the digest lands in the correct stable-digests queue downstream.
     /// If the inner store is itself a `FastSlowStore` it will push into its
     /// own `stable_digests`; the BIS broadcast loop's drain visits each
     /// terminal CAS store directly.
-    ///
-    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157);
-    /// `drain_stable_digests` / `stable_notify` ARE (via `stable_delegation`
-    /// above). Once #157 lands and the per-digest size-routing question is
-    /// resolved, this override can collapse into the enum.
     fn mark_stable(&self, digests: &[DigestInfo]) {
         if digests.is_empty() {
             return;

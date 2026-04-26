@@ -32,7 +32,7 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::spawn;
 use nativelink_util::store_trait::{
-    BoolValue, ItemCallback, PinDelegation, SchedulerCurrentVersionProvider,
+    BoolValue, ItemCallback, MarkStableDelegation, PinDelegation, SchedulerCurrentVersionProvider,
     SchedulerIndexProvider, SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo,
     SchedulerStoreKeyProvider, SchedulerSubscription, SchedulerSubscriptionManager,
     StableDigestDelegation, StoreDriver, StoreKey, UploadSizeInfo,
@@ -594,6 +594,12 @@ impl StoreDriver for ExperimentalMongoStore {
 
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// MongoStore is a leaf — `mark_stable` is a no-op (no BIS
+    /// participation from Mongo). (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

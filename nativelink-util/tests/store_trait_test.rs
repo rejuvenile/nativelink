@@ -9,8 +9,8 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::default_health_status_indicator;
 use nativelink_util::health_utils::HealthStatusIndicator;
 use nativelink_util::store_trait::{
-    DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
-    Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    DelegationChildren, ItemCallback, MarkStableDelegation, MergedNotifyState, PinDelegation,
+    StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use tokio::sync::Notify;
 use tonic::async_trait;
@@ -73,6 +73,10 @@ impl StoreDriver for FakeStore {
 
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 
@@ -163,6 +167,9 @@ impl StoreDriver for NonPinningLeafStore {
     }
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 
@@ -261,6 +268,9 @@ impl StoreDriver for CustomNotifyLeafStore {
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
     }
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
     fn stable_notify(&self) -> Arc<Notify> {
         self.notify.clone()
     }
@@ -339,6 +349,14 @@ impl StoreDriver for ManyTestWrapper {
         children.push(lower);
         children.push(upper);
         PinDelegation::Many(children)
+    }
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        let lower: &dyn StoreDriver = self.lower.as_ref();
+        let upper: &dyn StoreDriver = self.upper.as_ref();
+        let mut children = DelegationChildren::new();
+        children.push(lower);
+        children.push(upper);
+        MarkStableDelegation::Many(children)
     }
 }
 

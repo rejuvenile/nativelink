@@ -37,9 +37,9 @@ use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::fs;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    DelegationChildren, IS_MIRROR_REQUEST, ItemCallback, PinDelegation, StableDigestDelegation,
-    Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
-    slow_update_store_with_file,
+    DelegationChildren, IS_MIRROR_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
+    StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
+    UploadSizeInfo, slow_update_store_with_file,
 };
 use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
 use parking_lot::Mutex;
@@ -3355,6 +3355,16 @@ impl StoreDriver for FastSlowStore {
         self.stable_notify.clone()
     }
 
+    /// FastSlowStore IS the producer leaf for `mark_stable` — it owns the
+    /// BIS feeder queue. `Leaf` makes the trait default a no-op; the
+    /// override below pushes into `self.stable_digests` directly. Inner
+    /// stores (Memory + Filesystem) do not contribute independently.
+    /// (Task #157 / C+D folded mark_stable into the forced-delegation
+    /// enum mechanism.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+
     /// Push the given digests into the BIS feeder queue and wake the
     /// broadcast loop. Used by the worker API server's BlobsAvailable
     /// handler to cover every path where the server has a digest
@@ -3364,10 +3374,6 @@ impl StoreDriver for FastSlowStore {
     /// (durable under pin v2) would leak forever for those paths.
     /// Idempotent: the broadcast loop dedups downstream and the
     /// worker's `unpin_digest` is itself idempotent.
-    ///
-    /// `mark_stable` is not yet covered by the C+D enum dispatch — task
-    /// #157 will fold it in once the per-digest size-routing question for
-    /// `SizePartitioningStore` is resolved.
     fn mark_stable(&self, digests: &[DigestInfo]) {
         if digests.is_empty() {
             return;

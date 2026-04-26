@@ -39,9 +39,9 @@ use nativelink_util::buf_channel::{
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
-    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, PinDelegation, REDIRECT_PREFIX,
-    StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
-    UploadSizeInfo,
+    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
+    REDIRECT_PREFIX, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    StoreOptimizations, UploadSizeInfo,
 };
 
 use crate::grpc_store::GrpcStore;
@@ -2345,12 +2345,11 @@ impl StoreDriver for WorkerProxyStore {
         PinDelegation::Inner(self.inner.as_store_driver())
     }
 
-    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
-    /// Until then, wrappers must explicitly delegate so server-side
-    /// `mark_stable_on_blobs_available` doesn't silently no-op at the
-    /// WorkerProxyStore layer (#140).
-    fn mark_stable(&self, digests: &[DigestInfo]) {
-        self.inner.mark_stable(digests);
+    /// `mark_stable` forwards unchanged to `inner` via the trait
+    /// default's `Inner` arm (task #157 / C+D folded mark_stable into the
+    /// forced-delegation enum mechanism).
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Inner(self.inner.as_store_driver())
     }
 }
 

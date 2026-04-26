@@ -30,8 +30,8 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
-    UploadSizeInfo,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
 };
 use parking_lot::Mutex;
 use prost::Message;
@@ -560,6 +560,14 @@ impl StoreDriver for CompletenessCheckingStore {
     /// of this public API surface.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Inner(self.ac_store.as_store_driver())
+    }
+
+    /// `mark_stable` forwards to `ac_store` (matching the existing
+    /// `stable_delegation`/`pin_delegation` pattern). The CompletenessChecking
+    /// AC-only path is not currently a CAS BIS contributor, but the
+    /// declaration prevents the silent-default trap. (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Inner(self.ac_store.as_store_driver())
     }
 }
 

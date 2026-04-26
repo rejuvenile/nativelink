@@ -27,8 +27,8 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::fastcdc::FastCDC;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    DelegationChildren, ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation,
-    Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    DelegationChildren, ItemCallback, MarkStableDelegation, MergedNotifyState, PinDelegation,
+    StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::FramedRead;
@@ -445,13 +445,21 @@ impl StoreDriver for DedupStore {
         PinDelegation::Many(children)
     }
 
-    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
-    /// For DedupStore the outer (dedup-original) digest lives in the
-    /// index_store; per-chunk content digests have their own identity in
-    /// content_store and are independently advertised via BlobsAvailable.
-    /// Routing mark_stable to the index_store mirrors this layering — the
-    /// pin-release contract for the dedup-original digest is whatever
-    /// index_store's pin tier owns. (#140 / red-team F3.)
+    /// DedupStore needs SELECTIVE routing (only `index_store`, NOT
+    /// `content_store`) because the outer (dedup-original) digest lives in
+    /// the index_store; per-chunk content digests have their own identity
+    /// in content_store and are independently advertised via
+    /// BlobsAvailable. The enum's `Many` arm (broadcast-to-all) would
+    /// double-mark every digest. Declare `Leaf` and override `mark_stable`
+    /// directly — same pattern FastSlowStore uses to be the producer leaf.
+    /// (Task #157 / C+D folded mark_stable into the forced-delegation
+    /// enum mechanism; selective routers stay as Leaf+override.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+
+    /// Routes `mark_stable` to the index_store only — see
+    /// `mark_stable_delegation` above for rationale.
     fn mark_stable(&self, digests: &[DigestInfo]) {
         self.index_store.mark_stable(digests);
     }

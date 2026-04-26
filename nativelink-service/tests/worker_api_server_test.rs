@@ -39,7 +39,9 @@ use nativelink_scheduler::api_worker_scheduler::ApiWorkerScheduler;
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::worker::ActionInfoWithProps;
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
-use nativelink_service::worker_api_server::{ConnectWorkerStream, NowFn, WorkerApiServer};
+use nativelink_service::worker_api_server::{
+    ConnectWorkerStream, NowFn, WorkerApiMetrics, WorkerApiServer,
+};
 use nativelink_util::action_messages::{
     ActionInfo, ActionUniqueKey, ActionUniqueQualifier, OperationId, WorkerId,
 };
@@ -1820,4 +1822,135 @@ pub async fn boot_epoch_new_blobs_survive_old_disconnect_cleanup_test()
         "d_new must survive — old cleanup must not wipe new entries"
     );
     Ok(())
+}
+
+// =====================================================================
+// BLOCK-2 / task #157: WorkerApiMetrics is wired into the metrics tree
+// =====================================================================
+//
+// Asserts the `mark_stable_has_with_results_failures` AtomicU64 actually
+// reaches the registered metric tree (the bug red-team caught: prior to
+// the `#[derive(MetricsComponent)]` + `#[metric(group = "worker_api")]`
+// wiring, the counter lived only as a private AtomicU64 — operators had
+// no way to alert on it). The test exercises the increment path AND
+// asserts the publish output emits the counter name + value via a
+// custom tracing layer (the `metric` macro emits via `tracing::info!`
+// to the `nativelink_metric` target).
+
+/// In-memory layer that captures events targeting `nativelink_metric`.
+/// One row per published metric: (name, value, help).
+#[derive(Debug, Default, Clone)]
+struct CapturedMetric {
+    name: String,
+    value: String,
+    help: String,
+}
+
+#[derive(Default)]
+struct MetricCaptureLayer {
+    events: Arc<Mutex<Vec<CapturedMetric>>>,
+}
+
+impl<S> tracing_subscriber::Layer<S> for MetricCaptureLayer
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "nativelink_metric" {
+            return;
+        }
+        let mut visitor = FieldGrabber::default();
+        event.record(&mut visitor);
+        // Empty-name events are the group-span enters from `group!(...)`,
+        // not actual metric publishes. Skip them.
+        if visitor.name.is_empty() {
+            return;
+        }
+        self.events.lock().unwrap().push(CapturedMetric {
+            name: visitor.name,
+            value: visitor.value,
+            help: visitor.help,
+        });
+    }
+}
+
+#[derive(Default)]
+struct FieldGrabber {
+    name: String,
+    value: String,
+    help: String,
+}
+
+impl tracing::field::Visit for FieldGrabber {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+        let s = format!("{value:?}");
+        // Strip surrounding quotes for fields that come through as Debug-of-String.
+        let trimmed = s.trim_matches('"').to_string();
+        match field.name() {
+            "__name" => self.name = trimmed,
+            "__value" => self.value = trimmed,
+            "__help" => self.help = trimmed,
+            _ => {}
+        }
+    }
+}
+
+#[nativelink_test]
+async fn worker_api_metrics_mark_stable_failures_visible_in_metric_tree() {
+    use core::sync::atomic::Ordering;
+
+    use nativelink_metric::{MetricFieldData, MetricKind, MetricsComponent};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Registry;
+
+    let layer = MetricCaptureLayer::default();
+    let events = layer.events.clone();
+    let subscriber = Registry::default().with(layer);
+
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let metrics = WorkerApiMetrics::default();
+
+    // Drive the increment path the production code path uses.
+    metrics
+        .mark_stable_has_with_results_failures
+        .fetch_add(3, Ordering::Relaxed);
+
+    // Walk the metric tree the same way the metric exporter does.
+    metrics
+        .publish(MetricKind::Component, MetricFieldData::default())
+        .expect("publish must succeed for derived MetricsComponent");
+
+    drop(_guard);
+
+    let captured = events.lock().unwrap().clone();
+    let metric = captured
+        .iter()
+        .find(|m| m.name == "mark_stable_has_with_results_failures")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected metric `mark_stable_has_with_results_failures` to be \
+                 published when WorkerApiMetrics::publish() walks the tree. \
+                 Captured events: {captured:#?}. Without #[derive(MetricsComponent)] \
+                 + #[metric(help = ...)] on the field, the AtomicU64 stays invisible \
+                 to operators (BLOCK-2)."
+            )
+        });
+    assert_eq!(
+        metric.value, "3",
+        "expected counter value 3 to flow through the publish chain — got {:?}. \
+         If publish() returned Component without emitting Counter, the derive \
+         output is silently mis-routing the AtomicU64.",
+        metric.value
+    );
+    assert!(
+        !metric.help.is_empty(),
+        "expected non-empty help text for `mark_stable_has_with_results_failures` \
+         so operators have a description in the metric stream — found empty help. \
+         Add `#[metric(help = \"...\")]` to the field."
+    );
 }

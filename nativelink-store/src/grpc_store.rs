@@ -50,8 +50,8 @@ use nativelink_util::proto_stream_utils::{
 use nativelink_util::resource_info::ResourceInfo;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, PinDelegation, StableDigestDelegation,
-    StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
+    StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
 };
 use nativelink_util::{default_health_status_indicator, tls_utils};
 use opentelemetry::context::Context;
@@ -2425,6 +2425,13 @@ impl StoreDriver for GrpcStore {
     /// The remote endpoint manages its own eviction. Local pin is a no-op.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// GrpcStore is a leaf — `mark_stable` is a no-op (the remote
+    /// endpoint owns its own BIS pipeline; this client side does not
+    /// push into BIS). (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

@@ -45,8 +45,8 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
-    UploadSizeInfo,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
 };
 use pretty_assertions::assert_eq;
 
@@ -136,6 +136,10 @@ impl StoreDriver for ErrCodeOnGetStore {
 
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Inner(self.inner.as_store_driver())
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Inner(self.inner.as_store_driver())
     }
 }
 

@@ -29,8 +29,8 @@ use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthS
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
-    UploadSizeInfo,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+    StoreKey, StoreOptimizations, UploadSizeInfo,
 };
 use rand::Rng;
 use tokio::time::sleep;
@@ -484,6 +484,13 @@ where
     /// GcsStore is a leaf — pin requests do not propagate to GCS. No-op.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// GcsStore is a leaf — `mark_stable` is a no-op (GCS owns its own
+    /// object lifecycle; the BIS pipeline is owned by a wrapping
+    /// FastSlowStore if any). (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

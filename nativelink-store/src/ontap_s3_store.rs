@@ -48,7 +48,8 @@ use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, UploadSizeInfo,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+    StoreKey, UploadSizeInfo,
 };
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -807,6 +808,13 @@ where
     /// OntapS3Store is a leaf — pinning does not propagate to remote S3.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// OntapS3Store is a leaf — `mark_stable` is a no-op (Ontap S3 owns
+    /// object lifecycle; the BIS pipeline is owned by a wrapping
+    /// FastSlowStore if any). (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

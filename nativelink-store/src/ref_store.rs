@@ -28,8 +28,8 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
-    UploadSizeInfo,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
 };
 
 use crate::store_manager::StoreManager;
@@ -210,6 +210,15 @@ impl StoreDriver for RefStore {
     /// pattern; `pin_digests` below is the override.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// See [`Self::stable_delegation`] — same `Leaf`-plus-explicit-override
+    /// pattern; the `mark_stable` override below lazily resolves the inner
+    /// store via `get_store()` and forwards (matching the existing
+    /// drain/notify lazy-resolve semantics). Declaring `Leaf` here makes
+    /// the trait default a no-op; the override owns dispatch. (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 
     fn drain_stable_digests(&self) -> Vec<DigestInfo> {

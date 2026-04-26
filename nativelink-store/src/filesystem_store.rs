@@ -38,8 +38,8 @@ use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreKeyBorrow,
-    StoreOptimizations, UploadSizeInfo,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+    StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
 };
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReadDirStream;
@@ -1777,6 +1777,14 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
     /// to the evicting map.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
+    }
+
+    /// FilesystemStore is a leaf for `mark_stable` — the BIS feeder is
+    /// owned by `FastSlowStore` (the wrapper that watches FilesystemStore
+    /// pin-expire events). FilesystemStore itself does not push into the
+    /// BIS chain. (Task #157.)
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
     }
 }
 

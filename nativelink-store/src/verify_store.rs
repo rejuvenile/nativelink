@@ -26,12 +26,13 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
-use nativelink_util::common::{DigestInfo, PackedHash};
+use nativelink_util::common::PackedHash;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike,
     UploadSizeInfo,
 };
 
@@ -437,12 +438,11 @@ impl StoreDriver for VerifyStore {
         PinDelegation::Inner(self.inner_store.as_store_driver())
     }
 
-    /// `mark_stable` is not yet covered by the C+D enum dispatch (task #157).
-    /// Until then, wrappers must explicitly delegate so server-side
-    /// `mark_stable_on_blobs_available` doesn't silently no-op at the
-    /// VerifyStore layer (#140).
-    fn mark_stable(&self, digests: &[DigestInfo]) {
-        self.inner_store.mark_stable(digests);
+    /// `mark_stable` forwards unchanged to `inner_store` via the trait
+    /// default's `Inner` arm (task #157 / C+D folded mark_stable into the
+    /// forced-delegation enum mechanism).
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Inner(self.inner_store.as_store_driver())
     }
 }
 
