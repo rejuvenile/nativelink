@@ -83,6 +83,29 @@ pub struct WorkerApiServer {
     /// disconnect-cleanup task — both of which operate inside this
     /// server, not the scheduler.
     endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
+    /// Counters for the BlobsAvailable mark_stable / backfill pipeline.
+    /// Shared across every `WorkerConnection` and its background tasks
+    /// so a single counter aggregates server-wide.
+    metrics: Arc<WorkerApiMetrics>,
+}
+
+/// Counters for the BlobsAvailable mark_stable / backfill pipeline.
+/// Wrapped in `Arc` so the per-worker `WorkerConnection` instances and the
+/// background spawned tasks share a single counter across the process.
+///
+/// `mark_stable_has_with_results_failures` is the counter the operator
+/// alerts on per red-team F5: when the existence check fails, the
+/// previous code logged `error!` and silently moved on, masking a
+/// sustained problem (CLAUDE.md "Belt-and-suspenders masks bugs").
+/// Now we increment a counter alongside the log line so a sustained
+/// error rate is observable in the metric stream without grepping logs.
+#[derive(Debug, Default)]
+pub struct WorkerApiMetrics {
+    /// Total times `cas_store.has_with_results` failed inside
+    /// `request_missing_blob_uploads`. A sustained increase indicates
+    /// either a CAS store outage or a bug; without this counter the only
+    /// signal is `error!` log lines.
+    pub mark_stable_has_with_results_failures: AtomicU64,
 }
 
 /// Per-endpoint state for the #141 boot_epoch wipe path. See
@@ -189,7 +212,15 @@ impl WorkerApiServer {
             cas_store,
             worker_proxy,
             endpoint_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            metrics: Arc::new(WorkerApiMetrics::default()),
         })
+    }
+
+    /// Returns a clone of the metrics handle so callers (e.g. tests,
+    /// metrics scrape integration) can observe the BlobsAvailable
+    /// mark_stable / backfill counters directly.
+    pub fn metrics(&self) -> Arc<WorkerApiMetrics> {
+        self.metrics.clone()
     }
 
     pub fn into_service(self) -> Server<Self> {
@@ -326,6 +357,7 @@ impl WorkerApiServer {
             new_boot_epoch,
             self.endpoint_state.clone(),
             worker_tx,
+            self.metrics.clone(),
             update_stream,
         );
 
@@ -424,6 +456,8 @@ struct WorkerConnection {
     /// the request was sent. Entries older than `BACKFILL_INFLIGHT_TIMEOUT_SECS`
     /// are considered stale and eligible for re-request.
     backfill_inflight: Arc<parking_lot::Mutex<HashMap<DigestInfo, Instant>>>,
+    /// Shared metrics handle (cloned from `WorkerApiServer::metrics`).
+    metrics: Arc<WorkerApiMetrics>,
 }
 
 impl WorkerConnection {
@@ -438,6 +472,7 @@ impl WorkerConnection {
         boot_epoch: u64,
         endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
         worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
+        metrics: Arc<WorkerApiMetrics>,
         mut connection: impl Stream<Item = Result<UpdateForScheduler, Status>> + Unpin + Send + 'static,
     ) {
         let instance = Self {
@@ -453,6 +488,7 @@ impl WorkerConnection {
             worker_tx,
             last_backfill_epoch_secs: AtomicU64::new(0),
             backfill_inflight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            metrics,
         };
 
         background_spawn!("worker_api", async move {
@@ -884,6 +920,7 @@ impl WorkerConnection {
                 let tx = self.worker_tx.clone();
                 let worker_id = self.worker_id.clone();
                 let inflight = self.backfill_inflight.clone();
+                let metrics = self.metrics.clone();
                 background_spawn!("pull_pinned_mirror_blobs", async move {
                     Self::request_missing_blob_uploads(
                         &cas,
@@ -891,19 +928,38 @@ impl WorkerConnection {
                         &worker_id,
                         &pinned,
                         &inflight,
+                        // Pinned-mirror digests bypass the cooldown — these
+                        // are the only durable copies; latency to durability
+                        // matters more than the throttle.
+                        true,
+                        &metrics,
                     )
                     .await;
                 });
             }
         }
 
-        // After updating the locality map, check which of the newly reported
-        // blobs are missing from the server's CAS and request the worker to
-        // upload them. This runs asynchronously to avoid blocking the message
-        // processing loop. Only triggers on non-empty digest reports.
+        // After updating the locality map, do TWO things on every tick:
         //
-        // Rate-limited by a per-worker cooldown to avoid excessive
-        // has_with_results calls when many workers report every 100ms.
+        //   (1) ALWAYS run has_with_results + mark_stable for the digests
+        //       the worker reports it holds. This is the BIS-pipeline
+        //       feed — every 100 ms we ack the worker's pinned digests
+        //       that the server already has stably, so the worker can
+        //       unpin promptly. Per red-team F2 + reviewer feedback on
+        //       task #140: previously this rode on the cooldown-gated
+        //       backfill path, so worst-case mark_stable latency was
+        //       0–5 s + BIS lag. Decoupled here so worst-case latency
+        //       is ~one BlobsAvailable tick (~100 ms backstop).
+        //
+        //   (2) COOLDOWN-GATED, send UploadMissingBlobs requests for
+        //       digests the worker has but the server doesn't. The
+        //       cooldown is what actually exists to throttle the
+        //       (rare) upload protocol — has_with_results itself is
+        //       cheap (mostly served by ExistenceCacheStore).
+        //
+        // Both branches share the same `has_with_results` call inside
+        // `request_missing_blob_uploads`; the `send_uploads_if_missing`
+        // flag controls whether step (2) actually executes.
         if !digests.is_empty() {
             if let Some(ref cas_store) = self.cas_store {
                 let now_secs = SystemTime::now()
@@ -911,30 +967,36 @@ impl WorkerConnection {
                     .unwrap_or_default()
                     .as_secs();
                 let last = self.last_backfill_epoch_secs.load(Ordering::Relaxed);
-                if now_secs.saturating_sub(last) >= BACKFILL_COOLDOWN_SECS
-                    && self.last_backfill_epoch_secs.compare_exchange(
-                        last, now_secs, Ordering::Relaxed, Ordering::Relaxed,
-                    ).is_ok()
-                {
-                    let all_digests: Vec<DigestInfo> = digests.clone();
-                    let cas = cas_store.clone();
-                    let tx = self.worker_tx.clone();
-                    let worker_id = self.worker_id.clone();
-                    let inflight = self.backfill_inflight.clone();
-                    // Drop the locality map write lock before spawning.
-                    drop(map);
-                    background_spawn!("backfill_missing_blobs", async move {
+                let cooldown_passed = now_secs.saturating_sub(last) >= BACKFILL_COOLDOWN_SECS
+                    && self
+                        .last_backfill_epoch_secs
+                        .compare_exchange(last, now_secs, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok();
+
+                let all_digests: Vec<DigestInfo> = digests.clone();
+                let cas = cas_store.clone();
+                let tx = self.worker_tx.clone();
+                let worker_id = self.worker_id.clone();
+                let inflight = self.backfill_inflight.clone();
+                let metrics = self.metrics.clone();
+                // Drop the locality map write lock before spawning.
+                drop(map);
+                background_spawn!(
+                    "blobs_available_mark_stable_and_backfill",
+                    async move {
                         Self::request_missing_blob_uploads(
                             &cas,
                             &tx,
                             &worker_id,
                             &all_digests,
                             &inflight,
+                            cooldown_passed,
+                            &metrics,
                         )
                         .await;
-                    });
-                    return Ok(());
-                }
+                    }
+                );
+                return Ok(());
             }
         }
 
@@ -950,6 +1012,14 @@ impl WorkerConnection {
     /// every pin path the worker reports through BlobsAvailable is
     /// covered here, replacing the deleted `register_action_result_digests`.
     ///
+    /// `send_uploads_if_missing` controls only the second half — the
+    /// `UploadMissingBlobs` send. The mark_stable half ALWAYS runs (per
+    /// red-team F2: pin-release latency must be ~one BlobsAvailable tick
+    /// (~100 ms) for v2 durable pins, not 0–5 s + BIS lag). Setting the
+    /// flag to `false` corresponds to "we are inside the per-worker
+    /// `BACKFILL_COOLDOWN_SECS` window for the upload-protocol throttle"
+    /// — mark_stable still runs.
+    ///
     /// Deduplicates against in-flight requests: digests that were requested
     /// within the last `BACKFILL_INFLIGHT_TIMEOUT_SECS` are skipped to avoid
     /// redundant uploads. Digests that have since appeared in the CAS (or
@@ -960,6 +1030,8 @@ impl WorkerConnection {
         worker_id: &WorkerId,
         digests: &[DigestInfo],
         inflight: &parking_lot::Mutex<HashMap<DigestInfo, Instant>>,
+        send_uploads_if_missing: bool,
+        metrics: &WorkerApiMetrics,
     ) {
         if digests.is_empty() {
             return;
@@ -972,6 +1044,16 @@ impl WorkerConnection {
             .collect();
         let mut results = vec![None; keys.len()];
         if let Err(err) = cas_store.has_with_results(&keys, &mut results).await {
+            // Per red-team F5 + CLAUDE.md "Belt-and-suspenders masks bugs":
+            // increment a NOISY metric counter alongside the error log so
+            // operators can alert on sustained failures without having to
+            // grep logs. The error log alone makes this a quiet self-heal
+            // (the comment about "next tick recovers" is only true if the
+            // failure is transient — sustained failures are exactly the
+            // case the metric exists to catch).
+            metrics
+                .mark_stable_has_with_results_failures
+                .fetch_add(1, Ordering::Relaxed);
             error!(
                 worker_id=?worker_id,
                 ?err,
@@ -979,7 +1061,8 @@ impl WorkerConnection {
                 "backfill+mark_stable: failed to check CAS existence; \
                  worker pins for present digests will not be acked this round \
                  (next BlobsAvailable tick recovers) and missing digests will \
-                 not be requested for upload (next backfill tick recovers)"
+                 not be requested for upload (next backfill tick recovers); \
+                 metric `mark_stable_has_with_results_failures` incremented"
             );
             return;
         }
@@ -1008,6 +1091,17 @@ impl WorkerConnection {
         if !present_in_cas.is_empty() {
             let present_vec: Vec<DigestInfo> = present_in_cas.iter().copied().collect();
             cas_store.mark_stable(&present_vec);
+        }
+
+        // The mark_stable side runs every BlobsAvailable tick (~100 ms);
+        // the upload side is cooldown-gated. When inside the cooldown
+        // window we still ran has_with_results above (cheap, mostly served
+        // by ExistenceCacheStore) and pushed mark_stable for the present
+        // subset — but we skip the missing-digest enumeration and the
+        // UploadMissingBlobs send. The next BlobsAvailable tick that
+        // passes the cooldown will pick up any digests still missing.
+        if !send_uploads_if_missing {
+            return;
         }
 
         // Collect missing digests, filtering out those already in-flight.

@@ -518,3 +518,69 @@ async fn blobs_available_does_not_mark_stable_for_missing_digest_test()
 
     Ok(())
 }
+
+/// Regression for red-team F2: mark_stable MUST fire on every BlobsAvailable
+/// arrival, not just the ticks that pass the per-worker
+/// `BACKFILL_COOLDOWN_SECS` (5 s) gate. Before the decoupling fix the worker
+/// would hold a v2 durable pin for up to 5 s after the server already had
+/// the blob stably — which under high action throughput accumulates
+/// thousands of pin-seconds of needless retention per worker.
+///
+/// Test sends TWO BlobsAvailable in rapid succession (well within the 5 s
+/// cooldown). Both digests are pre-populated in cas_store. The contract:
+/// BOTH digests must end up in `drain_stable_digests` within `BIS_TIMEOUT`
+/// — not just the first one. A regression that gates mark_stable on the
+/// cooldown only fires for the first BlobsAvailable; the second's digest
+/// never appears in the stable queue (and the worker's pin leaks until the
+/// next post-cooldown tick).
+#[nativelink_test]
+async fn mark_stable_fires_for_back_to_back_blobs_available_within_cooldown_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    const CAS_ENDPOINT: &str = "grpc://192.168.55.7:50083";
+
+    let test_context = setup_context(CAS_ENDPOINT).await?;
+
+    // Pre-populate two distinct digests.
+    let data_a = Bytes::from_static(b"first within-cooldown blob");
+    let target_a = DigestInfo::new([13u8; 32], data_a.len() as u64);
+    test_context
+        .cas_store
+        .update_oneshot(target_a, data_a.clone())
+        .await
+        .err_tip(|| "Failed to pre-populate target_a")?;
+    let data_b = Bytes::from_static(b"second within-cooldown blob");
+    let target_b = DigestInfo::new([14u8; 32], data_b.len() as u64);
+    test_context
+        .cas_store
+        .update_oneshot(target_b, data_b.clone())
+        .await
+        .err_tip(|| "Failed to pre-populate target_b")?;
+    // Drain the slow-write feed so the assertions below are unambiguous.
+    await_stable_drain_contains(&test_context.cas_store, target_a).await;
+    await_stable_drain_contains(&test_context.cas_store, target_b).await;
+    drop(test_context.cas_store.drain_stable_digests());
+
+    // First BlobsAvailable: target_a. This trips the cooldown gate.
+    send_blobs_available(
+        &test_context.worker_stream,
+        CAS_ENDPOINT,
+        vec![target_a],
+    )
+    .await?;
+    await_stable_drain_contains(&test_context.cas_store, target_a).await;
+    drop(test_context.cas_store.drain_stable_digests());
+
+    // Second BlobsAvailable: target_b. Sent IMMEDIATELY after the first —
+    // well inside `BACKFILL_COOLDOWN_SECS=5`. The contract:
+    // mark_stable must fire for target_b even though we are inside the
+    // upload-backfill cooldown window.
+    send_blobs_available(
+        &test_context.worker_stream,
+        CAS_ENDPOINT,
+        vec![target_b],
+    )
+    .await?;
+    await_stable_drain_contains(&test_context.cas_store, target_b).await;
+
+    Ok(())
+}
