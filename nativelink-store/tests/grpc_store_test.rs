@@ -564,3 +564,187 @@ async fn grpc_store_tiny_blob_with_oversized_length_does_not_wedge_parallel()
     Ok(())
 }
 
+/// Bug B regression — INNER `chunk_count` clamp isolation.
+///
+/// Companion test to `grpc_store_tiny_blob_with_oversized_length_does_not_wedge_parallel`
+/// (which exercises the OUTER `effective_length` clamp at `get_part`).
+///
+/// The outer clamp keeps tiny blobs on the single-stream path. But for
+/// blobs that legitimately exceed `parallel_chunk_read_threshold`, the
+/// parallel path is entered and the INNER `chunk_count` clamp at
+/// `get_part_parallel` is the only thing that prevents N concurrent
+/// RPCs when the blob has bytes for fewer than N chunks.
+///
+/// Construction: blob_size = 16 MiB, threshold = 8 MiB, parallel_chunk_count
+/// = 32, caller-supplied length = Some(64 MiB). After the outer clamp,
+/// effective_length = min(64 MiB, 16 MiB) = 16 MiB ≥ 8 MiB → parallel path
+/// IS entered. Inside `get_part_parallel`, max_useful_chunks =
+/// ceil(16 MiB / 8 MiB) = 2, so the inner clamp collapses chunk_count
+/// from 32 down to 2 — exactly 2 RPCs. Without the inner clamp, the
+/// splitter would issue 32 RPCs of ~512 KiB each, every one within the
+/// blob (so the data is correct), but 30 of them are pure CAS-fan-out
+/// waste and feed the race-loser-abort h2 RST_STREAM contention pattern
+/// from #147.
+///
+/// Mutation evidence (per CLAUDE.md): revert ONLY the `chunk_count` clamp
+/// at `grpc_store.rs:get_part_parallel` (replace
+/// `let chunk_count = self.parallel_chunk_count.min(max_useful_chunks);`
+/// with `let chunk_count = self.parallel_chunk_count;`). Keep the OUTER
+/// `effective_length` clamp at `get_part` intact. This test MUST FAIL on
+/// the `read_request_count <= 2` assertion (counting 32 RPCs). A passing
+/// test after that mutation means the inner clamp is not load-bearing
+/// for this composition.
+#[nativelink_test]
+async fn grpc_store_chunk_count_clamp_collapses_parallel_to_useful_chunks()
+-> Result<(), Error> {
+    // 16 MiB payload — large enough to enter the parallel path even
+    // after the outer clamp folds the caller's oversized length down
+    // to the actual blob size.
+    const PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+    let payload_vec: Vec<u8> = (0..PAYLOAD_LEN).map(|i| i as u8).collect();
+    let payload = Bytes::from(payload_vec);
+
+    let read_request_count = Arc::new(AtomicU64::new(0));
+    let server_impl = TinyBlobByteStream {
+        payload: payload.clone(),
+        read_request_count: read_request_count.clone(),
+    };
+
+    // Bind on a free port and serve the in-process ByteStream.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ByteStreamServer::new(server_impl))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    // Construct a GrpcStore where the parallel path WILL be entered for
+    // this blob (outer clamp does not rescue): threshold = 8 MiB,
+    // parallel_chunk_count = 32. The 16 MiB blob fits comfortably above
+    // the threshold but only has bytes for 2 chunks of >= 8 MiB; without
+    // the inner `chunk_count` clamp the splitter would issue 32 RPCs.
+    // Zero retries to keep failure modes crisp.
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.rpc_timeout_s = 0;
+    spec.parallel_chunk_read_threshold = 8 * 1024 * 1024;
+    spec.parallel_chunk_count = 32;
+    spec.retry = Retry {
+        max_retries: 0,
+        delay: 0.0,
+        jitter: 0.0,
+        ..Default::default()
+    };
+    let store = GrpcStore::new(&spec).await?;
+
+    // Build the digest. Hash content unimportant — the in-process server
+    // doesn't validate. Size = 16 MiB matches the payload.
+    let digest = DigestInfo::try_new(
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        PAYLOAD_LEN as u64,
+    )?;
+    let key: StoreKey<'_> = digest.into();
+
+    // Caller passes length=Some(64 MiB) — over-large but legal REAPI.
+    // After the outer clamp this becomes 16 MiB (= blob_size), still
+    // ≥ threshold, so the parallel path IS entered. The INNER clamp is
+    // what prevents 32 RPCs from being issued.
+    let oversized_length = 64 * 1024 * 1024_u64;
+
+    let (writer, mut reader) = make_buf_channel_pair();
+
+    let store_clone = store.clone();
+    let key_owned: StoreKey<'static> = key.borrow().into_owned();
+    let get_part_fut = async move {
+        let mut writer_mut = writer;
+        store_clone
+            .get_part(key_owned, &mut writer_mut, 0, Some(oversized_length))
+            .await
+    };
+
+    let collect_fut = async move {
+        let mut total = bytes::BytesMut::new();
+        loop {
+            // Bounded chunk size: 1 MiB recvs comfortably handle
+            // 16 MiB total in 16 iterations.
+            let chunk = reader.consume(Some(1024 * 1024)).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            total.extend_from_slice(&chunk);
+        }
+        Ok::<Bytes, Error>(total.freeze())
+    };
+
+    // 10s outer timeout — generous for a 16 MiB local-loopback transfer
+    // even on a loaded CI runner. The deadlock detector for any
+    // writer-termination contract violation in the parallel path.
+    let outcome = timeout(
+        Duration::from_secs(10),
+        async move { tokio::join!(get_part_fut, collect_fut) },
+    )
+    .await
+    .expect(
+        "must not deadlock — Bug B writer-termination contract violated, \
+         or get_part_parallel hangs on shredded chunks",
+    );
+
+    server_handle.abort();
+
+    let (get_res, collect_res) = outcome;
+
+    let received = collect_res.expect(
+        "collect must read 16 MiB from the writer cleanly; \
+         parallel-path stream-closed wedges produce buf_channel errors here",
+    );
+
+    if let Err(err) = get_res {
+        let messages = err.messages.join(" / ");
+        panic!(
+            "Bug B regression — get_part failed with code={:?}, messages: {messages}\n\n\
+             Pre-fix wedge wording: \"Tried to send while stream is closed\" / \
+             \"in GrpcStore::get_part_parallel write\". The fix clamps \
+             chunk_count so a 16 MiB blob never fans out to 32 sub-RPCs.",
+            err.code,
+        );
+    }
+
+    assert_eq!(
+        received.len(),
+        PAYLOAD_LEN,
+        "expected to receive exactly {PAYLOAD_LEN} bytes from the writer, got {} \
+         (this asserts the writer was correctly EOF-terminated and not aborted \
+         mid-stream by the parallel-collector failure)",
+        received.len(),
+    );
+    assert_eq!(
+        received.as_ref(),
+        payload.as_ref(),
+        "received bytes must equal the 16 MiB payload",
+    );
+
+    // The discriminator: with the inner `chunk_count` clamp present,
+    // chunk_count = min(32, ceil(16 MiB / 8 MiB)) = min(32, 2) = 2 →
+    // exactly 2 RPCs. Without the clamp, the splitter would issue
+    // chunk_count = parallel_chunk_count = 32 RPCs. The bytes still
+    // arrive in either case (every chunk is within blob bounds), so a
+    // weaker assertion would not catch the regression — only the RPC
+    // count distinguishes the two states.
+    let count = read_request_count.load(Ordering::SeqCst);
+    assert!(
+        count <= 2,
+        "expected ≤2 ReadRequest RPCs for a 16 MiB blob with parallel_chunk_count=32 \
+         and threshold=8 MiB (clamped to max_useful_chunks=2), got {count}. \
+         Without the inner chunk_count clamp at get_part_parallel the splitter \
+         would issue 32 sub-RPCs."
+    );
+
+    Ok(())
+}
+
