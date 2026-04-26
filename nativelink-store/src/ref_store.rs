@@ -189,14 +189,25 @@ impl StoreDriver for RefStore {
     /// RefStore resolves its inner store lazily. We cannot safely return a
     /// `Passthrough(s)` borrow at trait-dispatch time because `get_store()`
     /// can fail (returns Err if the named store is missing from the
-    /// manager). Instead we declare `Leaf` and override every BIS / pin /
-    /// failed-digest method explicitly with a `match self.get_store()`
-    /// fallback so a missing store degrades to empty drains and a
-    /// never-woken notify (matching prior semantics).
+    /// manager) and the borrow's lifetime would have to outlive the
+    /// transient `Arc` `get_store()` returns.
+    ///
+    /// **Why `Leaf` instead of adding a `Lazy` variant:** every method that
+    /// would dispatch via the delegation enum (`drain_stable_digests`,
+    /// `stable_notify`, `pin_digests`, `pin_digests_with_results`) is
+    /// already overridden below with the same `match self.get_store()`
+    /// pattern. Declaring `Leaf` makes the trait default body a no-op, and
+    /// the explicit overrides do the lazy resolution AND the missing-store
+    /// degradation (empty drains, never-woken notify, silent pin no-op —
+    /// matching prior semantics). A dedicated `Lazy` enum variant would
+    /// add API surface to `StableDigestDelegation` / `PinDelegation` for
+    /// exactly one wrapper; the override pattern is the right tradeoff.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {
         StableDigestDelegation::Leaf
     }
 
+    /// See [`Self::stable_delegation`] — same `Leaf`-plus-explicit-override
+    /// pattern; `pin_digests` below is the override.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
     }

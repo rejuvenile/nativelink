@@ -176,8 +176,25 @@ pub struct MergedNotifyState {
     /// considers Drop-only fields "unused" because they are never
     /// explicitly read; allow the warning here so the field's purpose
     /// (preventing forwarder task leak via wrapper drop) stays visible.
+    ///
+    /// `pub(crate)` rather than `pub`: external callers have no business
+    /// touching the abort handles directly — the Drop chain is the only
+    /// load-bearing read. Construction goes through [`Self::new`] so a
+    /// future external author cannot field-init this struct without the
+    /// aborters and silently re-introduce F2.
     #[allow(dead_code)]
-    pub aborters: Vec<AbortOnDrop>,
+    pub(crate) aborters: Vec<AbortOnDrop>,
+}
+
+impl MergedNotifyState {
+    /// Build the state captured by the lazy `Many`-arm initialization in
+    /// [`StoreDriver::stable_notify`]. `aborters` MUST contain one
+    /// `AbortOnDrop` per spawned forwarder task — the wrapper's Drop is
+    /// the only mechanism that releases the `Arc<Notify>` clones held by
+    /// those tasks (closes F2).
+    pub(crate) fn new(notify: Arc<Notify>, aborters: Vec<AbortOnDrop>) -> Self {
+        Self { notify, aborters }
+    }
 }
 
 /// Inline-capacity for `Many`-arm child slices. Production wrappers are
@@ -1140,6 +1157,18 @@ pub trait StoreDriver:
     /// callers only `.notified().await`. Sharing one static avoids
     /// per-Leaf allocation; if a future change introduced a way to wake
     /// it, the cascade across trees would be a real concern.
+    ///
+    /// **Runtime precondition (Many arm):** the `Many` branch calls
+    /// `tokio::spawn` inside `get_or_init` to launch one forwarder task
+    /// per child Notify. `tokio::spawn` panics outside a tokio runtime,
+    /// so the FIRST call to `stable_notify()` for any `Many`-wrapped
+    /// store MUST originate from inside a tokio runtime context. In
+    /// production this is trivially satisfied (every BIS-feeder lives
+    /// inside the tokio reactor). In tests, ensure the test attribute
+    /// (`#[nativelink_test]` or `#[tokio::test]`) covers the call site,
+    /// or wrap the call in `Runtime::new()?.block_on(...)`. Subsequent
+    /// calls hit the `OnceLock`-cached state and do NOT spawn — only
+    /// the first invocation has the runtime requirement.
     fn stable_notify(&self) -> Arc<Notify> {
         match self.stable_delegation() {
             StableDigestDelegation::Leaf => {
@@ -1170,10 +1199,7 @@ pub trait StoreDriver:
                             });
                             aborters.push(AbortOnDrop::new(handle));
                         }
-                        MergedNotifyState {
-                            notify: merged,
-                            aborters,
-                        }
+                        MergedNotifyState::new(merged, aborters)
                     })
                     .notify
                     .clone()
