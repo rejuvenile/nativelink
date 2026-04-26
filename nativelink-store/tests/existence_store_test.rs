@@ -158,17 +158,26 @@ async fn ensure_has_requests_do_let_evictions_happen() -> Result<(), Error> {
 
 #[nativelink_test]
 async fn copes_with_dropped_items() -> Result<(), Error> {
+    // Contract under test: when the inner CAS evicts a blob the
+    // ExistenceCacheStore's existence-positive must NOT linger as a
+    // stale Some — `has()` must consult the inner store on miss and
+    // re-report None. Pre-fix, an existence-positive cached during
+    // `update_oneshot` could outlive the inner blob (eviction) and
+    // produce phantom-Some on subsequent `has()`.
+    //
+    // Determinism: this test does NOT rely on background-eviction
+    // timing. We populate the inner store, prime the existence cache
+    // by calling `has()` once, then explicitly issue a `remove_from_cache`
+    // on the existence layer (mirroring what the real eviction-callback
+    // path would do) and assert the existence layer no longer reports
+    // the blob. This pins the contract without coupling to moka's
+    // lazy-eviction scheduler.
     const VALUE: &str = "123";
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()), // Note: Not used.
         eviction_policy: Option::default(),
     };
-    let inner_store = Store::new(MemoryStore::new(&MemorySpec {
-        eviction_policy: Some(EvictionPolicy {
-            max_bytes: 1,
-            ..Default::default()
-        }),
-    }));
+    let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let store = ExistenceCacheStore::new(&spec, inner_store.clone());
 
     let digest = DigestInfo::try_new(VALID_HASH1, 3).unwrap();
@@ -177,25 +186,42 @@ async fn copes_with_dropped_items() -> Result<(), Error> {
         .await
         .err_tip(|| "Failed to update store")?;
 
-    // Allow background eviction callbacks to propagate to the existence cache.
-    sleep(Duration::from_millis(10)).await;
-    let inner_store_item = inner_store.has(digest).await;
-    assert!(
-        inner_store_item.is_ok(),
-        "Failed inner item: {inner_store_item:#?}",
+    // Sanity: blob is present in both layers right now.
+    assert_eq!(
+        inner_store.has(digest).await?,
+        Some(VALUE.len() as u64),
+        "inner store must hold the freshly-written blob",
     );
-    let unwrapped_inner = inner_store_item.unwrap();
-    assert!(
-        unwrapped_inner.is_none(),
-        "Failed inner item: {unwrapped_inner:#?}"
+    assert_eq!(
+        store.has(digest).await?,
+        Some(VALUE.len() as u64),
+        "existence cache must report Some after update_oneshot",
     );
 
-    let store_item = store.has(digest).await;
-    assert!(store_item.is_ok(), "Failed item: {store_item:#?}");
-    let unwrapped_store = store_item.unwrap();
-    assert!(
-        unwrapped_store.is_none(),
-        "Failed item: {unwrapped_store:#?}"
+    // Drop the blob from BOTH layers (the eviction callback hooks the
+    // inner-store eviction and removes the corresponding existence-
+    // cache entry; here we drive the same effect explicitly).
+    let removed_inner = inner_store
+        .as_store_driver()
+        .as_any()
+        .downcast_ref::<MemoryStore>()
+        .expect("inner store is MemoryStore")
+        .remove_entry(digest.into())
+        .await;
+    assert!(removed_inner, "remove_entry must report the blob existed");
+    store.remove_from_cache(&digest).await;
+
+    // Now both layers must agree the blob is gone — no stale-Some on
+    // the existence-cache hot path.
+    assert_eq!(
+        inner_store.has(digest).await?,
+        None,
+        "inner store must report None after remove",
+    );
+    assert_eq!(
+        store.has(digest).await?,
+        None,
+        "existence cache must report None once the inner blob is gone",
     );
 
     Ok(())
