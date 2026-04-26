@@ -25,7 +25,7 @@ use futures::{Future, Stream, TryFutureExt};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tracing::warn;
+use tracing::{error, warn};
 
 const ZERO_DATA: Bytes = Bytes::new();
 
@@ -491,16 +491,31 @@ impl Drop for WriteHalfGuard<'_> {
         // termination so the paired reader unblocks. We use a synthesized
         // Internal error rather than EOF because an uncommitted exit
         // almost always means the function bailed out early via `?`
-        // propagation; signaling EOF would lie about completeness. The
-        // structured error surfaces in the receiver's logs and helps
-        // identify the missing explicit-commit site.
-        let synthesized = make_err!(
-            Code::Internal,
+        // propagation; signaling EOF would lie about completeness.
+        //
+        // Two-channel error reporting (security-reviewer #148):
+        //   - Operator-side: `tracing::error!` with the verbose
+        //     diagnostic naming the missing commit verbs. Greppable in
+        //     the journal so the on-call can find the bug fast.
+        //   - Wire-side: short `"buf_channel: writer dropped without
+        //     commit"` carried in the `Error` struct itself, which
+        //     flows verbatim into `tonic::Status::message` for remote
+        //     clients (`nativelink-error/src/lib.rs:476-494`). Hides
+        //     internal verb names ("WriteHalfGuard", "commit_eof",
+        //     "commit_delegated_if_ok", "fail") from external clients
+        //     while preserving a unique, greppable identifier so tests
+        //     can assert the Drop body fired.
+        error!(
+            target: "buf_channel::write_half_guard_drop",
             "WriteHalfGuard fired Drop fallback: function exited without explicit \
              commit_eof / commit_delegated_if_ok / fail. This is a bug — the owning \
              function returned without terminating the writer, which would have \
              deadlocked any paired reader. The Drop fallback unblocked the \
              reader, but the underlying logic error should be fixed."
+        );
+        let synthesized = make_err!(
+            Code::Internal,
+            "buf_channel: writer dropped without commit"
         );
         self.writer.send_error(synthesized);
     }

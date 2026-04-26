@@ -339,11 +339,11 @@ async fn verify_store_around_verify_store_does_not_deadlock_on_get_part_err() ->
 ///   2. `cargo test --features failpoints -p nativelink-store --test \
 ///      composability_test verify_store_around_fast_slow_*`.
 ///   3. The test MUST fail with: the merged err.messages now contains
-///      the synthesized "WriteHalfGuard fired Drop fallback" string —
-///      it does NOT under correct code (`guard.fail` puts the structured
+///      the wire-side "buf_channel: writer dropped without commit" string
+///      — it does NOT under correct code (`guard.fail` puts the structured
 ///      NotFound in `terminal_error`, so the check-side reader sees the
 ///      same NotFound and the merged messages contain only the
-///      structured marker, never the Drop synthesized one).
+///      structured marker, never the Drop wire-side identifier).
 ///   4. Restore the call and re-run to confirm the test passes again.
 ///
 /// The non-deadlock detector (5s timeout) does NOT fire under this
@@ -388,8 +388,8 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_get_part_err()
     assert!(
         !err.messages
             .iter()
-            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
-        "merged Err MUST NOT carry the synthesized Drop-fallback identifier — \
+            .any(|m| m.contains("buf_channel: writer dropped without commit")),
+        "merged Err MUST NOT carry the wire-side Drop-fallback identifier — \
          that would mean the explicit `guard.fail(...)` at the local_only_reads \
          branch was bypassed and the outer Drop fallback fired. The structured \
          NotFound contract is broken: the wire-side err loses the structured \

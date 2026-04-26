@@ -345,8 +345,10 @@ impl StoreDriver for VerifyStore {
         // owned by the future. The move alone is enough to break the
         // deadlock (mpsc Sender drop wakes the receiver with a generic
         // "Sender dropped" Internal); the guard upgrades that to a
-        // structured "WriteHalfGuard fired Drop fallback" Internal that
-        // operators can grep for to identify the missing-commit-site.
+        // structured "buf_channel: writer dropped without commit" Internal
+        // that operators can grep for in tonic::Status messages, with the
+        // verbose verb-naming diagnostic logged separately via
+        // `tracing::error!` (target=buf_channel::write_half_guard_drop).
         // See `WriteHalfGuard` rustdoc and the composability harness in
         // `nativelink-store/tests/composability_test.rs`.
         let get_fut = async move {

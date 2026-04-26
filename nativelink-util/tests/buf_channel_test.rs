@@ -456,8 +456,9 @@ async fn write_half_guard_uncommitted_drop_terminates_with_internal() {
     assert!(
         err.messages
             .iter()
-            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
-        "fallback err MUST identify itself so operators can grep for the missing commit site, got: {err:?}",
+            .any(|m| m.contains("buf_channel: writer dropped without commit")),
+        "fallback err MUST carry the wire-side identifier so tests can verify the Drop body fired \
+         (operator-side verbose form is logged via tracing::error!), got: {err:?}",
     );
 }
 
@@ -534,8 +535,8 @@ async fn write_half_guard_commit_delegated_if_ok_arms_drop_on_err() {
     assert!(
         err.messages
             .iter()
-            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
-        "Err branch MUST surface the synthesized Internal, got: {err:?}",
+            .any(|m| m.contains("buf_channel: writer dropped without commit")),
+        "Err branch MUST surface the wire-side identifier from the Drop fallback, got: {err:?}",
     );
 }
 
@@ -586,7 +587,7 @@ async fn drop_during_active_send_does_not_corrupt_stream() {
     assert!(
         err.messages
             .iter()
-            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
-        "post-Drop err MUST be the synthesized Internal, got: {err:?}",
+            .any(|m| m.contains("buf_channel: writer dropped without commit")),
+        "post-Drop err MUST carry the wire-side identifier, got: {err:?}",
     );
 }

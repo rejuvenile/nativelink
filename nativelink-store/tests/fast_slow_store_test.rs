@@ -3141,11 +3141,13 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
 
 /// Falsification: builds a guard, returns Err WITHOUT committing. With the
 /// Drop fallback the wrapping VerifyStore unblocks within milliseconds AND
-/// the merged error carries the synthesized "WriteHalfGuard fired Drop
-/// fallback" message from the check-side, proving the Drop body was the
-/// load-bearing terminator (not the generic "Sender dropped before sending
-/// EOF" fallback that mpsc-drop alone would synthesize at
-/// `buf_channel.rs:567`).
+/// the merged error carries the wire-side "buf_channel: writer dropped
+/// without commit" identifier from the check-side, proving the Drop body
+/// was the load-bearing terminator (not the generic "Sender dropped
+/// before sending EOF" fallback that mpsc-drop alone would synthesize at
+/// `buf_channel.rs:567`). The verbose operator-side diagnostic is logged
+/// via `tracing::error!` (target: buf_channel::write_half_guard_drop) so
+/// internal verb names don't leak to remote clients via tonic::Status.
 ///
 /// Mutation evidence (run manually to validate the test guards the
 /// behavior — DO NOT commit the mutation):
@@ -3154,11 +3156,11 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
 ///      `WriteHalfGuard::Drop` in `nativelink-util/src/buf_channel.rs`.
 ///   2. `cargo test --features failpoints -p nativelink-store --test \
 ///      fast_slow_store_test write_half_guard_drop_fallback_prevents_uncommitted_deadlock`.
-///   3. The test MUST fail at the `messages.iter().any(... "WriteHalfGuard \
-///      fired Drop fallback" ...)` assertion below — the receiver instead
-///      sees the generic "Sender dropped before sending EOF" Internal that
-///      mpsc-drop synthesizes at `buf_channel.rs:567`. Without the Drop
-///      body, the synthesized identifier the operator greps for is gone.
+///   3. The test MUST fail at the `messages.iter().any(... "buf_channel: \
+///      writer dropped without commit" ...)` assertion below — the
+///      receiver instead sees the generic "Sender dropped before sending
+///      EOF" Internal that mpsc-drop synthesizes at `buf_channel.rs:567`.
+///      Without the Drop body, the wire-side identifier is gone.
 ///   4. Restore the line and re-run to confirm the test passes again.
 #[nativelink_test]
 async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
@@ -3256,10 +3258,13 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
     assert!(
         err.messages
             .iter()
-            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
-        "merged Err MUST carry the synthesized Drop-fallback identifier so \
+            .any(|m| m.contains("buf_channel: writer dropped without commit")),
+        "merged Err MUST carry the wire-side Drop-fallback identifier so \
          operators can grep for the missing-commit site; otherwise the test \
          is a tautology that passes even when the Drop body is mutated away. \
+         (The verbose operator-only diagnostic is logged via \
+         tracing::error! target=buf_channel::write_half_guard_drop and is \
+         not asserted here because it doesn't flow to the wire/Error.) \
          Got: {err:?}",
     );
 
