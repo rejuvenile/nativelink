@@ -300,6 +300,38 @@ liveness property holds. Both pin-TTL re-insert
 (`fast_slow_store.rs:128-155`) and in-band failure
 (`fast_slow_store.rs:2033, :2370`) paths are modeled.
 
+### `MarkStableViaBlobsAvailable.tla`
+
+Models the post-#140 (this branch) cross-component pin/release
+pairing protocol. Worker pins every digest, advertises via
+BlobsAvailable on every tick; server runs `has_with_results` and
+`mark_stable` for the present subset; BIS broadcast loop emits
+`BlobsInStableStorage`; worker `unpin_digest`s. Bug class: audit
+Path 2's `register_action_result_digests` race against
+`evicted_digests` on the same `mpsc::channel(1)` — eviction
+arriving before registration silently drops, then registration
+re-adds the stale entry. The `FixV140` constant toggles between
+the pre- and post-#140 architectures.
+
+`MarkStableViaBlobsAvailableBugged.cfg` (FixV140=FALSE) violates
+`NoLostEvictionRace` with the documented audit Path 2 trace.
+`MarkStableViaBlobsAvailableFixed.cfg` (FixV140=TRUE) runs clean
+AND satisfies the liveness property `EventuallyConsistentLocality`
+via WF on the dispatch / drain / deliver actions.
+
+KNOWN UNMODELED (deferred to follow-up tracker tasks; see
+`.claude/audits/task-139-lost-eviction/audit.md`):
+- **audit Path 1** — failed BlobsAvailable delta-send drops the
+  drained deltas (worker `swap()`s the BlobChangeTracker BEFORE
+  the network send acks; on Err, drained deltas are unrecoverable).
+  Spec models a successful FIFO delivery without explicit drop;
+  modeling Path 1 needs a separate `WorkerSendFailure` action that
+  reuses the drained-but-unsent state.
+- **audit Path 3** — `UploadMissingBlobs` / `TouchBlobs` reveal
+  missing digests but the worker doesn't backpropagate eviction
+  to the server. Spec models neither RPC; adding them needs new
+  actions on the server→worker direction (currently absent).
+
 ## Scope honesty
 
 Each spec includes an explicit ASSUMPTION block listing what is and
