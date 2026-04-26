@@ -48,7 +48,8 @@ use bytes::Bytes;
 use nativelink_config::cas_server::WorkerApiConfig;
 use nativelink_config::schedulers::WorkerAllocationStrategy;
 use nativelink_config::stores::{
-    ExistenceCacheSpec, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec, VerifySpec,
+    ExistenceCacheSpec, FastSlowSpec, MemorySpec, RefSpec, SizePartitioningSpec, StoreDirection,
+    StoreSpec, VerifySpec,
 };
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
@@ -65,6 +66,9 @@ use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
+use nativelink_store::ref_store::RefStore;
+use nativelink_store::size_partitioning_store::SizePartitioningStore;
+use nativelink_store::store_manager::StoreManager;
 use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
@@ -122,40 +126,127 @@ impl WorkerStateManager for MockWorkerStateManager {
 
 // ----- Production CAS composition -----
 //
-// `ExistenceCacheStore -> VerifyStore -> FastSlowStore { fast: Memory, slow: Memory }`.
-// This is the wrapper sequence used in production (per
+// Mirrors the production cas_STORE chain from
 // `~/fl/bld/infra/nativelink/prod-server.json5:94-153` and MEMORY.md
-// `Server CAS Store Architecture`). The point of the production
-// composition is to verify `mark_stable` propagates through every
-// wrapper to the `FastSlowStore` that owns `stable_digests`.
-fn make_production_cas_store() -> Store {
-    let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let fast_slow = Store::new(FastSlowStore::new(
+// `Server CAS Store Architecture`:
+//
+//     cas_STORE = Verify(Ref(cas_INNER))
+//     cas_INNER = ExistenceCache(SizePartitioning(
+//         lower = Ref(SMALL_CAS_CACHED),
+//         upper = Ref(cas_FAST_SLOW_STORE)))
+//
+// Each leg's `FastSlowStore` is the terminal that owns `stable_digests`
+// (and where the `mark_stable` push must land). The two `Ref` indirections
+// in the chain are real: prior reviewer findings (#157 wrapper coverage,
+// `aea1038e` C+D enum landing) hinge on the BIS pipeline composing
+// correctly across every wrapper, including `Ref` and `SizePartitioning`.
+//
+// Earlier revisions of this test used a single direct `FastSlowStore`
+// without `Ref` / `SizePartitioning` indirections, so a regression in
+// either wrapper's `mark_stable` delegation would not have been
+// detectable here — that is the bug class CLAUDE.md "Test in production
+// composition, not in isolation" exists to catch.
+//
+// Returns `(cas_STORE, store_manager, [lower_fast_slow, upper_fast_slow])`
+// — the `Ref` lookups need the manager to outlive the test, and the
+// terminal `FastSlowStore` handles allow tests to assert on the actual
+// `stable_digests` queue post-mark_stable propagation.
+fn make_production_cas_store() -> (Store, Arc<StoreManager>, Store, Store) {
+    let store_manager = Arc::new(StoreManager::new());
+
+    // cas_FAST_SLOW_STORE: terminal big-blob store. We use Memory for both
+    // tiers in the test (the real config uses Memory + Filesystem); the
+    // BIS-pipeline behavior under test depends on `FastSlowStore::mark_stable`
+    // — independent of whether the slow tier is Memory or Filesystem.
+    let upper_fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let upper_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let upper_fast_slow = Store::new(FastSlowStore::new(
         &FastSlowSpec {
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
         },
-        fast,
-        slow,
+        upper_fast,
+        upper_slow,
     ));
-    let verify = Store::new(VerifyStore::new(
-        &VerifySpec {
-            backend: StoreSpec::Memory(MemorySpec::default()),
-            verify_size: false,
-            verify_hash: false,
+    store_manager.add_store("cas_FAST_SLOW_STORE", upper_fast_slow.clone());
+
+    // SMALL_CAS_CACHED: terminal small-blob store. Real config wraps a
+    // Memory→Redis FastSlow; for the test, Memory→Memory is sufficient.
+    let lower_fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let lower_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let lower_fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
         },
-        fast_slow,
+        lower_fast,
+        lower_slow,
     ));
-    Store::new(ExistenceCacheStore::new(
+    store_manager.add_store("SMALL_CAS_CACHED", lower_fast_slow.clone());
+
+    // RefStores wrapping each leaf — matches the production indirections.
+    let upper_ref = Store::new(RefStore::new(
+        &RefSpec {
+            name: "cas_FAST_SLOW_STORE".to_string(),
+        },
+        Arc::downgrade(&store_manager),
+    ));
+    let lower_ref = Store::new(RefStore::new(
+        &RefSpec {
+            name: "SMALL_CAS_CACHED".to_string(),
+        },
+        Arc::downgrade(&store_manager),
+    ));
+
+    // SizePartitioningStore: 16KB partition matches prod-server.json5:136.
+    let size_part = Store::new(SizePartitioningStore::new(
+        &SizePartitioningSpec {
+            size: 16384,
+            lower_store: StoreSpec::RefStore(RefSpec {
+                name: "SMALL_CAS_CACHED".to_string(),
+            }),
+            upper_store: StoreSpec::RefStore(RefSpec {
+                name: "cas_FAST_SLOW_STORE".to_string(),
+            }),
+        },
+        lower_ref,
+        upper_ref,
+    ));
+
+    // cas_INNER: ExistenceCache(SizePartitioning).
+    let inner = Store::new(ExistenceCacheStore::new(
         &ExistenceCacheSpec {
             backend: StoreSpec::Memory(MemorySpec::default()),
             eviction_policy: None,
         },
-        verify,
-    ))
+        size_part,
+    ));
+    store_manager.add_store("cas_INNER", inner.clone());
+
+    // Outer Ref(cas_INNER) wrapper inside Verify, matching the cas_STORE
+    // declaration's `verify { backend: ref_store { name: cas_INNER } }`.
+    let inner_ref = Store::new(RefStore::new(
+        &RefSpec {
+            name: "cas_INNER".to_string(),
+        },
+        Arc::downgrade(&store_manager),
+    ));
+    let cas_store = Store::new(VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::RefStore(RefSpec {
+                name: "cas_INNER".to_string(),
+            }),
+            verify_size: false,
+            verify_hash: false,
+        },
+        inner_ref,
+    ));
+
+    (cas_store, store_manager, lower_fast_slow, upper_fast_slow)
 }
 
 // ----- Test context + setup -----
@@ -173,13 +264,21 @@ struct TestContext {
     >,
     worker_stream: mpsc::Sender<Update>,
     cas_store: Store,
+    // Hold the StoreManager and the two terminal FastSlowStore handles
+    // alive for the duration of the test. The Ref wrappers in
+    // make_production_cas_store hold Weak references to the manager;
+    // dropping the manager would break Ref resolution mid-test.
+    _store_manager: Arc<StoreManager>,
+    _lower_fast_slow: Store,
+    _upper_fast_slow: Store,
 }
 
 async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
     const SCHEDULER_NAME: &str = "MARK_STABLE_BIS_TEST_SCHEDULER";
     const UUID_SIZE: usize = 36;
 
-    let cas_store = make_production_cas_store();
+    let (cas_store, store_manager, lower_fast_slow, upper_fast_slow) =
+        make_production_cas_store();
 
     let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
     let tasks_or_worker_change_notify = Arc::new(Notify::new());
@@ -255,6 +354,9 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
         _connection_worker_stream: Box::new(connection_worker_stream),
         worker_stream: tx,
         cas_store,
+        _store_manager: store_manager,
+        _lower_fast_slow: lower_fast_slow,
+        _upper_fast_slow: upper_fast_slow,
     })
 }
 
