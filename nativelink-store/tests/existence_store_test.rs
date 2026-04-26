@@ -16,11 +16,13 @@ use core::time::Duration;
 
 use mock_instant::thread_local::MockClock;
 use nativelink_config::stores::{
-    EvictionPolicy, ExistenceCacheSpec, MemorySpec, NoopSpec, StoreSpec,
+    EvictionPolicy, ExistenceCacheSpec, FastSlowSpec, MemorySpec, NoopSpec, StoreDirection,
+    StoreSpec,
 };
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::instant_wrapper::MockInstantWrapped;
@@ -222,6 +224,50 @@ async fn copes_with_dropped_items() -> Result<(), Error> {
         store.has(digest).await?,
         None,
         "existence cache must report None once the inner blob is gone",
+    );
+
+    Ok(())
+}
+
+/// Per-wrapper regression for testing-czar MAJOR-1 (#140 follow-up):
+/// `ExistenceCacheStore::mark_stable` MUST delegate to `inner_store`.
+/// In production `cas_INNER = ExistenceCache(SizePartitioning(...))`,
+/// so a regression here would cut the BIS pipeline at the existence
+/// cache layer and the worker's pin (durable under v2) would leak.
+///
+/// Inner is a FastSlowStore so `mark_stable` lands in its observable
+/// `stable_digests` queue.
+#[nativelink_test]
+async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
+    let inner_fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let store = ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: None,
+        },
+        inner_fast_slow.clone(),
+    );
+
+    let digest = DigestInfo::new([0xBBu8; 32], 100);
+    let outer = Store::new(store);
+    outer.as_store_driver().mark_stable(&[digest]);
+
+    let drained = inner_fast_slow.as_store_driver().drain_stable_digests();
+    assert!(
+        drained.contains(&digest),
+        "ExistenceCacheStore::mark_stable must delegate to inner_store. \
+         The production cas_INNER chain wraps SizePartitioning inside \
+         ExistenceCache; a silent no-op here would cut the BIS pipeline \
+         at this layer. Drained: {drained:?}",
     );
 
     Ok(())

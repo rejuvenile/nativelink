@@ -14,9 +14,12 @@
 
 use std::sync::Arc;
 
-use nativelink_config::stores::{MemorySpec, SizePartitioningSpec, StoreSpec};
+use nativelink_config::stores::{
+    FastSlowSpec, MemorySpec, SizePartitioningSpec, StoreDirection, StoreSpec,
+};
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
 use nativelink_util::common::DigestInfo;
@@ -198,5 +201,113 @@ async fn update_test() -> Result<(), Error> {
             BIG_HASH
         );
     }
+    Ok(())
+}
+
+/// Per-wrapper regression for testing-czar MAJOR-1 (#140 follow-up):
+/// `SizePartitioningStore::mark_stable` MUST route each digest to the
+/// correct inner store by size threshold (`<partition_size` -> lower,
+/// `>=partition_size` -> upper). The production-composition test in
+/// `nativelink-service/tests/mark_stable_on_blobs_available_test.rs`
+/// only ever drives digests below 16 KiB, so a regression that
+/// SWAPPED the lower/upper destinations would still pass that test —
+/// this per-wrapper test exists to catch that swap.
+///
+/// Approach: build a `SizePartitioningStore` whose lower and upper
+/// inners are each a `FastSlowStore`. `FastSlowStore::mark_stable`
+/// pushes into its own `stable_digests` queue, observable via
+/// `drain_stable_digests`. Calling `mark_stable(&[small, large])` on
+/// the partition wrapper must result in:
+///   * the lower FastSlowStore's queue containing exactly `[small]`
+///   * the upper FastSlowStore's queue containing exactly `[large]`
+///
+/// Mutation step: in `size_partitioning_store.rs::mark_stable`, swap
+/// the lower/upper push targets (push `lower` to `upper_store` and
+/// vice versa); this assertion fails with a specific message.
+#[nativelink_test]
+async fn mark_stable_routes_by_size_threshold_test() -> Result<(), Error> {
+    // Use a threshold larger than the largest small digest used here
+    // and smaller than the large digest. 100 keeps both digests far
+    // from the boundary so an off-by-one in the comparison can't mask
+    // a routing swap.
+    const PARTITION: u64 = 100;
+
+    // Lower and upper inner stores are FastSlowStores so we can drain
+    // their `stable_digests` queues independently. The fast/slow tier
+    // identities don't matter — we only observe the
+    // `mark_stable` -> `stable_digests` sink.
+    let lower_inner = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let upper_inner = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+
+    let partition = SizePartitioningStore::new(
+        &SizePartitioningSpec {
+            size: PARTITION,
+            // The spec fields here are unused by the test path — the
+            // `lower_store` / `upper_store` arguments to `new` are the
+            // load-bearing ones. Match types/shapes so the spec
+            // validates.
+            lower_store: StoreSpec::Memory(MemorySpec::default()),
+            upper_store: StoreSpec::Memory(MemorySpec::default()),
+        },
+        lower_inner.clone(),
+        upper_inner.clone(),
+    );
+
+    // size_bytes: 50 -> lower (< 100), 200 -> upper (>= 100).
+    let small_digest = DigestInfo::new([1u8; 32], 50);
+    let large_digest = DigestInfo::new([2u8; 32], 200);
+
+    // Wrap in `Store` so the StoreLike `mark_stable` method on the
+    // outer call surface drives the SizePartitioningStore impl, matching
+    // how the production worker_api_server invokes it.
+    let outer = Store::new(partition);
+    outer
+        .as_store_driver()
+        .mark_stable(&[small_digest, large_digest]);
+
+    let lower_drained = lower_inner.as_store_driver().drain_stable_digests();
+    let upper_drained = upper_inner.as_store_driver().drain_stable_digests();
+
+    assert_eq!(
+        lower_drained,
+        vec![small_digest],
+        "SizePartitioningStore::mark_stable must route digests with \
+         size_bytes < partition_size to lower_store; got lower={:?}, \
+         upper={:?}. A regression that swapped the lower/upper push \
+         targets in size_partitioning_store.rs::mark_stable would land \
+         the small digest on the upper queue and the large digest on \
+         the lower queue, silently misrouting BIS notifications. The \
+         production-composition test in \
+         mark_stable_on_blobs_available_test.rs uses only digests \
+         below the 16 KiB threshold and would NOT catch the swap.",
+        lower_drained, upper_drained,
+    );
+    assert_eq!(
+        upper_drained,
+        vec![large_digest],
+        "SizePartitioningStore::mark_stable must route digests with \
+         size_bytes >= partition_size to upper_store; got lower={:?}, \
+         upper={:?}.",
+        lower_drained, upper_drained,
+    );
+
     Ok(())
 }

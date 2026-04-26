@@ -16,9 +16,12 @@ use core::pin::Pin;
 
 use futures::future::pending;
 use futures::try_join;
-use nativelink_config::stores::{MemorySpec, StoreSpec, VerifySpec};
+use nativelink_config::stores::{
+    FastSlowSpec, MemorySpec, StoreDirection, StoreSpec, VerifySpec,
+};
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_macro::nativelink_test;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::buf_channel::make_buf_channel_pair;
@@ -565,5 +568,53 @@ async fn verify_both_size_and_hash_on_read_succeeds() -> Result<(), Error> {
         "Expected correct data when both verify_size and verify_hash pass, got: {:?}",
         result
     );
+    Ok(())
+}
+
+/// Per-wrapper regression for testing-czar MAJOR-1 (#140 follow-up):
+/// `VerifyStore::mark_stable` MUST delegate to its inner store.
+/// Without an explicit override the trait's silent no-op default would
+/// swallow the call at the verify layer — and `cas_STORE` in
+/// production is `Verify(Ref(cas_INNER))`, so a regression would break
+/// the entire BIS pipeline. The production-composition test exercises
+/// this composition end-to-end, but a per-wrapper test pinpoints the
+/// regression to this specific layer.
+///
+/// Wraps a FastSlowStore as the inner so `mark_stable` lands in its
+/// observable `stable_digests` queue.
+#[nativelink_test]
+async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
+    let inner_fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let verify = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: false,
+            verify_hash: false,
+        },
+        inner_fast_slow.clone(),
+    );
+
+    let digest = DigestInfo::new([0xAAu8; 32], 100);
+    let outer = Store::new(verify);
+    outer.as_store_driver().mark_stable(&[digest]);
+
+    let drained = inner_fast_slow.as_store_driver().drain_stable_digests();
+    assert!(
+        drained.contains(&digest),
+        "VerifyStore::mark_stable must delegate to inner_store. Without \
+         this delegation the trait silent-default no-op swallows the \
+         call and the BIS pipeline breaks at the cas_STORE outer layer. \
+         Drained: {drained:?}",
+    );
+
     Ok(())
 }

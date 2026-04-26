@@ -17,10 +17,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use nativelink_config::stores::MemorySpec;
+use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::blob_locality_map::{SharedBlobLocalityMap, new_shared_blob_locality_map};
@@ -1900,6 +1901,42 @@ async fn inner_deadline_exceeded_does_not_invoke_peer_fetch() -> Result<(), Erro
         err.message_string().contains("INNER_DEADLINE_EXCEEDED_MARKER"),
         "Expected the original inner-store error message to surface, got: {}",
         err.message_string()
+    );
+
+    Ok(())
+}
+
+/// Per-wrapper regression for testing-czar MAJOR-1 (#140 follow-up):
+/// `WorkerProxyStore::mark_stable` MUST delegate to its inner store.
+/// WorkerProxyStore wraps the worker-side fast tier in some
+/// compositions; without delegation the BIS pipeline breaks at this
+/// layer. Inner is a FastSlowStore so `mark_stable` lands in its
+/// observable `stable_digests` queue.
+#[nativelink_test]
+async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
+    let inner_fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let locality_map = new_shared_blob_locality_map();
+    let proxy = WorkerProxyStore::new(inner_fast_slow.clone(), locality_map);
+
+    let digest = DigestInfo::new([0xCCu8; 32], 100);
+    let outer = Store::new(proxy);
+    outer.as_store_driver().mark_stable(&[digest]);
+
+    let drained = inner_fast_slow.as_store_driver().drain_stable_digests();
+    assert!(
+        drained.contains(&digest),
+        "WorkerProxyStore::mark_stable must delegate to inner. Without \
+         this delegation the BIS pipeline breaks at the worker proxy \
+         layer and worker pins (durable under v2) leak. Drained: {drained:?}",
     );
 
     Ok(())
