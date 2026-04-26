@@ -38,6 +38,7 @@ pub mod ref_store;
 pub mod s3_store;
 pub mod shard_store;
 pub mod size_partitioning_store;
+pub mod small_blob_dispatcher;
 pub mod store_manager;
 pub mod verify_store;
 pub mod worker_proxy_store;
