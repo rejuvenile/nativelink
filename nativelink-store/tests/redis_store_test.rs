@@ -475,6 +475,182 @@ async fn yield_between_sending_packets_in_update() -> Result<(), Error> {
     Ok(())
 }
 
+// Cache-poisoning regression: when an upstream is truncated mid-stream (e.g.
+// a tonic deadline drops the inbound buf_channel after only some chunks have
+// flushed to redis), `RedisStore::update` previously ignored its
+// `UploadSizeInfo` argument and would happily RENAME the temp key into the
+// final key with whatever partial bytes had landed. Every future `get_part`
+// for that digest then served the truncated bytes — a silent CAS poisoning
+// that survives across server restarts because the bad value lives in
+// Valkey. Mirrors the MemoryStore Bucket-B fix in commit 0ff03300
+// ("memory_store: enforce ExactSize on update; reject partial writes").
+//
+// The test declares `ExactSize(100_000)` but only sends 1_000 bytes followed
+// by `send_eof()`. It expects `update()` to return `Err(InvalidArgument)`
+// containing the substring "ExactSize" before the temp key is RENAMEd to the
+// real key. The mock connection queues only the SETRANGE for the partial
+// chunk — no STRLEN, no RENAME — so if `update()` proceeds past the size
+// check the MockRedisConnection will panic with an "unexpected command"
+// error, NOT the assertion below. Read the failure message: an
+// `InvalidArgument` with the right substring proves the check fires; an
+// `unexpected command` panic proves we got past the check (cache would
+// have been poisoned in production).
+#[nativelink_test]
+async fn update_rejects_partial_write_with_exact_size() -> Result<(), Error> {
+    const DECLARED_BYTES: u64 = 100_000;
+    let truncated = Bytes::from(vec![b'X'; 1_000]);
+
+    let digest = DigestInfo::try_new(VALID_HASH1, DECLARED_BYTES)?;
+    let packed_hash_hex = format!("{digest}");
+    let temp_key = make_temp_key(&packed_hash_hex);
+
+    // The fix MUST reject before STRLEN/RENAME. The mock therefore queues
+    // only the partial SETRANGE that the streaming loop will issue before
+    // EOF; an extra command past that point means cache poisoning shipped.
+    let commands = vec![MockCmd::new(
+        redis::cmd("SETRANGE")
+            .arg(temp_key.clone())
+            .arg(0)
+            .arg(truncated.clone().to_vec()),
+        Ok(Value::Int(0)),
+    )];
+
+    let store = make_mock_store(commands).await;
+
+    let (mut tx, rx) = make_buf_channel_pair();
+
+    let update_result = tokio::try_join!(
+        async {
+            store
+                .update(digest, rx, UploadSizeInfo::ExactSize(DECLARED_BYTES))
+                .await
+        },
+        async {
+            tx.send(truncated.clone()).await.unwrap();
+            tx.send_eof().unwrap();
+            Ok::<(), Error>(())
+        },
+    );
+
+    let err = update_result
+        .err()
+        .expect("update_rejects_partial_write_with_exact_size: expected Err but update succeeded — partial write would poison the CAS");
+    assert_eq!(
+        err.code,
+        Code::InvalidArgument,
+        "expected InvalidArgument for ExactSize mismatch, got: {err:?}",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ExactSize") && msg.contains("100000") && msg.contains("1000"),
+        "error message must name the size mismatch (declared/received) so the \
+         invariant violation is debuggable; got: {msg}",
+    );
+
+    Ok(())
+}
+
+// Sibling: an over-write (received > declared) is equally cache-poisoning —
+// the next reader will get bytes the producer never agreed to upload. This
+// test sends MORE than declared.
+#[nativelink_test]
+async fn update_rejects_overwrite_with_exact_size() -> Result<(), Error> {
+    const DECLARED_BYTES: u64 = 1_000;
+    let oversized = Bytes::from(vec![b'Y'; 5_000]);
+
+    let digest = DigestInfo::try_new(VALID_HASH1, DECLARED_BYTES)?;
+    let packed_hash_hex = format!("{digest}");
+    let temp_key = make_temp_key(&packed_hash_hex);
+
+    // SETRANGE is queued (the streaming loop runs to EOF before the size
+    // check fires); no STRLEN/RENAME — the fix MUST reject before then.
+    let commands = vec![MockCmd::new(
+        redis::cmd("SETRANGE")
+            .arg(temp_key.clone())
+            .arg(0)
+            .arg(oversized.clone().to_vec()),
+        Ok(Value::Int(0)),
+    )];
+
+    let store = make_mock_store(commands).await;
+
+    let (mut tx, rx) = make_buf_channel_pair();
+
+    let update_result = tokio::try_join!(
+        async {
+            store
+                .update(digest, rx, UploadSizeInfo::ExactSize(DECLARED_BYTES))
+                .await
+        },
+        async {
+            tx.send(oversized.clone()).await.unwrap();
+            tx.send_eof().unwrap();
+            Ok::<(), Error>(())
+        },
+    );
+
+    let err = update_result
+        .err()
+        .expect("update_rejects_overwrite_with_exact_size: expected Err but update succeeded — overwrite would poison the CAS");
+    assert_eq!(
+        err.code,
+        Code::InvalidArgument,
+        "expected InvalidArgument for ExactSize mismatch, got: {err:?}",
+    );
+
+    Ok(())
+}
+
+// Sibling: a `MaxSize` overrun is cache-poisoning in the same way — the
+// caller's declared ceiling was exceeded. Underrun on `MaxSize` is allowed
+// by definition (the caller declared a ceiling, not a floor), so we do NOT
+// add a sibling test for that case.
+#[nativelink_test]
+async fn update_rejects_overrun_with_max_size() -> Result<(), Error> {
+    const MAX_BYTES: u64 = 1_000;
+    let oversized = Bytes::from(vec![b'Z'; 5_000]);
+
+    let digest = DigestInfo::try_new(VALID_HASH1, oversized.len() as u64)?;
+    let packed_hash_hex = format!("{digest}");
+    let temp_key = make_temp_key(&packed_hash_hex);
+
+    let commands = vec![MockCmd::new(
+        redis::cmd("SETRANGE")
+            .arg(temp_key.clone())
+            .arg(0)
+            .arg(oversized.clone().to_vec()),
+        Ok(Value::Int(0)),
+    )];
+
+    let store = make_mock_store(commands).await;
+
+    let (mut tx, rx) = make_buf_channel_pair();
+
+    let update_result = tokio::try_join!(
+        async {
+            store
+                .update(digest, rx, UploadSizeInfo::MaxSize(MAX_BYTES))
+                .await
+        },
+        async {
+            tx.send(oversized.clone()).await.unwrap();
+            tx.send_eof().unwrap();
+            Ok::<(), Error>(())
+        },
+    );
+
+    let err = update_result
+        .err()
+        .expect("update_rejects_overrun_with_max_size: expected Err but update succeeded — overrun past MaxSize would poison the CAS");
+    assert_eq!(
+        err.code,
+        Code::InvalidArgument,
+        "expected InvalidArgument for MaxSize overrun, got: {err:?}",
+    );
+
+    Ok(())
+}
+
 // Regression test for: https://github.com/TraceMachina/nativelink/issues/1286
 #[nativelink_test]
 async fn zero_len_items_exist_check() -> Result<(), Error> {

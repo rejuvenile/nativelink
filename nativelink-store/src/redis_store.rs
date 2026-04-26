@@ -1421,7 +1421,7 @@ where
         self: Pin<&Self>,
         key: StoreKey<'_>,
         mut reader: DropCloserReadHalf,
-        _upload_size: UploadSizeInfo,
+        upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
         let final_key = self.encode_key(&key);
 
@@ -1542,6 +1542,58 @@ where
             if last_pos > total_len {
                 total_len = last_pos;
             }
+        }
+
+        // Enforce `UploadSizeInfo` BEFORE the RENAME — a truncated upstream
+        // (e.g. a tonic deadline dropping the inbound buf_channel after
+        // some chunks have flushed via SETRANGE) would otherwise commit a
+        // partial entry to the final key and poison every future `get_part`
+        // for this digest, persistently, in Valkey. Mirrors the MemoryStore
+        // Bucket-B fix in commit `0ff03300`. `MaxSize` is advisory: overruns
+        // are rejected, underruns are accepted (the caller declared a
+        // ceiling, not a floor). NOISY-failure policy per CLAUDE.md: emit
+        // `tracing::error!` with the declared/received pair before returning
+        // `Code::InvalidArgument` so the invariant violation is impossible
+        // to ignore in production logs.
+        //
+        // The check fires after the streaming loop and before STRLEN+RENAME,
+        // so the temp key is left dangling rather than promoted — no
+        // poisoning of the final key is possible. Defence-in-depth against
+        // callers that construct a `RedisStore` without a `VerifyStore`
+        // wrapper in front of it (the canonical pre-write enforcer).
+        let total_bytes = u64::from(total_len);
+        match upload_size {
+            UploadSizeInfo::ExactSize(declared) if total_bytes != declared => {
+                error!(
+                    key = %final_key,
+                    temp_key = %temp_key,
+                    declared,
+                    received = total_bytes,
+                    "RedisStore::update: ExactSize mismatch — rejecting partial write before RENAME",
+                );
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "RedisStore::update: ExactSize declared {declared} bytes but \
+                     received {total_bytes} — refusing to RENAME temp key {temp_key} \
+                     into {final_key} (would poison the CAS for every future read)"
+                ));
+            }
+            UploadSizeInfo::MaxSize(max) if total_bytes > max => {
+                error!(
+                    key = %final_key,
+                    temp_key = %temp_key,
+                    max,
+                    received = total_bytes,
+                    "RedisStore::update: MaxSize exceeded — rejecting overrun before RENAME",
+                );
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "RedisStore::update: MaxSize declared {max} bytes but \
+                     received {total_bytes} — refusing to RENAME temp key {temp_key} \
+                     into {final_key} (would poison the CAS for every future read)"
+                ));
+            }
+            _ => {}
         }
 
         let cmd_start = Instant::now();
