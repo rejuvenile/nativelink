@@ -18,6 +18,7 @@ use core::marker::PhantomData;
 use core::ops::{Bound, RangeBounds};
 use core::pin::Pin;
 use core::str::FromStr;
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -104,6 +105,167 @@ pub const DEFAULT_MAX_COUNT_PER_CURSOR: u64 = 1_500;
 const MAX_PIPELINE_BATCH: usize = 5000;
 
 const DEFAULT_CLIENT_PERMITS: usize = 500;
+
+/// Threshold above which a sampled redis call emits a slow-call warn
+/// with `wall_ms` / `actor_ms` / `queue_ms` split. Tunable; 100ms is
+/// roughly an order of magnitude above the typical Unix-socket Valkey
+/// command (a few µs to ~100µs) so genuinely slow calls stand out.
+const SLOW_CALL_WARN_THRESHOLD_MS: u64 = 100;
+
+/// Sample 1-in-N redis calls for actor-poll timing instrumentation.
+/// 100 → ~1% sample rate. The hot-path cost when SAMPLED is one
+/// `Instant::now()` per `poll()` (single CLOCK_MONOTONIC syscall, ~10ns
+/// on Linux). When NOT sampled the cost is one `AtomicUsize` modulo.
+const TIMING_SAMPLE_RATE: usize = 100;
+
+/// Process-wide counter that decides which redis calls get instrumented.
+/// `Relaxed` is fine — we only need rough 1-in-N sampling, not strict
+/// ordering.
+static TIMING_SAMPLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns true once every TIMING_SAMPLE_RATE invocations.
+#[inline(always)]
+fn should_sample_call() -> bool {
+    TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) % TIMING_SAMPLE_RATE == 0
+}
+
+/// Test-only: arrange that the next `should_sample_call()` call returns
+/// true. Used by integration tests that need to deterministically hit
+/// the sampled-and-logged branch of `instrument_redis_call` instead of
+/// relying on probabilistic sampling.
+#[doc(hidden)]
+pub fn force_next_call_sampled() {
+    // Set the counter so that the next `fetch_add(1) % TIMING_SAMPLE_RATE`
+    // yields 0. After increment the counter advances; subsequent calls
+    // resume normal 1-in-N sampling.
+    let cur = TIMING_SAMPLE_COUNTER.load(Ordering::Relaxed);
+    let target = cur.next_multiple_of(TIMING_SAMPLE_RATE);
+    // Set so that the next fetch_add yields exactly target.
+    TIMING_SAMPLE_COUNTER.store(target, Ordering::Relaxed);
+}
+
+/// Recorded timing for one redis call. `wall_ms` is end-to-end wall time
+/// (issue → completion); `actor_ms` is the sum of poll-active durations
+/// (CPU time inside the future); `queue_ms = wall_ms - actor_ms` is
+/// time the future was suspended waiting to be polled.
+///
+/// Interpretation per red-team Step 1 of the valkey-pool-521c13d1
+/// pivot recommendation:
+/// - `queue_ms ≪ wall_ms`: the future is being polled but suspended
+///   between polls — symptomatic of runtime starvation (e.g. tokio
+///   workers tied up in a Moka mutex). Adding more redis connections
+///   does not help; this is a calling-side bottleneck.
+/// - `queue_ms ≈ 0, wall_ms ≈ actor_ms`: the future is actively polling
+///   but the actor is slow returning a response — symptomatic of a
+///   loaded socket / slow Valkey. A connection pool that round-robins
+///   across N actors helps.
+#[derive(Clone, Copy, Debug)]
+pub struct RedisCallTiming {
+    pub wall_ms: u64,
+    pub actor_ms: u64,
+    pub queue_ms: u64,
+    pub poll_count: u32,
+}
+
+/// A `Future` adapter that records per-poll wall-clock timing and emits
+/// a `tracing::warn!` (with `wall_ms`/`actor_ms`/`queue_ms` split) for
+/// any wrapped call that exceeds [`SLOW_CALL_WARN_THRESHOLD_MS`]. Only
+/// constructed for sampled calls (1-in-[`TIMING_SAMPLE_RATE`]) — the
+/// hot path that picks the un-sampled branch sees zero allocation and
+/// one atomic increment.
+///
+/// The `actor_ms` accounting is the sum of `poll()` durations: every
+/// time the wrapped future is polled, we record `Instant::now()` on
+/// entry and add the elapsed on exit (whether Ready or Pending). The
+/// `wall_ms` is just `last_seen.elapsed()` from the issue-time
+/// `start`. Difference is `queue_ms` — time the future was suspended
+/// between polls.
+pub struct TimedRedisCall<F> {
+    inner: F,
+    start: Instant,
+    actor_total_nanos: u128,
+    poll_count: u32,
+}
+
+impl<F> TimedRedisCall<F> {
+    /// Wrap `inner` in a timing recorder. Caller is responsible for
+    /// reading `take_timing()` after the future resolves OR using
+    /// `into_future_with_log` which logs on drop / on completion.
+    pub fn new(inner: F) -> Self {
+        Self {
+            inner,
+            start: Instant::now(),
+            actor_total_nanos: 0,
+            poll_count: 0,
+        }
+    }
+}
+
+impl<F: Future> Future for TimedRedisCall<F> {
+    type Output = (F::Output, RedisCallTiming);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: we never move `inner` out; pin-projection via raw deref.
+        let this = unsafe { self.get_unchecked_mut() };
+        let inner_pin = unsafe { Pin::new_unchecked(&mut this.inner) };
+        let poll_start = Instant::now();
+        let result = inner_pin.poll(cx);
+        let poll_elapsed = poll_start.elapsed().as_nanos();
+        this.actor_total_nanos = this.actor_total_nanos.saturating_add(poll_elapsed);
+        this.poll_count = this.poll_count.saturating_add(1);
+        match result {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(out) => {
+                let wall_ms_u128 = this.start.elapsed().as_millis();
+                let actor_ms_u128 = this.actor_total_nanos / 1_000_000;
+                let wall_ms = u64::try_from(wall_ms_u128).unwrap_or(u64::MAX);
+                let actor_ms = u64::try_from(actor_ms_u128).unwrap_or(u64::MAX);
+                let queue_ms = wall_ms.saturating_sub(actor_ms);
+                Poll::Ready((
+                    out,
+                    RedisCallTiming {
+                        wall_ms,
+                        actor_ms,
+                        queue_ms,
+                        poll_count: this.poll_count,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+/// Helper: wrap a redis-call future in a `TimedRedisCall` and emit a
+/// `tracing::warn!` if `wall_ms` exceeds the threshold. Returns the
+/// inner future's `Output` unchanged. When sampling is OFF, the cost
+/// per call is ONE atomic increment (Relaxed) — no allocation, no
+/// extra Instant::now in the hot path.
+///
+/// The `key_for_log` argument is the cardinality-bound logging tag —
+/// for pipelined batches it's `"pipelined STRLEN+EXISTS x{n}"`; for
+/// per-key calls it's the encoded key string.
+pub async fn instrument_redis_call<F, T>(cmd: &'static str, key_for_log: &str, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    if should_sample_call() {
+        let (output, timing) = TimedRedisCall::new(fut).await;
+        if timing.wall_ms >= SLOW_CALL_WARN_THRESHOLD_MS {
+            warn!(
+                cmd,
+                key = %key_for_log,
+                wall_ms = timing.wall_ms,
+                actor_ms = timing.actor_ms,
+                queue_ms = timing.queue_ms,
+                poll_count = timing.poll_count,
+                "redis call slow: wall vs actor (sampled, see CLAUDE.md valkey-pool red-team Step 1)"
+            );
+        }
+        output
+    } else {
+        fut.await
+    }
+}
 
 /// A wrapper around Redis to allow it to be reconnected.
 pub trait RedisManager<C>
@@ -965,12 +1127,16 @@ where
                 let mut client = self.get_client().await?;
 
                 let cmd_start = Instant::now();
-                let (blob_len, exists) = timeout(
-                    self.command_timeout,
-                    pipe()
-                        .strlen(encoded_key.as_str())
-                        .exists(encoded_key.as_str())
-                        .query_async::<(u64, bool)>(&mut client.connection_manager),
+                let (blob_len, exists) = instrument_redis_call(
+                    "STRLEN+EXISTS",
+                    encoded_key,
+                    timeout(
+                        self.command_timeout,
+                        pipe()
+                            .strlen(encoded_key.as_str())
+                            .exists(encoded_key.as_str())
+                            .query_async::<(u64, bool)>(&mut client.connection_manager),
+                    ),
                 )
                 .await
                 .map_err(|_| {
@@ -1055,9 +1221,17 @@ where
             let mut client = self.get_client().await?;
 
             let cmd_start = Instant::now();
-            let pipeline_result = timeout(
-                self.command_timeout,
-                pipeline.query_async::<Vec<Value>>(&mut client.connection_manager),
+            // Synthesize a cardinality-bound logging key for the
+            // sampled instrumentation: the per-key encoded string
+            // would be too noisy at batch sizes of 5000.
+            let pipeline_key_tag = format!("pipelined x{}", chunk_keys.len());
+            let pipeline_result = instrument_redis_call(
+                "pipelined STRLEN+EXISTS",
+                &pipeline_key_tag,
+                timeout(
+                    self.command_timeout,
+                    pipeline.query_async::<Vec<Value>>(&mut client.connection_manager),
+                ),
             )
             .await;
 

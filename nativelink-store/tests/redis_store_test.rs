@@ -1715,6 +1715,121 @@ async fn pick_slot_concurrent_distribution_under_stampede() -> Result<(), Error>
     Ok(())
 }
 
+/// Verifies that `TimedRedisCall` correctly accumulates poll-active
+/// duration ("actor_ms") vs end-to-end wall-clock ("wall_ms") and
+/// computes the queue_ms split. Constructs an artificial future that
+/// sleeps for 50ms (waiting on a timer = queue time, not actor time)
+/// and busy-loops for 30ms inside its poll (active poll time =
+/// actor time). After completion:
+/// - `wall_ms` should be ~80ms (50 wait + 30 busy)
+/// - `actor_ms` should be ~30ms (the busy work in poll)
+/// - `queue_ms = wall_ms - actor_ms` should be ~50ms
+///
+/// Tolerance is generous since the test runs on a real timer and CPU
+/// (busy-loop variance, scheduler jitter). The point is the structural
+/// split — actor_ms must be substantially less than wall_ms when the
+/// future spends most of its time idle (the runtime-starvation pattern).
+///
+/// Mutation: change `TimedRedisCall::poll` to record `start.elapsed()`
+/// for actor_total_nanos instead of just the per-poll duration. With
+/// the mutation, actor_ms ≈ wall_ms, queue_ms ≈ 0, and the assertion
+/// `queue_ms >= 30` would fail (queue would be near zero).
+#[nativelink_test]
+async fn timed_redis_call_splits_wall_vs_actor_correctly() -> Result<(), Error> {
+    use nativelink_store::redis_store::TimedRedisCall;
+    use std::time::Instant;
+
+    // The future polls once: sleeps 50ms (Pending → wakes → Ready),
+    // then runs a 30ms busy-spin inside the SECOND poll.
+    let busy_spin_target = Duration::from_millis(30);
+    let probe = async move {
+        // First poll suspends here for 50ms wall — that becomes queue_ms.
+        sleep(Duration::from_millis(50)).await;
+        // Now busy-spin inside the active poll. This counts as actor_ms.
+        let start = Instant::now();
+        while start.elapsed() < busy_spin_target {
+            std::hint::spin_loop();
+        }
+        42_u32
+    };
+
+    let timed = TimedRedisCall::new(probe);
+    let (output, timing) = timeout(Duration::from_secs(5), timed)
+        .await
+        .expect("timed-call probe must not hang")
+        ;
+    assert_eq!(output, 42);
+    assert!(
+        timing.wall_ms >= 75,
+        "wall_ms should be >= 75ms (50 sleep + 30 busy minus jitter); got {:?}",
+        timing
+    );
+    assert!(
+        timing.queue_ms >= 30,
+        "queue_ms should reflect the 50ms sleep; got {:?} — \
+         a regression where actor_ms includes total elapsed (not just poll-active) \
+         would zero out queue_ms",
+        timing
+    );
+    assert!(
+        timing.actor_ms >= 20 && timing.actor_ms <= 80,
+        "actor_ms should reflect the 30ms busy-spin (with jitter); got {:?}",
+        timing
+    );
+    assert!(timing.poll_count >= 2, "expected >=2 polls, got {:?}", timing);
+    Ok(())
+}
+
+/// Verifies that `instrument_redis_call` actually emits a slow-call
+/// `tracing::warn!` when the wrapped future exceeds
+/// SLOW_CALL_WARN_THRESHOLD_MS. Uses `#[traced_test]` (via the
+/// `tracing-test` crate, which the existing nativelink_test macro
+/// configures) and `logs_assert` to scan for the expected warn line.
+///
+/// Sampling rate is 1-in-100, so we issue 200 calls to maximize the
+/// probability of hitting at least one sample (probability ≈ 1 -
+/// (99/100)^200 ≈ 87% per the geometric distribution). To make the
+/// test deterministic we manipulate the sampling counter directly via
+/// the test-only `force_next_call_sampled` helper.
+///
+/// Mutation: lower SLOW_CALL_WARN_THRESHOLD_MS to 0 — every sampled
+/// call would warn (test still passes). Raise to 1_000_000 — no calls
+/// warn (test fails on `expected at least one ...`).
+#[nativelink_test]
+async fn instrument_redis_call_emits_slow_warn() -> Result<(), Error> {
+    use nativelink_store::redis_store::{force_next_call_sampled, instrument_redis_call};
+    // Force sampling so this single call will record + log.
+    force_next_call_sampled();
+    let slow_fut = async {
+        // Exceeds SLOW_CALL_WARN_THRESHOLD_MS (100ms).
+        sleep(Duration::from_millis(150)).await;
+        "done"
+    };
+    let result = timeout(
+        Duration::from_secs(5),
+        instrument_redis_call("TEST_CMD", "test_key", slow_fut),
+    )
+    .await
+    .expect("instrumented call must not hang");
+    assert_eq!(result, "done");
+
+    logs_assert(|logs| {
+        for log in logs {
+            if log.contains("redis call slow: wall vs actor")
+                && log.contains("cmd=\"TEST_CMD\"")
+                && log.contains("key=test_key")
+            {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "expected at least one 'redis call slow' warn for TEST_CMD/test_key; \
+             logs = {logs:?}"
+        ))
+    });
+    Ok(())
+}
+
 /// `try_join_all` semantics: if any one of the parallel dials fails,
 /// the entire `new_with_pool_size` future resolves to Err with that
 /// failure's details. Per testing-czar MISSING-COVERAGE #6.
