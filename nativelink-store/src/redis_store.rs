@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use core::cmp;
-use core::fmt::Debug;
+use core::fmt::{self, Debug};
 use core::marker::PhantomData;
 use core::ops::{Bound, RangeBounds};
 use core::pin::Pin;
@@ -185,6 +185,18 @@ pub struct TimedRedisCall<F> {
     start: Instant,
     actor_total_nanos: u128,
     poll_count: u32,
+}
+
+impl<F> fmt::Debug for TimedRedisCall<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Omit `inner` since `F: Future` doesn't carry a `Debug` bound.
+        f.debug_struct("TimedRedisCall")
+            .field("start", &self.start)
+            .field("actor_total_nanos", &self.actor_total_nanos)
+            .field("poll_count", &self.poll_count)
+            .field("inner", &"<future>")
+            .finish()
+    }
 }
 
 impl<F> TimedRedisCall<F> {
