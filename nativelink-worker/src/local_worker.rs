@@ -1198,6 +1198,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 .cas_server_fss
                 .as_ref()
                 .map_or(0, |fss| fss.mirror_blobs_max_bytes()),
+            // Field 16 (per plan B5 + B7): the dispatcher-pushed
+            // pin snapshot. Currently empty because the worker-side
+            // mirror_blobs (store_id, digest) keying is not yet
+            // wired (skeleton commit). Once that lands, this is
+            // populated by iterating the BTreeMap which is already
+            // sorted by store_id (zero per-tick sort cost).
+            pinned_mirror_entries: Vec::new(),
         };
 
         if let Err(err) = grpc_client.blobs_available(notification).await {
@@ -1369,12 +1376,30 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         loop {
             select! {
                 maybe_update = update_for_worker_stream.next() => if !shutting_down || maybe_update.is_some() {
-                    match maybe_update
+                    let proto_update = maybe_update
                         .err_tip(|| "UpdateForWorker stream closed early")?
                         .err_tip(|| "Got error in UpdateForWorker stream")?
-                        .update
-                        .err_tip(|| "Expected update to exist in UpdateForWorker")?
-                    {
+                        .update;
+                    // Per plan B2 (USER OVERRIDE: no capability flag): when
+                    // the server sends a NEW oneof variant that this worker
+                    // does not know about, prost decodes the variant
+                    // INSIDE the oneof but leaves the outer `update` as
+                    // `None` (proto3 unknown-field skip). Pre-fix this
+                    // path `?`-propagated "Expected update to exist in
+                    // UpdateForWorker" and exited the connection task,
+                    // creating an offline-worker-wakeup hot loop on
+                    // server-side rollouts of new variants. Now we
+                    // gracefully `warn!` + continue so old workers
+                    // survive a rolling deploy of `BatchWriteSmallBlobs`
+                    // (and any future variant added at the same site).
+                    let Some(update) = proto_update else {
+                        warn!(
+                            "received UpdateForWorker with no recognized update variant; \
+                             skipping (server may be running a newer build with a new oneof tag)"
+                        );
+                        continue;
+                    };
+                    match update {
                         Update::ConnectionResult(_) => {
                             return Err(make_input_err!(
                                 "Got ConnectionResult in LocalWorker::run which should never happen"
@@ -1489,6 +1514,46 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             tokio::spawn(async move {
                                 Self::handle_upload_missing_blobs(&ram, digests).await;
                             });
+                        }
+                        Update::BatchWriteSmallBlobs(batch) => {
+                            // Per plan §"Architecture summary": the server's
+                            // SmallBlobDispatcher pushes a batch of small
+                            // CAS/AC blobs (≤ SMALL_BLOB_THRESHOLD = 16 KiB)
+                            // for the worker to hold in `mirror_blobs`
+                            // keyed by `(store_id, digest)`. The worker then
+                            // advertises the snapshot via field 16
+                            // `pinned_mirror_entries` on the next
+                            // BlobsAvailableNotification, and the server's
+                            // per-store `EphemeralServerSidePin` releases
+                            // matching pins.
+                            //
+                            // STATUS: skeleton arm. The worker-side
+                            // mirror_blobs key is currently
+                            // `HashMap<DigestInfo, _>`; per plan B5 it
+                            // becomes `BTreeMap<(Arc<str>, DigestInfo), _>`
+                            // in a follow-up commit. Until then this arm
+                            // logs + drops the batch (the dispatcher
+                            // is also gated behind `small_blob_mirror_enabled
+                            // = false` so this arm CAN'T fire in production
+                            // yet). The acknowledgement field 16 emitter
+                            // is a sibling follow-up.
+                            //
+                            // The arm exists today so:
+                            //   1. Old workers' graceful-skip path (B2 above)
+                            //      can be regression-tested against a real
+                            //      newer-worker that DOES have the arm.
+                            //   2. Future commits don't have to touch the
+                            //      proto + match-tail at the same time as
+                            //      the data-shape change.
+                            let blob_count = batch.blobs.len();
+                            let total_bytes: usize = batch.blobs.iter().map(|b| b.data.len()).sum();
+                            warn!(
+                                blob_count,
+                                total_bytes,
+                                "Update::BatchWriteSmallBlobs received (skeleton — \
+                                 mirror_blobs (store_id, digest) keying not yet wired); \
+                                 dropping batch"
+                            );
                         }
                         Update::StartAction(start_execute) => {
                             // Don't accept any new requests if we're shutting down.
@@ -1676,6 +1741,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                             pinned_mirror_digests: Vec::new(),
                                                             mirror_used_bytes: 0,
                                                             mirror_max_bytes: 0,
+                                                            pinned_mirror_entries: Vec::new(),
                                                         }
                                                     ).await {
                                                         // Failure to send BlobsAvailable
