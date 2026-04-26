@@ -28,7 +28,8 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    UploadSizeInfo,
 };
 
 use crate::store_manager::StoreManager;
@@ -183,6 +184,21 @@ impl StoreDriver for RefStore {
             }
         }
         Ok(())
+    }
+
+    /// RefStore resolves its inner store lazily. We cannot safely return a
+    /// `Passthrough(s)` borrow at trait-dispatch time because `get_store()`
+    /// can fail (returns Err if the named store is missing from the
+    /// manager). Instead we declare `Leaf` and override every BIS / pin /
+    /// failed-digest method explicitly with a `match self.get_store()`
+    /// fallback so a missing store degrades to empty drains and a
+    /// never-woken notify (matching prior semantics).
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 
     fn drain_stable_digests(&self) -> Vec<DigestInfo> {

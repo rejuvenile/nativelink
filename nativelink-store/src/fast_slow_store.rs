@@ -37,8 +37,8 @@ use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::fs;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    IS_MIRROR_REQUEST, ItemCallback, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
-    UploadSizeInfo, slow_update_store_with_file,
+    IS_MIRROR_REQUEST, ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo, slow_update_store_with_file,
 };
 use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
 use parking_lot::Mutex;
@@ -3326,6 +3326,25 @@ impl StoreDriver for FastSlowStore {
         Ok(())
     }
 
+    /// FastSlowStore IS the leaf for stable digests — `populate_fast_store`
+    /// pushes into `self.stable_digests` whenever a slow-store write
+    /// completes. Inner stores (Memory + Filesystem) do not contribute
+    /// independently. Hence `Leaf` + the two overrides below that read
+    /// FastSlowStore's owned state directly.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// FastSlowStore fans the pin out to BOTH fast and slow inner stores
+    /// (the slow one because in worker `FastSlowStore { fast: Memory, slow:
+    /// Filesystem }` the actual pin lives on the slow tier). Hence `Many`.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Many(vec![
+            self.fast_store.as_store_driver(),
+            self.slow_store.as_store_driver(),
+        ])
+    }
+
     fn drain_stable_digests(&self) -> Vec<DigestInfo> {
         let mut guard = self.stable_digests.lock();
         std::mem::take(&mut *guard)
@@ -3333,11 +3352,6 @@ impl StoreDriver for FastSlowStore {
 
     fn stable_notify(&self) -> Arc<Notify> {
         self.stable_notify.clone()
-    }
-
-    fn pin_digests(&self, digests: &[DigestInfo]) {
-        self.fast_store.pin_digests(digests);
-        self.slow_store.pin_digests(digests);
     }
 
     fn drain_failed_digests(&self) -> Vec<DigestInfo> {

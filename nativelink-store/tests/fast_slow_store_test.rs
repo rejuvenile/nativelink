@@ -28,7 +28,9 @@ use nativelink_store::noop_store::NoopStore;
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
-use nativelink_util::store_trait::{ItemCallback, Store, StoreDriver, StoreKey, StoreLike};
+use nativelink_util::store_trait::{
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+};
 use pretty_assertions::assert_eq;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -392,6 +394,14 @@ async fn drop_on_eof_completes_store_futures() -> Result<(), Error> {
         ) -> Result<(), Error> {
             Ok(())
         }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
     }
 
     impl Drop for DropCheckStore {
@@ -716,6 +726,14 @@ fn make_stores_with_lazy_slow() -> (Store, Store, Store) {
         ) -> Result<(), Error> {
             Ok(())
         }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
     }
 
     default_health_status_indicator!(LazyStore);
@@ -931,6 +949,14 @@ async fn update_with_whole_file_writes_to_both_stores() -> Result<(), Error> {
             _callback: Arc<dyn ItemCallback>,
         ) -> Result<(), Error> {
             Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
         }
     }
 
@@ -1415,6 +1441,14 @@ async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Erro
         ) -> Result<(), Error> {
             Ok(())
         }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
     }
 
     default_health_status_indicator!(GatedHasStore);
@@ -1608,6 +1642,14 @@ async fn populate_survives_caller_cancellation() -> Result<(), Error> {
         ) -> Result<(), Error> {
             Ok(())
         }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
     }
 
     default_health_status_indicator!(StallSlowStore);
@@ -1800,6 +1842,14 @@ async fn populate_producer_error_propagates_to_waiters() -> Result<(), Error> {
             _callback: Arc<dyn ItemCallback>,
         ) -> Result<(), Error> {
             Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
         }
     }
 
@@ -2321,6 +2371,14 @@ impl StoreDriver for CountingNotFoundSlowStore {
     ) -> Result<(), Error> {
         Ok(())
     }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
 }
 
 default_health_status_indicator!(CountingNotFoundSlowStore);
@@ -2821,6 +2879,14 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_fast_store_truncatio
         ) -> Result<(), Error> {
             Ok(())
         }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
     }
 
     default_health_status_indicator!(TruncatingFastStore);
@@ -3110,6 +3176,14 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
         ) -> Result<(), Error> {
             Ok(())
         }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
     }
 
     default_health_status_indicator!(LyingHasSlowStore);
@@ -3222,6 +3296,14 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
             _: Arc<dyn ItemCallback>,
         ) -> Result<(), Error> {
             Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
         }
     }
     default_health_status_indicator!(ForgetfulStore);

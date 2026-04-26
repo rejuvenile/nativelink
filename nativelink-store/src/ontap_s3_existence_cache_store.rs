@@ -36,7 +36,8 @@ use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::spawn;
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -538,6 +539,16 @@ where
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
         self.inner_store.register_item_callback(callback)
+    }
+
+    /// OntapS3ExistenceCache is a single-inner wrapper. The cache lives at
+    /// this layer; BIS / pin chain forwards unchanged to `inner_store`.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner_store.as_store_driver())
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner_store.as_store_driver())
     }
 }
 

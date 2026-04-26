@@ -23,7 +23,8 @@ use nativelink_metric::{
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
+    UploadSizeInfo,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -103,6 +104,18 @@ impl StoreDriver for NoopStore {
     ) -> Result<(), Error> {
         // does nothing, so drop
         Ok(())
+    }
+
+    /// NoopStore is a leaf — no data is stored, no inner store contributes
+    /// to the BIS chain.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// NoopStore is a leaf — pin requests are silently ignored (default
+    /// `pin_digests` is a no-op for `Leaf` per the trait contract).
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

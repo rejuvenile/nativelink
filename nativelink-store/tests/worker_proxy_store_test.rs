@@ -28,8 +28,8 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    IS_WORKER_REQUEST, ItemCallback, REDIRECT_PREFIX, Store, StoreDriver, StoreKey, StoreLike,
-    StoreOptimizations, UploadSizeInfo,
+    IS_WORKER_REQUEST, ItemCallback, PinDelegation, REDIRECT_PREFIX, StableDigestDelegation, Store,
+    StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
 };
 use pretty_assertions::assert_eq;
 
@@ -725,6 +725,14 @@ impl StoreDriver for PartialFailStore {
     ) -> Result<(), Error> {
         Ok(())
     }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner.as_store_driver())
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner.as_store_driver())
+    }
 }
 
 // -------------------------------------------------------------------
@@ -977,6 +985,14 @@ impl StoreDriver for StructuredFailStore {
         _callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner.as_store_driver())
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner.as_store_driver())
     }
 }
 
@@ -1473,6 +1489,14 @@ impl StoreDriver for EmptyEofStore {
     ) -> Result<(), Error> {
         Ok(())
     }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
 }
 
 // ===================================================================
@@ -1560,6 +1584,14 @@ impl StoreDriver for PartialWriteThenErrorStore {
         _callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

@@ -30,7 +30,8 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    UploadSizeInfo,
 };
 use parking_lot::Mutex;
 use prost::Message;
@@ -543,6 +544,22 @@ impl StoreDriver for CompletenessCheckingStore {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// CompletenessCheckingStore wraps the AC store (entry-point for AC
+    /// queries). The CAS store is consulted for verification reads only.
+    /// External `drain_stable_digests` / `stable_notify` flow through the
+    /// AC store path. (Internal `cas_store.pin_digests` calls inside the
+    /// completeness check loop are separate from the public pin API.)
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.ac_store.as_store_driver())
+    }
+
+    /// External pin requests forward to the AC store. The internal CAS-
+    /// pinning that happens inside the completeness check is independent
+    /// of this public API surface.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.ac_store.as_store_driver())
     }
 }
 

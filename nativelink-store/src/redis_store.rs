@@ -39,9 +39,10 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::spawn;
 use nativelink_util::store_trait::{
-    BoolValue, ItemCallback, SchedulerCurrentVersionProvider, SchedulerIndexProvider,
-    SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo, SchedulerStoreKeyProvider,
-    SchedulerSubscription, SchedulerSubscriptionManager, StoreDriver, StoreKey, UploadSizeInfo,
+    BoolValue, ItemCallback, PinDelegation, SchedulerCurrentVersionProvider,
+    SchedulerIndexProvider, SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo,
+    SchedulerStoreKeyProvider, SchedulerSubscription, SchedulerSubscriptionManager,
+    StableDigestDelegation, StoreDriver, StoreKey, UploadSizeInfo,
 };
 use nativelink_util::task::JoinHandleDropGuard;
 use parking_lot::{Mutex, RwLock};
@@ -2034,6 +2035,19 @@ where
     ) -> Result<(), Error> {
         // As redis doesn't drop stuff, we can just ignore this
         Ok(())
+    }
+
+    /// RedisStore is a leaf — Redis is the persistent backing for small
+    /// CAS blobs. The BIS pipeline is owned by the wrapping `FastSlowStore`,
+    /// not this leaf. Treat as Leaf with empty drains.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// RedisStore is a leaf — pinning a key in Redis is not part of the
+    /// store contract here (Redis has its own TTL semantics). No-op.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

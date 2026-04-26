@@ -14,7 +14,7 @@
 
 use core::cmp;
 use core::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bincode::serde::{decode_from_slice, encode_to_vec};
@@ -27,9 +27,11 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::fastcdc::FastCDC;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 use tokio_util::codec::FramedRead;
 use tokio_util::io::StreamReader;
 use tracing::warn;
@@ -64,6 +66,10 @@ pub struct DedupStore {
     #[metric(help = "Maximum number of concurrent fetches per get")]
     max_concurrent_fetch_per_get: usize,
     bincode_config: LegacyBincodeConfig,
+    /// Lazy-initialized merged Notify backing the `Many` BIS chain.
+    /// Populated on first call to `stable_notify()` by the trait default
+    /// body. Not metric'd — `OnceLock<Arc<Notify>>` is not derive-able.
+    merged_stable_notify: OnceLock<Arc<Notify>>,
 }
 
 impl core::fmt::Debug for DedupStore {
@@ -117,6 +123,7 @@ impl DedupStore {
             ),
             max_concurrent_fetch_per_get,
             bincode_config: bincode::config::legacy(),
+            merged_stable_notify: OnceLock::new(),
         }))
     }
 
@@ -394,6 +401,31 @@ impl StoreDriver for DedupStore {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// DedupStore is a multi-inner wrapper. Both `index_store` and
+    /// `content_store` may participate in the BIS chain (e.g. when each is
+    /// a FastSlowStore). Trait default concatenates drains and lazily
+    /// builds a merged Notify woken by either inner.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Many {
+            children: vec![
+                self.index_store.as_store_driver(),
+                self.content_store.as_store_driver(),
+            ],
+            merged_notify: &self.merged_stable_notify,
+        }
+    }
+
+    /// Pin requests fan out to BOTH inner stores. (Index entries live in
+    /// index_store; content chunks live in content_store. A pin on a
+    /// dedup-original digest typically resolves to one or the other; the
+    /// `Many` OR-merge surfaces success.)
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Many(vec![
+            self.index_store.as_store_driver(),
+            self.content_store.as_store_driver(),
+        ])
     }
 }
 

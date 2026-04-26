@@ -29,7 +29,8 @@ use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthS
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    ItemCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
+    UploadSizeInfo,
 };
 use rand::Rng;
 use tokio::time::sleep;
@@ -472,6 +473,17 @@ where
         // As we're backed by GCS, this store doesn't actually drop stuff
         // so we can actually just ignore this
         Ok(())
+    }
+
+    /// GcsStore is a leaf — GCS owns object lifecycle. The BIS pipeline is
+    /// owned by a wrapping FastSlowStore if any. Treat as Leaf.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// GcsStore is a leaf — pin requests do not propagate to GCS. No-op.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

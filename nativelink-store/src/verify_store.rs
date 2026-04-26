@@ -18,7 +18,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use opentelemetry::context::Context;
-use tokio::sync::Notify;
 use tracing::error;
 
 use nativelink_config::stores::VerifySpec;
@@ -27,12 +26,13 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
-use nativelink_util::common::{DigestInfo, PackedHash};
+use nativelink_util::common::PackedHash;
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    UploadSizeInfo,
 };
 
 #[derive(Debug, MetricsComponent)]
@@ -425,20 +425,16 @@ impl StoreDriver for VerifyStore {
         self.inner_store.register_item_callback(callback)
     }
 
-    fn drain_stable_digests(&self) -> Vec<DigestInfo> {
-        self.inner_store.drain_stable_digests()
+    /// VerifyStore is a single-inner wrapper. `Inner` makes the trait
+    /// defaults forward `drain_stable_digests` / `stable_notify` /
+    /// `pin_digests` / `pin_digests_with_results` / `drain_failed_digests`
+    /// unchanged to `inner_store`. No per-method override needed.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner_store.as_store_driver())
     }
 
-    fn stable_notify(&self) -> Arc<Notify> {
-        self.inner_store.stable_notify()
-    }
-
-    fn pin_digests(&self, digests: &[DigestInfo]) {
-        self.inner_store.pin_digests(digests);
-    }
-
-    fn drain_failed_digests(&self) -> Vec<DigestInfo> {
-        self.inner_store.drain_failed_digests()
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner_store.as_store_driver())
     }
 }
 

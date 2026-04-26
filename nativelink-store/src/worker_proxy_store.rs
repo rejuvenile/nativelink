@@ -23,7 +23,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
@@ -39,8 +39,9 @@ use nativelink_util::buf_channel::{
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
-    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, REDIRECT_PREFIX, Store, StoreDriver,
-    StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, PinDelegation, REDIRECT_PREFIX,
+    StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
+    UploadSizeInfo,
 };
 
 use crate::grpc_store::GrpcStore;
@@ -2333,20 +2334,15 @@ impl StoreDriver for WorkerProxyStore {
         self.inner.register_item_callback(callback)
     }
 
-    fn drain_stable_digests(&self) -> Vec<DigestInfo> {
-        self.inner.drain_stable_digests()
+    /// WorkerProxyStore is a single-inner wrapper. The proxy adds locality
+    /// + mirror routing on top of the inner store but does not own the BIS
+    /// or pin chain — both forward unchanged via the trait defaults.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner.as_store_driver())
     }
 
-    fn stable_notify(&self) -> Arc<Notify> {
-        self.inner.stable_notify()
-    }
-
-    fn pin_digests(&self, digests: &[DigestInfo]) {
-        self.inner.pin_digests(digests);
-    }
-
-    fn drain_failed_digests(&self) -> Vec<DigestInfo> {
-        self.inner.drain_failed_digests()
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner.as_store_driver())
     }
 }
 

@@ -33,7 +33,8 @@ use nativelink_util::health_utils::{
     HealthRegistryBuilder, HealthStatusIndicator, default_health_status_indicator,
 };
 use nativelink_util::store_trait::{
-    ItemCallback, StoreDriver, StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreKeyBorrow,
+    StoreOptimizations, UploadSizeInfo,
 };
 
 use crate::callback_utils::ItemCallbackHolder;
@@ -465,6 +466,21 @@ impl StoreDriver for MemoryStore {
         self.evicting_map
             .add_item_callback(ItemCallbackHolder::new(callback));
         Ok(())
+    }
+
+    /// MemoryStore is a leaf — it does not produce stable-storage digests
+    /// (only persistent stores like FilesystemStore do). The default
+    /// `drain_stable_digests` returns empty for `Leaf`.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// MemoryStore is a leaf — pinning here is a no-op. Pin protection is
+    /// useful only against eviction (the FilesystemStore case); a memory
+    /// store either has the blob or has lost it via cap eviction, in which
+    /// case the upper layer should re-fetch.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

@@ -47,7 +47,8 @@ use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthS
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    ItemCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
+    UploadSizeInfo,
 };
 use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
@@ -678,6 +679,18 @@ where
         next.push(callback);
         self.item_callbacks.store(Arc::new(next));
         Ok(())
+    }
+
+    /// S3Store is a leaf — S3 owns its own object lifecycle (versioning,
+    /// glacier transitions, etc.). The BIS pipeline is owned by a wrapping
+    /// FastSlowStore if any. Treat as Leaf with empty drains.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// S3Store is a leaf — pin requests do not propagate to S3. No-op.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

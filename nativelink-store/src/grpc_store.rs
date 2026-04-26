@@ -50,8 +50,8 @@ use nativelink_util::proto_stream_utils::{
 use nativelink_util::resource_info::ResourceInfo;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, StoreDriver, StoreKey, StoreOptimizations,
-    UploadSizeInfo,
+    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, PinDelegation, StableDigestDelegation,
+    StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
 };
 use nativelink_util::{default_health_status_indicator, tls_utils};
 use opentelemetry::context::Context;
@@ -2412,6 +2412,19 @@ impl StoreDriver for GrpcStore {
             Code::Internal,
             "gRPC stores are incompatible with removal callbacks".to_string(),
         ))
+    }
+
+    /// GrpcStore is a leaf — the remote endpoint owns its own BIS pipeline
+    /// (if any). This client side does not produce stable digests. Treat
+    /// as a leaf with empty drains.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// GrpcStore is a leaf — pin requests do not propagate over the wire.
+    /// The remote endpoint manages its own eviction. Local pin is a no-op.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

@@ -32,9 +32,10 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::spawn;
 use nativelink_util::store_trait::{
-    BoolValue, ItemCallback, SchedulerCurrentVersionProvider, SchedulerIndexProvider,
-    SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo, SchedulerStoreKeyProvider,
-    SchedulerSubscription, SchedulerSubscriptionManager, StoreDriver, StoreKey, UploadSizeInfo,
+    BoolValue, ItemCallback, PinDelegation, SchedulerCurrentVersionProvider,
+    SchedulerIndexProvider, SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo,
+    SchedulerStoreKeyProvider, SchedulerSubscription, SchedulerSubscriptionManager,
+    StableDigestDelegation, StoreDriver, StoreKey, UploadSizeInfo,
 };
 use nativelink_util::task::JoinHandleDropGuard;
 use parking_lot::{Mutex, RwLock};
@@ -583,6 +584,16 @@ impl StoreDriver for ExperimentalMongoStore {
     ) -> Result<(), Error> {
         // drop because we don't remove anything from Mongo
         Ok(())
+    }
+
+    /// MongoStore is a leaf — Mongo owns its own document lifecycle. No
+    /// BIS or pin participation here.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

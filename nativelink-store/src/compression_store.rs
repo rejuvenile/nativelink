@@ -31,7 +31,8 @@ use nativelink_util::buf_channel::{
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::spawn;
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    UploadSizeInfo,
 };
 use serde::{Deserialize, Serialize};
 
@@ -659,6 +660,17 @@ impl StoreDriver for CompressionStore {
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
         self.inner_store.register_item_callback(callback)
+    }
+
+    /// CompressionStore is a single-inner wrapper. The compression layer
+    /// transforms data on the wire but does not own the BIS or pin chain
+    /// — both forward unchanged via the trait defaults.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner_store.as_store_driver())
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner_store.as_store_driver())
     }
 }
 

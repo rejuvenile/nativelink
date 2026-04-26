@@ -19,7 +19,6 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::Notify;
 use tracing::{debug, error, info, trace};
 
 use nativelink_config::stores::{EvictionPolicy, ExistenceCacheSpec};
@@ -45,7 +44,8 @@ use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    StoreOptimizations, UploadSizeInfo,
 };
 
 /// Returns `true` for error codes that indicate the inner store cannot
@@ -562,20 +562,15 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         self.inner_store.register_item_callback(callback)
     }
 
-    fn drain_stable_digests(&self) -> Vec<DigestInfo> {
-        self.inner_store.drain_stable_digests()
+    /// ExistenceCacheStore is a single-inner wrapper. The cache lives at
+    /// this layer but does NOT participate in the BIS / pin chain — both
+    /// flow through unchanged to `inner_store`. Trait defaults handle it.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner_store.as_store_driver())
     }
 
-    fn stable_notify(&self) -> Arc<Notify> {
-        self.inner_store.stable_notify()
-    }
-
-    fn pin_digests(&self, digests: &[DigestInfo]) {
-        self.inner_store.pin_digests(digests);
-    }
-
-    fn drain_failed_digests(&self) -> Vec<DigestInfo> {
-        self.inner_store.drain_failed_digests()
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner_store.as_store_driver())
     }
 }
 

@@ -47,7 +47,9 @@ use nativelink_util::buf_channel::{
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
-use nativelink_util::store_trait::{ItemCallback, StoreDriver, StoreKey, UploadSizeInfo};
+use nativelink_util::store_trait::{
+    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, UploadSizeInfo,
+};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustls::{ClientConfig, RootCertStore};
@@ -794,6 +796,17 @@ where
         next.push(callback);
         self.item_callbacks.store(Arc::new(next));
         Ok(())
+    }
+
+    /// OntapS3Store is a leaf — Ontap S3 owns object lifecycle. Treat as
+    /// Leaf with empty drains.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// OntapS3Store is a leaf — pinning does not propagate to remote S3.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

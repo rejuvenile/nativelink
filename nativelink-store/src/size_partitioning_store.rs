@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use core::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,9 +23,11 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    UploadSizeInfo,
 };
 use tokio::join;
+use tokio::sync::Notify;
 use tracing::warn;
 
 #[derive(Debug, MetricsComponent)]
@@ -36,6 +38,15 @@ pub struct SizePartitioningStore {
     lower_store: Store,
     #[metric(group = "upper_store")]
     upper_store: Store,
+    /// Lazy-initialized merged Notify for the `Many` BIS chain. Populated
+    /// on first call to `stable_notify()` by the trait's default body
+    /// (`StableDigestDelegation::Many` arm). Each entry spawns ONE
+    /// background task per child notify that forwards wakes here. Must be
+    /// owned by the wrapper so subscribers see the same Notify across
+    /// repeated calls (returning a fresh Notify per call would orphan
+    /// existing subscribers). Not metric'd — `OnceLock<Arc<Notify>>` does
+    /// not implement `MetricsComponent`.
+    merged_stable_notify: OnceLock<Arc<Notify>>,
 }
 
 impl SizePartitioningStore {
@@ -44,6 +55,7 @@ impl SizePartitioningStore {
             partition_size: spec.size,
             lower_store,
             upper_store,
+            merged_stable_notify: OnceLock::new(),
         })
     }
 
@@ -256,6 +268,39 @@ impl StoreDriver for SizePartitioningStore {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// SizePartitioningStore is a multi-inner wrapper. The trait's default
+    /// `drain_stable_digests` will concatenate drains from BOTH inners and
+    /// `stable_notify` will lazy-build a merged Notify woken when EITHER
+    /// inner's notify fires (using `merged_stable_notify` field).
+    ///
+    /// **This is the single load-bearing fix from the BIS broadcast wedge
+    /// audit (`.claude/reviews/why-bis-bug-not-caught/audit.md`).** Before
+    /// this declaration the trait silently inherited noop defaults and the
+    /// production `cas_STORE` chain dropped 458K+ digests/day for 31 days.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Many {
+            children: vec![
+                self.lower_store.as_store_driver(),
+                self.upper_store.as_store_driver(),
+            ],
+            merged_notify: &self.merged_stable_notify,
+        }
+    }
+
+    /// Pin requests fan out to both inner stores. (A digest above the
+    /// partition lives only in the upper store; below, only in the lower
+    /// — but pin_digests sends to both inner stores' `pin_digests` and
+    /// each inner self-routes per its own delegation. The "wrong" inner's
+    /// FilesystemStore reports `false` for absent digests via
+    /// `pin_digests_with_results`; the OR-merge in the trait default
+    /// surfaces the success.)
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Many(vec![
+            self.lower_store.as_store_driver(),
+            self.upper_store.as_store_driver(),
+        ])
     }
 }
 

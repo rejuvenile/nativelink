@@ -14,7 +14,7 @@
 
 use core::ops::BitXor;
 use core::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, TryStreamExt};
@@ -24,8 +24,10 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
-    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
+    UploadSizeInfo,
 };
+use tokio::sync::Notify;
 use tracing::warn;
 
 #[derive(Debug, MetricsComponent)]
@@ -45,6 +47,10 @@ pub struct ShardStore {
         help = "The weights and stores that are used to determine which store to use"
     )]
     weights_and_stores: Vec<StoreAndWeight>,
+    /// Lazy-initialized merged Notify backing the `Many` BIS chain across
+    /// shards. Populated on first `stable_notify()` call. Not metric'd —
+    /// `OnceLock<Arc<Notify>>` is not derive-able.
+    merged_stable_notify: OnceLock<Arc<Notify>>,
 }
 
 impl ShardStore {
@@ -85,6 +91,7 @@ impl ShardStore {
                 .zip(stores)
                 .map(|(weight, store)| StoreAndWeight { weight, store })
                 .collect(),
+            merged_stable_notify: OnceLock::new(),
         }))
     }
 
@@ -266,6 +273,34 @@ impl StoreDriver for ShardStore {
             }
         }
         Ok(())
+    }
+
+    /// ShardStore is a multi-inner wrapper. Every shard may participate in
+    /// the BIS chain (e.g. when shards are FastSlowStore), so concatenate
+    /// drains and merge notifies. The audit (#why-bis-bug-not-caught)
+    /// flagged ShardStore as the next time-bomb — this declaration closes
+    /// that gap.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Many {
+            children: self
+                .weights_and_stores
+                .iter()
+                .map(|sw| sw.store.as_store_driver())
+                .collect(),
+            merged_notify: &self.merged_stable_notify,
+        }
+    }
+
+    /// Pin requests fan out to every shard. (A digest lives on exactly one
+    /// shard but pin_digests has no key affinity at this layer; the OR-
+    /// merge in the trait default surfaces success from the right shard.)
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Many(
+            self.weights_and_stores
+                .iter()
+                .map(|sw| sw.store.as_store_driver())
+                .collect(),
+        )
     }
 }
 

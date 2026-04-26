@@ -46,7 +46,8 @@ use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthS
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    ItemCallback, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
+    UploadSizeInfo,
 };
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -917,6 +918,16 @@ where
         // Azure Blob Storage manages object lifecycle externally,
         // so we can safely ignore remove callbacks.
         Ok(())
+    }
+
+    /// AzureBlobStore is a leaf — Azure owns object lifecycle. No BIS or
+    /// pin participation here.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 

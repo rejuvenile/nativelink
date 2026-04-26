@@ -38,7 +38,8 @@ use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
-    ItemCallback, StoreDriver, StoreKey, StoreKeyBorrow, StoreOptimizations, UploadSizeInfo,
+    ItemCallback, PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreKeyBorrow,
+    StoreOptimizations, UploadSizeInfo,
 };
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReadDirStream;
@@ -1761,6 +1762,21 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
                 self.evicting_map.pin_key(StoreKeyBorrow::from(key))
             })
             .collect()
+    }
+
+    /// FilesystemStore is a leaf — its `drain_stable_digests` is wired
+    /// from `FastSlowStore::populate_fast_store` via `register_pin_expire_listener`.
+    /// FilesystemStore itself does not expose a stable-digest stream;
+    /// FastSlowStore owns that contract.
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    /// FilesystemStore is a leaf and supports pinning natively via
+    /// `MokaEvictingMap::pin_keys()`. The overrides above route directly
+    /// to the evicting map.
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
     }
 }
 
