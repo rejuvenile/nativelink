@@ -3140,10 +3140,26 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
 }
 
 /// Falsification: builds a guard, returns Err WITHOUT committing. With the
-/// Drop fallback the wrapping VerifyStore unblocks within milliseconds;
-/// remove `self.writer.send_error(synthesized);` from `WriteHalfGuard::drop`
-/// and the timeout below fires — the only test that genuinely guards the
-/// Drop fallback (per-site tests cover the explicit `guard.fail(...)` calls).
+/// Drop fallback the wrapping VerifyStore unblocks within milliseconds AND
+/// the merged error carries the synthesized "WriteHalfGuard fired Drop
+/// fallback" message from the check-side, proving the Drop body was the
+/// load-bearing terminator (not the generic "Sender dropped before sending
+/// EOF" fallback that mpsc-drop alone would synthesize at
+/// `buf_channel.rs:567`).
+///
+/// Mutation evidence (run manually to validate the test guards the
+/// behavior — DO NOT commit the mutation):
+///
+///   1. Comment out `self.writer.send_error(synthesized);` at the end of
+///      `WriteHalfGuard::Drop` in `nativelink-util/src/buf_channel.rs`.
+///   2. `cargo test --features failpoints -p nativelink-store --test \
+///      fast_slow_store_test write_half_guard_drop_fallback_prevents_uncommitted_deadlock`.
+///   3. The test MUST fail at the `messages.iter().any(... "WriteHalfGuard \
+///      fired Drop fallback" ...)` assertion below — the receiver instead
+///      sees the generic "Sender dropped before sending EOF" Internal that
+///      mpsc-drop synthesizes at `buf_channel.rs:567`. Without the Drop
+///      body, the synthesized identifier the operator greps for is gone.
+///   4. Restore the line and re-run to confirm the test passes again.
 #[nativelink_test]
 async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
 -> Result<(), Error> {
@@ -3229,11 +3245,22 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
          writer.send_error(synthesized) when committed == false.",
     );
     let err = timed.err().expect("ForgetfulStore deliberately fails");
-    // Either NotFound (function's err propagated through get-side) or
-    // Internal (Drop fallback propagated through check-side) is acceptable.
+    // The test would be a tautology if it accepted any Code (NotFound from
+    // ForgetfulStore's structured Err vs Internal from a generic Sender-drop
+    // fallback both qualify), so we MUST assert on the specific synthesized
+    // message that ONLY `WriteHalfGuard::Drop` produces. Without this
+    // assertion, mutating away the Drop body would NOT fail the test —
+    // mpsc-drop alone synthesizes "Sender dropped before sending EOF"
+    // Internal at `buf_channel.rs:567`, which has Code::Internal AND would
+    // satisfy a loose `assert!(code == Internal || code == NotFound)`.
     assert!(
-        err.code == Code::Internal || err.code == Code::NotFound,
-        "expected Internal or NotFound, got: {err:?}",
+        err.messages
+            .iter()
+            .any(|m| m.contains("WriteHalfGuard fired Drop fallback")),
+        "merged Err MUST carry the synthesized Drop-fallback identifier so \
+         operators can grep for the missing-commit site; otherwise the test \
+         is a tautology that passes even when the Drop body is mutated away. \
+         Got: {err:?}",
     );
 
     Ok(())
