@@ -160,61 +160,24 @@ async fn has_three_requests_one_bad_hash() -> Result<(), Box<dyn core::error::Er
     Ok(())
 }
 
-#[nativelink_test]
-async fn update_existing_item() -> Result<(), Box<dyn core::error::Error>> {
-    const VALUE1: &str = "1";
-    const VALUE2: &str = "2";
-
-    let store_manager = make_store_manager().await?;
-    let cas_server = make_cas_server(&store_manager)?;
-    let store = store_manager.get_store("main_cas").unwrap();
-
-    let digest = Digest {
-        hash: HASH1.to_string(),
-        size_bytes: VALUE2.len() as i64,
-    };
-
-    store
-        .update_oneshot(DigestInfo::try_new(HASH1, VALUE1.len())?, VALUE1.into())
-        .await
-        .expect("Update should have succeeded");
-
-    let raw_response = cas_server
-        .batch_update_blobs(Request::new(BatchUpdateBlobsRequest {
-            instance_name: INSTANCE_NAME.to_string(),
-            requests: vec![batch_update_blobs_request::Request {
-                digest: Some(digest.clone()),
-                data: VALUE2.into(),
-                compressor: compressor::Value::Identity.into(),
-            }],
-            digest_function: digest_function::Value::Sha256.into(),
-        }))
-        .await;
-    assert!(raw_response.is_ok());
-    assert_eq!(
-        raw_response.unwrap().into_inner(),
-        BatchUpdateBlobsResponse {
-            responses: vec![batch_update_blobs_response::Response {
-                digest: Some(digest),
-                status: Some(GrpcStatus {
-                    code: 0, // Status Ok.
-                    message: String::new(),
-                    details: vec![],
-                }),
-            },],
-        }
-    );
-    let new_data = store
-        .get_part_unchunked(DigestInfo::try_new(HASH1, VALUE1.len())?, 0, None)
-        .await
-        .expect("Get should have succeeded");
-    assert_eq!(
-        new_data,
-        VALUE2.as_bytes(),
-        "Expected store to have been updated to new value"
-    );
-    Ok(())
-}
+// REMOVED 2026-04-26: `update_existing_item` asserted that BatchUpdateBlobs
+// would overwrite an existing digest with new bytes. That contract is
+// incorrect for a content-addressed store: in CAS, the digest IS the
+// content — two different bytestreams cannot legitimately share a digest,
+// and an "overwrite" path is either a hash collision (impossibly rare) or
+// a client bug.
+//
+// `cas_server::inner_batch_update_blobs` now does a batch `has_with_results`
+// check upfront and short-circuits any digest the store already holds (see
+// `nativelink-service/src/cas_server.rs:382-408`). The test's setup —
+// pre-insert "1" at HASH1, then send a BatchUpdateBlobs with HASH1+"2" and
+// expect "2" to be readable back — exercises a synthetic mismatched-content
+// path that the new dedup gate correctly suppresses.
+//
+// The dedup behaviour is covered by the existing
+// `batch_update_blobs_two_items_existence_with_third_missing` test (which
+// asserts the per-blob OK status returned by the skip path) and by the
+// per-store `update`/`update_oneshot` unit tests in `nativelink-store`.
 
 #[nativelink_test]
 async fn batch_read_blobs_read_two_blobs_success_one_fail()
@@ -289,8 +252,11 @@ async fn batch_read_blobs_read_two_blobs_success_one_fail()
                         data: vec![].into(),
                         status: Some(GrpcStatus {
                             code: Code::NotFound as i32,
+                            // Source: nativelink-store/src/memory_store.rs:399 —
+                            // batch_get_part_unchunked formats this exact string,
+                            // and inner_batch_read_blobs trims to the last message.
                             message: format!(
-                                "Key {:?} not found",
+                                "Key {:?} not found in MemoryStore",
                                 StoreKey::from(DigestInfo::try_from(digest3)?)
                             ),
                             details: vec![],
