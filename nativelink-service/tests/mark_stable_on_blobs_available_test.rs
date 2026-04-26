@@ -388,6 +388,53 @@ async fn send_blobs_available(
         .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))
 }
 
+/// Multi-target sibling of [`await_stable_drain_contains`]. Drains the
+/// cas_store's `stable_digests` until EVERY digest in `targets` has been
+/// observed, accumulating across destructive drains. Necessary when more
+/// than one target may flush in a single drain — calling
+/// `await_stable_drain_contains` per target loses the other targets to
+/// the per-call local accumulator.
+///
+/// Panics on timeout with a specific message naming the unsatisfied
+/// target(s) — same deadlock-detector role as
+/// [`await_stable_drain_contains`].
+async fn await_stable_drain_contains_all(cas_store: &Store, targets: &[DigestInfo]) {
+    let notify = cas_store.stable_notify();
+    let deadline = std::time::Instant::now() + BIS_TIMEOUT;
+    let mut accumulated: Vec<DigestInfo> = Vec::new();
+
+    loop {
+        let mut drained = cas_store.drain_stable_digests();
+        accumulated.append(&mut drained);
+        if targets.iter().all(|t| accumulated.contains(t)) {
+            return;
+        }
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            let missing: Vec<_> = targets
+                .iter()
+                .filter(|t| !accumulated.contains(t))
+                .collect();
+            panic!(
+                "BIS must fire for ALL digests the server has when worker reports \
+                 them in a single BlobsAvailable. Within {BIS_TIMEOUT:?} the \
+                 cas_store's drain_stable_digests never returned: {missing:?}. \
+                 Drained so far: {accumulated:?}. The BlobsAvailable handler \
+                 must call cas.has_with_results to find the present subset and \
+                 cas.mark_stable(&present) for ALL of them; a regression that \
+                 truncates the present subset (or gates mark_stable around the \
+                 call site instead of per digest) would surface here."
+            );
+        }
+        let _ = tokio::time::timeout(
+            remaining.min(Duration::from_millis(50)),
+            notify.notified(),
+        )
+        .await;
+    }
+}
+
 /// Drain the cas_store's `stable_digests` until `target` appears, polling
 /// via `stable_notify` (the production wake-up signal) bounded by
 /// `BIS_TIMEOUT`. Panic with a specific contract message on timeout —
@@ -581,6 +628,107 @@ async fn mark_stable_fires_for_back_to_back_blobs_available_within_cooldown_test
     )
     .await?;
     await_stable_drain_contains(&test_context.cas_store, target_b).await;
+
+    Ok(())
+}
+
+/// Sub-call-granularity sibling for testing-czar MAJOR-2 (#140 follow-up):
+/// the existing back-to-back test sends ONE digest per BlobsAvailable.
+/// That payload shape only ever drives ONE `mark_stable` call per
+/// BlobsAvailable, so a regression that gates `mark_stable` around the
+/// CALL SITE (not the per-digest decision) — e.g. a regression that
+/// re-engages the BACKFILL_COOLDOWN gate around the entire
+/// `mark_stable` call BEFORE checking which digests are present —
+/// would only suppress mark_stable on the second BlobsAvailable. With
+/// single-digest payloads, you cannot distinguish "mark_stable was
+/// truncated" from "mark_stable was suppressed" — only "mark_stable
+/// did/didn't fire at all".
+///
+/// This sibling exercises the multi-digest-per-tick path:
+///   1. First BlobsAvailable carries `[a, b]` together (one tick, two
+///      present digests). Both must end up in `stable_digests`.
+///   2. Second BlobsAvailable carries `[c]` immediately after (well
+///      inside `BACKFILL_COOLDOWN_SECS=5`). `c` must end up in
+///      `stable_digests` despite being inside the cooldown window.
+///
+/// A regression that wraps the `mark_stable` call in the cooldown gate
+/// (rather than letting it run alongside the upload-protocol throttle)
+/// fails specifically on `c`: the test panic message names `c` so the
+/// regression's site is unambiguous (CLAUDE.md "Test in production
+/// composition, not in isolation" — assertion message must be specific).
+#[nativelink_test]
+async fn mark_stable_fires_for_multi_digest_then_within_cooldown_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    const CAS_ENDPOINT: &str = "grpc://192.168.55.7:50084";
+
+    let test_context = setup_context(CAS_ENDPOINT).await?;
+
+    // Pre-populate three distinct digests in cas_store. Use distinct hash
+    // bytes so panics name the offender.
+    let data_a = Bytes::from_static(b"multi-digest within-cooldown blob a");
+    let target_a = DigestInfo::new([21u8; 32], data_a.len() as u64);
+    test_context
+        .cas_store
+        .update_oneshot(target_a, data_a.clone())
+        .await
+        .err_tip(|| "Failed to pre-populate target_a")?;
+    let data_b = Bytes::from_static(b"multi-digest within-cooldown blob b");
+    let target_b = DigestInfo::new([22u8; 32], data_b.len() as u64);
+    test_context
+        .cas_store
+        .update_oneshot(target_b, data_b.clone())
+        .await
+        .err_tip(|| "Failed to pre-populate target_b")?;
+    let data_c = Bytes::from_static(b"multi-digest within-cooldown blob c");
+    let target_c = DigestInfo::new([23u8; 32], data_c.len() as u64);
+    test_context
+        .cas_store
+        .update_oneshot(target_c, data_c.clone())
+        .await
+        .err_tip(|| "Failed to pre-populate target_c")?;
+    // Drain the slow-write feed so the assertions below are unambiguous.
+    // `await_stable_drain_contains` is destructive across digests (a single
+    // drain that returns multiple digests retains only the matched one in
+    // the local accumulator), so wait for ALL three to flush via a single
+    // multi-target loop and then drop.
+    await_stable_drain_contains_all(
+        &test_context.cas_store,
+        &[target_a, target_b, target_c],
+    )
+    .await;
+    drop(test_context.cas_store.drain_stable_digests());
+
+    // First BlobsAvailable carries TWO present digests in one tick.
+    // The handler must mark BOTH stable in a single call. This trips the
+    // cooldown gate (last_backfill_epoch_secs is set). Use the
+    // multi-target waiter so a single drain returning [a, b] doesn't
+    // lose `b` to the local accumulator.
+    send_blobs_available(
+        &test_context.worker_stream,
+        CAS_ENDPOINT,
+        vec![target_a, target_b],
+    )
+    .await?;
+    await_stable_drain_contains_all(
+        &test_context.cas_store,
+        &[target_a, target_b],
+    )
+    .await;
+    drop(test_context.cas_store.drain_stable_digests());
+
+    // Second BlobsAvailable carries `c` ALONE, sent IMMEDIATELY after
+    // the first — well inside BACKFILL_COOLDOWN_SECS=5. mark_stable
+    // must STILL fire for `c`. A regression that re-engages the
+    // cooldown gate around the mark_stable call (not just around the
+    // upload-protocol throttle) would suppress this and the test panics
+    // with the specific deadlock-detector message naming target_c.
+    send_blobs_available(
+        &test_context.worker_stream,
+        CAS_ENDPOINT,
+        vec![target_c],
+    )
+    .await?;
+    await_stable_drain_contains(&test_context.cas_store, target_c).await;
 
     Ok(())
 }
