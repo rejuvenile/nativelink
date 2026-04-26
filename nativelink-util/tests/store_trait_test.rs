@@ -1,5 +1,5 @@
 use core::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
@@ -9,9 +9,10 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::default_health_status_indicator;
 use nativelink_util::health_utils::HealthStatusIndicator;
 use nativelink_util::store_trait::{
-    ItemCallback, PinDelegation, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
-    UploadSizeInfo,
+    ItemCallback, MergedNotifyState, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
 };
+use tokio::sync::Notify;
 use tonic::async_trait;
 
 #[derive(Debug, MetricsComponent)]
@@ -193,4 +194,255 @@ async fn pin_digests_with_results_non_pinning_leaf_reports_false() {
          eviction races (CRIT-1 / F3). Fix in nativelink-util/src/store_trait.rs \
          pin_digests_with_results trait default."
     );
+}
+
+/// A leaf-position fake store that returns its own per-instance
+/// `Arc<Notify>` (not the shared static) so the test can probe
+/// `Weak::strong_count` to detect whether the spawned forwarder
+/// task is still holding a reference.
+#[derive(Debug, MetricsComponent)]
+struct CustomNotifyLeafStore {
+    notify: Arc<Notify>,
+}
+
+impl CustomNotifyLeafStore {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::todo)]
+impl StoreDriver for CustomNotifyLeafStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _keys: &[StoreKey<'_>],
+        _results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        todo!();
+    }
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        todo!();
+    }
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        todo!();
+    }
+    fn inner_store(&self, _digest: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        todo!();
+    }
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+    fn stable_notify(&self) -> Arc<Notify> {
+        self.notify.clone()
+    }
+}
+
+default_health_status_indicator!(CustomNotifyLeafStore);
+
+/// A `Many`-position fake wrapper that owns two leaf children and a
+/// `OnceLock<MergedNotifyState>`. Mirrors the production shape of
+/// SizePartitioningStore / ShardStore / DedupStore minus the size
+/// routing / sharding logic.
+#[derive(Debug, MetricsComponent)]
+struct ManyTestWrapper {
+    lower: Arc<CustomNotifyLeafStore>,
+    upper: Arc<CustomNotifyLeafStore>,
+    merged_state: OnceLock<MergedNotifyState>,
+}
+
+#[async_trait]
+#[allow(clippy::todo)]
+impl StoreDriver for ManyTestWrapper {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _keys: &[StoreKey<'_>],
+        _results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        todo!();
+    }
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        todo!();
+    }
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        todo!();
+    }
+    fn inner_store(&self, _digest: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        todo!();
+    }
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        let lower: &dyn StoreDriver = self.lower.as_ref();
+        let upper: &dyn StoreDriver = self.upper.as_ref();
+        StableDigestDelegation::Many {
+            children: vec![lower, upper],
+            merged_state: &self.merged_state,
+        }
+    }
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        let lower: &dyn StoreDriver = self.lower.as_ref();
+        let upper: &dyn StoreDriver = self.upper.as_ref();
+        PinDelegation::Many(vec![lower, upper])
+    }
+}
+
+default_health_status_indicator!(ManyTestWrapper);
+
+/// Regression test for F2 (forwarder task leak) closure via `AbortOnDrop`.
+///
+/// **Bug class (IMPORTANT-2 from c-plus-d/testing-czar.md).** The whole
+/// reason commit `669dabb9` exists is `MergedNotifyState`'s `Vec<AbortOnDrop>`
+/// — when the wrapper drops, the OnceLock drops the state, each
+/// `AbortOnDrop::drop` calls `JoinHandle::abort`, the forwarder task ends,
+/// and its `Arc<Notify>` clones are released.
+///
+/// Without this test, an accidental change to `AbortOnDrop::drop`, the
+/// `OnceLock` field placement, or `MergedNotifyState`'s `aborters` field
+/// (e.g. someone removing `#[allow(dead_code)]` and "cleaning up" the
+/// "unused" field) re-introduces F2 with zero test pressure.
+///
+/// Test shape:
+///   1. Build a `Many` wrapper over two leaf stores, each owning its own
+///      `Arc<Notify>` (not the shared static, so we can probe it).
+///   2. Capture `Weak<Notify>` on each child's notify BEFORE the wrapper
+///      acquires references via `stable_notify()`.
+///   3. Call `wrapper.stable_notify()` once — this spawns N forwarder
+///      tasks, each holding an `Arc<Notify>` clone of one child.
+///   4. After yield, observe `Weak::strong_count` increased to baseline+1.
+///   5. Drop the wrapper. The OnceLock drops MergedNotifyState, each
+///      AbortOnDrop fires JoinHandle::abort, forwarders unwind and release
+///      their child-Notify clones.
+///   6. Yield + poll `Weak::strong_count` under timeout, assert it returns
+///      to baseline (only the test's own Arc remaining).
+#[nativelink_test]
+async fn merged_notify_aborters_release_child_notify_arcs_on_wrapper_drop() {
+    let lower = Arc::new(CustomNotifyLeafStore::new());
+    let upper = Arc::new(CustomNotifyLeafStore::new());
+
+    // Capture weak references BEFORE the wrapper acquires Arcs.
+    let lower_weak: Weak<Notify> = Arc::downgrade(&lower.notify);
+    let upper_weak: Weak<Notify> = Arc::downgrade(&upper.notify);
+
+    // Baseline strong count: each leaf owns its notify (1) + this test's
+    // local clone via the leaf field (the child `lower`/`upper` Arcs
+    // still hold the only Arc<Notify>).
+    let baseline_lower = Arc::strong_count(&lower.notify);
+    let baseline_upper = Arc::strong_count(&upper.notify);
+    assert_eq!(baseline_lower, 1, "baseline assumed: only leaf owns its notify");
+    assert_eq!(baseline_upper, 1, "baseline assumed: only leaf owns its notify");
+
+    let wrapper = Arc::new(ManyTestWrapper {
+        lower: lower.clone(),
+        upper: upper.clone(),
+        merged_state: OnceLock::new(),
+    });
+
+    // Trigger the lazy init: spawns N forwarder tasks, each owning an
+    // Arc<Notify> clone of one child.
+    let merged = wrapper.stable_notify();
+    // Hold the merged Notify alive locally to prove that releasing the
+    // forwarders' Arcs is what changes the strong count, not just dropping
+    // the merged side.
+    let _merged = merged;
+
+    // Yield so the spawned tasks can run their first `child_notify.notified()`
+    // registration. (The Arc clone happens at spawn time, not at first
+    // notified, so this isn't strictly needed for the strong-count check —
+    // but a yield avoids any test-runner ordering surprises.)
+    tokio::task::yield_now().await;
+
+    let after_spawn_lower = Arc::strong_count(&lower.notify);
+    let after_spawn_upper = Arc::strong_count(&upper.notify);
+    assert!(
+        after_spawn_lower > baseline_lower,
+        "forwarder did not acquire an Arc clone of the lower child notify (strong_count {after_spawn_lower} <= baseline {baseline_lower}). \
+         If MergedNotifyState's spawn loop is broken, this assertion misfires."
+    );
+    assert!(
+        after_spawn_upper > baseline_upper,
+        "forwarder did not acquire an Arc clone of the upper child notify (strong_count {after_spawn_upper} <= baseline {baseline_upper})."
+    );
+
+    // Drop wrapper -> OnceLock drop -> MergedNotifyState drop -> AbortOnDrop
+    // drop -> JoinHandle::abort -> task unwind -> Arc<Notify> release.
+    drop(wrapper);
+
+    // Poll under a timeout: tokio's task abort + unwind isn't synchronous,
+    // so we need to yield repeatedly until the strong count drops back to
+    // baseline. The 1-second cap is the deadlock detector — without it a
+    // regression would hang the test runner instead of failing fast.
+    let waited = tokio::time::timeout(core::time::Duration::from_secs(1), async {
+        loop {
+            tokio::task::yield_now().await;
+            let lower_now = lower_weak.strong_count();
+            let upper_now = upper_weak.strong_count();
+            if lower_now == baseline_lower && upper_now == baseline_upper {
+                return (lower_now, upper_now);
+            }
+        }
+    })
+    .await;
+
+    let (final_lower, final_upper) = waited.expect(
+        "F2 regression: forwarder tasks did not release their Arc<Notify> clones \
+         within 1s of wrapper drop. AbortOnDrop did not abort the spawned \
+         forwarders, OR MergedNotifyState's aborters field was dropped without \
+         firing JoinHandle::abort. Verify nativelink-util/src/store_trait.rs \
+         AbortOnDrop::drop and MergedNotifyState's #[allow(dead_code)] \
+         aborters field. CLAUDE.md note: this is the entire reason commit \
+         669dabb9 exists.",
+    );
+
+    assert_eq!(final_lower, baseline_lower);
+    assert_eq!(final_upper, baseline_upper);
 }
