@@ -143,8 +143,8 @@ async fn has_falls_back_to_locality_map_when_inner_missing() -> Result<(), Error
 
     // has() consults the locality_map after the inner store misses and
     // reports `Some(digest.size_bytes())` if any worker holds the blob.
-    // This keeps Bazel's FindMissingBlobs coherent with the bytestream
-    // sync-confirm fast path (the blob lives only on the worker).
+    // This is what allows Bazel's FindMissingBlobs to recognize that a
+    // blob "lives only on the worker" and skip re-uploading.
     let size = proxy.has(digest).await?;
     assert_eq!(
         size,
@@ -178,9 +178,9 @@ async fn has_with_results_falls_back_to_locality_map_when_inner_missing()
 
     // Register d2 and d3 on workers — has_with_results consults the
     // locality_map for digests still missing after the inner check and
-    // reports them as `Some(digest.size_bytes())`. This keeps Bazel's
-    // FindMissingBlobs coherent with the worker-side bytestream
-    // sync-confirm fast path.
+    // reports them as `Some(digest.size_bytes())`. This is how Bazel's
+    // FindMissingBlobs sees a blob that lives only on a worker and
+    // skips re-uploading it.
     {
         let mut map = locality_map.write();
         map.register_blobs("worker-a:50081", &[d2]);

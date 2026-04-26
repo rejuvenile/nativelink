@@ -450,8 +450,9 @@ impl WorkerProxyStore {
     }
 
     /// Disable the locality-aware fast paths. Operator kill-switch — flips
-    /// `has_with_results` back to inner-store-only and disables the
-    /// bytestream_write sync-confirm fast path.
+    /// `has_with_results` and `has` back to inner-store-only so Bazel's
+    /// FindMissingBlobs / bytestream short-circuit no longer trust the
+    /// locality table.
     pub fn disable_locality_in_has(&self) {
         self.consult_locality_in_has.store(false, Ordering::Relaxed);
     }
@@ -2029,23 +2030,23 @@ impl StoreDriver for WorkerProxyStore {
 
         // For digests still missing from the server CAS, consult the
         // locality_map and report `Some` if any worker reports holding
-        // the blob. This is what makes the bytestream sync-confirm
-        // optimization coherent end-to-end: that path returns success
-        // to Bazel without storing on the server (the blob is only on
-        // the worker), and Bazel's next FindMissingBlobs would otherwise
-        // see "missing" and re-upload, defeating the optimization.
+        // the blob. This is what makes the worker-side fast path
+        // coherent end-to-end: the bytestream upload path short-circuits
+        // when `has` returns Some without storing on the server (the
+        // blob is only on the worker), and Bazel's next FindMissingBlobs
+        // would otherwise see "missing" and re-upload, defeating the
+        // optimization.
         //
-        // Stale-Some safety. Workers send explicit
-        // `BlobsAvailable.evicted_digests` on every eviction; worker
-        // disconnect triggers `remove_endpoint` cleanup at
+        // Stale-Some safety (v2 lost-eviction invariant). Workers send
+        // explicit `BlobsAvailable.evicted_digests` on every eviction;
+        // worker disconnect triggers `remove_endpoint` cleanup at
         // worker_api_server.rs:407 within ~5s; `try_read_from_worker`
-        // self-heal evicts the locality entry on per-digest NotFound;
-        // and the bytestream fast-path's `worker.has(digest)` is the
-        // last-mile sync verification before we drop Bazel's bytes.
+        // self-heal evicts the locality entry on per-digest NotFound.
         // The worst-case stale-Some manifests as a single proxy-fetch
         // attempt that NotFounds and self-heals — same risk class as
         // server CAS evicting between FMB and Read (which we already
-        // accept).
+        // accept). Task #155 deleted the bytestream sync-confirm
+        // safety-net that previously belt-and-suspendered this contract.
         if !self.consult_locality_in_has.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -2947,9 +2948,10 @@ mod tests {
     // ---------------------------------------------------------------
     // 4. has_with_results: locality fallback ON (default) reports
     //     worker-only blobs as present (canonical size from digest).
-    //     Required for bytestream sync-confirm coherence: that path
-    //     returns success without storing on the server, so the next
-    //     FMB must agree the blob is present or Bazel re-uploads.
+    //     Required for end-to-end coherence: the bytestream short-
+    //     circuit returns success without storing on the server, so
+    //     the next FMB must agree the blob is present or Bazel
+    //     re-uploads it.
     // ---------------------------------------------------------------
     #[nativelink_test]
     async fn test_has_with_results_locality_fallback_when_enabled() -> Result<(), Error> {

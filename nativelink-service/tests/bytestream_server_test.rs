@@ -25,7 +25,7 @@ use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use nativelink_config::cas_server::{ByteStreamConfig, HttpListener, WithInstanceName};
 use nativelink_config::stores::{MemorySpec, StoreSpec};
-use nativelink_error::{Code, Error, ResultExt, make_err};
+use nativelink_error::{Code, Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use nativelink_proto::google::bytestream::byte_stream_server::ByteStream;
@@ -2655,22 +2655,24 @@ pub async fn two_concurrent_writes_same_digest_coalesced()
 // ─────────────────────────────────────────────────────────────────────
 // E' v2 locality short-circuit fast path
 //
-// Production code under test: bytestream_server.rs lines 1893-2013.
-// When Bazel uploads a blob the inner CAS doesn't have but the
-// WorkerProxyStore's locality_map claims a worker holds, the server
-// synchronously confirms with that worker via worker.has(digest)
-// (wrapped in a 50ms tokio::time::timeout). Three branches:
-//   - Ok(Some(_))  -> short-circuit: return WriteResponse without
-//                     ingesting; the inner store stays empty.
-//   - Ok(None)     -> stale locality entry: evict, fall through to
-//                     normal ingest path.
-//   - Timeout/err  -> fall through to normal ingest, do NOT evict.
-// Only fires when proxy.locality_in_has_enabled() is true and the
-// blob is >= 64 KiB (LOCALITY_MIN_BLOB_SIZE).
+// Production path under test: the OUTER `store.has(digest)` short-circuit
+// at the top of `ByteStream::write_resumeable` (bytestream_server.rs).
+// When Bazel uploads a blob and the WorkerProxyStore's locality_map
+// claims a worker holds it, `WorkerProxyStore::has` (with locality-in-has
+// enabled) returns `Some` from the locality table without consulting the
+// peer — the upload short-circuits and the bytes are dropped.
+//
+// The previous bytestream-side sync-confirm safety-net branch (which
+// re-verified locality with a 50ms `worker.has()` RPC before trusting
+// the short-circuit) was removed in task #155 as a Belt-and-suspenders
+// anti-pattern that masked task #139's lost-eviction bugs. The v2
+// lost-eviction invariant guarantees workers eviction-broadcast before
+// the next FindMissingBlobs sees a stale Some, so the re-verification
+// is no longer needed.
 // ─────────────────────────────────────────────────────────────────────
 
-/// 100 KiB is comfortably above the 64 KiB LOCALITY_MIN_BLOB_SIZE
-/// threshold, ensuring the locality-confirm fast path is exercised.
+/// 100 KiB is comfortably above any plausible "small blob" threshold,
+/// ensuring the locality fast path is exercised across configurations.
 const LOCALITY_TEST_BLOB_SIZE: usize = 100 * 1024;
 
 // REMOVED 2026-04-26: `SleepingHasStore` was the test fake for the T3
@@ -2821,139 +2823,19 @@ pub async fn locality_short_circuit_succeeds()
     Ok(())
 }
 
-// REMOVED 2026-04-26: T2 (`locality_stale_evicts_and_ingests`) and
-// T3 (`locality_timeout_falls_through_without_eviction`) asserted the
-// behaviour of the bytestream sync-confirm safety-net branch
-// (`bytestream_server.rs:2074-2189`). That branch defensively
-// re-verified locality freshness with the worker before trusting the
-// short-circuit, and on stale-Some falls through to the normal ingest
-// path with explicit eviction.
-//
-// Per CLAUDE.md (2026-04-26): the sync-confirm branch is the
-// "belt-and-suspenders masks bugs" anti-pattern — defensive
-// re-verification of locality inside the trust boundary, scheduled to
-// be removed once the v2 lost-eviction invariant lands (task #155).
-// In the current code path the OUTER `store.has(digest)` short-circuit
-// at `bytestream_server.rs:2059` fires FIRST when locality is enabled
-// in `has`, so the sync-confirm branch is unreachable in the
-// scenarios these tests exercise — the WriteResponse is returned
-// without ever consulting the peer or evicting on stale entries.
-//
-// Coverage of the locality-in-has fast path remains via
-// `locality_short_circuit_succeeds` (T1, kept) and the
-// `locality_confirmation_*` interpret-only tests below (T4 cluster).
-// When task #155 lands the safety-net branch will be removed
-// outright; reintroducing T2/T3 against that future world would
-// require asserting the v2 invariant (workers eviction-broadcast
-// before the next FindMissingBlobs sees a stale Some) which is a
-// distributed-system property tested in the integration tier, not in
-// this unit-style file.
-
-// -------------------------------------------------------------------
-// T4: locality fast-path interpret_locality_confirmation
-//
-// Bug shape: pre-fix the bytestream write fast-path matched `worker.has()`
-// outcomes via:
-//   Ok(Ok(Ok(Some(_)))) => Some(true),
-//   Ok(Ok(Ok(None)))    => Some(false),
-//   _                   => None,    // join/RPC error or timeout
-//
-// The catch-all `_` swallowed `Ok(Ok(Err(e)))` — including peer-side
-// Err(Code::NotFound). On `None` the locality entry is preserved and
-// the upload falls through. That's correct for transient errors but
-// WRONG for a structured NotFound: the peer's has() RPC returned
-// successfully and explicitly said "I don't have this digest". The
-// locality map was lying and must be evicted.
-//
-// We test the interpretation function directly because the integration
-// path is wrapped inside the bytestream write streaming pipeline; testing
-// the interpretation in isolation pins the fix to its behavioral contract.
-// -------------------------------------------------------------------
-#[nativelink_test]
-pub async fn locality_confirmation_some_present_returns_true()
--> Result<(), Box<dyn core::error::Error>> {
-    use nativelink_service::bytestream_server::interpret_locality_confirmation;
-    let result: Result<
-        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
-        tokio::time::error::Elapsed,
-    > = Ok(Ok(Ok(Some(123))));
-    assert_eq!(interpret_locality_confirmation(result), Some(true));
-    Ok(())
-}
-
-#[nativelink_test]
-pub async fn locality_confirmation_ok_none_returns_false()
--> Result<(), Box<dyn core::error::Error>> {
-    use nativelink_service::bytestream_server::interpret_locality_confirmation;
-    let result: Result<
-        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
-        tokio::time::error::Elapsed,
-    > = Ok(Ok(Ok(None)));
-    assert_eq!(interpret_locality_confirmation(result), Some(false));
-    Ok(())
-}
-
-#[nativelink_test]
-pub async fn locality_confirmation_err_not_found_returns_false()
--> Result<(), Box<dyn core::error::Error>> {
-    use nativelink_service::bytestream_server::interpret_locality_confirmation;
-    // Pre-fix this fell into `_ => None` — the locality entry was kept.
-    // Post-fix: structured NotFound must be Some(false) so the caller
-    // evicts the locality entry.
-    let err = make_err!(Code::NotFound, "peer worker reports NotFound");
-    let result: Result<
-        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
-        tokio::time::error::Elapsed,
-    > = Ok(Ok(Err(err)));
-    assert_eq!(
-        interpret_locality_confirmation(result),
-        Some(false),
-        "structured NotFound from peer must evict, not be treated as transient"
-    );
-    Ok(())
-}
-
-#[nativelink_test]
-pub async fn locality_confirmation_err_other_returns_none()
--> Result<(), Box<dyn core::error::Error>> {
-    use nativelink_service::bytestream_server::interpret_locality_confirmation;
-    // Non-NotFound errors (Unavailable, DeadlineExceeded, Internal, etc.)
-    // are treated as transient: fall through without evicting.
-    for code in [
-        Code::Unavailable,
-        Code::DeadlineExceeded,
-        Code::Internal,
-        Code::Cancelled,
-    ] {
-        let err = make_err!(code, "peer worker {:?}", code);
-        let result: Result<
-            Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
-            tokio::time::error::Elapsed,
-        > = Ok(Ok(Err(err)));
-        assert_eq!(
-            interpret_locality_confirmation(result),
-            None,
-            "{code:?} must be treated as transient (None — preserve locality)"
-        );
-    }
-    Ok(())
-}
-
-#[nativelink_test]
-pub async fn locality_confirmation_timeout_returns_none()
--> Result<(), Box<dyn core::error::Error>> {
-    use nativelink_service::bytestream_server::interpret_locality_confirmation;
-    // Build a real Elapsed by triggering an actual timeout.
-    let elapsed = tokio::time::timeout(
-        core::time::Duration::from_nanos(1),
-        tokio::time::sleep(core::time::Duration::from_secs(60)),
-    )
-    .await
-    .expect_err("must time out");
-    let result: Result<
-        Result<Result<Option<u64>, Error>, tokio::task::JoinError>,
-        tokio::time::error::Elapsed,
-    > = Err(elapsed);
-    assert_eq!(interpret_locality_confirmation(result), None);
-    Ok(())
-}
+// REMOVED 2026-04-26 (task #155: delete bytestream sync-confirm safety-net
+// branch): T2 (`locality_stale_evicts_and_ingests`), T3
+// (`locality_timeout_falls_through_without_eviction`), and the T4 cluster
+// (`locality_confirmation_*`) all asserted the behaviour of the bytestream
+// sync-confirm safety-net branch (`bytestream_server.rs:2074-2189`) — a
+// defensive re-verification of locality freshness inside the trust
+// boundary. Per CLAUDE.md, that branch was the "belt-and-suspenders masks
+// bugs" anti-pattern: it was unreachable in production (the OUTER
+// `store.has(digest)` short-circuit fires FIRST when locality is enabled
+// in `has`) AND it covered up task #139's lost-eviction bugs for months.
+// With the v2 lost-eviction invariant landed, the safety-net branch was
+// removed outright — and `interpret_locality_confirmation` along with it
+// (the helper existed only to support that branch). T2/T3/T4 were tests
+// of dead code; removing them keeps the suite asserting the protocol's
+// behaviour, not the safety-net's. Coverage of the locality-in-has fast
+// path remains via `locality_short_circuit_succeeds` (T1, kept above).

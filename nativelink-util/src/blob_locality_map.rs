@@ -106,8 +106,10 @@ impl BuildHasher for DigestBuildHasher {
 ///
 /// Per-entry timestamps were dropped: with TTL filtering removed, a
 /// "freshest worker" tiebreaker is theatre — any worker carrying the digest
-/// is equally good and the bytestream sync-confirm path's own `has()` is the
-/// real correctness check.
+/// is equally good. Correctness now rests on the v2 lost-eviction invariant
+/// (workers eviction-broadcast before the next FindMissingBlobs can see a
+/// stale Some), which superseded the bytestream-side sync-confirm safety
+/// net deleted in task #155.
 #[derive(Debug, Clone, Default)]
 pub struct EndpointList {
     entries: Vec<Arc<str>>,
