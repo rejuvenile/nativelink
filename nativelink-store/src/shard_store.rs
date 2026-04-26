@@ -85,14 +85,31 @@ impl ShardStore {
             .collect();
         // Our last item should always be the max.
         *weights.last_mut().unwrap() = u32::MAX;
-        Ok(Arc::new(Self {
+        let result = Arc::new(Self {
             weights_and_stores: weights
                 .into_iter()
                 .zip(stores)
                 .map(|(weight, store)| StoreAndWeight { weight, store })
                 .collect(),
             merged_stable_notify: OnceLock::new(),
-        }))
+        });
+        // Eagerly initialize the merged-stable-notify forwarders so the
+        // cold-path lost-wakeup window between construction and first
+        // external `stable_notify()` call is closed (perf-optimizer
+        // CRITICAL Finding 1, .claude/reviews/c-plus-d/perf-optimizer.md).
+        // Requires a tokio runtime; all production callers and
+        // #[nativelink_test] harnesses provide one.
+        let _ = StoreDriver::stable_notify(result.as_ref());
+        Ok(result)
+    }
+
+    /// Returns `true` if the merged-stable-notify state has been
+    /// eagerly initialized (forwarder tasks running). Exposed for the
+    /// production-composition test that verifies cold-path lost-wakeup
+    /// safety; not used in production code.
+    #[doc(hidden)]
+    pub fn merged_stable_notify_initialized(&self) -> bool {
+        self.merged_stable_notify.get().is_some()
     }
 
     fn get_store_index(&self, store_key: &StoreKey) -> usize {

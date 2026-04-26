@@ -388,6 +388,98 @@ async fn outer_pin_digests_survives_eviction_pressure_on_fs_backend() -> Result<
     Ok(())
 }
 
+/// Property 4: Many-position wrappers must EAGERLY initialize their
+/// `merged_stable_notify` `OnceLock` during `new()`, not lazily on first
+/// `stable_notify()` call.
+///
+/// **Bug class (perf-optimizer Finding 1, CRITICAL).** With lazy
+/// initialization, a writer between `new()` and the first external
+/// `stable_notify()` call can fire `notify_one` on an inner child's
+/// Notify before the wrapper's forwarder task is registered. The first
+/// call to `stable_notify()` finally spawns the forwarder, which on
+/// first poll consumes the permit and fires the merged Notify — but
+/// permits don't accumulate (Notify caps at 1 permit), so multi-fire
+/// pre-spawn races collapse silently.
+///
+/// Eager init in `SizePartitioningStore::new` / `ShardStore::new` /
+/// `DedupStore::new` ensures the forwarder is running before any
+/// writer can fire, moving the invariant out of caller etiquette and
+/// into the type system.
+///
+/// To produce the mutation-step "kill": comment out the
+/// `let _ = StoreDriver::stable_notify(result.as_ref());` line in any
+/// of the three Many constructors and rerun this test.
+#[nativelink_test]
+async fn many_wrappers_eagerly_initialize_merged_stable_notify_on_new() -> Result<(), Error> {
+    use nativelink_config::stores::{DedupSpec, MemorySpec, ShardConfig, ShardSpec};
+    use nativelink_store::dedup_store::DedupStore;
+    use nativelink_store::shard_store::ShardStore;
+
+    // SizePartitioningStore — uses build_cas_chain's wrapper construction
+    // path (the wrapper's new() must eagerly init).
+    let lower = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let upper = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let size_part = SizePartitioningStore::new(
+        &SizePartitioningSpec {
+            size: SIZE_PARTITION_THRESHOLD,
+            lower_store: StoreSpec::Memory(MemorySpec::default()),
+            upper_store: StoreSpec::Memory(MemorySpec::default()),
+        },
+        lower,
+        upper,
+    );
+    assert!(
+        size_part.merged_stable_notify_initialized(),
+        "SizePartitioningStore::new must eagerly initialize merged_stable_notify (perf-optimizer F1). \
+         Lazy init opens a cold-path lost-wakeup window between construction and first external stable_notify() call."
+    );
+
+    // ShardStore — at least 2 shards so the Many fan-out applies.
+    let shard_lower = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let shard_upper = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let shard = ShardStore::new(
+        &ShardSpec {
+            stores: vec![
+                ShardConfig {
+                    store: StoreSpec::Memory(MemorySpec::default()),
+                    weight: Some(1),
+                },
+                ShardConfig {
+                    store: StoreSpec::Memory(MemorySpec::default()),
+                    weight: Some(1),
+                },
+            ],
+        },
+        vec![shard_lower, shard_upper],
+    )?;
+    assert!(
+        shard.merged_stable_notify_initialized(),
+        "ShardStore::new must eagerly initialize merged_stable_notify (perf-optimizer F1)."
+    );
+
+    // DedupStore — index + content child.
+    let dedup_index = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let dedup_content = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let dedup = DedupStore::new(
+        &DedupSpec {
+            index_store: StoreSpec::Memory(MemorySpec::default()),
+            content_store: StoreSpec::Memory(MemorySpec::default()),
+            min_size: 0,
+            normal_size: 0,
+            max_size: 0,
+            max_concurrent_fetch_per_get: 0,
+        },
+        dedup_index,
+        dedup_content,
+    )?;
+    assert!(
+        dedup.merged_stable_notify_initialized(),
+        "DedupStore::new must eagerly initialize merged_stable_notify (perf-optimizer F1)."
+    );
+
+    Ok(())
+}
+
 /// Hex-encode 32 bytes to a 64-char lowercase string (SHA256 digest format).
 /// Local helper — no `hex` crate dep needed for this one usage.
 fn hex_encode(bytes: &[u8; 32]) -> String {

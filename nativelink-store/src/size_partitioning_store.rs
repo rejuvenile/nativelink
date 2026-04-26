@@ -48,12 +48,20 @@ pub struct SizePartitioningStore {
 
 impl SizePartitioningStore {
     pub fn new(spec: &SizePartitioningSpec, lower_store: Store, upper_store: Store) -> Arc<Self> {
-        Arc::new(Self {
+        let result = Arc::new(Self {
             partition_size: spec.size,
             lower_store,
             upper_store,
             merged_stable_notify: OnceLock::new(),
-        })
+        });
+        // Eagerly initialize the merged-stable-notify forwarders so the
+        // cold-path lost-wakeup window between construction and first
+        // external `stable_notify()` call is closed (perf-optimizer
+        // CRITICAL Finding 1, .claude/reviews/c-plus-d/perf-optimizer.md).
+        // Requires a tokio runtime; all production callers and
+        // #[nativelink_test] harnesses provide one.
+        let _ = StoreDriver::stable_notify(result.as_ref());
+        result
     }
 
     /// Returns the size threshold that partitions blobs between lower and
@@ -61,6 +69,15 @@ impl SizePartitioningStore {
     /// lower store; all others go to the upper store.
     pub fn partition_size(&self) -> u64 {
         self.partition_size
+    }
+
+    /// Returns `true` if the merged-stable-notify state has been
+    /// eagerly initialized (forwarder tasks running). Exposed for the
+    /// production-composition test that verifies cold-path lost-wakeup
+    /// safety; not used in production code.
+    #[doc(hidden)]
+    pub fn merged_stable_notify_initialized(&self) -> bool {
+        self.merged_stable_notify.get().is_some()
     }
 }
 

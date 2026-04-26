@@ -112,7 +112,7 @@ impl DedupStore {
         } else {
             spec.max_concurrent_fetch_per_get as usize
         };
-        Ok(Arc::new(Self {
+        let result = Arc::new(Self {
             index_store,
             content_store,
             fast_cdc_decoder: FastCDC::new(
@@ -124,7 +124,24 @@ impl DedupStore {
             max_concurrent_fetch_per_get,
             bincode_config: bincode::config::legacy(),
             merged_stable_notify: OnceLock::new(),
-        }))
+        });
+        // Eagerly initialize the merged-stable-notify forwarders so the
+        // cold-path lost-wakeup window between construction and first
+        // external `stable_notify()` call is closed (perf-optimizer
+        // CRITICAL Finding 1, .claude/reviews/c-plus-d/perf-optimizer.md).
+        // Requires a tokio runtime; all production callers and
+        // #[nativelink_test] harnesses provide one.
+        let _ = StoreDriver::stable_notify(result.as_ref());
+        Ok(result)
+    }
+
+    /// Returns `true` if the merged-stable-notify state has been
+    /// eagerly initialized (forwarder tasks running). Exposed for the
+    /// production-composition test that verifies cold-path lost-wakeup
+    /// safety; not used in production code.
+    #[doc(hidden)]
+    pub fn merged_stable_notify_initialized(&self) -> bool {
+        self.merged_stable_notify.get().is_some()
     }
 
     async fn has(self: Pin<&Self>, key: StoreKey<'_>) -> Result<Option<u64>, Error> {
