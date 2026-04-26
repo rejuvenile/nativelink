@@ -26,7 +26,7 @@ use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
-use nativelink_util::common::PackedHash;
+use nativelink_util::common::{DigestInfo, PackedHash};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::metrics_utils::CounterWithTime;
