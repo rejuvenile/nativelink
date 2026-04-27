@@ -1960,6 +1960,18 @@ impl ByteStreamServer {
                 complete: false,
             }));
         };
+        // Defense-in-depth at the wire boundary: `committed_size` is what Bazel
+        // uses to position resumed uploads, so any inner-store `has()` that
+        // reports a size larger than the requested digest's size would push
+        // Bazel past the end of the blob and corrupt subsequent writes. The
+        // primary contract is enforced inside each store, but this assert
+        // catches any future regression at the single point where the value
+        // is serialized to the wire (testing-czar hot-fix retro MAJOR-2).
+        debug_assert!(
+            item_size <= digest.size_bytes(),
+            "committed_size {item_size} exceeds digest size {} for {digest}",
+            digest.size_bytes()
+        );
         Ok(Response::new(QueryWriteStatusResponse {
             committed_size: item_size as i64,
             complete: true,

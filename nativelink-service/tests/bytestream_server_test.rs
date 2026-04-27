@@ -2839,3 +2839,199 @@ pub async fn locality_short_circuit_succeeds()
 // of dead code; removing them keeps the suite asserting the protocol's
 // behaviour, not the safety-net's. Coverage of the locality-in-has fast
 // path remains via `locality_short_circuit_succeeds` (T1, kept above).
+
+// =====================================================================
+// Task #167: debug_assert that committed_size never exceeds digest size
+// at the QueryWriteStatus wire boundary.
+//
+// `QueryWriteStatusResponse.committed_size` returns `item_size as i64`
+// from `store.has(digest)` directly to Bazel. Bazel uses this number to
+// position upload-resume offsets — if any inner store ever returns a
+// `has()` value larger than the digest's declared size, Bazel would
+// resume past the end of the blob and corrupt subsequent writes. The
+// per-store contracts forbid this, but `bytestream_server.rs:1965` is
+// the single point where the value is serialized to the wire, so a
+// `debug_assert!` here catches future regressions in any inner store.
+//
+// This test wires a deliberately-misbehaving `LyingHasStore` into a
+// ByteStreamServer and verifies that calling `query_write_status` with
+// a digest whose declared size is smaller than the lie panics with the
+// expected message in debug builds.
+// =====================================================================
+
+use core::pin::Pin;
+use std::panic::AssertUnwindSafe;
+
+use futures::FutureExt;
+use nativelink_metric::{
+    MetricFieldData, MetricKind, MetricPublishKnownKindData,
+};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::health_utils::{
+    HealthStatusIndicator, default_health_status_indicator,
+};
+use nativelink_util::store_trait::{
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation,
+    StoreDriver, StoreKey, UploadSizeInfo,
+};
+
+/// Inner store that lies about `has()` — always reports a size larger
+/// than any digest's declared size. Used to drive the boundary
+/// `debug_assert` in `inner_query_write_status`.
+#[derive(Debug, Default)]
+struct LyingHasStore {
+    /// The lie returned for every `has()` query.
+    lie_size: u64,
+}
+
+impl LyingHasStore {
+    fn new(lie_size: u64) -> Arc<Self> {
+        Arc::new(Self { lie_size })
+    }
+}
+
+impl nativelink_metric::MetricsComponent for LyingHasStore {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreDriver for LyingHasStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        for (i, _key) in keys.iter().enumerate() {
+            results[i] = Some(self.lie_size);
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        reader.drain().await.err_tip(|| "In LyingHasStore::update")?;
+        Ok(())
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(nativelink_error::make_err!(
+            Code::Unimplemented,
+            "LyingHasStore::get_part not implemented"
+        ))
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+default_health_status_indicator!(LyingHasStore);
+
+#[nativelink_test]
+pub async fn query_write_status_debug_asserts_committed_size_within_digest()
+-> Result<(), Box<dyn core::error::Error>> {
+    // The misbehaving store reports `has() = 999_999` for every digest,
+    // but the resource_name we send declares a digest of size 7. The
+    // boundary `debug_assert` in `inner_query_write_status` must panic
+    // with a specific message that names both numbers. We pick numbers
+    // whose decimal representations are not substrings of each other so
+    // the `msg.contains` assertions cannot accidentally pass on the
+    // wrong number.
+    const DIGEST_SIZE: usize = 7;
+    const LIE_SIZE: u64 = 999_999;
+
+    let store_manager = Arc::new(StoreManager::new());
+    store_manager.add_store("main_cas", Store::new(LyingHasStore::new(LIE_SIZE)));
+
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None)
+            .expect("Failed to make server"),
+    );
+
+    let resource_name = make_resource_name(DIGEST_SIZE);
+
+    // Catch the debug_assert panic. We must AssertUnwindSafe since
+    // ByteStreamServer is not RefUnwindSafe; the panic itself is what
+    // we are testing, not the post-panic state of the server.
+    let result = AssertUnwindSafe(bs_server.query_write_status(Request::new(
+        QueryWriteStatusRequest {
+            resource_name,
+        },
+    )))
+    .catch_unwind()
+    .await;
+
+    let panic_payload = result.expect_err(
+        "must panic — debug_assert at bytestream_server.rs (query_write_status \
+         wire boundary) must catch a misbehaving inner store that reports \
+         `has()` size exceeding the digest's declared size",
+    );
+
+    // The assertion message must name both numbers so the operator
+    // immediately sees which store violated the contract. A generic
+    // panic ("assertion failed") would leave the on-call grepping.
+    let msg: String = if let Some(s) = panic_payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        String::from("<non-string panic payload>")
+    };
+    assert!(
+        msg.contains(&format!("{LIE_SIZE}")),
+        "panic message must include the lie ({LIE_SIZE}); got: {msg}",
+    );
+    assert!(
+        msg.contains(&format!("{DIGEST_SIZE}")),
+        "panic message must include the digest size ({DIGEST_SIZE}); got: {msg}",
+    );
+    assert!(
+        msg.contains("committed_size"),
+        "panic message must mention committed_size for greppability; got: {msg}",
+    );
+
+    Ok(())
+}
