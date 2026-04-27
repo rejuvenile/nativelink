@@ -351,6 +351,22 @@ impl WorkerApiServer {
                 if let Some(ref locality_map) = self.locality_map {
                     locality_map.write().remove_endpoint(&worker_cas_endpoint);
                 }
+                // TODO(#174 — boot-epoch wipe dispatcher leak): when a
+                // worker reconnects with a new boot_epoch BEFORE OLD's
+                // disconnect-cleanup runs, OLD's
+                // `dispatcher.worker_txs[(endpoint, prev_epoch)]` and
+                // per-(worker, prev_epoch) queues leak forever — OLD's
+                // later cleanup hits the ownership-check guard
+                // (NEW owns the endpoint) and SKIPS its
+                // `dispatcher.unregister_worker` /
+                // `dispatcher.unpin_on_disconnect` calls. Symmetric to
+                // the locality_map wipe just above; see also #141
+                // (which fixed locality_map for the same race class).
+                // Dormant under `small_blob_mirror_enabled=false`;
+                // becomes an active leak the moment the flag flips.
+                // Fix: call dispatcher.unregister_worker(endpoint,
+                // prev_epoch) + dispatcher.unpin_on_disconnect(endpoint,
+                // prev_epoch) here while endpoint_state lock is held.
                 info!(
                     endpoint = %worker_cas_endpoint,
                     prev_epoch = prev.as_ref().map(|p| p.boot_epoch),
