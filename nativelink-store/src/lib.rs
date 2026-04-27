@@ -47,6 +47,7 @@ mod redis_utils;
 pub mod ref_store;
 pub mod s3_store;
 pub mod shard_store;
+pub mod singleflight;
 pub mod size_partitioning_store;
 pub mod small_blob_dispatcher;
 pub mod store_manager;
