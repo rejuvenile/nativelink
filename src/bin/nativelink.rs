@@ -355,24 +355,123 @@ async fn inner_main(
     // explicitly enables it for canary rollout. See plan §"Decisions"
     // and `SmallBlobDispatcherConfig::small_blob_mirror_enabled`.
     //
-    // Per item 7 (register pin sets at startup): each FastSlowStore
-    // wraps `cas_FAST_SLOW_STORE` and `AC_BACKEND_CACHED` registers a
-    // per-store `EphemeralServerSidePin`. Today the dispatcher is
-    // created with no pin sets pre-registered; the registration is
-    // deferred to a follow-up because reaching the underlying
-    // FastSlowStore behind the wrapping (Verify, ExistenceCache,
-    // SizePartitioning…) requires a `downcast_ref` walk that is not
-    // currently implemented. The dispatcher is fully functional
-    // without pin sets — `enqueue` is a no-op when no pin set is
-    // registered for the source `store_id` (per dispatcher impl).
+    // Item 7: register `EphemeralServerSidePin` for every FastSlowStore
+    // that backs a CAS instance. We walk the (potentially wrapped:
+    // ExistenceCache → Verify → SizePartitioning → FastSlowStore) chain
+    // for each `cas_store_names` entry, find the FastSlowStore via
+    // `as_any().downcast_ref` (matches the existing `find_fast_slow`
+    // pattern in `store_manager.rs:81-108`), and register the pin set
+    // keyed by the store's CAS instance name. Stores not backed by a
+    // FastSlowStore (e.g., direct GrpcStore for testing) are skipped.
     let small_blob_dispatcher: Option<Arc<nativelink_store::small_blob_dispatcher::SmallBlobDispatcher>> = {
         if worker_schedulers.is_empty() {
             None
         } else {
-            let cfg = nativelink_store::small_blob_dispatcher::SmallBlobDispatcherConfig::default();
-            Some(Arc::new(
-                nativelink_store::small_blob_dispatcher::SmallBlobDispatcher::new(cfg),
-            ))
+            use nativelink_store::existence_cache_store::ExistenceCacheStore;
+            use nativelink_store::fast_slow_store::FastSlowStore;
+            use nativelink_store::small_blob_dispatcher::{
+                EphemeralServerSidePin, SmallBlobDispatcher, SmallBlobDispatcherConfig,
+            };
+            use nativelink_store::verify_store::VerifyStore;
+            use nativelink_util::store_trait::StoreDriver;
+
+            // Walk the store wrapper chain to find the underlying
+            // FastSlowStore. Mirrors `store_manager.rs:81-108` —
+            // ExistenceCacheStore + VerifyStore are the two production
+            // wrappers that return `self` from `inner_store()`, so we
+            // downcast manually. Returns Some(&FastSlowStore) on hit;
+            // None for non-FSS leaves (NoopStore / pure-Memory test
+            // backends / etc.). Stops on the first wrapper that is not
+            // recognized + does not unwrap further.
+            fn find_fast_slow_for_pin<'a>(
+                store: &'a dyn StoreDriver,
+            ) -> Option<&'a FastSlowStore> {
+                if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
+                    return Some(fss);
+                }
+                if let Some(ecs) = store
+                    .as_any()
+                    .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
+                {
+                    return find_fast_slow_for_pin(
+                        ecs.inner_store().inner_store(
+                            Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+                        ),
+                    );
+                }
+                if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
+                    return find_fast_slow_for_pin(
+                        vs.inner_store().inner_store(
+                            Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+                        ),
+                    );
+                }
+                let inner = store.inner_store(None);
+                if core::ptr::eq(
+                    inner as *const dyn StoreDriver,
+                    store as *const dyn StoreDriver,
+                ) {
+                    return None;
+                }
+                find_fast_slow_for_pin(inner)
+            }
+
+            let cfg = SmallBlobDispatcherConfig::default();
+            let pin_max_bytes = cfg.pin_max_bytes;
+            let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+
+            // Register a per-store `EphemeralServerSidePin` for every
+            // FastSlowStore backing a CAS instance. The `store_id`
+            // matches the CAS instance name so the dispatcher's
+            // (store_id, digest) keying is unambiguous.
+            //
+            // We use `unwrapped_cas_stores` (the stores BEFORE
+            // WorkerProxyStore wrapping) so the find walks straight to
+            // the FastSlowStore without the WorkerProxyStore layer
+            // adding another inner_store hop.
+            for store_name in &cas_store_names {
+                let Some(store) = unwrapped_cas_stores.get(store_name) else {
+                    continue;
+                };
+                // Skip stores whose names don't match the dispatcher
+                // store_id format (`[a-z][a-z0-9_]*`); pin sets won't
+                // match and we'd just waste a registration.
+                if store_name.is_empty()
+                    || !store_name
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_ascii_lowercase())
+                    || !store_name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    info!(
+                        store_name,
+                        "small_blob_dispatcher: skipping pin-set registration; \
+                         store_name does not match `[a-z][a-z0-9_]*` (per plan C11)"
+                    );
+                    continue;
+                }
+                let driver: &dyn StoreDriver = store.inner_store(
+                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+                );
+                if find_fast_slow_for_pin(driver).is_some() {
+                    let pin = Arc::new(EphemeralServerSidePin::new(pin_max_bytes));
+                    dispatcher.register_pin_set(store_name, pin);
+                    info!(
+                        store_name,
+                        pin_max_bytes,
+                        "small_blob_dispatcher: registered EphemeralServerSidePin"
+                    );
+                }
+            }
+            // TODO(#168): also walk AC store names and register their
+            // FastSlowStores once AC store names are aggregated by the
+            // bootstrap (today they are local to each AcStoreConfig).
+            // The dispatcher works without AC pin registration —
+            // ac_server's enqueue site (item 3, also follow-up) will
+            // be a no-op until both AC pin set + ac_server hook land.
+            Some(dispatcher)
         }
     };
 

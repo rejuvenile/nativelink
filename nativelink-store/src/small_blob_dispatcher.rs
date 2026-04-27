@@ -673,6 +673,11 @@ async fn drainer_task(
             }
         }
         let blob_count = batch.len();
+        // task #168 item 10 (per plan B6): wall-time the encode +
+        // worker_tx.send so operators can see dispatch latency from
+        // logs without a separate metric. We log the duration AFTER
+        // the send so the success and failure paths both report it.
+        let send_started = std::time::Instant::now();
         let proto_blobs: Vec<SmallBlobEntry> = batch
             .iter()
             .map(|item| SmallBlobEntry {
@@ -687,6 +692,7 @@ async fn drainer_task(
             )),
         };
         if let Err(send_err) = worker_tx.send(msg) {
+            let wall_ms = send_started.elapsed().as_millis() as u64;
             // worker_tx closed (worker disconnected) — roll back every
             // pin entry we held for this batch and exit.
             warn!(
@@ -695,6 +701,7 @@ async fn drainer_task(
                 %store_id,
                 blob_count,
                 total_bytes,
+                wall_ms,
                 ?send_err,
                 "drainer_task: worker_tx closed; rolling back pin entries + exiting"
             );
@@ -703,12 +710,14 @@ async fn drainer_task(
             }
             return;
         }
+        let wall_ms = send_started.elapsed().as_millis() as u64;
         debug!(
             %endpoint,
             boot_epoch_id,
             %store_id,
             blob_count,
             total_bytes,
+            wall_ms,
             "drainer_task: batch sent"
         );
     }

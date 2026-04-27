@@ -165,5 +165,18 @@ pub(crate) fn update_eq(
                 _ => false,
             }
         }
+        // Bug A small-CAS peer-mirror dispatcher (#153 / #168). Test
+        // utility used by scheduler tests; no scheduler test exercises
+        // BatchWriteSmallBlobs (the dispatcher writes that variant on
+        // its own bidi stream, not via the scheduler), so eq is equality
+        // of the BatchWriteSmallBlobsRequest field.
+        update_for_worker::Update::BatchWriteSmallBlobs(actual_update) => {
+            match expected_update {
+                update_for_worker::Update::BatchWriteSmallBlobs(expected_update) => {
+                    expected_update == actual_update
+                }
+                _ => false,
+            }
+        }
     }
 }
