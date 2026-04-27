@@ -93,6 +93,14 @@
   release of (s, d) is still keyed to the worker that "owns" the
   pin, so the cross-store leak window remains the same as in the
   original spec.
+
+  WorkerDisconnect models the SINGLE-worker case; the multi-worker
+  over-broad clear (per code TODO at small_blob_dispatcher.rs:562) is
+  out-of-scope — the spec uses Workers = {w1} (implicitly: one worker
+  process, modelled by the single workerMirror variable) which cannot
+  expose the amplification where one worker's disconnect clears pins
+  the dispatcher pushed to OTHER live workers. See task #177 for the
+  per-worker-attribution v2 design that lifts this restriction.
  ***************************************************************************)
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC

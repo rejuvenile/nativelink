@@ -203,9 +203,17 @@ impl EphemeralServerSidePin {
         }
     }
 
-    /// Total bytes currently held in the pin set.
+    /// Returns the cap-projection counter as an `Acquire` atomic load.
+    ///
+    /// Consistent with `len()` ONLY for callers that hold `state.lock()`
+    /// (the same critical section that mutates state also publishes the
+    /// new total under `AcqRel`/`Release`). Unsynchronized callers
+    /// (metrics, logs, tests) may observe a transient skew of one
+    /// in-flight insert/remove operation against the matching `len()`
+    /// snapshot — fine for those use-cases (the lock-held atomic-update
+    /// fix only guarantees pair-consistency for in-lock observers).
     pub fn total_bytes(&self) -> u64 {
-        self.total_bytes.load(Ordering::Relaxed)
+        self.total_bytes.load(Ordering::Acquire)
     }
 
     /// Number of entries currently held.
@@ -233,7 +241,10 @@ impl EphemeralServerSidePin {
     pub fn insert(&self, digest: DigestInfo, data: Bytes) -> Result<(), Error> {
         let new_bytes = data.len() as u64;
         let mut state = self.state.lock();
-        let current_total = self.total_bytes.load(Ordering::Relaxed);
+        // `Acquire` keeps the load consistent with the matching
+        // `Release` / `AcqRel` on every other writer (per code-reviewer
+        // #168 NIT-2: pick ONE ordering and use it everywhere).
+        let current_total = self.total_bytes.load(Ordering::Acquire);
         // Subtract old entry's size if we're replacing.
         let old_size = state.get(&digest).map(|d| d.len() as u64).unwrap_or(0);
         let projected = current_total.saturating_sub(old_size).saturating_add(new_bytes);
@@ -255,8 +266,11 @@ impl EphemeralServerSidePin {
         }
         state.insert(digest, data);
         // Update atomic UNDER the state lock so an observer racing a
-        // remove cannot see a torn `(len, total_bytes)` pair.
-        self.total_bytes.store(projected, Ordering::Relaxed);
+        // remove cannot see a torn `(len, total_bytes)` pair. `Release`
+        // pairs with the `Acquire` reader at `total_bytes()` and the
+        // `AcqRel` updater at `remove_one` (consistent ordering per
+        // code-reviewer #168 NIT-2).
+        self.total_bytes.store(projected, Ordering::Release);
         Ok(())
     }
 
