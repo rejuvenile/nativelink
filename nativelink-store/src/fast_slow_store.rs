@@ -100,6 +100,19 @@ tokio::task_local! {
     /// termination contract) closes the outer writer and the peer's
     /// bytes can never be delivered to the consumer — bug #171.
     ///
+    /// Coverage extends to ALL `slow_store.get_part(&mut *guard, ...)`
+    /// fallback sites that may return NotFound while the OUTER writer
+    /// still has zero bytes written (NoopUpdates / ReadOnly bypass,
+    /// fast-store-evicted-after-populate, sliding-window-evicted, AND
+    /// the WAITER-path streaming-reader-error fallback). Without
+    /// extending the gate to the waiter site, a parallel-chunk request
+    /// that races multiple `get_part` calls for the same digest through
+    /// a single FastSlowStore would have its WAITERS' Drop fallback
+    /// terminate the OUTER writer the moment the populator's NotFound
+    /// flows through the streaming buffer — defeating the populator-
+    /// side gate at the same chain depth (#171 parallel-path leak,
+    /// 2026-04-27).
+    ///
     /// Other early-return `guard.fail(...)` sites in `FastSlowStore::get_part`
     /// (mirror_blobs size mismatch, fast_store truncation, in_flight size
     /// mismatch, fast_store error path, local_only_reads NotFound) do NOT
@@ -107,6 +120,38 @@ tokio::task_local! {
     /// that peer-fetch cannot recover from and that VerifyStore's
     /// deadlock-defense still requires.
     pub static INNER_MISS_NO_TERMINATE: bool;
+}
+
+/// Commits the [`WriteHalfGuard`] honoring the
+/// [`INNER_MISS_NO_TERMINATE`] task-local: identical Ok semantics to
+/// `commit_delegated_if_ok(&res)`, but on `Err(NotFound)` with no bytes
+/// written AND the gate set, suppresses the Drop fallback so the OUTER
+/// writer survives for the upstream caller's recovery path (typically
+/// `WorkerProxyStore`'s peer-fetch fallback).
+///
+/// This is the gate-aware analogue of the inline checks at the
+/// populator terminal-state branch (line 3210-3221) and the populator
+/// streaming-reader-error branch (line 3326-3347). All three sites
+/// share the same contract: when the upstream caller has opted in, an
+/// inner-NotFound with no bytes written must NOT terminate the OUTER
+/// writer.
+fn commit_with_inner_miss_gate(
+    guard: &mut WriteHalfGuard<'_>,
+    res: &Result<(), Error>,
+    bytes_before: u64,
+) {
+    if let Err(err) = res
+        && err.code == Code::NotFound
+        && guard.get_bytes_written() == bytes_before
+        && INNER_MISS_NO_TERMINATE.try_with(|v| *v).unwrap_or(false)
+    {
+        // Suppress the Drop fallback — the upstream caller (typically
+        // `WorkerProxyStore::get_part_sequential`) owns recovery on the
+        // still-open OUTER writer.
+        guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
+        return;
+    }
+    guard.commit_delegated_if_ok(res);
 }
 
 /// Listener registered on the fast store's eviction map so the
@@ -3130,13 +3175,18 @@ impl StoreDriver for FastSlowStore {
             // Ok (EOF). On Err the contract is also termination, but a
             // sub-store contract violation (Err without send_error) would
             // silently deadlock paired readers without the Drop fallback.
-            // Use commit_delegated_if_ok so the safety net stays armed
-            // on Err — caught by the synthesized Internal at Drop time.
+            // Use `commit_with_inner_miss_gate` so the safety net stays
+            // armed on Err — except when the caller has set
+            // `INNER_MISS_NO_TERMINATE` and the err is NotFound with no
+            // bytes written, in which case the upstream caller owns
+            // peer-fetch recovery on the still-open OUTER writer (#171
+            // parallel-path coverage).
+            let bytes_before = guard.get_bytes_written();
             let res = self
                 .slow_store
                 .get_part(key, &mut *guard, offset, length)
                 .await;
-            guard.commit_delegated_if_ok(&res);
+            commit_with_inner_miss_gate(&mut guard, &res, bytes_before);
             res?;
             self.metrics
                 .slow_store_downloaded_bytes
@@ -3227,9 +3277,13 @@ impl StoreDriver for FastSlowStore {
                 // be present even though the producer's stream failed.
             }
             let bytes_before = guard.get_bytes_written();
-            // Sub-call terminates the writer on Ok; commit_delegated_if_ok
-            // keeps the Drop fallback armed on Err so a sub-store contract
-            // violation (Err without send_error) is caught at Drop time.
+            // Sub-call terminates the writer on Ok; the gate-aware
+            // commit at the bottom keeps the Drop fallback armed on Err
+            // (catching sub-store contract violations) EXCEPT when the
+            // caller set `INNER_MISS_NO_TERMINATE` and the err is
+            // NotFound with no bytes written — in which case the
+            // upstream caller owns peer-fetch recovery (#171
+            // parallel-path coverage).
             let res = match self
                 .fast_store
                 .get_part(key.borrow(), &mut *guard, offset, length)
@@ -3255,7 +3309,7 @@ impl StoreDriver for FastSlowStore {
                     Err(guard.fail(err))
                 }
             };
-            guard.commit_delegated_if_ok(&res);
+            commit_with_inner_miss_gate(&mut guard, &res, bytes_before);
             return res;
         }
 
@@ -3269,11 +3323,12 @@ impl StoreDriver for FastSlowStore {
                 earliest,
                 "streaming populate: chunks evicted, falling back to slow store"
             );
+            let bytes_before = guard.get_bytes_written();
             let res = self
                 .slow_store
                 .get_part(key.borrow(), &mut *guard, offset, length)
                 .await;
-            guard.commit_delegated_if_ok(&res);
+            commit_with_inner_miss_gate(&mut guard, &res, bytes_before);
             return res;
         }
 
@@ -3359,6 +3414,21 @@ impl StoreDriver for FastSlowStore {
                     // no longer fire for caller cancellation (which was
                     // the production WARN flood); only genuine producer
                     // errors or sliding-window evictions reach it.
+                    //
+                    // #171 parallel-path coverage: a parallel-chunk
+                    // request that races multiple `get_part` calls for
+                    // the same digest through a single FastSlowStore
+                    // turns ALL but one caller into WAITERS here. The
+                    // populator-NotFound flowing through the streaming
+                    // buffer wakes every waiter at this Err arm; the
+                    // waiter's slow-store fallback then ALSO returns
+                    // NotFound (slow tier really is empty), and the
+                    // pre-fix `commit_delegated_if_ok(&Err)` left the
+                    // Drop fallback armed → terminating the OUTER
+                    // writer. Each waiter's WPS would then see the
+                    // inner-NotFound and fall through to peer-fetch on
+                    // a now-closed writer. Honor the gate here so the
+                    // waiter's OUTER writer survives for peer-fetch.
                     let bytes_already_sent = guard.get_bytes_written();
                     let new_offset = offset + bytes_already_sent;
                     let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
@@ -3373,7 +3443,11 @@ impl StoreDriver for FastSlowStore {
                         .slow_store
                         .get_part(key.borrow(), &mut *guard, new_offset, new_length)
                         .await;
-                    guard.commit_delegated_if_ok(&res);
+                    commit_with_inner_miss_gate(
+                        &mut guard,
+                        &res,
+                        bytes_already_sent,
+                    );
                     return res;
                 }
             }
