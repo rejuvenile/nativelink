@@ -530,16 +530,24 @@ async fn inner_main(
                         target: "nativelink::stable_storage_broadcast",
                         digest_count = all_digests.len(),
                         scheduler_count = schedulers.len(),
-                        "BlobsInStableStorage: broadcasting drained digests"
+                        "BlobsInStableStorage: broadcasting drained digests (chunked)"
                     );
                     for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
+                        // (#97) Chunked dispatch: splits the digest list
+                        // into ~4096-digest chunks, dispatches each via
+                        // `Update::ChunkedMessage(BlobsInStableStorage)`,
+                        // and tracks per-worker unacked chunks so a worker
+                        // reconnect replays them. Closes the durability
+                        // gap from #89 where BIS notifications were lost
+                        // on h2/QUIC stream churn — without ack-tracking,
+                        // a single dropped chunk leaked pin state forever.
                         scheduler
-                            .broadcast_blobs_in_stable_storage(all_digests.clone())
+                            .broadcast_blobs_in_stable_storage_chunked(all_digests.clone())
                             .await;
                         info!(
                             target: "nativelink::stable_storage_broadcast",
                             scheduler_idx,
-                            "BlobsInStableStorage: broadcast returned for scheduler"
+                            "BlobsInStableStorage chunked: broadcast returned for scheduler"
                         );
                     }
                 }

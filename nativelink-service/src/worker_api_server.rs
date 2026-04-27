@@ -335,7 +335,7 @@ impl WorkerApiServer {
         // the owner_worker_id update guarantees the OLD task cannot
         // observe a half-applied state where the old owner is still
         // recorded but the locality_map has already been mutated.
-        if !worker_cas_endpoint.is_empty() {
+        let needs_bis_buffer_clear = if !worker_cas_endpoint.is_empty() {
             let mut state = self.endpoint_state.lock();
             let prev = state.get(&worker_cas_endpoint).cloned();
             // Wipe whenever the new epoch differs from the prev epoch,
@@ -381,6 +381,20 @@ impl WorkerApiServer {
                     owner_worker_id: worker_id.clone(),
                 },
             );
+            needs_wipe
+        } else {
+            false
+        };
+
+        // (#97) On boot_epoch change, clear the BIS resend buffer for
+        // this endpoint BEFORE add_worker triggers replay. The new
+        // process has fresh pin state; replaying old chunks would just
+        // waste memory until the worker happens to ack. Done outside
+        // the sync `endpoint_state` mutex because the call is async.
+        if needs_bis_buffer_clear && !worker_cas_endpoint.is_empty() {
+            self.scheduler
+                .clear_bis_resend_buffer_for_endpoint(&worker_cas_endpoint)
+                .await;
         }
 
         // Now register the worker with the scheduler. This triggers

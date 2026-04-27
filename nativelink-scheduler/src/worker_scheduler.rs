@@ -103,6 +103,15 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     /// be unpinned from local CAS. Default implementation is a no-op.
     async fn broadcast_blobs_in_stable_storage(&self, _digests: Vec<DigestInfo>) {}
 
+    /// (#97) Chunked variant of `broadcast_blobs_in_stable_storage`.
+    /// Default implementation falls back to the unchunked variant so
+    /// schedulers that don't implement chunking still work; the
+    /// production `ApiWorkerScheduler` overrides this to do per-chunk
+    /// dispatch + per-worker resend tracking.
+    async fn broadcast_blobs_in_stable_storage_chunked(&self, digests: Vec<DigestInfo>) {
+        self.broadcast_blobs_in_stable_storage(digests).await;
+    }
+
     /// (#97) Notify the scheduler that a worker has acked one BIS chunk.
     /// The scheduler drops the matching `(broadcast_id, sequence)` from
     /// its per-worker resend buffer. Default impl is a no-op (schedulers
@@ -114,4 +123,10 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
         _sequence: u32,
     ) {
     }
+
+    /// (#97) Drop the BIS resend buffer for a worker's `cas_endpoint`.
+    /// Called on `boot_epoch_id` change so the new worker process — which
+    /// has fresh pin state — doesn't get bombarded with replays for
+    /// digests that no longer exist in its CAS. Default impl is a no-op.
+    async fn clear_bis_resend_buffer_for_endpoint(&self, _cas_endpoint: &str) {}
 }

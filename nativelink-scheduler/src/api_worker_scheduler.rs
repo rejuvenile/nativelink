@@ -3775,6 +3775,10 @@ impl WorkerScheduler for ApiWorkerScheduler {
         self.broadcast_blobs_in_stable_storage(digests).await;
     }
 
+    async fn broadcast_blobs_in_stable_storage_chunked(&self, digests: Vec<DigestInfo>) {
+        self.broadcast_blobs_in_stable_storage_chunked(digests).await;
+    }
+
     async fn bis_ack_received(
         &self,
         worker_id: &WorkerId,
@@ -3784,6 +3788,10 @@ impl WorkerScheduler for ApiWorkerScheduler {
         // Inherent impl on ApiWorkerScheduler is the source of truth
         // for BIS resend tracking; the trait impl just forwards.
         self.bis_ack_received(worker_id, broadcast_id, sequence).await;
+    }
+
+    async fn clear_bis_resend_buffer_for_endpoint(&self, cas_endpoint: &str) {
+        self.clear_bis_resend_buffer_for_endpoint(cas_endpoint).await;
     }
 }
 

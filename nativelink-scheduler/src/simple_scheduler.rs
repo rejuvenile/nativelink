@@ -1019,6 +1019,12 @@ impl WorkerScheduler for SimpleScheduler {
             .await;
     }
 
+    async fn broadcast_blobs_in_stable_storage_chunked(&self, digests: Vec<DigestInfo>) {
+        self.worker_scheduler
+            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .await;
+    }
+
     async fn bis_ack_received(
         &self,
         worker_id: &WorkerId,
@@ -1027,6 +1033,12 @@ impl WorkerScheduler for SimpleScheduler {
     ) {
         self.worker_scheduler
             .bis_ack_received(worker_id, broadcast_id, sequence)
+            .await;
+    }
+
+    async fn clear_bis_resend_buffer_for_endpoint(&self, cas_endpoint: &str) {
+        self.worker_scheduler
+            .clear_bis_resend_buffer_for_endpoint(cas_endpoint)
             .await;
     }
 }
