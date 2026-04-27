@@ -16,6 +16,7 @@ pub mod action_messages;
 pub mod blob_locality_map;
 pub mod buf_channel;
 pub mod channel_body_for_tests;
+pub mod chunk_iter;
 pub mod chunked_stream;
 pub mod coalesce;
 pub mod common;
