@@ -33,11 +33,13 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     BlobDigestInfo, BlobsAvailableNotification, ExecuteComplete, ExecuteResult, GoingAwayRequest,
-    KeepAliveRequest, MirrorPinEntry, UpdateForWorker, execute_result,
+    KeepAliveRequest, MirrorPinEntry, PeerHintsChunk, UpdateForWorker, chunked_message,
+    execute_result,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::FilesystemStore;
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
+use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
@@ -625,13 +627,18 @@ const DEFAULT_ENDPOINT_TIMEOUT_S: f32 = 5.;
 ///
 /// Tonic's generated client default is 4 MiB. The worker receives the
 /// `UpdateForWorker` oneof which today carries:
-///   * `StartExecute` with up to `MAX_PEER_HINTS = 16384` `PeerHint` entries
-///     (each ~250 bytes worst case → potentially > 4 MiB on its own), plus
-///     pre-resolved directory trees up to 32 MiB
-///     (`api_worker_scheduler::MAX_TREE_PROTO_BYTES`).
+///   * `StartExecute` with pre-resolved directory trees up to 32 MiB
+///     (`api_worker_scheduler::MAX_TREE_PROTO_BYTES`). Peer hints used to
+///     ride here under a `MAX_PEER_HINTS = 16384` cap; #98 moved them to
+///     `Update::ChunkedMessage(PeerHintsChunk)` so `StartExecute` no
+///     longer balloons under high-locality workloads.
 ///   * `BlobsInStableStorage` with an unbounded `repeated Digest` list
 ///     (one entry per blob the server just persisted; a write burst of
-///     thousands of blobs in a single message is plausible).
+///     thousands of blobs in a single message is plausible). #97 will
+///     chunk this similarly.
+///   * `Update::ChunkedMessage` payloads — capped per chunk by their
+///     producer (e.g. `PEER_HINTS_PER_CHUNK = 256` ≈ 64 KiB), so the
+///     decoder limit is not the bottleneck for chunked streams.
 ///
 /// At the default 4 MiB limit, a large `StartExecute` or
 /// `BlobsInStableStorage` would be silently rejected by the worker's tonic
@@ -837,6 +844,70 @@ pub fn handle_blobs_in_stable_storage(
     );
 }
 
+/// Process one `PeerHintsChunk` arriving on the scheduler→worker stream:
+/// register every (digest, endpoints) pair into the worker's global
+/// `peer_locality_map` so subsequent `WorkerProxyStore` reads can route
+/// to peer workers.
+///
+/// Direct-merge design: NO buffer keyed on `operation_id`, NO wait for a
+/// chunk-count predicate, NO race-elimination machinery. Each chunk's
+/// hints are independently meaningful — a chunk that arrives BEFORE the
+/// matching `StartAction` works fine (the worker has the hints early); a
+/// chunk that arrives AFTER `input_fetch` started works fine too (the
+/// hints simply aren't consulted; the worker falls back to the server CAS
+/// or whatever locality state was already present).
+///
+/// Logged at `info!` so the chunk arrival cadence is visible in
+/// production journals; the per-chunk count + sequence + is_last let
+/// reviewers reconstruct the scheduler's emit pattern from logs alone.
+pub fn handle_peer_hints_chunk(
+    peer_locality_map: Option<&SharedBlobLocalityMap>,
+    chunk: &PeerHintsChunk,
+) {
+    let Some(locality_map) = peer_locality_map else {
+        // Worker built without peer-blob sharing (no `cas_server_port`).
+        // Hints would be unused even if registered; drop them silently
+        // at trace level.
+        trace!(
+            operation_id = %chunk.operation_id,
+            sequence = chunk.sequence,
+            is_last = chunk.is_last,
+            hint_count = chunk.peer_hints.len(),
+            "PeerHintsChunk received but worker has no peer_locality_map (peer sharing disabled)"
+        );
+        return;
+    };
+    let mut total_registered = 0usize;
+    {
+        // Single locked region per chunk so we don't pay N times the
+        // contention cost for a 256-hint payload. The bottleneck of the
+        // worker's read path is `WorkerProxyStore::lookup_workers`, which
+        // takes a read lock; bursts of writes don't starve it because
+        // parking_lot RwLock is fair.
+        let mut map = locality_map.write();
+        for hint in &chunk.peer_hints {
+            let Some(ref digest_proto) = hint.digest else {
+                continue;
+            };
+            let Ok(digest) = DigestInfo::try_from(digest_proto) else {
+                continue;
+            };
+            for endpoint in &hint.peer_endpoints {
+                map.register_blobs(endpoint, &[digest]);
+                total_registered += 1;
+            }
+        }
+    }
+    info!(
+        operation_id = %chunk.operation_id,
+        sequence = chunk.sequence,
+        is_last = chunk.is_last,
+        hint_count = chunk.peer_hints.len(),
+        registrations = total_registered,
+        "PeerHintsChunk: registered hints into worker locality map"
+    );
+}
+
 struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> {
     config: &'a LocalWorkerConfig,
     // According to the tonic documentation it is a cheap operation to clone this.
@@ -851,6 +922,11 @@ struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsM
     metrics: Arc<Metrics>,
     /// State for periodic BlobsAvailable reporting. None if disabled (no CAS endpoint).
     blobs_available_state: Option<BlobsAvailableState>,
+    /// Worker-global locality map shared with `WorkerProxyStore`. When
+    /// present, `Update::ChunkedMessage(PeerHints)` arms register hints
+    /// directly into this map. None if peer-blob sharing is disabled
+    /// (no `cas_server_port`).
+    peer_locality_map: Option<SharedBlobLocalityMap>,
     /// Reference to the CAS server shutdown signal for graceful shutdown.
     cas_shutdown_tx: &'a Option<tokio::sync::watch::Sender<bool>>,
 }
@@ -914,6 +990,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         running_actions_manager: Arc<U>,
         metrics: Arc<Metrics>,
         blobs_available_state: Option<BlobsAvailableState>,
+        peer_locality_map: Option<SharedBlobLocalityMap>,
         cas_shutdown_tx: &'a Option<tokio::sync::watch::Sender<bool>>,
     ) -> Self {
         Self {
@@ -928,6 +1005,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             actions_in_transit: Arc::new(AtomicU64::new(0)),
             metrics,
             blobs_available_state,
+            peer_locality_map,
             cas_shutdown_tx,
         }
     }
@@ -1594,6 +1672,26 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                 );
                             }
                         }
+                        Update::ChunkedMessage(chunked) => {
+                            // (#98) Streaming protocol envelope. Today only the
+                            // PeerHints arm is populated; future PRs add
+                            // BlobsInStableStorage and BlobsAvailable arms.
+                            // Per-arm dispatch keeps the route correct as the
+                            // `oneof` grows.
+                            match chunked.payload {
+                                Some(chunked_message::Payload::PeerHints(chunk)) => {
+                                    handle_peer_hints_chunk(
+                                        self.peer_locality_map.as_ref(),
+                                        &chunk,
+                                    );
+                                }
+                                None => {
+                                    warn!(
+                                        "Update::ChunkedMessage with empty payload from scheduler; ignoring"
+                                    );
+                                }
+                            }
+                        }
                         Update::UploadMissingBlobs(request) => {
                             // Server is requesting we upload blobs it doesn't
                             // have. Read from local fast store and upload to
@@ -2028,6 +2126,11 @@ pub struct LocalWorker<T: WorkerApiClientTrait + 'static, U: RunningActionsManag
     metrics: Arc<Metrics>,
     /// State for periodic BlobsAvailable reporting.
     blobs_available_state: Option<BlobsAvailableState>,
+    /// Worker-global locality map shared with `WorkerProxyStore`. Forwarded
+    /// to `LocalWorkerImpl` so `Update::ChunkedMessage(PeerHints)` chunks
+    /// can register hints directly without going through the action
+    /// manager (#98 — peer-hints chunking, direct-merge design).
+    peer_locality_map: Option<SharedBlobLocalityMap>,
     /// Guards for the worker CAS server tasks (TCP + QUIC). Keeps the tasks
     /// alive as long as the `LocalWorker` is alive. When dropped, servers abort.
     _cas_server_guards: Vec<JoinHandleDropGuard<Result<(), Error>>>,
@@ -2485,7 +2588,7 @@ pub async fn new_local_worker(
         }
     }
 
-    let local_worker = LocalWorker::new_with_connection_factory_and_actions_manager(
+    let local_worker = LocalWorker::new_with_connection_factory_actions_manager_and_locality(
         config.clone(),
         running_actions_manager,
         Box::new(move || {
@@ -2553,6 +2656,7 @@ pub async fn new_local_worker(
         }),
         Box::new(move |d| Box::pin(sleep(d))),
         blobs_available_state,
+        peer_locality_map,
         cas_server_guard,
         cas_shutdown_tx,
     );
@@ -2569,6 +2673,34 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
         cas_server_guards: Vec<JoinHandleDropGuard<Result<(), Error>>>,
         cas_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Self {
+        Self::new_with_connection_factory_actions_manager_and_locality(
+            config,
+            running_actions_manager,
+            connection_factory,
+            sleep_fn,
+            blobs_available_state,
+            None,
+            cas_server_guards,
+            cas_shutdown_tx,
+        )
+    }
+
+    /// Same as `new_with_connection_factory_and_actions_manager` but plumbs
+    /// through an optional `peer_locality_map` so the worker's
+    /// `Update::ChunkedMessage(PeerHints)` arm can register hints
+    /// directly. The legacy constructor preserved as a thin wrapper so
+    /// existing test setups (which never enable peer sharing) compile
+    /// unchanged.
+    pub fn new_with_connection_factory_actions_manager_and_locality(
+        config: Arc<LocalWorkerConfig>,
+        running_actions_manager: Arc<U>,
+        connection_factory: ConnectionFactory<T>,
+        sleep_fn: Box<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>,
+        blobs_available_state: Option<BlobsAvailableState>,
+        peer_locality_map: Option<SharedBlobLocalityMap>,
+        cas_server_guards: Vec<JoinHandleDropGuard<Result<(), Error>>>,
+        cas_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    ) -> Self {
         let metrics = Arc::new(Metrics::new(Arc::downgrade(
             running_actions_manager.metrics(),
         )));
@@ -2579,6 +2711,7 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             sleep_fn: Some(sleep_fn),
             metrics,
             blobs_available_state,
+            peer_locality_map,
             _cas_server_guards: cas_server_guards,
             cas_shutdown_tx,
         }
@@ -2693,6 +2826,7 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
                         self.running_actions_manager.clone(),
                         self.metrics.clone(),
                         self.blobs_available_state.clone(),
+                        self.peer_locality_map.clone(),
                         &self.cas_shutdown_tx,
                     ),
                     update_for_worker_stream,

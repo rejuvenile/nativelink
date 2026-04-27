@@ -5144,34 +5144,13 @@ impl RunningActionsManager for RunningActionsManagerImpl {
         self.metrics
             .create_and_add_action
             .wrap(async move {
-                // Extract peer hints BEFORE consuming start_execute.
-                let peer_hints = start_execute.peer_hints.clone();
-                info!(
-                    peer_hint_count = peer_hints.len(),
-                    has_locality_map = self.peer_locality_map.is_some(),
-                    "create_and_add_action: peer hints received"
-                );
-                if !peer_hints.is_empty() {
-                    if let Some(ref locality_map) = self.peer_locality_map {
-                        let mut map = locality_map.write();
-                        let mut total_registered = 0usize;
-                        for hint in &peer_hints {
-                            if let Some(ref digest_proto) = hint.digest {
-                                if let Ok(digest) = DigestInfo::try_from(digest_proto) {
-                                    for endpoint in &hint.peer_endpoints {
-                                        map.register_blobs(endpoint, &[digest]);
-                                        total_registered += 1;
-                                    }
-                                }
-                            }
-                        }
-                        info!(
-                            hints = peer_hints.len(),
-                            registrations = total_registered,
-                            "Registered peer hints from scheduler into worker locality map"
-                        );
-                    }
-                }
+                // Peer hints used to ride inside `StartExecute.peer_hints` and
+                // get registered here. As of #98 (peer-hints chunking) hints
+                // arrive on a separate `Update::ChunkedMessage` stream owned
+                // by `LocalWorkerImpl::run` — they're already in
+                // `peer_locality_map` by the time this code runs (or will be
+                // shortly; the worker tolerates either ordering because each
+                // chunk's hints are independently meaningful).
 
                 // Extract pre-resolved directory tree from the scheduler
                 // before consuming start_execute. The parallel arrays are
