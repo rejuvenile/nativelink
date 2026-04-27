@@ -2349,13 +2349,30 @@ async fn cdn_cache_populates_local_on_first_peer_fetch() -> Result<(), Error> {
 /// it represents the FULL bytes. Subsequent reads of the same digest
 /// would return wrong data.
 ///
-/// Implementation: use a `RecordingInnerStore` so we observe whether
-/// the tee called `update()` at all. Doing so via the production
-/// chain (which happens to reject partial bytes via VerifyStore) would
-/// pass the test for the wrong reason — the guard could be removed
-/// and the test would still pass because VerifyStore caught the
-/// mistake. We want the test to fire on the OVER-ACTION itself
-/// (tee invocation), not the downstream defense.
+/// Production composition: `RecordingInnerStore` is wired as the SLOW
+/// tier of `FastSlowStore`, with a `MemoryStore` as the fast tier and
+/// `VerifyStore` (`verify_size=true`) + `ExistenceCacheStore` wrapping
+/// it. This matches the server CAS chain
+/// `ExistenceCache → Verify → FastSlow{fast=Memory, slow=Recording}`
+/// so the test exercises the same composition that ships in
+/// production. The recorder remains the slow tier so its `update()`
+/// counter still observes any tee invocation that survives the chain.
+///
+/// Why also check `RecordingInnerStore::update_calls == 0`: even
+/// though `VerifyStore` would reject partial bytes that fail the
+/// size check, the OVER-action we want to guard is the tee CALLING
+/// `inner.update()` AT ALL on a partial-range read. Removing the
+/// `offset == 0 && length.is_none()` guard would make the chain
+/// observe the partial bytes — VerifyStore catching the mistake is
+/// the WRONG reason for this test to pass. The recorder fires on
+/// the OVER-action itself, regardless of downstream defenses.
+///
+/// Synchronization: termination of `get_part_unchunked` is the
+/// barrier — the `tokio::join!` inside `get_part_and_cache` awaits
+/// the cache_write_fut alongside forward_fut, so by the time the
+/// outer call returns the cache write has either run to completion
+/// or short-circuited (no detached task). No `tokio::time::sleep`
+/// is used as a synchronization primitive (per CLAUDE.md §Tests).
 ///
 /// Mutation step: remove the partial-range guard
 /// (`offset == 0 && length.is_none()`) inside `get_part_and_cache`.
@@ -2370,14 +2387,45 @@ async fn cdn_cache_does_not_populate_on_partial_range_read() -> Result<(), Error
     let value: Vec<u8> = (0..10_000u32).map(|i| (i & 0xFF) as u8).collect();
     let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
 
+    // Production composition for the WPS inner chain:
+    //   ExistenceCache → Verify(verify_size=true)
+    //                  → FastSlow{fast=Memory, slow=Recording}
     let recording = Arc::new(RecordingInnerStore {
         update_calls: AtomicU64::new(0),
     });
     let recording_for_assert = recording.clone();
-    let inner = Store::new(recording);
+    let recording_store = Store::new(recording);
+    let fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        recording_store,
+    ));
+    let verify = Store::new(VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        fast_slow,
+    ));
+    let existence_cache = Store::new(ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1_000_000,
+                ..Default::default()
+            }),
+        },
+        verify,
+    ));
 
     let locality_map = new_shared_blob_locality_map();
-    let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
+    let proxy_arc = WorkerProxyStore::new(existence_cache, locality_map.clone());
     let proxy = Store::new(proxy_arc.clone());
 
     let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
@@ -2396,7 +2444,10 @@ async fn cdn_cache_does_not_populate_on_partial_range_read() -> Result<(), Error
         proxy.get_part_unchunked(digest, 10, Some(100)),
     )
     .await
-    .expect("partial-range read must complete within 5s")?;
+    .expect(
+        "must not deadlock — partial-range peer read must complete \
+         within 5s; production composition wraps a RecordingInnerStore",
+    )?;
 
     assert_eq!(
         bytes.len(),
@@ -2407,16 +2458,20 @@ async fn cdn_cache_does_not_populate_on_partial_range_read() -> Result<(), Error
 
     // CRITICAL: tee MUST NOT have called inner.update() — partial-range
     // bytes would corrupt the local CAS under the full-blob digest.
-    // Wait briefly to give any (incorrect) background tee task time to
-    // fire so we don't false-pass on a race.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // No sleep needed: the partial-range path takes the early-return
+    // `if !should_cache` branch in get_part_and_cache (line ~898), so
+    // no tee future is even scheduled. Once get_part_unchunked has
+    // returned, the outcome is final — there is no detached task to
+    // wait for. Polling for "did anything fire?" with sleep would be
+    // sleep-as-synchronization (forbidden by CLAUDE.md §Tests).
     let calls = recording_for_assert.update_calls.load(AOrdering::SeqCst);
     assert_eq!(
         calls, 0,
         "CDN tee MUST NOT populate local CAS on partial-range read — \
          caching prefix/middle bytes under the full-blob digest corrupts \
          every subsequent read; observed {calls} update() call(s) when 0 \
-         was expected",
+         was expected (production composition: ExistenceCache → Verify \
+         → FastSlow{{fast=Memory, slow=Recording}})",
     );
 
     Ok(())
@@ -2514,6 +2569,16 @@ impl StoreDriver for RecordingInnerStore {
 /// channel the implementation explicitly drops the cache writer and
 /// continues forwarding to the caller.
 ///
+/// Production composition: `FailingUpdateStore` is wired as the FAST
+/// tier of `FastSlowStore` (with a `MemoryStore` slow tier) and that
+/// `FastSlowStore` is wrapped by `VerifyStore` + `ExistenceCacheStore`,
+/// matching the server CAS chain
+/// `ExistenceCache → Verify → FastSlow{fast=Failing, slow=Memory}`.
+/// Putting `FailingUpdate` in the FAST slot is what causes the chain's
+/// `update()` to fail (FastSlow returns Err on the fast tier write
+/// failure at `fast_slow_store.rs:2241`); putting it in the slow slot
+/// would silently succeed because the slow write is decoupled.
+///
 /// Mutation step: replace the `warn!` log on cache_result Err with
 /// `?` propagation. Test must then fail because the original read
 /// returns Err instead of bytes.
@@ -2524,12 +2589,44 @@ async fn cdn_cache_failure_does_not_fail_read() -> Result<(), Error> {
     let value: Vec<u8> = (0..1_000u32).map(|i| (i & 0xFF) as u8).collect();
     let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
 
-    // Use a FailingUpdateStore as inner: get_part returns NotFound,
-    // update always returns Err. This forces the tee path to error
-    // while the peer-fetch must still succeed end-to-end.
-    let failing_inner = Store::new(Arc::new(FailingUpdateStore { _marker: () }));
+    // Production composition for the WPS inner chain:
+    //   ExistenceCache → Verify(verify_size=true)
+    //                  → FastSlow{fast=Failing, slow=Memory}
+    // FailingUpdate must be the fast tier so FastSlow's `update()`
+    // surfaces the error (see line ~2241: `fast_res?` after the
+    // fast-store write completes).
+    let failing_fast = Store::new(Arc::new(FailingUpdateStore { _marker: () }));
+    let fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        failing_fast,
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let verify = Store::new(VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        fast_slow,
+    ));
+    let existence_cache = Store::new(ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1_000_000,
+                ..Default::default()
+            }),
+        },
+        verify,
+    ));
+
     let locality_map = new_shared_blob_locality_map();
-    let proxy_arc = WorkerProxyStore::new(failing_inner, locality_map.clone());
+    let proxy_arc = WorkerProxyStore::new(existence_cache, locality_map.clone());
     let proxy = Store::new(proxy_arc.clone());
 
     let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
@@ -2548,15 +2645,171 @@ async fn cdn_cache_failure_does_not_fail_read() -> Result<(), Error> {
         proxy.get_part_unchunked(digest, 0, None),
     )
     .await
-    .expect("read must complete within 5s even when tee fails")?;
+    .expect(
+        "must not deadlock — peer-fetch with failing tee must complete \
+         within 5s; tee best-effort contract violated if cache_write_fut \
+         hangs while waiting on a closed channel",
+    )?;
 
     assert_eq!(
         bytes.len(),
         value.len(),
         "tee failure MUST NOT fail the original read — peer bytes must \
-         still be delivered to the caller; the tee is best-effort",
+         still be delivered to the caller; the tee is best-effort \
+         (production composition: ExistenceCache → Verify → \
+         FastSlow{{fast=Failing, slow=Memory}})",
     );
     assert_eq!(bytes.as_ref(), value.as_slice());
+
+    Ok(())
+}
+
+/// Test 4 (peer-mid-stream-Err survives un-terminated cache_tx).
+///
+/// Documented coverage gap: in `get_part_and_cache`, when the peer
+/// errors mid-stream after pumping some bytes, `proxy_tx` is dropped
+/// without `send_eof()`/`send_error()`. `forward_fut` then sees
+/// `proxy_rx.recv()` Err on its next iteration and returns Err,
+/// which drops `cache_tx` at the end of the async block. The
+/// `cache_write_fut` (running `inner.update`) observes the dropped
+/// sender on `cache_rx` and returns its own Err. The `tokio::join!`
+/// completes for all three futures and the outer caller receives
+/// the structured peer error.
+///
+/// What this guards: `cache_tx` is left UN-terminated (no explicit
+/// `send_eof` or `send_error`); `inner.update()` relies on the
+/// implicit drop of `cache_tx` to unblock its read half. If a
+/// future refactor hoists `cache_tx` out of `forward_fut`'s scope
+/// (so the drop is delayed past the join!), `cache_write_fut` would
+/// block forever waiting on `cache_rx.recv()` and the outer get_part
+/// would deadlock.
+///
+/// Production composition: same as Test 3 — `FailingUpdateStore` as
+/// the fast tier of FastSlow inside Verify+ExistenceCache. The
+/// `FailingUpdateStore::update` impl drains its reader before
+/// returning Err, so it observes the implicit cache_tx drop and
+/// returns naturally — exactly the production contract under test.
+///
+/// Asserts:
+///   (a) outer caller writer sees the peer's Err (NOT a hang),
+///   (b) inner.update() observed the dropped read half (also NOT a
+///       hang) — covered by the same 5s timeout that wraps (a),
+///       because the join! awaits cache_write_fut alongside
+///       forward_fut. If cache_write_fut were stuck on cache_rx,
+///       the timeout would fire.
+///
+/// Mutation step: in `WorkerProxyStore::get_part_and_cache`,
+/// replace the implicit drop of `cache_tx` at the end of
+/// `forward_fut` with an explicit `core::mem::forget(cache_tx)` (or
+/// hoist `cache_tx` to the outer scope so it outlives forward_fut).
+/// The test must then panic with the
+/// "must not deadlock — cache_tx un-terminated on peer-mid-stream-Err"
+/// message because cache_write_fut blocks on cache_rx.recv()
+/// indefinitely.
+#[nativelink_test]
+async fn cdn_cache_failure_on_peer_mid_stream_err_does_not_deadlock() -> Result<(), Error> {
+    use core::time::Duration;
+
+    let value: Vec<u8> = (0..50_000u32).map(|i| (i & 0xFF) as u8).collect();
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    // Production composition: ExistenceCache → Verify → FastSlow
+    // with FailingUpdate as fast tier so any tee invocation surfaces
+    // an Err at the chain root (matches the chain's update()
+    // failure mode that motivates the un-terminated cache_tx case).
+    let failing_fast = Store::new(Arc::new(FailingUpdateStore { _marker: () }));
+    let fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        failing_fast,
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let verify = Store::new(VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        fast_slow,
+    ));
+    let existence_cache = Store::new(ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1_000_000,
+                ..Default::default()
+            }),
+        },
+        verify,
+    ));
+
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(existence_cache, locality_map.clone());
+    let proxy = Store::new(proxy_arc.clone());
+
+    // Peer: writes a non-trivial prefix (so forward_fut has consumed
+    // at least one chunk and cache_tx has been used for at least one
+    // send) and then errors mid-stream with a structured DataLoss code
+    // (peer drops proxy_tx without EOF, forward_fut sees recv Err on
+    // next iteration).
+    let prefix: Bytes = Bytes::from(value[..1024].to_vec());
+    let peer_inner = Store::new(Arc::new(PartialWriteThenErrorStore {
+        prefix,
+        err_code: Code::DataLoss,
+        err_marker: "cdn-tee-test4: peer mid-stream error".to_string(),
+    }));
+    let peer_endpoint = "grpc://cdn-tee-mid-stream-err-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_inner);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    // Outer call must error (peer's mid-stream DataLoss surfaces) and
+    // must NOT deadlock. Both halves of the assertion are covered by
+    // the timeout: if cache_write_fut were stuck on cache_rx.recv()
+    // (because cache_tx was leaked past forward_fut's scope), the
+    // tokio::join! inside get_part_and_cache would never complete and
+    // the outer get_part_unchunked would not return.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        proxy.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — cache_tx un-terminated on peer-mid-stream-Err",
+    );
+
+    // (a) The outer caller saw the peer's structured error — not a
+    // generic "writer dropped" artifact. Confirms the error surfaced
+    // through both forward_fut AND the get_part_and_cache error-
+    // preference branch (line ~1027).
+    let err = match outcome {
+        Ok(bytes) => panic!(
+            "expected peer-mid-stream-Err to surface to caller; got Ok({} \
+             bytes) — peer's mid-stream DataLoss was swallowed",
+            bytes.len()
+        ),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.code,
+        Code::DataLoss,
+        "outer caller must see the peer's structured DataLoss code; got \
+         {:?} ({err}) — peer error swallowed by forward_fut artifact",
+        err.code,
+    );
+
+    // (b) The fact that the timeout did NOT fire above proves
+    // cache_write_fut also returned. cache_write_fut runs inner.update
+    // through the production composition; FailingUpdateStore drains
+    // the reader and returns Err, so its drain ONLY completes if
+    // cache_rx saw the dropped sender. If cache_tx had been leaked
+    // past forward_fut's scope, drain would block on recv and the
+    // 5s timeout above would have fired.
 
     Ok(())
 }
