@@ -1315,6 +1315,26 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
         self.evicting_map
             .sizes_for_keys(own_keys.iter(), results, false /* peek */)
             .await;
+        // `sizes_for_keys` returns `LenEntry::len()`, which for
+        // `FileEntryImpl` is `size_on_disk()` =
+        // `data_size.div_ceil(block_size) * block_size` (page-rounded
+        // for EvictingMap LRU accounting). The trait contract for
+        // `has_with_results` requires the actual blob byte length;
+        // returning the page-rounded value causes upstream callers
+        // (e.g. `FastSlowStore::run_producer`) to construct
+        // `UploadSizeInfo::ExactSize(rounded)` then stream only the
+        // actual `data_size` bytes — which trips MemoryStore's ExactSize
+        // enforcement and rejects every populate of a non-page-aligned
+        // blob. For `Digest` keys the actual size is encoded in the
+        // digest itself; for `Str` keys we have no separate logical
+        // size to substitute, so we leave the LenEntry value unchanged.
+        for (key, result) in keys.iter().zip(results.iter_mut()) {
+            if result.is_some() {
+                if let StoreKey::Digest(digest) = key.borrow() {
+                    *result = Some(digest.size_bytes());
+                }
+            }
+        }
         // We need to do a special pass to ensure our zero files exist.
         // If our results failed and the result was a zero file, we need to
         // create the file by spec.

@@ -1288,6 +1288,109 @@ async fn get_file_size_uses_block_size() -> Result<(), Error> {
     Ok(())
 }
 
+// Regression: FilesystemStore::has_with_results MUST return the actual
+// blob byte length, NOT the page-rounded `size_on_disk()` used internally
+// for EvictingMap accounting.
+//
+// Production bug (2026-04-26): commit `0ff03300` added an
+// `UploadSizeInfo::ExactSize` enforcement check in `MemoryStore::update`,
+// which exposed a long-latent contract violation in
+// `FilesystemStore::has_with_results`: the underlying `LenEntry::len()`
+// for `FileEntryImpl` returns `size_on_disk()` =
+// `data_size.div_ceil(block_size) * block_size` (page-rounded), and that
+// value leaks back through `EvictingMap::sizes_for_keys` as the "size"
+// that callers like `FastSlowStore::run_producer` then use to construct
+// `UploadSizeInfo::ExactSize(size)` for the populate-fast-store stream.
+// The stream only carries the actual `data_size` bytes, so MemoryStore's
+// new enforcement rejects every populate of a non-page-aligned blob with
+// `MemoryStore::update: ExactSize declared X bytes but received Y` where
+// X is page-aligned and Y is the real digest size. Bazel reads fail with
+// INVALID_ARGUMENT at ~100/sec until either the rounding is fixed or the
+// MemoryStore enforcement is reverted.
+//
+// The fix belongs at the `FilesystemStore::has_with_results` boundary —
+// LenEntry::len()'s page-rounding is intentional for LRU accounting and
+// should stay; what must NOT page-round is the value reported as the
+// blob's logical size.
+#[nativelink_test]
+async fn has_with_results_returns_actual_data_size_not_page_rounded() -> Result<(), Error> {
+    // Deliberately non-page-aligned: 2653392 bytes is exactly the size
+    // observed in production logs for a Bazel blob whose declared size
+    // came back rounded to 2654208 (= 648 * 4096). Reproducing the
+    // exact size makes the failure message match the production log
+    // line for instant pattern recognition.
+    const ACTUAL_BLOB_SIZE: usize = 2_653_392;
+
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+
+    // Default block_size = 4096 (production setting). The bug only
+    // manifests when block_size > 1, which is why the existing test
+    // suite — every existing FilesystemStore test uses
+    // `block_size: 1` — never caught it.
+    let store = Arc::new(
+        FilesystemStore::<FileEntryImpl>::new_with_timeout_and_rename_fn(
+            &FilesystemSpec {
+                content_path: content_path.clone(),
+                temp_path: temp_path.clone(),
+                read_buffer_size: 4 * 1024,
+                ..Default::default()
+            },
+            |from, to| std::fs::rename(from, to),
+        )
+        .await?,
+    );
+
+    let blob_data = make_random_data(ACTUAL_BLOB_SIZE);
+    let digest = DigestInfo::try_new(HASH1, ACTUAL_BLOB_SIZE)?;
+    store
+        .update_oneshot(digest, Bytes::from(blob_data))
+        .await?;
+
+    // Sanity: confirm the LRU-accounting value IS page-rounded (this is
+    // the source of the leak, not a regression target).
+    let entry = store.get_file_entry_for_digest(&digest).await?;
+    let page_rounded = ACTUAL_BLOB_SIZE.next_multiple_of(4096);
+    assert_eq!(
+        entry.size_on_disk(),
+        page_rounded as u64,
+        "size_on_disk() must remain page-rounded for LRU accounting; \
+         this assertion documents the bug source, not the fix",
+    );
+
+    // The actual contract under test: has() must report the ACTUAL
+    // blob size so callers can use it as `UploadSizeInfo::ExactSize`
+    // without truncating downstream readers.
+    let has_size = store
+        .has(digest)
+        .await?
+        .expect("blob just written; has() must return Some");
+    assert_eq!(
+        has_size, ACTUAL_BLOB_SIZE as u64,
+        "has() returned page-rounded size_on_disk ({page_rounded}) \
+         instead of actual digest size ({ACTUAL_BLOB_SIZE}); this is \
+         the production bug — populate_fast_store_unchecked then \
+         streams ExactSize({page_rounded}) into MemoryStore, which \
+         rejects the partial write because the file only has \
+         {ACTUAL_BLOB_SIZE} bytes",
+    );
+
+    // has_with_results must also report actual size — same code path,
+    // but assert it explicitly so a future change to has() doesn't
+    // accidentally leave has_with_results broken.
+    let keys = vec![digest.into()];
+    let mut results = vec![None];
+    store.has_with_results(&keys, &mut results).await?;
+    assert_eq!(
+        results,
+        vec![Some(ACTUAL_BLOB_SIZE as u64)],
+        "has_with_results returned page-rounded size_on_disk; same \
+         underlying bug as has() above",
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn update_with_whole_file_closes_file() -> Result<(), Error> {
     #[expect(clippy::collection_is_never_read)] // TODO(jhpratt) investigate
