@@ -21,7 +21,7 @@ use hyper::body::Frame;
 use nativelink_config::cas_server::{EndpointConfig, LocalWorkerConfig, WorkerProperty};
 use nativelink_error::Error;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BlobsAvailableNotification, ConnectWorkerRequest, ExecuteComplete, ExecuteResult,
+    BisAck, BlobsAvailableNotification, ConnectWorkerRequest, ExecuteComplete, ExecuteResult,
     GoingAwayRequest, KeepAliveRequest, UpdateForWorker,
 };
 use nativelink_util::channel_body_for_tests::ChannelBody;
@@ -52,6 +52,14 @@ enum WorkerClientApiCalls {
     ConnectWorker(ConnectWorkerRequest),
     ExecutionResponse(ExecuteResult),
     BlobsAvailable(BlobsAvailableNotification),
+    /// (#97) Recorded BisAck call from the dispatch arm. Tests that
+    /// exercise the chunked-message envelope-decode path can pull this
+    /// to assert the worker echoed the chunk's
+    /// (broadcast_id, sequence, server_instance_token) into a
+    /// real `worker_api_client_wrapper::bis_ack` call (vs the
+    /// `bis_chunk_handler_test`'s direct ack-sink injection which
+    /// bypasses the dispatch arm).
+    BisAck(BisAck),
 }
 
 #[derive(Debug)]
@@ -63,6 +71,7 @@ enum WorkerClientApiReturns {
     ConnectWorker(Result<Response<Streaming<UpdateForWorker>>, Status>),
     ExecutionResponse(Result<(), Error>),
     BlobsAvailable(Result<(), Error>),
+    BisAck(Result<(), Error>),
 }
 
 #[derive(Clone)]
@@ -154,6 +163,69 @@ impl MockWorkerApiClient {
             .expect("Could not send request to mpsc");
         req
     }
+
+    /// (#97) Receive the next call as a BisAck. Used by the
+    /// production-composition test that asserts the worker's
+    /// `Update::ChunkedMessage(BlobsInStableStorageChunk)` dispatch
+    /// arm wires through `worker_api_client_wrapper::bis_ack` —
+    /// the ack-sink-injection path in `bis_chunk_handler_test`
+    /// bypasses both the envelope-decode AND the wrapper.
+    #[allow(dead_code, reason = "exercised only by BIS dispatch tests")]
+    pub(crate) async fn expect_bis_ack(&self, result: Result<(), Error>) -> BisAck {
+        let mut rx_call_lock = self.rx_call.lock().await;
+        let req = match rx_call_lock
+            .recv()
+            .await
+            .expect("Could not receive msg in mpsc")
+        {
+            WorkerClientApiCalls::BisAck(req) => req,
+            other => panic!("expect_bis_ack expected BisAck, got : {other:?}"),
+        };
+        self.tx_resp
+            .send(WorkerClientApiReturns::BisAck(result))
+            .expect("Could not send request to mpsc");
+        req
+    }
+
+    /// (#97) Drain calls until a `BisAck` arrives, auto-ack'ing every
+    /// `BlobsAvailable` along the way (those are the periodic loop
+    /// firing on every blob-set change and not what the BIS-dispatch
+    /// test is asserting on). Returns the BisAck.
+    ///
+    /// The match-and-drain pattern is needed because the worker fires
+    /// a `BlobsAvailable` immediately on start when
+    /// `blobs_available_state` is set (the change-tracker's notify
+    /// triggers on the first connection); using `expect_bis_ack`
+    /// directly would panic on the first BlobsAvailable.
+    #[allow(dead_code, reason = "exercised only by BIS dispatch tests")]
+    pub(crate) async fn expect_bis_ack_skipping_blobs_available(&self) -> BisAck {
+        loop {
+            let mut rx_call_lock = self.rx_call.lock().await;
+            let next = rx_call_lock
+                .recv()
+                .await
+                .expect("Could not receive msg in mpsc");
+            drop(rx_call_lock);
+            match next {
+                WorkerClientApiCalls::BisAck(req) => {
+                    self.tx_resp
+                        .send(WorkerClientApiReturns::BisAck(Ok(())))
+                        .expect("Could not send response to mpsc");
+                    return req;
+                }
+                WorkerClientApiCalls::BlobsAvailable(_ba) => {
+                    self.tx_resp
+                        .send(WorkerClientApiReturns::BlobsAvailable(Ok(())))
+                        .expect("Could not send response to mpsc");
+                    continue;
+                }
+                other => panic!(
+                    "expect_bis_ack_skipping_blobs_available expected BisAck \
+                     or BlobsAvailable, got : {other:?}"
+                ),
+            }
+        }
+    }
 }
 
 impl WorkerApiClientTrait for MockWorkerApiClient {
@@ -222,13 +294,28 @@ impl WorkerApiClientTrait for MockWorkerApiClient {
 
     async fn bis_ack(
         &mut self,
-        _request: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BisAck,
+        request: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BisAck,
     ) -> Result<(), Error> {
-        // (#97) Not currently exercised by local_worker_test; the
-        // bis_chunk_handler_test injects its own ack sink directly into
-        // `handle_bis_chunk`. Returning Ok preserves the existing
-        // mock contract.
-        Ok(())
+        // (#97) Record the call so the production-composition test
+        // (`bis_chunked_dispatch_arm_round_trips_ack`) can assert the
+        // dispatch arm fired through `worker_api_client_wrapper::bis_ack`.
+        // Tests that don't await `expect_bis_ack` will see the call
+        // queue grow but no test-side block, since the ack is fired
+        // from a `tokio::spawn`'d task in the dispatch arm — the
+        // mpsc::unbounded_channel under the hood means we don't
+        // back-pressure the spawned task either.
+        self.tx_call
+            .send(WorkerClientApiCalls::BisAck(request))
+            .expect("Could not send BisAck to mpsc");
+        let mut rx_resp_lock = self.rx_resp.lock().await;
+        match rx_resp_lock
+            .recv()
+            .await
+            .expect("Could not receive msg in mpsc")
+        {
+            WorkerClientApiReturns::BisAck(result) => result,
+            resp => panic!("bis_ack expected BisAck response, received {resp:?}"),
+        }
     }
 }
 
@@ -292,6 +379,55 @@ pub(crate) async fn setup_local_worker(
         ..Default::default()
     };
     setup_local_worker_with_config(local_worker_config).await
+}
+
+/// (#97) Same as [`setup_local_worker_with_config`] but plumbs through
+/// a constructed [`nativelink_worker::local_worker::BlobsAvailableState`]
+/// so the worker's `Update::ChunkedMessage(BlobsInStableStorageChunk)`
+/// arm can fire (the arm warns + drops the chunk when the state is
+/// `None`). Used by `bis_chunked_dispatch_arm_round_trips_ack`.
+#[allow(dead_code, reason = "exercised only by BIS dispatch tests")]
+pub(crate) async fn setup_local_worker_with_blobs_state(
+    blobs_available_state: nativelink_worker::local_worker::BlobsAvailableState,
+) -> TestContext {
+    use nativelink_config::cas_server::LocalWorkerConfig;
+    const ARBITRARY_LARGE_TIMEOUT: f32 = 10000.;
+    let local_worker_config = LocalWorkerConfig {
+        worker_api_endpoint: EndpointConfig {
+            timeout: Some(ARBITRARY_LARGE_TIMEOUT),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mock_worker_api_client = MockWorkerApiClient::new();
+    let mock_worker_api_client_clone = mock_worker_api_client.clone();
+    let actions_manager = Arc::new(MockRunningActionsManager::new());
+    let worker = LocalWorker::new_with_connection_factory_and_actions_manager(
+        Arc::new(local_worker_config),
+        actions_manager.clone(),
+        Box::new(move || {
+            let mock_worker_api_client = mock_worker_api_client_clone.clone();
+            Box::pin(async move { Ok(mock_worker_api_client) })
+        }),
+        Box::new(move |_| Box::pin(async move { /* No sleep */ })),
+        Some(blobs_available_state),
+        Vec::new(),
+        None,
+    );
+    let (shutdown_tx_test, _) = broadcast::channel::<ShutdownGuard>(BROADCAST_CAPACITY);
+
+    let drop_guard = spawn!("local_worker_spawn_bis", async move {
+        worker.run(shutdown_tx_test.subscribe()).await
+    });
+
+    let (tx_stream, streaming_response) = setup_grpc_stream();
+    TestContext {
+        client: mock_worker_api_client,
+        actions_manager,
+        maybe_streaming_response: Some(streaming_response),
+        maybe_tx_stream: Some(tx_stream),
+        _drop_guard: drop_guard,
+    }
 }
 
 pub(crate) struct TestContext {

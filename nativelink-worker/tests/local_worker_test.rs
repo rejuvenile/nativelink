@@ -1529,3 +1529,141 @@ async fn worker_translates_not_found_to_failed_precondition_test() -> Result<(),
     Ok(())
 }
 
+
+// ----------------------------------------------------------------------
+// (#97) Production-composition test for the BIS chunked dispatch arm.
+//
+// This test addresses testing-czar requirement (a) from the #97 fixup
+// pass: the existing `bis_chunk_handler_test.rs` calls
+// `handle_bis_chunk` with a hand-rolled `ack_sink` closure, which
+// bypasses two production layers:
+//   1. The `Update::ChunkedMessage(BlobsInStableStorageChunk)`
+//      envelope-decode arm in `LocalWorkerImpl::run`.
+//   2. The `worker_api_client_wrapper::bis_ack` send.
+//
+// A bug in either layer (wrong oneof tag handling, dropped ack on the
+// async-spawn boundary, missing token echo in the wire-level wrapper)
+// would not surface from the bis_chunk_handler_test. This test feeds a
+// real `BlobsInStableStorageChunk` through the live `Streaming<...>`
+// channel and asserts the ack flows back through
+// `worker_api_client_wrapper::bis_ack` with the correct
+// (broadcast_id, sequence, server_instance_token) round-trip.
+//
+// Mutation guidance:
+//   * Replace the `Some(chunked_message::Payload::BlobsInStableStorage(chunk))`
+//     match arm in `local_worker.rs:1813-1864` with `_ => {}`. This test
+//     MUST then time out at the `expect_bis_ack` step (no ack ever
+//     fires) — the timeout's `expect("...")` message is the SPECIFIC
+//     guard.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn bis_chunked_dispatch_arm_round_trips_ack() -> Result<(), Error> {
+    use nativelink_proto::build::bazel::remote::execution::v2::Digest as ProtoDigest;
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+        BlobsInStableStorageChunk, ChunkedMessage, chunked_message,
+    };
+    use nativelink_store::filesystem_store::FileEntryImpl;
+    use nativelink_worker::local_worker::BlobsAvailableState;
+    use tempfile::TempDir;
+    use tokio::time::{Duration, timeout};
+    use utils::local_worker_test_utils::setup_local_worker_with_blobs_state;
+
+    // Set up a real FilesystemStore so the BlobsAvailableState has a
+    // legit fs_store reference. The unpin path is exercised but the
+    // stores have no entries — that's fine, unpin_digest is a no-op
+    // on absent keys (FilesystemStore drops the lookup if nothing is
+    // pinned at that key).
+    let content_dir: TempDir = tempfile::Builder::new()
+        .prefix("nl_bis_dispatch_content_")
+        .tempdir()
+        .map_err(|e| make_input_err!("tempdir: {e:?}"))?;
+    let temp_dir: TempDir = tempfile::Builder::new()
+        .prefix("nl_bis_dispatch_temp_")
+        .tempdir()
+        .map_err(|e| make_input_err!("tempdir: {e:?}"))?;
+    let fs_store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_dir.path().to_string_lossy().into_owned(),
+        temp_path: temp_dir.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .await?;
+    let blobs_state = BlobsAvailableState::new_for_test(fs_store, None);
+
+    let mut test_context = setup_local_worker_with_blobs_state(blobs_state).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+    let _ = test_context
+        .client
+        .expect_connect_worker(Ok(streaming_response))
+        .await;
+
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+
+    // Initialize via ConnectionResult so the worker's run loop
+    // is in the dispatch state.
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::ConnectionResult(ConnectionResult {
+                    worker_id: "bis-disp-worker".to_string(),
+                })),
+            })
+            .map_err(|e| make_input_err!("encode connection result: {e:?}"))?,
+        ))
+        .await
+        .map_err(|e| make_input_err!("send connection result: {e:?}"))?;
+
+    // Real BlobsInStableStorageChunk through the live stream.
+    let chunk = BlobsInStableStorageChunk {
+        digests: vec![ProtoDigest {
+            hash: "0".repeat(64),
+            size_bytes: 0,
+        }],
+        broadcast_id: 0xCAFE_F00D,
+        sequence: 7,
+        is_last: true,
+        server_instance_token: 0xDEAD_BEEF_DEAD_BEEF,
+    };
+    tx_stream
+        .send(Frame::data(
+            encode_stream_proto(&UpdateForWorker {
+                update: Some(Update::ChunkedMessage(ChunkedMessage {
+                    payload: Some(chunked_message::Payload::BlobsInStableStorage(
+                        chunk.clone(),
+                    )),
+                })),
+            })
+            .map_err(|e| make_input_err!("encode chunked: {e:?}"))?,
+        ))
+        .await
+        .map_err(|e| make_input_err!("send chunked: {e:?}"))?;
+
+    // Ack should appear on the mock client's recorded calls. The
+    // dispatch arm fires the ack from a `tokio::spawn`'d task, so
+    // wrap in a generous timeout — without this, a missing ack would
+    // hang the test indefinitely instead of failing. The worker's
+    // periodic BlobsAvailable loop also fires while we wait — the
+    // helper auto-acks those so the test is robust to the
+    // worker-loop's first-wakeup behavior.
+    let ack = timeout(
+        Duration::from_secs(5),
+        test_context.client.expect_bis_ack_skipping_blobs_available(),
+    )
+    .await
+    .expect(
+        "must NOT time out waiting for BisAck — the worker's \
+         Update::ChunkedMessage(BlobsInStableStorage) dispatch arm \
+         must wire through worker_api_client_wrapper::bis_ack so \
+         the server's per-worker resend buffer can release the slot",
+    );
+
+    assert_eq!(ack.broadcast_id, chunk.broadcast_id);
+    assert_eq!(ack.sequence, chunk.sequence);
+    assert_eq!(
+        ack.server_instance_token, chunk.server_instance_token,
+        "wrapper must round-trip the chunk's server_instance_token \
+         into the ack (red-team #5: token validation requires the \
+         exact value back)"
+    );
+
+    Ok(())
+}
