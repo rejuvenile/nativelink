@@ -226,10 +226,11 @@ struct ApiWorkerSchedulerImpl {
     /// resend buffer for that endpoint is flushed: every digest the
     /// worker had pinned died with the old process, so the BIS-driven
     /// unpins are moot.
+    ///
+    /// Chunks are wrapped in `Arc` so dispatch (one per worker) and
+    /// resend-buffer storage share the same allocation rather than
+    /// re-cloning the proto Vec<Digest> per worker.
     bis_resend_buffers: HashMap<String, BisResendBuffer>,
-
-    /// (#97) Monotonic broadcast id allocator for BIS chunked broadcasts.
-    next_bis_broadcast_id: u64,
 }
 
 /// (#97) Per-worker BIS chunk resend buffer. Holds chunks dispatched to
@@ -253,18 +254,23 @@ struct ApiWorkerSchedulerImpl {
 /// for N seconds, evict the entire per-endpoint slot.
 #[derive(Debug, Default)]
 pub(crate) struct BisResendBuffer {
-    /// (broadcast_id, sequence) -> chunk bytes-equivalent (Vec of proto
-    /// digests). Stored as the proto type so resend is a clone + send.
+    /// (broadcast_id, sequence) -> Arc-shared chunk. The chunk is
+    /// allocated once at dispatch and shared between the per-worker
+    /// dispatch tx (Arc clone, ~8 bytes) and this buffer (Arc clone,
+    /// ~8 bytes); without Arc, the proto Vec<Digest> would be
+    /// memcpy'd per worker, which at ~64 workers × ~25 chunks per
+    /// 100K-digest broadcast = ~1600 redundant Vec clones per
+    /// broadcast.
     chunks: HashMap<
         (u64, u32),
-        nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsInStableStorageChunk,
+        Arc<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsInStableStorageChunk>,
     >,
 }
 
 impl BisResendBuffer {
     pub(crate) fn add(
         &mut self,
-        chunk: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsInStableStorageChunk,
+        chunk: Arc<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsInStableStorageChunk>,
     ) {
         self.chunks
             .insert((chunk.broadcast_id, chunk.sequence), chunk);
@@ -280,16 +286,6 @@ impl BisResendBuffer {
 
     pub(crate) fn len(&self) -> usize {
         self.chunks.len()
-    }
-
-    /// Drain every buffered chunk for replay on (re)connect. Caller
-    /// re-adds to the buffer if it wants resend tracking on the second
-    /// pass (typically yes — the resent chunk needs an ack too).
-    pub(crate) fn drain(
-        &mut self,
-    ) -> Vec<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsInStableStorageChunk>
-    {
-        self.chunks.drain().map(|(_, v)| v).collect()
     }
 }
 
@@ -1176,6 +1172,13 @@ pub struct ApiWorkerScheduler {
     /// Optional TLS config for connecting to worker CAS endpoints.
     /// When set, prefetch connections use TLS with this config.
     worker_tls_config: Option<ClientTlsConfig>,
+
+    /// (#97) Monotonic broadcast id allocator for BIS chunked broadcasts.
+    /// Lock-free `fetch_add` removes the per-broadcast write-lock
+    /// previously taken to bump a u64. Initialised to 1 so a fresh
+    /// scheduler's first broadcast carries id=1 (avoids the "did the
+    /// counter ever advance?" ambiguity of a 0 sentinel).
+    next_bis_broadcast_id: AtomicU64,
 }
 
 /// Probe a CAS store chain to find the SizePartitioningStore threshold.
@@ -1440,7 +1443,6 @@ impl ApiWorkerScheduler {
                 endpoint_to_worker: HashMap::new(),
                 scores_cache: scores_cache.clone(),
                 bis_resend_buffers: HashMap::new(),
-                next_bis_broadcast_id: 1,
             }),
             platform_property_manager,
             worker_timeout_s,
@@ -1460,6 +1462,7 @@ impl ApiWorkerScheduler {
             prefetch_semaphores: ParkingMutex::new(HashMap::new()),
             memory_store_threshold,
             worker_tls_config,
+            next_bis_broadcast_id: AtomicU64::new(1),
         })
     }
 
@@ -2738,43 +2741,37 @@ impl ApiWorkerScheduler {
         let proto_digests: Vec<Digest> = digests.iter().map(Digest::from).collect();
         let total = proto_digests.len();
 
-        // Snapshot the (worker_id, cas_endpoint, tx) tuples under a brief
-        // read lock, then build chunks + dispatch outside the lock. Then
-        // acquire a write lock to persist the chunks into the resend
-        // buffer (one write lock per broadcast, not per chunk, to keep
-        // contention proportional to broadcast frequency rather than
-        // chunk count).
+        // Allocate broadcast_id lock-free. Bumping a counter under the
+        // RwLock previously took the write lock at a cost proportional
+        // to broadcast frequency; `fetch_add` removes that contention.
+        let broadcast_id = self
+            .next_bis_broadcast_id
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Snapshot (worker_id, cas_endpoint, tx) tuples under one read
+        // lock; build chunks + dispatch outside any lock; then take ONE
+        // write lock at the end to walk every per-endpoint buffer in a
+        // single pass and record the broadcast. One write lock per
+        // broadcast, not per chunk and not per worker.
         let senders: Vec<(WorkerId, Arc<str>, _)> = {
             let inner = self.inner.read().await;
             inner
                 .workers
                 .iter()
-                .filter_map(|(id, w)| {
-                    if w.cas_endpoint.is_empty() {
-                        // Workers without a cas_endpoint can't be tracked
-                        // for resend (no stable identity across reconnect).
-                        // Send to them but skip the buffer.
-                        Some((id.clone(), Arc::<str>::from(""), w.tx.clone()))
+                .map(|(id, w)| {
+                    // Workers without a cas_endpoint can't be tracked for
+                    // resend (no stable identity across reconnect). Send
+                    // to them but skip the buffer (empty endpoint marker).
+                    let endpoint = if w.cas_endpoint.is_empty() {
+                        Arc::<str>::from("")
                     } else {
-                        Some((
-                            id.clone(),
-                            Arc::<str>::from(w.cas_endpoint.as_str()),
-                            w.tx.clone(),
-                        ))
-                    }
+                        Arc::<str>::from(w.cas_endpoint.as_str())
+                    };
+                    (id.clone(), endpoint, w.tx.clone())
                 })
                 .collect()
         };
         let worker_count = senders.len();
-
-        // Allocate a unique broadcast_id under the write lock; bump the
-        // counter atomically so concurrent broadcasts don't collide.
-        let broadcast_id = {
-            let mut inner = self.inner.write().await;
-            let id = inner.next_bis_broadcast_id;
-            inner.next_bis_broadcast_id = inner.next_bis_broadcast_id.wrapping_add(1);
-            id
-        };
 
         info!(
             target: "nativelink::bis_chunked_dispatch",
@@ -2785,28 +2782,35 @@ impl ApiWorkerScheduler {
             "broadcast_blobs_in_stable_storage_chunked: dispatching"
         );
 
-        // Build all chunks once (cheap clone of Vec<Digest> per chunk).
-        // Chunks share the same broadcast_id; sequence is monotonic 0..N.
-        let chunks: Vec<BlobsInStableStorageChunk> = ChunkIter::new(
+        // Build all chunks once and Arc-wrap them so dispatch +
+        // resend-buffer storage share allocations. Without Arc, each
+        // chunk's Vec<Digest> would be cloned per worker AND once more
+        // per buffer entry.
+        let chunks: Vec<Arc<BlobsInStableStorageChunk>> = ChunkIter::new(
             proto_digests.into_iter(),
             BIS_DIGESTS_PER_CHUNK,
         )
-        .map(|c| BlobsInStableStorageChunk {
+        .map(|c| Arc::new(BlobsInStableStorageChunk {
             digests: c.items,
             broadcast_id,
             sequence: c.sequence,
             is_last: c.is_last,
-        })
+        }))
         .collect();
 
-        // Dispatch + record in resend buffer per worker.
+        // Dispatch outside the lock. Track per-endpoint success: only
+        // endpoints that received every chunk are buffered (a partial
+        // dispatch leaves the resend path to the reconnect handler).
         let mut send_failures = 0usize;
+        let mut endpoints_to_buffer: Vec<Arc<str>> = Vec::with_capacity(senders.len());
         for (worker_id, endpoint, tx) in &senders {
+            let mut all_sent = true;
             for chunk in &chunks {
+                // Clone the Arc (~8 bytes), not the proto chunk.
                 let msg = UpdateForWorker {
                     update: Some(update_for_worker::Update::ChunkedMessage(ChunkedMessage {
                         payload: Some(chunked_message::Payload::BlobsInStableStorage(
-                            chunk.clone(),
+                            (**chunk).clone(),
                         )),
                     })),
                 };
@@ -2824,12 +2828,22 @@ impl ApiWorkerScheduler {
                     // don't pile up resend entries that won't have a live
                     // tx anyway. The reconnect path will replay from
                     // whatever's in the buffer at that point.
+                    all_sent = false;
                     break;
                 }
             }
+            if all_sent && !endpoint.is_empty() {
+                endpoints_to_buffer.push(endpoint.clone());
+            }
+        }
 
-            if !endpoint.is_empty() {
-                let mut inner = self.inner.write().await;
+        // ONE write lock walks every per-endpoint buffer in a single
+        // pass. Previously this loop took a write lock per worker —
+        // 64 workers × 25-chunk broadcast = 64 lock-acquire round-trips
+        // contending against every other scheduler operation.
+        if !endpoints_to_buffer.is_empty() {
+            let mut inner = self.inner.write().await;
+            for endpoint in &endpoints_to_buffer {
                 let buf = inner
                     .bis_resend_buffers
                     .entry(endpoint.to_string())
@@ -2897,9 +2911,16 @@ impl ApiWorkerScheduler {
             "replaying buffered BIS chunks to (re)connecting worker"
         );
         for chunk in chunks_to_replay {
+            // Arc<BlobsInStableStorageChunk> → owned proto via clone of
+            // the inner value (the proto must be owned by the wire
+            // message). This is the same single Vec<Digest> clone we
+            // would have done before Arc-wrap; the Arc saves only the
+            // dispatch/buffer duplication, not this terminal clone.
             let msg = UpdateForWorker {
                 update: Some(update_for_worker::Update::ChunkedMessage(ChunkedMessage {
-                    payload: Some(chunked_message::Payload::BlobsInStableStorage(chunk)),
+                    payload: Some(chunked_message::Payload::BlobsInStableStorage(
+                        (*chunk).clone(),
+                    )),
                 })),
             };
             if tx.send(msg).is_err() {
