@@ -753,3 +753,172 @@ async fn pin_set_remove_one_keeps_len_and_total_bytes_consistent() -> Result<(),
     assert_eq!(pin.total_bytes(), 100);
     Ok(())
 }
+
+// ----------------------------------------------------------------------
+// Test 15 (testing-czar #168 MAJOR-2 — concurrent race coverage):
+// the existing single-threaded test only verifies the FUNCTIONAL property
+// (insert-then-remove restores total_bytes), it would PASS with the
+// buggy `drop(state); fetch_sub(...)` ordering because no concurrent
+// reader is ever scheduled in between. This concurrent test exercises
+// the lock-held atomic-update fix at the production-realistic scale.
+//
+// The strict invariant under attack: `EphemeralServerSidePin::insert`
+// uses `total_bytes.store(projected, ...)` (overwrite, not fetch_add)
+// for the cap-check / accounting update, while `remove_one` uses
+// `fetch_sub`. With the LOCK-HELD fix in place, every modification of
+// state is ATOMIC with the matching atomic update — so for any digest
+// d the sequence (insert d → remove d) leaves total_bytes at its
+// pre-insert value, even under concurrent contention.
+//
+// With the BUGGY ordering (`drop(state); fetch_sub(...)`), the
+// following racing interleaving corrupts accounting:
+//   T0: state=[d→100], atomic=100
+//   T1: thread A: state.remove(d) → state=[], atomic still 100
+//   T2: thread A drops state lock
+//   T3: thread B: insert(d, 100): takes lock, current_total=100,
+//                projected=100, atomic.store(100), state=[d→100]
+//   T4: thread A: fetch_sub(100) → atomic = 0, but state=[d→100].
+// The accounting has now drifted: state holds 100 bytes but
+// total_bytes reports 0. After the post-test drain sweep removes
+// the leaked d, fetch_sub will underflow (u64 wrap), producing a
+// visibly-wrong final total_bytes that is neither 0 nor the actual
+// state byte sum.
+//
+// Test design: many concurrent inserters and removers contend on the
+// SAME (i, j) digest space so insert-then-remove on the same key
+// happens often. After all tasks finish, a final sweep removes every
+// digest. The invariant: total_bytes() MUST equal exactly the sum of
+// bytes still held in state (here: 0, because every insert was
+// paired with a remove sweep). Under the bug, total_bytes drifts
+// below 0 (u64 wrap) and the assertion fires with the specific
+// "(len, total_bytes) torn pair detected" message.
+//
+// Mutation step (per CLAUDE.md TDD step 5): in
+// `EphemeralServerSidePin::remove_one`, change
+//
+//     let mut state = self.state.lock();
+//     if let Some(data) = state.remove(digest) {
+//         let removed = data.len() as u64;
+//         self.total_bytes.fetch_sub(removed, Ordering::AcqRel);
+//     }
+//
+// to the buggy version
+//
+//     let mut state = self.state.lock();
+//     if let Some(data) = state.remove(digest) {
+//         let removed = data.len() as u64;
+//         drop(state);
+//         self.total_bytes.fetch_sub(removed, Ordering::AcqRel);
+//     }
+//
+// This test MUST then panic with "(len, total_bytes) torn pair detected".
+// ----------------------------------------------------------------------
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn pin_set_concurrent_insert_remove_no_torn_pair() -> Result<(), Error> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PAYLOAD_SIZE: usize = 100;
+    const CAP: u64 = 64 * 1024 * 1024; // ample headroom — we are not testing cap.
+    const INSERTERS: u8 = 16;
+    const REMOVERS: u8 = 16;
+    // 16 inserters × 64 iters × 16 (key-space sharing) → ~16k touches
+    // per worker pair, well above the ~10k threshold the user requested
+    // for race exposure.
+    const ITERS_PER_WORKER: u64 = 64;
+
+    let pin = Arc::new(EphemeralServerSidePin::new(CAP));
+    let stop = Arc::new(AtomicBool::new(false));
+    let payload = Bytes::from(vec![0u8; PAYLOAD_SIZE]);
+
+    // Each inserter / remover shares the same digest key-space so
+    // insert and remove RACE on the SAME key (where the
+    // `drop(state); fetch_sub` bug fires).
+    let mut inserter_handles = Vec::with_capacity(INSERTERS as usize);
+    for i in 0..INSERTERS {
+        let pin = pin.clone();
+        let payload = payload.clone();
+        let stop = stop.clone();
+        inserter_handles.push(tokio::spawn(async move {
+            for iter in 0..ITERS_PER_WORKER {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                for k in 0..16u64 {
+                    let d = make_digest(i, k);
+                    drop(pin.insert(d, payload.clone()));
+                }
+                if iter.is_multiple_of(8) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }));
+    }
+
+    let mut remover_handles = Vec::with_capacity(REMOVERS as usize);
+    for i in 0..REMOVERS {
+        let pin = pin.clone();
+        let stop = stop.clone();
+        remover_handles.push(tokio::spawn(async move {
+            for iter in 0..ITERS_PER_WORKER {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                for k in 0..16u64 {
+                    let d = make_digest(i, k);
+                    pin.remove_one(&d);
+                }
+                if iter.is_multiple_of(8) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }));
+    }
+
+    // 5s deadlock detector wraps the entire concurrent workload.
+    tokio::time::timeout(DEADLOCK_DETECTOR, async {
+        for h in inserter_handles {
+            h.await.expect("inserter task must not panic");
+        }
+        for h in remover_handles {
+            h.await.expect("remover task must not panic");
+        }
+        // Drain any insert that landed AFTER its matched remove. After
+        // this sweep the pin set MUST be empty AND total_bytes MUST
+        // be 0 — the strict invariant the lock-held update fix
+        // protects.
+        for i in 0..INSERTERS {
+            for k in 0..16u64 {
+                pin.remove_one(&make_digest(i, k));
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    })
+    .await
+    .expect(
+        "concurrent insert/remove workload deadlocked — \
+         5s deadlock-detector timeout fired",
+    );
+
+    // Final consistency: pin set is empty, total_bytes is 0. Under the
+    // buggy `drop(state); fetch_sub` ordering, repeated insert/remove
+    // races on the same key cause atomic underflow (u64 wrap) and/or
+    // accounting drift, producing a final total_bytes that is neither
+    // 0 nor matches the state byte sum.
+    let final_len = pin.len();
+    let final_total = pin.total_bytes();
+    assert_eq!(
+        final_len, 0,
+        "final state: len MUST be 0 after the post-loop drain sweep; got len={final_len}, \
+         total_bytes={final_total}"
+    );
+    assert_eq!(
+        final_total, 0,
+        "(len, total_bytes) torn pair detected: final total_bytes={final_total} after every \
+         insert key was swept by remove (state len={final_len}) — accounting has drifted, \
+         the lock-held atomic-update fix in remove_one has regressed (the \
+         `drop(state); fetch_sub` race causes u64 underflow / accounting drift)"
+    );
+
+    Ok(())
+}
