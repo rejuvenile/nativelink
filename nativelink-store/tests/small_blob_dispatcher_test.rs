@@ -149,7 +149,6 @@ async fn dispatcher_disabled_enqueue_is_noop() -> Result<(), Error> {
         max_pending_per_worker: 32,
         max_batch_bytes: 256 * 1024,
         pin_max_bytes: 256 * 1024 * 1024,
-        pin_ttl: Duration::from_secs(10),
     };
     let dispatcher = SmallBlobDispatcher::new(cfg);
     let d = make_digest(1, 100);
@@ -190,7 +189,6 @@ async fn dispatcher_enqueue_rejects_oversize_blob() -> Result<(), Error> {
         max_pending_per_worker: 32,
         max_batch_bytes: 256 * 1024,
         pin_max_bytes: 256 * 1024 * 1024,
-        pin_ttl: Duration::from_secs(10),
     };
     let dispatcher = SmallBlobDispatcher::new(cfg);
     let oversize = (SMALL_BLOB_THRESHOLD + 1) as u64;
@@ -227,7 +225,6 @@ async fn dispatcher_enqueue_rejects_empty_store_id() -> Result<(), Error> {
         max_pending_per_worker: 32,
         max_batch_bytes: 256 * 1024,
         pin_max_bytes: 256 * 1024 * 1024,
-        pin_ttl: Duration::from_secs(10),
     };
     let dispatcher = SmallBlobDispatcher::new(cfg);
     let d = make_digest(1, 100);
@@ -264,7 +261,6 @@ async fn dispatcher_enqueue_rejects_malformed_store_id() -> Result<(), Error> {
         max_pending_per_worker: 32,
         max_batch_bytes: 256 * 1024,
         pin_max_bytes: 256 * 1024 * 1024,
-        pin_ttl: Duration::from_secs(10),
     };
     let dispatcher = SmallBlobDispatcher::new(cfg);
     let d = make_digest(1, 100);
@@ -329,7 +325,6 @@ async fn dispatcher_enqueue_delivers_batch_to_registered_worker() -> Result<(), 
         max_pending_per_worker: 32,
         max_batch_bytes: 256 * 1024,
         pin_max_bytes: 256 * 1024 * 1024,
-        pin_ttl: Duration::from_secs(10),
     };
     let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
     let pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 256 * 1024));
@@ -392,7 +387,6 @@ async fn dispatcher_zero_window_coalesces_pending_into_single_batch() -> Result<
         max_pending_per_worker: 32,
         max_batch_bytes: 256 * 1024,
         pin_max_bytes: 256 * 1024 * 1024,
-        pin_ttl: Duration::from_secs(10),
     };
     let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
     let pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 256 * 1024));
@@ -596,7 +590,6 @@ async fn dispatcher_enqueue_for_unregistered_worker_drops_silently() -> Result<(
         max_pending_per_worker: 32,
         max_batch_bytes: 256 * 1024,
         pin_max_bytes: 256 * 1024 * 1024,
-        pin_ttl: Duration::from_secs(10),
     };
     let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
     let pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 256 * 1024));
@@ -621,5 +614,142 @@ async fn dispatcher_enqueue_for_unregistered_worker_drops_silently() -> Result<(
         pin.is_empty(),
         "pin set MUST NOT grow when bytes never make it to a worker"
     );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Test 12 (TDD per CLAUDE.md, refactor: delete TTL + add explicit
+// unpin_on_disconnect): `EphemeralServerSidePin::unpin_on_disconnect`
+// MUST clear the entire HashMap AND zero the `total_bytes` accounting.
+//
+// Production composition: called from the dispatcher's
+// `unpin_on_disconnect(endpoint, boot_epoch_id)` method, which is in
+// turn called from `WorkerApiServer`'s disconnect-cleanup task once
+// the disconnected worker can no longer ack via
+// `observe_pinned_mirror_ack`. Without this, every disconnect would
+// leak the worker's in-flight pin entries forever — `pin_max_bytes`
+// would steadily fill with ghost pins until the dispatcher rejects
+// every new admission with `ResourceExhausted`.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn pin_set_unpin_on_disconnect_clears_state() -> Result<(), Error> {
+    let pin = EphemeralServerSidePin::new(/* cap= */ 1024);
+    let d1 = make_digest(60, 100);
+    let d2 = make_digest(61, 200);
+    let d3 = make_digest(62, 300);
+
+    pin.insert(d1, Bytes::from(vec![0u8; 100]))?;
+    pin.insert(d2, Bytes::from(vec![0u8; 200]))?;
+    pin.insert(d3, Bytes::from(vec![0u8; 300]))?;
+    assert_eq!(pin.len(), 3);
+    assert_eq!(pin.total_bytes(), 600);
+
+    pin.unpin_on_disconnect();
+
+    assert_eq!(
+        pin.len(),
+        0,
+        "unpin_on_disconnect MUST drop every entry; state was not cleared"
+    );
+    assert_eq!(
+        pin.total_bytes(),
+        0,
+        "unpin_on_disconnect MUST zero total_bytes; accounting was not zeroed"
+    );
+    assert!(pin.is_empty(), "pin set MUST report is_empty after unpin");
+    // Sanity: a fresh insert MUST work after unpin (the cap accounting
+    // must not be inadvertently consumed).
+    pin.insert(d1, Bytes::from(vec![0u8; 50]))?;
+    assert_eq!(pin.total_bytes(), 50);
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Test 13: SmallBlobDispatcher::unpin_on_disconnect for a registered
+// pin set MUST clear it AND drop the worker's queues / worker_tx
+// (idempotent with unregister_worker call ordering).
+//
+// NOTE on per-worker push attribution: the per-store pin set is keyed
+// by `DigestInfo`, NOT by worker. The dispatcher does NOT track which
+// worker pushed which entries. So `unpin_on_disconnect(endpoint, epoch)`
+// clears the ENTIRE pin set for every registered store. This is
+// intentionally over-broad for the v1 implementation — see TODO in
+// the doc comment. For an isolated single-worker disconnect this is
+// correct (every in-flight push from that worker is lost regardless);
+// for a staggered fleet it temporarily over-clears entries in flight
+// to OTHER workers. Tracked for the v2 design.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn dispatcher_unpin_on_disconnect_clears_registered_pin_sets() -> Result<(), Error> {
+    use std::sync::Arc;
+
+    let cfg = SmallBlobDispatcherConfig {
+        small_blob_mirror_enabled: true,
+        ..SmallBlobDispatcherConfig::default()
+    };
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+    let cas_pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024));
+    let ac_pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024));
+    dispatcher.register_pin_set("cas", cas_pin.clone());
+    dispatcher.register_pin_set("ac", ac_pin.clone());
+
+    let d_cas = make_digest(70, 100);
+    let d_ac = make_digest(71, 50);
+    cas_pin.insert(d_cas, Bytes::from(vec![0u8; 100]))?;
+    ac_pin.insert(d_ac, Bytes::from(vec![0u8; 50]))?;
+    assert_eq!(cas_pin.len(), 1);
+    assert_eq!(ac_pin.len(), 1);
+
+    dispatcher.unpin_on_disconnect("ep1", 7);
+
+    assert!(
+        cas_pin.is_empty(),
+        "dispatcher.unpin_on_disconnect MUST clear cas pin set"
+    );
+    assert!(
+        ac_pin.is_empty(),
+        "dispatcher.unpin_on_disconnect MUST clear ac pin set"
+    );
+    assert_eq!(cas_pin.total_bytes(), 0);
+    assert_eq!(ac_pin.total_bytes(), 0);
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Test 14 (perf-optimizer #153 MAJOR + red-team B4): `remove_one` MUST
+// update `total_bytes` while still holding the state lock, OR fold the
+// fetch_sub into the same critical section as the HashMap mutation.
+// Otherwise a concurrent `len()` / `total_bytes()` reader can observe
+// `len = 0` AND `total_bytes != 0` (or vice-versa), and a concurrent
+// re-insert can race the late `fetch_sub` with the prior `total_bytes`
+// snapshot used by the cap check, producing a spurious cap rejection
+// or — worse — admit a payload that puts the actual byte total above
+// `cap`.
+//
+// Functional regression check: after a sequence of insert + remove,
+// `len()` and `total_bytes()` MUST be CONSISTENT (insert-of-N then
+// remove-of-same-key MUST return total_bytes to its pre-insert value).
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn pin_set_remove_one_keeps_len_and_total_bytes_consistent() -> Result<(), Error> {
+    let pin = EphemeralServerSidePin::new(/* cap= */ 1024);
+    let d = make_digest(80, 100);
+
+    pin.insert(d, Bytes::from(vec![0u8; 100]))?;
+    assert_eq!(pin.len(), 1);
+    assert_eq!(pin.total_bytes(), 100);
+
+    pin.remove_one(&d);
+    assert_eq!(pin.len(), 0, "len MUST reflect removal");
+    assert_eq!(
+        pin.total_bytes(),
+        0,
+        "total_bytes MUST be zeroed atomically with len"
+    );
+
+    // Re-insert MUST succeed (no leftover stale total_bytes).
+    pin.insert(d, Bytes::from(vec![0u8; 100]))?;
+    assert_eq!(pin.len(), 1);
+    assert_eq!(pin.total_bytes(), 100);
     Ok(())
 }
