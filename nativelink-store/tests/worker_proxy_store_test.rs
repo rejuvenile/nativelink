@@ -17,12 +17,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
+use nativelink_config::stores::{
+    EvictionPolicy, ExistenceCacheSpec, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
+    VerifySpec,
+};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
+use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
+use nativelink_store::verify_store::VerifyStore;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::blob_locality_map::{SharedBlobLocalityMap, new_shared_blob_locality_map};
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
@@ -1937,6 +1942,238 @@ async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
         "WorkerProxyStore::mark_stable must delegate to inner. Without \
          this delegation the BIS pipeline breaks at the worker proxy \
          layer and worker pins (durable under v2) leak. Drained: {drained:?}",
+    );
+
+    Ok(())
+}
+
+// =====================================================================
+// #171 — inner-miss writer-termination race vs WorkerProxyStore peer-fetch
+// =====================================================================
+
+/// A peer-side store that delays before serving any chunk. Models a
+/// real network peer that takes ~200ms to respond. The delay opens
+/// the race window that production exhibits: the local
+/// notify_waiters of `streaming_writer.send_error` always fires
+/// first, so any writer-termination there propagates BEFORE the
+/// peer's bytes can be delivered.
+#[derive(Debug, MetricsComponent)]
+struct DelayedPeerStore {
+    inner: Store,
+    delay: core::time::Duration,
+}
+
+default_health_status_indicator!(DelayedPeerStore);
+
+#[async_trait]
+impl StoreDriver for DelayedPeerStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.inner.has_with_results(digests, results).await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        reader: DropCloserReadHalf,
+        upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        self.inner.update(key, reader, upload_size).await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        // Wait BEFORE issuing the read so the local-NotFound notify
+        // wins the race deterministically.
+        tokio::time::sleep(self.delay).await;
+        self.inner
+            .get_part(key.borrow(), writer, offset, length)
+            .await
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Inner(self.inner.as_store_driver())
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Inner(self.inner.as_store_driver())
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Inner(self.inner.as_store_driver())
+    }
+}
+
+/// Reproducer for the #171 inner-miss writer-termination race.
+///
+/// Production composition (server side):
+///
+/// ```text
+///   bytestream tx
+///     │
+///     ▼
+///   WorkerProxyStore  (race_peers=false)
+///     │ inner.get_part(&mut tx, ...)
+///     ▼
+///   ExistenceCacheStore
+///     │
+///     ▼
+///   VerifyStore (verify_size=true)  — when should_verify is FALSE
+///     │ passes outer tx through unchanged
+///     ▼
+///   FastSlowStore  (fast=Memory, slow=Memory) — both empty
+///     │
+///     ▼ run_producer.head=NotFound → streaming_writer.send_error
+///     │
+///   guard.fail(producer_err)  ← terminates outer tx (THE BUG)
+/// ```
+///
+/// The OUTER tx is terminated before WorkerProxyStore's
+/// `get_part_sequential` can fall through to `try_read_from_worker`
+/// → `get_part_and_cache`. The peer DOES return all bytes but
+/// `writer.send(chunk)` fails with
+/// `Code::Internal "Tried to send while stream is closed"`.
+///
+/// Production trace: ~38 events/sec since 2026-04-27 11:28 deploy.
+///
+/// To force the bug to surface even when `should_verify=true` (which
+/// otherwise inserts a separate internal tx between the OUTER writer
+/// and FastSlowStore), this test issues a partial read
+/// (`offset=0, length=Some(_)`) so VerifyStore's `should_verify`
+/// gate fails and FastSlowStore wraps the OUTER tx directly. This
+/// matches the production scenario where the outer tx is fast_slow's
+/// guard target.
+#[nativelink_test]
+async fn inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_writer_termination_race()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    let value: Vec<u8> = (0..108_944u32).map(|i| (i & 0xFF) as u8).collect();
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    // Inner store chain mirrors production CAS:
+    //   ExistenceCache → Verify(verify_size=true) → FastSlow(Memory, Memory)
+    // All tiers EMPTY for the test digest.
+    let fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let verify = Store::new(VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        fast_slow,
+    ));
+    let existence_cache = Store::new(ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1_000_000,
+                ..Default::default()
+            }),
+        },
+        verify,
+    ));
+
+    // Wrap with WorkerProxyStore — the production outer layer.
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(existence_cache.clone(), locality_map.clone());
+    let proxy = Store::new(proxy_arc.clone());
+
+    // Peer holds the blob and serves with a 200ms artificial delay so
+    // the local-NotFound notify always wins the race.
+    let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_inner
+        .update_oneshot(digest, Bytes::from(value.clone()))
+        .await?;
+    let delayed_peer = Store::new(Arc::new(DelayedPeerStore {
+        inner: peer_inner,
+        delay: Duration::from_millis(200),
+    }));
+
+    let peer_endpoint = "grpc://delayed-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, delayed_peer);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    // Read the blob with a length hint that pushes VerifyStore's
+    // `should_verify` gate to false (length.is_some()), so VerifyStore
+    // delegates directly to the inner store with the OUTER writer
+    // (rather than inserting its own internal tx). This makes
+    // FastSlowStore's `guard.fail(producer_err)` close the OUTER writer
+    // — the exact production failure mode.
+    let timed = tokio::time::timeout(
+        Duration::from_secs(5),
+        proxy.get_part_unchunked(digest, 0, Some(value.len() as u64)),
+    )
+    .await
+    .expect(
+        "must not deadlock — inner-miss + peer-fetch with delayed peer \
+         must deliver bytes within 5s; race-loser writer-termination \
+         bug at fast_slow_store::populate (line ~3178) closed the outer \
+         writer before the peer's bytes could be forwarded",
+    );
+
+    let bytes = timed.unwrap_or_else(|err| {
+        panic!(
+            "inner-miss + peer-fetch must succeed; race-loser writer-\
+             termination bug at fast_slow_store::populate dropped the \
+             peer's bytes: got Err {err:?} expected {} bytes from peer",
+            value.len()
+        )
+    });
+
+    assert_eq!(
+        bytes.len(),
+        value.len(),
+        "inner-miss + peer-fetch with delayed peer must deliver bytes; \
+         race-loser writer-termination bug at fast_slow_store::populate \
+         dropped them: got {} vs expected {}",
+        bytes.len(),
+        value.len(),
+    );
+    assert_eq!(
+        bytes.as_ref(),
+        value.as_slice(),
+        "peer bytes must round-trip identically through the outer \
+         WorkerProxyStore writer; mismatched bytes indicate the writer \
+         was partially terminated then re-opened",
     );
 
     Ok(())

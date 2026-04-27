@@ -85,6 +85,30 @@ const LOCAL_ONLY_READS_BATCH_CONCURRENCY: usize = 16;
 /// secondary safety net for hangs longer than 120s.
 const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
 
+tokio::task_local! {
+    /// Per-call opt-in: when set on the calling task, the populate-NotFound
+    /// terminal branch in [`FastSlowStore::get_part`] (the `producer_err.code
+    /// == NotFound` arm at the `streaming_inner.is_terminal()` check) returns
+    /// `Err(NotFound)` WITHOUT calling `writer.send_error()`. The CALLER takes
+    /// responsibility for any downstream writer-termination semantics.
+    ///
+    /// Used by [`crate::worker_proxy_store::WorkerProxyStore::get_part_sequential`]
+    /// — when the local store reports NotFound, WorkerProxyStore re-uses
+    /// the same outer writer for its peer-fetch fallback. Without this
+    /// flag, FastSlowStore's deadlock-defense termination (added for
+    /// `VerifyStore`'s `tokio::join!(get_fut, check_fut)` writer-
+    /// termination contract) closes the outer writer and the peer's
+    /// bytes can never be delivered to the consumer — bug #171.
+    ///
+    /// Other early-return `guard.fail(...)` sites in `FastSlowStore::get_part`
+    /// (mirror_blobs size mismatch, fast_store truncation, in_flight size
+    /// mismatch, fast_store error path, local_only_reads NotFound) do NOT
+    /// honor this flag because they signal real corruption / fault states
+    /// that peer-fetch cannot recover from and that VerifyStore's
+    /// deadlock-defense still requires.
+    pub static INNER_MISS_NO_TERMINATE: bool;
+}
+
 /// Listener registered on the fast store's eviction map so the
 /// `on_pin_expired` hook lands the digest in `failed_slow_writes`. The
 /// pin TTL firing without an explicit unpin would, by itself, be
@@ -3175,6 +3199,26 @@ impl StoreDriver for FastSlowStore {
                         code = ?producer_err.code,
                         "populate already failed with NotFound, returning producer error directly"
                     );
+                    // #171: when wrapped by `WorkerProxyStore`, the outer
+                    // writer is reused for peer-fetch fallback. Calling
+                    // `guard.fail` here closes the outer channel and the
+                    // peer's bytes can never be delivered. WorkerProxyStore
+                    // sets `INNER_MISS_NO_TERMINATE = true` for exactly this
+                    // case; honor it by returning the structured Err WITHOUT
+                    // terminating the writer. The caller owns downstream
+                    // termination from this point on.
+                    let no_terminate = INNER_MISS_NO_TERMINATE
+                        .try_with(|v| *v)
+                        .unwrap_or(false);
+                    if no_terminate {
+                        // Suppress the WriteHalfGuard Drop fallback — the
+                        // caller (WorkerProxyStore) is now responsible for
+                        // terminating the writer (with peer bytes on
+                        // success, or with its own send_error on final
+                        // peer-fetch failure when its outer fn returns).
+                        guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
+                        return Err(producer_err);
+                    }
                     return Err(guard.fail(producer_err));
                 }
                 // Non-NotFound terminal Err (Code::Internal "writer
@@ -3278,6 +3322,29 @@ impl StoreDriver for FastSlowStore {
                         // prior `loader.get_or_try_init(populate).await?`
                         // behavior so existing failpoint tests and
                         // user-visible error contracts hold.
+                        //
+                        // #171 sibling: same INNER_MISS_NO_TERMINATE gate
+                        // as the terminal-state branch above. Only honor
+                        // for NotFound AND when no bytes have been written
+                        // yet (`get_bytes_written() == 0`) — once any
+                        // bytes have flowed to the outer writer, peer-
+                        // fetch cannot recover without producing a
+                        // corrupt-prefix-from-populate + full-peer-copy
+                        // stream. WorkerProxyStore already enforces this
+                        // bytes_written_by_inner > 0 → no-fallback rule;
+                        // mirror it here so the writer-termination skip
+                        // is symmetric with the peer-fetch eligibility.
+                        let bytes_written = guard.get_bytes_written();
+                        let no_terminate = err.code == Code::NotFound
+                            && bytes_written == 0
+                            && INNER_MISS_NO_TERMINATE
+                                .try_with(|v| *v)
+                                .unwrap_or(false);
+                        if no_terminate {
+                            guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
+                            return Err(err)
+                                .err_tip(|| "populate failed for the requesting caller");
+                        }
                         return Err(guard.fail(err)).err_tip(|| {
                             "populate failed for the requesting caller"
                         });

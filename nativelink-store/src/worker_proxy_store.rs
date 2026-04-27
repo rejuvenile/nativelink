@@ -44,6 +44,7 @@ use nativelink_util::store_trait::{
     StoreOptimizations, UploadSizeInfo,
 };
 
+use crate::fast_slow_store::INNER_MISS_NO_TERMINATE;
 use crate::grpc_store::GrpcStore;
 
 /// A store wrapper that transparently proxies CAS reads from workers when
@@ -1083,10 +1084,19 @@ impl WorkerProxyStore {
             length = ?length,
             "WorkerProxyStore::get_part_sequential: awaiting inner.get_part (will reveal whether NotFound returns or stream hangs)"
         );
-        let inner_result = IS_WORKER_REQUEST
+        // #171: set INNER_MISS_NO_TERMINATE so the wrapped FastSlowStore
+        // does NOT close the OUTER writer on populate-NotFound. We re-use
+        // this same writer for peer-fetch fallback below (try_read_from_worker
+        // → get_part_and_cache); a closed writer there means peer bytes
+        // arrive but cannot be delivered. WorkerProxyStore owns the writer-
+        // termination contract from this point on.
+        let inner_result = INNER_MISS_NO_TERMINATE
             .scope(
                 true,
-                self.inner.get_part(key.borrow(), &mut *writer, offset, length),
+                IS_WORKER_REQUEST.scope(
+                    true,
+                    self.inner.get_part(key.borrow(), &mut *writer, offset, length),
+                ),
             )
             .await;
         let inner_elapsed_ms = inner_await_start.elapsed().as_millis() as u64;
