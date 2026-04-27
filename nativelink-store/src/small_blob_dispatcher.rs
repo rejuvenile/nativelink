@@ -58,18 +58,23 @@
 //! # Concurrency
 //!
 //! - `EphemeralServerSidePin`: a `parking_lot::Mutex<HashMap<DigestInfo,
-//!   (Bytes, Instant)>>` plus an `AtomicU64` for total bytes.
+//!   Bytes>>` plus an `AtomicU64` for total bytes. `total_bytes` is
+//!   updated WHILE the state lock is held so concurrent observers
+//!   never see a torn `(len, total_bytes)` pair (perf-optimizer #153
+//!   MAJOR + red-team B4).
 //! - The pin set holds `Bytes` (Arc-counted), so insert / remove is O(1).
 //! - `observe_pinned_mirror_ack` does a single binary search over the
 //!   sorted-by-store_id `entries` slice and removes ONLY the entries
 //!   whose `store_id` matches `self.store_id`. Other stores' broadcasts
 //!   are O(log N) no-ops.
+//! - `unpin_on_disconnect` clears every entry on every registered
+//!   store. The dispatcher does NOT track per-worker push attribution
+//!   in v1 — see `SmallBlobDispatcher::unpin_on_disconnect` doc for the
+//!   correctness argument and follow-up TODO.
 
-use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err, make_input_err};
@@ -108,14 +113,24 @@ const DEFAULT_MAX_BATCH_BYTES: usize = 256 * 1024;
 /// aggregate memory budget; size for production fleet.
 const DEFAULT_PIN_MAX_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
-/// Default TTL fallback on a server-side pin entry. Real lifetime is ~RTT
-/// (sub-100ms); this only fires on worker silence / disconnect / reconnect
-/// race. Bytes are still in slow tier — TTL expiry just frees server pin
-/// memory and falls back to slow-tier reads.
-const DEFAULT_PIN_TTL: Duration = Duration::from_secs(10);
-
 /// Operator-tunable knobs for the dispatcher. Mirrors the "Knobs" table in
 /// the plan; defaults match production-canary plan rec.
+///
+/// Per the unpin_on_disconnect refactor (red-team #153 B3 + testing-czar
+/// #153 MAJOR-1 + testing-czar #168 MAJOR-2): there is intentionally NO
+/// `pin_ttl`. Pin entries are durable until one of:
+///
+/// 1. The worker advertises them in `BlobsAvailable.pinned_mirror_entries`
+///    (proto field 16) and `observe_pinned_mirror_ack` removes them.
+/// 2. The dispatcher's `unpin_on_disconnect(endpoint, boot_epoch_id)` is
+///    called from `WorkerApiServer`'s disconnect-cleanup task, which
+///    drops every entry in every registered pin set.
+///
+/// Memory bound is `pin_max_bytes`. A previous design had a `pin_ttl`
+/// field with no purge loop attached — the field was dead weight that
+/// invited a leak (a worker that disconnected without acking would leak
+/// its pin entries indefinitely). The v2 pin protocol requires durable
+/// pins until explicit unpin; a TTL is incompatible.
 #[derive(Clone, Debug)]
 pub struct SmallBlobDispatcherConfig {
     /// Master feature flag. `false` ⇒ all `enqueue` calls are no-ops; no
@@ -129,8 +144,6 @@ pub struct SmallBlobDispatcherConfig {
     pub max_batch_bytes: usize,
     /// Per-FastSlowStore pin set byte cap. See `DEFAULT_PIN_MAX_BYTES`.
     pub pin_max_bytes: u64,
-    /// Server-side pin TTL fallback. See `DEFAULT_PIN_TTL`.
-    pub pin_ttl: Duration,
 }
 
 impl Default for SmallBlobDispatcherConfig {
@@ -140,7 +153,6 @@ impl Default for SmallBlobDispatcherConfig {
             max_pending_per_worker: DEFAULT_MAX_PENDING_PER_WORKER,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             pin_max_bytes: DEFAULT_PIN_MAX_BYTES,
-            pin_ttl: DEFAULT_PIN_TTL,
         }
     }
 }
@@ -148,10 +160,15 @@ impl Default for SmallBlobDispatcherConfig {
 /// Server-side pin tracking for bytes the dispatcher pushed to a worker
 /// that the worker has not yet ack'd.
 ///
-/// Lifetime: ~RTT, TTL-evicted. Each entry (`DigestInfo` -> `(Bytes,
-/// Instant)`) costs `data.len() + 24` bytes-ish. Cap is per-store
-/// (`pin_max_bytes`) so two stores (CAS + AC) sum to `2 × pin_max_bytes`
-/// per server.
+/// Lifetime: durable until explicit unpin (via `observe_pinned_mirror_ack`
+/// when the worker advertises the digest in
+/// `BlobsAvailable.pinned_mirror_entries`, OR via `unpin_on_disconnect`
+/// when `WorkerApiServer` notices the worker disconnected). NOT
+/// TTL-evicted. Memory bound is `pin_max_bytes` (per-store).
+///
+/// Each entry (`DigestInfo` -> `Bytes`) costs `data.len()` plus a small
+/// fixed overhead. Cap is per-store (`pin_max_bytes`) so two stores
+/// (CAS + AC) sum to `2 × pin_max_bytes` per server.
 ///
 /// **NOT** the v2 worker-side pin contract; **NOT** the worker-side
 /// `mirror_blobs` map. This lives on the SERVER for in-flight push tracking
@@ -162,9 +179,16 @@ impl Default for SmallBlobDispatcherConfig {
 /// dispatcher Mutex: dispatcher Mutex BEFORE per-store pin-set Mutex.
 /// `observe_pinned_mirror_ack` MUST NOT call back into the dispatcher
 /// under the pin-set lock (no back-edge).
+///
+/// Per perf-optimizer #153 MAJOR + red-team B4: every method that mutates
+/// the HashMap also updates `total_bytes` BEFORE releasing the state
+/// lock. Decoupling the two (e.g. `drop(state); fetch_sub(...)`) was the
+/// previous design and introduced a lost-update race where a concurrent
+/// reader saw `len = 0` AND `total_bytes != 0`, OR a concurrent insert
+/// admitted a payload that put the actual byte total above `cap`.
 pub struct EphemeralServerSidePin {
     cap: u64,
-    state: Mutex<HashMap<DigestInfo, (Bytes, Instant)>>,
+    state: Mutex<HashMap<DigestInfo, Bytes>>,
     total_bytes: AtomicU64,
 }
 
@@ -202,12 +226,16 @@ impl EphemeralServerSidePin {
     /// Insert a new pin entry. Rejects with `Code::ResourceExhausted` if
     /// the new total would exceed `cap`. The bytes are held under the
     /// per-store lock; caller's `Bytes` clone is O(1) refcount-bump.
+    ///
+    /// `total_bytes` is updated WHILE the state lock is held so that a
+    /// concurrent reader cannot observe a torn `(len, total_bytes)` pair
+    /// (per perf-optimizer #153 MAJOR + red-team B4).
     pub fn insert(&self, digest: DigestInfo, data: Bytes) -> Result<(), Error> {
         let new_bytes = data.len() as u64;
         let mut state = self.state.lock();
         let current_total = self.total_bytes.load(Ordering::Relaxed);
         // Subtract old entry's size if we're replacing.
-        let old_size = state.get(&digest).map(|(d, _)| d.len() as u64).unwrap_or(0);
+        let old_size = state.get(&digest).map(|d| d.len() as u64).unwrap_or(0);
         let projected = current_total.saturating_sub(old_size).saturating_add(new_bytes);
         if projected > self.cap {
             drop(state);
@@ -225,21 +253,50 @@ impl EphemeralServerSidePin {
                 self.cap
             ));
         }
-        state.insert(digest, (data, Instant::now()));
-        // Update atomic AFTER mutation so an observer that races a remove
-        // sees the post-insert value (not a torn intermediate).
+        state.insert(digest, data);
+        // Update atomic UNDER the state lock so an observer racing a
+        // remove cannot see a torn `(len, total_bytes)` pair.
         self.total_bytes.store(projected, Ordering::Relaxed);
         Ok(())
     }
 
     /// Remove a single pin entry by digest. No-op if not present.
+    ///
+    /// `total_bytes` fetch_sub is performed WHILE the state lock is held
+    /// (perf-optimizer #153 MAJOR + red-team B4). Releasing the lock
+    /// before the atomic update would let a concurrent
+    /// `len()` / `total_bytes()` reader observe `len = 0 ∧ total_bytes != 0`
+    /// (or worse — a concurrent `insert` race the cap check against
+    /// stale `total_bytes` and admit a payload that exceeds `cap`).
     pub fn remove_one(&self, digest: &DigestInfo) {
         let mut state = self.state.lock();
-        if let Some((data, _)) = state.remove(digest) {
+        if let Some(data) = state.remove(digest) {
             let removed = data.len() as u64;
-            drop(state);
-            self.total_bytes.fetch_sub(removed, Ordering::Relaxed);
+            self.total_bytes.fetch_sub(removed, Ordering::AcqRel);
         }
+    }
+
+    /// Drop every pin entry unconditionally and zero the byte accounting.
+    ///
+    /// Called by `SmallBlobDispatcher::unpin_on_disconnect` when
+    /// `WorkerApiServer` notices a worker has disconnected — the
+    /// disconnected worker can no longer ack pushed blobs via
+    /// `observe_pinned_mirror_ack`, so the in-flight push tracker for
+    /// those bytes would otherwise leak forever. The bytes themselves
+    /// remain in the slow tier; this only frees the in-flight
+    /// server-side push tracker.
+    ///
+    /// `total_bytes` is updated UNDER the state lock for the same
+    /// reason as `remove_one` / `insert` — concurrent readers must
+    /// never see a torn `(len, total_bytes)` pair.
+    pub fn unpin_on_disconnect(&self) {
+        let mut state = self.state.lock();
+        let freed: u64 = state.values().map(|b| b.len() as u64).sum();
+        state.clear();
+        // Zero the atomic UNDER the state lock to keep `len` and
+        // `total_bytes` consistent for any concurrent observer.
+        self.total_bytes.store(0, Ordering::Release);
+        debug!(freed, "EphemeralServerSidePin::unpin_on_disconnect dropped pin entries");
     }
 
     /// Remove all entries the worker has acked.
@@ -301,13 +358,15 @@ impl EphemeralServerSidePin {
                 );
                 continue;
             };
-            if let Some((data, _)) = state.remove(&digest) {
+            if let Some(data) = state.remove(&digest) {
                 freed += data.len() as u64;
             }
         }
-        drop(state);
+        // Update atomic UNDER the state lock (perf-optimizer #153 MAJOR
+        // + red-team B4) — concurrent readers must never see a torn
+        // `(len, total_bytes)` pair.
         if freed > 0 {
-            self.total_bytes.fetch_sub(freed, Ordering::Relaxed);
+            self.total_bytes.fetch_sub(freed, Ordering::AcqRel);
         }
     }
 }
@@ -472,6 +531,48 @@ impl SmallBlobDispatcher {
         // disconnect.
         let mut queues = self.queues.lock();
         queues.retain(|(ep, epoch, _), _| !(*ep == key && *epoch == boot_epoch_id));
+    }
+
+    /// Drop every pin entry on every registered store after the worker
+    /// at `(endpoint, boot_epoch_id)` disconnects. Called from
+    /// `WorkerApiServer`'s disconnect-cleanup task in addition to
+    /// `unregister_worker` — the two together (a) prevent new pushes
+    /// from queuing for the dead worker AND (b) release the in-flight
+    /// push tracker so `pin_max_bytes` is not consumed forever by
+    /// digests the worker can no longer ack.
+    ///
+    /// **Per-worker push attribution gap (v1 limitation):** the
+    /// per-store `EphemeralServerSidePin` set is keyed by `DigestInfo`,
+    /// NOT by `(endpoint, boot_epoch_id)`. The dispatcher does NOT
+    /// track which worker pushed which entry. So this method clears
+    /// the ENTIRE pin set for every registered store — the
+    /// `endpoint` / `boot_epoch_id` arguments are recorded in the log
+    /// for audit but do not gate the clear.
+    ///
+    /// This is correct under the assumption that a single worker
+    /// disconnect signals every in-flight push from that worker is
+    /// lost, AND in a single-worker fleet the over-broad clear is
+    /// equivalent to the precise clear. For staggered fleets it
+    /// temporarily drops in-flight push tracking for entries destined
+    /// to OTHER workers; those workers will continue to ack via
+    /// `BlobsAvailable.pinned_mirror_entries`, so the worst-case
+    /// effect is one duplicate push per orphaned entry on the next
+    /// blob update — bounded and self-healing.
+    ///
+    /// TODO(#168 follow-up): track per-(endpoint, boot_epoch_id) push
+    /// attribution so unpin_on_disconnect only clears that worker's
+    /// in-flight entries.
+    pub fn unpin_on_disconnect(&self, endpoint: &str, boot_epoch_id: u64) {
+        let snapshot = self.all_pin_sets();
+        debug!(
+            endpoint,
+            boot_epoch_id,
+            store_count = snapshot.len(),
+            "SmallBlobDispatcher::unpin_on_disconnect clearing per-store pin sets"
+        );
+        for (_store_id, pin_set) in snapshot {
+            pin_set.unpin_on_disconnect();
+        }
     }
 
     /// Enqueue a single small blob for push to a specific worker.
