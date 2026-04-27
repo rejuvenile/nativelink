@@ -62,7 +62,7 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreLike};
 use nativelink_worker::local_worker::{
-    BlobsAvailableState, handle_bis_chunk,
+    BisUnpinOutcome, BlobsAvailableState, handle_bis_chunk,
 };
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -153,11 +153,15 @@ async fn bis_chunked_full_burst() -> Result<(), nativelink_error::Error> {
     };
 
     let mut acks: Vec<BisAck> = Vec::new();
-    let unpinned = handle_bis_chunk(&state, None, &chunk, |a| acks.push(a));
+    let outcome = handle_bis_chunk(&state, None, &chunk, |a| acks.push(a));
 
     assert_eq!(
-        unpinned, 32,
+        outcome.unpinned, 32,
         "every digest in the chunk must unpin"
+    );
+    assert_eq!(
+        outcome.failed, 0,
+        "well-formed digests must not fail decode"
     );
     assert_eq!(
         fss.mirror_blob_count(),
@@ -189,9 +193,10 @@ async fn bis_chunked_empty_terminal_acks() -> Result<(), nativelink_error::Error
     };
 
     let mut acks: Vec<BisAck> = Vec::new();
-    let unpinned = handle_bis_chunk(&state, None, &chunk, |a| acks.push(a));
+    let outcome = handle_bis_chunk(&state, None, &chunk, |a| acks.push(a));
 
-    assert_eq!(unpinned, 0, "no digests means no unpins");
+    assert_eq!(outcome.unpinned, 0, "no digests means no unpins");
+    assert_eq!(outcome.failed, 0, "empty input cannot fail-decode");
     assert_eq!(
         acks.len(),
         1,
@@ -242,5 +247,87 @@ async fn bis_chunked_idempotent_unpin() -> Result<(), nativelink_error::Error> {
     assert_eq!(acks[0].sequence, 2);
     assert_eq!(acks[1].broadcast_id, 11);
     assert_eq!(acks[1].sequence, 2);
+    Ok(())
+}
+
+/// 4. **Over-action contract test (asymmetric coverage):** when ANY digest
+///    in the chunk fails to decode, the ack MUST NOT fire. Exercises the
+///    fix for red-team finding #3 on the original #97 PR — previously the
+///    ack went out unconditionally after the unpin pass, so a partial-
+///    failure chunk was dropped from the server's resend buffer and never
+///    replayed → the failed digests stayed pinned forever (the same
+///    durability gap as #89, in different clothes).
+///
+///    The under-action sibling (`bis_chunked_full_burst`) asserts the ack
+///    DOES fire when every digest succeeds; that test covers the success
+///    path only. Per CLAUDE.md §Asymmetric contract coverage, both
+///    directions need explicit tests; without this one, regressing
+///    `handle_bis_chunk` to "always ack" would silently re-introduce
+///    the bug.
+///
+///    Mutation step: comment out the `if outcome.all_succeeded()` gate
+///    in `handle_bis_chunk` so the ack fires unconditionally. This test
+///    MUST then panic with the specific "must NOT emit an ack" message.
+#[nativelink_test]
+async fn bis_ack_not_sent_when_unpin_fails() -> Result<(), nativelink_error::Error> {
+    use tokio::time::{Duration, timeout};
+
+    let (fs_store, _content, _temp) = make_filesystem_store().await;
+    let fss = make_fss_for_mirror();
+    let valid_digests = populate_mirror_blobs(&fss, 4).await;
+    let state = BlobsAvailableState::new_for_test(fs_store.clone(), Some(fss.clone()));
+
+    // Chunk mixes one MALFORMED proto digest (hex won't decode) with
+    // four well-formed ones. The handler must report failed=1 and
+    // SUPPRESS the ack so the server replays on next reconnect.
+    let mut digests_proto = proto_from(&valid_digests);
+    digests_proto.insert(
+        2, // middle of the batch — exercise the no-fail-fast path
+        ProtoDigest {
+            hash: "definitely-not-valid-hex".into(),
+            size_bytes: 7,
+        },
+    );
+
+    let chunk = BlobsInStableStorageChunk {
+        digests: digests_proto,
+        broadcast_id: 99,
+        sequence: 13,
+        is_last: false,
+    };
+
+    let mut acks: Vec<BisAck> = Vec::new();
+    // Wrap in `timeout` per CLAUDE.md production-composition convention:
+    // the deadlock detector. handle_bis_chunk is sync today but a future
+    // refactor that wraps it in async must not silently hang.
+    let outcome: BisUnpinOutcome = timeout(
+        Duration::from_secs(5),
+        async { handle_bis_chunk(&state, None, &chunk, |a| acks.push(a)) },
+    )
+    .await
+    .expect("handle_bis_chunk must not hang on partial-failure path");
+
+    assert_eq!(
+        outcome.failed, 1,
+        "exactly one digest must report decode failure"
+    );
+    assert_eq!(
+        outcome.unpinned, 4,
+        "the four well-formed digests still unpin even when a sibling fails"
+    );
+    assert!(
+        !outcome.all_succeeded(),
+        "outcome.all_succeeded() must report partial failure"
+    );
+
+    assert!(
+        acks.is_empty(),
+        "must NOT emit an ack when ANY digest in the chunk fails to decode \
+         — otherwise the server drops the chunk from the resend buffer and \
+         the failed digest's pin state leaks until manual eviction. \
+         Acks emitted: {}",
+        acks.len()
+    );
+
     Ok(())
 }

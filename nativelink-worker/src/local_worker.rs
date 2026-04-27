@@ -782,6 +782,36 @@ pub fn handle_batch_write_small_blobs(
     );
 }
 
+/// Outcome of one BIS unpin pass: how many digests were successfully
+/// unpinned and how many failed (currently only digest-decode errors;
+/// `unpin_digest` itself is infallible). Returned by
+/// [`handle_blobs_in_stable_storage`] so the chunked caller
+/// ([`handle_bis_chunk`]) can gate the ack on per-digest success — see
+/// the doc comment on `handle_bis_chunk` for why partial failure must
+/// suppress the ack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BisUnpinOutcome {
+    /// Number of digests where the proto decoded AND every per-digest
+    /// side effect (FilesystemStore::unpin_digest, mirror cleanup,
+    /// failed_slow_writes ack) ran without error.
+    pub unpinned: usize,
+    /// Number of digests where the proto failed `DigestInfo::try_from`.
+    /// All other unpin operations on this layer are infallible today,
+    /// so this is the only failure mode currently observable; the count
+    /// is exposed as a struct field to make future failure-mode growth
+    /// non-breaking.
+    pub failed: usize,
+}
+
+impl BisUnpinOutcome {
+    /// True iff every digest in the input batch was processed without
+    /// error. Used by `handle_bis_chunk` as the ack gate.
+    #[inline]
+    pub const fn all_succeeded(&self) -> bool {
+        self.failed == 0
+    }
+}
+
 /// Process a `BlobsInStableStorage` notification from the server:
 ///   * Unpin the digests on the local FilesystemStore so they become
 ///     eligible for eviction.
@@ -791,6 +821,14 @@ pub fn handle_batch_write_small_blobs(
 ///     FastSlowStore — the server now has its own durable copy and
 ///     the worker no longer needs to hold one.
 ///
+/// Returns a [`BisUnpinOutcome`] reporting how many digests
+/// succeeded vs. failed. Today the only failure mode is
+/// `DigestInfo::try_from` returning Err on a malformed proto digest;
+/// `FilesystemStore::unpin_digest` and the mirror cleanup are both
+/// infallible. The `Result`-shaped return type is preserved so future
+/// failure-mode growth (e.g. disk-IO-backed unpin) does not require a
+/// breaking signature change at every call-site.
+///
 /// Extracted from the `Update::BlobsInStableStorage` match arm in
 /// `LocalWorkerImpl::run` so the handler is unit-testable without
 /// standing up the full scheduler/worker stream stack. The dispatch
@@ -799,10 +837,11 @@ pub fn handle_blobs_in_stable_storage(
     state: &BlobsAvailableState,
     cas_store: Option<&Arc<FastSlowStore>>,
     proto_digests: &[nativelink_proto::build::bazel::remote::execution::v2::Digest],
-) {
+) -> BisUnpinOutcome {
     let digest_count = proto_digests.len();
     let fs_store = &state.fs_store;
     let mut unpinned = 0usize;
+    let mut failed = 0usize;
     let mut acked_digests: Vec<DigestInfo> = Vec::with_capacity(digest_count);
     for proto_digest in proto_digests {
         if let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) {
@@ -810,6 +849,7 @@ pub fn handle_blobs_in_stable_storage(
             acked_digests.push(digest);
             unpinned += 1;
         } else {
+            failed += 1;
             warn!(
                 ?proto_digest,
                 "BlobsInStableStorage: invalid digest, skipping unpin"
@@ -839,57 +879,76 @@ pub fn handle_blobs_in_stable_storage(
     }
     info!(
         unpinned,
+        failed,
         digest_count,
         "BlobsInStableStorage: unpinned digests from local CAS"
     );
+    BisUnpinOutcome { unpinned, failed }
 }
 
 /// (#97) Process one `BlobsInStableStorageChunk` arriving on the
-/// scheduler→worker stream and emit the matching `BisAck`.
+/// scheduler→worker stream and emit the matching `BisAck` IFF every
+/// digest in the chunk was unpinned without error.
 ///
-/// Reuses [`handle_blobs_in_stable_storage`] for the unpin work — the
-/// chunked path differs only in (a) per-chunk granularity and (b) the
-/// per-chunk ack the server uses to release its resend buffer slot.
+/// **Ack-on-success-only.** Per red-team finding #3 on the original
+/// #97 PR: previously the ack fired unconditionally after the unpin
+/// pass. If `handle_blobs_in_stable_storage` failed on any digest
+/// (today: malformed proto), the ack still went out → the server
+/// dropped the chunk from the resend buffer → on the next ConnectWorker
+/// the worker never saw a replay → the failed digests stayed pinned
+/// forever. Same outcome as the original #89 bug, different mechanism,
+/// less detectable. The fix: the ack fires only when every digest in
+/// the chunk was processed successfully (`outcome.all_succeeded()`).
+/// On partial failure, an `error!` log records the chunk identity and
+/// the failure count; the server's resend buffer keeps the chunk and
+/// the next reconnect replays it.
 ///
-/// The ack is emitted UNCONDITIONALLY — even when the chunk carries
-/// zero digests (the empty-terminal case from `chunk_iter`'s contract).
-/// Without this, a broadcast whose final chunk lands on the chunk-size
-/// boundary (or carries zero digests) would leak its slot in the
-/// server's resend buffer forever.
+/// **Empty-terminal still acks.** A chunk with zero digests
+/// (`chunk_iter`'s empty-terminal contract) trivially succeeds — there
+/// is nothing to fail on — so the ack fires and the server's resend
+/// buffer slot is released. Without this, a broadcast whose final
+/// chunk lands on the chunk-size boundary would leak its slot forever.
 ///
-/// Acks are also emitted on duplicate deliveries (e.g. when a server
-/// resend crosses an in-flight ack). The server's per-chunk slot in the
-/// resend buffer is keyed on `(broadcast_id, sequence)` so a second ack
-/// is a harmless `HashMap::remove` on a missing key.
+/// **Duplicate chunks ack on every delivery.** When a server resend
+/// crosses an in-flight ack, the worker sees the same chunk twice;
+/// every digest decodes again, every unpin is idempotent → outcome
+/// is success → ack fires. The server's per-chunk slot is keyed on
+/// `(broadcast_id, sequence)` so the second ack is a harmless
+/// `HashMap::remove` on a missing key.
 ///
-/// Returns the number of digests successfully unpinned (0 on
-/// empty-terminal or duplicate). The caller may use this for
-/// observability but the worker arm must not gate the ack on it.
+/// Returns the [`BisUnpinOutcome`] reporting per-digest success/failure
+/// counts. Callers can use the failed-count for observability;
+/// production callers MUST NOT bypass the ack-gate by calling
+/// `ack_sink` themselves on partial failure.
 pub fn handle_bis_chunk(
     state: &BlobsAvailableState,
     cas_store: Option<&Arc<FastSlowStore>>,
     chunk: &BlobsInStableStorageChunk,
     ack_sink: impl FnOnce(BisAck),
-) -> usize {
-    let before = cas_store.map(|s| s.mirror_blob_count()).unwrap_or(0);
-    handle_blobs_in_stable_storage(state, cas_store, &chunk.digests);
-    // The mirror count delta is the most reliable "unpinned" signal at
-    // this layer (FilesystemStore::unpin_digest is fire-and-forget and
-    // doesn't return a count). We only compute when a CAS store is
-    // attached; without one, return the proto digest count as an
-    // upper bound (no easy way to know how many were already absent).
-    let unpinned = if let Some(cas_store) = cas_store {
-        let after = cas_store.mirror_blob_count();
-        before.saturating_sub(after)
+) -> BisUnpinOutcome {
+    let outcome = handle_blobs_in_stable_storage(state, cas_store, &chunk.digests);
+    if outcome.all_succeeded() {
+        (ack_sink)(BisAck {
+            broadcast_id: chunk.broadcast_id,
+            sequence: chunk.sequence,
+        });
     } else {
-        // No CAS server, no mirror state — best-effort upper bound.
-        chunk.digests.len()
-    };
-    (ack_sink)(BisAck {
-        broadcast_id: chunk.broadcast_id,
-        sequence: chunk.sequence,
-    });
-    unpinned
+        // Loud-log so operators see the unpin-failure rate. The server
+        // will retain the chunk in its per-worker resend buffer and
+        // replay on the next ConnectWorker.
+        error!(
+            target: "nativelink::bis_chunk_unpin_failure",
+            broadcast_id = chunk.broadcast_id,
+            sequence = chunk.sequence,
+            unpinned = outcome.unpinned,
+            failed = outcome.failed,
+            digest_count = chunk.digests.len(),
+            "BIS chunk had unpin failures; SUPPRESSING ack so server replays \
+             chunk on next reconnect — without this gate a single malformed \
+             digest in the chunk would leak the chunk's pin state forever"
+        );
+    }
+    outcome
 }
 
 /// Process one `PeerHintsChunk` arriving on the scheduler→worker stream:
