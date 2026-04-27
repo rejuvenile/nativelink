@@ -113,12 +113,41 @@ tokio::task_local! {
     /// side gate at the same chain depth (#171 parallel-path leak,
     /// 2026-04-27).
     ///
-    /// Other early-return `guard.fail(...)` sites in `FastSlowStore::get_part`
-    /// (mirror_blobs size mismatch, fast_store truncation, in_flight size
-    /// mismatch, fast_store error path, local_only_reads NotFound) do NOT
-    /// honor this flag because they signal real corruption / fault states
-    /// that peer-fetch cannot recover from and that VerifyStore's
-    /// deadlock-defense still requires.
+    /// Coverage ALSO extends to the three early-return NotFound sites
+    /// that route to peer-fetch in production (red-team #171 follow-up,
+    /// 2026-04-27):
+    ///
+    /// 1. `mirror_blobs` size mismatch (line ~2949) — the in-memory
+    ///    mirror cache held a phantom-positive entry whose bytes
+    ///    didn't match `digest.size_bytes()`. The corrupt entry has
+    ///    been removed; the blob may still live on slow-tier or peers,
+    ///    so peer-fetch on the still-open OUTER writer IS recoverable.
+    /// 2. `in_flight_slow_writes` size mismatch (line ~3101) — the
+    ///    in-flight chunks didn't sum to the digest size. Same shape:
+    ///    the bad entry has been removed; the blob may still live
+    ///    elsewhere, so peer-fetch is the recovery path.
+    /// 3. `local_only_reads` NotFound (line ~3157) — the worker public-
+    ///    CAS variant DELIBERATELY refuses slow-tier fallthrough so
+    ///    the asking server "tries a different peer rather than looping
+    ///    the request back through this worker's slow tier." The
+    ///    upstream `WorkerProxyStore`'s peer-fetch IS that "different
+    ///    peer" path — terminating the OUTER writer here defeats the
+    ///    very design intent of `local_only_reads`.
+    ///
+    /// All three preserve VerifyStore's deadlock-defense when the gate
+    /// is NOT set (no upstream peer-fetch caller above): the helper
+    /// falls through to `commit_delegated_if_ok(&Err)` which leaves the
+    /// `WriteHalfGuard` Drop fallback armed.
+    ///
+    /// Sites that do NOT honor this flag, even with the gate set:
+    /// fast_store truncation (Code::Internal — semantics indicate
+    /// corruption, not absence; consumer must see structured Internal
+    /// error), fast_store non-NotFound err path (preserves the inner
+    /// store's structured error code), and the populator streaming-
+    /// reader-error branch when bytes have already been sent
+    /// (peer-fetch cannot recover without producing a corrupt-prefix-
+    /// from-populate + full-peer-copy stream — see existing inline
+    /// `bytes_written == 0` guard at line ~3392-3402).
     pub static INNER_MISS_NO_TERMINATE: bool;
 }
 
@@ -150,11 +179,20 @@ tokio::task_local! {
 ///    callers don't go through the helper).
 ///
 /// This is the gate-aware analogue of the inline checks at the
-/// populator terminal-state branch (line 3210-3221) and the populator
-/// streaming-reader-error branch (line 3326-3347). All three sites
+/// populator terminal-state branch (line ~3290) and the populator
+/// streaming-reader-error branch (line ~3422). All three sites
 /// share the same contract: when the upstream caller has opted in, an
 /// inner-NotFound with no bytes written must NOT terminate the OUTER
 /// writer.
+///
+/// Also called from the three early-return NotFound paths in
+/// `FastSlowStore::get_part` that route to peer-fetch in production:
+/// `mirror_blobs` size mismatch, `in_flight_slow_writes` size mismatch,
+/// and `local_only_reads`. At each of those sites the caller passes a
+/// synthesized `Err(NotFound)` (no inner await happened) so the gate
+/// suppresses the Drop fallback while the caller still propagates the
+/// structured Err to its parent — see [`INNER_MISS_NO_TERMINATE`] for
+/// the per-site rationale.
 fn commit_with_inner_miss_gate(
     guard: &mut WriteHalfGuard<'_>,
     res: &Result<(), Error>,
@@ -2978,12 +3016,28 @@ impl StoreDriver for FastSlowStore {
                     // and silently leave the server's locality_map pointing
                     // at this worker for a digest the worker has just discarded.
                     self.remove_mirror_blobs(&[digest]);
-                    return Err(guard.fail(make_err!(
+                    // #171 sibling: route through `commit_with_inner_miss_gate`
+                    // so the OUTER writer survives when the caller (typically
+                    // `WorkerProxyStore::get_part_sequential`) has opted in
+                    // via `INNER_MISS_NO_TERMINATE`. The corrupt mirror entry
+                    // was just evicted; the blob may still live on slow-tier
+                    // or peers, so peer-fetch on the same writer is the
+                    // recovery path. Without the gate, the Drop fallback
+                    // closes the OUTER writer and peer-fetch fails with
+                    // `"Tried to send while stream is closed"`. When the
+                    // gate is NOT set, the helper falls through to
+                    // `commit_delegated_if_ok(&Err)` which leaves the
+                    // VerifyStore deadlock-defense armed (under-action
+                    // contract preserved).
+                    let bytes_before = guard.get_bytes_written();
+                    let res: Result<(), Error> = Err(make_err!(
                         Code::NotFound,
                         "mirror_blobs entry for {digest} had wrong size \
                          ({} != {expected}) — entry removed",
                         data.len()
-                    )));
+                    ));
+                    commit_with_inner_miss_gate(&mut guard, &res, bytes_before);
+                    return res;
                 }
                 let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
                 if offset_usize < data.len() {
@@ -3130,11 +3184,22 @@ impl StoreDriver for FastSlowStore {
                                 self.in_flight_empty_notify.notify_waiters();
                             }
                         }
-                        return Err(guard.fail(make_err!(
+                        // #171 sibling: route through `commit_with_inner_miss_gate`
+                        // so the OUTER writer survives when the caller has
+                        // opted in via `INNER_MISS_NO_TERMINATE`. The
+                        // bad in-flight entry was just evicted; the blob
+                        // may still live on slow-tier or peers, so peer-fetch
+                        // on the same writer is the recovery path. Same
+                        // shape as the mirror_blobs size-mismatch sibling
+                        // above.
+                        let bytes_before = guard.get_bytes_written();
+                        let res: Result<(), Error> = Err(make_err!(
                             Code::NotFound,
                             "in_flight_slow_writes entry for {d} had wrong total \
                              size ({total_len} != {expected}) — entry removed"
-                        )));
+                        ));
+                        commit_with_inner_miss_gate(&mut guard, &res, bytes_before);
+                        return res;
                     }
                 }
                 let offset_usize = usize::try_from(offset)
@@ -3186,10 +3251,25 @@ impl StoreDriver for FastSlowStore {
                 ?key,
                 "local_only_reads: returning NotFound instead of falling through to slow store"
             );
-            return Err(guard.fail(make_err!(
+            // #171 sibling: route through `commit_with_inner_miss_gate`
+            // so the OUTER writer survives when the caller has opted in
+            // via `INNER_MISS_NO_TERMINATE`. The ENTIRE PURPOSE of
+            // `local_only_reads` is to force the asking server to "try
+            // a different peer rather than looping the request back
+            // through this worker's slow tier." When the upstream
+            // `WorkerProxyStore` is wired for peer-fetch, that is
+            // EXACTLY the recovery path `local_only_reads` is designed
+            // to enable; terminating the OUTER writer here defeats the
+            // design intent. When the gate is NOT set, the helper
+            // falls through to `commit_delegated_if_ok(&Err)` so the
+            // VerifyStore deadlock-defense stays armed.
+            let bytes_before = guard.get_bytes_written();
+            let res: Result<(), Error> = Err(make_err!(
                 Code::NotFound,
                 "FastSlowStore local_only_reads: blob not present on this worker"
-            )));
+            ));
+            commit_with_inner_miss_gate(&mut guard, &res, bytes_before);
+            return res;
         }
 
         // If the fast store is noop or read only or update only then bypass it.
