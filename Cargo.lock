@@ -3643,6 +3643,7 @@ dependencies = [
  "formatx",
  "futures",
  "h3-quinn",
+ "hex",
  "hostname",
  "hyper 1.8.1",
  "libc",
