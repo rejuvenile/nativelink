@@ -168,7 +168,6 @@ async fn basic_add_action_with_one_worker_test() -> Result<(), Error> {
                 queued_timestamp: Some(insert_timestamp.into()),
                 platform: Some(Platform::default()),
                 worker_id: worker_id.into(),
-                peer_hints: Vec::new(),
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
@@ -358,7 +357,6 @@ async fn find_executing_action() -> Result<(), Error> {
                 queued_timestamp: Some(insert_timestamp.into()),
                 platform: Some(Platform::default()),
                 worker_id: worker_id.into(),
-                peer_hints: Vec::new(),
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
@@ -444,7 +442,6 @@ async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Err
         queued_timestamp: Some(insert_timestamp1.into()),
         platform: Some(Platform::default()),
         worker_id: worker_id1.to_string(),
-        peer_hints: Vec::new(),
         resolved_directories: Vec::new(),
         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
@@ -461,7 +458,6 @@ async fn remove_worker_reschedules_multiple_running_job_test() -> Result<(), Err
         queued_timestamp: Some(insert_timestamp2.into()),
         platform: Some(Platform::default()),
         worker_id: worker_id1.to_string(),
-        peer_hints: Vec::new(),
         resolved_directories: Vec::new(),
         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
@@ -758,7 +754,6 @@ async fn worker_should_not_queue_if_properties_dont_match_test() -> Result<(), E
                 queued_timestamp: Some(insert_timestamp.into()),
                 platform: Some((&worker2_properties).into()),
                 worker_id: worker_id2.to_string(),
-                peer_hints: Vec::new(),
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
@@ -864,7 +859,6 @@ async fn cacheable_items_join_same_action_queued_test() -> Result<(), Error> {
                 queued_timestamp: Some(insert_timestamp1.into()),
                 platform: Some(Platform::default()),
                 worker_id: worker_id.into(),
-                peer_hints: Vec::new(),
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
@@ -1231,7 +1225,6 @@ async fn worker_timesout_reschedules_running_job_test() -> Result<(), Error> {
         queued_timestamp: Some(insert_timestamp.into()),
         platform: Some(Platform::default()),
         worker_id: worker_id1.to_string(),
-        peer_hints: Vec::new(),
         resolved_directories: Vec::new(),
         resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
@@ -1722,7 +1715,6 @@ async fn does_not_crash_if_operation_joined_then_relaunched() -> Result<(), Erro
                 queued_timestamp: Some(insert_timestamp.into()),
                 platform: Some(Platform::default()),
                 worker_id: worker_id.clone().into(),
-                peer_hints: Vec::new(),
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
                         missing_digests: Vec::new(),
@@ -2729,14 +2721,58 @@ async fn setup_action_with_input_root(
 }
 
 /// Helper: extracts the StartExecute from a worker receiver, returning
-/// (operation_id, start_execute).
+/// (operation_id, start_execute, peer_hints). The dispatch path emits
+/// `Update::ChunkedMessage(PeerHints)` messages alongside (typically just
+/// before) `Update::StartAction`. We drain whatever's in the queue,
+/// concatenating peer-hint chunks until we see the matching StartAction
+/// (and one terminal chunk OR end-of-stream). Cap the drain at 64
+/// messages so a buggy emitter can't hang the test forever.
 async fn recv_start_execute(
     rx: &mut mpsc::UnboundedReceiver<UpdateForWorker>,
 ) -> (String, StartExecute) {
-    match rx.recv().await.unwrap().update {
-        Some(update_for_worker::Update::StartAction(se)) => (se.operation_id.clone(), se),
-        v => panic!("Expected StartAction, got: {v:?}"),
+    let (op_id, se, _hints) = recv_start_execute_with_hints(rx).await;
+    (op_id, se)
+}
+
+/// As `recv_start_execute` but ALSO returns the concatenated hints from
+/// every `PeerHintsChunk` for the matching operation_id. The order of
+/// arrival between chunks and `StartAction` is not guaranteed by the
+/// protocol — this helper handles either ordering.
+async fn recv_start_execute_with_hints(
+    rx: &mut mpsc::UnboundedReceiver<UpdateForWorker>,
+) -> (String, StartExecute, Vec<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::PeerHint>) {
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+        chunked_message, PeerHint,
+    };
+    let mut start_action: Option<(String, StartExecute)> = None;
+    let mut hints: Vec<PeerHint> = Vec::new();
+    let mut saw_terminal_chunk = false;
+    for _ in 0..256 {
+        let msg = match rx.recv().await {
+            Some(m) => m,
+            None => break,
+        };
+        match msg.update {
+            Some(update_for_worker::Update::StartAction(se)) => {
+                start_action = Some((se.operation_id.clone(), se));
+            }
+            Some(update_for_worker::Update::ChunkedMessage(cm)) => match cm.payload {
+                Some(chunked_message::Payload::PeerHints(chunk)) => {
+                    if chunk.is_last {
+                        saw_terminal_chunk = true;
+                    }
+                    hints.extend(chunk.peer_hints);
+                }
+                None => panic!("ChunkedMessage with empty payload"),
+            },
+            v => panic!("Expected StartAction or ChunkedMessage, got: {v:?}"),
+        }
+        if start_action.is_some() && saw_terminal_chunk {
+            break;
+        }
     }
+    let (op_id, se) = start_action.expect("did not receive StartAction within drain budget");
+    (op_id, se, hints)
 }
 
 #[nativelink_test]
@@ -2937,12 +2973,13 @@ async fn no_peer_hints_without_resolved_tree_test() -> Result<(), Error> {
     )
     .await?;
 
-    // Worker should receive StartAction with empty peer_hints (no resolved tree).
-    let (_, start_execute) = recv_start_execute(&mut rx_from_worker).await;
+    // Worker should receive StartAction with no peer-hints chunks (no resolved tree).
+    let (_, _start_execute, peer_hints) =
+        recv_start_execute_with_hints(&mut rx_from_worker).await;
 
     assert!(
-        start_execute.peer_hints.is_empty(),
-        "peer_hints should be empty without a resolved tree (directory digests are not useful)"
+        peer_hints.is_empty(),
+        "peer-hints chunks should be empty without a resolved tree (directory digests are not useful)"
     );
 
     Ok(())
@@ -3038,25 +3075,26 @@ async fn peer_hints_from_resolved_tree_test() -> Result<(), Error> {
     )
     .await?;
 
-    let (_, start_execute) = recv_start_execute(&mut rx_from_worker).await;
+    let (_, _start_execute, peer_hints) =
+        recv_start_execute_with_hints(&mut rx_from_worker).await;
 
     // Should have per-file peer hints (one per file in the tree).
     assert_eq!(
-        start_execute.peer_hints.len(),
+        peer_hints.len(),
         2,
         "Should have 2 peer hints (one per file in the input tree)"
     );
 
     // Hints should be sorted by size descending (large first).
     let first_hint_digest = DigestInfo::try_from(
-        start_execute.peer_hints[0]
+        peer_hints[0]
             .digest
             .as_ref()
             .expect("hint should have digest"),
     )
     .unwrap();
     let second_hint_digest = DigestInfo::try_from(
-        start_execute.peer_hints[1]
+        peer_hints[1]
             .digest
             .as_ref()
             .expect("hint should have digest"),
@@ -3073,7 +3111,7 @@ async fn peer_hints_from_resolved_tree_test() -> Result<(), Error> {
     );
 
     // Both hints should reference the peer endpoint.
-    for hint in &start_execute.peer_hints {
+    for hint in &peer_hints {
         assert!(
             hint.peer_endpoints.contains(&peer_endpoint.to_string()),
             "Each hint should reference the peer endpoint"
@@ -3184,22 +3222,15 @@ async fn fallback_to_lru_when_no_locality_data_test() -> Result<(), Error> {
     )
     .await?;
 
-    // One of the workers should receive the action (LRU fallback).
-    // We don't care which worker gets it -- just that it succeeds.
-    let (selected_worker_id, start_execute) = tokio::select! {
-        msg = rx_a.recv() => {
-            let se = match msg.unwrap().update {
-                Some(update_for_worker::Update::StartAction(se)) => se,
-                v => panic!("Expected StartAction on worker_a, got: {v:?}"),
-            };
-            (worker_id_a.clone(), se)
+    // One of the workers should receive the action (LRU fallback). The
+    // PeerHints chunk + StartAction may interleave; drain whichever rx
+    // produces first via `recv_start_execute_with_hints`.
+    let (selected_worker_id, _start_execute, peer_hints) = tokio::select! {
+        v = recv_start_execute_with_hints(&mut rx_a) => {
+            (worker_id_a.clone(), v.1, v.2)
         }
-        msg = rx_b.recv() => {
-            let se = match msg.unwrap().update {
-                Some(update_for_worker::Update::StartAction(se)) => se,
-                v => panic!("Expected StartAction on worker_b, got: {v:?}"),
-            };
-            (worker_id_b.clone(), se)
+        v = recv_start_execute_with_hints(&mut rx_b) => {
+            (worker_id_b.clone(), v.1, v.2)
         }
     };
 
@@ -3211,9 +3242,9 @@ async fn fallback_to_lru_when_no_locality_data_test() -> Result<(), Error> {
 
     // With no locality data, there should be no peer hints (no blobs are registered).
     assert!(
-        start_execute.peer_hints.is_empty(),
-        "peer_hints should be empty when locality map has no data for input files, got {} hints",
-        start_execute.peer_hints.len()
+        peer_hints.is_empty(),
+        "peer-hints chunks should be empty when locality map has no data for input files, got {} hints",
+        peer_hints.len()
     );
 
     // Client should see the Executing state.
@@ -3262,12 +3293,13 @@ async fn locality_scoring_with_empty_map_and_no_cas_store_test() -> Result<(), E
         setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp).await?;
 
     // Worker should receive the action via normal LRU selection.
-    let (_, start_execute) = recv_start_execute(&mut rx_from_worker).await;
+    let (_, _start_execute, peer_hints) =
+        recv_start_execute_with_hints(&mut rx_from_worker).await;
 
     // No peer hints should be generated (no tree, no locality data).
     assert!(
-        start_execute.peer_hints.is_empty(),
-        "peer_hints should be empty when no CAS store is configured"
+        peer_hints.is_empty(),
+        "peer-hints chunks should be empty when no CAS store is configured"
     );
 
     assert_eq!(
