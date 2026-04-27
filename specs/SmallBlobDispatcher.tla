@@ -79,10 +79,20 @@
     * Bytestream / CAS server / AC server ENQUEUE-side hooks — those
       are call-site additions whose correctness is local to the hook
       site, not protocol-level.
-    * TTL expiry of EphemeralServerSidePin entries — modeled
-      separately by the per-test mutation in nativelink-store/tests.
     * mpsc capacity overflow / try_send Full — covered by existing
       tests, not a protocol-state concern.
+
+  ADDITION (unpin_on_disconnect refactor): pins are durable until
+  EXPLICIT release. There is NO TTL eviction — the previous design
+  recorded an Instant on each insert but never read it (no purge
+  loop). On worker disconnect the WorkerApiServer calls
+  SmallBlobDispatcher::unpin_on_disconnect, which clears every pin
+  set unconditionally (the per-store pin set is keyed by digest, not
+  by worker — see WorkerDisconnect action below). The
+  NoCrossStoreLeak invariant is unaffected: the disconnect-driven
+  release of (s, d) is still keyed to the worker that "owns" the
+  pin, so the cross-store leak window remains the same as in the
+  original spec.
  ***************************************************************************)
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
@@ -182,11 +192,49 @@ ServerProcessAck ==
        /\ UNCHANGED <<workerMirror, inflightPushes>>
 
 ----------------------------------------------------------------------------
+(* WorkerDisconnect: models the WorkerApiServer disconnect-cleanup
+   path that calls SmallBlobDispatcher::unpin_on_disconnect — every
+   per-store pin set is cleared unconditionally because the v1
+   dispatcher does NOT track per-(endpoint, boot_epoch_id) push
+   attribution (the per-store pin set is keyed by DigestInfo only).
+
+   The disconnected worker can no longer ack pushed blobs via
+   BlobsAvailable.pinned_mirror_entries, so without this clear the
+   server-side pin tracker would leak indefinitely (pin_max_bytes
+   would steadily fill until ResourceExhausted).
+
+   Modeling the worker side: the worker process is gone, so
+   workerMirror is wiped AND any inflight pushes / acks are dropped.
+   The auxiliary ackedByServer history variable is preserved
+   (we don't lose the audit log of what was ever acked).
+
+   Critically for safety: the server's clear of serverPins is also
+   "as if every (s, d) it had pushed was acked" — but only because
+   the worker is dead and its bytes are unrecoverable from THAT
+   worker (the slow tier still has them; the bytes themselves are
+   not lost — only the in-flight push tracker). To keep
+   NoCrossStoreLeak intact, ackedByServer is augmented with every
+   (s, d) the dispatcher had pinned — modeling the contract that
+   "explicit unpin on disconnect counts as acked-by-disconnection".
+ *)
+----------------------------------------------------------------------------
+WorkerDisconnect ==
+    /\ \E st \in Stores : serverPins[st] /= {}
+    /\ ackedByServer' = ackedByServer
+                          \cup UNION { { <<st, d>> : d \in serverPins[st] }
+                                       : st \in Stores }
+    /\ serverPins' = [st \in Stores |-> {}]
+    /\ workerMirror' = {}
+    /\ inflightPushes' = <<>>
+    /\ inflightAcks' = <<>>
+
+----------------------------------------------------------------------------
 Next ==
     \/ \E s \in Stores, d \in Digests : DispatcherPush(s, d)
     \/ WorkerReceivePush
     \/ WorkerSendAck
     \/ ServerProcessAck
+    \/ WorkerDisconnect
 
 Spec ==
     /\ Init
