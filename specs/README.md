@@ -126,6 +126,17 @@ state exploration on large models; the bounded models here finish in
     #   DrainAndRetryUnbounded -> back to InFlight, failed_slow_writes
     #   recurs forever under persistent failure.
 
+    # UploadSizeInfo producer/consumer size contract:
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config SizeInfoContractFixed.cfg SizeInfoContract
+    #   Expected: "Model checking completed. No error has been found."
+    java -cp /tmp/tla2tools.jar tlc2.TLC -config SizeInfoContractBugged.cfg SizeInfoContract
+    #   Expected: "Invariant NoPoisonedCommit is violated."
+    #   Trace shows: DeclareExactSize(N) -> DeliverBytes(M != N) ->
+    #   ConsumerCommit -> committedSize=N, deliveredM=M, poisoned=TRUE.
+    #   Matches the production page-rounding regression (commit 9bfe9924,
+    #   2026-04-26): declared 139264, received 137515, silent commit
+    #   poisoning every future read.
+
 To run only static analysis (parser + name-resolution; useful when you
 want to verify a spec compiles without running model checking):
 
@@ -332,6 +343,34 @@ KNOWN UNMODELED (deferred to follow-up tracker tasks; see
   to the server. Spec models neither RPC; adding them needs new
   actions on the server→worker direction (currently absent).
 
+### `SizeInfoContract.tla`
+
+Models the `UploadSizeInfo` producer/consumer size contract that today's
+hot-fix (commit `9bfe9924`,
+`filesystem_store: has_with_results returns actual blob size, not
+page-rounded size_on_disk`) closed at the `FilesystemStore` producer
+side. Producer declares one of `ExactSize(N)` / `MaxSize(N)`; the byte
+stream eventually delivers `M`; the leaf-store consumer must enforce
+"`ExactSize(N)` requires `M == N`; `MaxSize(N)` requires `M <= N`" or
+the cache is silently poisoned with a `committedSize != deliveredM`
+that every future reader inherits.
+
+Two `.cfg` files toggle `FixSize`. Bugged (`FixSize=FALSE`) violates
+`NoPoisonedCommit` with a 4-state trace
+(`DeclareExactSize(N) -> DeliverBytes(M != N) -> ConsumerCommit ->
+poisoned=TRUE`) — the same shape as the production failure (declared
+139264, received 137515). Fixed (`FixSize=TRUE`) holds all
+invariants because the consumer rejects every contract-violating pair
+before commit.
+
+The four latent consumer sites the hot-fix audit identified
+(`fast_slow_store.rs:948`, `fast_slow_store.rs:1891/1900`,
+`bytestream_server.rs:2001`, `store_trait.rs:1106-1113`) all build
+sizes that flow into the same leaf-store contract; this spec is the
+protocol-level invariant they share. If any one of them ever again
+declares an `ExactSize(N)` for a stream that delivers `M != N`, the
+Bugged trace reproduces the failure.
+
 ## Scope honesty
 
 Each spec includes an explicit ASSUMPTION block listing what is and
@@ -440,6 +479,11 @@ that time:
 - `FailedSlowWritesRetryBugged.cfg`: FAIL as designed (LIVENESS property
   `EventuallyConverges` violated; 4-state SCC cycle on the
   drain-retry-fail loop)
+- `SizeInfoContractFixed.cfg`: PASS (no violation)
+- `SizeInfoContractBugged.cfg`: FAIL as designed (`NoPoisonedCommit`
+  violated; 4-state trace `DeclareExactSize(N) -> DeliverBytes(M != N) ->
+  ConsumerCommit -> poisoned=TRUE` matches the production page-rounding
+  regression of commit `9bfe9924` declared/received pattern)
 
 If a fix lands that changes one of the production code paths cited in
 a spec, re-run the corresponding bugged config to verify the spec
