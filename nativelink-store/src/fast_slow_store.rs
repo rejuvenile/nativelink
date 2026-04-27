@@ -123,11 +123,31 @@ tokio::task_local! {
 }
 
 /// Commits the [`WriteHalfGuard`] honoring the
-/// [`INNER_MISS_NO_TERMINATE`] task-local: identical Ok semantics to
-/// `commit_delegated_if_ok(&res)`, but on `Err(NotFound)` with no bytes
-/// written AND the gate set, suppresses the Drop fallback so the OUTER
-/// writer survives for the upstream caller's recovery path (typically
-/// `WorkerProxyStore`'s peer-fetch fallback).
+/// [`INNER_MISS_NO_TERMINATE`] task-local. Three-way commit:
+///
+/// 1. **Ok**: identical to `commit_delegated_if_ok(&Ok)`. The sub-call
+///    already sent EOF, so just suppress the Drop fallback.
+/// 2. **Err(NotFound) with no bytes written AND gate set**: suppress
+///    the Drop fallback so the OUTER writer survives for the upstream
+///    caller's recovery path (typically `WorkerProxyStore`'s peer-
+///    fetch fallback). The caller now owns terminating the writer
+///    when its outer fn returns.
+/// 3. **Err otherwise (the COMMON non-WPS case)**: explicitly terminate
+///    the writer with the structured error via `guard.fail(err)`. This
+///    REPLACES the previous behavior which left the Drop fallback
+///    armed → fired the synthesized `"buf_channel: writer dropped
+///    without commit"` error and an `error!` log
+///    `"WriteHalfGuard fired Drop fallback: function exited without
+///    explicit commit"`. The structured `err` is the better signal
+///    (preserves Code, message, err_tip chain) than Drop's generic
+///    Internal, AND the loud "this is a bug" Drop log was firing at
+///    ~835/min in production from non-WPS callers — actively
+///    misleading because the helper IS the explicit commit, just
+///    delegated. Calling `guard.fail` here makes the commit explicit
+///    in the same place the helper was already committing on Ok, and
+///    eliminates the false-positive Drop log without losing any
+///    diagnostic for genuine sub-store contract violations (those
+///    callers don't go through the helper).
 ///
 /// This is the gate-aware analogue of the inline checks at the
 /// populator terminal-state branch (line 3210-3221) and the populator
@@ -140,18 +160,30 @@ fn commit_with_inner_miss_gate(
     res: &Result<(), Error>,
     bytes_before: u64,
 ) {
-    if let Err(err) = res
-        && err.code == Code::NotFound
-        && guard.get_bytes_written() == bytes_before
-        && INNER_MISS_NO_TERMINATE.try_with(|v| *v).unwrap_or(false)
-    {
-        // Suppress the Drop fallback — the upstream caller (typically
-        // `WorkerProxyStore::get_part_sequential`) owns recovery on the
-        // still-open OUTER writer.
-        guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
-        return;
+    match res {
+        Ok(()) => {
+            guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
+        }
+        Err(err) => {
+            if err.code == Code::NotFound
+                && guard.get_bytes_written() == bytes_before
+                && INNER_MISS_NO_TERMINATE.try_with(|v| *v).unwrap_or(false)
+            {
+                // Gate set + recoverable inner-miss: suppress the Drop
+                // fallback. Upstream caller owns peer-fetch recovery
+                // on the still-open OUTER writer.
+                guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
+                return;
+            }
+            // Non-gated path (the COMMON case): explicit termination
+            // with the structured error. `guard.fail` is idempotent
+            // (`send_error` only records the first error) so callers
+            // that already terminated the writer themselves before
+            // invoking the helper (e.g. the inner non-NotFound match
+            // arm at the terminal-state branch) are unaffected.
+            let _ = guard.fail(err.clone());
+        }
     }
-    guard.commit_delegated_if_ok(res);
 }
 
 /// Listener registered on the fast store's eviction map so the
