@@ -144,7 +144,17 @@ run_tlc() {
             "${spec_basename}" "${cfg_basename}" "${rc}"
         printf '%s\n' "${raw}"
     } >> "${OUTLOG}"
-    if [[ "${raw}" == *"is violated"* ]] || [[ "${raw}" == *"was violated"* ]]; then
+    if [[ "${raw}" == *"is violated"* ]] \
+       || [[ "${raw}" == *"was violated"* ]] \
+       || [[ "${raw}" == *"were violated"* ]]; then
+        # TLC emits "is violated" / "was violated" for invariants, and
+        # "was violated" / "were violated" for temporal properties (the
+        # plural form fires when multiple temporal properties fail in
+        # the same trace, e.g. BISChunkingAck violates both
+        # AllChunksEventuallyUnpinned AND ServerBufferEventuallyEmpty).
+        # All three are real violations and must classify as such —
+        # without the "were" branch the script misclassifies a Bugged
+        # spec as "errored" and the gate falsely BLOCKs.
         echo "violated"
     elif [[ "${raw}" == *"No error has been found"* ]]; then
         echo "clean"
