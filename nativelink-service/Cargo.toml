@@ -97,3 +97,11 @@ tracing-subscriber = { version = "0.3.19", default-features = false, features = 
 [package.metadata.cargo-machete]
 # Used by nativelink_test macro
 ignored = ["tracing-test"]
+
+# Integration tests that need the in-crate `test-utils` feature gate.
+# Run with:
+#   `cargo test -p nativelink-service --features test-utils --test worker_api_server_test`
+# (cargo auto-skips tests whose required-features are not enabled.)
+[[test]]
+name = "worker_api_server_test"
+required-features = ["test-utils"]
