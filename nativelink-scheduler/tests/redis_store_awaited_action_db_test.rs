@@ -329,7 +329,6 @@ async fn test_multiple_clients_subscribe_to_same_action() -> Result<(), Error> {
                 queued_timestamp: Some(SystemTime::UNIX_EPOCH.into()),
                 platform: Some(Platform::default()),
                 worker_id: worker_id.clone().into(),
-                peer_hints: Vec::new(),
                 resolved_directories: Vec::new(),
                 resolved_directory_digests: Vec::new(),
 

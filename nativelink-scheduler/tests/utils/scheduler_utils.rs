@@ -178,5 +178,11 @@ pub(crate) fn update_eq(
                 _ => false,
             }
         }
+        update_for_worker::Update::ChunkedMessage(actual_update) => match expected_update {
+            update_for_worker::Update::ChunkedMessage(expected_update) => {
+                expected_update == actual_update
+            }
+            _ => false,
+        },
     }
 }

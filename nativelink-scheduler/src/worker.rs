@@ -279,7 +279,6 @@ impl Worker {
                     queued_timestamp: Some(action_info.inner.insert_timestamp.into()),
                     platform: Some((&action_info.platform_properties).into()),
                     worker_id,
-                    peer_hints: Vec::new(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
                     missing_digests: Vec::new(),

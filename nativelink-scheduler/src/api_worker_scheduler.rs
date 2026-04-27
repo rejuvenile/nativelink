@@ -95,8 +95,18 @@ pub struct SchedulerMetrics {
 }
 
 /// Cached result of `score_and_generate_hints`: endpoint scores (cached
-/// bytes per endpoint) and peer hints.
-type ScoringResult = (HashMap<Arc<str>, u64>, Vec<PeerHint>);
+/// bytes per endpoint) and peer hints. Hints live behind an `Arc<[_]>`
+/// so per-worker dispatch is a refcount bump rather than a Vec clone
+/// (#83 ride-along — was `peer_hints.to_vec()` per match in the prior
+/// design, which churned ~16 KiB per dispatched action).
+type ScoringResult = (HashMap<Arc<str>, u64>, Arc<[PeerHint]>);
+
+/// Maximum number of `PeerHint` entries packed into one `PeerHintsChunk`
+/// proto. At ~250 bytes per hint worst case, 256 hints per chunk caps
+/// each proto message at ~64 KiB — well below the 64 MiB worker decoder
+/// limit (`WORKER_API_MAX_DECODING_MESSAGE_SIZE`) AND well below typical
+/// h2/QUIC frame fragmentation thresholds.
+pub(crate) const PEER_HINTS_PER_CHUNK: usize = 256;
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::worker::{
@@ -494,11 +504,11 @@ impl ApiWorkerSchedulerImpl {
     /// This prevents two concurrent match operations from selecting the
     /// same worker, which is the key enabler for `MATCH_CONCURRENCY > 1`.
     ///
-    /// `endpoint_scores` and `peer_hints` are pre-computed outside the write
-    /// lock to avoid holding it during O(files) iterations over the locality
-    /// map. Both are passed by reference from a shared `Arc<ScoringResult>`
-    /// to avoid cloning per action match — the proto clone is deferred to
-    /// `prepare_worker_run_action` and only happens when a worker is found.
+    /// `endpoint_scores` is pre-computed outside the write lock to avoid
+    /// holding it during O(files) iterations over the locality map.
+    /// Peer hints are NO LONGER threaded through this method — they ride a
+    /// separate `Update::ChunkedMessage` stream emitted by the dispatch path
+    /// after the lock is dropped (#98).
     fn inner_find_and_reserve_worker(
         &mut self,
         platform_properties: &PlatformProperties,
@@ -506,7 +516,6 @@ impl ApiWorkerSchedulerImpl {
         action_info: &ActionInfoWithProps,
         full_worker_logging: bool,
         endpoint_scores: Option<&HashMap<Arc<str>, u64>>,
-        peer_hints: &[PeerHint],
         resolved_tree: Option<&ResolvedTree>,
         pre_computed_tree: Option<(Vec<Directory>, Vec<Digest>)>,
     ) -> Option<(WorkerId, UnboundedSender<UpdateForWorker>, UpdateForWorker)> {
@@ -786,7 +795,6 @@ impl ApiWorkerSchedulerImpl {
             &worker_id,
             operation_id,
             action_info,
-            peer_hints,
             pre_computed_tree,
         )?;
 
@@ -904,14 +912,14 @@ impl ApiWorkerSchedulerImpl {
     /// and pre-built message so the caller can send the notification *after* releasing
     /// the write lock.
     ///
-    /// `peer_hints` are pre-computed outside the write lock from the resolved
-    /// input tree and passed as a shared slice reference to avoid cloning
-    /// per action match. The slice is cloned into the protobuf message only
-    /// here, and only when a worker was actually found. When no resolved
-    /// tree is available the hints will be empty.
-    ///
     /// `pre_computed_tree` contains directory and digest Vecs that were built
     /// outside the write lock to avoid cloning Directory protos while holding it.
+    ///
+    /// Note: peer hints are NO LONGER carried inside `StartExecute` (#98 — peer
+    /// hints chunking). They ride a separate `Update::ChunkedMessage` stream
+    /// emitted by the dispatch path AFTER the lock is dropped. This keeps the
+    /// reserved-write critical section free of an O(hints) proto clone, and
+    /// removes the implicit cap that previously truncated to 16384 hints.
     ///
     /// Returns `None` if the worker was not found.
     fn prepare_worker_run_action(
@@ -919,34 +927,22 @@ impl ApiWorkerSchedulerImpl {
         worker_id: &WorkerId,
         operation_id: &OperationId,
         action_info: &ActionInfoWithProps,
-        peer_hints: &[PeerHint],
         pre_computed_tree: Option<(Vec<Directory>, Vec<Digest>)>,
     ) -> Option<(UnboundedSender<UpdateForWorker>, UpdateForWorker)> {
         let worker = self.workers.get_mut(worker_id)?;
         // Clone the tx so we can send outside the lock.
         let tx = worker.tx.clone();
 
-        if !peer_hints.is_empty() {
-            debug!(
-                ?worker_id,
-                hints = peer_hints.len(),
-                "generated peer hints for StartExecute"
-            );
-        }
-
         let (resolved_directories, resolved_directory_digests) =
             pre_computed_tree.unwrap_or_default();
 
         // Build the protobuf message while we still have access to worker state.
-        // peer_hints is cloned here (the only place) — deferred from the cache
-        // lookup so actions that don't find a worker avoid the clone entirely.
         let start_execute = StartExecute {
             execute_request: Some(action_info.inner.as_ref().into()),
             operation_id: operation_id.to_string(),
             queued_timestamp: Some(action_info.inner.insert_timestamp.into()),
             platform: Some((&action_info.platform_properties).into()),
             worker_id: worker.id.clone().into(),
-            peer_hints: peer_hints.to_vec(),
             resolved_directories,
             resolved_directory_digests,
             missing_digests: Vec::new(),
@@ -1418,7 +1414,7 @@ impl ApiWorkerScheduler {
         let prepare_result = {
             let mut inner = self.inner.write().await;
             let result =
-                inner.prepare_worker_run_action(&worker_id, &operation_id, &action_info, &[], None);
+                inner.prepare_worker_run_action(&worker_id, &operation_id, &action_info, None);
             if result.is_none() {
                 // Worker not found - handle under the lock since we need worker_state_manager.
                 warn!(
@@ -1649,24 +1645,19 @@ impl ApiWorkerScheduler {
         // ── Phase 3: acquire write lock, do selection + reservation ──
         // Inside the lock we only do O(workers) work: candidate filtering,
         // endpoint→WorkerId mapping, and state mutation. Peer hints are
-        // passed as a slice reference — cloned into the proto only when a
-        // worker is actually found (inside prepare_worker_run_action).
+        // emitted on the same `tx` as separate `ChunkedMessage` payloads
+        // AFTER the lock drops (see Phase 6 below) — they no longer ride
+        // inside `StartExecute`.
         let mut inner = self.inner.write().await;
         let worker_count = inner.workers.len() as u64;
-        let (endpoint_scores, peer_hints_slice): (
-            Option<&HashMap<Arc<str>, u64>>,
-            &[PeerHint],
-        ) = match scoring_result.as_deref() {
-            Some((scores, hints)) => (Some(scores), hints.as_slice()),
-            None => (None, &[]),
-        };
+        let endpoint_scores: Option<&HashMap<Arc<str>, u64>> =
+            scoring_result.as_deref().map(|(scores, _hints)| scores);
         let mut result = inner.inner_find_and_reserve_worker(
             platform_properties,
             operation_id,
             action_info,
             full_worker_logging,
             endpoint_scores,
-            peer_hints_slice,
             resolved_tree.as_deref(),
             pre_computed_tree,
         );
@@ -1779,7 +1770,96 @@ impl ApiWorkerScheduler {
             self.spawn_server_cache_warm(blobs_to_warm, operation_id);
         }
 
+        // ── Phase 6: emit `PeerHintsChunk` messages on the worker tx ──
+        // (#98) The hints are NOT in `StartExecute` anymore; they ride a
+        // separate `Update::ChunkedMessage` stream on the same tx so the
+        // worker can register them into its `peer_locality_map` as they
+        // arrive — no buffer, no ordering invariant vs StartAction. The
+        // worker-side arm is stateless: each chunk's hints are merged
+        // directly into the global locality map.
+        //
+        // A `tx.send` failure here means the worker just disconnected —
+        // we don't unwind the reservation because (a) the StartAction
+        // dispatch via `send_reserved_worker_notification` will hit the
+        // same disconnect and trigger eviction there, (b) chunks are
+        // best-effort hints whose loss only degrades to LRU/MRU
+        // selection at the worker.
+        if let (Some((worker_id, tx, _)), Some(arc)) =
+            (result.as_ref(), scoring_result.as_deref())
+        {
+            let hints: &Arc<[PeerHint]> = &arc.1;
+            self.emit_peer_hints_chunks(worker_id, tx, operation_id, hints);
+        }
+
         result
+    }
+
+    /// Emit one or more `Update::ChunkedMessage(PeerHintsChunk)` messages
+    /// on the worker's tx. Chunks of at most `PEER_HINTS_PER_CHUNK` hints
+    /// each; the final chunk has `is_last = true` and may be empty when
+    /// `hints.len() % PEER_HINTS_PER_CHUNK == 0` (or when there are no
+    /// hints at all). Empty-hint case still emits one terminal chunk so
+    /// the worker can log "this action had no peer hints" rather than
+    /// inferring it from absence.
+    ///
+    /// Uses the shared `nativelink_util::chunk_iter` helper so chunk
+    /// boundaries match the BlobsInStableStorage producer (PR #97) and
+    /// the BlobsAvailable producer (PR #99) — same correctness pieces
+    /// (terminal `is_last`, empty-input case) live in one place.
+    fn emit_peer_hints_chunks(
+        &self,
+        worker_id: &WorkerId,
+        tx: &UnboundedSender<UpdateForWorker>,
+        operation_id: &OperationId,
+        hints: &Arc<[PeerHint]>,
+    ) {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+            ChunkedMessage, PeerHintsChunk, chunked_message,
+        };
+        use nativelink_util::chunk_iter::ChunkIter;
+
+        let op_id_str = operation_id.to_string();
+        let total = hints.len();
+        let mut sent_chunks = 0u32;
+        // Walk by index so we can build owned `PeerHint` clones cheaply
+        // (each `PeerHint` is Clone). The `Arc<[_]>` keeps the storage
+        // shared across all per-worker dispatches of the same scoring
+        // result; only the proto for the wire is owned.
+        let iter = (0..total).map(|i| hints[i].clone());
+        for chunk in ChunkIter::new(iter, PEER_HINTS_PER_CHUNK) {
+            let proto = ChunkedMessage {
+                payload: Some(chunked_message::Payload::PeerHints(PeerHintsChunk {
+                    peer_hints: chunk.items,
+                    operation_id: op_id_str.clone(),
+                    sequence: chunk.sequence,
+                    is_last: chunk.is_last,
+                })),
+            };
+            let msg = UpdateForWorker {
+                update: Some(update_for_worker::Update::ChunkedMessage(proto)),
+            };
+            if tx.send(msg).is_err() {
+                warn!(
+                    ?worker_id,
+                    operation_id = %op_id_str,
+                    sent_chunks,
+                    total_hints = total,
+                    "peer-hints chunk send failed (worker disconnected); StartAction dispatch will detect + evict"
+                );
+                return;
+            }
+            sent_chunks = sent_chunks.saturating_add(1);
+        }
+        if total > 0 {
+            debug!(
+                ?worker_id,
+                operation_id = %op_id_str,
+                hint_count = total,
+                chunk_count = sent_chunks,
+                per_chunk = PEER_HINTS_PER_CHUNK,
+                "emitted peer-hints chunks"
+            );
+        }
     }
 
     /// Undoes a reservation made by `find_and_reserve_worker`. This must
@@ -2869,15 +2949,22 @@ async fn resolve_tree_from_cas(
 }
 
 /// Scores endpoints by the total bytes of input blobs they have cached
-/// AND generates peer hints in a single pass over the file digests,
-/// acquiring the locality map read lock only once.
+/// AND generates peer hints. The locality-map read lock is held ONLY for
+/// the candidate-collection pass; the size-descending sort happens OUTSIDE
+/// the lock so a million-input action doesn't block every other scheduler
+/// op for the duration of the sort (#82 ride-along, was previously inside
+/// the lock).
 ///
 /// Returns:
 /// - `HashMap<Arc<str>, u64>`: endpoint scores (total cached bytes per
 ///   endpoint). Per-blob freshness timestamps were dropped from the
 ///   locality_map (entries persist until explicit eviction signal).
-/// - `Vec<PeerHint>`: peer hints sorted by file size descending, truncated
-///   to MAX_PEER_HINTS
+/// - `Arc<[PeerHint]>`: ALL peer hints sorted by file size descending.
+///   The previous MAX_PEER_HINTS = 16384 truncation cap was removed in
+///   #98 (peer-hints chunking) — hints that exceed one wire-message worth
+///   of bytes now ride a `PeerHintsChunk` stream instead of being silently
+///   dropped. Returned as `Arc<[_]>` so per-worker dispatch is a refcount
+///   bump (#83 ride-along).
 ///
 /// This is called OUTSIDE the scheduler write lock, so it does not need
 /// access to `endpoint_to_worker` or the candidate set. The caller maps
@@ -2885,38 +2972,45 @@ async fn resolve_tree_from_cas(
 fn score_and_generate_hints(
     file_digests: &[(DigestInfo, u64)],
     locality_map: &SharedBlobLocalityMap,
-) -> (HashMap<Arc<str>, u64>, Vec<PeerHint>) {
-    /// Maximum number of peer hints to include in a StartExecute message
-    /// to avoid oversized messages.
-    const MAX_PEER_HINTS: usize = 16384;
-
-    let map = locality_map.read();
-    let blobs = map.blobs_map();
-    let locality_blob_count = blobs.len();
+) -> (HashMap<Arc<str>, u64>, Arc<[PeerHint]>) {
     let mut scores: HashMap<Arc<str>, u64> = HashMap::new();
     let mut hint_candidates: Vec<(DigestInfo, u64, Vec<Arc<str>>)> = Vec::new();
+    let locality_blob_count;
 
-    for &(digest, size) in file_digests {
-        if let Some(endpoints) = blobs.get(&digest) {
-            // Accumulate endpoint byte scores. Timestamps were dropped from
-            // EndpointList — locality entries persist until explicit eviction
-            // signal, so freshness ranking is no longer meaningful.
-            for endpoint in endpoints {
-                *scores.entry(endpoint.clone()).or_insert(0) += size;
-            }
-            // Collect hint candidate if this digest has peer locations.
-            if !endpoints.is_empty() {
-                let peer_eps: Vec<Arc<str>> = endpoints.keys().cloned().collect();
-                hint_candidates.push((digest, size, peer_eps));
+    // ── Inside-lock pass: collect scores + hint candidates ──
+    // Hold the read lock only while reading from the map. The sort,
+    // dedup, and proto conversion happen below after the lock drops.
+    {
+        let map = locality_map.read();
+        let blobs = map.blobs_map();
+        locality_blob_count = blobs.len();
+        for &(digest, size) in file_digests {
+            if let Some(endpoints) = blobs.get(&digest) {
+                // Accumulate endpoint byte scores. Timestamps were dropped from
+                // EndpointList — locality entries persist until explicit eviction
+                // signal, so freshness ranking is no longer meaningful.
+                for endpoint in endpoints {
+                    *scores.entry(endpoint.clone()).or_insert(0) += size;
+                }
+                // Collect hint candidate if this digest has peer locations.
+                if !endpoints.is_empty() {
+                    let peer_eps: Vec<Arc<str>> = endpoints.keys().cloned().collect();
+                    hint_candidates.push((digest, size, peer_eps));
+                }
             }
         }
+        // Lock dropped here at end of scope.
     }
 
-    // Sort by size descending to prioritize large files.
+    // Sort by size descending to prioritize large files. This is the part
+    // that #82 moves outside the locality-map lock — sort cost grows with
+    // candidate count and large actions can have thousands of inputs.
     hint_candidates.sort_by(|a, b| b.1.cmp(&a.1));
-    hint_candidates.truncate(MAX_PEER_HINTS);
 
-    let peer_hints: Vec<PeerHint> = hint_candidates
+    // Build the peer-hint protos in size-descending order. NO truncation:
+    // any hints that don't fit in a single wire message are sent in
+    // additional `PeerHintsChunk` messages by the dispatch path.
+    let peer_hints: Arc<[PeerHint]> = hint_candidates
         .into_iter()
         .map(|(digest, _size, peer_endpoints)| PeerHint {
             digest: Some(digest.into()),
