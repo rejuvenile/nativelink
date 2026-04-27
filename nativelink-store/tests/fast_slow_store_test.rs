@@ -3393,3 +3393,93 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
 
     Ok(())
 }
+
+/// task #168 item 5 + partial Plan B5: `insert_dispatched_mirror_blob`
+/// populates the parallel `dispatched_mirror_pins` index keyed by
+/// `(store_id, digest)`. The snapshot iterator returns entries sorted by
+/// `store_id` ASCII first then by `DigestInfo`, which is the
+/// precondition for the server's binary-search self-filter in
+/// `EphemeralServerSidePin::observe_pinned_mirror_ack`.
+///
+/// Per CLAUDE.md TDD: this test was written first, verified to FAIL
+/// (no `dispatched_mirror_pin_snapshot` API existed; the index field
+/// did not exist), then the implementation landed and the test passed.
+/// Mutation step: comment out the `pins.insert(...)` line in
+/// `insert_dispatched_mirror_blob` and verify the assertion below
+/// (`snap.is_empty()` instead of len==2) fails.
+#[nativelink_test]
+async fn dispatched_mirror_pin_snapshot_is_sorted_by_store_id() -> Result<(), Error> {
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Empty initially.
+    let snap0 = fast_slow_store.dispatched_mirror_pin_snapshot();
+    assert!(
+        snap0.is_empty(),
+        "fresh store MUST snapshot to empty Vec; got {snap0:?}"
+    );
+
+    // Use 16-byte payloads so size matches the digest size_bytes
+    // invariant (insert_mirror_blob enforces data.len() ==
+    // digest.size_bytes()).
+    let d_a = DigestInfo::try_new(VALID_HASH, 16).unwrap();
+    // Construct a 2nd digest by changing the 1st byte (still 64 hex chars).
+    let alt_hash: String = format!(
+        "f{}",
+        &VALID_HASH[1..]
+    );
+    let d_b = DigestInfo::try_new(&alt_hash, 16).unwrap();
+
+    // Insert in non-sorted order to verify BTreeMap re-sorts.
+    fast_slow_store
+        .insert_dispatched_mirror_blob("cas", d_a, Bytes::from(vec![0u8; 16]))
+        .expect("insert MUST succeed");
+    fast_slow_store
+        .insert_dispatched_mirror_blob("ac", d_b, Bytes::from(vec![1u8; 16]))
+        .expect("insert MUST succeed");
+
+    let snap = fast_slow_store.dispatched_mirror_pin_snapshot();
+    assert_eq!(
+        snap.len(),
+        2,
+        "snapshot MUST hold both inserted (store_id, digest); got {snap:?}"
+    );
+    // Sorted by store_id ASCII: "ac" < "cas".
+    assert_eq!(
+        snap[0].0.as_ref(),
+        "ac",
+        "snapshot[0] MUST be the 'ac' entry (sorted by store_id ASCII); \
+         got {:?}",
+        snap[0]
+    );
+    assert_eq!(
+        snap[1].0.as_ref(),
+        "cas",
+        "snapshot[1] MUST be the 'cas' entry (sorted by store_id ASCII); \
+         got {:?}",
+        snap[1]
+    );
+
+    // After remove_mirror_blobs (server-confirmed), the matching index
+    // entries MUST also drop.
+    fast_slow_store.remove_mirror_blobs(&[d_a, d_b]);
+    let snap2 = fast_slow_store.dispatched_mirror_pin_snapshot();
+    assert!(
+        snap2.is_empty(),
+        "snapshot MUST be empty after remove_mirror_blobs cleared the \
+         underlying mirror_blobs (the parallel index is cleaned in lock-step); \
+         got {snap2:?}"
+    );
+
+    Ok(())
+}

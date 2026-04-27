@@ -185,6 +185,7 @@ async fn setup_api_server_with_task_limit(
         None,
         None,
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -699,6 +700,7 @@ async fn setup_api_server_with_locality(
         Some(locality_map.clone()),
         None,
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -815,6 +817,7 @@ async fn setup_api_server_with_mirror_proxy(
         Some(locality_map.clone()),
         None,
         Some(worker_proxy.clone()),
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -1538,6 +1541,7 @@ async fn setup_multi_connect() -> Result<MultiConnectContext, Error> {
         Box::new(static_now_fn),
         [1u8; 6],
         Some(locality_map.clone()),
+        None,
         None,
         None,
     )

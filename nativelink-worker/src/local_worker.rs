@@ -33,7 +33,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     BlobDigestInfo, BlobsAvailableNotification, ExecuteComplete, ExecuteResult, GoingAwayRequest,
-    KeepAliveRequest, UpdateForWorker, execute_result,
+    KeepAliveRequest, MirrorPinEntry, UpdateForWorker, execute_result,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::FilesystemStore;
@@ -1283,13 +1283,27 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 .cas_server_fss
                 .as_ref()
                 .map_or(0, |fss| fss.mirror_blobs_max_bytes()),
-            // Field 16 (per plan B5 + B7): the dispatcher-pushed
-            // pin snapshot. Currently empty because the worker-side
-            // mirror_blobs (store_id, digest) keying is not yet
-            // wired (skeleton commit). Once that lands, this is
-            // populated by iterating the BTreeMap which is already
-            // sorted by store_id (zero per-tick sort cost).
-            pinned_mirror_entries: Vec::new(),
+            // Field 16 (task #168 item 5): the dispatcher-pushed
+            // pin snapshot keyed by (store_id, digest). Iterates the
+            // FastSlowStore's `dispatched_mirror_pins` BTreeMap so the
+            // order is sorted by `store_id` ASCII (then by DigestInfo)
+            // — the precondition for the server's binary-search
+            // self-filter in `EphemeralServerSidePin::observe_pinned_mirror_ack`.
+            // Empty when the dispatcher has pushed nothing OR when
+            // there is no `cas_server_fss` on this worker.
+            pinned_mirror_entries: state
+                .cas_server_fss
+                .as_ref()
+                .map(|fss| {
+                    fss.dispatched_mirror_pin_snapshot()
+                        .into_iter()
+                        .map(|(store_id, digest)| MirrorPinEntry {
+                            digest: Some(digest.into()),
+                            store_id: store_id.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
         };
 
         if let Err(err) = grpc_client.blobs_available(notification).await {

@@ -411,6 +411,38 @@ impl SmallBlobDispatcher {
             .collect()
     }
 
+    /// Broadcast a `pinned_mirror_entries` ack (proto field 16) to every
+    /// registered per-store `EphemeralServerSidePin`. Each pin set
+    /// binary-searches the `entries` slice for its own `store_id` region
+    /// and removes confirmed-held entries (Option F: broadcast +
+    /// self-filter). Stores whose `store_id` is absent from `entries`
+    /// no-op in O(log N).
+    ///
+    /// Called by `WorkerApiServer::handle_blobs_available` on each
+    /// BlobsAvailable tick that carries a non-empty `pinned_mirror_entries`.
+    /// Snapshots the registered pin sets under the dispatcher Mutex first,
+    /// then releases it before iterating — so the per-pin-set Mutex
+    /// acquisitions never compose with the dispatcher Mutex (preserves
+    /// the dispatcher-BEFORE-pin-set lock order).
+    ///
+    /// Per C8 mutation: invert the per-store binary-search bounds and
+    /// the unit-level test
+    /// `observe_pinned_mirror_ack_filters_by_store_id` MUST fail.
+    pub fn broadcast_pinned_mirror_ack(&self, entries: &[MirrorPinEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let snapshot = self.all_pin_sets();
+        debug!(
+            entry_count = entries.len(),
+            store_count = snapshot.len(),
+            "SmallBlobDispatcher::broadcast_pinned_mirror_ack"
+        );
+        for (store_id, pin_set) in snapshot {
+            pin_set.observe_pinned_mirror_ack(store_id.as_ref(), entries);
+        }
+    }
+
     /// Register a worker's `UpdateForWorker` sender at connect time. The
     /// dispatcher uses this `worker_tx` from the drainer task to deliver
     /// `BatchWriteSmallBlobs`. On reconnect with a NEW `boot_epoch_id`

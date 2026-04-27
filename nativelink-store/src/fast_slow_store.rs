@@ -18,7 +18,7 @@ use core::ops::Range;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
@@ -242,6 +242,37 @@ pub struct FastSlowStore {
     /// Lock acquisition order: `mirror_blobs` BEFORE `mirror_changes`. See
     /// the comment on `mirror_changes` for the deadlock rationale.
     mirror_blobs: Mutex<HashMap<DigestInfo, (Bytes, Instant)>>,
+    /// Parallel `(store_id, digest)`-keyed index of dispatcher-pushed
+    /// pins (task #168 item 5; partial Plan B5). The values carry no
+    /// payload — the bytes still live in `mirror_blobs` keyed by
+    /// `DigestInfo`. This index exists ONLY so the worker's
+    /// `BlobsAvailableNotification.pinned_mirror_entries` (proto field
+    /// 16) can report the (store_id, digest) snapshot to the server in
+    /// sorted order (BTreeMap iteration is sorted by `store_id` ASCII —
+    /// matches the binary-search precondition in
+    /// `EphemeralServerSidePin::observe_pinned_mirror_ack`).
+    ///
+    /// Rationale for keeping this as a parallel index instead of
+    /// keying `mirror_blobs` by `(store_id, digest)` directly (the
+    /// full Plan B5):
+    ///   - Multi-store collisions on the same digest are inherently
+    ///     deduplicable at the byte level (same digest ⇒ same bytes by
+    ///     CAS contract), so the storage-level last-writer-wins
+    ///     behavior is benign.
+    ///   - Production code (`get_part`, `has`, eviction, the
+    ///     `mirror_blobs_size_mismatch` regression test) all key on
+    ///     `DigestInfo` — moving to a tuple key requires updating each
+    ///     call site, which is a separate refactor with its own test
+    ///     coverage.
+    ///   - Field-16 reporting only needs the `(store_id, digest)`
+    ///     coverage, not separate byte storage.
+    ///
+    /// Insert: `insert_dispatched_mirror_blob` populates this and
+    /// `mirror_blobs` together. Remove: when a digest leaves
+    /// `mirror_blobs` (`remove_mirror_blobs`, eviction), every
+    /// matching `(_, digest)` entry is removed from this index.
+    /// Lock acquisition order: this index AFTER `mirror_blobs`.
+    dispatched_mirror_pins: Mutex<BTreeMap<(Arc<str>, DigestInfo), ()>>,
     /// Total bytes currently held in `mirror_blobs`. Tracked separately to
     /// enforce `mirror_blobs_max_bytes` without iterating the map.
     mirror_blobs_total_bytes: AtomicU64,
@@ -375,6 +406,7 @@ impl FastSlowStore {
             shutting_down: AtomicBool::new(false),
             failed_slow_writes,
             mirror_blobs: Mutex::new(HashMap::new()),
+            dispatched_mirror_pins: Mutex::new(BTreeMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
             mirror_changes: Mutex::new(MirrorChanges::default()),
@@ -604,6 +636,7 @@ impl FastSlowStore {
             shutting_down: AtomicBool::new(false),
             failed_slow_writes: shared,
             mirror_blobs: Mutex::new(HashMap::new()),
+            dispatched_mirror_pins: Mutex::new(BTreeMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
             mirror_changes: Mutex::new(MirrorChanges::default()),
@@ -656,7 +689,17 @@ impl FastSlowStore {
         if freed > 0 {
             self.mirror_blobs_total_bytes.fetch_sub(freed, Ordering::Relaxed);
         }
+        // task #168 item 5: also clean up the parallel
+        // `dispatched_mirror_pins` index for removed digests so the
+        // worker's next `BlobsAvailable` field 16 snapshot does not
+        // re-advertise an unpinned (store_id, digest). Removes EVERY
+        // matching `(_, digest)` entry across all source store_ids
+        // (multiple stores' pins for the same digest collapse on
+        // confirm).
         if any_removed {
+            let mut pins = self.dispatched_mirror_pins.lock();
+            pins.retain(|(_, d), ()| !digests.contains(d));
+            drop(pins);
             self.mirror_changes_notify.notify_one();
         }
     }
@@ -850,13 +893,40 @@ impl FastSlowStore {
             data_len = data.len(),
             "insert_dispatched_mirror_blob"
         );
-        // For now the underlying mirror_blobs is keyed by DigestInfo only.
-        // Once plan B5 lands the BTreeMap<(Arc<str>, DigestInfo), _>
-        // refactor, this entry-point routes to the (store_id, digest)
-        // slot. Until then `store_id` is informational; multi-store
-        // collisions on the same digest will overwrite (last-writer-wins).
-        let _ = store_id;
-        self.insert_mirror_blob(digest, data)
+        // Underlying `mirror_blobs` is keyed by `DigestInfo` (Plan B5
+        // is parallel-indexed for now per `dispatched_mirror_pins` doc).
+        // Multi-store collisions on the same digest are benign (CAS
+        // contract: same digest ⇒ same bytes), so byte-storage
+        // last-writer-wins on the HashMap is correct.
+        self.insert_mirror_blob(digest, data)?;
+        // task #168 item 5: record the (store_id, digest) so the
+        // worker's BlobsAvailable loop can emit `pinned_mirror_entries`
+        // (proto field 16) sorted by `store_id` ASCII (BTreeMap
+        // iteration order). The index is consulted only for reporting;
+        // get_part / has / eviction continue to key on `DigestInfo`.
+        let key: Arc<str> = Arc::from(store_id);
+        self.dispatched_mirror_pins.lock().insert((key, digest), ());
+        Ok(())
+    }
+
+    /// Snapshot the dispatcher-pushed pin set as a sorted `Vec<(store_id,
+    /// digest)>`. Returns BTreeMap iteration order (sorted by `store_id`
+    /// ASCII first, then by `DigestInfo`). The worker's
+    /// `BlobsAvailableNotification.pinned_mirror_entries` (proto field
+    /// 16) is populated from this snapshot — sorted order is the
+    /// precondition for the server's binary-search `self_filter` in
+    /// `EphemeralServerSidePin::observe_pinned_mirror_ack`.
+    ///
+    /// Cheap when empty (BTreeMap::is_empty is O(1) → returns Vec::new
+    /// without locking). Otherwise allocates one Vec — the snapshot is
+    /// owned + Send so the worker can build the proto without holding
+    /// the lock across `.await`.
+    pub fn dispatched_mirror_pin_snapshot(&self) -> Vec<(Arc<str>, DigestInfo)> {
+        let pins = self.dispatched_mirror_pins.lock();
+        if pins.is_empty() {
+            return Vec::new();
+        }
+        pins.iter().map(|(k, ())| k.clone()).collect()
     }
 
     /// Default per-blob streaming buffer: 64 MiB sliding window.

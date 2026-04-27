@@ -33,6 +33,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     execute_result, ExecuteComplete, ExecuteResult, GoingAwayRequest, KeepAliveRequest,
     UpdateForScheduler, UpdateForWorker, UploadMissingBlobsRequest,
 };
+use nativelink_store::small_blob_dispatcher::SmallBlobDispatcher;
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::common::DigestInfo;
 use nativelink_scheduler::worker::Worker;
@@ -70,6 +71,18 @@ pub struct WorkerApiServer {
     /// picker's pre-check filter. None for tests / standalone runs
     /// without peer mirroring.
     worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
+    /// Optional handle on the `SmallBlobDispatcher` so we can:
+    ///   - register the worker's `UpdateForWorker` Sender at connect
+    ///     (`register_worker`) and drop it at disconnect (`unregister_worker`);
+    ///   - broadcast `BlobsAvailableNotification.pinned_mirror_entries`
+    ///     (proto field 16) to every registered FastSlowStore via
+    ///     `broadcast_pinned_mirror_ack` so each store binary-searches its
+    ///     own `store_id` slice and unpins acked entries.
+    /// `None` for tests / standalone runs without the small-blob mirror.
+    /// Per task #168: the dispatcher mechanism is plumbed in here even
+    /// when the feature flag is off; broadcast / register paths are no-ops
+    /// in that case.
+    small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     /// Per-endpoint connection state used by the #141 boot_epoch wipe
     /// path. For each CAS endpoint we track:
     ///   - `boot_epoch_id` from the worker's most recent
@@ -158,6 +171,7 @@ impl WorkerApiServer {
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
+        small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     ) -> Result<Self, Error> {
         let node_id = {
             let mut out = [0; 6];
@@ -203,6 +217,7 @@ impl WorkerApiServer {
             locality_map,
             cas_store,
             worker_proxy,
+            small_blob_dispatcher,
         )
     }
 
@@ -216,6 +231,7 @@ impl WorkerApiServer {
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
+        small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     ) -> Result<Self, Error> {
         let scheduler = schedulers
             .get(&config.scheduler)
@@ -233,6 +249,7 @@ impl WorkerApiServer {
             locality_map,
             cas_store,
             worker_proxy,
+            small_blob_dispatcher,
             endpoint_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             metrics: Arc::new(WorkerApiMetrics::default()),
         })
@@ -368,6 +385,24 @@ impl WorkerApiServer {
                 .err_tip(|| "Failed to add worker in inner_connect_worker()")?;
         }
 
+        // task #168 (item 6): plumb the worker's UpdateForWorker Sender
+        // into the SmallBlobDispatcher so the per-`(endpoint,
+        // boot_epoch_id, store_id)` drainer task can deliver
+        // `BatchWriteSmallBlobs`. Replaces any prior entry for the same
+        // `(endpoint, boot_epoch_id)` (rare; #141 wipe handles old
+        // process). On disconnect (below in `WorkerConnection::start`'s
+        // task body), `unregister_worker` drops the Sender + per-(worker,
+        // store) queues, causing drainers to exit gracefully.
+        if let Some(dispatcher) = self.small_blob_dispatcher.as_ref() {
+            if !worker_cas_endpoint.is_empty() {
+                dispatcher.register_worker(
+                    &worker_cas_endpoint,
+                    new_boot_epoch,
+                    worker_tx.clone(),
+                );
+            }
+        }
+
         WorkerConnection::start(
             self.scheduler.clone(),
             self.now_fn.clone(),
@@ -375,6 +410,7 @@ impl WorkerApiServer {
             self.locality_map.clone(),
             self.cas_store.clone(),
             self.worker_proxy.clone(),
+            self.small_blob_dispatcher.clone(),
             worker_cas_endpoint,
             new_boot_epoch,
             self.endpoint_state.clone(),
@@ -457,6 +493,12 @@ struct WorkerConnection {
     /// WorkerProxyStore handle for plumbing per-endpoint mirror
     /// capacity reports (review #1).
     worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
+    /// SmallBlobDispatcher handle (task #168). Used to:
+    ///   - broadcast `pinned_mirror_entries` (proto field 16) on every
+    ///     `BlobsAvailable` tick;
+    ///   - call `unregister_worker(endpoint, boot_epoch)` on disconnect
+    ///     so per-(worker, store) drainers exit gracefully.
+    small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     cas_endpoint: String,
     /// `boot_epoch_id` reported by this connection. Logged on cleanup
     /// for #141 traceability.
@@ -490,6 +532,7 @@ impl WorkerConnection {
         locality_map: Option<SharedBlobLocalityMap>,
         cas_store: Option<Store>,
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
+        small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
         cas_endpoint: String,
         boot_epoch: u64,
         endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
@@ -504,6 +547,7 @@ impl WorkerConnection {
             locality_map,
             cas_store,
             worker_proxy,
+            small_blob_dispatcher,
             cas_endpoint,
             boot_epoch,
             endpoint_state,
@@ -616,6 +660,19 @@ impl WorkerConnection {
                 }
             }
 
+            // task #168 (item 6): drop the worker_tx the dispatcher
+            // holds so any in-flight per-(worker, store) drainer task
+            // exits gracefully (its UnboundedSender clones drop, the
+            // mpsc Receiver hits None, the drainer returns). Per
+            // SmallBlobDispatcher::unregister_worker doc: also drops
+            // the per-(worker, store) queue Senders so a stale
+            // boot_epoch reconnect does not inherit dead queues.
+            if let Some(ref dispatcher) = instance.small_blob_dispatcher {
+                if !instance.cas_endpoint.is_empty() {
+                    dispatcher.unregister_worker(&instance.cas_endpoint, instance.boot_epoch);
+                }
+            }
+
             if !had_going_away {
                 drop(instance.scheduler.remove_worker(&instance.worker_id).await);
             }
@@ -711,6 +768,20 @@ impl WorkerConnection {
         &self,
         notification: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsAvailableNotification,
     ) -> Result<(), Error> {
+        // task #168 (item 1): broadcast `pinned_mirror_entries` (proto
+        // field 16) to every registered FastSlowStore via the dispatcher.
+        // Each `EphemeralServerSidePin` binary-searches the entries slice
+        // for its own `store_id` region and removes confirmed-held
+        // entries (Option F: broadcast + self-filter; per plan §"Routing").
+        // Pre-existing field 13 path (`pinned_mirror_digests`, below)
+        // is UNCHANGED — fields 13 and 16 have distinct semantics per
+        // the proto comment and are processed independently.
+        if !notification.pinned_mirror_entries.is_empty() {
+            if let Some(ref dispatcher) = self.small_blob_dispatcher {
+                dispatcher.broadcast_pinned_mirror_ack(&notification.pinned_mirror_entries);
+            }
+        }
+
         let cpu_load_pct = notification.cpu_load_pct;
         let p_core_load_pct = notification.p_core_load_pct;
         let e_core_load_pct = notification.e_core_load_pct;

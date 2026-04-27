@@ -618,6 +618,18 @@ impl Store {
         self.inner.clone().register_item_callback(callback)
     }
 
+    /// Observe a `pinned_mirror_entries` (BlobsAvailableNotification field 16)
+    /// ack broadcast. Delegates to the inner
+    /// [`StoreDriver::observe_pinned_mirror_ack`]. See trait doc for
+    /// semantics.
+    #[inline]
+    pub fn observe_pinned_mirror_ack(
+        &self,
+        entries: &[nativelink_proto::com::github::trace_machina::nativelink::remote_execution::MirrorPinEntry],
+    ) {
+        self.inner.observe_pinned_mirror_ack(entries);
+    }
+
     /// Drain digests that have completed their write to stable storage.
     /// Delegates to the inner [`StoreDriver::drain_stable_digests`].
     #[inline]
@@ -1163,6 +1175,37 @@ pub trait StoreDriver:
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error>;
+
+    /// Observe a `pinned_mirror_entries` ack broadcast (per Bug A small-CAS
+    /// peer-mirror dispatcher; task #168 integration). The
+    /// `WorkerApiServer::handle_blobs_available` calls this for every
+    /// registered FastSlowStore on each `BlobsAvailable` tick that carries
+    /// a non-empty `BlobsAvailableNotification.pinned_mirror_entries`
+    /// (proto field 16). Each store inspects the slice for its own
+    /// `store_id` (via binary search since `entries` is sorted by
+    /// `store_id` ASCII), and removes confirmed-held entries from its
+    /// `EphemeralServerSidePin` set.
+    ///
+    /// Default body is a no-op so the vast majority of stores (Memory,
+    /// Filesystem, Compression, Dedup, Shard, etc.) never opt in. Only
+    /// FastSlowStore overrides today; the dispatcher's `register_pin_set`
+    /// glue side-steps the trait when calling directly into the per-store
+    /// pin set, but the trait method exists so any wrapper layer can route
+    /// the broadcast down its inner stores without special-casing.
+    ///
+    /// Per plan C10: matches the `register_item_callback` /
+    /// `drain_stable_digests` "default no-op" precedent. The plan
+    /// considered making this `No default body` per the C+D rule but the
+    /// trait callers (broadcast loop) iterate ALL registered stores —
+    /// silent no-op IS the contract for non-participating stores, not a
+    /// trap. Wrapper stores that delegate to inner FastSlowStores should
+    /// override and forward to inner via their existing delegation enum.
+    fn observe_pinned_mirror_ack(
+        &self,
+        _entries: &[nativelink_proto::com::github::trace_machina::nativelink::remote_execution::MirrorPinEntry],
+    ) {
+        // Default no-op (per C10 + matches register_item_callback shape).
+    }
 
     /// Declare how this store routes [`Self::drain_stable_digests`] /
     /// [`Self::stable_notify`] / [`Self::drain_failed_digests`] requests.

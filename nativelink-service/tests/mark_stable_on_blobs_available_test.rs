@@ -307,6 +307,7 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
         Some(locality_map),
         Some(cas_store.clone()),
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 

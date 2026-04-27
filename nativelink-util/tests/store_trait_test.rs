@@ -470,3 +470,33 @@ async fn merged_notify_aborters_release_child_notify_arcs_on_wrapper_drop() {
     assert_eq!(final_lower, baseline_lower);
     assert_eq!(final_upper, baseline_upper);
 }
+
+// ----------------------------------------------------------------------
+// task #168 item 2 (per plan C10): StoreDriver::observe_pinned_mirror_ack
+// has a default no-op body. Stores that don't override (FakeStore here,
+// MemoryStore / FilesystemStore in production) inherit the no-op so they
+// can be safely included in the WorkerApiServer broadcast loop without
+// special-casing.
+//
+// Per CLAUDE.md TDD: this test was written first to drive the trait
+// addition, then verified to PASS once the default body landed. To
+// mutate: change the default body to `panic!` and verify this test
+// panics.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn observe_pinned_mirror_ack_default_is_noop() -> Result<(), Error> {
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::MirrorPinEntry;
+
+    let store = Arc::new(FakeStore {});
+    // Default no-op MUST accept an empty slice.
+    StoreDriver::observe_pinned_mirror_ack(store.as_ref(), &[]);
+    // Default no-op MUST also accept a non-empty slice (a wrapper that
+    // ignores acks should not panic).
+    let entry = MirrorPinEntry {
+        digest: None,
+        store_id: "cas".to_string(),
+    };
+    StoreDriver::observe_pinned_mirror_ack(store.as_ref(), &[entry]);
+
+    Ok(())
+}

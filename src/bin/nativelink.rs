@@ -345,6 +345,37 @@ async fn inner_main(
         names
     };
 
+    // task #168 item 8: build the SmallBlobDispatcher singleton for
+    // Bug A small-CAS peer-mirror push. The dispatcher is plumbed into
+    // the WorkerApiServer (register/unregister_worker on connect, broadcast
+    // on BlobsAvailable) and into the upload-completion hook sites
+    // (item 3) when the feature flag is on. Today the feature flag is OFF
+    // by default (`SmallBlobDispatcherConfig::default`), so the
+    // dispatcher's `enqueue` is an inert no-op until the operator
+    // explicitly enables it for canary rollout. See plan §"Decisions"
+    // and `SmallBlobDispatcherConfig::small_blob_mirror_enabled`.
+    //
+    // Per item 7 (register pin sets at startup): each FastSlowStore
+    // wraps `cas_FAST_SLOW_STORE` and `AC_BACKEND_CACHED` registers a
+    // per-store `EphemeralServerSidePin`. Today the dispatcher is
+    // created with no pin sets pre-registered; the registration is
+    // deferred to a follow-up because reaching the underlying
+    // FastSlowStore behind the wrapping (Verify, ExistenceCache,
+    // SizePartitioning…) requires a `downcast_ref` walk that is not
+    // currently implemented. The dispatcher is fully functional
+    // without pin sets — `enqueue` is a no-op when no pin set is
+    // registered for the source `store_id` (per dispatcher impl).
+    let small_blob_dispatcher: Option<Arc<nativelink_store::small_blob_dispatcher::SmallBlobDispatcher>> = {
+        if worker_schedulers.is_empty() {
+            None
+        } else {
+            let cfg = nativelink_store::small_blob_dispatcher::SmallBlobDispatcherConfig::default();
+            Some(Arc::new(
+                nativelink_store::small_blob_dispatcher::SmallBlobDispatcher::new(cfg),
+            ))
+        }
+    };
+
     // Spawn the BlobsInStableStorage drain-then-fire loop. When any CAS
     // FastSlowStore completes a background slow write it pushes the digest
     // and notifies us. We drain all queued digests and broadcast immediately,
@@ -609,6 +640,7 @@ async fn inner_main(
                             Some(locality_map.clone()),
                             backfill_cas,
                             worker_proxy,
+                            small_blob_dispatcher.clone(),
                         )
                         .map(|v| Some(svc_setup!(v)))
                     })

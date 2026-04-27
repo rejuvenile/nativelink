@@ -450,6 +450,138 @@ async fn dispatcher_zero_window_coalesces_pending_into_single_batch() -> Result<
 }
 
 // ----------------------------------------------------------------------
+// Test 168.A (task #168 item 1, broadcast wiring): dispatcher's
+// `broadcast_pinned_mirror_ack` iterates all registered pin sets and
+// each one's binary-search self-filter removes only its own slice.
+// This is the production composition of test #3
+// (`observe_pinned_mirror_ack_filters_by_store_id`) but exercised via
+// the broadcast path that the WorkerApiServer actually calls.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn dispatcher_broadcast_pinned_mirror_ack_routes_to_each_pin_set()
+-> Result<(), Error> {
+    use std::sync::Arc;
+
+    let cfg = SmallBlobDispatcherConfig::default();
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+    let cas_pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024));
+    let ac_pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024));
+    dispatcher.register_pin_set("cas", cas_pin.clone());
+    dispatcher.register_pin_set("ac", ac_pin.clone());
+
+    let d_cas = make_digest(10, 100);
+    let d_ac = make_digest(11, 50);
+    cas_pin.insert(d_cas, Bytes::from(vec![0u8; 100]))?;
+    ac_pin.insert(d_ac, Bytes::from(vec![0u8; 50]))?;
+
+    // Worker reports BOTH digests in its pinned_mirror_entries snapshot.
+    // Sorted by store_id ASCII (worker invariant). Broadcast MUST clear
+    // both pin sets via the per-store self-filter.
+    let mut entries: Vec<MirrorPinEntry> = vec![
+        MirrorPinEntry { digest: Some(d_ac.into()), store_id: "ac".to_string() },
+        MirrorPinEntry { digest: Some(d_cas.into()), store_id: "cas".to_string() },
+    ];
+    entries.sort_by(|a, b| a.store_id.cmp(&b.store_id));
+
+    dispatcher.broadcast_pinned_mirror_ack(&entries);
+
+    assert!(
+        cas_pin.is_empty(),
+        "broadcast MUST drain cas pin (entry was acked); got len={}",
+        cas_pin.len()
+    );
+    assert!(
+        ac_pin.is_empty(),
+        "broadcast MUST drain ac pin (entry was acked); got len={}",
+        ac_pin.len()
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Test 168.B (task #168 item 1): broadcast on EMPTY entries is a no-op
+// (does not lock pin sets, does not warn) — this is the common-case
+// fast path.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn dispatcher_broadcast_pinned_mirror_ack_empty_is_noop() -> Result<(), Error> {
+    use std::sync::Arc;
+
+    let cfg = SmallBlobDispatcherConfig::default();
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+    let pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024));
+    dispatcher.register_pin_set("cas", pin.clone());
+    let d = make_digest(20, 100);
+    pin.insert(d, Bytes::from(vec![0u8; 100]))?;
+
+    dispatcher.broadcast_pinned_mirror_ack(&[]);
+    assert_eq!(
+        pin.len(),
+        1,
+        "empty broadcast MUST NOT touch any pin set; got len={}",
+        pin.len()
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Test 168.C (task #168 item 6): register_worker followed by
+// unregister_worker drops the worker_tx + per-(worker, store) queues.
+// After unregister, enqueue for the same `(endpoint, boot_epoch_id)`
+// MUST drop silently (no worker_tx → unregistered case).
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn dispatcher_register_then_unregister_worker_clears_state() -> Result<(), Error> {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let cfg = SmallBlobDispatcherConfig {
+        small_blob_mirror_enabled: true,
+        ..SmallBlobDispatcherConfig::default()
+    };
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+    let pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024));
+    dispatcher.register_pin_set("cas", pin.clone());
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    dispatcher.register_worker("ep1", 7, tx);
+
+    // Sanity: register-then-enqueue lands in the queue.
+    let d1 = make_digest(30, 100);
+    let res1 = tokio::time::timeout(
+        DEADLOCK_DETECTOR,
+        dispatcher.enqueue("ep1", 7, "cas", d1, Bytes::from(vec![0u8; 100])),
+    )
+    .await
+    .expect("enqueue MUST NOT block")?;
+    let _ = res1;
+    assert_eq!(
+        dispatcher.dispatched_count(),
+        1,
+        "first enqueue MUST land in queue while worker is registered"
+    );
+
+    // Unregister; the worker_tx and per-(worker, store) queues drop.
+    dispatcher.unregister_worker("ep1", 7);
+
+    // Subsequent enqueue MUST drop silently (no worker_tx).
+    let d2 = make_digest(31, 100);
+    let res2 = tokio::time::timeout(
+        DEADLOCK_DETECTOR,
+        dispatcher.enqueue("ep1", 7, "cas", d2, Bytes::from(vec![0u8; 100])),
+    )
+    .await
+    .expect("enqueue MUST NOT block on unregistered worker")?;
+    let _ = res2;
+    assert_eq!(
+        dispatcher.dispatched_count(),
+        1,
+        "post-unregister enqueue MUST NOT increment dispatched_count"
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
 // Test 11 (per plan §"Concurrency design" + B4 boot_epoch_id keying):
 // enqueueing for a worker that has NOT registered (or has a stale
 // boot_epoch_id) MUST NOT panic; it MUST log + drop, and the pin set
