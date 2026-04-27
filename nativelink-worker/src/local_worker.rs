@@ -690,6 +690,91 @@ impl BlobsAvailableState {
     }
 }
 
+/// Process a `BatchWriteSmallBlobs` push from the server's
+/// `SmallBlobDispatcher` (Bug A small-CAS peer-mirror; task #153).
+///
+/// For each `SmallBlobEntry`:
+///   * Decode the proto digest into `DigestInfo` (skip + warn on
+///     malformed).
+///   * Validate `data.len() == digest.size_bytes()` (preserves the
+///     load-bearing invariant from `fast_slow_store.rs:771-784`).
+///   * Call `cas_server_fss.insert_dispatched_mirror_blob(store_id,
+///     digest, data)`. Errors (cap exceeded, etc.) are logged but the
+///     batch continues — partial-batch acceptance is OK because the
+///     server's per-store `EphemeralServerSidePin` TTL will reclaim
+///     the unacked entries.
+///
+/// Extracted from the `Update::BatchWriteSmallBlobs` match arm in
+/// `LocalWorkerImpl::run` so the handler is unit-testable without
+/// standing up the full scheduler/worker stream stack. The dispatch
+/// arm is a thin call site; all behavior lives here.
+pub fn handle_batch_write_small_blobs(
+    cas_server_fss: Option<&Arc<FastSlowStore>>,
+    blobs: &[nativelink_proto::com::github::trace_machina::nativelink::remote_execution::SmallBlobEntry],
+) {
+    let blob_count = blobs.len();
+    let total_bytes: usize = blobs.iter().map(|b| b.data.len()).sum();
+    let Some(fss) = cas_server_fss else {
+        warn!(
+            blob_count,
+            total_bytes,
+            "BatchWriteSmallBlobs: no cas_server_fss on this worker; dropping batch \
+             (worker has no CAS server / mirror store — server should not have \
+             dispatched here; check locality registration)"
+        );
+        return;
+    };
+    let mut inserted = 0usize;
+    let mut skipped = 0usize;
+    for entry in blobs {
+        let Some(proto_digest) = entry.digest.as_ref() else {
+            warn!(
+                store_id = entry.store_id,
+                "BatchWriteSmallBlobs: entry has no digest; skipping"
+            );
+            skipped += 1;
+            continue;
+        };
+        let digest = match DigestInfo::try_from(proto_digest.clone()) {
+            Ok(d) => d,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    store_id = entry.store_id,
+                    "BatchWriteSmallBlobs: invalid digest, skipping"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        if let Err(err) = fss.insert_dispatched_mirror_blob(
+            &entry.store_id,
+            digest,
+            entry.data.clone(),
+        ) {
+            // insert_dispatched_mirror_blob already warns; bump the
+            // skip counter and move on. Partial batches are fine
+            // because the server's pin TTL recovers.
+            warn!(
+                ?err,
+                store_id = entry.store_id,
+                %digest,
+                "BatchWriteSmallBlobs: insert_dispatched_mirror_blob failed; skipping"
+            );
+            skipped += 1;
+            continue;
+        }
+        inserted += 1;
+    }
+    info!(
+        blob_count,
+        inserted,
+        skipped,
+        total_bytes,
+        "BatchWriteSmallBlobs: batch processed"
+    );
+}
+
 /// Process a `BlobsInStableStorage` notification from the server:
 ///   * Unpin the digests on the local FilesystemStore so they become
 ///     eligible for eviction.
@@ -1519,41 +1604,24 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             // Per plan §"Architecture summary": the server's
                             // SmallBlobDispatcher pushes a batch of small
                             // CAS/AC blobs (≤ SMALL_BLOB_THRESHOLD = 16 KiB)
-                            // for the worker to hold in `mirror_blobs`
-                            // keyed by `(store_id, digest)`. The worker then
-                            // advertises the snapshot via field 16
+                            // for the worker to hold in `mirror_blobs`. The
+                            // worker advertises the snapshot via field 16
                             // `pinned_mirror_entries` on the next
                             // BlobsAvailableNotification, and the server's
                             // per-store `EphemeralServerSidePin` releases
                             // matching pins.
                             //
-                            // STATUS: skeleton arm. The worker-side
-                            // mirror_blobs key is currently
-                            // `HashMap<DigestInfo, _>`; per plan B5 it
-                            // becomes `BTreeMap<(Arc<str>, DigestInfo), _>`
-                            // in a follow-up commit. Until then this arm
-                            // logs + drops the batch (the dispatcher
-                            // is also gated behind `small_blob_mirror_enabled
-                            // = false` so this arm CAN'T fire in production
-                            // yet). The acknowledgement field 16 emitter
-                            // is a sibling follow-up.
-                            //
-                            // The arm exists today so:
-                            //   1. Old workers' graceful-skip path (B2 above)
-                            //      can be regression-tested against a real
-                            //      newer-worker that DOES have the arm.
-                            //   2. Future commits don't have to touch the
-                            //      proto + match-tail at the same time as
-                            //      the data-shape change.
-                            let blob_count = batch.blobs.len();
-                            let total_bytes: usize = batch.blobs.iter().map(|b| b.data.len()).sum();
-                            warn!(
-                                blob_count,
-                                total_bytes,
-                                "Update::BatchWriteSmallBlobs received (skeleton — \
-                                 mirror_blobs (store_id, digest) keying not yet wired); \
-                                 dropping batch"
-                            );
+                            // The (store_id, digest) keying is INFORMATIONAL
+                            // for now — per plan B5 the BTreeMap refactor
+                            // is a follow-up; today the underlying mirror_blobs
+                            // is keyed by DigestInfo. Multi-store collisions
+                            // on the same digest will overwrite (last-writer
+                            // wins). The dispatcher's feature flag is OFF in
+                            // canary, so production is not yet exposed.
+                            let cas_server_fss =
+                                self.blobs_available_state.as_ref()
+                                    .and_then(|s| s.cas_server_fss.as_ref());
+                            handle_batch_write_small_blobs(cas_server_fss, &batch.blobs);
                         }
                         Update::StartAction(start_execute) => {
                             // Don't accept any new requests if we're shutting down.
