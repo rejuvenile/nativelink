@@ -351,6 +351,12 @@ pub struct BlobsInStableStorageChunk {
     /// / True on the FINAL chunk of one broadcast.
     #[prost(bool, tag = "4")]
     pub is_last: bool,
+    /// / Server-generation nonce. Random u64 chosen at server startup;
+    /// / echoed back by the worker in the matching `BisAck.server_instance_token`.
+    /// / Guards against stale-ack-across-server-bounce
+    /// / (red-team finding #5 on #97).
+    #[prost(uint64, tag = "5")]
+    pub server_instance_token: u64,
 }
 /// / A streaming-message envelope shared across the cas->worker, scheduler->
 /// / worker, and worker->scheduler chunk producers. Exactly ONE of the
@@ -523,6 +529,11 @@ pub struct BisAck {
     pub broadcast_id: u64,
     #[prost(uint32, tag = "2")]
     pub sequence: u32,
+    /// / Echo of `BlobsInStableStorageChunk.server_instance_token`. The
+    /// / scheduler silently drops acks whose token does not match the
+    /// / CURRENT server-process token (red-team finding #5 on #97).
+    #[prost(uint64, tag = "3")]
+    pub server_instance_token: u64,
 }
 /// / Communication from the worker to the scheduler.
 #[derive(Clone, PartialEq, ::prost::Message)]

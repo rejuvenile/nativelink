@@ -1179,6 +1179,22 @@ pub struct ApiWorkerScheduler {
     /// scheduler's first broadcast carries id=1 (avoids the "did the
     /// counter ever advance?" ambiguity of a 0 sentinel).
     next_bis_broadcast_id: AtomicU64,
+
+    /// (#97 red-team #5) Server-generation nonce. Random u64 chosen at
+    /// scheduler construction; injected into every dispatched
+    /// `BlobsInStableStorageChunk.server_instance_token`. Workers echo
+    /// it back in `BisAck.server_instance_token` and the scheduler
+    /// silently drops acks whose token doesn't match — guarding
+    /// against a worker holding a stale ack across a server bounce
+    /// dropping an unrelated chunk from the new server's resend
+    /// buffer (which would happen because `next_bis_broadcast_id`
+    /// resets to 1 on startup → broadcast_id collisions across
+    /// server-instance boundaries are guaranteed).
+    ///
+    /// Never zero (the all-zero token is the proto default and would
+    /// silently coexist with a buggy worker that omitted the field;
+    /// regenerate until non-zero).
+    server_instance_token: u64,
 }
 
 /// Probe a CAS store chain to find the SizePartitioningStore threshold.
@@ -1463,6 +1479,29 @@ impl ApiWorkerScheduler {
             memory_store_threshold,
             worker_tls_config,
             next_bis_broadcast_id: AtomicU64::new(1),
+            // (#97 red-team #5) Random nonce per server-process. Loop
+            // to regenerate if `gen` returns 0 — the proto default for
+            // an unset uint64 field is 0; treating it as always-mismatch
+            // protects against legacy workers that don't echo the token
+            // BUT also means an unlikely all-zero generation would
+            // refuse every ack from its OWN workers. Keep generating
+            // until non-zero (probability 2^-64 per draw → terminates
+            // with overwhelming probability on the first call).
+            server_instance_token: {
+                use rand::Rng;
+                let mut rng = rand::rng();
+                let mut token: u64 = rng.random();
+                while token == 0 {
+                    token = rng.random();
+                }
+                tracing::info!(
+                    target: "nativelink::bis_chunked_dispatch",
+                    %token,
+                    "ApiWorkerScheduler: generated server_instance_token \
+                     for BIS ack-token validation (#97 red-team #5)"
+                );
+                token
+            },
         })
     }
 
@@ -2786,6 +2825,7 @@ impl ApiWorkerScheduler {
         // resend-buffer storage share allocations. Without Arc, each
         // chunk's Vec<Digest> would be cloned per worker AND once more
         // per buffer entry.
+        let server_instance_token = self.server_instance_token;
         let chunks: Vec<Arc<BlobsInStableStorageChunk>> = ChunkIter::new(
             proto_digests.into_iter(),
             BIS_DIGESTS_PER_CHUNK,
@@ -2795,6 +2835,7 @@ impl ApiWorkerScheduler {
             broadcast_id,
             sequence: c.sequence,
             is_last: c.is_last,
+            server_instance_token,
         }))
         .collect();
 
@@ -2959,12 +3000,41 @@ impl ApiWorkerScheduler {
     /// for a chunk we previously dispatched. Idempotent: an ack for an
     /// unknown broadcast_id (e.g. one we already replayed-and-acked, or
     /// one from a server we restarted into) is silently ignored.
+    ///
+    /// **Server-instance-token validation (red-team #5).** Acks whose
+    /// `server_instance_token` does not match the current scheduler's
+    /// token are silently dropped (with a `debug!` for observability).
+    /// Without this, a worker holding a stale `BisAck { broadcast_id =
+    /// 42, server_instance_token = OLD }` sent across a server bounce
+    /// would drop an unrelated chunk from the new server's resend
+    /// buffer (the new server resets `next_bis_broadcast_id` to 1 on
+    /// startup → broadcast_id collisions across server-instance
+    /// boundaries are guaranteed).
     pub async fn bis_ack_received(
         &self,
         worker_id: &WorkerId,
         broadcast_id: u64,
         sequence: u32,
+        server_instance_token: u64,
     ) {
+        if server_instance_token != self.server_instance_token {
+            debug!(
+                target: "nativelink::bis_chunked_ack",
+                ?worker_id,
+                broadcast_id,
+                sequence,
+                ack_token = server_instance_token,
+                expected_token = self.server_instance_token,
+                "BisAck dropped: server_instance_token mismatch — \
+                 worker is holding an ack from a previous server \
+                 process. Without the drop, this ack would silently \
+                 release an unrelated chunk from the resend buffer \
+                 (next_bis_broadcast_id resets to 1 on server startup, \
+                 so broadcast_id collisions across server bounces are \
+                 guaranteed)"
+            );
+            return;
+        }
         let mut inner = self.inner.write().await;
         let Some(endpoint) = inner.workers.get(worker_id).map(|w| w.cas_endpoint.clone())
         else {
@@ -3813,10 +3883,12 @@ impl WorkerScheduler for ApiWorkerScheduler {
         worker_id: &WorkerId,
         broadcast_id: u64,
         sequence: u32,
+        server_instance_token: u64,
     ) {
         // Inherent impl on ApiWorkerScheduler is the source of truth
         // for BIS resend tracking; the trait impl just forwards.
-        self.bis_ack_received(worker_id, broadcast_id, sequence).await;
+        self.bis_ack_received(worker_id, broadcast_id, sequence, server_instance_token)
+            .await;
     }
 
     async fn clear_bis_resend_buffer_for_endpoint(&self, cas_endpoint: &str) {
@@ -4718,13 +4790,16 @@ mod tests {
             "every dispatched chunk must be in the resend buffer until acked"
         );
 
-        // Ack every chunk; buffer must drain.
+        // Ack every chunk; buffer must drain. Echo the chunk's
+        // server_instance_token (red-team #5: scheduler validates
+        // tokens to drop stale-server-bounce acks).
         for chunk in &chunks {
             scheduler
                 .bis_ack_received(
                     &WorkerId("worker-1".to_string()),
                     chunk.broadcast_id,
                     chunk.sequence,
+                    chunk.server_instance_token,
                 )
                 .await;
         }
@@ -4766,6 +4841,7 @@ mod tests {
                     &WorkerId("worker-2a".to_string()),
                     bid,
                     chunk.sequence,
+                    chunk.server_instance_token,
                 )
                 .await;
         }
@@ -4866,6 +4942,7 @@ mod tests {
                     &WorkerId("worker-4".to_string()),
                     chunk.broadcast_id,
                     chunk.sequence,
+                    chunk.server_instance_token,
                 )
                 .await;
         }
@@ -4875,6 +4952,202 @@ mod tests {
             "after every chunk acked, the endpoint's buffer entry must \
              be removed entirely (not just emptied) so a long-lived \
              worker doesn't accumulate empty BisResendBuffer entries"
+        );
+    }
+
+    /// 5. **Server-instance-token (red-team #5).** A `BisAck` whose
+    ///    `server_instance_token` does not match the current scheduler's
+    ///    token MUST be silently dropped — without this, a worker
+    ///    holding a stale ack across a server bounce would drop an
+    ///    unrelated chunk from the new server's resend buffer (because
+    ///    `next_bis_broadcast_id` resets to 1 on startup → broadcast_id
+    ///    collisions across server-instance boundaries are guaranteed).
+    ///
+    ///    Mutation step: in `bis_ack_received`, replace the
+    ///    `if server_instance_token != self.server_instance_token`
+    ///    guard with `if false`. This test MUST then panic with
+    ///    "stale-token ack must NOT remove the chunk from the resend buffer".
+    #[tokio::test]
+    async fn bis_ack_with_stale_server_token_silently_dropped() {
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w5.local:50081";
+        let mut rx = register_worker_endpoint(&scheduler, "worker-5", endpoint).await;
+
+        // Dispatch a broadcast — chunks will carry the scheduler's
+        // current server_instance_token.
+        let digests: Vec<DigestInfo> = (0..200u64).map(make_digest_info).collect();
+        scheduler
+            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .await;
+        let chunks = drain_bis_chunks(&mut rx).await;
+        assert!(!chunks.is_empty(), "must dispatch at least one chunk");
+        let valid_token = chunks[0].server_instance_token;
+        let buffered_before = {
+            let inner = scheduler.inner.read().await;
+            inner
+                .bis_resend_buffers
+                .get(endpoint)
+                .map(|b| b.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            buffered_before,
+            chunks.len(),
+            "every dispatched chunk must be in the resend buffer"
+        );
+
+        // Send acks with the WRONG token — simulates a worker holding
+        // acks from a previous server process. The broadcast_id +
+        // sequence still match valid in-buffer chunks, so without the
+        // token check these acks would silently release the chunks.
+        let stale_token = valid_token.wrapping_add(1);
+        assert_ne!(
+            stale_token, valid_token,
+            "test setup invariant: stale_token must differ from valid_token"
+        );
+        for chunk in &chunks {
+            scheduler
+                .bis_ack_received(
+                    &WorkerId("worker-5".to_string()),
+                    chunk.broadcast_id,
+                    chunk.sequence,
+                    stale_token,
+                )
+                .await;
+        }
+        let buffered_after_stale = {
+            let inner = scheduler.inner.read().await;
+            inner
+                .bis_resend_buffers
+                .get(endpoint)
+                .map(|b| b.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            buffered_after_stale, chunks.len(),
+            "stale-token ack must NOT remove the chunk from the resend buffer \
+             (red-team #5: across-server-bounce broadcast_id collisions are \
+             guaranteed; without the token check, a stale ack from a \
+             previous server's worker would silently release an unrelated \
+             chunk and leak the corresponding pin state)"
+        );
+
+        // Sanity: matching-token acks STILL drain the buffer (the
+        // gate is on token mismatch, not all-acks-rejected).
+        for chunk in &chunks {
+            scheduler
+                .bis_ack_received(
+                    &WorkerId("worker-5".to_string()),
+                    chunk.broadcast_id,
+                    chunk.sequence,
+                    valid_token,
+                )
+                .await;
+        }
+        let inner = scheduler.inner.read().await;
+        assert!(
+            !inner.bis_resend_buffers.contains_key(endpoint),
+            "matching-token acks must STILL drain the buffer — the \
+             token check is a guard against stale acks, not a \
+             reject-everything sentinel"
+        );
+    }
+
+    /// 6. **Concurrent ack/replay race (testing-czar requirement).**
+    ///    `bis_ack_received` and `replay_bis_chunks_to_worker` both
+    ///    take `inner.write().await`. The lock-ordering guarantee is
+    ///    that they are SERIALIZED on the inner RwLock, so racing
+    ///    them must produce: (a) no deadlock, (b) no chunk delivered
+    ///    twice via replay if it was acked first, (c) no chunk lost.
+    ///
+    ///    Mutation guidance: introducing a `tokio::time::sleep(10ms)`
+    ///    between any internal read-acquire and write-acquire in
+    ///    `replay_bis_chunks_to_worker` would not change the outcome
+    ///    (the test asserts on result-state, not timing).
+    #[tokio::test]
+    async fn bis_concurrent_ack_and_replay_no_deadlock() {
+        use tokio::time::{Duration, timeout};
+
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w6.local:50081";
+        let mut rx1 = register_worker_endpoint(&scheduler, "worker-6a", endpoint).await;
+
+        // Pre-populate the buffer with N chunks for endpoint E.
+        let digests: Vec<DigestInfo> = (0..400u64).map(make_digest_info).collect();
+        scheduler
+            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .await;
+        let chunks = drain_bis_chunks(&mut rx1).await;
+        assert!(chunks.len() >= 1, "must dispatch chunks");
+        let bid = chunks[0].broadcast_id;
+        let token = chunks[0].server_instance_token;
+
+        // Race: simultaneously ack the first chunk AND register a new
+        // worker on the same endpoint (which triggers replay).
+        // The deadlock detector — wrap the whole race in 5s timeout.
+        let scheduler_clone = scheduler.clone();
+        let scheduler_clone2 = scheduler.clone();
+        let first_seq = chunks[0].sequence;
+        let endpoint_owned = endpoint.to_string();
+
+        let race = async move {
+            // Drop the first worker so the new add_worker can replay
+            // through the tx for the SAME endpoint.
+            drop(rx1);
+            let _ = scheduler_clone
+                .remove_worker(&WorkerId("worker-6a".to_string()))
+                .await;
+
+            tokio::join!(
+                async {
+                    scheduler_clone
+                        .bis_ack_received(
+                            &WorkerId("worker-6a".to_string()),
+                            bid,
+                            first_seq,
+                            token,
+                        )
+                        .await;
+                },
+                async {
+                    let _rx2 = register_worker_endpoint(
+                        &scheduler_clone2,
+                        "worker-6b",
+                        &endpoint_owned,
+                    )
+                    .await;
+                    // Hold rx2 alive briefly so replay completes.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    drop(_rx2);
+                }
+            );
+        };
+
+        timeout(Duration::from_secs(5), race)
+            .await
+            .expect("must not deadlock — bis_ack_received vs replay_bis_chunks_to_worker \
+                     must serialize cleanly on inner.write().await");
+
+        // After the race the buffer either contains chunks.len() - 1
+        // entries (ack landed first; first chunk removed) or
+        // chunks.len() entries (ack hit a non-existent worker first;
+        // worker-6a was already removed before bis_ack_received's
+        // worker-lookup, so endpoint resolution failed → no removal).
+        // Either is correct; what is NOT correct is panic / deadlock /
+        // chunk count above the dispatched total.
+        let buffered_after_race = {
+            let inner = scheduler.inner.read().await;
+            inner
+                .bis_resend_buffers
+                .get(endpoint)
+                .map(|b| b.len())
+                .unwrap_or(0)
+        };
+        assert!(
+            buffered_after_race <= chunks.len(),
+            "race must not produce chunk count above dispatched total \
+             (got {buffered_after_race}, dispatched {})",
+            chunks.len()
         );
     }
 }

@@ -635,12 +635,18 @@ impl WorkerConnection {
                         // drop the matching chunk. Default trait impl is
                         // a no-op; only api_worker_scheduler tracks the
                         // resend state.
+                        //
+                        // The scheduler's `bis_ack_received` validates
+                        // `server_instance_token` against its own token
+                        // (red-team #5: stale acks across server bounces
+                        // would otherwise drop unrelated chunks).
                         instance
                             .scheduler
                             .bis_ack_received(
                                 &instance.worker_id,
                                 ack.broadcast_id,
                                 ack.sequence,
+                                ack.server_instance_token,
                             )
                             .await;
                         Ok(())

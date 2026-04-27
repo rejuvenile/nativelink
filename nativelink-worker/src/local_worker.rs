@@ -928,9 +928,13 @@ pub fn handle_bis_chunk(
 ) -> BisUnpinOutcome {
     let outcome = handle_blobs_in_stable_storage(state, cas_store, &chunk.digests);
     if outcome.all_succeeded() {
+        // Echo the server_instance_token from the chunk into the ack
+        // (red-team #5: scheduler validates the token to drop acks
+        // across server-bounces).
         (ack_sink)(BisAck {
             broadcast_id: chunk.broadcast_id,
             sequence: chunk.sequence,
+            server_instance_token: chunk.server_instance_token,
         });
     } else {
         // Loud-log so operators see the unpin-failure rate. The server

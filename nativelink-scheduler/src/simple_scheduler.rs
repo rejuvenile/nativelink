@@ -1030,9 +1030,10 @@ impl WorkerScheduler for SimpleScheduler {
         worker_id: &WorkerId,
         broadcast_id: u64,
         sequence: u32,
+        server_instance_token: u64,
     ) {
         self.worker_scheduler
-            .bis_ack_received(worker_id, broadcast_id, sequence)
+            .bis_ack_received(worker_id, broadcast_id, sequence, server_instance_token)
             .await;
     }
 

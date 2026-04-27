@@ -344,6 +344,20 @@ message BlobsInStableStorageChunk {
     /// == 0` (or the broadcast carried zero digests at all); receivers
     /// MUST tolerate that.
     bool is_last = 4;
+    /// Server-generation nonce. Random u64 chosen at server startup;
+    /// echoed back by the worker in the matching `BisAck.server_instance_token`.
+    /// Without this, a worker holding a stale `BisAck { broadcast_id =
+    /// 42 }` sent across a server bounce can drop an unrelated chunk
+    /// from the new server's resend buffer (the new server resets
+    /// `next_bis_broadcast_id` to 1 on startup → broadcast_id collisions
+    /// across server-instance boundaries are guaranteed). The server
+    /// silently discards acks whose token mismatches; the chunk simply
+    /// retries on the next ack of a same-instance chunk. Field 5 is
+    /// safe (BlobsInStableStorageChunk has no reserved tags). A value
+    /// of 0 means "uninitialised / pre-#97-fixup worker"; the server
+    /// MAY accept legacy acks during a fleet rev (currently fleet
+    /// rev's all-at-once so 0 means a bug).
+    uint64 server_instance_token = 5;
 }
 
 /// A streaming-message envelope shared across the cas→worker, scheduler→
@@ -506,6 +520,16 @@ message BisAck {
     uint64 broadcast_id = 1;
     /// Sequence within the broadcast that this ack covers.
     uint32 sequence = 2;
+    /// Echo of `BlobsInStableStorageChunk.server_instance_token`. The
+    /// scheduler silently drops acks whose token does not match the
+    /// CURRENT server-process token — this guards against a worker
+    /// holding a stale ack across a server bounce dropping an
+    /// unrelated chunk from the new server's resend buffer. Per
+    /// red-team finding #5 on #97. A value of 0 means
+    /// "uninitialised / pre-fixup worker"; the server treats 0 as
+    /// always-mismatched (today; legacy compat would make it
+    /// always-accepted).
+    uint64 server_instance_token = 3;
 }
 
 /// Communication from the worker to the scheduler.

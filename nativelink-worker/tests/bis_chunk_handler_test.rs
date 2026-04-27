@@ -150,6 +150,7 @@ async fn bis_chunked_full_burst() -> Result<(), nativelink_error::Error> {
         broadcast_id: 7,
         sequence: 0,
         is_last: true,
+        server_instance_token: 0xDEAD_BEEF_CAFE_F00D,
     };
 
     let mut acks: Vec<BisAck> = Vec::new();
@@ -175,6 +176,10 @@ async fn bis_chunked_full_burst() -> Result<(), nativelink_error::Error> {
     );
     assert_eq!(acks[0].broadcast_id, 7, "ack must carry the chunk's broadcast_id");
     assert_eq!(acks[0].sequence, 0, "ack must carry the chunk's sequence");
+    assert_eq!(
+        acks[0].server_instance_token, 0xDEAD_BEEF_CAFE_F00D,
+        "worker MUST echo the chunk's server_instance_token (red-team #5)"
+    );
     Ok(())
 }
 
@@ -190,6 +195,7 @@ async fn bis_chunked_empty_terminal_acks() -> Result<(), nativelink_error::Error
         broadcast_id: 42,
         sequence: 5,
         is_last: true,
+        server_instance_token: 0x1234,
     };
 
     let mut acks: Vec<BisAck> = Vec::new();
@@ -226,6 +232,7 @@ async fn bis_chunked_idempotent_unpin() -> Result<(), nativelink_error::Error> {
         broadcast_id: 11,
         sequence: 2,
         is_last: false,
+        server_instance_token: 0x5678,
     };
 
     let mut acks: Vec<BisAck> = Vec::new();
@@ -294,6 +301,7 @@ async fn bis_ack_not_sent_when_unpin_fails() -> Result<(), nativelink_error::Err
         broadcast_id: 99,
         sequence: 13,
         is_last: false,
+        server_instance_token: 0xABCD,
     };
 
     let mut acks: Vec<BisAck> = Vec::new();

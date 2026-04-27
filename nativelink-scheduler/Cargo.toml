@@ -27,6 +27,9 @@ opentelemetry-semantic-conventions = { version = "0.31.0", default-features = fa
 ] }
 parking_lot = { version = "0.12.3", default-features = false }
 prost = { version = "0.14.3", default-features = false }
+rand = { version = "0.9.0", default-features = false, features = [
+  "thread_rng",
+] }
 redis = { version = "1.0.0", default-features = false }
 scopeguard = { version = "1.2.0", default-features = false }
 serde = { version = "1.0.219", features = ["rc"], default-features = false }

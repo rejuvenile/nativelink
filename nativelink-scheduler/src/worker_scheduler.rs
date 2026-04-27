@@ -114,13 +114,16 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
 
     /// (#97) Notify the scheduler that a worker has acked one BIS chunk.
     /// The scheduler drops the matching `(broadcast_id, sequence)` from
-    /// its per-worker resend buffer. Default impl is a no-op (schedulers
-    /// that don't implement chunked BIS just discard acks).
+    /// its per-worker resend buffer if and only if `server_instance_token`
+    /// matches the scheduler's current token (red-team #5: stale acks
+    /// across server bounces would otherwise drop unrelated chunks).
+    /// Default impl is a no-op.
     async fn bis_ack_received(
         &self,
         _worker_id: &WorkerId,
         _broadcast_id: u64,
         _sequence: u32,
+        _server_instance_token: u64,
     ) {
     }
 

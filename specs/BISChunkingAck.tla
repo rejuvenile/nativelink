@@ -36,6 +36,17 @@
         - FALSE => resend on reconnect: drained chunks are replayed
                    when the worker reconnects with the same endpoint.
                    Models the #97 implementation.
+    * StaleTokenAccepted (BOOLEAN): models red-team finding #5 — the
+      `server_instance_token` validation in `bis_ack_received`.
+        - TRUE  => acks accepted regardless of token. The bug class:
+                   a worker holding a stale ack (from a previous
+                   server-process broadcast that happened to carry
+                   the SAME broadcast_id) drops an unrelated chunk
+                   from the new server's buffer. Models the
+                   pre-fixup behavior.
+        - FALSE => acks whose token mismatches the current server's
+                   token are silently dropped. Models the shipped
+                   fixup-pass behavior.
 
   EXPECTED TLC OUTCOMES:
     * BISChunkingAckFixed.cfg (BugMode = FALSE):
@@ -88,11 +99,21 @@
 EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
-    NumChunks,    \* Number of chunks in the modeled broadcast (Nat >= 1)
-    BugMode       \* TRUE => no resend on reconnect; FALSE => resend
+    NumChunks,           \* Number of chunks in the modeled broadcast (Nat >= 1)
+    BugMode,             \* TRUE => no resend on reconnect; FALSE => resend
+    StaleTokenAccepted   \* TRUE => server accepts acks with stale token;
+                         \*  FALSE => server validates server_instance_token
 
 ASSUME NumChunks \in Nat /\ NumChunks >= 1
 ASSUME BugMode \in BOOLEAN
+ASSUME StaleTokenAccepted \in BOOLEAN
+
+\* Tokens: the current server's token vs. a stale token from a
+\* previous server-process. ServerToken is the only token the current
+\* server's bis_ack_received accepts when StaleTokenAccepted = FALSE.
+ServerToken == "current"
+StaleToken == "stale"
+Tokens == {ServerToken, StaleToken}
 
 \* Chunk identifiers (= sequence within the broadcast).
 Chunks == 1..NumChunks
@@ -156,7 +177,9 @@ DeliverChunk(c) ==
 
 ----------------------------------------------------------------------------
 \* AckChunk(c): server receives the worker's ack for chunk c (only
-\* when connected). The ack drops c from serverBuffer.
+\* when connected). The worker echoes the server's current token, so
+\* the ack always passes the token check; the chunk drops from
+\* serverBuffer.
 ----------------------------------------------------------------------------
 AckChunk(c) ==
     /\ connState = "Connected"
@@ -164,6 +187,33 @@ AckChunk(c) ==
     /\ pendingAcks' = pendingAcks \ {c}
     /\ serverBuffer' = serverBuffer \ {c}
     /\ UNCHANGED <<workerUnpinned, connState, inFlight>>
+
+----------------------------------------------------------------------------
+\* StaleAck(c): models red-team finding #5. A worker is holding an ack
+\* from a PREVIOUS server-process broadcast that happens to share the
+\* same broadcast_id (because next_bis_broadcast_id resets to 1 on
+\* server startup). The stale ack arrives at the current server and
+\* attempts to drop chunk c from the buffer.
+\*   * StaleTokenAccepted = TRUE  (BUG): the server has no token check
+\*     and treats this ack as valid → c is dropped from serverBuffer.
+\*     If c was never workerUnpinned, ServerBufferReleaseImpliesUnpin
+\*     is violated.
+\*   * StaleTokenAccepted = FALSE (FIX): the server compares the ack's
+\*     token to its own and silently drops the mismatching ack →
+\*     serverBuffer unchanged. The chunk eventually drains via the
+\*     legitimate AckChunk path.
+\* Independent of connState: a stale ack can arrive any time the wire
+\* is up. It does NOT consume from pendingAcks (those are the chunks
+\* THIS server-process actually queued).
+----------------------------------------------------------------------------
+StaleAck(c) ==
+    /\ connState = "Connected"
+    /\ c \in serverBuffer  \* meaningful only if the slot exists
+    /\ \/ /\ StaleTokenAccepted
+          /\ serverBuffer' = serverBuffer \ {c}
+          /\ UNCHANGED <<workerUnpinned, connState, inFlight, pendingAcks>>
+       \/ /\ ~StaleTokenAccepted
+          /\ UNCHANGED <<serverBuffer, workerUnpinned, connState, inFlight, pendingAcks>>
 
 ----------------------------------------------------------------------------
 \* DropConnection: the wire terminates. In-flight chunks are dropped
@@ -197,6 +247,7 @@ Reconnect ==
 Next ==
     \/ \E c \in Chunks : DeliverChunk(c)
     \/ \E c \in Chunks : AckChunk(c)
+    \/ \E c \in Chunks : StaleAck(c)
     \/ DropConnection
     \/ Reconnect
 
