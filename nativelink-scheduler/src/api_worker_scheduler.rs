@@ -238,11 +238,19 @@ struct ApiWorkerSchedulerImpl {
 /// every buffered chunk is resent so worker reconnects don't lose
 /// unpins.
 ///
-/// Bounded by total entries because every chunk holds up to
-/// `BIS_DIGESTS_PER_CHUNK` digests; a runaway buffer would dominate
-/// scheduler memory. When the cap is hit, the OLDEST broadcast is
-/// dropped: the worker will see it again as part of a future
-/// `BlobsAvailable`-driven path or simply hold the pin a little longer.
+/// Currently UNBOUNDED. Eviction relies on:
+///   (a) per-broadcast `ack` removal — every successful chunk delivery
+///       drops one `(broadcast_id, sequence)` slot;
+///   (b) `unregister_worker` clearing the per-endpoint slot on
+///       disconnect (only fires when the connection is recognised as
+///       gone — a long-disconnected-but-not-yet-reaped worker keeps
+///       its slot);
+///   (c) `clear_bis_resend_buffer_for_endpoint` on boot-epoch change.
+///
+/// A long-disconnected-but-not-yet-reaped worker with a stable
+/// `cas_endpoint` accumulates one chunk per broadcast indefinitely.
+/// TODO(#97-followup): cap by disconnect-timeout — when no ack received
+/// for N seconds, evict the entire per-endpoint slot.
 #[derive(Debug, Default)]
 pub(crate) struct BisResendBuffer {
     /// (broadcast_id, sequence) -> chunk bytes-equivalent (Vec of proto
