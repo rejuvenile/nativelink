@@ -108,6 +108,14 @@ type ScoringResult = (HashMap<Arc<str>, u64>, Arc<[PeerHint]>);
 /// h2/QUIC frame fragmentation thresholds.
 pub(crate) const PEER_HINTS_PER_CHUNK: usize = 256;
 
+/// (#97) Maximum number of `Digest` entries packed into one
+/// `BlobsInStableStorageChunk` proto. SHA-256 digests are ~32 bytes
+/// each plus prost framing (~40 B with size_bytes); 4096 digests per
+/// chunk caps the proto at ~160 KiB, well below the 64 MiB worker
+/// decoder limit. Larger chunks reduce per-chunk ack overhead but
+/// increase the cost of a single resend after a connection drop.
+pub(crate) const BIS_DIGESTS_PER_CHUNK: usize = 4096;
+
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::worker::{
     ActionInfoWithProps, PendingActionInfoData, Worker, WorkerTimestamp, WorkerUpdate,
@@ -2689,6 +2697,234 @@ impl ApiWorkerScheduler {
         }
     }
 
+    /// (#97) Chunked variant of `broadcast_blobs_in_stable_storage`: splits
+    /// `digests` into `BIS_DIGESTS_PER_CHUNK`-sized
+    /// `BlobsInStableStorageChunk` messages, dispatches each chunk to
+    /// every connected worker via `Update::ChunkedMessage`, and adds the
+    /// dispatched chunk to the per-worker resend buffer (keyed by
+    /// `cas_endpoint`). The matching `Update::BisAck` from the worker
+    /// later removes the chunk from the buffer. On the next ConnectWorker
+    /// for the same `cas_endpoint`+`boot_epoch_id`, every still-buffered
+    /// chunk is replayed via `replay_bis_chunks_to_worker` so a worker
+    /// reconnect does not drop unacked unpins.
+    ///
+    /// Direct-merge per the streaming-design plan: each chunk is
+    /// independently meaningful; chunks may arrive out of order on
+    /// resends; unpins are idempotent. Empty `digests` is a no-op (no
+    /// chunks emitted, no buffer entries — distinct from the
+    /// chunk_iter's "always emit one terminal chunk" contract because
+    /// the empty broadcast is not a meaningful protocol event for any
+    /// worker).
+    pub async fn broadcast_blobs_in_stable_storage_chunked(
+        &self,
+        digests: Vec<DigestInfo>,
+    ) {
+        if digests.is_empty() {
+            return;
+        }
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+            BlobsInStableStorageChunk, ChunkedMessage, chunked_message,
+        };
+        use nativelink_util::chunk_iter::ChunkIter;
+
+        let proto_digests: Vec<Digest> = digests.iter().map(Digest::from).collect();
+        let total = proto_digests.len();
+
+        // Snapshot the (worker_id, cas_endpoint, tx) tuples under a brief
+        // read lock, then build chunks + dispatch outside the lock. Then
+        // acquire a write lock to persist the chunks into the resend
+        // buffer (one write lock per broadcast, not per chunk, to keep
+        // contention proportional to broadcast frequency rather than
+        // chunk count).
+        let senders: Vec<(WorkerId, Arc<str>, _)> = {
+            let inner = self.inner.read().await;
+            inner
+                .workers
+                .iter()
+                .filter_map(|(id, w)| {
+                    if w.cas_endpoint.is_empty() {
+                        // Workers without a cas_endpoint can't be tracked
+                        // for resend (no stable identity across reconnect).
+                        // Send to them but skip the buffer.
+                        Some((id.clone(), Arc::<str>::from(""), w.tx.clone()))
+                    } else {
+                        Some((
+                            id.clone(),
+                            Arc::<str>::from(w.cas_endpoint.as_str()),
+                            w.tx.clone(),
+                        ))
+                    }
+                })
+                .collect()
+        };
+        let worker_count = senders.len();
+
+        // Allocate a unique broadcast_id under the write lock; bump the
+        // counter atomically so concurrent broadcasts don't collide.
+        let broadcast_id = {
+            let mut inner = self.inner.write().await;
+            let id = inner.next_bis_broadcast_id;
+            inner.next_bis_broadcast_id = inner.next_bis_broadcast_id.wrapping_add(1);
+            id
+        };
+
+        info!(
+            target: "nativelink::bis_chunked_dispatch",
+            worker_count,
+            digest_count = total,
+            broadcast_id,
+            chunk_size = BIS_DIGESTS_PER_CHUNK,
+            "broadcast_blobs_in_stable_storage_chunked: dispatching"
+        );
+
+        // Build all chunks once (cheap clone of Vec<Digest> per chunk).
+        // Chunks share the same broadcast_id; sequence is monotonic 0..N.
+        let chunks: Vec<BlobsInStableStorageChunk> = ChunkIter::new(
+            proto_digests.into_iter(),
+            BIS_DIGESTS_PER_CHUNK,
+        )
+        .map(|c| BlobsInStableStorageChunk {
+            digests: c.items,
+            broadcast_id,
+            sequence: c.sequence,
+            is_last: c.is_last,
+        })
+        .collect();
+
+        // Dispatch + record in resend buffer per worker.
+        let mut send_failures = 0usize;
+        for (worker_id, endpoint, tx) in &senders {
+            for chunk in &chunks {
+                let msg = UpdateForWorker {
+                    update: Some(update_for_worker::Update::ChunkedMessage(ChunkedMessage {
+                        payload: Some(chunked_message::Payload::BlobsInStableStorage(
+                            chunk.clone(),
+                        )),
+                    })),
+                };
+                if let Err(e) = tx.send(msg) {
+                    send_failures += 1;
+                    warn!(
+                        target: "nativelink::bis_chunked_dispatch_per_worker",
+                        worker_id = %worker_id,
+                        broadcast_id,
+                        sequence = chunk.sequence,
+                        ?e,
+                        "BIS chunk send failed; will replay on reconnect"
+                    );
+                    // Send failed — disconnected. Bail this worker so we
+                    // don't pile up resend entries that won't have a live
+                    // tx anyway. The reconnect path will replay from
+                    // whatever's in the buffer at that point.
+                    break;
+                }
+            }
+
+            if !endpoint.is_empty() {
+                let mut inner = self.inner.write().await;
+                let buf = inner
+                    .bis_resend_buffers
+                    .entry(endpoint.to_string())
+                    .or_default();
+                for chunk in &chunks {
+                    buf.add(chunk.clone());
+                }
+            }
+        }
+
+        if send_failures > 0 {
+            debug!(
+                digest_count = total,
+                worker_count,
+                broadcast_id,
+                send_failures,
+                "BIS chunked broadcast had send failures (workers will see resend on reconnect)"
+            );
+        } else {
+            trace!(
+                digest_count = total,
+                worker_count,
+                broadcast_id,
+                "BIS chunked broadcast complete"
+            );
+        }
+    }
+
+    /// (#97) Replay every still-buffered BIS chunk for `cas_endpoint` to
+    /// the supplied tx. Called from `add_worker` whenever the worker
+    /// joining has the same `cas_endpoint` as a previously-disconnected
+    /// worker AND has the same `boot_epoch_id` (a different epoch means
+    /// the worker's pin state died with the old process and the resend
+    /// is moot — caller is responsible for clearing the buffer in that
+    /// case via `clear_bis_resend_buffer_for_endpoint`).
+    ///
+    /// Failed sends are silently dropped (the new worker is also
+    /// disconnected — nothing more we can do).
+    pub async fn replay_bis_chunks_to_worker(
+        &self,
+        cas_endpoint: &str,
+        tx: &tokio::sync::mpsc::UnboundedSender<UpdateForWorker>,
+    ) -> usize {
+        if cas_endpoint.is_empty() {
+            return 0;
+        }
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+            ChunkedMessage, chunked_message,
+        };
+        let chunks_to_replay = {
+            let inner = self.inner.read().await;
+            match inner.bis_resend_buffers.get(cas_endpoint) {
+                Some(buf) => buf.chunks.values().cloned().collect::<Vec<_>>(),
+                None => return 0,
+            }
+        };
+        let n = chunks_to_replay.len();
+        if n == 0 {
+            return 0;
+        }
+        info!(
+            target: "nativelink::bis_chunked_replay",
+            cas_endpoint,
+            chunk_count = n,
+            "replaying buffered BIS chunks to (re)connecting worker"
+        );
+        for chunk in chunks_to_replay {
+            let msg = UpdateForWorker {
+                update: Some(update_for_worker::Update::ChunkedMessage(ChunkedMessage {
+                    payload: Some(chunked_message::Payload::BlobsInStableStorage(chunk)),
+                })),
+            };
+            if tx.send(msg).is_err() {
+                // Worker dropped already — leave buffer in place; next
+                // reconnect will retry.
+                break;
+            }
+        }
+        n
+    }
+
+    /// (#97) Drop ALL buffered BIS chunks for `cas_endpoint`. Called
+    /// when the worker's `boot_epoch_id` changes (a fresh process
+    /// means the old pin state is gone — the unpins these chunks
+    /// would drive are no-ops; keeping them in the buffer would
+    /// just waste memory until the new worker happens to ack).
+    pub async fn clear_bis_resend_buffer_for_endpoint(&self, cas_endpoint: &str) {
+        if cas_endpoint.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().await;
+        if let Some(buf) = inner.bis_resend_buffers.remove(cas_endpoint) {
+            if !buf.is_empty() {
+                info!(
+                    target: "nativelink::bis_chunked_replay",
+                    cas_endpoint,
+                    dropped_chunks = buf.len(),
+                    "cleared BIS resend buffer on worker boot_epoch change"
+                );
+            }
+        }
+    }
+
     /// (#97) Drop the matching `(broadcast_id, sequence)` chunk from this
     /// worker's BIS resend buffer. Called when the worker sends a `BisAck`
     /// for a chunk we previously dispatched. Idempotent: an ack for an
@@ -3187,6 +3423,12 @@ impl WorkerScheduler for ApiWorkerScheduler {
     async fn add_worker(&self, worker: Worker) -> Result<(), Error> {
         let worker_id = worker.id.clone();
         let worker_timestamp = worker.last_update_timestamp;
+        // (#97) Snapshot endpoint + tx so we can replay any buffered BIS
+        // chunks AFTER the worker is registered. The replay is best-effort
+        // — if the new tx is also dropped immediately, the chunks stay in
+        // the buffer for the next reconnect.
+        let cas_endpoint_for_replay = worker.cas_endpoint.clone();
+        let tx_for_replay = worker.tx.clone();
         let mut inner = self.inner.write().await;
         if inner.shutting_down {
             warn!("Rejected worker add during shutdown: {}", worker_id);
@@ -3202,9 +3444,30 @@ impl WorkerScheduler for ApiWorkerScheduler {
             return Result::<(), _>::Err(err.clone())
                 .merge(inner.immediate_evict_worker(&worker_id, err, false).await);
         }
+        drop(inner);
 
         let now = UNIX_EPOCH + Duration::from_secs(worker_timestamp);
         self.worker_registry.register_worker(&worker_id, now).await;
+
+        // (#97) Replay any buffered BIS chunks for this endpoint. Same
+        // boot_epoch_id only — `inner_connect_worker` clears the buffer
+        // via `clear_bis_resend_buffer_for_endpoint` on epoch change
+        // before calling add_worker, so we always replay against
+        // same-epoch state here.
+        if !cas_endpoint_for_replay.is_empty() {
+            let replayed = self
+                .replay_bis_chunks_to_worker(&cas_endpoint_for_replay, &tx_for_replay)
+                .await;
+            if replayed > 0 {
+                info!(
+                    target: "nativelink::bis_chunked_replay",
+                    %worker_id,
+                    cas_endpoint = %cas_endpoint_for_replay,
+                    replayed,
+                    "replayed BIS chunks on worker (re)connect"
+                );
+            }
+        }
 
         // Scores cache is cleared on worker removal (remove_worker) to avoid
         // stale endpoint scores influencing locality decisions.
@@ -4250,6 +4513,331 @@ mod tests {
                 .await
                 .contains(&dir_digest),
             "tree_resolution_in_progress must not retain digest after second resolve_input_tree call"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (#97) BIS chunked broadcast + ack + reconnect-replay tests.
+    //
+    // These exercise the inherent methods on `ApiWorkerScheduler`:
+    //   * `broadcast_blobs_in_stable_storage_chunked`
+    //   * `bis_ack_received`
+    //   * `replay_bis_chunks_to_worker` (called from `add_worker`)
+    //   * `clear_bis_resend_buffer_for_endpoint`
+    // ------------------------------------------------------------------
+
+    use crate::worker_registry::WorkerRegistry;
+    use nativelink_metric::{
+        MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+    };
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+        chunked_message,
+        update_for_worker::Update as ServerUpdate,
+    };
+    use nativelink_util::operation_state_manager::WorkerStateManager;
+    use tokio::sync::mpsc;
+
+    /// Minimal no-op WorkerStateManager for unit tests that don't touch
+    /// operation state.
+    #[derive(Debug)]
+    struct NoopWsm;
+
+    impl MetricsComponent for NoopWsm {
+        fn publish(
+            &self,
+            _kind: MetricKind,
+            _field_metadata: MetricFieldData,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[async_trait]
+    impl WorkerStateManager for NoopWsm {
+        async fn update_operation(
+            &self,
+            _operation_id: &OperationId,
+            _worker_id: &WorkerId,
+            _update: UpdateOperationType,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn make_test_scheduler() -> Arc<ApiWorkerScheduler> {
+        ApiWorkerScheduler::new_with_locality_map(
+            Arc::new(NoopWsm),
+            Arc::new(PlatformPropertyManager::new(HashMap::new())),
+            WorkerAllocationStrategy::default(),
+            Arc::new(Notify::new()),
+            100,
+            Arc::new(WorkerRegistry::new()),
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn make_digest_info(i: u64) -> DigestInfo {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&i.to_be_bytes());
+        DigestInfo::new(hash, 4)
+    }
+
+    /// Drain every UpdateForWorker waiting on rx and return only the BIS
+    /// chunk payloads. Other update arms (ConnectionResult, KeepAlive,
+    /// etc.) are skipped — they're not what these tests assert on.
+    async fn drain_bis_chunks(
+        rx: &mut mpsc::UnboundedReceiver<UpdateForWorker>,
+    ) -> Vec<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsInStableStorageChunk>
+    {
+        let mut out = Vec::new();
+        while let Ok(Some(msg)) = tokio::time::timeout(
+            Duration::from_millis(200),
+            rx.recv(),
+        )
+        .await
+        {
+            if let Some(ServerUpdate::ChunkedMessage(envelope)) = msg.update
+                && let Some(chunked_message::Payload::BlobsInStableStorage(chunk)) =
+                    envelope.payload
+            {
+                out.push(chunk);
+            }
+        }
+        out
+    }
+
+    /// Register a worker, returning its rx so the test can observe what
+    /// the scheduler dispatches.
+    async fn register_worker_endpoint(
+        scheduler: &Arc<ApiWorkerScheduler>,
+        worker_id: &str,
+        cas_endpoint: &str,
+    ) -> mpsc::UnboundedReceiver<UpdateForWorker> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = Worker::new_with_cas_endpoint(
+            WorkerId(worker_id.to_string()),
+            PlatformProperties::default(),
+            tx,
+            42, // timestamp
+            0,  // max_inflight_tasks
+            cas_endpoint.to_string(),
+        );
+        scheduler.add_worker(worker).await.expect("add_worker");
+        rx
+    }
+
+    /// 1. End-to-end broadcast → chunks delivered → ack drains the
+    ///    resend buffer for the corresponding (broadcast_id, sequence).
+    #[tokio::test]
+    async fn bis_chunked_ack_acknowledged() {
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w1.local:50081";
+        let mut rx = register_worker_endpoint(&scheduler, "worker-1", endpoint).await;
+
+        // 100K digests will exceed BIS_DIGESTS_PER_CHUNK (4096), forcing
+        // ceil(100000 / 4096) = 25 chunks. Plenty to verify multi-chunk
+        // semantics.
+        let digests: Vec<DigestInfo> = (0..100_000u64).map(make_digest_info).collect();
+        scheduler
+            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .await;
+
+        let chunks = drain_bis_chunks(&mut rx).await;
+        assert!(
+            chunks.len() >= 24,
+            "expected ~25 chunks for 100K digests / 4096 per chunk, got {}",
+            chunks.len()
+        );
+        assert!(chunks.last().unwrap().is_last, "final chunk must set is_last");
+        assert!(
+            chunks
+                .iter()
+                .take(chunks.len() - 1)
+                .all(|c| !c.is_last),
+            "non-final chunks must not set is_last"
+        );
+
+        // Sanity: every chunk shares the same broadcast_id.
+        let bid = chunks[0].broadcast_id;
+        assert!(
+            chunks.iter().all(|c| c.broadcast_id == bid),
+            "all chunks of one broadcast must share broadcast_id"
+        );
+
+        // Buffer should hold every dispatched chunk awaiting ack.
+        let buffered_before = {
+            let inner = scheduler.inner.read().await;
+            inner
+                .bis_resend_buffers
+                .get(endpoint)
+                .map(|b| b.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            buffered_before,
+            chunks.len(),
+            "every dispatched chunk must be in the resend buffer until acked"
+        );
+
+        // Ack every chunk; buffer must drain.
+        for chunk in &chunks {
+            scheduler
+                .bis_ack_received(
+                    &WorkerId("worker-1".to_string()),
+                    chunk.broadcast_id,
+                    chunk.sequence,
+                )
+                .await;
+        }
+        let buffered_after = {
+            let inner = scheduler.inner.read().await;
+            inner.bis_resend_buffers.get(endpoint).map(|b| b.len()).unwrap_or(0)
+        };
+        assert_eq!(
+            buffered_after, 0,
+            "after acking every chunk, the resend buffer must be empty — \
+             without this, the buffer leaks and a long-lived worker \
+             accumulates 100K+ unacked chunks per broadcast in memory"
+        );
+    }
+
+    /// 2. Connection drop after partial ack → reconnect → server replays
+    ///    only the unacked chunks (not the acked ones).
+    #[tokio::test]
+    async fn bis_chunked_ack_lost_resend() {
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w2.local:50081";
+        let mut rx1 = register_worker_endpoint(&scheduler, "worker-2a", endpoint).await;
+
+        let digests: Vec<DigestInfo> = (0..10_000u64).map(make_digest_info).collect();
+        scheduler
+            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .await;
+
+        let chunks = drain_bis_chunks(&mut rx1).await;
+        assert!(chunks.len() >= 2, "need >= 2 chunks for the test, got {}", chunks.len());
+        let bid = chunks[0].broadcast_id;
+
+        // Ack only the first half of chunks. The second half is "in flight"
+        // when the simulated disconnect occurs.
+        let half = chunks.len() / 2;
+        for chunk in chunks.iter().take(half) {
+            scheduler
+                .bis_ack_received(
+                    &WorkerId("worker-2a".to_string()),
+                    bid,
+                    chunk.sequence,
+                )
+                .await;
+        }
+        let buffered_after_partial = {
+            let inner = scheduler.inner.read().await;
+            inner.bis_resend_buffers.get(endpoint).map(|b| b.len()).unwrap_or(0)
+        };
+        assert_eq!(
+            buffered_after_partial,
+            chunks.len() - half,
+            "buffer must hold exactly the unacked chunks after partial ack"
+        );
+
+        // Simulate disconnect: drop rx1 (worker side closed). Then the
+        // worker reconnects with the same cas_endpoint (same boot_epoch).
+        drop(rx1);
+        // Remove the old WorkerId so add_worker doesn't reject as
+        // duplicate. (Production uses a different WorkerId per connect;
+        // mirror that here.)
+        let _ = scheduler
+            .remove_worker(&WorkerId("worker-2a".to_string()))
+            .await;
+
+        let mut rx2 = register_worker_endpoint(&scheduler, "worker-2b", endpoint).await;
+        let replayed = drain_bis_chunks(&mut rx2).await;
+        assert_eq!(
+            replayed.len(),
+            chunks.len() - half,
+            "reconnect must replay every unacked chunk — without this, \
+             the worker permanently misses unpins and pin state leaks"
+        );
+        // Replayed sequences must match the unacked subset.
+        let mut replayed_seqs: Vec<u32> = replayed.iter().map(|c| c.sequence).collect();
+        replayed_seqs.sort_unstable();
+        let mut expected_seqs: Vec<u32> = chunks.iter().skip(half).map(|c| c.sequence).collect();
+        expected_seqs.sort_unstable();
+        assert_eq!(
+            replayed_seqs, expected_seqs,
+            "replayed chunks must be exactly the unacked sequences"
+        );
+    }
+
+    /// 3. Worker boot_epoch_id change → buffer cleared, no replay.
+    ///    A new process means the worker's pin state died with the old
+    ///    one; replaying unpins for blobs that no longer exist would be
+    ///    a no-op AND eat memory until ack-or-disconnect.
+    #[tokio::test]
+    async fn bis_chunked_boot_epoch_change_clears_buffer() {
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w3.local:50081";
+        let mut rx1 = register_worker_endpoint(&scheduler, "worker-3a", endpoint).await;
+
+        let digests: Vec<DigestInfo> = (0..5_000u64).map(make_digest_info).collect();
+        scheduler
+            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .await;
+        let chunks = drain_bis_chunks(&mut rx1).await;
+        assert!(!chunks.is_empty(), "must dispatch at least one chunk");
+
+        // Simulate boot_epoch change: caller (worker_api_server) clears
+        // the buffer before the new connection's add_worker fires.
+        scheduler.clear_bis_resend_buffer_for_endpoint(endpoint).await;
+
+        // Drop the old worker, register a new worker on the same endpoint.
+        drop(rx1);
+        let _ = scheduler
+            .remove_worker(&WorkerId("worker-3a".to_string()))
+            .await;
+        let mut rx2 = register_worker_endpoint(&scheduler, "worker-3b", endpoint).await;
+        let replayed = drain_bis_chunks(&mut rx2).await;
+        assert_eq!(
+            replayed.len(),
+            0,
+            "after clear_bis_resend_buffer_for_endpoint (boot_epoch \
+             change), the new worker must NOT receive replayed chunks — \
+             those chunks' digests refer to pin state in the dead process"
+        );
+    }
+
+    /// 4. Acks across ALL chunks of a broadcast leave the buffer fully
+    ///    drained AND remove the per-endpoint entry (not a stale empty
+    ///    HashMap entry that grows unbounded over the worker's lifetime).
+    #[tokio::test]
+    async fn bis_chunked_full_ack_drops_endpoint_entry() {
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w4.local:50081";
+        let mut rx = register_worker_endpoint(&scheduler, "worker-4", endpoint).await;
+
+        let digests: Vec<DigestInfo> = (0..1000u64).map(make_digest_info).collect();
+        scheduler
+            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .await;
+        let chunks = drain_bis_chunks(&mut rx).await;
+
+        for chunk in &chunks {
+            scheduler
+                .bis_ack_received(
+                    &WorkerId("worker-4".to_string()),
+                    chunk.broadcast_id,
+                    chunk.sequence,
+                )
+                .await;
+        }
+        let inner = scheduler.inner.read().await;
+        assert!(
+            !inner.bis_resend_buffers.contains_key(endpoint),
+            "after every chunk acked, the endpoint's buffer entry must \
+             be removed entirely (not just emptied) so a long-lived \
+             worker doesn't accumulate empty BisResendBuffer entries"
         );
     }
 }
