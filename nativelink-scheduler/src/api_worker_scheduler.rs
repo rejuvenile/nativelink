@@ -1784,20 +1784,25 @@ impl ApiWorkerScheduler {
         // same disconnect and trigger eviction there, (b) chunks are
         // best-effort hints whose loss only degrades to LRU/MRU
         // selection at the worker.
-        // Always emit at least one terminal chunk per action — even when
-        // `scoring_result` is None (no resolved tree → no hints possible).
-        // This guarantees a stable protocol invariant on the worker: every
-        // operation_id gets exactly one `is_last = true` chunk, mirroring
-        // the `chunk_iter` empty-input contract. Receivers (and the
-        // simple_scheduler_test helper) can rely on this terminal marker
-        // rather than inferring "no chunks coming" from absence.
+        //
+        // When there are zero hints to send (no resolved tree, or a
+        // resolved tree with no peer-cached blobs) we emit NOTHING. The
+        // worker's `Update::ChunkedMessage(PeerHints)` arm is purely
+        // additive — it merges hints into the map and is a no-op on an
+        // empty payload. There is no protocol consumer that depends on
+        // an empty terminal "no hints" marker (the `chunk_iter` empty-
+        // terminal guarantee is informational only, not load-bearing
+        // here — the receiver does not gate any state on its arrival).
+        // Skipping the empty case avoids one wire message + one tx.send
+        // per StartAction and keeps the StartAction stream uncluttered
+        // for tests and operators that expect "first message after a
+        // dispatch is StartAction" in the no-hint case.
         if let Some((worker_id, tx, _)) = result.as_ref() {
-            let empty: Arc<[PeerHint]> = Arc::from(Vec::<PeerHint>::new());
-            let hints: &Arc<[PeerHint]> = match scoring_result.as_deref() {
-                Some(arc) => &arc.1,
-                None => &empty,
-            };
-            self.emit_peer_hints_chunks(worker_id, tx, operation_id, hints);
+            if let Some(arc) = scoring_result.as_deref() {
+                if !arc.1.is_empty() {
+                    self.emit_peer_hints_chunks(worker_id, tx, operation_id, &arc.1);
+                }
+            }
         }
 
         result
@@ -1806,15 +1811,19 @@ impl ApiWorkerScheduler {
     /// Emit one or more `Update::ChunkedMessage(PeerHintsChunk)` messages
     /// on the worker's tx. Chunks of at most `PEER_HINTS_PER_CHUNK` hints
     /// each; the final chunk has `is_last = true` and may be empty when
-    /// `hints.len() % PEER_HINTS_PER_CHUNK == 0` (or when there are no
-    /// hints at all). Empty-hint case still emits one terminal chunk so
-    /// the worker can log "this action had no peer hints" rather than
-    /// inferring it from absence.
+    /// `hints.len() % PEER_HINTS_PER_CHUNK == 0`.
+    ///
+    /// Caller invariant: do NOT invoke with an empty `hints` slice. The
+    /// scheduler short-circuits zero-hint dispatches one frame up
+    /// (`do_try_match`'s Phase 6) so this function never produces an
+    /// "empty terminal" wire message — see the doc on `chunk_iter::ChunkIter`
+    /// for why the empty-terminal guarantee is informational only and not
+    /// a load-bearing protocol contract for any current consumer.
     ///
     /// Uses the shared `nativelink_util::chunk_iter` helper so chunk
     /// boundaries match the BlobsInStableStorage producer (PR #97) and
     /// the BlobsAvailable producer (PR #99) — same correctness pieces
-    /// (terminal `is_last`, empty-input case) live in one place.
+    /// (terminal `is_last`) live in one place.
     fn emit_peer_hints_chunks(
         &self,
         worker_id: &WorkerId,

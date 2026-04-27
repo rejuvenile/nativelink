@@ -16,15 +16,27 @@
 //! #97 (`BlobsInStableStorageChunk`), #98 (`PeerHintsChunk`), and #99
 //! (`BlobsAvailableChunk`). Each producer emits N protocol messages whose
 //! `(sequence, is_last)` pair lets the receiver reassemble in the obvious
-//! way; the empty-input case still emits a single `is_last = true` chunk so
-//! receivers can rely on a terminal marker for backpressure / commit
-//! semantics.
+//! way; the empty-input case still yields a single `is_last = true` chunk
+//! at the iterator level — but whether the caller actually transmits that
+//! empty terminal on the wire is its decision (see below).
 //!
 //! Why a helper? Three independent producers (cas → worker, scheduler →
 //! worker, worker → scheduler) all want the same envelope shape, and the
-//! correctness-critical pieces — "is_last is set on the FINAL chunk only"
-//! and "an empty input still emits one is_last chunk" — should live in one
-//! place so each call site doesn't reinvent them subtly differently.
+//! correctness-critical piece — "is_last is set on the FINAL chunk only"
+//! — should live in one place so each call site doesn't reinvent it
+//! subtly differently.
+//!
+//! Empty-terminal policy: the iterator's empty-input behavior (one
+//! `is_last = true` empty chunk) is INFORMATIONAL ONLY for callers that
+//! WANT to surface "I have nothing to send" as a wire message. It is NOT
+//! a load-bearing protocol contract — no current receiver gates state on
+//! the arrival of an empty terminal. The #98 (peer-hints) caller skips
+//! emission entirely on an empty hint list to avoid one wire message per
+//! StartAction in the no-hint case; #97/#99 callers may make the
+//! opposite choice if they do want a heartbeat-style "still alive, no
+//! data this tick" marker. Pick whichever is right for the consumer's
+//! semantics — just don't assume the empty terminal will appear without
+//! checking the producer's behavior.
 //!
 //! The helper is intentionally generic over the payload `T` — the proto
 //! `oneof payload` arm decides what to wrap each chunk in. Callers pass in
@@ -38,8 +50,11 @@ use core::iter::Iterator;
 /// source iterator into batches of at most `max_per_chunk`.
 ///
 /// Always yields at least one tuple, even when `source` is empty (the
-/// single tuple is `(0, true, vec![])`). This guarantees downstream
-/// receivers always see a terminal `is_last = true` chunk.
+/// single tuple is `(0, true, vec![])`). The empty-terminal yield is a
+/// CONVENIENCE for callers that want to surface "no data" as a wire
+/// message; receivers MUST NOT assume it always arrives — see the
+/// module-level docs on the empty-terminal policy. Producers that have
+/// nothing meaningful to send may legitimately skip emission entirely.
 ///
 /// The `sequence` field is monotonically increasing 0, 1, 2, ... within
 /// one stream and is informational only — receivers do NOT need to
@@ -110,9 +125,16 @@ impl<I: Iterator> Iterator for ChunkIter<I> {
 }
 
 /// Convenience: chunk a source iterator and return all chunks as a Vec.
-/// Useful for tests and for call sites that want to count chunks before
-/// emitting.
-pub fn chunk_iter<I: IntoIterator>(source: I, max_per_chunk: usize) -> Vec<Chunk<I::Item>> {
+/// Crate-private — only the in-module tests use this; production code uses
+/// the streaming `ChunkIter::new` directly to avoid materializing all
+/// chunks at once. If a future production caller wants the eager-collect
+/// shape, promote to `pub` and add a caller in the same diff (see
+/// `feedback_public_api_needs_caller_in_diff` — public API without an
+/// in-diff caller is dead code).
+pub(crate) fn chunk_iter<I: IntoIterator>(
+    source: I,
+    max_per_chunk: usize,
+) -> Vec<Chunk<I::Item>> {
     ChunkIter::new(source.into_iter(), max_per_chunk).collect()
 }
 

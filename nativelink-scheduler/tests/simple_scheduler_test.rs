@@ -2747,10 +2747,29 @@ async fn recv_start_execute_with_hints(
     let mut start_action: Option<(String, StartExecute)> = None;
     let mut hints: Vec<PeerHint> = Vec::new();
     let mut saw_terminal_chunk = false;
+    // The scheduler now SKIPS chunk emission entirely when hints is empty
+    // (post-fixup pass for #98). So the exit condition is:
+    //   * StartAction received, AND
+    //   * either (a) we've seen the terminal chunk, OR (b) the queue is
+    //     empty and no more messages are pending.
+    // We do a blocking recv() for the StartAction, then a non-blocking
+    // try_recv() drain for any chunks the scheduler chose to send.
     for _ in 0..256 {
-        let msg = match rx.recv().await {
-            Some(m) => m,
-            None => break,
+        let msg = if start_action.is_none() {
+            match rx.recv().await {
+                Some(m) => m,
+                None => break,
+            }
+        } else {
+            // Once StartAction has arrived, do a short bounded wait for
+            // any chunks. The scheduler emits chunks before StartAction
+            // for non-empty hint lists, but we accept either ordering.
+            // For the empty-hint case there will be NO chunks at all —
+            // the loop must terminate without hanging.
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(m)) => m,
+                Ok(None) | Err(_) => break,
+            }
         };
         match msg.update {
             Some(update_for_worker::Update::StartAction(se)) => {
@@ -2891,20 +2910,14 @@ async fn locality_scoring_selects_best_worker_test() -> Result<(), Error> {
     .await?;
 
     // Worker A should get the action because it has the highest locality score (7000 > 3000).
-    let (selected_worker_id, _se) = tokio::select! {
-        msg = rx_a.recv() => {
-            let se = match msg.unwrap().update {
-                Some(update_for_worker::Update::StartAction(se)) => se,
-                v => panic!("Expected StartAction on worker_a, got: {v:?}"),
-            };
-            (worker_id_a.clone(), se)
+    // The PeerHints chunk + StartAction may interleave; drain whichever rx
+    // produces first via `recv_start_execute_with_hints`.
+    let (selected_worker_id, _se, _hints) = tokio::select! {
+        v = recv_start_execute_with_hints(&mut rx_a) => {
+            (worker_id_a.clone(), v.1, v.2)
         }
-        msg = rx_b.recv() => {
-            let se = match msg.unwrap().update {
-                Some(update_for_worker::Update::StartAction(se)) => se,
-                v => panic!("Expected StartAction on worker_b, got: {v:?}"),
-            };
-            (worker_id_b.clone(), se)
+        v = recv_start_execute_with_hints(&mut rx_b) => {
+            (worker_id_b.clone(), v.1, v.2)
         }
     };
 
@@ -3413,20 +3426,14 @@ async fn locality_scoring_partial_data_still_selects_best_worker_test() -> Resul
     .await?;
 
     // Worker B should be selected (8000 cached bytes vs. 0 for worker A).
-    let (selected_worker_id, _se) = tokio::select! {
-        msg = rx_a.recv() => {
-            let se = match msg.unwrap().update {
-                Some(update_for_worker::Update::StartAction(se)) => se,
-                v => panic!("Expected StartAction on worker_a, got: {v:?}"),
-            };
-            (worker_id_a.clone(), se)
+    // The PeerHints chunk + StartAction may interleave; drain whichever rx
+    // produces first via `recv_start_execute_with_hints`.
+    let (selected_worker_id, _se, _hints) = tokio::select! {
+        v = recv_start_execute_with_hints(&mut rx_a) => {
+            (worker_id_a.clone(), v.1, v.2)
         }
-        msg = rx_b.recv() => {
-            let se = match msg.unwrap().update {
-                Some(update_for_worker::Update::StartAction(se)) => se,
-                v => panic!("Expected StartAction on worker_b, got: {v:?}"),
-            };
-            (worker_id_b.clone(), se)
+        v = recv_start_execute_with_hints(&mut rx_b) => {
+            (worker_id_b.clone(), v.1, v.2)
         }
     };
 

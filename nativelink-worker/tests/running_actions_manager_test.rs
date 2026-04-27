@@ -983,7 +983,6 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1111,7 +1110,6 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1241,7 +1239,6 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1427,7 +1424,6 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1614,7 +1610,6 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1827,7 +1822,6 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1967,7 +1961,6 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2175,7 +2168,6 @@ exit 0
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2356,7 +2348,6 @@ exit 0
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2531,7 +2522,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2620,7 +2610,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2697,7 +2686,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2780,7 +2768,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2884,7 +2871,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2932,7 +2918,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3002,7 +2987,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3123,7 +3107,6 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
-                    peer_locality_map: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3215,7 +3198,6 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
-                    peer_locality_map: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3307,7 +3289,6 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
-                    peer_locality_map: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3396,7 +3377,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3555,7 +3535,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3737,7 +3716,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3839,7 +3817,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -3958,7 +3935,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4143,7 +4119,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4268,7 +4243,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         // Create a simple action
@@ -4414,7 +4388,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             })?);
 
         // Create a simple action
@@ -5314,7 +5287,6 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
-                peer_locality_map: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,

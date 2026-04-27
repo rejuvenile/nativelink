@@ -898,14 +898,27 @@ pub fn handle_peer_hints_chunk(
             }
         }
     }
-    info!(
-        operation_id = %chunk.operation_id,
-        sequence = chunk.sequence,
-        is_last = chunk.is_last,
-        hint_count = chunk.peer_hints.len(),
-        registrations = total_registered,
-        "PeerHintsChunk: registered hints into worker locality map"
-    );
+    // Per-chunk events are repetitive in the hot path (a 1M-hint dispatch
+    // = ~3908 chunks). Demote to debug! for the per-chunk cadence; emit
+    // an info! once per dispatch on the terminal chunk so journals still
+    // record the state-transition "all hints for op_id are in".
+    if chunk.is_last {
+        info!(
+            operation_id = %chunk.operation_id,
+            sequence = chunk.sequence,
+            hint_count = chunk.peer_hints.len(),
+            registrations = total_registered,
+            "PeerHintsChunk: terminal chunk applied; locality registrations complete"
+        );
+    } else {
+        debug!(
+            operation_id = %chunk.operation_id,
+            sequence = chunk.sequence,
+            hint_count = chunk.peer_hints.len(),
+            registrations = total_registered,
+            "PeerHintsChunk: registered hints into worker locality map"
+        );
+    }
 }
 
 struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> {
@@ -2375,7 +2388,6 @@ pub async fn new_local_worker(
             max_upload_timeout,
             timeout_handled_externally: config.timeout_handled_externally,
             directory_cache,
-            peer_locality_map: peer_locality_map.clone(),
         })?);
 
     // Set up BlobsAvailable reporting with drain-then-fire semantics.
