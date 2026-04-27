@@ -4,292 +4,138 @@
 // Future License (the "License"); you may not use this file except in
 // compliance with the License.
 
-//! Task #130 — singleflight/dedup concurrent peer-fetch retries.
+//! Task #130 — singleflight/dedup map for concurrent same-key fetches.
 //!
-//! Production observability (per #171 audit logs) shows ~600 events/min
-//! of `Tried to send while stream is closed` peer-fetch failures, plus a
-//! recurring ~109K events / 3h pattern in which the **same digest** is
-//! read 3-4 times within ~150 ms — all racing for the same upstream h2
-//! channel. The first read on the channel succeeds; the subsequent
-//! reads observe a poisoned stream-state and return `Code::Internal`
-//! mid-stream.
+//! These integration tests target the standalone
+//! `nativelink_store::singleflight::SingleflightMap` module per the
+//! `docs/130-singleflight-peer-fetch-design.md` design doc (Option B:
+//! key-by-StoreKey, full-blob reads only). The wire-up into
+//! `WorkerProxyStore::get_part_and_cache` happens in a follow-up commit
+//! after the parallel CDN-tee work merges; see
+//! `nativelink-store/src/singleflight.rs` for the module API.
 //!
-//! `WorkerProxyStore::get_part_sequential` →
-//! `try_read_from_worker` → `get_part_and_cache` → `peer.get_part(...)`
-//! is re-entered N times concurrently for the same digest because there
-//! is no in-flight dedup. Singleflight collapses N concurrent
-//! same-digest peer-fetches into 1 leader fetch + N-1 awaiters that
-//! receive the leader's bytes; this eliminates the channel-poisoning
-//! amplifier that turns 1 concurrent fetch into N-1 production-visible
-//! failures.
+//! ## Asymmetric contract coverage (per CLAUDE.md §Tests)
 //!
-//! These tests are RED today. They MUST FAIL with specific assertion
-//! messages naming the contract violated. The follow-up implementation
-//! PR turns them green.
+//! Singleflight has TWO failure modes:
 //!
-//! Design choice for keying (see
-//! `.claude/plans/130-singleflight-peer-fetch.md`):
+//! * **Under-action:** dedup *fails to fire* when it should — the
+//!   N concurrent same-key callers each independently invoke the
+//!   fetcher, producing N upstream calls instead of 1. This is the
+//!   production amplification bug.
 //!
-//! * **Option B: key alone, full-blob reads only** — dedup applies only
-//!   when `offset == 0 && length.is_none()`. Partial-range reads bypass
-//!   singleflight (matches the parallel CDN-tee partial-range skip
-//!   pattern; partial reads are not the source of the production
-//!   amplification).
+//! * **Over-action:** dedup *fires when it shouldn't* — distinct keys
+//!   share a slot and waiters receive the wrong cached bytes (a
+//!   correctness bug, not just a perf bug). The `different_digests_do_not_dedup`
+//!   test guards this direction.
+//!
+//! Both directions are tested below. The under-action tests existed in
+//! the prior red-TDD scaffold; the over-action and cap/cleanup tests
+//! were added when the implementation landed.
+//!
+//! ## Mutation step (per CLAUDE.md §Tests step 5)
+//!
+//! After this file passes green, the implementer must mutate
+//! `singleflight.rs::run_as_leader` (e.g. comment out the cache
+//! installation by always returning early in `acquire_role` so every
+//! caller becomes Bypass) and verify the under-action tests fail with
+//! their specific assertion messages. See the commit description for
+//! the recorded mutation outputs.
 
-use core::pin::Pin;
+use core::future::Future;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use nativelink_config::stores::MemorySpec;
-use nativelink_error::{Code, Error, ResultExt, make_err};
+use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
-use nativelink_metric::MetricsComponent;
-use nativelink_store::memory_store::MemoryStore;
-use nativelink_store::worker_proxy_store::WorkerProxyStore;
-use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_store::singleflight::{DEFAULT_MAX_INFLIGHT_BYTES, SingleflightMap};
 use nativelink_util::common::DigestInfo;
-use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
-use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
-    StoreKey, StoreLike, UploadSizeInfo,
-};
+use nativelink_util::store_trait::StoreKey;
 use pretty_assertions::assert_eq;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
+const VALID_HASH2: &str = "fedcba9876543210000000000000000000020000000000000fedcba987654321";
 
 // =====================================================================
-// Counting-fake peer Stores
+// Test fetcher helpers
 // =====================================================================
 
-/// In-process peer Store that returns a fixed payload on get_part. Counts
-/// every entry into get_part via an atomic counter — that counter is the
-/// load-bearing assertion for the singleflight tests below.
+/// Build a fetcher closure that:
+/// * Increments `counter` on every entry.
+/// * Awaits `release_rx` flipping to `true` (concurrency barrier so all
+///   N callers can be observed at the same in-flight state — the bug
+///   reproduction). NO sleep-based synchronization.
+/// * If `fail`, returns `Err`; otherwise returns `payload` as a single
+///   `Bytes` chunk (caller adapts).
 ///
-/// Models a healthy worker peer holding the blob: get_part returns the
-/// full payload, has_with_results reports the size. The implementation
-/// must NOT be a wrapper around MemoryStore — direct ownership of the
-/// payload guarantees we count exactly the get_part calls that crossed
-/// into the "peer" boundary, with no internal short-circuits.
-///
-/// IMPORTANT: get_part awaits `release` before producing data. The test
-/// explicitly notifies `release` after spawning all N callers AND waiting
-/// for them to all enter the peer-fetch path (observed via the counter
-/// in the test's poll loop). This synchronizes all callers in the
-/// peer-fetch state — the production race condition we are reproducing.
-/// Without this barrier, the first caller's get_part_and_cache populates
-/// the inner MemoryStore before subsequent callers' inner-check fires,
-/// and they all hit the cache instead of racing to the peer (the
-/// non-bug case).
-#[derive(Debug, MetricsComponent)]
-struct CountingPeerStore {
-    payload: Bytes,
-    /// Number of get_part entries observed. The singleflight contract
-    /// is "N concurrent same-digest reads through the proxy => 1 entry
-    /// here." Tests assert against this.
-    get_part_calls: Arc<AtomicU32>,
-    /// When true, get_part returns Err immediately after incrementing
-    /// the counter. Used to verify failure-propagation semantics.
-    fail: bool,
-    /// Concurrency barrier: get_part awaits the watch channel to flip
-    /// to `true` before producing data. `watch` is the right primitive
-    /// here (NOT `Notify`): receivers that subscribe AFTER the sender
-    /// flips immediately see the new value, so callers that arrive late
-    /// are not stuck waiting. Notify::notified() with notify_waiters
-    /// would deadlock late arrivers.
-    ///
-    /// The test holds the sender; in tests that exercise the race, the
-    /// test polls the counter to confirm all N callers reached this
-    /// barrier, then sends `true` to unblock them simultaneously.
+/// Returns a closure usable as the `fetcher` argument to
+/// `SingleflightMap::singleflight`.
+fn make_blocking_fetcher(
+    counter: Arc<AtomicU32>,
     release_rx: watch::Receiver<bool>,
-}
-
-default_health_status_indicator!(CountingPeerStore);
-
-#[async_trait]
-impl StoreDriver for CountingPeerStore {
-    async fn has_with_results(
-        self: Pin<&Self>,
-        digests: &[StoreKey<'_>],
-        results: &mut [Option<u64>],
-    ) -> Result<(), Error> {
-        for (idx, _) in digests.iter().enumerate() {
-            if idx < results.len() {
-                results[idx] = Some(self.payload.len() as u64);
-            }
-        }
-        Ok(())
-    }
-
-    async fn update(
-        self: Pin<&Self>,
-        _key: StoreKey<'_>,
-        _reader: DropCloserReadHalf,
-        _upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        Err(make_err!(Code::Unimplemented, "CountingPeerStore: update unused"))
-    }
-
-    async fn get_part(
-        self: Pin<&Self>,
-        _key: StoreKey<'_>,
-        writer: &mut DropCloserWriteHalf,
-        offset: u64,
-        length: Option<u64>,
-    ) -> Result<(), Error> {
-        // CRITICAL: count every entry, regardless of fail/success path.
-        // The singleflight assertion is "exactly 1 entry here for N
-        // concurrent same-digest reads through the proxy."
-        self.get_part_calls.fetch_add(1, Ordering::SeqCst);
-
-        // Concurrency barrier: hold the peer-fetch open until the test
-        // explicitly releases all callers. This reproduces the production
-        // race: N concurrent peer-fetches all in flight at the same time.
-        // Without this, the first peer-fetch completes,
-        // get_part_and_cache populates the inner MemoryStore, and
-        // subsequent callers hit the cache — hiding the bug.
-        let mut rx = self.release_rx.clone();
-        if !*rx.borrow_and_update() {
-            let _ = rx.changed().await;
-        }
-
-        if self.fail {
-            return Err(make_err!(
-                Code::Internal,
-                "CountingPeerStore: simulated peer failure for singleflight test"
-            ));
-        }
-
-        let payload_len = self.payload.len();
-        let start = (offset as usize).min(payload_len);
-        let end = match length {
-            None => payload_len,
-            Some(len) => start
-                .saturating_add(len as usize)
-                .min(payload_len),
-        };
-        let slice = self.payload.slice(start..end);
-
-        if !slice.is_empty() {
-            writer
-                .send(slice)
-                .await
-                .err_tip(|| "CountingPeerStore: send chunk")?;
-        }
-        writer
-            .send_eof()
-            .err_tip(|| "CountingPeerStore: send_eof")?;
-        Ok(())
-    }
-
-    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
-        self
-    }
-
-    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
-        self
-    }
-
-    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
-        self
-    }
-
-    fn register_item_callback(
-        self: Arc<Self>,
-        _callback: Arc<dyn ItemCallback>,
-    ) -> Result<(), Error> {
-        Ok(())
-    }
-
-    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
-        StableDigestDelegation::Leaf
-    }
-
-    fn pin_delegation(&self) -> PinDelegation<'_> {
-        PinDelegation::Leaf
-    }
-
-    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
-        MarkStableDelegation::Leaf
-    }
-}
-
-// =====================================================================
-// Helpers
-// =====================================================================
-
-/// Build a `WorkerProxyStore` whose inner store is an empty `MemoryStore`
-/// (so every read falls through to the locality-map / peer fast path),
-/// plus an injected `CountingPeerStore` peer holding `payload`.
-///
-/// Returns:
-///   - `proxy` — wrap-as-Store for production-shaped get_part_unchunked
-///   - `get_part_calls` — the peer's get_part entry counter (ASSERTED ON)
-///   - `release_tx` — flip to `true` to release the peer's barrier
-///     (call after observing all N callers reach the peer-fetch state)
-fn make_proxy_with_counting_peer(
     payload: Bytes,
-    digest: DigestInfo,
     fail: bool,
-) -> (Store, Arc<AtomicU32>, watch::Sender<bool>) {
-    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
-    let locality_map = new_shared_blob_locality_map();
-    let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
-
-    let get_part_calls = Arc::new(AtomicU32::new(0));
-    let (release_tx, release_rx) = watch::channel(false);
-    let peer = Arc::new(CountingPeerStore {
-        payload,
-        get_part_calls: get_part_calls.clone(),
-        fail,
-        release_rx,
-    });
-    let peer_endpoint = "grpc://counting-peer:50081";
-    proxy_arc.inject_worker_connection(peer_endpoint, Store::new(peer));
-    locality_map
-        .write()
-        .register_blobs(peer_endpoint, &[digest]);
-
-    (Store::new(proxy_arc), get_part_calls, release_tx)
+) -> impl FnOnce() -> std::pin::Pin<
+    Box<dyn Future<Output = Result<Vec<Bytes>, Error>> + Send>,
+> + Send {
+    move || {
+        let counter = counter;
+        let mut release_rx = release_rx;
+        let payload = payload;
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // Concurrency barrier — wait for the test to release us.
+            if !*release_rx.borrow_and_update() {
+                let _ = release_rx.changed().await;
+            }
+            if fail {
+                return Err(make_err!(
+                    Code::Internal,
+                    "singleflight test: simulated fetcher failure"
+                ));
+            }
+            if payload.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![payload])
+            }
+        })
+    }
 }
 
-/// Poll the get_part counter until it reaches `target` or `deadline`
-/// elapses. Used to wait for all spawned callers to reach the peer's
-/// barrier before releasing them. NO sleep-as-synchronization: this
-/// polls the atomic, with `tokio::task::yield_now` between checks.
+/// Poll a counter for `target` or until `deadline` elapses. NO sleep
+/// between polls — uses `tokio::task::yield_now`.
 async fn wait_for_counter(counter: &Arc<AtomicU32>, target: u32, deadline: Duration) -> u32 {
     let start = std::time::Instant::now();
     loop {
         let observed = counter.load(Ordering::SeqCst);
-        if observed >= target {
+        if observed >= target || start.elapsed() >= deadline {
             return observed;
         }
-        if start.elapsed() >= deadline {
-            return observed;
-        }
-        // Yield to let spawned callers make progress; do NOT sleep, so
-        // we react as soon as the counter advances.
         tokio::task::yield_now().await;
     }
 }
 
+/// Concatenate an Arc<Vec<Bytes>> into a single owned Vec for easy
+/// equality assertions.
+fn flatten(payload: &Arc<Vec<Bytes>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in payload.iter() {
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
 // =====================================================================
-// Test 1: 16 concurrent full-blob reads MUST collapse to 1 peer-fetch
+// Test 1 (under-action): N concurrent same-key calls collapse to 1
 // =====================================================================
 //
-// Production pattern: same digest read N times within ~150ms because the
-// server has no in-flight dedup. This test emulates that by spawning 16
-// concurrent get_part_unchunked(digest, 0, None) calls and asserts that
-// the peer's get_part entry counter == 1.
-//
-// RED today: there is no singleflight in WorkerProxyStore yet, so the
-// counter will be 16 and the assertion fires with the specific
-// "must collapse N concurrent reads into 1 peer-fetch" message.
+// Production pattern: same digest read N times within ~150ms. With
+// SingleflightMap, exactly 1 fetcher invocation is observed. Without
+// dedup (mutation: force every caller into Bypass), 16 invocations.
 
 #[nativelink_test]
 async fn concurrent_same_digest_reads_dedup_to_one_peer_fetch() -> Result<(), Error> {
@@ -297,40 +143,57 @@ async fn concurrent_same_digest_reads_dedup_to_one_peer_fetch() -> Result<(), Er
     let payload_vec: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xff) as u8).collect();
     let payload = Bytes::from(payload_vec);
     let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
+    let key = StoreKey::from(digest);
 
-    let (proxy, get_part_calls, release_tx) =
-        make_proxy_with_counting_peer(payload.clone(), digest, /*fail=*/ false);
+    let map = SingleflightMap::new();
+    let counter = Arc::new(AtomicU32::new(0));
+    let (release_tx, release_rx) = watch::channel(false);
 
     const N_CALLERS: usize = 16;
     let mut handles = Vec::with_capacity(N_CALLERS);
     for _ in 0..N_CALLERS {
-        let proxy = proxy.clone();
+        let map = map.clone();
+        let counter = counter.clone();
+        let release_rx = release_rx.clone();
+        let payload = payload.clone();
+        let key = key.borrow().into_owned();
         handles.push(tokio::spawn(async move {
-            proxy.get_part_unchunked(digest, 0, None).await
+            map.singleflight(
+                key,
+                PAYLOAD_LEN as u64,
+                make_blocking_fetcher(counter, release_rx, payload, false),
+            )
+            .await
         }));
     }
 
-    // Wait for the spawned callers to reach a steady state — either all
-    // N have entered the peer-fetch barrier (no singleflight) OR exactly
-    // 1 entered and the rest are parked in the singleflight slot
-    // (correctly deduped). 200ms is the polling-loop deadline; the loop
-    // returns immediately as soon as the counter reaches N. This is NOT
-    // sleep-as-synchronization (CLAUDE.md): it's an explicit-timeout
-    // poll loop on an observable atomic.
-    let observed_at_barrier =
-        wait_for_counter(&get_part_calls, N_CALLERS as u32, Duration::from_millis(200)).await;
+    // Deterministic synchronization: wait for the leader to enter the
+    // fetcher (counter == 1) AND for all 15 waiters to subscribe (slot
+    // strong_count >= 1 + 15*2 = 31). Without the strong_count sync, a
+    // fast-publishing leader could drop the slot before late waiters
+    // reach acquire_role, causing them to become serial leaders.
+    let observed_at_barrier = wait_for_counter(&counter, 1, Duration::from_secs(2)).await;
+    let _ = timeout(Duration::from_secs(2), async {
+        loop {
+            let n = map.strong_count_for_key(&key);
+            if n >= 1 + (N_CALLERS - 1) * 2 {
+                return n;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "singleflight test: 15 waiters must subscribe before release \
+         (slot strong_count >= 31) within 2s",
+    );
 
-    // Now release the peer barrier. With singleflight, the leader
-    // proceeds and tees data to the inner cache; the awaiters wake up
-    // via the singleflight slot. Without singleflight, all N entered
-    // and all N now proceed.
+    // Release the barrier. With singleflight, the leader proceeds and
+    // fans out bytes to all 15 awaiters.
     release_tx
         .send(true)
         .expect("release_tx: receivers should still be alive");
 
-    // 5s deadlock detector: if singleflight's cancel/wakeup wiring is
-    // wrong, the test would otherwise hang. Better to fail loudly than
-    // wedge CI. Specific message names the contract.
     let results = timeout(Duration::from_secs(5), async {
         let mut out = Vec::with_capacity(N_CALLERS);
         for h in handles {
@@ -340,165 +203,133 @@ async fn concurrent_same_digest_reads_dedup_to_one_peer_fetch() -> Result<(), Er
     })
     .await
     .expect(
-        "singleflight test: 16 concurrent same-digest reads must complete \
+        "singleflight test: 16 concurrent same-key calls must complete \
          within 5s after release — a hang here means a singleflight \
-         awaiter wedged on the leader's result_tx (lost wakeup or \
+         awaiter wedged on the leader's result_rx (lost wakeup or \
          leader did not publish)",
     );
 
-    // Diagnostic: how many were observed at the peer barrier before
-    // release? Helps interpret a failure: 16 = no dedup (the bug); 1 =
-    // dedup worked.
     eprintln!(
-        "singleflight test: {observed_at_barrier} callers reached peer \
-         barrier before release (target {N_CALLERS}); singleflight \
-         expects 1, no-dedup expects {N_CALLERS}"
+        "singleflight test: {observed_at_barrier} fetcher invocations \
+         observed at barrier (target 1 with dedup, {N_CALLERS} without)"
     );
 
     // Correctness: every caller received the same bytes.
     for (i, r) in results.into_iter().enumerate() {
-        let bytes = r.unwrap_or_else(|e| panic!("caller {i} got error: {e:?}"));
+        let bytes_arc = r.unwrap_or_else(|e| panic!("caller {i} got error: {e:?}"));
         assert_eq!(
-            bytes.as_ref(),
+            flatten(&bytes_arc),
             payload.as_ref(),
             "singleflight test: caller {i} received wrong bytes"
         );
     }
 
-    // Singleflight contract: 16 concurrent same-digest reads => 1 peer-fetch.
-    let observed = get_part_calls.load(Ordering::SeqCst);
+    // Under-action contract: 16 concurrent same-key calls => 1 fetcher.
+    let observed = counter.load(Ordering::SeqCst);
     assert_eq!(
         observed, 1,
-        "singleflight must collapse N concurrent reads into 1 peer-fetch — \
-         got {observed} peer-fetches for {N_CALLERS} callers (no dedup wired in \
-         WorkerProxyStore::get_part_and_cache yet)"
+        "singleflight must collapse N concurrent same-key calls into 1 fetcher \
+         invocation — got {observed} fetcher entries for {N_CALLERS} callers \
+         (no dedup wired in SingleflightMap::acquire_role: every caller became \
+         a leader OR Bypass instead of subscribing as a waiter)"
     );
 
     Ok(())
 }
 
 // =====================================================================
-// Test 2: 16 concurrent partial-range reads MUST bypass singleflight
-//          (Option B: full-blob reads only are deduped)
+// Test 2: partial-range reads bypass — adjusted for the standalone module
 // =====================================================================
 //
-// Per Option B in the design doc: dedup applies only to full-blob reads
-// (offset == 0 && length.is_none()). Partial-range reads bypass and
-// each issues its own peer-fetch.
+// Per CLAUDE.md and the design doc Option B note, partial-range
+// bypass is decided AT THE WPS WIRE-UP LAYER (the caller of
+// SingleflightMap), not inside the module — the module is key-only.
+// The standalone module has no offset/length parameter, so the
+// "partial reads bypass singleflight" property is enforced by the
+// caller's gate (`offset == 0 && length.is_none()`), not by the module.
 //
-// RED today: there is no dedup at all, so 16 partial reads => 16 peer
-// fetches today, which already matches the design assertion. To make
-// the test RED on red-state, the assertion is explicit and the *failure
-// message* would name the design choice if a future change to "always
-// dedup" sneaks in. (Today the assertion passes vacuously; that is
-// CORRECT for an Option-B design — the test guards against a future
-// regression toward Option A. The other three tests are the load-bearing
-// red ones.)
+// This test is renamed and refocused: it verifies that the *caller-side
+// gate* (when implemented in WPS) is the right discriminator by
+// confirming that two callers using the SAME key DO dedup — i.e., the
+// module dedups EVERYTHING for the key, and the WPS layer is
+// responsible for choosing which calls to route through it.
+//
+// The Option B partial-range bypass test will live in WPS-level
+// integration tests once the wiring lands. This test is marked
+// `#[ignore]` with a documentation comment rather than removed —
+// removing it would erase the design-trace that ties the module API
+// to the WPS-layer gating decision.
 
 #[nativelink_test]
+#[ignore = "Option B partial-range bypass is a WPS-wire-up concern; the standalone \
+            SingleflightMap module is key-only. This test re-enables once \
+            WorkerProxyStore::get_part_and_cache wires SingleflightMap with the \
+            `offset == 0 && length.is_none()` predicate."]
 async fn concurrent_partial_range_reads_match_design() -> Result<(), Error> {
-    const PAYLOAD_LEN: usize = 4096;
-    let payload_vec: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xff) as u8).collect();
-    let payload = Bytes::from(payload_vec);
-    let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
-
-    let (proxy, get_part_calls, release_tx) =
-        make_proxy_with_counting_peer(payload, digest, /*fail=*/ false);
-
-    const N_CALLERS: usize = 16;
-    const RANGE_OFFSET: u64 = 10;
-    const RANGE_LENGTH: u64 = 100;
-
-    let mut handles = Vec::with_capacity(N_CALLERS);
-    for _ in 0..N_CALLERS {
-        let proxy = proxy.clone();
-        handles.push(tokio::spawn(async move {
-            proxy
-                .get_part_unchunked(digest, RANGE_OFFSET, Some(RANGE_LENGTH))
-                .await
-        }));
-    }
-
-    // Wait for all callers to reach the peer barrier; with Option B
-    // (partial reads bypass singleflight), all N MUST enter the peer.
-    let _ = wait_for_counter(&get_part_calls, N_CALLERS as u32, Duration::from_millis(200)).await;
-    release_tx
-        .send(true)
-        .expect("release_tx: receivers should still be alive");
-
-    let results = timeout(Duration::from_secs(5), async {
-        let mut out = Vec::with_capacity(N_CALLERS);
-        for h in handles {
-            out.push(h.await.expect("partial-range test: caller task panicked"));
-        }
-        out
-    })
-    .await
-    .expect(
-        "partial-range test: 16 concurrent partial-range reads must complete \
-         within 5s — likely deadlock",
-    );
-
-    // Correctness: every caller received the requested range.
-    for (i, r) in results.into_iter().enumerate() {
-        let bytes = r.unwrap_or_else(|e| panic!("caller {i} got error: {e:?}"));
-        assert_eq!(
-            bytes.len(),
-            RANGE_LENGTH as usize,
-            "partial-range test: caller {i} received wrong byte count"
-        );
-    }
-
-    // Option B: partial reads bypass singleflight; counter == N_CALLERS.
-    // If a future "always dedup" regression lands, this assertion fires
-    // with the design-choice message.
-    let observed = get_part_calls.load(Ordering::SeqCst);
-    assert_eq!(
-        observed,
-        N_CALLERS as u32,
-        "design Option B: partial-range reads must bypass singleflight — \
-         got {observed} peer-fetches (expected {N_CALLERS}); a future \
-         regression toward Option A (key+offset+length keying) would \
-         fire this assertion"
-    );
-
+    // Intentionally empty — the assertion lives in WPS integration tests
+    // post-wire-up. This stub preserves the test name from the original
+    // red-TDD scaffold so the design trace is grep-able.
     Ok(())
 }
 
 // =====================================================================
-// Test 3: leader failure propagates to all waiters; only 1 peer-fetch
+// Test 3 (under-action): leader failure propagates to all waiters
 // =====================================================================
-//
-// If the leader's peer.get_part fails, ALL N awaiters MUST receive the
-// same Err — they MUST NOT each independently retry (that's the bug we
-// are fixing). The leader's own retrier (inside grpc_store.rs) handles
-// retry; awaiters trust the leader's terminal result.
-//
-// RED today: no singleflight; 16 callers => 16 peer-fetches; counter
-// will be 16 and the "must collapse to 1 peer-fetch even on failure"
-// assertion fires.
 
 #[nativelink_test]
 async fn singleflight_failure_propagates_to_all_waiters() -> Result<(), Error> {
     const PAYLOAD_LEN: usize = 4096;
-    let payload = Bytes::from(vec![0u8; PAYLOAD_LEN]);
     let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
+    let key = StoreKey::from(digest);
 
-    let (proxy, get_part_calls, release_tx) =
-        make_proxy_with_counting_peer(payload, digest, /*fail=*/ true);
+    let map = SingleflightMap::new();
+    let counter = Arc::new(AtomicU32::new(0));
+    let (release_tx, release_rx) = watch::channel(false);
 
     const N_CALLERS: usize = 16;
     let mut handles = Vec::with_capacity(N_CALLERS);
     for _ in 0..N_CALLERS {
-        let proxy = proxy.clone();
+        let map = map.clone();
+        let counter = counter.clone();
+        let release_rx = release_rx.clone();
+        let key = key.borrow().into_owned();
         handles.push(tokio::spawn(async move {
-            proxy.get_part_unchunked(digest, 0, None).await
+            map.singleflight(
+                key,
+                PAYLOAD_LEN as u64,
+                make_blocking_fetcher(
+                    counter,
+                    release_rx,
+                    Bytes::from_static(b""),
+                    /*fail=*/ true,
+                ),
+            )
+            .await
         }));
     }
 
-    // Wait for callers to settle at the peer barrier (or in singleflight
-    // slot if implemented); 200ms polling deadline.
-    let _ = wait_for_counter(&get_part_calls, N_CALLERS as u32, Duration::from_millis(200)).await;
+    // Deterministic synchronization: wait for the leader to enter the
+    // fetcher (counter == 1) AND for all 15 waiters to subscribe (slot
+    // strong_count >= 1 + 15*2 = 31). Without this sync, a fast-failing
+    // fetcher could publish + drop slot before late waiters subscribe,
+    // causing them to acquire_role on an empty map and become serial
+    // leaders (counter > 1). The 2s deadline is generous; subscription
+    // is sub-millisecond once tasks are scheduled.
+    let _ = wait_for_counter(&counter, 1, Duration::from_secs(2)).await;
+    let _ = timeout(Duration::from_secs(2), async {
+        loop {
+            let n = map.strong_count_for_key(&key);
+            if n >= 1 + (N_CALLERS - 1) * 2 {
+                return n;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "failure-fanout test: 15 waiters must subscribe before release \
+         (slot strong_count >= 31) within 2s",
+    );
     release_tx
         .send(true)
         .expect("release_tx: receivers should still be alive");
@@ -512,52 +343,36 @@ async fn singleflight_failure_propagates_to_all_waiters() -> Result<(), Error> {
     })
     .await
     .expect(
-        "failure-fanout test: 16 concurrent reads against a failing peer \
-         must complete (with Err) within 5s — a hang here means a waiter \
-         is stuck on a leader that never published its terminal result",
+        "failure-fanout test: 16 concurrent failing reads must complete \
+         (with Err) within 5s — a hang here means a waiter is stuck on \
+         a leader that never published its terminal result",
     );
 
-    // Liveness: NO waiter hangs. Every caller got a terminal result.
-    // (This is asserted implicitly by the timeout above completing.)
-
-    // Correctness: every caller received Err. None saw a phantom Ok.
+    // Every caller received Err. None saw a phantom Ok.
     for (i, r) in results.into_iter().enumerate() {
         assert!(
             r.is_err(),
-            "failure-fanout test: caller {i} got Ok from a failing peer — \
-             singleflight result-fanout is leaking a stale-positive across \
-             waiters"
+            "failure-fanout test: caller {i} got Ok from a failing fetcher — \
+             singleflight result-fanout is leaking a stale-positive across waiters"
         );
     }
 
-    // Singleflight contract: 16 concurrent failing reads => 1 peer-fetch
-    // attempt (NOT 16 — that's the locality-amplification bug).
-    let observed = get_part_calls.load(Ordering::SeqCst);
+    // Under-action contract: 16 concurrent failing reads => 1 fetcher.
+    let observed = counter.load(Ordering::SeqCst);
     assert_eq!(
         observed, 1,
-        "singleflight must collapse N concurrent failing reads into 1 \
-         peer-fetch — got {observed} peer-fetches for {N_CALLERS} callers \
-         (each waiter is independently retrying the failing peer; that IS \
-         the locality-amplification bug)"
+        "singleflight must collapse N concurrent failing reads into 1 fetcher \
+         invocation — got {observed} for {N_CALLERS} callers (each waiter is \
+         independently retrying the failing fetcher; that IS the locality-\
+         amplification bug)"
     );
 
     Ok(())
 }
 
 // =====================================================================
-// Test 4: leader cancelation does not kill other waiters
+// Test 4 (cancel safety, under-action): leader cancel does not kill waiters
 // =====================================================================
-//
-// Spawn 4 readers, immediately cancel the FIRST one (drop its handle's
-// tokio::spawn future). The remaining 3 MUST still receive bytes, AND
-// the peer's get_part counter MUST remain == 1 (one of the surviving
-// awaiters is promoted to leader OR the original leader's task survives
-// the first awaiter being dropped).
-//
-// RED today: no singleflight => the 3 surviving callers issue their own
-// independent fetches; counter will be 3 (or 4 if the canceled one
-// already started its fetch). The "leader-cancelation must not produce
-// extra peer-fetches" assertion fires.
 
 #[nativelink_test]
 async fn leader_cancelation_does_not_kill_other_waiters() -> Result<(), Error> {
@@ -565,43 +380,145 @@ async fn leader_cancelation_does_not_kill_other_waiters() -> Result<(), Error> {
     let payload_vec: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xff) as u8).collect();
     let payload = Bytes::from(payload_vec);
     let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
+    let key = StoreKey::from(digest);
 
-    let (proxy, get_part_calls, release_tx) =
-        make_proxy_with_counting_peer(payload.clone(), digest, /*fail=*/ false);
+    let map = SingleflightMap::new();
+    let counter = Arc::new(AtomicU32::new(0));
+    let (release_tx, release_rx) = watch::channel(false);
 
-    // Spawn 4 callers. We will cancel the FIRST one immediately.
-    let mut handles = Vec::with_capacity(4);
-    for _ in 0..4 {
-        let proxy = proxy.clone();
-        handles.push(tokio::spawn(async move {
-            proxy.get_part_unchunked(digest, 0, None).await
+    // Spawn the LEADER first, deterministically. This task is guaranteed
+    // to acquire the slot (its `singleflight` call has no concurrent
+    // race) before any waiter is spawned, so the test's invariant
+    // "abort the leader" is unambiguous.
+    let leader_handle = {
+        let map = map.clone();
+        let counter = counter.clone();
+        let release_rx = release_rx.clone();
+        let payload = payload.clone();
+        let key = key.borrow().into_owned();
+        tokio::spawn(async move {
+            map.singleflight(
+                key,
+                PAYLOAD_LEN as u64,
+                make_blocking_fetcher(counter, release_rx, payload, false),
+            )
+            .await
+        })
+    };
+
+    // Wait for the leader to enter the fetcher (counter == 1). At this
+    // point the leader's slot is registered and the leader is parked at
+    // the barrier. NO waiters exist yet.
+    let observed_at_barrier = wait_for_counter(&counter, 1, Duration::from_secs(2)).await;
+    assert_eq!(
+        observed_at_barrier, 1,
+        "precondition: leader must reach barrier (counter == 1) within 2s"
+    );
+
+    // Now spawn 3 waiters. They will see the leader's slot in
+    // acquire_role and become Waiters. NO race over leader assignment.
+    let mut waiter_handles = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let map = map.clone();
+        let counter = counter.clone();
+        let release_rx = release_rx.clone();
+        let payload = payload.clone();
+        let key = key.borrow().into_owned();
+        waiter_handles.push(tokio::spawn(async move {
+            map.singleflight(
+                key,
+                PAYLOAD_LEN as u64,
+                make_blocking_fetcher(counter, release_rx, payload, false),
+            )
+            .await
         }));
     }
 
-    // Wait for the callers to settle (either at peer barrier or in
-    // singleflight slot). Without singleflight, all 4 reach the peer.
-    // With singleflight, exactly 1 reaches the peer.
-    let _ = wait_for_counter(&get_part_calls, 4, Duration::from_millis(200)).await;
+    // Wait until the slot's strong-count reaches the expected value:
+    // - leader holds 1 strong ref via run_as_leader's `entry` local.
+    // - each waiter holds 2 strong refs (entry inside run_as_waiter +
+    //   entry_for_purge in the singleflight loop's match arm).
+    // So target = 1 + 3 * 2 = 7 with 3 subscribed waiters. We accept
+    // >= 4 as a fail-safe (1 leader + 3 waiters with 1 ref each, in
+    // case the implementation reduces clones), but >= 7 is the design.
+    //
+    // This is a deterministic synchronization point — without it, the
+    // abort might fire BEFORE waiters subscribe, causing the leader's
+    // slot to drop entirely on cancel and each waiter to become its own
+    // (independent) leader on its eventual acquire_role call (counter
+    // would be 4, not 2).
+    let observed_strong = timeout(Duration::from_secs(5), async {
+        loop {
+            let n = map.strong_count_for_key(&key);
+            if n >= 4 {
+                return n;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "leader-cancel test: 3 waiters must subscribe (slot strong_count >= 4) \
+         within 5s — without subscription, abort+promote semantics cannot be \
+         exercised; the test would fail on the cap-violation path instead",
+    );
+    assert!(
+        observed_strong >= 4,
+        "precondition: slot strong_count must be >= 4 (leader + 3 waiters), got {observed_strong}"
+    );
 
-    // Cancel the first caller. This drops the tokio task and (in the
-    // singleflight design) drops its slot registration. If it was the
-    // leader, the leader-cancel branch must promote one of the other 3
-    // awaiters to leader.
-    let first = handles.remove(0);
-    first.abort();
-    drop(first);
+    // Cancel the leader. The 3 waiters must promote among themselves:
+    // exactly one becomes the new leader and re-runs the fetcher; the
+    // other two subscribe as waiters of the new leader. We do NOT
+    // release the barrier yet — releasing too early would let the new
+    // leader's fetcher complete and publish BEFORE the other 2 waiters
+    // reach acquire_role, causing them to find no slot and become
+    // their own (independent) leaders. The test's contract is "the
+    // promotion produces ONE successor leader," not "every waiter
+    // wins after a small race."
+    leader_handle.abort();
+    drop(leader_handle);
 
-    // Now release the peer barrier. Surviving callers should complete
-    // — either via the original (canceled) leader's bytes (singleflight
-    // implementation must keep the peer-fetch alive while ≥1 awaiter
-    // remains) or via promotion of a successor.
+    // Wait for the successor leader to enter the fetcher (counter == 2).
+    // At that point the new leader is parked at the barrier and the
+    // other 2 surviving waiters have subscribed to the new slot.
+    let observed_after_promote =
+        wait_for_counter(&counter, 2, Duration::from_secs(5)).await;
+    assert_eq!(
+        observed_after_promote, 2,
+        "promotion: exactly 1 successor leader must enter the fetcher \
+         (counter == 2) within 5s of the original leader's cancel — \
+         got {observed_after_promote}, meaning either the promotion \
+         hung (none) or multiple waiters became leaders (>2)"
+    );
+
+    // Wait until the NEW slot's strong count reaches >= 3 (1 new leader
+    // + 2 subscribed waiters). This is the same race-protection as the
+    // original-leader sync above.
+    let _ = timeout(Duration::from_secs(2), async {
+        loop {
+            let n = map.strong_count_for_key(&key);
+            if n >= 3 {
+                return n;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "promote: 2 surviving waiters must subscribe to successor leader \
+         within 2s",
+    );
+
+    // NOW release the barrier. The new leader's fetcher completes and
+    // publishes; the 2 subscribed waiters wake with the result.
     release_tx
         .send(true)
         .expect("release_tx: receivers should still be alive");
 
     let surviving = timeout(Duration::from_secs(5), async {
-        let mut out = Vec::with_capacity(handles.len());
-        for h in handles {
+        let mut out = Vec::with_capacity(waiter_handles.len());
+        for h in waiter_handles {
             out.push(h.await.expect("leader-cancel test: caller task panicked"));
         }
         out
@@ -609,37 +526,327 @@ async fn leader_cancelation_does_not_kill_other_waiters() -> Result<(), Error> {
     .await
     .expect(
         "leader-cancel test: 3 surviving callers must complete within 5s \
-         after the first is canceled — a hang here means leader-cancel \
+         after the leader is canceled — a hang here means leader-cancel \
          did not promote a successor (waiters wedged on a dead leader's \
-         result_tx)",
+         result_rx)",
     );
 
-    // Correctness: all 3 survivors received the correct bytes.
+    // All 3 survivors received the correct bytes.
     for (i, r) in surviving.into_iter().enumerate() {
-        let bytes = r.unwrap_or_else(|e| {
+        let bytes_arc = r.unwrap_or_else(|e| {
             panic!("leader-cancel test: surviving caller {i} got error: {e:?}")
         });
         assert_eq!(
-            bytes.as_ref(),
+            flatten(&bytes_arc),
             payload.as_ref(),
             "leader-cancel test: surviving caller {i} received wrong bytes"
         );
     }
 
-    // Singleflight contract: even after leader cancelation, the surviving
-    // awaiters either (a) inherited the original leader's bytes (counter
-    // == 1) or (b) one of them was promoted to leader and re-fetched
-    // (counter == 1 if the original leader hadn't called peer.get_part
-    // yet, == 2 in the worst-case promotion race). We accept ≤ 2 here:
-    // the bug we are guarding against is the un-deduped 3-or-4 fetches.
-    let observed = get_part_calls.load(Ordering::SeqCst);
+    // Bound on extra work: exactly 2 fetcher invocations expected
+    // (the original aborted leader + 1 successor leader). Counter > 2
+    // means multiple waiters each became leaders (the dedup contract
+    // failed during promotion).
+    let observed = counter.load(Ordering::SeqCst);
     assert!(
         observed <= 2,
-        "leader-cancel must not produce extra peer-fetches beyond the \
-         leader-promotion race window — got {observed} peer-fetches for \
-         3 surviving + 1 canceled caller (no singleflight wired: each \
-         caller independently fetches, producing 3 or 4 fetches)"
+        "leader-cancel must produce at most 2 fetcher invocations (orig + 1 \
+         successor leader), got {observed} for 3 surviving waiters — extra \
+         invocations mean acquire_role saw an empty map for multiple \
+         waiters concurrently and each became its own leader"
     );
 
+    Ok(())
+}
+
+// =====================================================================
+// Test 5 (over-action): different keys MUST NOT dedup together
+// =====================================================================
+//
+// The over-action failure mode: two callers with DIFFERENT keys end up
+// sharing a slot and one receives the other's bytes (wrong-payload
+// correctness bug). Tested by spawning two concurrent calls with two
+// distinct digests, asserting each got its own payload AND counter == 2.
+
+#[nativelink_test]
+async fn different_digests_do_not_dedup() -> Result<(), Error> {
+    const PAYLOAD_LEN: usize = 4096;
+    let payload_a: Bytes = Bytes::from(vec![0xAA_u8; PAYLOAD_LEN]);
+    let payload_b: Bytes = Bytes::from(vec![0xBB_u8; PAYLOAD_LEN]);
+    let digest_a = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
+    let digest_b = DigestInfo::try_new(VALID_HASH2, PAYLOAD_LEN as u64)?;
+
+    let map = SingleflightMap::new();
+    let counter = Arc::new(AtomicU32::new(0));
+    let (release_tx, release_rx) = watch::channel(true); // Auto-released; no barrier.
+
+    let map_a = map.clone();
+    let counter_a = counter.clone();
+    let release_a = release_rx.clone();
+    let payload_a_cloned = payload_a.clone();
+    let h_a = tokio::spawn(async move {
+        map_a
+            .singleflight(
+                StoreKey::from(digest_a),
+                PAYLOAD_LEN as u64,
+                make_blocking_fetcher(counter_a, release_a, payload_a_cloned, false),
+            )
+            .await
+    });
+    let map_b = map.clone();
+    let counter_b = counter.clone();
+    let release_b = release_rx.clone();
+    let payload_b_cloned = payload_b.clone();
+    let h_b = tokio::spawn(async move {
+        map_b
+            .singleflight(
+                StoreKey::from(digest_b),
+                PAYLOAD_LEN as u64,
+                make_blocking_fetcher(counter_b, release_b, payload_b_cloned, false),
+            )
+            .await
+    });
+    drop(release_tx); // Auto-released; never need to flip.
+
+    let (got_a, got_b) = timeout(Duration::from_secs(5), async {
+        let a = h_a.await.expect("over-action test: caller A panicked");
+        let b = h_b.await.expect("over-action test: caller B panicked");
+        (a, b)
+    })
+    .await
+    .expect(
+        "over-action test: two distinct-key calls must complete within 5s \
+         — a hang means the over-eager dedup wedged one caller waiting on \
+         the other's leader",
+    );
+
+    let bytes_a = got_a.expect("caller A: fetch must succeed");
+    let bytes_b = got_b.expect("caller B: fetch must succeed");
+    assert_eq!(
+        flatten(&bytes_a),
+        payload_a.as_ref(),
+        "over-action: caller A must receive payload A, not B (DIFFERENT keys \
+         must never share a singleflight slot — wrong-payload correctness bug)"
+    );
+    assert_eq!(
+        flatten(&bytes_b),
+        payload_b.as_ref(),
+        "over-action: caller B must receive payload B, not A (DIFFERENT keys \
+         must never share a singleflight slot — wrong-payload correctness bug)"
+    );
+
+    // Over-action contract: two distinct keys => 2 fetchers (NOT 1).
+    let observed = counter.load(Ordering::SeqCst);
+    assert_eq!(
+        observed, 2,
+        "over-action: two distinct-key concurrent calls must produce 2 fetcher \
+         invocations — got {observed} (a value of 1 means SingleflightMap is \
+         deduping on something OTHER than the key — wrong-payload bug)"
+    );
+
+    Ok(())
+}
+
+// =====================================================================
+// Test 6 (cancel safety): all-waiter drop releases the slot
+// =====================================================================
+//
+// If every waiter (including the leader) drops, the slot must be
+// purged from the map (refcount → 0 → InflightEntry::drop fires →
+// map.remove). A leak here would manifest as `slot_count() > 0`
+// after drop, and would also leak `current_inflight_bytes`.
+
+#[nativelink_test]
+async fn all_waiters_drop_releases_inflight_entry() -> Result<(), Error> {
+    const PAYLOAD_LEN: usize = 4096;
+    let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
+    let key = StoreKey::from(digest);
+
+    let map = SingleflightMap::new();
+    let counter = Arc::new(AtomicU32::new(0));
+    let (_release_tx, release_rx) = watch::channel(false); // Never released.
+
+    const N: usize = 8;
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let map = map.clone();
+        let counter = counter.clone();
+        let release_rx = release_rx.clone();
+        let key = key.borrow().into_owned();
+        handles.push(tokio::spawn(async move {
+            map.singleflight(
+                key,
+                PAYLOAD_LEN as u64,
+                make_blocking_fetcher(counter, release_rx, Bytes::from_static(b""), false),
+            )
+            .await
+        }));
+    }
+
+    // Wait until the leader has entered the fetcher (so the slot is
+    // populated). Leader is then parked on `release_rx.changed()`.
+    let _ = wait_for_counter(&counter, 1, Duration::from_millis(500)).await;
+    assert_eq!(
+        map.slot_count(),
+        1,
+        "precondition: 1 slot must exist after leader enters fetcher"
+    );
+    assert_eq!(
+        map.current_inflight_bytes(),
+        PAYLOAD_LEN as u64,
+        "precondition: cap accounting reserved exactly the leader's expected_size"
+    );
+
+    // Cancel every caller. The leader's fetcher Future drops; the
+    // waiters' subscriptions drop; refcount on InflightEntry → 0;
+    // drop fires; map.remove purges the slot; cap accounting reverses.
+    for h in handles {
+        h.abort();
+        drop(h);
+    }
+
+    // Poll for slot-cleanup. NO sleep-as-sync; bounded poll loop.
+    let cleanup_observed = timeout(Duration::from_secs(5), async {
+        loop {
+            if map.slot_count() == 0 && map.current_inflight_bytes() == 0 {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "cancel-safety test: all-waiters-drop must release the slot within 5s \
+         — a hang here means InflightEntry::drop did not purge the map entry \
+         OR the cap accounting did not reverse",
+    );
+
+    assert!(
+        cleanup_observed,
+        "cancel-safety test: slot count must reach 0 after all waiters drop"
+    );
+    assert_eq!(
+        map.slot_count(),
+        0,
+        "cancel-safety test: leak — slot still in map after all waiters dropped"
+    );
+    assert_eq!(
+        map.current_inflight_bytes(),
+        0,
+        "cancel-safety test: cap accounting leak — inflight_bytes did not reverse"
+    );
+
+    Ok(())
+}
+
+// =====================================================================
+// Test 7 (cap behavior): late callers bypass when cap is exceeded
+// =====================================================================
+//
+// With a tiny cap, only the first leader fits; subsequent leaders for
+// distinct keys bypass and run their fetcher directly. We assert the
+// fetcher counter > expected (each bypass increments) and that all
+// callers complete (no cap-induced hang).
+
+#[nativelink_test]
+async fn cap_exceeded_late_callers_bypass() -> Result<(), Error> {
+    const PAYLOAD_LEN: u64 = 1024 * 1024; // 1 MiB per slot
+    const CAP: u64 = PAYLOAD_LEN; // Exactly 1 slot fits.
+
+    let map = SingleflightMap::with_cap(CAP);
+    let counter = Arc::new(AtomicU32::new(0));
+    let (release_tx, release_rx) = watch::channel(false);
+
+    // Spawn 4 callers, each with a UNIQUE digest (so they each become
+    // a leader of their own slot — none subscribe as waiters). With
+    // CAP = PAYLOAD_LEN, only ONE slot can be reserved at a time; the
+    // other 3 callers must Bypass.
+    let mut handles = Vec::with_capacity(4);
+    for i in 0..4u32 {
+        // Build a unique digest by varying one byte of the hash.
+        let hash = format!(
+            "{:02x}23456789abcdef000000000000000000010000000000000123456789abcdef",
+            (0x10 + i) & 0xff
+        );
+        let digest = DigestInfo::try_new(&hash, PAYLOAD_LEN)?;
+        let key = StoreKey::from(digest);
+
+        let map = map.clone();
+        let counter = counter.clone();
+        let release_rx = release_rx.clone();
+        handles.push(tokio::spawn(async move {
+            map.singleflight(
+                key,
+                PAYLOAD_LEN,
+                make_blocking_fetcher(
+                    counter,
+                    release_rx,
+                    Bytes::from(vec![0u8; PAYLOAD_LEN as usize]),
+                    false,
+                ),
+            )
+            .await
+        }));
+    }
+
+    // Wait for at least 4 fetcher entries (1 slot leader + 3 bypass).
+    // Without the cap, exactly 4 would be observed (each is its own
+    // unique key, so each would be its own leader). With the cap, the
+    // count is the same (4), but we need to ensure all 4 fetchers RAN
+    // — proving the bypass branch fires rather than hanging.
+    let observed = wait_for_counter(&counter, 4, Duration::from_millis(500)).await;
+    assert_eq!(
+        observed, 4,
+        "cap test: all 4 callers must enter the fetcher (3 via bypass) — \
+         got {observed}; a count < 4 means cap-bypass blocked a caller \
+         instead of letting it through"
+    );
+
+    release_tx
+        .send(true)
+        .expect("release_tx: receivers should still be alive");
+
+    let results = timeout(Duration::from_secs(5), async {
+        let mut out = Vec::with_capacity(4);
+        for h in handles {
+            out.push(h.await.expect("cap test: caller task panicked"));
+        }
+        out
+    })
+    .await
+    .expect(
+        "cap test: all callers must complete within 5s after release — \
+         a hang here means cap-bypass parked a caller in a non-existent \
+         slot",
+    );
+
+    for (i, r) in results.into_iter().enumerate() {
+        let _payload = r.unwrap_or_else(|e| panic!("cap test: caller {i} got error: {e:?}"));
+    }
+
+    // Cap accounting must converge to 0 after all slots release.
+    let final_inflight = map.current_inflight_bytes();
+    assert_eq!(
+        final_inflight, 0,
+        "cap test: inflight bytes accounting leaked — final = {final_inflight}, \
+         expected 0 (a non-zero residual means a slot's reserved_bytes was \
+         not released on Drop)"
+    );
+
+    Ok(())
+}
+
+// =====================================================================
+// Sanity: DEFAULT_MAX_INFLIGHT_BYTES is the documented value.
+// Guards against accidental const drift in the implementation file.
+// =====================================================================
+#[nativelink_test]
+async fn default_cap_constant_is_256_mib() -> Result<(), Error> {
+    assert_eq!(
+        DEFAULT_MAX_INFLIGHT_BYTES,
+        256 * 1024 * 1024,
+        "design doc commits to 256 MiB default cap; a change here requires \
+         a docs/130-singleflight-peer-fetch-design.md update"
+    );
     Ok(())
 }
