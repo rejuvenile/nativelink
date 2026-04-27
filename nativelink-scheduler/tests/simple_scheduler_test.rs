@@ -2782,6 +2782,12 @@ async fn recv_start_execute_with_hints(
                     }
                     hints.extend(chunk.peer_hints);
                 }
+                // BIS chunks (#97) are produced by the production
+                // broadcast loop in `src/bin/nativelink.rs`, not by the
+                // scheduler under test here. Tolerate them defensively in
+                // case a future test composition wires the loop in — they
+                // are not what this helper asserts on.
+                Some(chunked_message::Payload::BlobsInStableStorage(_)) => {}
                 None => panic!("ChunkedMessage with empty payload"),
             },
             v => panic!("Expected StartAction or ChunkedMessage, got: {v:?}"),

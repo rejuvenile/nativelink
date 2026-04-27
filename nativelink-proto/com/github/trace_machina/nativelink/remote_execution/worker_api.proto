@@ -313,18 +313,52 @@ message PeerHintsChunk {
     bool is_last = 4;
 }
 
+/// One chunk of a streaming `BlobsInStableStorage` broadcast (task #97).
+/// Carries up to `BIS_DIGESTS_PER_CHUNK` (server-side default: 4096 →
+/// ~128 KiB on the wire) `Digest` entries plus a server-allocated
+/// `broadcast_id` that identifies the broadcast-event the chunk belongs
+/// to. The `(broadcast_id, sequence)` pair is what the worker acks via
+/// `Update::BisAck` (see `UpdateForScheduler` below); the server uses it
+/// to drop unacked chunks from its per-worker resend buffer.
+///
+/// Direct-merge design (mirrors task #98): there is no per-broadcast
+/// buffer on the worker side — each chunk's digests are unpinned
+/// immediately as the chunk arrives, and the worker emits a per-chunk
+/// ack as soon as the unpins land. `is_last` marks the terminal chunk
+/// of one broadcast; the empty-input case still emits a single
+/// `is_last = true` chunk so the worker always sees a terminal marker
+/// for diagnostics. Chunks of the SAME broadcast may arrive out of order
+/// (after a reconnect-driven resend); each is independently meaningful,
+/// and unpins are idempotent.
+message BlobsInStableStorageChunk {
+    /// Up to BIS_DIGESTS_PER_CHUNK digests (server-side default: 4096).
+    repeated build.bazel.remote.execution.v2.Digest digests = 1;
+    /// Server-allocated identifier of the broadcast event this chunk
+    /// belongs to. Monotonic per-server-process; resets on server
+    /// restart (workers see a brand-new sequence and ack normally).
+    uint64 broadcast_id = 2;
+    /// Monotonic sequence within one broadcast_id (0, 1, 2, ...).
+    uint32 sequence = 3;
+    /// True on the FINAL chunk of one broadcast_id's stream. The final
+    /// chunk MAY be empty when `digests.len() % BIS_DIGESTS_PER_CHUNK
+    /// == 0` (or the broadcast carried zero digests at all); receivers
+    /// MUST tolerate that.
+    bool is_last = 4;
+}
+
 /// A streaming-message envelope shared across the cas→worker, scheduler→
 /// worker, and worker→scheduler chunk producers. Exactly ONE of the
 /// `oneof payload` arms is set; receivers route on the arm.
 ///
 /// Today's payloads (added incrementally per the streaming-design plan):
-///   * `peer_hints` — task #98 (this PR)
+///   * `peer_hints` — task #98 (PR2)
+///   * `blobs_in_stable_storage` — task #97 (PR1, this PR)
 /// Reserved for follow-up PRs:
-///   * `blobs_in_stable_storage` — task #97 (PR1)
 ///   * `blobs_available` — task #99 (PR3)
 message ChunkedMessage {
     oneof payload {
         PeerHintsChunk peer_hints = 1;
+        BlobsInStableStorageChunk blobs_in_stable_storage = 2;
     }
 }
 
@@ -452,6 +486,28 @@ message UpdateForWorker {
     reserved 6; // Previously NextId, now reserved.
 }
 
+/// Acknowledgement of one BlobsInStableStorageChunk delivery (task #97).
+/// Sent by the worker after every chunk it processes (success path AND
+/// the no-op path where every digest was already unpinned). The
+/// scheduler uses `(broadcast_id, sequence)` to drop the matching chunk
+/// from its per-worker resend buffer; chunks NOT acked when the
+/// connection closes are replayed on the next ConnectWorker.
+///
+/// Independent ack channel rather than coopting BlobsAvailable's
+/// `bis_ack_seq`: BIS broadcasts have per-chunk granularity (sequence
+/// inside a broadcast_id) that is independent of BlobsAvailable's
+/// per-snapshot cadence; collapsing them would require the worker to
+/// emit a BlobsAvailable per chunk (chatty + couples two protocols)
+/// or the server to wait for the next BlobsAvailable to learn an ack
+/// landed (delays the resend buffer's release by up to one snapshot
+/// interval). Per-chunk ack is the simpler primitive.
+message BisAck {
+    /// Server-allocated broadcast_id from the original chunk.
+    uint64 broadcast_id = 1;
+    /// Sequence within the broadcast that this ack covers.
+    uint32 sequence = 2;
+}
+
 /// Communication from the worker to the scheduler.
 message UpdateForScheduler {
     oneof update {
@@ -490,6 +546,11 @@ message UpdateForScheduler {
 
         /// Notifies the scheduler that blobs have been evicted from this worker.
         BlobsEvictedNotification blobs_evicted = 8;
+
+        /// Acknowledges one BlobsInStableStorageChunk delivery so the
+        /// scheduler can drop the matching chunk from its per-worker
+        /// resend buffer (task #97).
+        BisAck bis_ack = 9;
     }
     reserved 6; // Previously NextId, now reserved.
 }

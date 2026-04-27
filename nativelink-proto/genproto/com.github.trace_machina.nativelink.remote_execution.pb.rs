@@ -329,12 +329,35 @@ pub struct PeerHintsChunk {
     #[prost(bool, tag = "4")]
     pub is_last: bool,
 }
+/// / One chunk of a streaming `BlobsInStableStorage` broadcast (task #97).
+/// / Carries up to BIS_DIGESTS_PER_CHUNK digests plus a server-allocated
+/// / `broadcast_id` and a monotonic `sequence`. Workers ack via
+/// / `Update::BisAck { broadcast_id, sequence }` so the server can drop
+/// / unacked chunks from its per-worker resend buffer; chunks not acked
+/// / before connection close are replayed on the next ConnectWorker.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BlobsInStableStorageChunk {
+    /// / Up to BIS_DIGESTS_PER_CHUNK digests (server-side default: 4096).
+    #[prost(message, repeated, tag = "1")]
+    pub digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / Server-allocated identifier of the broadcast event.
+    #[prost(uint64, tag = "2")]
+    pub broadcast_id: u64,
+    /// / Monotonic sequence within one broadcast_id.
+    #[prost(uint32, tag = "3")]
+    pub sequence: u32,
+    /// / True on the FINAL chunk of one broadcast.
+    #[prost(bool, tag = "4")]
+    pub is_last: bool,
+}
 /// / A streaming-message envelope shared across the cas->worker, scheduler->
 /// / worker, and worker->scheduler chunk producers. Exactly ONE of the
 /// / `oneof payload` arms is set; receivers route on the arm.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChunkedMessage {
-    #[prost(oneof = "chunked_message::Payload", tags = "1")]
+    #[prost(oneof = "chunked_message::Payload", tags = "1, 2")]
     pub payload: ::core::option::Option<chunked_message::Payload>,
 }
 /// Nested message and enum types in `ChunkedMessage`.
@@ -343,6 +366,8 @@ pub mod chunked_message {
     pub enum Payload {
         #[prost(message, tag = "1")]
         PeerHints(super::PeerHintsChunk),
+        #[prost(message, tag = "2")]
+        BlobsInStableStorage(super::BlobsInStableStorageChunk),
     }
 }
 /// / The result of an ExecutionRequest.
@@ -487,10 +512,22 @@ pub mod update_for_worker {
         ChunkedMessage(super::ChunkedMessage),
     }
 }
+/// / Acknowledgement of one BlobsInStableStorageChunk delivery (task #97).
+/// / Sent by the worker after every chunk it processes; the scheduler uses
+/// / `(broadcast_id, sequence)` to drop the matching chunk from its
+/// / per-worker resend buffer. Chunks NOT acked when the connection closes
+/// / are replayed on the next ConnectWorker.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BisAck {
+    #[prost(uint64, tag = "1")]
+    pub broadcast_id: u64,
+    #[prost(uint32, tag = "2")]
+    pub sequence: u32,
+}
 /// / Communication from the worker to the scheduler.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateForScheduler {
-    #[prost(oneof = "update_for_scheduler::Update", tags = "1, 2, 3, 4, 5, 7, 8")]
+    #[prost(oneof = "update_for_scheduler::Update", tags = "1, 2, 3, 4, 5, 7, 8, 9")]
     pub update: ::core::option::Option<update_for_scheduler::Update>,
 }
 /// Nested message and enum types in `UpdateForScheduler`.
@@ -533,6 +570,9 @@ pub mod update_for_scheduler {
         /// / Notifies the scheduler that blobs have been evicted from this worker.
         #[prost(message, tag = "8")]
         BlobsEvicted(super::BlobsEvictedNotification),
+        /// / Acknowledges one BlobsInStableStorageChunk delivery (task #97).
+        #[prost(message, tag = "9")]
+        BisAck(super::BisAck),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
