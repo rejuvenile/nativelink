@@ -32,9 +32,9 @@ use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BlobDigestInfo, BlobsAvailableNotification, ExecuteComplete, ExecuteResult, GoingAwayRequest,
-    KeepAliveRequest, MirrorPinEntry, PeerHintsChunk, UpdateForWorker, chunked_message,
-    execute_result,
+    BisAck, BlobDigestInfo, BlobsAvailableNotification, BlobsInStableStorageChunk, ExecuteComplete,
+    ExecuteResult, GoingAwayRequest, KeepAliveRequest, MirrorPinEntry, PeerHintsChunk,
+    UpdateForWorker, chunked_message, execute_result,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::FilesystemStore;
@@ -842,6 +842,54 @@ pub fn handle_blobs_in_stable_storage(
         digest_count,
         "BlobsInStableStorage: unpinned digests from local CAS"
     );
+}
+
+/// (#97) Process one `BlobsInStableStorageChunk` arriving on the
+/// scheduler→worker stream and emit the matching `BisAck`.
+///
+/// Reuses [`handle_blobs_in_stable_storage`] for the unpin work — the
+/// chunked path differs only in (a) per-chunk granularity and (b) the
+/// per-chunk ack the server uses to release its resend buffer slot.
+///
+/// The ack is emitted UNCONDITIONALLY — even when the chunk carries
+/// zero digests (the empty-terminal case from `chunk_iter`'s contract).
+/// Without this, a broadcast whose final chunk lands on the chunk-size
+/// boundary (or carries zero digests) would leak its slot in the
+/// server's resend buffer forever.
+///
+/// Acks are also emitted on duplicate deliveries (e.g. when a server
+/// resend crosses an in-flight ack). The server's per-chunk slot in the
+/// resend buffer is keyed on `(broadcast_id, sequence)` so a second ack
+/// is a harmless `HashMap::remove` on a missing key.
+///
+/// Returns the number of digests successfully unpinned (0 on
+/// empty-terminal or duplicate). The caller may use this for
+/// observability but the worker arm must not gate the ack on it.
+pub fn handle_bis_chunk(
+    state: &BlobsAvailableState,
+    cas_store: Option<&Arc<FastSlowStore>>,
+    chunk: &BlobsInStableStorageChunk,
+    ack_sink: impl FnOnce(BisAck),
+) -> usize {
+    let before = cas_store.map(|s| s.mirror_blob_count()).unwrap_or(0);
+    handle_blobs_in_stable_storage(state, cas_store, &chunk.digests);
+    // The mirror count delta is the most reliable "unpinned" signal at
+    // this layer (FilesystemStore::unpin_digest is fire-and-forget and
+    // doesn't return a count). We only compute when a CAS store is
+    // attached; without one, return the proto digest count as an
+    // upper bound (no easy way to know how many were already absent).
+    let unpinned = if let Some(cas_store) = cas_store {
+        let after = cas_store.mirror_blob_count();
+        before.saturating_sub(after)
+    } else {
+        // No CAS server, no mirror state — best-effort upper bound.
+        chunk.digests.len()
+    };
+    (ack_sink)(BisAck {
+        broadcast_id: chunk.broadcast_id,
+        sequence: chunk.sequence,
+    });
+    unpinned
 }
 
 /// Process one `PeerHintsChunk` arriving on the scheduler→worker stream:
@@ -1686,17 +1734,65 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             }
                         }
                         Update::ChunkedMessage(chunked) => {
-                            // (#98) Streaming protocol envelope. Today only the
-                            // PeerHints arm is populated; future PRs add
-                            // BlobsInStableStorage and BlobsAvailable arms.
-                            // Per-arm dispatch keeps the route correct as the
-                            // `oneof` grows.
+                            // (#98 / #97) Streaming protocol envelope. PeerHints
+                            // chunks register into the worker's peer_locality_map
+                            // (#98); BlobsInStableStorage chunks unpin local CAS
+                            // entries + emit a BisAck so the server's per-worker
+                            // resend buffer can drop the matching slot (#97).
                             match chunked.payload {
                                 Some(chunked_message::Payload::PeerHints(chunk)) => {
                                     handle_peer_hints_chunk(
                                         self.peer_locality_map.as_ref(),
                                         &chunk,
                                     );
+                                }
+                                Some(chunked_message::Payload::BlobsInStableStorage(chunk)) => {
+                                    let digest_count = chunk.digests.len();
+                                    let broadcast_id = chunk.broadcast_id;
+                                    let sequence = chunk.sequence;
+                                    info!(
+                                        target: "nativelink::stable_storage_chunked_received",
+                                        broadcast_id,
+                                        sequence,
+                                        digest_count,
+                                        is_last = chunk.is_last,
+                                        "BIS chunk arm entered"
+                                    );
+                                    if let Some(ref state) = self.blobs_available_state {
+                                        let cas_store_for_ack =
+                                            self.running_actions_manager.get_cas_store();
+                                        let mut grpc_client = self.grpc_client.clone();
+                                        // Send the ack inline so the resend
+                                        // buffer is released as soon as the
+                                        // unpins land. The async send is
+                                        // spawned to avoid blocking the
+                                        // dispatch loop on a slow ack.
+                                        handle_bis_chunk(
+                                            state,
+                                            cas_store_for_ack.as_ref(),
+                                            &chunk,
+                                            move |ack| {
+                                                tokio::spawn(async move {
+                                                    if let Err(err) = grpc_client.bis_ack(ack).await {
+                                                        warn!(
+                                                            ?err,
+                                                            broadcast_id,
+                                                            sequence,
+                                                            "BIS ack send failed; server will resend on reconnect"
+                                                        );
+                                                    }
+                                                });
+                                            },
+                                        );
+                                    } else {
+                                        warn!(
+                                            target: "nativelink::stable_storage_chunked_gate",
+                                            broadcast_id,
+                                            sequence,
+                                            digest_count,
+                                            "blobs_available_state is None, dropping BIS chunk + ack (BUG?)"
+                                        );
+                                    }
                                 }
                                 None => {
                                     warn!(

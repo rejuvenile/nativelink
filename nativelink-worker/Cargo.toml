@@ -102,6 +102,10 @@ name = "blobs_in_stable_storage_handler_test"
 required-features = ["test-utils"]
 
 [[test]]
+name = "bis_chunk_handler_test"
+required-features = ["test-utils"]
+
+[[test]]
 name = "download_to_directory_mirror_test"
 required-features = ["test-utils"]
 

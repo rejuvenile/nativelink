@@ -1018,6 +1018,17 @@ impl WorkerScheduler for SimpleScheduler {
             .broadcast_blobs_in_stable_storage(digests)
             .await;
     }
+
+    async fn bis_ack_received(
+        &self,
+        worker_id: &WorkerId,
+        broadcast_id: u64,
+        sequence: u32,
+    ) {
+        self.worker_scheduler
+            .bis_ack_received(worker_id, broadcast_id, sequence)
+            .await;
+    }
 }
 
 impl RootMetricsComponent for SimpleScheduler {}

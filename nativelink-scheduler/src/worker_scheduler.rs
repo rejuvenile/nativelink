@@ -102,4 +102,16 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     /// telling them that the given digests are now safe on stable storage and can
     /// be unpinned from local CAS. Default implementation is a no-op.
     async fn broadcast_blobs_in_stable_storage(&self, _digests: Vec<DigestInfo>) {}
+
+    /// (#97) Notify the scheduler that a worker has acked one BIS chunk.
+    /// The scheduler drops the matching `(broadcast_id, sequence)` from
+    /// its per-worker resend buffer. Default impl is a no-op (schedulers
+    /// that don't implement chunked BIS just discard acks).
+    async fn bis_ack_received(
+        &self,
+        _worker_id: &WorkerId,
+        _broadcast_id: u64,
+        _sequence: u32,
+    ) {
+    }
 }

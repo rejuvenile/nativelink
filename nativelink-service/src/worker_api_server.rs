@@ -615,6 +615,22 @@ impl WorkerConnection {
                         // Kept for wire compatibility with older workers.
                         Ok(())
                     }
+                    Update::BisAck(ack) => {
+                        // (#97) BIS chunked-ack receipt — route into the
+                        // scheduler so the per-worker resend buffer can
+                        // drop the matching chunk. Default trait impl is
+                        // a no-op; only api_worker_scheduler tracks the
+                        // resend state.
+                        instance
+                            .scheduler
+                            .bis_ack_received(
+                                &instance.worker_id,
+                                ack.broadcast_id,
+                                ack.sequence,
+                            )
+                            .await;
+                        Ok(())
+                    }
                 };
                 if let Err(err) = result {
                     let msg = format!("{err:?}");

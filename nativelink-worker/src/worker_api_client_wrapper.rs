@@ -19,7 +19,7 @@ use nativelink_error::{make_err, Error, ResultExt};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_scheduler::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BlobsAvailableNotification, ConnectWorkerRequest, ExecuteComplete,
+    BisAck, BlobsAvailableNotification, ConnectWorkerRequest, ExecuteComplete,
     ExecuteResult, GoingAwayRequest, KeepAliveRequest, UpdateForScheduler, UpdateForWorker,
 };
 use tokio::sync::mpsc::Sender;
@@ -58,6 +58,12 @@ pub trait WorkerApiClientTrait: Clone + Sync + Send + Sized + Unpin {
     fn blobs_available(
         &mut self,
         request: BlobsAvailableNotification,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// (#97) Send a per-chunk BIS ack to the scheduler.
+    fn bis_ack(
+        &mut self,
+        request: BisAck,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 }
 
@@ -176,5 +182,9 @@ impl WorkerApiClientTrait for WorkerApiClientWrapper {
         request: BlobsAvailableNotification,
     ) -> Result<(), Error> {
         self.send_update(Update::BlobsAvailable(request)).await
+    }
+
+    async fn bis_ack(&mut self, request: BisAck) -> Result<(), Error> {
+        self.send_update(Update::BisAck(request)).await
     }
 }

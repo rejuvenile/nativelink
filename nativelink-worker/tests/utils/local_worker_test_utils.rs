@@ -219,6 +219,17 @@ impl WorkerApiClientTrait for MockWorkerApiClient {
             resp => panic!("blobs_available expected BlobsAvailable response, received {resp:?}"),
         }
     }
+
+    async fn bis_ack(
+        &mut self,
+        _request: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BisAck,
+    ) -> Result<(), Error> {
+        // (#97) Not currently exercised by local_worker_test; the
+        // bis_chunk_handler_test injects its own ack sink directly into
+        // `handle_bis_chunk`. Returning Ok preserves the existing
+        // mock contract.
+        Ok(())
+    }
 }
 
 pub(crate) fn setup_grpc_stream() -> (
