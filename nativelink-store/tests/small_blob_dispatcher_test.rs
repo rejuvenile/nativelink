@@ -309,3 +309,185 @@ async fn small_blob_threshold_is_16kib() -> Result<(), Error> {
     );
     Ok(())
 }
+
+// ----------------------------------------------------------------------
+// Test 9 (per plan §"Order of operations" step 2: drainer wiring): a
+// successful enqueue against a registered worker MUST result in a
+// BatchWriteSmallBlobsRequest being delivered over the worker_tx mpsc
+// AND the EphemeralServerSidePin set populated.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn dispatcher_enqueue_delivers_batch_to_registered_worker() -> Result<(), Error> {
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+        UpdateForWorker, update_for_worker::Update,
+    };
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let cfg = SmallBlobDispatcherConfig {
+        small_blob_mirror_enabled: true,
+        max_pending_per_worker: 32,
+        max_batch_bytes: 256 * 1024,
+        pin_max_bytes: 256 * 1024 * 1024,
+        pin_ttl: Duration::from_secs(10),
+    };
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+    let pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 256 * 1024));
+    dispatcher.register_pin_set("cas", pin.clone());
+
+    let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<UpdateForWorker>();
+    dispatcher.register_worker("endpoint-a", /* boot_epoch_id= */ 1, worker_tx);
+
+    let d = make_digest(7, 100);
+    let payload = Bytes::from(vec![0xABu8; 100]);
+    tokio::time::timeout(
+        DEADLOCK_DETECTOR,
+        dispatcher.enqueue("endpoint-a", 1, "cas", d, payload.clone()),
+    )
+    .await
+    .expect("enqueue MUST NOT block on registered worker")
+    .expect("enqueue MUST succeed");
+
+    // The drainer task is async; wait for the batch to land on the wire.
+    let msg = tokio::time::timeout(DEADLOCK_DETECTOR, worker_rx.recv())
+        .await
+        .expect("dispatcher MUST deliver a batch within deadlock-detector budget — \
+                 drainer task missing or worker_tx not wired")
+        .expect("worker_rx must yield a message; channel closed unexpectedly");
+
+    let Some(Update::BatchWriteSmallBlobs(batch)) = msg.update else {
+        panic!("dispatcher MUST emit Update::BatchWriteSmallBlobs; got {:?}", msg);
+    };
+    assert_eq!(
+        batch.blobs.len(),
+        1,
+        "single enqueue MUST produce a single-entry batch; got {} entries",
+        batch.blobs.len()
+    );
+    assert_eq!(batch.blobs[0].store_id, "cas");
+    assert_eq!(batch.blobs[0].data, payload);
+
+    // Pin set MUST contain the digest while the worker has not yet acked.
+    assert!(
+        pin.contains(&d),
+        "EphemeralServerSidePin MUST hold the digest until worker acks via pinned_mirror_entries"
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Test 10 (per plan §"State machine" + decision #3 zero-window coalesce):
+// rapid back-to-back enqueues MUST coalesce into a single batch.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn dispatcher_zero_window_coalesces_pending_into_single_batch() -> Result<(), Error> {
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+        UpdateForWorker, update_for_worker::Update,
+    };
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let cfg = SmallBlobDispatcherConfig {
+        small_blob_mirror_enabled: true,
+        max_pending_per_worker: 32,
+        max_batch_bytes: 256 * 1024,
+        pin_max_bytes: 256 * 1024 * 1024,
+        pin_ttl: Duration::from_secs(10),
+    };
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+    let pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 256 * 1024));
+    dispatcher.register_pin_set("cas", pin);
+
+    let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<UpdateForWorker>();
+    dispatcher.register_worker("endpoint-a", 1, worker_tx);
+
+    // Enqueue 5 small blobs in quick succession. Per decision #3 the
+    // drainer pulls the first item then try_recv-drains all pending into
+    // the SAME batch.
+    let payload = Bytes::from(vec![0u8; 50]);
+    for i in 0..5u8 {
+        dispatcher
+            .enqueue("endpoint-a", 1, "cas", make_digest(100 + i, 50), payload.clone())
+            .await
+            .expect("enqueue must succeed");
+    }
+
+    // Collect all batches that arrive within the deadlock-detector
+    // window. With zero-window coalesce we expect ONE batch with 5
+    // entries (the drainer had time to drain pending while the producer
+    // was still enqueuing). Worst case (drainer woke between every
+    // enqueue) we get 5 batches with 1 entry each, but with zero-window
+    // pulling we expect coalescing.
+    let mut received: Vec<Update> = Vec::new();
+    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(100), worker_rx.recv()).await {
+        if let Some(update) = msg.update {
+            received.push(update);
+        }
+    }
+
+    let total_blobs: usize = received
+        .iter()
+        .map(|u| match u {
+            Update::BatchWriteSmallBlobs(b) => b.blobs.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(
+        total_blobs, 5,
+        "all 5 enqueued blobs MUST appear in delivered batches; got {} blobs across {} batches",
+        total_blobs,
+        received.len()
+    );
+    // Coalesce assertion: at least SOME coalescing happened (we got
+    // strictly fewer batches than enqueues).
+    assert!(
+        received.len() < 5,
+        "zero-window coalesce MUST coalesce some pending items; got {} batches for 5 enqueues \
+         (no coalescing means try_recv-drain was not implemented)",
+        received.len()
+    );
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// Test 11 (per plan §"Concurrency design" + B4 boot_epoch_id keying):
+// enqueueing for a worker that has NOT registered (or has a stale
+// boot_epoch_id) MUST NOT panic; it MUST log + drop, and the pin set
+// MUST NOT grow (server bytes never made it to the worker).
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn dispatcher_enqueue_for_unregistered_worker_drops_silently() -> Result<(), Error> {
+    use std::sync::Arc;
+
+    let cfg = SmallBlobDispatcherConfig {
+        small_blob_mirror_enabled: true,
+        max_pending_per_worker: 32,
+        max_batch_bytes: 256 * 1024,
+        pin_max_bytes: 256 * 1024 * 1024,
+        pin_ttl: Duration::from_secs(10),
+    };
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+    let pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 256 * 1024));
+    dispatcher.register_pin_set("cas", pin.clone());
+    // NOTE: register_worker NOT called — simulates a worker that has not
+    // connected, OR has reconnected with a new boot_epoch_id leaving the
+    // stale (endpoint, OLD_boot_epoch_id, store_id) entry orphaned.
+
+    let d = make_digest(50, 100);
+    let res = tokio::time::timeout(
+        DEADLOCK_DETECTOR,
+        dispatcher.enqueue("nonexistent-endpoint", 999, "cas", d, Bytes::from(vec![0u8; 100])),
+    )
+    .await
+    .expect("enqueue MUST NOT block on unregistered worker");
+    assert!(
+        res.is_ok(),
+        "enqueue for unregistered worker MUST drop silently (Ok); got {res:?}. \
+         Caller is post-Bazel-ack fire-and-forget — propagating Err to Bazel is wrong"
+    );
+    assert!(
+        pin.is_empty(),
+        "pin set MUST NOT grow when bytes never make it to a worker"
+    );
+    Ok(())
+}
