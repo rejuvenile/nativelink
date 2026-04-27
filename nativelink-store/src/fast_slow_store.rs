@@ -828,6 +828,37 @@ impl FastSlowStore {
         Ok(())
     }
 
+    /// Public insert_mirror_blob entry-point used by the worker's
+    /// `Update::BatchWriteSmallBlobs` handler (Bug A small-CAS peer-mirror
+    /// dispatcher, task #153). Carries the source `store_id` for future
+    /// (store_id, digest) keying — currently logged but not part of the
+    /// HashMap key (per plan B5 the BTreeMap refactor is a follow-up).
+    ///
+    /// Errors propagate from the underlying private `insert_mirror_blob`
+    /// (cap-exceeded ⇒ `Code::ResourceExhausted`; size-mismatch ⇒
+    /// `Code::Internal`). Caller logs and drops; the dispatcher's
+    /// EphemeralServerSidePin TTL handles the unacked entry.
+    pub fn insert_dispatched_mirror_blob(
+        &self,
+        store_id: &str,
+        digest: DigestInfo,
+        data: Bytes,
+    ) -> Result<(), Error> {
+        debug!(
+            store_id,
+            %digest,
+            data_len = data.len(),
+            "insert_dispatched_mirror_blob"
+        );
+        // For now the underlying mirror_blobs is keyed by DigestInfo only.
+        // Once plan B5 lands the BTreeMap<(Arc<str>, DigestInfo), _>
+        // refactor, this entry-point routes to the (store_id, digest)
+        // slot. Until then `store_id` is informational; multi-store
+        // collisions on the same digest will overwrite (last-writer-wins).
+        let _ = store_id;
+        self.insert_mirror_blob(digest, data)
+    }
+
     /// Default per-blob streaming buffer: 64 MiB sliding window.
     const POPULATE_STREAM_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 

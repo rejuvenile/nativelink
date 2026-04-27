@@ -67,14 +67,20 @@
 
 use core::time::Duration;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err, make_input_err};
-use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::MirrorPinEntry;
+use nativelink_proto::build::bazel::remote::execution::v2::Digest as ProtoDigest;
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+    BatchWriteSmallBlobsRequest, MirrorPinEntry, SmallBlobEntry, UpdateForWorker,
+    update_for_worker::Update as UpdateForWorkerUpdate,
+};
 use nativelink_util::common::DigestInfo;
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 /// The maximum blob size (bytes) that the dispatcher accepts. Larger blobs
@@ -306,35 +312,56 @@ impl EphemeralServerSidePin {
     }
 }
 
+/// One in-flight blob entry queued for a (endpoint, boot_epoch_id,
+/// store_id) worker. The drainer task pops these and packs them into a
+/// `BatchWriteSmallBlobsRequest`.
+#[derive(Debug, Clone)]
+struct DispatchItem {
+    digest: DigestInfo,
+    data: Bytes,
+    /// `store_id` is keyed at the queue level so it does NOT need to
+    /// be repeated on each item; we still carry it to populate the
+    /// wire-level `SmallBlobEntry.store_id` without extra lookups.
+    store_id: Arc<str>,
+}
+
+/// One mpsc producer handle for a `(endpoint, boot_epoch_id, store_id)`
+/// triple. The dispatcher's outer Mutex guards the lookup; the actual
+/// send is bounded `try_send` (no `.await` while holding the Mutex).
+#[derive(Clone)]
+struct PerWorkerStoreState {
+    sender: mpsc::Sender<DispatchItem>,
+}
+
 /// The server-singleton dispatcher. Manages per-`(endpoint, boot_epoch_id,
-/// store_id)` queues and drainer tasks (TODO: drainer not yet wired —
-/// see module-level Status section).
+/// store_id)` bounded mpsc queues and drainer tasks per plan §"Concurrency
+/// design".
 ///
-/// Today this exposes:
-///
-/// - `enqueue(...)`: precondition checks + (when wired) push-into-mpsc.
-///   When `small_blob_mirror_enabled = false` the call is a no-op
-///   returning `Ok(())`.
-///
-/// Future commits will add:
-///
-/// - A `parking_lot::Mutex<HashMap<(Arc<str>, u64, Arc<str>),
-///   PerWorkerStoreState>>` map (per plan "Component owners" + B4 keying).
-/// - A spawned drainer task per state that zero-window-coalesces pending
-///   items into a `BatchWriteSmallBlobsRequest` and sends over the
-///   `worker_tx: mpsc::UnboundedSender<UpdateForWorker>`.
-/// - `TimedDispatchCall<F>` instrumentation (B6).
-///
-/// Concurrency invariants (per plan "Concurrency design"):
+/// Concurrency invariants (per plan):
 /// - Dispatcher Mutex BEFORE per-store pin-set Mutex (prevents AB/BA).
 /// - Drainer holds NO locks during send (S3 future-regression guard).
+/// - `worker_tx: UnboundedSender<UpdateForWorker>` is sync `send()`; no
+///   `.await` happens between the drainer's mpsc `recv()` and the worker
+///   send.
 pub struct SmallBlobDispatcher {
     config: SmallBlobDispatcherConfig,
+    /// Per-`(endpoint, boot_epoch_id, store_id)` mpsc Sender. Lookup is
+    /// Mutex-guarded (short critical section). On a miss the enqueue is
+    /// silently dropped — production callers are post-Bazel-ack
+    /// fire-and-forget and MUST NOT block on registration races.
+    queues: Mutex<HashMap<(Arc<str>, u64, Arc<str>), PerWorkerStoreState>>,
+    /// Per-`(endpoint, boot_epoch_id)` mpsc::UnboundedSender that the
+    /// drainer task sends `UpdateForWorker` messages into. Registered by
+    /// `WorkerApiServer::inner_connect_worker`.
+    worker_txs: Mutex<HashMap<(Arc<str>, u64), mpsc::UnboundedSender<UpdateForWorker>>>,
+    /// Per-`store_id` `EphemeralServerSidePin` set. Populated on
+    /// successful enqueue; depleted by `observe_pinned_mirror_ack`.
+    pin_sets: Mutex<HashMap<Arc<str>, Arc<EphemeralServerSidePin>>>,
     /// Diagnostic counter: number of `enqueue` calls that successfully
-    /// passed precondition and feature-flag gates. Currently only used
-    /// in tests because the drainer is not wired yet — production
-    /// callers should use the pin-set telemetry as the primary health
-    /// signal (per B6).
+    /// passed precondition + feature-flag gates AND landed in a queue.
+    /// Production callers should rely on pin-set telemetry as the primary
+    /// health signal (per B6); this counter is for tests + low-frequency
+    /// debug.
     dispatched_count: AtomicUsize,
 }
 
@@ -344,14 +371,75 @@ impl SmallBlobDispatcher {
     pub fn new(config: SmallBlobDispatcherConfig) -> Self {
         Self {
             config,
+            queues: Mutex::new(HashMap::new()),
+            worker_txs: Mutex::new(HashMap::new()),
+            pin_sets: Mutex::new(HashMap::new()),
             dispatched_count: AtomicUsize::new(0),
         }
     }
 
-    /// Diagnostic accessor: how many calls passed all gates and (would)
-    /// have hit the per-(worker, store) mpsc.
+    /// Diagnostic accessor: how many calls passed all gates and landed
+    /// in a per-(worker, store) mpsc.
     pub fn dispatched_count(&self) -> usize {
         self.dispatched_count.load(Ordering::Relaxed)
+    }
+
+    /// Register the `EphemeralServerSidePin` set for a `store_id`. Called
+    /// at server startup (one per FastSlowStore that opts into the
+    /// dispatcher).
+    pub fn register_pin_set(&self, store_id: &str, pin: Arc<EphemeralServerSidePin>) {
+        let key: Arc<str> = Arc::from(store_id);
+        self.pin_sets.lock().insert(key, pin);
+    }
+
+    /// Lookup a registered pin set by `store_id`. Used by the
+    /// WorkerApiServer's `handle_blobs_available` to fan out
+    /// `pinned_mirror_entries` (field 16) acks (broadcast + self-filter
+    /// per plan Option F).
+    pub fn pin_set_for(&self, store_id: &str) -> Option<Arc<EphemeralServerSidePin>> {
+        self.pin_sets.lock().get(store_id).cloned()
+    }
+
+    /// All registered pin sets. Used to broadcast `observe_pinned_mirror_ack`
+    /// across every registered FastSlowStore on each `BlobsAvailable` tick.
+    /// Returns `(store_id, pin_set)` pairs.
+    pub fn all_pin_sets(&self) -> Vec<(Arc<str>, Arc<EphemeralServerSidePin>)> {
+        self.pin_sets
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Register a worker's `UpdateForWorker` sender at connect time. The
+    /// dispatcher uses this `worker_tx` from the drainer task to deliver
+    /// `BatchWriteSmallBlobs`. On reconnect with a NEW `boot_epoch_id`
+    /// (per B4 + worker_api_server.rs:220), call this AGAIN — the new
+    /// `(endpoint, new_boot_epoch_id)` entry replaces a stale one,
+    /// dropping its sender; old drainer tasks then exit gracefully when
+    /// their Sender clones are dropped + their per-(worker, store)
+    /// queue's Receiver hits None.
+    pub fn register_worker(
+        &self,
+        endpoint: &str,
+        boot_epoch_id: u64,
+        worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
+    ) {
+        let key: Arc<str> = Arc::from(endpoint);
+        self.worker_txs.lock().insert((key, boot_epoch_id), worker_tx);
+    }
+
+    /// Drop the `worker_tx` for a worker (called at disconnect). Pending
+    /// drainers will see their `worker_tx` sends fail and exit.
+    pub fn unregister_worker(&self, endpoint: &str, boot_epoch_id: u64) {
+        let key: Arc<str> = Arc::from(endpoint);
+        self.worker_txs.lock().remove(&(key.clone(), boot_epoch_id));
+        // Also drop any per-(worker, store) queues whose Sender we own —
+        // the drainer's `recv()` returns None when we drop the Sender,
+        // so the drainer task exits. Per B4: stale queue cleanup on
+        // disconnect.
+        let mut queues = self.queues.lock();
+        queues.retain(|(ep, epoch, _), _| !(*ep == key && *epoch == boot_epoch_id));
     }
 
     /// Enqueue a single small blob for push to a specific worker.
@@ -368,10 +456,16 @@ impl SmallBlobDispatcher {
     /// post-Bazel-ack fire-and-forget per `feedback_no_sync_slow_write_ack`).
     /// Log + drop is the production behavior — the caller's `if let Err`
     /// guard at the hook site does this.
+    ///
+    /// On unregistered-worker miss (no `worker_tx` for `(endpoint,
+    /// boot_epoch_id)`): silently drop with `Ok(())`. The pin set is NOT
+    /// modified (bytes never made it to a worker). This is the
+    /// "stale-or-disconnected worker" case from plan §"Failure modes
+    /// (general)".
     pub async fn enqueue(
         &self,
         endpoint: &str,
-        _boot_epoch_id: u64,
+        boot_epoch_id: u64,
         store_id: &str,
         digest: DigestInfo,
         data: Bytes,
@@ -396,22 +490,202 @@ impl SmallBlobDispatcher {
                  (must be non-empty + match `[a-z][a-z0-9_]*` per plan C11)"
             ));
         }
-        // TODO(bug-a small-CAS peer-mirror): wire to per-(endpoint,
-        // boot_epoch_id, store_id) mpsc + drainer. Currently no-op +
-        // counter increment. The pin set + worker-side
-        // BatchWriteSmallBlobs handler are in separate commits; this
-        // skeleton lands the API surface so the trait + tests can
-        // compile and reviewers see the eventual call site.
+        let endpoint_key: Arc<str> = Arc::from(endpoint);
+        let store_key: Arc<str> = Arc::from(store_id);
+        // Resolve worker_tx (lookup-only, no .await under lock).
+        let worker_tx_opt = {
+            let txs = self.worker_txs.lock();
+            txs.get(&(endpoint_key.clone(), boot_epoch_id)).cloned()
+        };
+        let Some(worker_tx) = worker_tx_opt else {
+            // Unregistered or stale boot_epoch_id. Per plan §"Failure
+            // modes": drop silently; the slow tier still has the bytes.
+            debug!(
+                endpoint,
+                boot_epoch_id,
+                store_id,
+                %digest,
+                data_len = data.len(),
+                "enqueue: no worker_tx registered for (endpoint, boot_epoch_id); dropping"
+            );
+            return Ok(());
+        };
+        // Resolve the pin set; required for accounting. Missing pin set
+        // is a config error (FastSlowStore did not register) — drop with
+        // a warn but do NOT propagate (post-ack fire-and-forget).
+        let pin_set_opt = self.pin_set_for(store_id);
+        let Some(pin_set) = pin_set_opt else {
+            warn!(
+                endpoint,
+                store_id,
+                %digest,
+                "enqueue: no EphemeralServerSidePin registered for store_id; \
+                 dropping (FastSlowStore did not register at startup — operator-actionable)"
+            );
+            return Ok(());
+        };
+        // Insert into pin set BEFORE handing to the drainer so the worker's
+        // ack can never race ahead of our pin record. If the cap is
+        // exceeded, drop without queuing.
+        if let Err(err) = pin_set.insert(digest, data.clone()) {
+            warn!(
+                endpoint,
+                store_id,
+                %digest,
+                ?err,
+                "enqueue: pin set cap exceeded; dropping"
+            );
+            return Ok(());
+        }
+        // Acquire-or-spawn the per-(endpoint, boot_epoch_id, store_id)
+        // queue + drainer task. Short critical section — Mutex held only
+        // across HashMap entry resolution.
+        let item = DispatchItem {
+            digest,
+            data,
+            store_id: store_key.clone(),
+        };
+        let sender = {
+            let mut queues = self.queues.lock();
+            let key = (endpoint_key.clone(), boot_epoch_id, store_key.clone());
+            if let Some(state) = queues.get(&key) {
+                state.sender.clone()
+            } else {
+                let (tx, rx) = mpsc::channel::<DispatchItem>(self.config.max_pending_per_worker);
+                queues.insert(key.clone(), PerWorkerStoreState { sender: tx.clone() });
+                drop(queues);
+                // Spawn the drainer. Holds NO locks during send.
+                let max_batch_bytes = self.config.max_batch_bytes;
+                let endpoint_for_log = endpoint_key.clone();
+                let store_id_for_log = store_key.clone();
+                let pin_set_for_drainer = pin_set.clone();
+                tokio::spawn(drainer_task(
+                    endpoint_for_log,
+                    boot_epoch_id,
+                    store_id_for_log,
+                    rx,
+                    worker_tx,
+                    max_batch_bytes,
+                    pin_set_for_drainer,
+                ));
+                tx
+            }
+        };
+        // Bounded try_send: on Full drop with warn (per plan
+        // §"Concurrency design"). Pin set was already populated; remove
+        // it to keep accounting honest.
+        if let Err(err) = sender.try_send(item) {
+            // Roll back the pin entry — bytes will never land on the
+            // worker.
+            pin_set.remove_one(&digest);
+            warn!(
+                endpoint,
+                store_id,
+                %digest,
+                ?err,
+                "enqueue: per-worker dispatch queue full; dropping (pin entry rolled back)"
+            );
+            return Ok(());
+        }
         debug!(
             endpoint,
             store_id,
             %digest,
-            data_len = data.len(),
-            "SmallBlobDispatcher::enqueue (skeleton — drainer not yet wired)"
+            "SmallBlobDispatcher::enqueue dispatched"
         );
         self.dispatched_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// Per-`(endpoint, boot_epoch_id, store_id)` drainer task. Runs until
+/// the upstream Sender drops (`recv()` returns None) — typically when
+/// the worker disconnects and `unregister_worker` clears the queue.
+///
+/// Per decision #3 (zero-window opportunistic coalesce): pull the first
+/// item via `recv()`, then `try_recv()` until empty OR cumulative
+/// `data.len()` exceeds `max_batch_bytes`. Send the batch as a single
+/// `UpdateForWorker { batch_write_small_blobs }` message.
+///
+/// Per S3 (drainer-no-locks-during-send invariant): this function
+/// holds NO mutex while calling `worker_tx.send`. The `pin_set` is only
+/// touched on send-failure rollback — the success path leaves the
+/// dispatcher's locks untouched.
+async fn drainer_task(
+    endpoint: Arc<str>,
+    boot_epoch_id: u64,
+    store_id: Arc<str>,
+    mut rx: mpsc::Receiver<DispatchItem>,
+    worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
+    max_batch_bytes: usize,
+    pin_set: Arc<EphemeralServerSidePin>,
+) {
+    debug!(
+        %endpoint,
+        boot_epoch_id,
+        %store_id,
+        "drainer_task: start"
+    );
+    while let Some(first) = rx.recv().await {
+        // Pull the first item then opportunistically drain pending up
+        // to the byte cap.
+        let mut total_bytes = first.data.len();
+        let mut batch: Vec<DispatchItem> = vec![first];
+        while total_bytes < max_batch_bytes {
+            match rx.try_recv() {
+                Ok(item) => {
+                    total_bytes += item.data.len();
+                    batch.push(item);
+                }
+                Err(_) => break,
+            }
+        }
+        let blob_count = batch.len();
+        let proto_blobs: Vec<SmallBlobEntry> = batch
+            .iter()
+            .map(|item| SmallBlobEntry {
+                digest: Some(ProtoDigest::from(item.digest)),
+                data: item.data.clone(),
+                store_id: item.store_id.to_string(),
+            })
+            .collect();
+        let msg = UpdateForWorker {
+            update: Some(UpdateForWorkerUpdate::BatchWriteSmallBlobs(
+                BatchWriteSmallBlobsRequest { blobs: proto_blobs },
+            )),
+        };
+        if let Err(send_err) = worker_tx.send(msg) {
+            // worker_tx closed (worker disconnected) — roll back every
+            // pin entry we held for this batch and exit.
+            warn!(
+                %endpoint,
+                boot_epoch_id,
+                %store_id,
+                blob_count,
+                total_bytes,
+                ?send_err,
+                "drainer_task: worker_tx closed; rolling back pin entries + exiting"
+            );
+            for item in &batch {
+                pin_set.remove_one(&item.digest);
+            }
+            return;
+        }
+        debug!(
+            %endpoint,
+            boot_epoch_id,
+            %store_id,
+            blob_count,
+            total_bytes,
+            "drainer_task: batch sent"
+        );
+    }
+    debug!(
+        %endpoint,
+        boot_epoch_id,
+        %store_id,
+        "drainer_task: queue closed; exiting"
+    );
 }
 
 /// Validate `store_id` per plan C11. Format `[a-z][a-z0-9_]*`.
