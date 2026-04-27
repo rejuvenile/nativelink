@@ -31,7 +31,7 @@
 
 use core::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -41,7 +41,9 @@ use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::memory_store::MemoryStore;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::buf_channel::{
+    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
+};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
@@ -51,6 +53,12 @@ use nativelink_util::store_trait::{
 use pretty_assertions::assert_eq;
 
 const VALID_HASH: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
+
+// Additional stable hashes for multi-digest tests (e.g. batch_get_part).
+// Each is hex-distinct so `logs_contain` can differentiate per-digest log
+// entries without false matches on substrings of the staged digest.
+const VALID_HASH_B: &str = "fedcba9876543210000000000000000000020000000000000fedcba987654321";
+const VALID_HASH_C: &str = "aabbccddeeff001100000000000000000003000000000000aabbccddeeff0011";
 
 /// A wrapping Store that delegates to an inner MemoryStore for `update`
 /// (so we can stage data) but returns a configurable error `Code` from
@@ -63,6 +71,14 @@ struct ErrCodeOnGetStore {
     err_code: Code,
     /// Atomic count of get_part calls (to verify retry behavior etc).
     get_part_calls: AtomicU32,
+    /// When true, `has_with_results` reports every queried digest as
+    /// missing regardless of inner state. Used by stale-positive tests
+    /// that prime the cache via a real `update_oneshot` (cache + inner
+    /// both have the digest), then flip this flag so the next
+    /// update / update_oneshot / batch read sees the cache claiming
+    /// "yes" while the inner store reports "no" — exactly the
+    /// invariant the `error!` log is meant to surface.
+    has_returns_none: AtomicBool,
 }
 
 impl ErrCodeOnGetStore {
@@ -71,7 +87,12 @@ impl ErrCodeOnGetStore {
             inner,
             err_code,
             get_part_calls: AtomicU32::new(0),
+            has_returns_none: AtomicBool::new(false),
         }
+    }
+
+    fn set_has_returns_none(&self, val: bool) {
+        self.has_returns_none.store(val, Ordering::SeqCst);
     }
 }
 
@@ -84,6 +105,17 @@ impl StoreDriver for ErrCodeOnGetStore {
         digests: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
+        if self.has_returns_none.load(Ordering::SeqCst) {
+            // Simulate the inner store losing track of every queried
+            // digest (eviction race / data loss / cache populated by an
+            // unverified path). Caller's existence cache may still
+            // believe the digest is present — that mismatch is exactly
+            // what the stale-positive `error!` logs guard.
+            for r in results.iter_mut() {
+                *r = None;
+            }
+            return Ok(());
+        }
         self.inner.has_with_results(digests, results).await
     }
 
@@ -385,14 +417,256 @@ async fn get_part_not_found_logs_error_for_stale_positive() -> Result<(), Error>
          in production (14,776 events / 24h on buildcache 2026-04-26)"
     );
 
-    // Specificity: the digest MUST appear in the log so operators can
+    // Specificity: the digest hash MUST appear in the log so operators can
     // correlate against upstream/downstream traces. A log saying only
     // "stale positive detected" without the offending digest is useless.
-    let digest_str = format!("{digest}");
+    // Grep for the stable hex hash prefix rather than `format!("{digest}")`
+    // — DigestInfo's Display impl is not part of the contract this test
+    // guards, so depending on it makes the test brittle to formatting tweaks.
     assert!(
-        logs_contain(&digest_str),
-        "expected the offending digest {digest_str} in the stale-positive \
+        logs_contain(VALID_HASH),
+        "expected the offending digest hash {VALID_HASH} in the stale-positive \
          error log so operators can grep for it"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 8. Stale positive on update() path MUST surface as error!-level log.
+//
+// This is a sibling of test #7. The update() path has its OWN
+// `error!` site (`existence_cache_store.rs` ~line 327) that fires
+// when a write arrives for a digest the cache claims to have but the
+// inner store's `has()` reports as missing. Without this test the
+// error! at that site can be silently regressed (testing-czar
+// HOLD-MAJOR mutation finding: 3 of 4 sites shipped UNPROTECTED).
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn update_logs_error_for_stale_positive() -> Result<(), Error> {
+    // Prime cache + inner via the standard helper (err_code is unused
+    // here because we only call update, not get_part).
+    let (store, err_store, digest) = make_primed_cache_store(Code::NotFound).await?;
+    assert!(
+        store.exists_in_cache(&digest).await,
+        "precondition: cache must contain the digest after the priming write"
+    );
+
+    // Now flip the inner store's has() to always report None — this
+    // creates the stale-positive scenario at the moment the next
+    // update() runs (cache says yes, inner says no).
+    err_store.set_has_returns_none(true);
+
+    // Drive the update path. update() takes a DropCloserReadHalf, so
+    // build a buf_channel pair, send the payload + EOF on the writer,
+    // and pass the reader to update(). Use try_join! so the send
+    // future and the update future progress concurrently — the
+    // wrapper's update() drains the reader after detecting the
+    // stale positive (reader.drain()) only on the inner-has=Some
+    // branch; on the inner-has=None branch update() forwards the
+    // reader to inner.update(). The MemoryStore inner accepts the
+    // re-upload, completing the test.
+    let payload = Bytes::from_static(b"primed cache data");
+    let payload_len = payload.len() as u64;
+    let (mut tx, rx) = make_buf_channel_pair();
+    let send_fut = async move {
+        tx.send(payload).await?;
+        tx.send_eof()?;
+        Ok::<_, Error>(())
+    };
+    let update_fut = async {
+        Pin::new(store.as_ref())
+            .update(digest.into(), rx, UploadSizeInfo::ExactSize(payload_len))
+            .await
+    };
+    tokio::try_join!(send_fut, update_fut)?;
+
+    // The error! log MUST fire — assert by message + hash. Without
+    // both, a regression that changes the message text but keeps
+    // the digest, or vice versa, would slip through.
+    assert!(
+        logs_contain("existence cache stale positive"),
+        "expected error!-level 'existence cache stale positive' log on \
+         the update() path when inner.has() returns None for a digest \
+         the cache claims to have"
+    );
+    assert!(
+        logs_contain("update path"),
+        "expected log to identify the originating path ('update path') \
+         so operators can distinguish update vs update_oneshot vs \
+         get_part vs batch_get_part stale-positive sources"
+    );
+    assert!(
+        logs_contain(VALID_HASH),
+        "expected the offending digest hash {VALID_HASH} in the stale-positive \
+         error log on the update() path"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 9. Stale positive on update_oneshot() path MUST surface as
+//    error!-level log. Sibling of tests #7 / #8.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn update_oneshot_logs_error_for_stale_positive() -> Result<(), Error> {
+    let (store, err_store, digest) = make_primed_cache_store(Code::NotFound).await?;
+    assert!(
+        store.exists_in_cache(&digest).await,
+        "precondition: cache must contain the digest after the priming write"
+    );
+
+    err_store.set_has_returns_none(true);
+
+    // Re-upload via update_oneshot: the wrapper's overridden
+    // update_oneshot is invoked directly here (StoreLike's default
+    // update_oneshot would route through update(), which is the
+    // wrong site for THIS test).
+    store
+        .update_oneshot(digest, Bytes::from_static(b"primed cache data"))
+        .await?;
+
+    assert!(
+        logs_contain("existence cache stale positive"),
+        "expected error!-level 'existence cache stale positive' log on \
+         the update_oneshot() path"
+    );
+    assert!(
+        logs_contain("update_oneshot path"),
+        "expected log to identify the originating path ('update_oneshot path') \
+         so operators can distinguish from update / get_part / batch sites"
+    );
+    assert!(
+        logs_contain(VALID_HASH),
+        "expected the offending digest hash {VALID_HASH} in the stale-positive \
+         error log on the update_oneshot() path"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 10. Stale positive on batch_get_part_unchunked() path MUST surface
+//     as error!-level log — AND must fire ONLY for the cached digest,
+//     not for sibling digests in the same batch that were never
+//     cached.
+//
+// This composite assertion guards two invariants:
+//   - The error! site fires when a stale entry is removed.
+//   - It does NOT fire for honest NotFounds on never-cached digests
+//     (which would create false-positive operator alarm storms).
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn batch_get_part_logs_error_for_stale_positive() -> Result<(), Error> {
+    // Prime cache + inner with digest A via the standard helper. B
+    // and C are NEVER cached; they go straight into the batch and
+    // should hit the inner-store NotFound path without producing a
+    // stale-positive log entry.
+    let (store, _err_store, digest_a) = make_primed_cache_store(Code::NotFound).await?;
+    let digest_b = DigestInfo::try_new(VALID_HASH_B, 17u64)?;
+    let digest_c = DigestInfo::try_new(VALID_HASH_C, 17u64)?;
+
+    assert!(store.exists_in_cache(&digest_a).await);
+    assert!(!store.exists_in_cache(&digest_b).await);
+    assert!(!store.exists_in_cache(&digest_c).await);
+
+    let keys: Vec<StoreKey<'_>> = vec![digest_a.into(), digest_b.into(), digest_c.into()];
+    let results = store
+        .as_store_driver_pin()
+        .batch_get_part_unchunked(keys, None)
+        .await;
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(Result::is_err));
+
+    // The cache entry for A must be gone (it was the stale positive).
+    assert!(!store.exists_in_cache(&digest_a).await);
+
+    // The error! log fired with the canonical wording + the hash of A.
+    assert!(
+        logs_contain("existence cache stale positive"),
+        "expected error!-level 'existence cache stale positive' log on \
+         the batch_get_part path for the cached digest"
+    );
+    assert!(
+        logs_contain("batch_get_part"),
+        "expected log to identify the originating path ('batch_get_part')"
+    );
+    assert!(
+        logs_contain(VALID_HASH),
+        "expected the cached digest's hash {VALID_HASH} in the stale-positive \
+         error log"
+    );
+
+    // Crucially: B and C were honest NotFounds on never-cached
+    // digests. Their hashes must NOT appear in any stale-positive
+    // log entry. Without this assertion an off-by-one in the
+    // `if removed` gate would produce alarm storms in production.
+    assert!(
+        !logs_contain(VALID_HASH_B),
+        "digest B was never cached — its hash must NOT appear in any \
+         stale-positive log entry (honest NotFound stays silent)"
+    );
+    assert!(
+        !logs_contain(VALID_HASH_C),
+        "digest C was never cached — its hash must NOT appear in any \
+         stale-positive log entry (honest NotFound stays silent)"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 11. Honest NotFound on a never-cached digest MUST stay silent.
+//
+// Negative-case guard for the `if removed { error!(...) }` gate at
+// every stale-positive site. If the gate were dropped, every
+// FindMissingBlobs-style read on a never-seen digest would produce
+// an error!-level log — drowning operators in noise and rendering
+// the alarm useless. This test asserts the GATE, not just the
+// presence of the log on a real stale-positive case.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn get_part_not_found_does_not_log_error_for_never_cached_digest()
+-> Result<(), Error> {
+    // Build the cache store WITHOUT priming anything. The inner is
+    // wired to return NotFound on get_part — this is the inner-store
+    // genuinely not having the blob, not a stale cache entry.
+    let backing_mem = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let err_store = Arc::new(ErrCodeOnGetStore::new(backing_mem, Code::NotFound));
+    let inner = Store::new(err_store.clone());
+    let spec = ExistenceCacheSpec {
+        backend: StoreSpec::Noop(NoopSpec::default()),
+        eviction_policy: None,
+    };
+    let store = ExistenceCacheStore::new(&spec, inner);
+
+    let digest = DigestInfo::try_new(VALID_HASH, 17u64)?;
+    assert!(
+        !store.exists_in_cache(&digest).await,
+        "precondition: digest must NOT be cached (this is the negative case)"
+    );
+
+    let result = store.get_part_unchunked(digest, 0, None).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().code, Code::NotFound);
+
+    // The log MUST NOT fire for a digest that was never in the cache.
+    // A NotFound on a never-cached digest is honest, expected behavior
+    // (the cache simply didn't know about it). Logging error! here
+    // would produce 1000s of false alarms per minute on cold-cache
+    // reads.
+    assert!(
+        !logs_contain("existence cache stale positive"),
+        "honest NotFound on a never-cached digest must NOT produce a \
+         stale-positive error log — the `if removed {{ error!(...) }}` \
+         gate at every stale-positive site is what keeps this silent. \
+         If this assertion fails, that gate has been dropped."
+    );
+    assert!(
+        !logs_contain(VALID_HASH),
+        "the digest hash must NOT appear in any error log for an \
+         honest NotFound on a never-cached digest"
     );
 
     Ok(())
