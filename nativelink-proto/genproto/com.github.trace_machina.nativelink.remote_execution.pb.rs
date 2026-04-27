@@ -307,6 +307,44 @@ pub struct PeerHint {
     #[prost(string, repeated, tag = "2")]
     pub peer_endpoints: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// / One chunk of a streaming peer-hints emission. Carries up to
+/// / `PEER_HINTS_PER_CHUNK` `PeerHint` entries plus the operation_id the
+/// / hints were generated for (informational only — the worker does NOT key
+/// / any state by operation_id; hints register directly into the worker's
+/// / global `peer_locality_map` as chunks arrive). `sequence` is monotonic
+/// / 0,1,2,... within one stream and `is_last` marks the terminal chunk.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PeerHintsChunk {
+    /// / Up to PEER_HINTS_PER_CHUNK hints (worker-side default: 256).
+    #[prost(message, repeated, tag = "1")]
+    pub peer_hints: ::prost::alloc::vec::Vec<PeerHint>,
+    /// / The scheduler-side operation_id these hints were generated for.
+    /// / Diagnostics-only; the worker doesn't key state on it.
+    #[prost(string, tag = "2")]
+    pub operation_id: ::prost::alloc::string::String,
+    /// / Monotonic sequence within one operation_id's hint stream.
+    #[prost(uint32, tag = "3")]
+    pub sequence: u32,
+    /// / True on the FINAL chunk of one operation_id's stream.
+    #[prost(bool, tag = "4")]
+    pub is_last: bool,
+}
+/// / A streaming-message envelope shared across the cas->worker, scheduler->
+/// / worker, and worker->scheduler chunk producers. Exactly ONE of the
+/// / `oneof payload` arms is set; receivers route on the arm.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChunkedMessage {
+    #[prost(oneof = "chunked_message::Payload", tags = "1")]
+    pub payload: ::core::option::Option<chunked_message::Payload>,
+}
+/// Nested message and enum types in `ChunkedMessage`.
+pub mod chunked_message {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "1")]
+        PeerHints(super::PeerHintsChunk),
+    }
+}
 /// / The result of an ExecutionRequest.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExecuteResult {
@@ -385,7 +423,7 @@ pub struct KillOperationRequest {
 /// / Communication from the scheduler to the worker.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateForWorker {
-    #[prost(oneof = "update_for_worker::Update", tags = "1, 2, 3, 4, 5, 7, 8, 9, 10")]
+    #[prost(oneof = "update_for_worker::Update", tags = "1, 2, 3, 4, 5, 7, 8, 9, 10, 11")]
     pub update: ::core::option::Option<update_for_worker::Update>,
 }
 /// Nested message and enum types in `UpdateForWorker`.
@@ -442,6 +480,11 @@ pub mod update_for_worker {
         /// / is required.
         #[prost(message, tag = "10")]
         BatchWriteSmallBlobs(super::BatchWriteSmallBlobsRequest),
+        /// / One chunk of a streaming protocol message. Today carries
+        /// / `PeerHintsChunk` (task #98); future PRs add other payload
+        /// / arms (`BlobsInStableStorageChunk`, `BlobsAvailableChunk`).
+        #[prost(message, tag = "11")]
+        ChunkedMessage(super::ChunkedMessage),
     }
 }
 /// / Communication from the worker to the scheduler.
@@ -515,10 +558,8 @@ pub struct StartExecute {
     /// / The ID of the worker that is executing the action.
     #[prost(string, tag = "6")]
     pub worker_id: ::prost::alloc::string::String,
-    /// / Hints about input blobs available on peer workers.
-    /// / Workers should try these peers first before falling back to server CAS.
-    #[prost(message, repeated, tag = "8")]
-    pub peer_hints: ::prost::alloc::vec::Vec<PeerHint>,
+    /// / Tag 8 reserved (was `peer_hints`; replaced by streaming
+    /// / `ChunkedMessage::PeerHintsChunk` in #98 — peer hints chunking).
     /// / Pre-resolved input directory tree from the scheduler.
     /// / The scheduler already resolves the tree for locality scoring; including
     /// / it here lets the worker skip its own GetTree RPC. Parallel arrays:

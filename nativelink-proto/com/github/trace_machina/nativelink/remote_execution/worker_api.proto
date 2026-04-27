@@ -287,6 +287,47 @@ message PeerHint {
     repeated string peer_endpoints = 2;
 }
 
+/// One chunk of a streaming peer-hints emission. Carries up to
+/// `PEER_HINTS_PER_CHUNK` `PeerHint` entries plus the operation_id the
+/// hints were generated for (informational only — the worker does NOT key
+/// any state by operation_id; hints register directly into the worker's
+/// global `peer_locality_map` as chunks arrive). `sequence` is monotonic
+/// 0,1,2,... within one stream and `is_last` marks the terminal chunk.
+///
+/// Direct-merge design (2026-04-24): there is no per-action buffer, no
+/// chunk-count field on `StartExecute`, no race between chunk arrival and
+/// action dispatch. Chunks may arrive before, after, or interleaved with
+/// `StartAction` for any operation_id; each chunk's hints become available
+/// as soon as it's processed.
+message PeerHintsChunk {
+    /// Up to PEER_HINTS_PER_CHUNK hints (worker-side default: 256).
+    repeated PeerHint peer_hints = 1;
+    /// The scheduler-side operation_id these hints were generated for.
+    /// Diagnostics-only; the worker doesn't key state on it.
+    string operation_id = 2;
+    /// Monotonic sequence within one operation_id's hint stream.
+    uint32 sequence = 3;
+    /// True on the FINAL chunk of one operation_id's stream. The final
+    /// chunk MAY be empty (when `peer_hints.len() % PEER_HINTS_PER_CHUNK
+    /// == 0`); receivers MUST tolerate that.
+    bool is_last = 4;
+}
+
+/// A streaming-message envelope shared across the cas→worker, scheduler→
+/// worker, and worker→scheduler chunk producers. Exactly ONE of the
+/// `oneof payload` arms is set; receivers route on the arm.
+///
+/// Today's payloads (added incrementally per the streaming-design plan):
+///   * `peer_hints` — task #98 (this PR)
+/// Reserved for follow-up PRs:
+///   * `blobs_in_stable_storage` — task #97 (PR1)
+///   * `blobs_available` — task #99 (PR3)
+message ChunkedMessage {
+    oneof payload {
+        PeerHintsChunk peer_hints = 1;
+    }
+}
+
 /// The result of an ExecutionRequest.
 message ExecuteResult {
     /// The `instance_name` this task was initially assigned to. This is set by the client
@@ -399,6 +440,14 @@ message UpdateForWorker {
         /// `Ok(())` rather than `?`-propagating). NO capability flag
         /// is required.
         BatchWriteSmallBlobsRequest batch_write_small_blobs = 10;
+        /// One chunk of a streaming protocol message. Today carries
+        /// `PeerHintsChunk` (task #98); future PRs add other payload
+        /// arms (`BlobsInStableStorageChunk`, `BlobsAvailableChunk`).
+        /// Receivers MUST be prepared to see chunks for an operation
+        /// before, after, or interleaved with `start_action` for the
+        /// same operation_id (no ordering invariant — each chunk's
+        /// payload is independently meaningful).
+        ChunkedMessage chunked_message = 11;
     }
     reserved 6; // Previously NextId, now reserved.
 }
@@ -463,10 +512,6 @@ message StartExecute {
     /// The ID of the worker that is executing the action.
     string worker_id = 6;
 
-    /// Hints about input blobs available on peer workers.
-    /// Workers should try these peers first before falling back to server CAS.
-    repeated PeerHint peer_hints = 8;
-
     /// Pre-resolved input directory tree from the scheduler.
     /// The scheduler already resolves the tree for locality scoring; including
     /// it here lets the worker skip its own GetTree RPC. Parallel arrays:
@@ -485,6 +530,9 @@ message StartExecute {
     /// normal error-recovery path.
     repeated build.bazel.remote.execution.v2.Digest missing_digests = 11;
 
+    reserved 8; // Previously `peer_hints`; replaced by streaming
+                // `ChunkedMessage::PeerHintsChunk` in #98 (no
+                // backwards-compat per user directive 2026-04-24).
     reserved 12; // NextId.
 }
 
