@@ -404,7 +404,38 @@ impl GrpcStore {
     /// `running_actions_manager::resolve_directory_tree` consuming a
     /// `Streaming<GetTreeResponse>`) can apply the same recovery.
     pub fn evict_pool_on_transport_err(&self, err: &Error) {
-        if !looks_like_dead_channel(err) {
+        // #147 trace: log every call, including no-op cases. Hypothesis
+        // (a) "evict is never called" is verified by counting these
+        // log lines per failed get_part. Hypothesis (c)/(d) "the
+        // predicate doesn't match the production error shape" is
+        // verified by comparing `predicate_matched` against the error
+        // code+message head we log alongside the failure site.
+        let predicate_matched = looks_like_dead_channel(err);
+        // Truncate the first message to the first 80 chars to avoid
+        // log spam from long upstream-stack messages while preserving
+        // enough text to disambiguate "Tried to send while stream is
+        // closed" from "broken pipe" from "h2 protocol error" etc.
+        let msg_head: &str = err
+            .messages
+            .first()
+            .map(|m| m.as_str())
+            .unwrap_or("<no_message>");
+        let msg_head_short: String = msg_head.chars().take(80).collect();
+        let transport_kind: &str = match &self.transport {
+            Transport::Tcp(_) => "tcp",
+            #[cfg(feature = "quic")]
+            Transport::Quic(_) => "quic",
+            #[cfg(feature = "quic")]
+            Transport::Dual { .. } => "dual",
+        };
+        info!(
+            code = ?err.code,
+            %msg_head_short,
+            predicate_matched,
+            transport_kind,
+            "GrpcStore::evict_pool_on_transport_err entry (#147 trace)",
+        );
+        if !predicate_matched {
             return;
         }
         let reason = format!("transport-shaped err in retry: code={:?}", err.code);
@@ -883,9 +914,22 @@ impl GrpcStore {
                 tonic::metadata::MetadataValue::from_static("true"),
             );
         }
+        // #147 trace: capture the resource_name BEFORE the request
+        // moves into the gRPC call so we can log "channel X selected
+        // for resource Y" — the same resource_name appears in
+        // get_part_single_stream's logs, providing a join key.
+        let resource_for_log = grpc_request.get_ref().resource_name.clone();
         let mut response = match &self.transport {
             Transport::Tcp(cm) => {
                 let channel = cm.connection("bytestream_read".into()).await.err_tip(|| "in read_internal")?;
+                let (ep_idx, conn_idx) = channel.channel_id_for_log();
+                info!(
+                    resource_name = %resource_for_log,
+                    transport = "tcp",
+                    endpoint_index = ep_idx,
+                    connection_index = conn_idx,
+                    "GrpcStore::read_internal channel acquired (#147 trace)",
+                );
                 self.bs_client(channel)
                     .read(grpc_request)
                     .await
@@ -894,6 +938,11 @@ impl GrpcStore {
             }
             #[cfg(feature = "quic")]
             Transport::Quic(ch) => {
+                info!(
+                    resource_name = %resource_for_log,
+                    transport = "quic",
+                    "GrpcStore::read_internal channel acquired (#147 trace)",
+                );
                 self.bs_client(ch.clone())
                     .read(grpc_request)
                     .await
@@ -906,6 +955,14 @@ impl GrpcStore {
                     // Parallel chunked reads: prefer TCP (2x faster at
                     // high concurrency)
                     let channel = tcp.connection("bytestream_read".into()).await.err_tip(|| "in read_internal (dual/tcp)")?;
+                    let (ep_idx, conn_idx) = channel.channel_id_for_log();
+                    info!(
+                        resource_name = %resource_for_log,
+                        transport = "dual/tcp",
+                        endpoint_index = ep_idx,
+                        connection_index = conn_idx,
+                        "GrpcStore::read_internal channel acquired (#147 trace)",
+                    );
                     self.bs_client(channel)
                         .read(grpc_request)
                         .await
@@ -913,6 +970,11 @@ impl GrpcStore {
                         .into_inner()
                 } else {
                     // Single-stream reads: prefer QUIC (2.6x faster)
+                    info!(
+                        resource_name = %resource_for_log,
+                        transport = "dual/quic",
+                        "GrpcStore::read_internal channel acquired (#147 trace)",
+                    );
                     self.bs_client(quic.clone())
                         .read(grpc_request)
                         .await
@@ -1561,6 +1623,39 @@ impl GrpcStore {
                             "While sending in GrpcStore::get_part()"
                         })
                     {
+                        // #147 trace: classify whether this writer-side
+                        // error LOOKS like a dead-channel error (it
+                        // SHOULDN'T — this is the downstream
+                        // buf_channel reader being dropped, not the
+                        // upstream gRPC channel being broken — but the
+                        // production error string "Tried to send while
+                        // stream is closed" is generated here AND
+                        // matches `looks_like_dead_channel`. If we
+                        // observe this branch firing in production
+                        // with `looks_like_dead = true`, it means the
+                        // 109k events are caused by writer-termination
+                        // (caller dropped the read half), NOT by
+                        // upstream channel staleness, and adding
+                        // eviction here would be a misdiagnosis fix.
+                        let looks_like_dead = looks_like_dead_channel(&err);
+                        let msg_head: &str = err
+                            .messages
+                            .first()
+                            .map(|m| m.as_str())
+                            .unwrap_or("<no_message>");
+                        let msg_head_short: String =
+                            msg_head.chars().take(80).collect();
+                        warn!(
+                            resource_name = %local_state.resource_name,
+                            attempt = local_state.attempt,
+                            bytes_received_this_stream =
+                                local_state.bytes_received_this_stream,
+                            chunk_len = length,
+                            code = ?err.code,
+                            %msg_head_short,
+                            looks_like_dead,
+                            "GrpcStore::get_part_single_stream writer.send failed (#147 trace) — RetryResult::Err returned, no eviction invoked",
+                        );
                         return Some((RetryResult::Err(err), local_state));
                     }
                     local_state.read_offset += length;

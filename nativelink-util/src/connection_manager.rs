@@ -26,7 +26,7 @@ use rand::Rng;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tonic::transport::{Channel, Endpoint, channel};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::background_spawn;
 use crate::retry::{self, Retrier, RetryResult};
@@ -544,10 +544,16 @@ impl ConnectionManagerWorker {
                 if let Some(prev) = self.last_evict_at.get(&dedup_key)
                     && now.duration_since(*prev) < EVICT_DEDUP_WINDOW
                 {
-                    debug!(
+                    // Promoted to info! during the #147 production
+                    // investigation: hypothesis (b) is "eviction IS
+                    // requested but the dedup gate swallows it." If
+                    // the journal shows N "Tried to send while stream
+                    // is closed" errors and N-1 of these dedup
+                    // messages, we're masking a real recurring need.
+                    info!(
                         %reason,
                         ?endpoint_uri,
-                        "ConnectionManager: EvictIdle deduped within window"
+                        "ConnectionManager: EvictIdle deduped within window (#147 trace)"
                     );
                     return;
                 }
@@ -579,10 +585,23 @@ impl ConnectionManagerWorker {
                     );
                     self.connect_endpoint(endpoint_index, Some(connection_index));
                 } else {
-                    debug!(
+                    // Promoted to info! during the #147 production
+                    // investigation: this fires when EvictIdle is
+                    // requested but every channel for the matching
+                    // endpoint is currently checked-out (in use by an
+                    // in-flight RPC). When that happens, the eviction
+                    // is silently dropped — no reconnect is queued —
+                    // so a stale-channel-checked-out-during-burst
+                    // scenario would leave the dead channel in service
+                    // until it returns to idle and a future eviction
+                    // catches it. Surfacing this fires the alarm if
+                    // the dead-channel pattern is producing many
+                    // unmatched evictions.
+                    info!(
                         %reason,
                         ?endpoint_uri,
-                        "ConnectionManager: EvictIdle requested but no matching idle channel"
+                        available_channels = self.available_channels.len(),
+                        "ConnectionManager: EvictIdle requested but no matching idle channel (#147 trace)"
                     );
                 }
             }
@@ -607,6 +626,24 @@ pub struct Connection {
     pending_channel: Option<Channel>,
     /// The identifier to send to `tx`.
     channel: EstablishedChannel,
+}
+
+impl Connection {
+    /// Returns `(endpoint_index, connection_index)` for diagnostic
+    /// logging only. Used by `GrpcStore::get_part_single_stream` to
+    /// correlate "blob X read at 09:54:01 succeeded on channel (0,3)"
+    /// with "blob X read at 09:54:01.150 failed on channel (0,3)" — a
+    /// repeating pattern would be the smoking gun for #147 stale-pool
+    /// reuse. Do NOT use as a stable identifier across reconnects:
+    /// `connection_index` is reset to a fresh value when an endpoint's
+    /// channel is reconnected, so the same `(ep, conn)` pair can refer
+    /// to physically different h2 connections over time.
+    pub fn channel_id_for_log(&self) -> (usize, usize) {
+        (
+            self.channel.identifier.endpoint_index,
+            self.channel.identifier.connection_index,
+        )
+    }
 }
 
 impl Drop for Connection {
