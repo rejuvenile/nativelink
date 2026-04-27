@@ -71,6 +71,21 @@ jobs:
           nix develop --impure --command
           bash -c "cargo test --all --profile=smol"
 
+      - name: Test mirror durability (test-utils feature)
+        # The mirror_durability / blobs_in_stable_storage / download_to_directory
+        # mirror / mirror_capacity_plumbing / local_worker BIS-dispatch integration
+        # tests are gated on the `test-utils` feature so the internal-only test
+        # hooks (`set_mirror_blobs_max_bytes_for_test`,
+        # `BlobsAvailableState::new_for_test`, `mirror_capacity_for_test`) cannot
+        # leak into release builds. The default `--all` step above does NOT pass
+        # the feature flag, so these tests would otherwise be silently skipped
+        # from CI (cargo with `required-features` skips the test bin entirely
+        # without erroring). Mirrors the equivalent step in native-cargo.yaml.
+        # (#97 follow-up: closes silent-skip on local_worker_test.)
+        run: >
+          nix develop --impure --command
+          bash -c "cargo test -p nativelink-store -p nativelink-worker -p nativelink-service --features nativelink-store/test-utils --features nativelink-worker/test-utils --features nativelink-service/test-utils --tests --profile=smol"
+
   installation:
     strategy:
       fail-fast: false
