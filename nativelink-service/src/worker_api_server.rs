@@ -628,6 +628,13 @@ impl WorkerConnection {
             // connection). Hold the endpoint_state mutex across the
             // locality_map.write() so no other thread can flip the
             // owner out from under us between the check and the wipe.
+            //
+            // The dispatcher's `unregister_worker` + `unpin_on_disconnect`
+            // calls are made INSIDE the same ownership-check guard
+            // (per code-reviewer #168 MAJOR-2): a same-epoch reconnect
+            // race that has already claimed the endpoint must NOT have
+            // its dispatcher state clobbered by the OLD connection's
+            // disconnect-cleanup task.
             if !instance.cas_endpoint.is_empty() {
                 let mut state = instance.endpoint_state.lock();
                 let current_owner = state
@@ -636,6 +643,35 @@ impl WorkerConnection {
                 if current_owner.as_ref() == Some(&instance.worker_id) {
                     if let Some(ref locality_map) = instance.locality_map {
                         locality_map.write().remove_endpoint(&instance.cas_endpoint);
+                    }
+                    // task #168 (item 6 + unpin_on_disconnect refactor):
+                    //
+                    //   1. Drop the worker_tx the dispatcher holds so any
+                    //      in-flight per-(worker, store) drainer task
+                    //      exits gracefully (its UnboundedSender clones
+                    //      drop, the mpsc Receiver hits None, the
+                    //      drainer returns). Also drops the per-(worker,
+                    //      store) queue Senders so a stale boot_epoch
+                    //      reconnect does not inherit dead queues.
+                    //   2. Release the in-flight server-side push
+                    //      tracker (`EphemeralServerSidePin`) for this
+                    //      worker — the disconnected worker can no
+                    //      longer ack pushed blobs via
+                    //      `BlobsAvailable.pinned_mirror_entries`, so
+                    //      without this call `pin_max_bytes` would
+                    //      fill with ghost pins until the dispatcher
+                    //      rejected new admissions with
+                    //      ResourceExhausted. (TTL-based eviction was
+                    //      removed in the unpin_on_disconnect refactor;
+                    //      explicit release on disconnect replaces it.)
+                    //
+                    // Both calls are gated by the same
+                    // owner-still-matches check that gates the
+                    // locality_map.write() above (per code-reviewer
+                    // #168 MAJOR-2).
+                    if let Some(ref dispatcher) = instance.small_blob_dispatcher {
+                        dispatcher.unregister_worker(&instance.cas_endpoint, instance.boot_epoch);
+                        dispatcher.unpin_on_disconnect(&instance.cas_endpoint, instance.boot_epoch);
                     }
                     // Drop the per-endpoint state: with no live
                     // connection on this endpoint, any future connect
@@ -657,19 +693,6 @@ impl WorkerConnection {
                         ?current_owner,
                         "Skipped locality_map wipe on disconnect — endpoint has been claimed by a newer connection"
                     );
-                }
-            }
-
-            // task #168 (item 6): drop the worker_tx the dispatcher
-            // holds so any in-flight per-(worker, store) drainer task
-            // exits gracefully (its UnboundedSender clones drop, the
-            // mpsc Receiver hits None, the drainer returns). Per
-            // SmallBlobDispatcher::unregister_worker doc: also drops
-            // the per-(worker, store) queue Senders so a stale
-            // boot_epoch reconnect does not inherit dead queues.
-            if let Some(ref dispatcher) = instance.small_blob_dispatcher {
-                if !instance.cas_endpoint.is_empty() {
-                    dispatcher.unregister_worker(&instance.cas_endpoint, instance.boot_epoch);
                 }
             }
 
