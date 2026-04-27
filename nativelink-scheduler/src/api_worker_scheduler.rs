@@ -1784,10 +1784,19 @@ impl ApiWorkerScheduler {
         // same disconnect and trigger eviction there, (b) chunks are
         // best-effort hints whose loss only degrades to LRU/MRU
         // selection at the worker.
-        if let (Some((worker_id, tx, _)), Some(arc)) =
-            (result.as_ref(), scoring_result.as_deref())
-        {
-            let hints: &Arc<[PeerHint]> = &arc.1;
+        // Always emit at least one terminal chunk per action — even when
+        // `scoring_result` is None (no resolved tree → no hints possible).
+        // This guarantees a stable protocol invariant on the worker: every
+        // operation_id gets exactly one `is_last = true` chunk, mirroring
+        // the `chunk_iter` empty-input contract. Receivers (and the
+        // simple_scheduler_test helper) can rely on this terminal marker
+        // rather than inferring "no chunks coming" from absence.
+        if let Some((worker_id, tx, _)) = result.as_ref() {
+            let empty: Arc<[PeerHint]> = Arc::from(Vec::<PeerHint>::new());
+            let hints: &Arc<[PeerHint]> = match scoring_result.as_deref() {
+                Some(arc) => &arc.1,
+                None => &empty,
+            };
             self.emit_peer_hints_chunks(worker_id, tx, operation_id, hints);
         }
 

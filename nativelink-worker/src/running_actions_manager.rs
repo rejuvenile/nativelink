@@ -4381,9 +4381,14 @@ pub struct RunningActionsManagerArgs<'a> {
     pub max_upload_timeout: Duration,
     pub timeout_handled_externally: bool,
     pub directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
-    /// Worker-local locality map for registering peer hints from StartExecute.
-    /// When present, peer_hints from the scheduler are registered here so that
-    /// WorkerProxyStore can fetch blobs from peer workers.
+    /// Worker-local locality map. As of #98 (peer-hints chunking) this is
+    /// kept here only for caller-side API compatibility — peer hints now
+    /// register into the worker's global map via
+    /// `Update::ChunkedMessage(PeerHints)` on the scheduler->worker stream
+    /// (see `local_worker::handle_peer_hints_chunk`). The
+    /// `RunningActionsManagerImpl` ignores this field; callers may pass
+    /// `None`. The field will be removed in a follow-up that touches the
+    /// worker setup site.
     pub peer_locality_map: Option<nativelink_util::blob_locality_map::SharedBlobLocalityMap>,
 }
 
@@ -4432,8 +4437,6 @@ pub struct RunningActionsManagerImpl {
     /// Optional directory cache for improving performance by caching reconstructed
     /// input directories and using hardlinks.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
-    /// Worker-local locality map for registering peer hints from StartExecute.
-    peer_locality_map: Option<nativelink_util::blob_locality_map::SharedBlobLocalityMap>,
 }
 
 impl RunningActionsManagerImpl {
@@ -4461,6 +4464,12 @@ impl RunningActionsManagerImpl {
             .get_arc()
             .err_tip(|| "FilesystemStore's internal Arc was lost")?;
         let (action_done_tx, _) = watch::channel(());
+        // args.peer_locality_map is intentionally dropped — peer hints
+        // now arrive on the scheduler->worker stream as
+        // `Update::ChunkedMessage(PeerHints)` and register directly into
+        // the worker's global map (#98). The field is kept on
+        // `RunningActionsManagerArgs` for caller-side API compatibility.
+        let _ = args.peer_locality_map;
         Ok(Self {
             root_action_directory: args.root_action_directory,
             execution_configuration: args.execution_configuration,
@@ -4482,7 +4491,6 @@ impl RunningActionsManagerImpl {
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
-            peer_locality_map: args.peer_locality_map,
         })
     }
 
