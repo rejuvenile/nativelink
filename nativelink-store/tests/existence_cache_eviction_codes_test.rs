@@ -326,3 +326,74 @@ async fn batch_get_part_data_loss_evicts_cache() -> Result<(), Error> {
 
     Ok(())
 }
+
+// -------------------------------------------------------------------
+// 7. Stale-positive removal MUST surface as error!-level log.
+//
+// Per CLAUDE.md "be NOISY when impossible state happens": a
+// stale-positive in the existence cache (`has` says yes, `get_part`
+// returns NotFound on the same blob) is a contract violation — the
+// inner store lost data after we cached its existence, OR the cache
+// was populated by something other than a verified write, OR the
+// inner store's `has()` returned a stale positive itself. None of
+// these should happen in normal operation. Production saw 14,776
+// "not found in inner store or any worker" errors in ~24h — many
+// of which are these stale positives. They MUST be visible to
+// operators at error level so the systemic issue surfaces.
+//
+// This test:
+//   1. Primes the cache via update_oneshot (cache becomes positive)
+//   2. Bypasses the cache to verify the digest is cached
+//   3. Calls get_part with the inner store wired to return NotFound
+//   4. Asserts the get_part returns NotFound
+//   5. Asserts the cache entry was removed
+//   6. Asserts an error!-level log fired with "stale positive" wording
+//      and the actual digest (so operators can correlate)
+//
+// `nativelink_test` macro applies `#[traced_test]`; `logs_contain`
+// returns true if any captured event contains the given substring
+// across ALL levels — but the message MUST mention "stale positive"
+// so we know the error! call (not some debug! line) fired.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn get_part_not_found_logs_error_for_stale_positive() -> Result<(), Error> {
+    let (store, _err_store, digest) = make_primed_cache_store(Code::NotFound).await?;
+
+    // Sanity: cache MUST be primed before we can claim a stale positive.
+    assert!(
+        store.exists_in_cache(&digest).await,
+        "precondition: cache must contain the digest after the priming \
+         write — otherwise get_part wouldn't be detecting a stale positive"
+    );
+
+    let result = store.get_part_unchunked(digest, 0, None).await;
+    assert!(result.is_err(), "get_part must propagate NotFound");
+    assert_eq!(result.unwrap_err().code, Code::NotFound);
+
+    assert!(
+        !store.exists_in_cache(&digest).await,
+        "NotFound must remove the stale cache entry (regression guard)"
+    );
+
+    // The error log MUST fire. Without this, 14k+ stale positives per
+    // day stay invisible to operators.
+    assert!(
+        logs_contain("existence cache stale positive"),
+        "expected error!-level log with 'existence cache stale positive' \
+         when ExistenceCacheStore::get_part removes a stale entry — without \
+         it operators have no way to see the cache invariant being violated \
+         in production (14,776 events / 24h on buildcache 2026-04-26)"
+    );
+
+    // Specificity: the digest MUST appear in the log so operators can
+    // correlate against upstream/downstream traces. A log saying only
+    // "stale positive detected" without the offending digest is useless.
+    let digest_str = format!("{digest}");
+    assert!(
+        logs_contain(&digest_str),
+        "expected the offending digest {digest_str} in the stale-positive \
+         error log so operators can grep for it"
+    );
+
+    Ok(())
+}

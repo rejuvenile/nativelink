@@ -313,7 +313,29 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         if debug_digest_match(&digest) {
             info!(?digest, source = "update_remove_stale", "DEBUG: ExistenceCacheStore removing wedge digest (update path: inner.has=None)");
         }
-        self.existence_cache.remove(&digest).await;
+        // Peek-then-remove pattern: the cache size tells operators what
+        // the cache had been claiming about this blob. Stale-positive
+        // here means cache said "yes I have it (size=N)" but inner.has()
+        // said "no I don't" — caller is now re-uploading to fix it.
+        // Even though the upload heals the user-visible symptom, the
+        // underlying invariant violation must surface so the systemic
+        // cause gets fixed (otherwise repeated cache lies waste
+        // bandwidth re-uploading the same blob).
+        let prior_size = self.existence_cache.size_for_key(&digest).await;
+        let removed = self.existence_cache.remove(&digest).await;
+        if removed {
+            error!(
+                %digest,
+                ?prior_size,
+                "existence cache stale positive (update path): cache claimed \
+                 blob present but inner store's has() returned None; \
+                 removed stale entry and will re-upload. possible causes: \
+                 (a) inner-store data loss after cache population, (b) \
+                 cache populated by a path other than a verified successful \
+                 update, (c) eviction race where moka's async eviction \
+                 callback hasn't fired yet to remove the entry",
+            );
+        }
         // Track that an update is in progress. Eviction callbacks fire
         // normally (no queuing) — they just remove from the existence
         // cache, which is idempotent. We re-insert after a successful
@@ -400,7 +422,22 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         if debug_digest_match(&digest) {
             info!(?digest, source = "update_oneshot_remove_stale", "DEBUG: ExistenceCacheStore removing wedge digest (update_oneshot path: inner.has=None)");
         }
-        self.existence_cache.remove(&digest).await;
+        // Mirror the update() path's stale-positive logging contract.
+        let prior_size = self.existence_cache.size_for_key(&digest).await;
+        let removed = self.existence_cache.remove(&digest).await;
+        if removed {
+            error!(
+                %digest,
+                ?prior_size,
+                "existence cache stale positive (update_oneshot path): cache \
+                 claimed blob present but inner store's has() returned None; \
+                 removed stale entry and will re-upload. possible causes: \
+                 (a) inner-store data loss after cache population, (b) \
+                 cache populated by a path other than a verified successful \
+                 update, (c) eviction race where moka's async eviction \
+                 callback hasn't fired yet to remove the entry",
+            );
+        }
 
         // Failpoint: simulate inner store oneshot write failure. Verifies
         // that the existence cache is NOT populated on write failure.
@@ -491,7 +528,41 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 if debug_digest_match(&digest) {
                     info!(?digest, code = ?err.code, source = "get_part_remove_unrecoverable", "DEBUG: ExistenceCacheStore PRE-remove wedge digest (get_part path: inner unrecoverable error)");
                 }
-                self.existence_cache.remove(&digest).await;
+                // Peek the prior cached size BEFORE removing so the
+                // error log can report what the cache claimed. A stale
+                // positive == cache had a sized entry but inner store
+                // can't deliver it. If the cache had no entry to begin
+                // with this isn't a stale positive, just an honest
+                // NotFound from a never-cached digest — log nothing.
+                let prior_size = self.existence_cache.size_for_key(&digest).await;
+                let removed = self.existence_cache.remove(&digest).await;
+                if removed {
+                    // Surface stale positives loudly. Per CLAUDE.md "be
+                    // NOISY when impossible state happens": the cache
+                    // claimed this blob existed and then the inner store
+                    // failed to deliver it. None of the four root causes
+                    // listed below should happen in normal operation —
+                    // each indicates a real bug that operators need to
+                    // see. 14,776 such events / 24h on buildcache
+                    // (2026-04-26) were invisible at debug-only logging.
+                    error!(
+                        %digest,
+                        ?prior_size,
+                        inner_code = ?err.code,
+                        ?err,
+                        "existence cache stale positive: cache claimed blob \
+                         present but inner store returned unrecoverable \
+                         error on read; removed stale entry. possible \
+                         causes: (a) inner-store data loss after cache \
+                         population (eviction race / OOM-killed mid-write \
+                         / disk corruption), (b) cache populated by a \
+                         path other than a verified successful update \
+                         (has() return value trusted blindly), (c) inner \
+                         store's has() returned a stale positive itself \
+                         (e.g. cached existence beneath a missing blob \
+                         on disk)",
+                    );
+                }
                 if debug_digest_match(&digest) {
                     info!(?digest, code = ?err.code, source = "get_part_remove_unrecoverable", "DEBUG: ExistenceCacheStore POST-remove wedge digest (cache.remove returned, about to return Err to caller)");
                 }
@@ -514,7 +585,13 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         // single insert_many() call (one run_pending_tasks() at the end)
         // instead of N sequential insert() calls.
         let mut inserts = Vec::new();
-        let mut removals = Vec::new();
+        // Carry both the digest and the inner-store error code so the
+        // stale-positive log on the removal pass has the same context as
+        // the per-digest `get_part` site (digest, prior cached size,
+        // inner code). Without the code carried through, the operator
+        // sees "stale positive" with no hint of WHY the inner store
+        // refused (NotFound vs DataLoss vs Internal vs OutOfRange).
+        let mut removals: Vec<(DigestInfo, Code, Error)> = Vec::new();
         for (digest, result) in digests.iter().zip(results.iter()) {
             match result {
                 Ok(_) => {
@@ -529,7 +606,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                     if debug_digest_match(digest) {
                         info!(?digest, code = ?err.code, source = "batch_get_part_unchunked_remove_unrecoverable", "DEBUG: ExistenceCacheStore removing wedge digest (batch_get_part_unchunked: unrecoverable)");
                     }
-                    removals.push(*digest);
+                    removals.push((*digest, err.code, err.clone()));
                 }
                 Err(_) => {}
             }
@@ -537,8 +614,27 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         if !inserts.is_empty() {
             drop(self.existence_cache.insert_many(inserts).await);
         }
-        for digest in removals {
-            self.existence_cache.remove(&digest).await;
+        for (digest, inner_code, err) in removals {
+            // Mirror the per-digest get_part site's stale-positive
+            // logging contract — peek the prior cached size, remove,
+            // log error! only if a stale entry actually existed.
+            let prior_size = self.existence_cache.size_for_key(&digest).await;
+            let removed = self.existence_cache.remove(&digest).await;
+            if removed {
+                error!(
+                    %digest,
+                    ?prior_size,
+                    ?inner_code,
+                    ?err,
+                    "existence cache stale positive (batch_get_part): cache \
+                     claimed blob present but inner store returned \
+                     unrecoverable error on read; removed stale entry. \
+                     possible causes: (a) inner-store data loss after \
+                     cache population, (b) cache populated by a path other \
+                     than a verified successful update, (c) inner store's \
+                     has() returned a stale positive itself",
+                );
+            }
         }
         results
     }
