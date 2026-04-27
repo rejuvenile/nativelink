@@ -2178,3 +2178,471 @@ async fn inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_writer_termin
 
     Ok(())
 }
+
+// =====================================================================
+// CDN-tee: peer-fetched bytes populate local CAS so subsequent reads
+// hit local instead of going back to the peer
+// =====================================================================
+//
+// Why this matters: every server-side read of a digest the existence
+// cache claims-but-CAS-doesn't-have triggers a peer-fetch. Without a
+// tee, EVERY repeat read goes to the peer — the peer-fetch path gets
+// hit over and over for the same digest. CDN-tee converts the second
+// read into a local hit, eliminating the structural amplification.
+//
+// Asymmetric contract coverage (per CLAUDE.md §Tests):
+//   * UNDER-action: tee doesn't fire when it should (Test 1) — no
+//     caching, every read is a peer-fetch, peer load amplifies.
+//   * OVER-action: tee fires when it shouldn't (Test 2) — partial-range
+//     bytes get cached as if they were the full blob, corrupting local
+//     CAS.
+
+/// Test 1 (UNDER-action guard): a successful peer-fetch through the
+/// production composition (ExistenceCache → Verify → FastSlow) must
+/// populate the local inner store with the fetched bytes, so a
+/// subsequent has() returns Some(size).
+///
+/// Wrapped in a 5s timeout — the tee runs as a background task and
+/// must complete within that window. A timeout means the cache write
+/// future is wedged or the writer-termination contract is broken.
+///
+/// Mutation step: comment out the `inner.update(...)` call inside
+/// `get_part_and_cache` (or the tee code added to the parallel path
+/// when peer wins). Test must fail with the assertion message below.
+#[nativelink_test]
+async fn cdn_cache_populates_local_on_first_peer_fetch() -> Result<(), Error> {
+    use core::time::Duration;
+
+    let value: Vec<u8> = (0..10_000u32).map(|i| (i & 0xFF) as u8).collect();
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    // Production composition: ExistenceCache → Verify(verify_size=true)
+    // → FastSlow(Memory, Memory). This is what wraps WorkerProxyStore
+    // on the server side.
+    let fast_slow = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let verify = Store::new(VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        fast_slow,
+    ));
+    let existence_cache = Store::new(ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1_000_000,
+                ..Default::default()
+            }),
+        },
+        verify,
+    ));
+
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc =
+        WorkerProxyStore::new(existence_cache.clone(), locality_map.clone());
+    let proxy = Store::new(proxy_arc.clone());
+
+    // Peer holds the blob.
+    let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_inner
+        .update_oneshot(digest, Bytes::from(value.clone()))
+        .await?;
+    let peer_endpoint = "grpc://cdn-tee-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_inner);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    // Sanity: inner does not have it yet.
+    let mut pre_check = [None];
+    existence_cache
+        .has_with_results(&[digest.into()], &mut pre_check)
+        .await?;
+    assert_eq!(
+        pre_check[0], None,
+        "precondition: inner CAS must NOT have the blob before the peer-fetch",
+    );
+
+    // First read: must fetch from peer AND tee into local CAS.
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(5),
+        proxy.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "tee must complete within 5s — likely deadlock in writer-termination \
+         contract or background cache_write task wedged",
+    )?;
+    assert_eq!(
+        bytes.len(),
+        value.len(),
+        "peer bytes must be returned to the caller in full",
+    );
+    assert_eq!(bytes.as_ref(), value.as_slice());
+
+    // The tee runs concurrently with delivery via tokio::join! in
+    // get_part_and_cache, so by the time get_part_unchunked returns,
+    // the cache write has also completed. Poll-with-timeout below
+    // is defensive in case the tee design moves to fire-and-forget.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last_seen: Option<u64> = None;
+    while std::time::Instant::now() < deadline {
+        let mut probe = [None];
+        existence_cache
+            .has_with_results(&[digest.into()], &mut probe)
+            .await?;
+        last_seen = probe[0];
+        if last_seen.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        last_seen,
+        Some(value.len() as u64),
+        "CDN tee MUST populate local CAS after peer-fetch — without this, \
+         every subsequent read of this digest re-fetches from the peer, \
+         producing the structural amplification that motivates CDN-tee",
+    );
+
+    // End-to-end proof: drop the peer connection so a subsequent
+    // peer-fetch would fail. If the tee correctly populated local
+    // CAS, the second read hits local and succeeds; if not, it
+    // panics on the empty locality_map / unreachable peer.
+    proxy_arc.remove_worker_endpoint(peer_endpoint);
+    locality_map
+        .write()
+        .evict_blobs(peer_endpoint, &[digest]);
+
+    let bytes2 = tokio::time::timeout(
+        Duration::from_secs(5),
+        proxy.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect("second read must complete within 5s")?;
+    assert_eq!(
+        bytes2.as_ref(),
+        value.as_slice(),
+        "after CDN tee, the second read must hit local CAS — without the \
+         tee, this read would fail because the peer is gone",
+    );
+
+    Ok(())
+}
+
+/// Test 2 (OVER-action guard): a partial-range read from a peer must
+/// NOT populate local CAS. Caching partial bytes would corrupt the
+/// local store — the cached "blob" would be a prefix, suffix, or
+/// middle slice of the real blob, but the digest would still claim
+/// it represents the FULL bytes. Subsequent reads of the same digest
+/// would return wrong data.
+///
+/// Implementation: use a `RecordingInnerStore` so we observe whether
+/// the tee called `update()` at all. Doing so via the production
+/// chain (which happens to reject partial bytes via VerifyStore) would
+/// pass the test for the wrong reason — the guard could be removed
+/// and the test would still pass because VerifyStore caught the
+/// mistake. We want the test to fire on the OVER-ACTION itself
+/// (tee invocation), not the downstream defense.
+///
+/// Mutation step: remove the partial-range guard
+/// (`offset == 0 && length.is_none()`) inside `get_part_and_cache`.
+/// Test must then fail because `RecordingInnerStore::update_calls`
+/// becomes 1 instead of 0.
+#[nativelink_test]
+async fn cdn_cache_does_not_populate_on_partial_range_read() -> Result<(), Error> {
+    use core::sync::atomic::AtomicU64;
+    use core::sync::atomic::Ordering as AOrdering;
+    use core::time::Duration;
+
+    let value: Vec<u8> = (0..10_000u32).map(|i| (i & 0xFF) as u8).collect();
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    let recording = Arc::new(RecordingInnerStore {
+        update_calls: AtomicU64::new(0),
+    });
+    let recording_for_assert = recording.clone();
+    let inner = Store::new(recording);
+
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
+    let proxy = Store::new(proxy_arc.clone());
+
+    let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_inner
+        .update_oneshot(digest, Bytes::from(value.clone()))
+        .await?;
+    let peer_endpoint = "grpc://cdn-tee-partial-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_inner);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    // Partial-range read: offset=10, length=Some(100).
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(5),
+        proxy.get_part_unchunked(digest, 10, Some(100)),
+    )
+    .await
+    .expect("partial-range read must complete within 5s")?;
+
+    assert_eq!(
+        bytes.len(),
+        100,
+        "partial bytes must be returned correctly",
+    );
+    assert_eq!(bytes.as_ref(), &value[10..110]);
+
+    // CRITICAL: tee MUST NOT have called inner.update() — partial-range
+    // bytes would corrupt the local CAS under the full-blob digest.
+    // Wait briefly to give any (incorrect) background tee task time to
+    // fire so we don't false-pass on a race.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let calls = recording_for_assert.update_calls.load(AOrdering::SeqCst);
+    assert_eq!(
+        calls, 0,
+        "CDN tee MUST NOT populate local CAS on partial-range read — \
+         caching prefix/middle bytes under the full-blob digest corrupts \
+         every subsequent read; observed {calls} update() call(s) when 0 \
+         was expected",
+    );
+
+    Ok(())
+}
+
+/// Inner store that records every update() call. NotFound on
+/// has_with_results / get_part forces the proxy to fall through to
+/// the peer. Used by Test 2 to detect tee OVER-action regardless of
+/// whether the recorded bytes would have been accepted downstream.
+#[derive(Debug, MetricsComponent)]
+struct RecordingInnerStore {
+    #[metric(help = "Number of update() calls observed")]
+    update_calls: core::sync::atomic::AtomicU64,
+}
+
+default_health_status_indicator!(RecordingInnerStore);
+
+#[async_trait]
+impl StoreDriver for RecordingInnerStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        for slot in results.iter_mut().take(digests.len()) {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        self.update_calls
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        let _drained = reader.drain().await;
+        Ok(())
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(
+            Code::NotFound,
+            "RecordingInnerStore: get_part NotFound (peer-fetch must take over)",
+        ))
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+/// Test 3: a tee failure (e.g. inner.update() returns Err) must NOT
+/// fail the original read. The peer's bytes must still be delivered
+/// to the caller; the tee is best-effort.
+///
+/// This is structurally enforced by `get_part_and_cache`: the cache
+/// write future is part of `tokio::join!`, but the cache_result is
+/// only logged (not propagated) on success. On failure of the cache
+/// channel the implementation explicitly drops the cache writer and
+/// continues forwarding to the caller.
+///
+/// Mutation step: replace the `warn!` log on cache_result Err with
+/// `?` propagation. Test must then fail because the original read
+/// returns Err instead of bytes.
+#[nativelink_test]
+async fn cdn_cache_failure_does_not_fail_read() -> Result<(), Error> {
+    use core::time::Duration;
+
+    let value: Vec<u8> = (0..1_000u32).map(|i| (i & 0xFF) as u8).collect();
+    let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
+
+    // Use a FailingUpdateStore as inner: get_part returns NotFound,
+    // update always returns Err. This forces the tee path to error
+    // while the peer-fetch must still succeed end-to-end.
+    let failing_inner = Store::new(Arc::new(FailingUpdateStore { _marker: () }));
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(failing_inner, locality_map.clone());
+    let proxy = Store::new(proxy_arc.clone());
+
+    let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    peer_inner
+        .update_oneshot(digest, Bytes::from(value.clone()))
+        .await?;
+    let peer_endpoint = "grpc://cdn-tee-failing-inner-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_inner);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+
+    // Read must succeed even though tee will fail.
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(5),
+        proxy.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect("read must complete within 5s even when tee fails")?;
+
+    assert_eq!(
+        bytes.len(),
+        value.len(),
+        "tee failure MUST NOT fail the original read — peer bytes must \
+         still be delivered to the caller; the tee is best-effort",
+    );
+    assert_eq!(bytes.as_ref(), value.as_slice());
+
+    Ok(())
+}
+
+/// Inner store that always errors on update() but returns NotFound on
+/// get_part / has_with_results. Used to force the tee path into its
+/// failure mode while keeping the peer-fetch path live.
+#[derive(Debug, MetricsComponent)]
+struct FailingUpdateStore {
+    // Empty marker field so MetricsComponent derive succeeds; the
+    // derive can't generate impl methods for a unit struct.
+    _marker: (),
+}
+
+default_health_status_indicator!(FailingUpdateStore);
+
+#[async_trait]
+impl StoreDriver for FailingUpdateStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        for slot in results.iter_mut().take(digests.len()) {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Drain the reader so the producer doesn't hang on a full channel
+        // before we surface the configured failure.
+        let _drained = reader.drain().await;
+        Err(make_err!(
+            Code::Internal,
+            "FailingUpdateStore: update intentionally fails to exercise tee \
+             best-effort behavior",
+        ))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(
+            Code::NotFound,
+            "FailingUpdateStore: get_part NotFound (peer-fetch must take over)",
+        ))
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
