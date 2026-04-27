@@ -70,6 +70,41 @@ fn is_unrecoverable_read_error(code: Code) -> bool {
     )
 }
 
+/// Possible causes of a stale positive observed on a WRITE path
+/// (`update` / `update_oneshot`). Emitted as a structured `causes`
+/// field on the `error!` log so the prose lives in one place instead
+/// of being duplicated per call site (and silently drifting). Three
+/// distinct mechanisms; an operator who sees this log walks through
+/// them to figure out which one fired:
+///   (a) the inner store lost the blob after the cache observed it
+///       (eviction, OOM kill mid-write, on-disk corruption),
+///   (b) the cache was populated by a code path that did not verify
+///       the inner store's `has()` (e.g. stale-positive propagated
+///       upward from a downstream `has` call),
+///   (c) moka's async eviction callback hasn't run yet — the
+///       canonical race-window described above the `update()` site.
+const STALE_POSITIVE_CAUSES_WRITE: &str =
+    "(a) inner-store data loss after cache population, \
+     (b) cache populated by a path other than a verified successful update, \
+     (c) eviction race where moka's async eviction callback hasn't fired \
+     yet to remove the entry";
+
+/// Possible causes of a stale positive observed on a READ path
+/// (`get_part` / `batch_get_part_unchunked`). Same three mechanisms as
+/// the WRITE form but with the inner-store-data-loss bucket
+/// elaborated (read paths have richer signal — we know the inner
+/// store actively refused, not just that it claimed not to have the
+/// blob). Operators correlating production stale positives between
+/// read and write paths should expect the same root causes; the
+/// extra detail in (a) is operational hint, not a different class.
+const STALE_POSITIVE_CAUSES_READ: &str =
+    "(a) inner-store data loss after cache population (eviction race / \
+     OOM-killed mid-write / disk corruption), \
+     (b) cache populated by a path other than a verified successful update \
+     (has() return value trusted blindly), \
+     (c) inner store's has() returned a stale positive itself \
+     (e.g. cached existence beneath a missing blob on disk)";
+
 #[derive(Clone, Debug)]
 struct ExistenceItem(u64);
 
@@ -321,19 +356,30 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         // underlying invariant violation must surface so the systemic
         // cause gets fixed (otherwise repeated cache lies waste
         // bandwidth re-uploading the same blob).
+        //
+        // CANONICAL RACE-WINDOW NOTE (referenced by sibling sites in
+        // `update_oneshot` ~line 426, `get_part` ~line 537, and
+        // `batch_get_part_unchunked` ~line 621):
+        // `size_for_key()` and `remove()` are separate awaits with no
+        // lock held between them; under concurrent eviction (moka's
+        // background eviction task removing the entry first) the
+        // `remove()` returns `removed=true` for the race-loser path
+        // while `size_for_key()` may have already observed `None`.
+        // The error message lists "eviction race" as one of the
+        // possible causes for exactly this reason — operators seeing
+        // `prior_size=None` should treat it as "cache claimed presence
+        // but the size was lost to a concurrent eviction" rather than
+        // "the cache never had a size for this digest".
         let prior_size = self.existence_cache.size_for_key(&digest).await;
         let removed = self.existence_cache.remove(&digest).await;
         if removed {
             error!(
                 %digest,
                 ?prior_size,
+                causes = STALE_POSITIVE_CAUSES_WRITE,
                 "existence cache stale positive (update path): cache claimed \
-                 blob present but inner store's has() returned None; \
-                 removed stale entry and will re-upload. possible causes: \
-                 (a) inner-store data loss after cache population, (b) \
-                 cache populated by a path other than a verified successful \
-                 update, (c) eviction race where moka's async eviction \
-                 callback hasn't fired yet to remove the entry",
+                 blob present but inner store's has() returned None; removed \
+                 stale entry and will re-upload",
             );
         }
         // Track that an update is in progress. Eviction callbacks fire
@@ -423,19 +469,20 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             info!(?digest, source = "update_oneshot_remove_stale", "DEBUG: ExistenceCacheStore removing wedge digest (update_oneshot path: inner.has=None)");
         }
         // Mirror the update() path's stale-positive logging contract.
+        // Race-window: see canonical note above the `update()` site
+        // (~line 326). `size_for_key()` may observe `None` if a
+        // concurrent eviction removed the entry between this peek and
+        // the `remove()` below.
         let prior_size = self.existence_cache.size_for_key(&digest).await;
         let removed = self.existence_cache.remove(&digest).await;
         if removed {
             error!(
                 %digest,
                 ?prior_size,
+                causes = STALE_POSITIVE_CAUSES_WRITE,
                 "existence cache stale positive (update_oneshot path): cache \
                  claimed blob present but inner store's has() returned None; \
-                 removed stale entry and will re-upload. possible causes: \
-                 (a) inner-store data loss after cache population, (b) \
-                 cache populated by a path other than a verified successful \
-                 update, (c) eviction race where moka's async eviction \
-                 callback hasn't fired yet to remove the entry",
+                 removed stale entry and will re-upload",
             );
         }
 
@@ -534,6 +581,10 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 // can't deliver it. If the cache had no entry to begin
                 // with this isn't a stale positive, just an honest
                 // NotFound from a never-cached digest — log nothing.
+                // Race-window: see canonical note above the `update()`
+                // site (~line 326). `size_for_key()` may observe `None`
+                // if a concurrent eviction removed the entry between
+                // this peek and the `remove()` below.
                 let prior_size = self.existence_cache.size_for_key(&digest).await;
                 let removed = self.existence_cache.remove(&digest).await;
                 if removed {
@@ -550,17 +601,10 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                         ?prior_size,
                         inner_code = ?err.code,
                         ?err,
-                        "existence cache stale positive: cache claimed blob \
-                         present but inner store returned unrecoverable \
-                         error on read; removed stale entry. possible \
-                         causes: (a) inner-store data loss after cache \
-                         population (eviction race / OOM-killed mid-write \
-                         / disk corruption), (b) cache populated by a \
-                         path other than a verified successful update \
-                         (has() return value trusted blindly), (c) inner \
-                         store's has() returned a stale positive itself \
-                         (e.g. cached existence beneath a missing blob \
-                         on disk)",
+                        causes = STALE_POSITIVE_CAUSES_READ,
+                        "existence cache stale positive (get_part path): \
+                         cache claimed blob present but inner store returned \
+                         unrecoverable error on read; removed stale entry",
                     );
                 }
                 if debug_digest_match(&digest) {
@@ -618,6 +662,10 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             // Mirror the per-digest get_part site's stale-positive
             // logging contract — peek the prior cached size, remove,
             // log error! only if a stale entry actually existed.
+            // Race-window: see canonical note above the `update()` site
+            // (~line 326). `size_for_key()` may observe `None` if a
+            // concurrent eviction removed the entry between this peek
+            // and the `remove()` below.
             let prior_size = self.existence_cache.size_for_key(&digest).await;
             let removed = self.existence_cache.remove(&digest).await;
             if removed {
@@ -626,13 +674,10 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                     ?prior_size,
                     ?inner_code,
                     ?err,
-                    "existence cache stale positive (batch_get_part): cache \
-                     claimed blob present but inner store returned \
-                     unrecoverable error on read; removed stale entry. \
-                     possible causes: (a) inner-store data loss after \
-                     cache population, (b) cache populated by a path other \
-                     than a verified successful update, (c) inner store's \
-                     has() returned a stale positive itself",
+                    causes = STALE_POSITIVE_CAUSES_READ,
+                    "existence cache stale positive (batch_get_part path): \
+                     cache claimed blob present but inner store returned \
+                     unrecoverable error on read; removed stale entry",
                 );
             }
         }
