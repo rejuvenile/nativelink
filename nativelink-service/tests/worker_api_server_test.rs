@@ -1971,3 +1971,206 @@ async fn worker_api_metrics_mark_stable_failures_visible_in_metric_tree() {
          Add `#[metric(help = \"...\")]` to the field."
     );
 }
+
+// =====================================================================
+// task #168: SmallBlobDispatcher production-composition disconnect test
+// =====================================================================
+//
+// testing-czar #168 MAJOR-1: every existing dispatcher test owns the
+// SmallBlobDispatcher in isolation and exercises its API directly. The
+// PRODUCTION wireup contract — "WorkerApiServer's disconnect-cleanup
+// task calls dispatcher.unpin_on_disconnect when the worker stream is
+// dropped" — is invisible to those tests. A regression that deletes
+// the unpin_on_disconnect call (or accidentally moves it outside the
+// ownership-check guard) would leak every server-side pin entry on
+// every worker disconnect, drifting `pin_max_bytes` toward
+// ResourceExhausted with no test signal until production.
+//
+// This test wraps the dispatcher in its production composition
+// (`WorkerApiServer::new_with_now_fn(... Some(dispatcher) ...)`),
+// connects a worker, populates the dispatcher's pin set directly via
+// the pin-set API, then drops the worker stream. The disconnect-cleanup
+// task in `WorkerConnection::start` MUST call
+// `dispatcher.unpin_on_disconnect(endpoint, boot_epoch)` from inside
+// the ownership-check guard, draining the pin set. The assertion
+// is wrapped in `tokio::time::timeout(5s, ...)` per the CLAUDE.md
+// production-composition deadlock-detector rule.
+//
+// Mutation step (per CLAUDE.md TDD step 5): in
+// `nativelink-service/src/worker_api_server.rs`, comment out the
+// `dispatcher.unpin_on_disconnect(...)` line inside the
+// `if let Some(ref dispatcher) = instance.small_blob_dispatcher` block
+// (around line 674). The test MUST then panic with
+// "disconnect must drain dispatcher pin set within 5s — wireup
+// contract violated".
+async fn setup_api_server_with_dispatcher(
+    cas_endpoint: &str,
+    boot_epoch_id: u64,
+) -> Result<DispatcherTestContext, Error> {
+    use nativelink_store::small_blob_dispatcher::{
+        EphemeralServerSidePin, SmallBlobDispatcher, SmallBlobDispatcherConfig,
+    };
+
+    const SCHEDULER_NAME: &str = "DUMMY_SCHEDULE_NAME";
+    const UUID_SIZE: usize = 36;
+
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager::new());
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager.clone(),
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+
+    // Production-realistic dispatcher: feature flag is OFF (matches
+    // production today; the test exercises the disconnect-cleanup path
+    // which fires regardless of the flag because pin-set membership is
+    // the property under test). Pin set is registered for "cas" and
+    // populated directly via the public API.
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+    let cas_pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024 * 1024));
+    dispatcher.register_pin_set("cas", cas_pin.clone());
+
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert(SCHEDULER_NAME.to_string(), scheduler.clone());
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: SCHEDULER_NAME.to_string(),
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [1u8; 6],
+        None, // no locality_map needed
+        None, // no cas_store
+        None, // no worker_proxy
+        Some(dispatcher.clone()),
+    )
+    .err_tip(|| "Error creating WorkerApiServer")?;
+
+    let connect_worker_request = ConnectWorkerRequest {
+        cas_endpoint: cas_endpoint.to_string(),
+        boot_epoch_id,
+        ..Default::default()
+    };
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(Update::ConnectWorkerRequest(connect_worker_request))
+        .await
+        .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut connection_worker_stream = worker_api_server
+        .inner_connect_worker_for_testing(update_stream)
+        .await?
+        .into_inner();
+
+    let first = connection_worker_stream
+        .next()
+        .await
+        .err_tip(|| "expected ConnectionResult")?
+        .err_tip(|| "stream error before ConnectionResult")?
+        .update
+        .err_tip(|| "ConnectionResult update missing")?;
+    let worker_id = match first {
+        update_for_worker::Update::ConnectionResult(connection_result) => {
+            connection_result.worker_id
+        }
+        other => unreachable!("Expected ConnectionResult, got {:?}", other),
+    };
+    assert_eq!(worker_id.len(), UUID_SIZE);
+
+    Ok(DispatcherTestContext {
+        _scheduler: scheduler,
+        _worker_api_server: worker_api_server,
+        connection_worker_stream,
+        _worker_id: worker_id.into(),
+        worker_stream: tx,
+        dispatcher,
+        cas_pin,
+    })
+}
+
+#[expect(dead_code, reason = "fields kept alive for the duration of the test")]
+struct DispatcherTestContext {
+    _scheduler: Arc<ApiWorkerScheduler>,
+    _worker_api_server: WorkerApiServer,
+    connection_worker_stream: ConnectWorkerStream,
+    _worker_id: WorkerId,
+    worker_stream: mpsc::Sender<Update>,
+    dispatcher: Arc<nativelink_store::small_blob_dispatcher::SmallBlobDispatcher>,
+    cas_pin: Arc<nativelink_store::small_blob_dispatcher::EphemeralServerSidePin>,
+}
+
+#[nativelink_test]
+pub async fn dispatcher_unpin_on_worker_disconnect_drains_pin_set_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.40:50081";
+    let boot_epoch = 4242u64;
+    let ctx = setup_api_server_with_dispatcher(cas_endpoint, boot_epoch).await?;
+
+    // Populate the dispatcher's "cas" pin set directly with two
+    // entries — these simulate the in-flight push tracker for blobs
+    // the dispatcher pushed to the worker that have not yet been
+    // ack'd via BlobsAvailable.pinned_mirror_entries. When the worker
+    // disconnects without sending the matching ack, the cleanup task
+    // MUST drain the pin set so the bytes do not leak the
+    // server-side push tracker forever.
+    let d1 = DigestInfo::new([0xE1u8; 32], 100);
+    let d2 = DigestInfo::new([0xE2u8; 32], 200);
+    ctx.cas_pin
+        .insert(d1, Bytes::from(vec![0u8; 100]))
+        .err_tip(|| "pin insert d1")?;
+    ctx.cas_pin
+        .insert(d2, Bytes::from(vec![0u8; 200]))
+        .err_tip(|| "pin insert d2")?;
+    assert_eq!(ctx.cas_pin.len(), 2, "pre-disconnect: pin set populated");
+    assert_eq!(ctx.cas_pin.total_bytes(), 300);
+
+    // Drop the worker stream — both ends — to fire the
+    // WorkerConnection cleanup task.
+    drop(ctx.worker_stream);
+    drop(ctx.connection_worker_stream);
+
+    // Wait — bounded — for the cleanup task to drain the pin set.
+    // The 5s deadlock detector exists per the CLAUDE.md
+    // production-composition rule: a regression that deletes the
+    // dispatcher.unpin_on_disconnect call (or accidentally moves it
+    // outside the ownership-check guard) would leave the pin set
+    // populated forever; without the timeout the CI runner would hang
+    // instead of failing.
+    let pin = ctx.cas_pin.clone();
+    tokio::time::timeout(Duration::from_secs(5), async move {
+        loop {
+            if pin.is_empty() && pin.total_bytes() == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect must drain dispatcher pin set within 5s — wireup contract violated");
+
+    // Belt-and-braces post-condition checks: cleanly drained.
+    assert!(
+        ctx.cas_pin.is_empty(),
+        "post-disconnect: pin set MUST be empty (got len={})",
+        ctx.cas_pin.len()
+    );
+    assert_eq!(
+        ctx.cas_pin.total_bytes(),
+        0,
+        "post-disconnect: total_bytes MUST be 0 (got {})",
+        ctx.cas_pin.total_bytes()
+    );
+    Ok(())
+}
