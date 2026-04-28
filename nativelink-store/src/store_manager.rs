@@ -275,6 +275,118 @@ impl StoreManager {
                 "flush_slow_writes: all background slow writes drained",
             );
         }
+
+        // Phase 2 (#210): drain MemoryStore-only blobs that have no
+        // in-flight write entry. Without this step, blobs read from the
+        // slow tier and back-populated into the fast MemoryStore — or
+        // blobs whose in-flight write was already removed (failed,
+        // watchdog-marked, etc.) — vanish on exit because the
+        // MemoryStore dies with the process. #206 observed 9904 of 66174
+        // worker-reported blobs missing for 6+ hours after restart, with
+        // 4 of 5 sampled small-blob digests missing from Redis. We use
+        // the deadline budget that remains after Phase 1; if Phase 1
+        // consumed all of it, Phase 2 still gets a small floor (1
+        // second) so it can at least make progress on a near-empty fast
+        // tier rather than reporting the entire snapshot as unflushed.
+        const PHASE_2_FLOOR: core::time::Duration =
+            core::time::Duration::from_secs(1);
+        let phase_2_deadline = timeout
+            .checked_sub(started.elapsed())
+            .unwrap_or(PHASE_2_FLOOR)
+            .max(PHASE_2_FLOOR);
+        info!(
+            phase_2_deadline_secs = phase_2_deadline.as_secs(),
+            stores = targets.len(),
+            "flush_slow_writes: Phase 2 — flushing MemoryStore-only blobs to slow tier",
+        );
+
+        let phase_2_started = std::time::Instant::now();
+        let mut phase_2_joins: Vec<
+            tokio::task::JoinHandle<(String, usize, core::time::Duration)>,
+        > = Vec::with_capacity(targets.len());
+        for (name, store, _) in &targets {
+            let name_owned = name.clone();
+            let store_clone = store.clone();
+            let phase_2_per_store = phase_2_deadline;
+            phase_2_joins.push(tokio::spawn(async move {
+                let driver: &dyn StoreDriver = store_clone.inner_store(
+                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+                );
+                let Some(fss) = find_fast_slow(driver) else {
+                    return (name_owned, 0, core::time::Duration::ZERO);
+                };
+                let store_started = std::time::Instant::now();
+                let unflushed = fss
+                    .flush_fast_to_slow_at_shutdown(phase_2_per_store)
+                    .await;
+                (name_owned, unflushed, store_started.elapsed())
+            }));
+        }
+
+        let phase_2_drain = async {
+            let mut results: Vec<(String, usize, core::time::Duration)> =
+                Vec::with_capacity(phase_2_joins.len());
+            for join in phase_2_joins {
+                match join.await {
+                    Ok(tuple) => results.push(tuple),
+                    Err(e) => {
+                        warn!(error = ?e, "flush_slow_writes: Phase 2 task panicked")
+                    }
+                }
+            }
+            results
+        };
+        let phase_2_results = match tokio::time::timeout(
+            phase_2_deadline + core::time::Duration::from_secs(2),
+            phase_2_drain,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(
+                    elapsed_ms = u64::try_from(phase_2_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                    "flush_slow_writes: Phase 2 outer wall-clock timeout fired",
+                );
+                Vec::new()
+            }
+        };
+
+        let phase_2_total_unflushed: usize =
+            phase_2_results.iter().map(|(_, r, _)| *r).sum();
+        let phase_2_elapsed_ms =
+            u64::try_from(phase_2_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        for (name, unflushed, dur) in &phase_2_results {
+            let store_ms = u64::try_from(dur.as_millis()).unwrap_or(u64::MAX);
+            if *unflushed > 0 {
+                warn!(
+                    store = %name,
+                    unflushed,
+                    store_ms,
+                    "flush_slow_writes: Phase 2 store did not fully drain MemoryStore",
+                );
+            } else {
+                info!(
+                    store = %name,
+                    store_ms,
+                    "flush_slow_writes: Phase 2 store drained MemoryStore",
+                );
+            }
+        }
+        if phase_2_total_unflushed > 0 {
+            warn!(
+                phase_2_total_unflushed,
+                phase_2_elapsed_ms,
+                "flush_slow_writes: Phase 2 COMPLETED WITH UNFLUSHED MEMORY-ONLY \
+                 BLOBS — these will be lost on exit (#210)",
+            );
+        } else {
+            info!(
+                phase_2_elapsed_ms,
+                "flush_slow_writes: Phase 2 — all MemoryStore-only blobs flushed",
+            );
+        }
     }
 }
 

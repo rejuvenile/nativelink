@@ -1513,8 +1513,18 @@ async fn inner_main(
                     timeout_secs = flush_budget.as_secs(),
                     "flushing in-flight slow writes before shutdown",
                 );
+                // The outer guard accommodates BOTH phases of
+                // `StoreManager::flush_slow_writes`:
+                //   Phase 1 (in-flight drain) ≤ flush_budget,
+                //   Phase 2 (#210 MemoryStore→slow) ≥ 1s floor when
+                //                                      Phase 1 used the full
+                //                                      budget, plus its own
+                //                                      2s outer-guard slack.
+                // 8s of headroom keeps the SIGTERM-to-exit budget tight
+                // (well under listener-drain's 35s) while leaving enough
+                // room that the inner timeouts always fire first.
                 match tokio::time::timeout(
-                    flush_budget + Duration::from_secs(2),
+                    flush_budget + Duration::from_secs(8),
                     sm.flush_slow_writes(flush_budget),
                 )
                 .await
