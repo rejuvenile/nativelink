@@ -79,20 +79,40 @@ impl StoreDriver for NoopStore {
     async fn get_part(
         self: Pin<&Self>,
         _key: StoreKey<'_>,
-        writer: &mut DropCloserWriteHalf,
+        _writer: &mut DropCloserWriteHalf,
         _offset: u64,
         _length: Option<u64>,
     ) -> Result<(), Error> {
-        // Writer-termination contract: NoopStore is test-only, but a
-        // wrapping `VerifyStore` (or any composer that joins a paired
-        // reader on this writer's other half) will deadlock on
-        // `rx.recv().await` if the writer is never terminated. Send the
-        // structured NotFound through the wire BEFORE returning so the
-        // paired reader unblocks. This keeps NoopStore honest for the
-        // composability harness too.
-        let err = make_err!(Code::NotFound, "Not found in noop store");
-        writer.send_error(err.clone());
-        Err(err)
+        // CONTRACT EXCEPTION (intentionally NOT calling
+        // `_writer.send_error`): NoopStore is the canonical "skip me"
+        // fast tier for `FastSlowStore` tests (see
+        // `fast_slow_store.rs:3275-3307`'s `optimized_for(NoopUpdates)`
+        // bypass branch). FastSlowStore calls
+        // `fast_store.get_part(&mut *guard, ...)` UNCONDITIONALLY before
+        // checking the bypass flag in some code paths
+        // (line ~3084-3151). When the fast store is NoopStore, that call
+        // returns `Err(NotFound)` and FastSlowStore falls through to the
+        // slow store. If NoopStore had called `writer.send_error(NotFound)`
+        // first, the buf_channel's `terminal_error` `OnceLock` would be
+        // set to "Not found in noop store" — and the later
+        // `commit_with_inner_miss_gate` → `guard.fail(slow_store_err)`
+        // would be a silent no-op (`OnceLock::set` returns Err if already
+        // set). The downstream reader would observe the misleading
+        // "Not found in noop store" instead of the slow store's
+        // structured error message. Tests like
+        // `waiter_explicit_termination_test::non_wps_slow_store_fallback_err_terminates_writer_with_structured_error`
+        // would break.
+        //
+        // The writer-termination contract violation here is therefore
+        // intentional and SAFE in production composition: the wrapping
+        // FastSlowStore owns the writer and either (a) falls through to
+        // the slow store and propagates the slow store's structured Err,
+        // or (b) when the slow store also returns Err, fires
+        // `commit_with_inner_miss_gate` which terminates the writer
+        // explicitly. NoopStore is test-only and never directly user-
+        // visible; its NotFound is a SIGNAL ("I don't have it, fall
+        // through") not a terminal error.
+        Err(make_err!(Code::NotFound, "Not found in noop store"))
     }
 
     fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {

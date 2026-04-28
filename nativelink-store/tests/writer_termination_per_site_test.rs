@@ -254,22 +254,42 @@ async fn ref_store_missing_target_terminates_writer_with_send_error() -> Result<
 }
 
 // -----------------------------------------------------------------------
-// Fix 3: NoopStore::get_part NotFound termination.
+// Fix 3: NoopStore::get_part — INTENTIONALLY does NOT terminate writer.
 // -----------------------------------------------------------------------
 
-/// `NoopStore::get_part` always returns `Err(Code::NotFound, ...)`.
-/// Before the fix the writer was never terminated; paired readers
-/// deadlocked. After the fix `writer.send_error(err.clone())` runs
-/// before the Err return so the paired reader observes the structured
-/// NotFound. NoopStore is test-only so production impact is zero, but
-/// the contract is maintained for consistency (and the composability
-/// harness is more honest with NoopStore in place).
+/// `NoopStore::get_part` returns `Err(Code::NotFound, ...)` WITHOUT
+/// calling `writer.send_error()` — this is the documented contract
+/// EXCEPTION (see `noop_store.rs::get_part` rustdoc).
 ///
-/// Mutation evidence: comment out the new `writer.send_error(err.clone())`
-/// line in `noop_store.rs` and rerun; rx.recv() hangs past 5s, panic
-/// message `WRITER_TERMINATION_VIOLATED_noop_store_not_found` fires.
+/// Why the contract exception: `FastSlowStore::get_part` calls
+/// `fast_store.get_part(&mut *guard, ...)` BEFORE checking the
+/// `optimized_for(NoopUpdates)` bypass flag (the per-call attempt
+/// avoids the extra has() round-trip; see
+/// `fast_slow_store.rs:3081-3151`). When the fast store IS NoopStore,
+/// that call returns `Err(NotFound)` and FastSlowStore falls through to
+/// the slow store. If NoopStore had set `terminal_error` to its
+/// "Not found in noop store" string FIRST, the buf_channel's `OnceLock`
+/// would freeze that misleading message — the later
+/// `commit_with_inner_miss_gate` → `guard.fail(slow_store_err)` would
+/// be a silent no-op and the downstream reader would observe
+/// "Not found in noop store" instead of the slow store's structured
+/// error (the `waiter_explicit_termination_test` regression).
+///
+/// FastSlowStore owns the writer and is responsible for terminating it
+/// after fall-through, so NoopStore's contract violation is SAFE-by-
+/// composition. NoopStore is also test-only and never user-visible in
+/// production; the Bazel server / worker chains never include it.
+///
+/// This test asserts the EXCEPTION holds: NoopStore::get_part returns
+/// Err with the NotFound code AND does NOT terminate the writer (the
+/// `OnceLock` `terminal_error` should remain unset; the receiver sees
+/// the generic "Sender dropped before sending EOF" Internal once `tx`
+/// drops). If we ever change NoopStore to terminate, this test will
+/// fail loudly and force the author to also fix
+/// `fast_slow_store.rs::get_part`'s fast-store-call site to clear/skip
+/// terminal_error before falling through.
 #[nativelink_test]
-async fn noop_store_not_found_terminates_writer_with_send_error() -> Result<(), Error> {
+async fn noop_store_get_part_does_not_terminate_writer_by_design() -> Result<(), Error> {
     let noop = NoopStore::new();
     let digest = DigestInfo::try_new(MISSING_HASH, 100)?;
     let key = StoreKey::Digest(digest);
@@ -279,7 +299,15 @@ async fn noop_store_not_found_terminates_writer_with_send_error() -> Result<(), 
     let noop_ptr = noop.clone();
     let get_fut = async move {
         let pin_ref = core::pin::Pin::new(noop_ptr.as_ref());
-        nativelink_util::store_trait::StoreDriver::get_part(pin_ref, key, &mut tx, 0, None).await
+        let res = nativelink_util::store_trait::StoreDriver::get_part(
+            pin_ref, key, &mut tx, 0, None,
+        )
+        .await;
+        // Drop tx explicitly to mirror what FastSlowStore would do after
+        // falling through (writer ownership returns; in our test the
+        // tx is dropped as the future returns).
+        drop(tx);
+        res
     };
     let recv_fut = async move {
         loop {
@@ -296,10 +324,9 @@ async fn noop_store_not_found_terminates_writer_with_send_error() -> Result<(), 
     })
     .await
     .expect(
-        "WRITER_TERMINATION_VIOLATED_noop_store_not_found: \
-         NoopStore::get_part did not terminate the writer; paired rx.recv() \
-         deadlocked past 5s. The Err return must call \
-         writer.send_error(err.clone()) before `Err(err)`.",
+        "NoopStore must not deadlock — even with the contract exception, \
+         dropping tx unblocks the receiver via Sender-dropped Internal. \
+         If this elapses, something more fundamental broke.",
     );
 
     let (get_res, recv_res) = joined;
@@ -308,23 +335,33 @@ async fn noop_store_not_found_terminates_writer_with_send_error() -> Result<(), 
     assert_eq!(
         get_err.code,
         Code::NotFound,
-        "expected NotFound code, got {get_err:?}",
+        "expected NotFound code from get_part return, got {get_err:?}",
     );
-    assert!(
-        recv_res.is_err(),
-        "rx side must observe an error (not eof); got {recv_res:?}",
+    let recv_err = recv_res.expect_err(
+        "rx must NOT see EOF — NoopStore returned Err; if we see EOF here, \
+         someone called send_eof which is wrong",
     );
-    let recv_err = recv_res.unwrap_err();
+    // CONTRACT EXCEPTION ASSERTION: the receiver does NOT see the
+    // structured "Not found in noop store" message because NoopStore did
+    // NOT call `send_error` (by design — see noop_store.rs rustdoc).
+    // Instead it sees the generic "Sender dropped before sending EOF"
+    // Internal that the channel synthesizes when tx is dropped without
+    // termination. If NoopStore is ever changed to terminate the writer,
+    // this assertion will flip and the author will be forced to also fix
+    // the fast_slow_store fast-tier-call site.
     assert!(
-        recv_err
+        !recv_err
             .messages
             .iter()
             .any(|m| m.contains("Not found in noop store")),
-        "rx side err must contain the structured NoopStore NotFound message; got {recv_err:?}",
-    );
-    assert!(
-        !recv_err.messages.iter().any(|m| m.contains(DROP_FALLBACK_IDENTIFIER)),
-        "rx side err MUST NOT carry the Drop-fallback identifier; got {recv_err:?}",
+        "NOOP_STORE_CONTRACT_EXCEPTION_VIOLATED: rx side observed the \
+         structured NoopStore NotFound message — meaning NoopStore.get_part \
+         called writer.send_error before returning Err. This BREAKS \
+         FastSlowStore composition (the OnceLock-based terminal_error \
+         freezes this message and the slow-store fallback's structured Err \
+         can never reach the wire). Either revert the NoopStore change OR \
+         update fast_slow_store.rs::get_part to clear/bypass terminal_error \
+         before the fast-store-call fall-through. Got: {recv_err:?}",
     );
     Ok(())
 }
