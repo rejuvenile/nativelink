@@ -457,6 +457,38 @@ impl SmallBlobDispatcher {
         self.dispatched_count.load(Ordering::Relaxed)
     }
 
+    /// Diagnostic accessor: is a `worker_tx` registered for `(endpoint,
+    /// boot_epoch_id)`? Used by tests to assert that the disconnect /
+    /// boot-epoch wipe paths cleared per-(endpoint, epoch) state.
+    /// Production callers should NOT branch on this — use the registered
+    /// `worker_tx`'s send-error result as the authoritative liveness
+    /// signal. Gated on `cfg(test)` (in-crate use) and the `test-utils`
+    /// feature (cross-crate use, e.g. `nativelink-service` integration
+    /// tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn has_worker_tx_for_test(&self, endpoint: &str, boot_epoch_id: u64) -> bool {
+        let key: Arc<str> = Arc::from(endpoint);
+        self.worker_txs.lock().contains_key(&(key, boot_epoch_id))
+    }
+
+    /// Diagnostic accessor: how many per-`(endpoint, boot_epoch_id, *)`
+    /// queue entries exist (one per `store_id`). Used by tests to assert
+    /// that boot-epoch wipe / disconnect cleared the per-(worker, epoch)
+    /// drainer queues. Gated on `cfg(test)` (in-crate use) and the
+    /// `test-utils` feature (cross-crate use, e.g. `nativelink-service`
+    /// integration tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn queue_count_for_worker_for_test(&self, endpoint: &str, boot_epoch_id: u64) -> usize {
+        let key: Arc<str> = Arc::from(endpoint);
+        self.queues
+            .lock()
+            .keys()
+            .filter(|(ep, epoch, _)| *ep == key && *epoch == boot_epoch_id)
+            .count()
+    }
+
     /// Register the `EphemeralServerSidePin` set for a `store_id`. Called
     /// at server startup (one per FastSlowStore that opts into the
     /// dispatcher).

@@ -351,27 +351,43 @@ impl WorkerApiServer {
                 if let Some(ref locality_map) = self.locality_map {
                     locality_map.write().remove_endpoint(&worker_cas_endpoint);
                 }
-                // TODO(#174 — boot-epoch wipe dispatcher leak): when a
-                // worker reconnects with a new boot_epoch BEFORE OLD's
-                // disconnect-cleanup runs, OLD's
+                // #174: boot-epoch wipe dispatcher leak. When a worker
+                // reconnects with a new boot_epoch BEFORE OLD's
+                // disconnect-cleanup task runs, OLD's
                 // `dispatcher.worker_txs[(endpoint, prev_epoch)]` and
-                // per-(worker, prev_epoch) queues leak forever — OLD's
-                // later cleanup hits the ownership-check guard
-                // (NEW owns the endpoint) and SKIPS its
+                // per-(worker, prev_epoch) queues would leak forever —
+                // OLD's later cleanup hits the ownership-check guard
+                // (NEW owns the endpoint, see WorkerConnection::start
+                // disconnect path) and SKIPS its
                 // `dispatcher.unregister_worker` /
                 // `dispatcher.unpin_on_disconnect` calls. Symmetric to
                 // the locality_map wipe just above; see also #141
                 // (which fixed locality_map for the same race class).
                 // Dormant under `small_blob_mirror_enabled=false`;
                 // becomes an active leak the moment the flag flips.
-                // Fix: call dispatcher.unregister_worker(endpoint,
-                // prev_epoch) + dispatcher.unpin_on_disconnect(endpoint,
-                // prev_epoch) here while endpoint_state lock is held.
+                //
+                // Both calls happen while the `endpoint_state` lock is
+                // held — same atomicity argument as the locality_map
+                // wipe: the OLD disconnect task observes a fully wiped
+                // dispatcher state OR an unwiped one, never a partial
+                // state that could lose entries from EITHER epoch.
+                if let Some(ref dispatcher) = self.small_blob_dispatcher {
+                    if let Some(ref prev_state) = prev {
+                        dispatcher.unregister_worker(
+                            &worker_cas_endpoint,
+                            prev_state.boot_epoch,
+                        );
+                        dispatcher.unpin_on_disconnect(
+                            &worker_cas_endpoint,
+                            prev_state.boot_epoch,
+                        );
+                    }
+                }
                 info!(
                     endpoint = %worker_cas_endpoint,
                     prev_epoch = prev.as_ref().map(|p| p.boot_epoch),
                     new_epoch = new_boot_epoch,
-                    "wiped locality_map on worker boot_epoch_id change"
+                    "wiped locality_map + dispatcher state on worker boot_epoch_id change"
                 );
             }
             state.insert(

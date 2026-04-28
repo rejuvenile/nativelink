@@ -2174,3 +2174,358 @@ pub async fn dispatcher_unpin_on_worker_disconnect_drains_pin_set_test()
     );
     Ok(())
 }
+
+// #174: boot-epoch wipe dispatcher leak. When a worker reconnects with a
+// new boot_epoch BEFORE the OLD's disconnect-cleanup task runs (or when
+// the OLD's cleanup runs after the wipe and is suppressed by the
+// ownership-check guard), the OLD epoch's `dispatcher.worker_txs[(endpoint,
+// OLD_epoch)]` and per-(worker, OLD_epoch) queues leak forever — the new
+// owner has overwritten `endpoint_state[endpoint].owner_worker_id` so
+// the OLD cleanup task SKIPS its `unregister_worker` call. Symmetric to
+// the locality_map wipe (#141) that the boot-epoch wipe block already
+// performs. Currently dormant in production behind
+// `small_blob_mirror_enabled=false`; becomes an active leak the moment
+// the flag flips. The fix: while `endpoint_state` lock is held in the
+// boot-epoch wipe block, the wipe MUST also call
+// `dispatcher.unregister_worker(endpoint, prev_epoch)` and
+// `dispatcher.unpin_on_disconnect(endpoint, prev_epoch)`.
+//
+// Builds a fresh dispatcher with `small_blob_mirror_enabled=true` and
+// `pin_max_bytes` high enough that the precondition gates pass. Connects
+// a worker at (endpoint=E, epoch=A); seeds `worker_txs[(E,A)]` (via the
+// connect path) and a per-(worker, store) queue (via `enqueue`).
+// Reconnects the SAME endpoint with a new boot_epoch B (epoch flip).
+// The wipe block is the only synchronization point that can clear
+// `(E, A)` state atomically with the `endpoint_state` ownership flip;
+// after the second connect returns, `(E, A)` MUST be cleared.
+async fn setup_dispatcher_with_mirror_enabled(
+    cas_endpoint: &str,
+    boot_epoch_id: u64,
+) -> Result<DispatcherTestContext, Error> {
+    use nativelink_store::small_blob_dispatcher::{
+        EphemeralServerSidePin, SmallBlobDispatcher, SmallBlobDispatcherConfig,
+    };
+
+    const SCHEDULER_NAME: &str = "DUMMY_SCHEDULE_NAME";
+    const UUID_SIZE: usize = 36;
+
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager::new());
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager.clone(),
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+
+    // Mirror flag ON so `enqueue` actually populates the queues map —
+    // we need real per-(endpoint, boot_epoch_id, store_id) queue state
+    // to assert the boot-epoch wipe clears it. In production today the
+    // flag is OFF, but the leak this test guards against fires the
+    // moment the flag flips.
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig {
+        small_blob_mirror_enabled: true,
+        ..Default::default()
+    }));
+    let cas_pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024 * 1024));
+    dispatcher.register_pin_set("cas", cas_pin.clone());
+
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert(SCHEDULER_NAME.to_string(), scheduler.clone());
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: SCHEDULER_NAME.to_string(),
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [1u8; 6],
+        None, // no locality_map needed
+        None, // no cas_store
+        None, // no worker_proxy
+        Some(dispatcher.clone()),
+    )
+    .err_tip(|| "Error creating WorkerApiServer")?;
+
+    let connect_worker_request = ConnectWorkerRequest {
+        cas_endpoint: cas_endpoint.to_string(),
+        boot_epoch_id,
+        ..Default::default()
+    };
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(Update::ConnectWorkerRequest(connect_worker_request))
+        .await
+        .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut connection_worker_stream = worker_api_server
+        .inner_connect_worker_for_testing(update_stream)
+        .await?
+        .into_inner();
+
+    let first = connection_worker_stream
+        .next()
+        .await
+        .err_tip(|| "expected ConnectionResult")?
+        .err_tip(|| "stream error before ConnectionResult")?
+        .update
+        .err_tip(|| "ConnectionResult update missing")?;
+    let worker_id = match first {
+        update_for_worker::Update::ConnectionResult(connection_result) => {
+            connection_result.worker_id
+        }
+        other => unreachable!("Expected ConnectionResult, got {:?}", other),
+    };
+    assert_eq!(worker_id.len(), UUID_SIZE);
+
+    Ok(DispatcherTestContext {
+        _scheduler: scheduler,
+        _worker_api_server: worker_api_server,
+        connection_worker_stream,
+        _worker_id: worker_id.into(),
+        worker_stream: tx,
+        dispatcher,
+        cas_pin,
+    })
+}
+
+// Connect a SECOND worker stream on the same WorkerApiServer with the
+// given boot_epoch_id. Returns the new (sender, stream) pair plus the
+// allocated worker_id. Mirrors the second half of
+// setup_dispatcher_with_mirror_enabled.
+async fn connect_second_worker(
+    server: &WorkerApiServer,
+    cas_endpoint: &str,
+    boot_epoch_id: u64,
+) -> Result<(mpsc::Sender<Update>, ConnectWorkerStream, String), Error> {
+    let connect_worker_request = ConnectWorkerRequest {
+        cas_endpoint: cas_endpoint.to_string(),
+        boot_epoch_id,
+        ..Default::default()
+    };
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(Update::ConnectWorkerRequest(connect_worker_request))
+        .await
+        .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut connection_worker_stream = server
+        .inner_connect_worker_for_testing(update_stream)
+        .await?
+        .into_inner();
+    let first = connection_worker_stream
+        .next()
+        .await
+        .err_tip(|| "expected ConnectionResult")?
+        .err_tip(|| "stream error before ConnectionResult")?
+        .update
+        .err_tip(|| "ConnectionResult update missing")?;
+    let worker_id = match first {
+        update_for_worker::Update::ConnectionResult(connection_result) => {
+            connection_result.worker_id
+        }
+        other => unreachable!("Expected ConnectionResult, got {:?}", other),
+    };
+    Ok((tx, connection_worker_stream, worker_id))
+}
+
+#[nativelink_test]
+pub async fn boot_epoch_wipe_clears_dispatcher_state()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.41:50081";
+    let old_epoch = 1111u64;
+    let new_epoch = 2222u64;
+    let ctx = setup_dispatcher_with_mirror_enabled(cas_endpoint, old_epoch).await?;
+
+    // Sanity: register_worker fired during the connect path, so
+    // worker_txs[(endpoint, old_epoch)] is populated.
+    assert!(
+        ctx.dispatcher.has_worker_tx_for_test(cas_endpoint, old_epoch),
+        "pre-reconnect: dispatcher MUST have worker_tx for (endpoint, OLD)"
+    );
+
+    // Populate per-(endpoint, OLD_epoch, store_id) queue state by
+    // calling enqueue. With small_blob_mirror_enabled=true and the
+    // worker_tx + pin_set both registered, enqueue spawns a drainer
+    // and inserts a queue entry for (endpoint, OLD_epoch, "cas").
+    let d = DigestInfo::new([0xAA; 32], 64);
+    ctx.dispatcher
+        .enqueue(cas_endpoint, old_epoch, "cas", d, Bytes::from(vec![0u8; 64]))
+        .await
+        .err_tip(|| "enqueue OLD")?;
+    assert_eq!(
+        ctx.dispatcher
+            .queue_count_for_worker_for_test(cas_endpoint, old_epoch),
+        1,
+        "pre-reconnect: per-(worker, OLD_epoch) queue MUST exist after enqueue"
+    );
+
+    // Reconnect the SAME endpoint with a NEW boot_epoch BEFORE the OLD
+    // stream is dropped. This is the production race: the worker process
+    // restarted, opened a new gRPC stream, and the new ConnectWorker
+    // request landed before the OLD cleanup task ran. The boot-epoch
+    // wipe block in inner_connect_worker is the ONLY synchronization
+    // point that can clear (E, OLD) state atomically with the ownership
+    // flip — once the new connect returns, the OLD cleanup task will be
+    // suppressed by the ownership-check guard and any (E, OLD) state
+    // that the wipe didn't clear leaks forever.
+    let (_new_tx, _new_stream, _new_worker_id) = tokio::time::timeout(
+        Duration::from_secs(5),
+        connect_second_worker(&ctx._worker_api_server, cas_endpoint, new_epoch),
+    )
+    .await
+    .expect("second connect must complete within 5s — wipe path stalled")
+    .err_tip(|| "second connect failed")?;
+
+    // After the wipe completes (synchronously within the new connect):
+    //   - worker_txs[(endpoint, OLD)] MUST be cleared
+    //   - queues[(endpoint, OLD, *)] MUST be empty
+    //   - pin set MUST be drained (unpin_on_disconnect was called)
+    assert!(
+        !ctx.dispatcher.has_worker_tx_for_test(cas_endpoint, old_epoch),
+        "post-reconnect: dispatcher MUST NOT retain worker_tx for (endpoint, OLD) — \
+         #174 leak: boot-epoch wipe failed to call unregister_worker"
+    );
+    assert_eq!(
+        ctx.dispatcher
+            .queue_count_for_worker_for_test(cas_endpoint, old_epoch),
+        0,
+        "post-reconnect: dispatcher MUST NOT retain per-(worker, OLD_epoch) queues — \
+         #174 leak: boot-epoch wipe failed to call unregister_worker"
+    );
+    assert!(
+        ctx.cas_pin.is_empty(),
+        "post-reconnect: pin set MUST be drained (got len={}) — \
+         #174 leak: boot-epoch wipe failed to call unpin_on_disconnect",
+        ctx.cas_pin.len()
+    );
+    Ok(())
+}
+
+// Asymmetric contract coverage (CLAUDE.md §Tests): the wipe of
+// endpoint A's `(endpoint_A, OLD_A)` state MUST NOT touch endpoint B's
+// `(endpoint_B, ANY_B)` state. A regression that nukes BOTH (e.g. a
+// `retain` filter that forgets to gate on `endpoint`, or a blunt
+// `dispatcher.queues.lock().clear()`) would still pass the previous
+// "NEW epoch on the SAME endpoint is registered" assertion (because
+// register_worker runs unconditionally AFTER the wipe block, repopulating
+// (endpoint_A, NEW_A) regardless of regression). This test pins the
+// real over-action contract: a per-endpoint wipe must be SCOPED to that
+// endpoint and must not collateral-damage other endpoints' state.
+//
+// **v1 limitation note.** `unpin_on_disconnect` is documented v1 broad-
+// clearing — it clears EVERY registered store's pin set regardless of
+// which `endpoint`/`boot_epoch_id` invoked it (see the doc comment on
+// `SmallBlobDispatcher::unpin_on_disconnect` and `TODO(#168 follow-up)`).
+// Therefore endpoint B's pin entry IS expected to be cleared by
+// endpoint A's wipe today; we deliberately do NOT assert pin-set
+// survival here. The per-endpoint contract DOES hold for `worker_tx`
+// and `queues` (both are keyed by `(endpoint, boot_epoch_id)`), so
+// those are the assertions we make. When per-attribution lands
+// (#168/#190), update this test to also require that B's pin set
+// survives A's wipe.
+#[nativelink_test]
+pub async fn boot_epoch_wipe_does_not_clear_other_endpoint_state()
+-> Result<(), Box<dyn core::error::Error>> {
+    let endpoint_a = "grpc://192.168.1.42:50081";
+    let endpoint_b = "grpc://192.168.1.43:50081";
+    let old_epoch_a = 3333u64;
+    let new_epoch_a = 4444u64;
+    let epoch_b = 5555u64;
+
+    // (1) Connect worker A on endpoint_A with OLD_A. Seeds A's
+    // worker_tx + queue (via enqueue) + pin entry.
+    let ctx = setup_dispatcher_with_mirror_enabled(endpoint_a, old_epoch_a).await?;
+    let d_a = DigestInfo::new([0xAA; 32], 32);
+    ctx.dispatcher
+        .enqueue(endpoint_a, old_epoch_a, "cas", d_a, Bytes::from(vec![0u8; 32]))
+        .await
+        .err_tip(|| "enqueue A")?;
+
+    // (2) Connect worker B on endpoint_B with epoch_B (DIFFERENT
+    // endpoint). Seeds B's worker_tx + queue (via enqueue) + pin entry.
+    let (_b_tx, _b_stream, _b_worker_id) = tokio::time::timeout(
+        Duration::from_secs(5),
+        connect_second_worker(&ctx._worker_api_server, endpoint_b, epoch_b),
+    )
+    .await
+    .expect("worker B connect must complete within 5s")
+    .err_tip(|| "worker B connect failed")?;
+    let d_b = DigestInfo::new([0xBB; 32], 32);
+    ctx.dispatcher
+        .enqueue(endpoint_b, epoch_b, "cas", d_b, Bytes::from(vec![0u8; 32]))
+        .await
+        .err_tip(|| "enqueue B")?;
+
+    // Sanity: B's per-endpoint state is populated before the wipe.
+    assert!(
+        ctx.dispatcher.has_worker_tx_for_test(endpoint_b, epoch_b),
+        "pre-reconnect: dispatcher MUST have worker_tx for (endpoint_B, epoch_B)"
+    );
+    assert_eq!(
+        ctx.dispatcher
+            .queue_count_for_worker_for_test(endpoint_b, epoch_b),
+        1,
+        "pre-reconnect: per-(endpoint_B, epoch_B) queue MUST exist after enqueue"
+    );
+
+    // (3) Reconnect endpoint_A with NEW_A — triggers wipe of
+    // (endpoint_A, OLD_A) state. The wipe is scoped to endpoint_A;
+    // endpoint_B's state must survive.
+    let (_a_new_tx, _a_new_stream, _a_new_worker_id) = tokio::time::timeout(
+        Duration::from_secs(5),
+        connect_second_worker(&ctx._worker_api_server, endpoint_a, new_epoch_a),
+    )
+    .await
+    .expect("endpoint_A reconnect must complete within 5s")
+    .err_tip(|| "endpoint_A reconnect failed")?;
+
+    // (4) Existing assertion: A's NEW_A state present (register_worker
+    // ran post-wipe). This guards against a regression that nukes
+    // (endpoint_A, *) including the NEW entry.
+    assert!(
+        ctx.dispatcher.has_worker_tx_for_test(endpoint_a, new_epoch_a),
+        "post-reconnect: dispatcher MUST retain worker_tx for (endpoint_A, NEW_A) — \
+         over-action regression: wipe cleared NEW epoch's state on the same endpoint"
+    );
+
+    // (5) THE OVER-ACTION CONTRACT: endpoint_B's state UNTOUCHED.
+    // worker_tx and queues are keyed by (endpoint, boot_epoch_id), so a
+    // correctly-scoped per-endpoint wipe leaves B's entries alone. A
+    // regression that over-clears (e.g.
+    // `dispatcher.queues.lock().clear()` or
+    // `worker_txs.retain(|(_, e), _| *e != prev_epoch)`) would nuke B's
+    // entries too.
+    assert!(
+        ctx.dispatcher.has_worker_tx_for_test(endpoint_b, epoch_b),
+        "post-reconnect: endpoint_B's state must not be cleared by endpoint_A's wipe — \
+         over-action contract: dispatcher.worker_tx for (endpoint_B, epoch_B) was over-cleared"
+    );
+    assert_eq!(
+        ctx.dispatcher
+            .queue_count_for_worker_for_test(endpoint_b, epoch_b),
+        1,
+        "post-reconnect: endpoint_B's state must not be cleared by endpoint_A's wipe — \
+         over-action contract: dispatcher.queues for (endpoint_B, epoch_B) was over-cleared"
+    );
+
+    // Note: B's pin entry IS expected to be cleared by A's wipe under
+    // the v1 limitation (see test header comment + #168/#190). The
+    // per-endpoint contract above is the load-bearing assertion.
+    Ok(())
+}
