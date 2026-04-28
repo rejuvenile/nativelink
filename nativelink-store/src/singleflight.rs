@@ -32,7 +32,7 @@
 //! * **Result fan-out.** Leader buffers chunks into `Arc<Vec<Bytes>>`,
 //!   preserving producer chunk boundaries (no copy). All waiters
 //!   receive the same `Arc` via `tokio::sync::watch::Receiver`.
-//! * **Cap.** `max_inflight_bytes` (default 256 MiB). When the cap is
+//! * **Cap.** `max_inflight_bytes` (default 1 GiB). When the cap is
 //!   exceeded at slot-registration time, NEW callers bypass singleflight
 //!   and run the fetcher directly. Bypass is best-effort; the cap is a
 //!   soft ceiling to keep total fan-out memory bounded.
@@ -57,26 +57,31 @@
 //! across `.await`.
 
 use core::future::Future;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::info;
 
 use nativelink_error::Error;
+use nativelink_metric::MetricsComponent;
 use nativelink_util::store_trait::{StoreKey, StoreKeyBorrow};
 
 /// Default soft cap on total in-flight singleflight payload bytes
 /// (reserved at slot registration; released on slot drop). New leaders
 /// past this ceiling bypass dedup. Tuned for the WorkerProxyStore use
 /// case where per-blob payload is bounded by `MAX_CACHE_BLOB_SIZE`
-/// (~1 MiB) and concurrent slot count is bounded by inflight-fan-out
-/// width (typically 4-16, up to 64 in pathological bursts).
-pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+/// (64 MiB at `worker_proxy_store.rs:874`) and concurrent slot count
+/// is bounded by inflight-fan-out width (typically 4-16, up to 64 in
+/// pathological bursts).
+///
+/// Sized at 1 GiB so the cap accommodates 16 concurrent in-flight
+/// 64 MiB blobs (today's max per-blob cap) instead of just 4. The
+/// server has 100s of GB free RAM; 1 GiB is conservative.
+pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Result type fanned out from the leader to all waiters. `Vec<Bytes>`
 /// preserves producer chunk boundaries (avoids the O(blob) copy a
@@ -88,18 +93,18 @@ pub type SingleflightPayload = Arc<Vec<Bytes>>;
 /// `SingleflightMapInner::current_inflight_bytes` is reversed and the
 /// slot's dead `Weak` is purged from the map.
 ///
-/// `published` distinguishes "leader sent terminal value" from "leader
-/// dropped without sending" so a waiter that wakes on `Err(closed)` can
-/// choose between "consume the value" and "promote".
+/// The `result_rx` carries `Option<Arc<Result<SingleflightPayload,
+/// Arc<Error>>>>`: the outer `Arc` is the watch-channel wire format
+/// (one allocation shared across all waiters); the inner `Arc<Error>`
+/// avoids `Error::clone()` per-waiter on the failure-fanout path. With
+/// N waiters and a leader Err, the failure path before this Arc-wrap
+/// would do N `Error::clone()` calls (each cloning refcounted strings
+/// and the source chain); after, all N waiters share a single
+/// `Arc<Error>` refcount bump.
 #[derive(Debug)]
 struct InflightEntry {
     /// Receiver-side handle. Cloned by waiters at subscription.
-    result_rx: watch::Receiver<Option<Arc<Result<SingleflightPayload, Error>>>>,
-    /// Set true by the leader BEFORE it calls `result_tx.send`. If a
-    /// waiter wakes via `result_rx.changed()` with `Err(closed)` AND
-    /// `published` is false, the leader was canceled and the waiter
-    /// must promote.
-    published: AtomicBool,
+    result_rx: watch::Receiver<Option<Arc<Result<SingleflightPayload, Arc<Error>>>>>,
     /// The map that owns this slot — used by Drop to reverse cap
     /// accounting and purge the dead `Weak` from the map.
     parent: Weak<SingleflightMapInner>,
@@ -135,12 +140,24 @@ impl Drop for InflightEntry {
 ///
 /// See module-level docs for design and contract. Cheap to clone via
 /// `Arc<SingleflightMap>` if shared across tasks.
-#[derive(Debug)]
+///
+/// Metrics (via `MetricsComponent` derive):
+/// * `current_inflight_bytes` — current sum of reserved bytes across
+///   live slots
+/// * `max_inflight_bytes` — soft cap on `current_inflight_bytes`
+/// * `total_dedup_hits` — count of waiters that joined an existing
+///   leader (cumulative)
+/// * `total_bypasses_cap` — count of callers that bypassed dedup
+///   because the cap would be exceeded (cumulative)
+/// * `total_bypasses_size_zero` — count of callers that bypassed dedup
+///   because `expected_size == 0` (cumulative)
+#[derive(Debug, MetricsComponent)]
 pub struct SingleflightMap {
+    #[metric(group = "inner")]
     inner: Arc<SingleflightMapInner>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, MetricsComponent)]
 struct SingleflightMapInner {
     /// Active slots keyed by `StoreKeyBorrow` (a `StoreKey<'static>`
     /// wrapper that has `Hash + Eq + Borrow<StoreKey<'a>>`). `Weak` so
@@ -151,11 +168,28 @@ struct SingleflightMapInner {
     /// callers that would push the counter past this value bypass
     /// singleflight (run the fetcher directly without registering a
     /// slot). Existing waiters are NEVER blocked by the cap.
+    #[metric(help = "Soft cap on total reserved bytes across live slots")]
     max_inflight_bytes: u64,
     /// Current sum of `reserved_bytes` across all live slots. Atomic
     /// because increment happens under the map lock but decrement
     /// happens lock-free in `InflightEntry::drop`.
+    #[metric(help = "Current sum of reserved bytes across live slots")]
     current_inflight_bytes: AtomicU64,
+    /// Count of waiters that joined an existing leader (cumulative).
+    /// Operator signal: `total_dedup_hits / get_part_calls` is the
+    /// dedup ratio.
+    #[metric(help = "Cumulative count of waiters that joined an existing leader")]
+    total_dedup_hits: AtomicU64,
+    /// Count of callers that bypassed dedup because the cap would be
+    /// exceeded (cumulative). Persistent non-zero values mean the cap
+    /// is too low for the workload.
+    #[metric(help = "Cumulative count of callers that bypassed dedup due to cap")]
+    total_bypasses_cap: AtomicU64,
+    /// Count of callers that bypassed dedup because `expected_size`
+    /// was 0 (cumulative). Reserved for future use; the WPS wire-up
+    /// gates `expected_size > 0` upstream.
+    #[metric(help = "Cumulative count of callers that bypassed dedup due to size==0")]
+    total_bypasses_size_zero: AtomicU64,
 }
 
 impl SingleflightMap {
@@ -174,6 +208,9 @@ impl SingleflightMap {
                 map: Mutex::new(HashMap::new()),
                 max_inflight_bytes,
                 current_inflight_bytes: AtomicU64::new(0),
+                total_dedup_hits: AtomicU64::new(0),
+                total_bypasses_cap: AtomicU64::new(0),
+                total_bypasses_size_zero: AtomicU64::new(0),
             }),
         })
     }
@@ -266,17 +303,28 @@ impl SingleflightMap {
         if let Some(weak) = map.get(owned_key)
             && let Some(entry) = weak.upgrade()
         {
+            self.inner
+                .total_dedup_hits
+                .fetch_add(1, Ordering::Relaxed);
+            info!(
+                target: "singleflight",
+                "singleflight: dedup hit",
+            );
             return Role::Waiter(entry);
         }
         // No live slot. Cap-check before becoming leader.
         let current = self.inner.current_inflight_bytes.load(Ordering::Relaxed);
         let new_total = current.saturating_add(expected_size);
         if new_total > self.inner.max_inflight_bytes {
-            warn!(
+            self.inner
+                .total_bypasses_cap
+                .fetch_add(1, Ordering::Relaxed);
+            info!(
+                target: "singleflight",
                 current_inflight_bytes = current,
                 max_inflight_bytes = self.inner.max_inflight_bytes,
                 expected_size,
-                "singleflight cap exceeded — bypassing dedup, fetcher runs without registration"
+                "singleflight: bypass cap_exceeded",
             );
             return Role::Bypass;
         }
@@ -287,47 +335,50 @@ impl SingleflightMap {
         let (tx, rx) = watch::channel(None);
         let entry = Arc::new(InflightEntry {
             result_rx: rx,
-            published: AtomicBool::new(false),
             parent: Arc::downgrade(&self.inner),
             key: owned_key.clone(),
             reserved_bytes: expected_size,
         });
-        match map.entry(owned_key.clone()) {
-            Entry::Vacant(v) => {
-                v.insert(Arc::downgrade(&entry));
-            }
-            Entry::Occupied(mut o) => {
-                // Pre-existing dead Weak — overwrite atomically under
-                // the map lock.
-                o.insert(Arc::downgrade(&entry));
-            }
-        }
+        // Single `insert` — overwrites any pre-existing dead `Weak`
+        // atomically under the map lock. Equivalent to the prior
+        // `Entry::Vacant` / `Entry::Occupied` arms (both inserted the
+        // new `Weak`), simplified per code-simplifier MEDIUM #1 + LOW #4.
+        map.insert(owned_key.clone(), Arc::downgrade(&entry));
         Role::Leader { entry, tx }
     }
 
     /// Leader path: run the fetcher, publish, return.
+    ///
+    /// The leader's failure path wraps `Err` as `Arc<Error>` so the
+    /// failure-fanout to N waiters performs N refcount bumps instead
+    /// of N full `Error::clone()` calls (each cloning refcounted
+    /// strings + source chain). Per perf-MAJOR-1.
     async fn run_as_leader<F, Fut>(
         self: &Arc<Self>,
         entry: Arc<InflightEntry>,
-        tx: watch::Sender<Option<Arc<Result<SingleflightPayload, Error>>>>,
+        tx: watch::Sender<Option<Arc<Result<SingleflightPayload, Arc<Error>>>>>,
         fetcher: F,
     ) -> Result<SingleflightPayload, Error>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<Bytes>, Error>>,
     {
-        let result: Result<SingleflightPayload, Error> = match fetcher().await {
-            Ok(chunks) => Ok(Arc::new(chunks)),
-            Err(e) => Err(e),
-        };
-        // Publish flag MUST flip BEFORE the watch send so any waiter
-        // that races on `borrow_and_update` sees `published=true` and
-        // can distinguish "leader-cancel" from "leader-published".
-        entry.published.store(true, Ordering::Release);
-        let arc_result = Arc::new(match &result {
+        // Build the wire-format result (`Arc<Error>` for cheap waiter
+        // fan-out) then peel a leader-side return value off it. We
+        // build the wire form first so the leader's own return uses
+        // the same `Arc<Error>` (no extra clone for the leader).
+        let arc_result: Arc<Result<SingleflightPayload, Arc<Error>>> = Arc::new(
+            match fetcher().await {
+                Ok(chunks) => Ok(Arc::new(chunks)),
+                Err(e) => Err(Arc::new(e)),
+            },
+        );
+        let leader_result: Result<SingleflightPayload, Error> = match &*arc_result {
             Ok(p) => Ok(Arc::clone(p)),
-            Err(e) => Err(e.clone()),
-        });
+            // Leader gets a single `Error::clone()`; the N waiters
+            // each get a cheap `Arc<Error>` clone instead.
+            Err(arc_err) => Err((**arc_err).clone()),
+        };
         // Send. Errors mean all receivers are gone (every waiter
         // dropped) — the leader still returns its own copy below.
         drop(tx.send(Some(arc_result)));
@@ -336,11 +387,20 @@ impl SingleflightMap {
         // immediately after our send would find the slot gone.
         drop(entry);
         drop(tx);
-        result
+        leader_result
     }
 
     /// Waiter path: subscribe to leader's result. Returns Promote if
     /// the leader was canceled and the slot is gone (caller loops).
+    ///
+    /// Implementation note: the redundant `published` AtomicBool was
+    /// removed because the watch-channel state itself disambiguates
+    /// "leader-published" from "leader-canceled": the leader publishes
+    /// `Some(_)` BEFORE dropping `tx`, so any post-drop borrow that
+    /// returns `Some(_)` proves the leader published, and any one
+    /// returning `None` proves the leader canceled. The published flag
+    /// added an extra atomic store/load on the hot path with no
+    /// information not already encoded in the channel state.
     async fn run_as_waiter(entry: Arc<InflightEntry>) -> WaitOutcome {
         let mut rx = entry.result_rx.clone();
         // Fast path: maybe the leader has already published before we
@@ -364,14 +424,14 @@ impl SingleflightMap {
                 WaitOutcome::Promote
             }
             Err(_recv_err) => {
-                // Sender dropped. If `published` is true, the leader
-                // sent the value but the channel closed before we
-                // observed `changed()` — re-check borrow once.
-                if entry.published.load(Ordering::Acquire) {
-                    let v = rx.borrow().clone();
-                    if let Some(arc_result) = v {
-                        return WaitOutcome::Result(clone_result(&arc_result));
-                    }
+                // Sender dropped. The leader publishes `Some(_)` BEFORE
+                // dropping `tx`, so a final post-drop `borrow().clone()`
+                // observes the published value (if any) atomically with
+                // the channel teardown. If the borrow returns `Some(_)`
+                // the leader published; if `None`, the leader canceled.
+                let v = rx.borrow().clone();
+                if let Some(arc_result) = v {
+                    return WaitOutcome::Result(clone_result(&arc_result));
                 }
                 // Leader canceled. Drop our entry Arc to shrink the
                 // slot refcount (potentially to 0 if we were the last
@@ -434,7 +494,7 @@ enum Role {
     Bypass,
     Leader {
         entry: Arc<InflightEntry>,
-        tx: watch::Sender<Option<Arc<Result<SingleflightPayload, Error>>>>,
+        tx: watch::Sender<Option<Arc<Result<SingleflightPayload, Arc<Error>>>>>,
     },
     Waiter(Arc<InflightEntry>),
 }
@@ -444,15 +504,17 @@ enum WaitOutcome {
     Promote,
 }
 
-/// Clone an `Arc<Result<Payload, Error>>` into a `Result<Payload, Error>`
-/// where the Ok inner `Arc<Vec<Bytes>>` is reference-bumped (no copy)
-/// and the Err is `Error::clone()` (cheap struct clone, refcounted
-/// strings inside).
+/// Clone an `Arc<Result<Payload, Arc<Error>>>` into a
+/// `Result<Payload, Error>` where the Ok inner `Arc<Vec<Bytes>>` is
+/// reference-bumped (no copy) and the Err path performs a single
+/// `Error::clone()` against the shared `Arc<Error>` payload (one
+/// clone per waiter, vs N `Error::clone()`s in the old fan-out where
+/// the watch channel itself carried `Error` by value).
 fn clone_result(
-    arc_result: &Arc<Result<SingleflightPayload, Error>>,
+    arc_result: &Arc<Result<SingleflightPayload, Arc<Error>>>,
 ) -> Result<SingleflightPayload, Error> {
     match &**arc_result {
         Ok(payload) => Ok(Arc::clone(payload)),
-        Err(e) => Err(e.clone()),
+        Err(arc_err) => Err((**arc_err).clone()),
     }
 }

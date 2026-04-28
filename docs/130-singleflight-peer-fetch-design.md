@@ -133,11 +133,14 @@ Per-blob fan-out width is bounded by the inflight count (typically 4-16 for
 the bug pattern; 64+ in pathological bursts).
 
 Total inflight memory: bounded by `inflight_count × payload_size`. We propose
-a **soft cap of 256 MiB** total in-flight singleflight payload. When the cap
-is exceeded, NEW callers bypass singleflight and do their own peer-fetch
-(graceful degradation: we lose the dedup-amplification protection for those
-extra callers, but no caller is blocked on cap accounting). The cap is
-configurable; default `256 * 1024 * 1024`.
+a **soft cap of 1 GiB** total in-flight singleflight payload. The cap is sized
+to accommodate 16 concurrent in-flight 64 MiB blobs (today's max per-blob cap
+at `worker_proxy_store.rs:874`'s `MAX_CACHE_BLOB_SIZE`) instead of just 4. The
+server has 100s of GB free RAM; 1 GiB is conservative. When the cap is
+exceeded, NEW callers bypass singleflight and do their own peer-fetch (graceful
+degradation: we lose the dedup-amplification protection for those extra
+callers, but no caller is blocked on cap accounting). The cap is configurable;
+default `1024 * 1024 * 1024`.
 
 ### Interaction with the CDN-tee (currently in progress)
 

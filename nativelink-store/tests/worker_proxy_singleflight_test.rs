@@ -841,12 +841,13 @@ async fn cap_exceeded_late_callers_bypass() -> Result<(), Error> {
 // Guards against accidental const drift in the implementation file.
 // =====================================================================
 #[nativelink_test]
-async fn default_cap_constant_is_256_mib() -> Result<(), Error> {
+async fn default_cap_constant_is_1_gib() -> Result<(), Error> {
     assert_eq!(
         DEFAULT_MAX_INFLIGHT_BYTES,
-        256 * 1024 * 1024,
-        "design doc commits to 256 MiB default cap; a change here requires \
-         a docs/130-singleflight-peer-fetch-design.md update"
+        1024 * 1024 * 1024,
+        "design doc commits to 1 GiB default cap (sized for 16 concurrent \
+         64 MiB MAX_CACHE_BLOB_SIZE blobs); a change here requires a \
+         docs/130-singleflight-peer-fetch-design.md update"
     );
     Ok(())
 }
