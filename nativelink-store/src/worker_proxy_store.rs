@@ -1036,7 +1036,11 @@ impl WorkerProxyStore {
         // Log cache write result (non-fatal).
         match cache_result {
             Ok(()) => {
-                debug!(
+                // Per-blob (not per-chunk) state transition: a peer-fetched
+                // blob was successfully tee'd into local CAS. info! lets
+                // operators see how often the CDN tee fires in production
+                // without needing to enable debug logging.
+                info!(
                     %digest,
                     size_bytes = total_bytes,
                     "proxy_cache: cached proxied blob in inner store"
@@ -2193,6 +2197,15 @@ impl StoreDriver for WorkerProxyStore {
         // responder mode and refuses to chain. Note: tokio::spawn does NOT
         // inherit task-locals, so the scope must be set INSIDE the spawned
         // task — outside the spawn is a no-op.
+        //
+        // TODO(cdn-tee-parallel-path): when the peer wins this race the
+        // forwarded bytes are sent straight to `writer` and never tee'd
+        // into local CAS, so the next read of the same digest re-races
+        // (or re-fetches if the peer disappears). The sequential path
+        // `get_part_and_cache` (line 883-1056) already tees; this parallel
+        // path needs a similar tee on the peer-winner branches in the
+        // tokio::select! below (lines ~2267 and ~2275). Tracked in
+        // `.claude/agent-memory/.../project_cdn_tee_already_implemented.md`.
         let peer_handle: JoinHandle<Result<(), Error>> = tokio::spawn(async move {
             IS_WORKER_REQUEST
                 .scope(
