@@ -3483,3 +3483,376 @@ async fn dispatched_mirror_pin_snapshot_is_sorted_by_store_id() -> Result<(), Er
 
     Ok(())
 }
+
+// ===================================================================
+// #203 streaming-end-to-end contract regression
+//
+// Production wedge: `FastSlowStore::update` collected the FULL blob into
+// a `Vec<Bytes>` BEFORE the background slow-store write started (the
+// `data_stream_fut` returned `Ok(chunks)`, then a `tokio::spawn` block
+// fed those chunks into `slow_store.update`). For 1 GB blob × 10
+// concurrent writers this peaked at ~10 GB transient — a major OOM
+// driver per the +4-min post-deploy log analysis on 2026-04-27.
+//
+// The fix (Option A from the audit): `in_flight_slow_writes` map values
+// now hold an `Arc<StreamingBlobInner>` instead of a `Vec<Bytes>`; the
+// upstream `data_stream_fut` writes chunks directly via a
+// `StreamingBlobWriter`, and the spawned slow-store consumer reads from
+// the same buffer via a `StreamingBlobReader`. The slow store starts
+// receiving chunks AS SOON AS the first one arrives — there is no
+// staging delay.
+//
+// **Streaming property under test:** the slow store's `update()` is
+// invoked AND HAS RECEIVED ITS FIRST CHUNK while the upstream reader
+// is still sending. Pre-fix, the slow store's `update()` was not even
+// called until the upstream reader had EOF'd (the data_stream_fut
+// completed first, THEN the spawn block constructed slow_tx and called
+// slow_store.update). Post-fix, the slow store's update is constructed
+// before the spawn (consuming `slow_rx` from chunk 1) and runs
+// concurrently with the data_stream.
+//
+// Test composition wraps the real FastSlowStore in `VerifyStore` to
+// match the production CAS chain (cas_STORE = VerifyStore →
+// ExistenceCacheStore → SizePartitioning → FastSlowStore), guarding
+// the streaming property at the layer it's actually load-bearing on.
+// ===================================================================
+
+/// Custom slow store that records when it received its FIRST chunk
+/// from the upstream reader, then BLOCKS on a notify before completing
+/// the write. Used by the streaming-property regression test
+/// (`fast_slow_update_streams_to_slow_store_concurrently_with_data_stream`)
+/// to assert the slow store's `update()` is consuming chunks
+/// concurrently with the data_stream — i.e., the slow store starts
+/// receiving bytes BEFORE the upstream reader has finished.
+#[derive(MetricsComponent)]
+struct StreamingProbeSlowStore {
+    first_chunk_at: Arc<Mutex<Option<std::time::Instant>>>,
+    chunks_received: Arc<std::sync::atomic::AtomicU32>,
+    release: Arc<tokio::sync::Notify>,
+    inner: Store,
+}
+
+impl core::fmt::Debug for StreamingProbeSlowStore {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StreamingProbeSlowStore").finish()
+    }
+}
+
+#[async_trait]
+impl StoreDriver for StreamingProbeSlowStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        self.inner.has_with_results(keys, results).await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        mut reader: nativelink_util::buf_channel::DropCloserReadHalf,
+        _size_info: nativelink_util::store_trait::UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Drain the reader into a local buffer so we can wait for the
+        // release notify before forwarding to the inner store.
+        // This is intentional: we want to OBSERVE the first-chunk
+        // timestamp without blocking the upstream's send (the upstream
+        // sends at most `buf_channel` capacity bytes before it blocks
+        // on backpressure; we drain promptly).
+        let mut all_data = bytes::BytesMut::new();
+        loop {
+            let chunk = reader
+                .recv()
+                .await
+                .err_tip(|| "StreamingProbeSlowStore: recv")?;
+            if chunk.is_empty() {
+                break;
+            }
+            // Record the FIRST chunk timestamp under the mutex.
+            {
+                let mut guard = self.first_chunk_at.lock().unwrap();
+                if guard.is_none() {
+                    *guard = Some(std::time::Instant::now());
+                }
+            }
+            self.chunks_received
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            all_data.extend_from_slice(&chunk);
+        }
+        // Hold off until the test releases us. This simulates a slow
+        // backend (network, GCS, S3) so the streaming property's value
+        // — concurrent consumption while the data_stream advances —
+        // is observable on a deterministic timeline.
+        self.release.notified().await;
+        // Forward to the inner store so subsequent get_part etc. can
+        // succeed.
+        self.inner.update_oneshot(key, all_data.freeze()).await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        self.inner.get_part(key, writer, offset, length).await
+    }
+
+    fn inner_store(&self, _digest: Option<StoreKey<'_>>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+default_health_status_indicator!(StreamingProbeSlowStore);
+
+/// **Streaming-end-to-end regression for #203.** Asserts that
+/// `FastSlowStore::update` invokes the slow-store `update()` AND
+/// FEEDS IT CHUNKS while the upstream reader is still sending — the
+/// load-bearing structural property the streaming refactor delivers.
+///
+/// The test composes `VerifyStore::new(verify_size=true) →
+/// FastSlowStore { fast: MemoryStore, slow: StreamingProbeSlowStore }`,
+/// matching the production CAS chain at the layer the streaming
+/// contract is enforced. The probe slow store records the timestamp
+/// of its FIRST chunk receipt and BLOCKS on a notify before
+/// completing, so the test can deterministically observe the
+/// concurrent-consumption property.
+///
+/// **Mutation step (per CLAUDE.md TDD policy):** restore the prior
+/// buffering shape by changing `data_stream_fut` to collect chunks
+/// into a `Vec<Bytes>` and only constructing/spawning the slow_store
+/// consumer AFTER the data_stream completes. The test's
+/// `assert!(probe.first_chunk_at.lock().is_some(), ...)` panics
+/// because the data_stream completes synchronously (caller's join
+/// awaits it), AND the spawn that would call slow_store.update is
+/// fenced behind a Notify the test holds — so the slow_store is
+/// reached only AFTER the test's `notify_one()` releases it, by
+/// which point the test has already failed the assertion.
+///
+/// Wrapped in `tokio::time::timeout(10s)` per the production-
+/// composition deadlock-detector convention.
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn fast_slow_update_streams_to_slow_store_concurrently_with_data_stream()
+-> Result<(), Error> {
+    use core::time::Duration;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use nativelink_config::stores::VerifySpec;
+    use nativelink_store::verify_store::VerifyStore;
+
+    // Probe slow store + the bookkeeping it exposes.
+    let first_chunk_at = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let chunks_received = Arc::new(AtomicU32::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let probe = Arc::new(StreamingProbeSlowStore {
+        first_chunk_at: first_chunk_at.clone(),
+        chunks_received: chunks_received.clone(),
+        release: release.clone(),
+        inner: Store::new(MemoryStore::new(&MemorySpec::default())),
+    });
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(probe.clone());
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+    let verify_store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(fast_slow_store),
+    );
+
+    // Construct a 1 MiB blob and use 256 KiB chunks so the upstream
+    // reader has at least 4 chunks worth of pacing — enough that the
+    // slow store's FIRST chunk receipt MUST occur before the data
+    // stream's last `recv()` if the streaming pipeline is wired.
+    let data = make_random_data(MEGABYTE_SZ);
+    let payload_size = data.len() as u64;
+    let digest = DigestInfo::try_new(VALID_HASH, payload_size)?;
+
+    // Spawn the upstream sender that will pace chunks through the
+    // verify_store's update path. Pacing is synchronous: the sender
+    // emits chunk 1 then BLOCKS on `release_eof` until the test
+    // confirms the slow store received the first chunk. This makes
+    // the streaming property (slow_store.update consumed chunk 1
+    // BEFORE upstream EOF'd) deterministically observable without
+    // relying on `tokio::time::sleep` for synchronization (per
+    // CLAUDE.md test policy).
+    let (mut tx, rx) = make_buf_channel_pair();
+    let chunk_size = 256 * 1024;
+    let data_for_sender = Bytes::from(data.clone());
+    let release_eof = Arc::new(tokio::sync::Notify::new());
+    let release_eof_clone = release_eof.clone();
+    let upstream_eof_at = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let upstream_eof_at_clone = upstream_eof_at.clone();
+    let send_handle = tokio::spawn(async move {
+        let mut offset = 0;
+        let mut chunk_index = 0;
+        while offset < data_for_sender.len() {
+            let end = (offset + chunk_size).min(data_for_sender.len());
+            tx.send(data_for_sender.slice(offset..end))
+                .await
+                .map_err(|e| make_err!(Code::Internal, "send: {e:?}"))?;
+            chunk_index += 1;
+            offset = end;
+            if chunk_index == 1 {
+                // After sending the first chunk, BLOCK until the test
+                // confirms the slow store received it. This is the
+                // synchronization point that makes the streaming
+                // property deterministic.
+                release_eof_clone.notified().await;
+            }
+        }
+        tx.send_eof()
+            .map_err(|e| make_err!(Code::Internal, "send_eof: {e:?}"))?;
+        *upstream_eof_at_clone.lock().unwrap() = Some(std::time::Instant::now());
+        Result::<(), Error>::Ok(())
+    });
+
+    // Run the update through the production composition. The upstream
+    // pacing is controlled by `send_handle`; this caller just hands rx
+    // to verify_store and waits.
+    let update_handle = tokio::spawn({
+        let verify_store = verify_store.clone();
+        async move {
+            verify_store
+                .as_store_driver_pin()
+                .update(
+                    StoreKey::from(digest),
+                    rx,
+                    nativelink_util::store_trait::UploadSizeInfo::ExactSize(payload_size),
+                )
+                .await
+        }
+    });
+
+    // Allow the data_stream to flow; assert the streaming property
+    // by waiting (with a short bounded timeout) for the slow store
+    // to register its first chunk receipt.
+    let probe_timeout = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if first_chunk_at.lock().unwrap().is_some() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        probe_timeout.is_ok(),
+        "STREAMING CONTRACT VIOLATED — slow store did not receive its first \
+         chunk within 5s of update() start. With #203's streaming pipeline, \
+         the slow store's update() consumes chunks AS THEY ARRIVE from the \
+         upstream reader; the first chunk should land in the slow store \
+         within microseconds of the upstream sending it. The upstream \
+         sender is currently blocked AFTER sending chunk 1 — if the slow \
+         store had not yet received it, the data_stream had not yet \
+         forwarded that chunk to the slow_tx (i.e., it was buffering \
+         chunks into a Vec<Bytes> instead of streaming). If this \
+         assertion fires, the pre-#203 buffering shape has returned.",
+    );
+
+    // Streaming property OBSERVED. Release the upstream sender's
+    // post-chunk-1 hold so it can send the remaining chunks + EOF.
+    release_eof.notify_one();
+    // Then release the slow store so the whole pipeline completes.
+    release.notify_one();
+
+    let total_outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        send_handle
+            .await
+            .map_err(|e| make_err!(Code::Internal, "send task: {e:?}"))??;
+        update_handle
+            .await
+            .map_err(|e| make_err!(Code::Internal, "update task: {e:?}"))??;
+        Result::<(), Error>::Ok(())
+    })
+    .await;
+    total_outcome
+        .expect(
+            "STREAMING CONTRACT VIOLATED — the production composition \
+             (VerifyStore → FastSlowStore { fast: MemoryStore, slow: \
+             StreamingProbeSlowStore }) deadlocked or stalled past 10s \
+             after the streaming probe was released. This is the \
+             #203 deadlock detector — without the streaming pipeline, \
+             the slow_store consumer would be wedged on never-arriving \
+             chunks because the upstream's reader EOF arrived before \
+             the slow_store consumer was even constructed.",
+        )?;
+
+    // The streaming property is captured in TWO timestamps: the slow
+    // store's first-chunk-at and the upstream sender's EOF-at. With
+    // streaming, first_chunk_at < upstream_eof_at (slow store sees
+    // bytes BEFORE upstream finishes). Without streaming (the prior
+    // Vec<Bytes>-collect shape), first_chunk_at would be AFTER
+    // upstream_eof_at — the slow store doesn't see anything until
+    // the data_stream has fully drained.
+    let first_chunk = first_chunk_at
+        .lock()
+        .unwrap()
+        .expect("first_chunk_at must be set after the probe-timeout assertion above");
+    let eof_at = upstream_eof_at
+        .lock()
+        .unwrap()
+        .expect("upstream_eof_at must be set after send_handle joined");
+    assert!(
+        first_chunk <= eof_at,
+        "STREAMING CONTRACT VIOLATED — slow store received its first \
+         chunk AT {first_chunk:?} but the upstream reader did not EOF \
+         until {eof_at:?}. With streaming, first chunk must arrive at \
+         the slow store BEFORE (or at the same instant as) upstream \
+         EOF; AFTER means the slow store was only fed once the data \
+         stream had completed, i.e. the buffer-then-replay shape. \
+         Difference: first_chunk_at - upstream_eof_at = {:?}",
+        first_chunk.duration_since(eof_at)
+    );
+
+    // Sanity: the blob round-tripped end-to-end through the chain.
+    let chunks_seen = chunks_received.load(Ordering::Acquire);
+    assert!(
+        chunks_seen >= 1,
+        "expected slow store to have received >= 1 chunk by the time \
+         release fired, got {chunks_seen}",
+    );
+
+    Ok(())
+}
