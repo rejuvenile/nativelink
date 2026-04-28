@@ -2141,6 +2141,17 @@ impl StoreDriver for WorkerProxyStore {
         if self.race_peers.load(Ordering::Relaxed) {
             let is_responder = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
             if is_responder {
+                // SAFETY (writer-termination contract): direct delegation to
+                // `self.inner.get_part(...)` is safe because `Store::get_part`
+                // is contractually required to terminate the writer
+                // (`send_eof` on Ok, `send_error` on Err) on every exit path.
+                // Every leaf store in the codebase satisfies this (see
+                // composability_test.rs `verify_store_around_*` family),
+                // including the per-site fixes in this audit
+                // (size_partitioning, ref, noop). Adding a `WriteHalfGuard`
+                // here would be defensive against a sub-store violating its
+                // own contract, but that violation would surface in the
+                // composability test for that sub-store directly.
                 return self.inner.get_part(key, writer, offset, length).await;
             }
         }

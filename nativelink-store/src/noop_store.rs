@@ -79,11 +79,20 @@ impl StoreDriver for NoopStore {
     async fn get_part(
         self: Pin<&Self>,
         _key: StoreKey<'_>,
-        _writer: &mut DropCloserWriteHalf,
+        writer: &mut DropCloserWriteHalf,
         _offset: u64,
         _length: Option<u64>,
     ) -> Result<(), Error> {
-        Err(make_err!(Code::NotFound, "Not found in noop store"))
+        // Writer-termination contract: NoopStore is test-only, but a
+        // wrapping `VerifyStore` (or any composer that joins a paired
+        // reader on this writer's other half) will deadlock on
+        // `rx.recv().await` if the writer is never terminated. Send the
+        // structured NotFound through the wire BEFORE returning so the
+        // paired reader unblocks. This keeps NoopStore honest for the
+        // composability harness too.
+        let err = make_err!(Code::NotFound, "Not found in noop store");
+        writer.send_error(err.clone());
+        Err(err)
     }
 
     fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {

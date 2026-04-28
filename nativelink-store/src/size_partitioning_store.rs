@@ -161,9 +161,20 @@ impl StoreDriver for SizePartitioningStore {
         let digest = match key {
             StoreKey::Digest(digest) => digest,
             other @ StoreKey::Str(_) => {
-                return Err(make_input_err!(
+                // Writer-termination contract: this validation early-return
+                // takes a borrowed `&mut DropCloserWriteHalf` and never
+                // delegated the call further, so no inner store has
+                // terminated the writer. Without an explicit `send_error`,
+                // a wrapping `VerifyStore` (or any composer that joins a
+                // paired reader on this writer's other half) would deadlock
+                // forever on `rx.recv().await`. Send the structured Err
+                // through the wire BEFORE returning so the paired reader
+                // unblocks with the matching diagnostic.
+                let err = make_input_err!(
                     "SizePartitioningStore only supports Digest keys, got {other:?}"
-                ));
+                );
+                writer.send_error(err.clone());
+                return Err(err);
             }
         };
         if digest.size_bytes() < self.partition_size {

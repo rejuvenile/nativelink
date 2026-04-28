@@ -143,9 +143,21 @@ impl StoreDriver for RefStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
-        self.get_store()?
-            .get_part(key, writer, offset, length)
-            .await
+        // Writer-termination contract: `self.get_store()?` early-returns Err
+        // without first sending the error through the writer. If a caller
+        // wraps this RefStore in `VerifyStore` (or any composer that joins
+        // a paired reader on this writer's other half), the missing
+        // termination deadlocks `check_fut` forever on `rx.recv().await`.
+        // Resolve the inner store explicitly and `send_error` BEFORE the
+        // early return so the paired reader unblocks with the structured Err.
+        let store = match self.get_store() {
+            Ok(store) => store,
+            Err(err) => {
+                writer.send_error(err.clone());
+                return Err(err);
+            }
+        };
+        store.get_part(key, writer, offset, length).await
     }
 
     fn inner_store(&self, key: Option<StoreKey>) -> &'_ dyn StoreDriver {

@@ -352,6 +352,25 @@ impl StoreDriver for VerifyStore {
         // `tracing::error!` (target=buf_channel::write_half_guard_drop).
         // See `WriteHalfGuard` rustdoc and the composability harness in
         // `nativelink-store/tests/composability_test.rs`.
+        //
+        // **Three-way commit (#186 fix, mirrors FastSlowStore #191):**
+        //   - Ok(()): suppress Drop fallback; inner already sent EOF.
+        //   - Err(e): EXPLICITLY terminate via `tx_guard.fail(e.clone())`
+        //     to send the structured error to the receiver AND suppress
+        //     the Drop fallback. Previously this used
+        //     `commit_delegated_if_ok(&res)` which left the Drop fallback
+        //     armed on every Err — firing the loud
+        //     `"WriteHalfGuard fired Drop fallback: function exited
+        //     without explicit commit"` `error!` log on every legitimate
+        //     inner-store NotFound (600+/min sustained in production,
+        //     contributing to the OOM trajectory at deploy +15-25 min).
+        //     Drop fallback was originally a defensive net for inner
+        //     stores that violated the contract themselves; per the
+        //     contract-wide audit, all relevant leaf stores now satisfy
+        //     the contract (filesystem, memory, redis, gcs, etc.), so
+        //     the noisy Drop log was a false alarm on the COMMON case.
+        //     Genuine inner-store contract violations now surface in the
+        //     composability harness (`verify_store_around_*`) directly.
         let get_fut = async move {
             let mut tx = tx;
             let mut tx_guard = WriteHalfGuard::new(&mut tx);
@@ -359,7 +378,12 @@ impl StoreDriver for VerifyStore {
                 .inner_store
                 .get_part(digest, &mut *tx_guard, 0, None)
                 .await;
-            tx_guard.commit_delegated_if_ok(&res);
+            match &res {
+                Ok(()) => tx_guard.commit_delegated_if_ok(&res),
+                Err(err) => {
+                    let _ = tx_guard.fail(err.clone());
+                }
+            }
             res
         };
         let check_fut = self.inner_check_get_part(
