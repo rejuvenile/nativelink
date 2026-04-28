@@ -41,9 +41,7 @@ use nativelink_util::store_trait::{
     StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
     UploadSizeInfo, slow_update_store_with_file,
 };
-use nativelink_util::streaming_blob::{
-    StreamingBlobInner, StreamingBlobReader, StreamingBlobWriter,
-};
+use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
@@ -58,99 +56,6 @@ use tracing::{debug, error, info, trace, warn};
 // previous `Arc<OnceCell<()>>` was a vestige from before the
 // spawn-detach refactor removed `OnceCell::get_or_try_init`).
 type Loader = Arc<()>;
-
-/// Value type for `FastSlowStore::in_flight_slow_writes`. Holds a streaming
-/// blob handle whose chunks are appended by the caller's `update()` data
-/// stream and consumed concurrently by (a) the background slow-store write
-/// task and (b) any [`FastSlowStore::get_part`] caller that lands here on a
-/// fast-store cache miss.
-///
-/// **Streaming-end-to-end contract (#203, 2026-04-27):** the previous shape
-/// (`Vec<Bytes>`) collected the FULL blob into the map before the
-/// background slow-store write started, doubling the in-memory footprint
-/// for the duration of the slow write and incurring O(blob_size) per
-/// concurrent caller. Audit:
-/// `.claude/audits/streaming-transfer-contract/sites.md`. The streaming
-/// shape lets the slow-store write start as soon as the first chunk arrives
-/// (3-way `tokio::join!` analogous to the CDN-tee pattern at
-/// `worker_proxy_store.rs:883-1056`) and lets the data_stream feed both
-/// fast_store and slow_store concurrently without an intermediate buffer.
-///
-/// Memory bound: `inner.max_buffer_bytes` controls the sliding window for
-/// chunks retained in the streaming blob. To preserve cache-miss
-/// recoverability semantics from the prior `Vec<Bytes>` shape (a
-/// fast-store-evicted blob can still be served from in-flight while the
-/// slow-store write is in progress), `expected_size` is used as the buffer
-/// budget so the streaming blob holds the whole blob until the entry is
-/// removed (i.e. until the background slow-store write completes). With
-/// concurrent slow-store consumption AND the absence of `Vec<Bytes>`
-/// double-buffering, peak memory is now bounded by N concurrent writers ×
-/// blob_size (down from 2N × blob_size in the worst case).
-#[derive(Debug)]
-pub(crate) struct InFlightEntry {
-    /// The streaming blob shared between the upstream `data_stream_fut`
-    /// (writer), the background slow-store consumer, and any concurrent
-    /// `get_part` reader that hits the in-flight map on a fast-store
-    /// miss.
-    pub(crate) inner: Arc<StreamingBlobInner>,
-    /// Total size in bytes the blob is expected to reach at EOF — equals
-    /// `digest.size_bytes()` for the digest-keyed case, or the upstream
-    /// `UploadSizeInfo::ExactSize` value when known. For `MaxSize` callers
-    /// this is an upper bound (capped at
-    /// `STREAMING_INFLIGHT_MAXSIZE_BUDGET_BYTES`), NOT the actual
-    /// eventual byte count; consult [`Self::bytes_streamed`] for the
-    /// running actual.
-    pub(crate) expected_size: u64,
-    /// Running count of bytes written into the streaming blob by
-    /// `data_stream_fut`. For `StoreKey::Digest` callers this converges
-    /// to `expected_size` at EOF; for `StoreKey::Str` + `MaxSize` callers
-    /// this is the only honest answer for `has_with_results`. Updated
-    /// once per chunk inside the producer loop. Held separately from
-    /// `StreamingBlobInner`'s private `bytes_written` so this crate can
-    /// observe it without exporting an extra getter from
-    /// `nativelink-util/streaming_blob.rs`.
-    pub(crate) bytes_streamed: Arc<AtomicU64>,
-}
-
-impl InFlightEntry {
-    /// Construct a new entry. Allocates a fresh `StreamingBlobInner`
-    /// with `expected_size` as the sliding-window budget so the chunks
-    /// are retained for the cache-miss replay path until the entry is
-    /// removed from the map.
-    fn new(digest: DigestInfo, expected_size: u64) -> Self {
-        // Use `max(expected_size, 1)` because `StreamingBlobInner::new`
-        // is happy with 0 but a 0-byte budget would immediately evict
-        // any chunk for a non-empty blob (defense-in-depth against a
-        // future caller passing an empty `expected_size`).
-        let buf = max(expected_size, 1);
-        let inner = Arc::new(StreamingBlobInner::new(digest, buf));
-        Self {
-            inner,
-            expected_size,
-            bytes_streamed: Arc::new(AtomicU64::new(0)),
-        }
-    }
-}
-
-/// Pick the size value to report from `has_with_results` for an in-flight
-/// streaming-blob entry. For `StoreKey::Digest`, the digest's
-/// `size_bytes()` is the source of truth — it equals `entry.expected_size`
-/// for digest-keyed CAS uploads (verified by the size-mismatch guard in
-/// `get_part`). For `StoreKey::Str` (the only path where `entry.expected_size`
-/// may differ from the actual eventual byte count — `MaxSize`-callers can
-/// over-state the upper bound), report `entry.bytes_streamed` so the
-/// answer reflects bytes-actually-streamed rather than the upper-bound
-/// upper bound. B1 fix-up (2026-04-27): pre-fix this always reported
-/// `entry.expected_size`, which over-stated the eventual size for
-/// `MaxSize`-keyed Str uploads (no current production caller — verified
-/// 2026-04-27 — but the wire-correctness regression for
-/// `FindMissingBlobs` was real and is now defensive).
-fn in_flight_reported_size(owned: &StoreKey<'static>, entry: &InFlightEntry) -> u64 {
-    match owned {
-        StoreKey::Digest(d) => d.size_bytes(),
-        StoreKey::Str(_) => entry.bytes_streamed.load(Ordering::Acquire),
-    }
-}
 
 /// Default maximum aggregate bytes held in `mirror_blobs`. The runtime cap
 /// is held in `FastSlowStore::mirror_blobs_max_bytes` and is only overridable
@@ -179,21 +84,6 @@ const LOCAL_ONLY_READS_BATCH_CONCURRENCY: usize = 16;
 /// fired. The pin-expiry callback (registered on the fast store) is the
 /// secondary safety net for hangs longer than 120s.
 const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
-
-/// Cap on the streaming-buffer budget when the caller supplies
-/// `UploadSizeInfo::MaxSize(s)` instead of `ExactSize(s)`. `MaxSize` is an
-/// UPPER BOUND only (see `UploadSizeInfo` doc) — for example
-/// `CompressionStore::update` forwards `MaxSize(max_output_size)` where the
-/// actual encoded length can be much smaller than the bound. Treating that
-/// upper bound as the streaming-buffer ceiling would let
-/// `StreamingBlobInner::max_buffer_bytes` grow to many GiB for a small
-/// blob, defeating the sliding-window eviction. Cap at 64 MiB which is the
-/// same magnitude as `max_bytes_per_stream` in worker upload paths and well
-/// above any realistic single-blob streaming window. Reviewer audit (#203
-/// fix-up B1, 2026-04-27): production composition does NOT include
-/// `CompressionStore`, so no MaxSize+Str caller currently reaches
-/// `FastSlowStore::update`; this is defense-in-depth.
-const STREAMING_INFLIGHT_MAXSIZE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 tokio::task_local! {
     /// Per-call opt-in: when set on the calling task, the populate-NotFound
@@ -372,7 +262,7 @@ struct PinExpireFailedWritesListener {
     /// from this map is what makes the listener idempotent across the
     /// 3-wrapper composition AND scopes the durability path to actual
     /// uploads (vs `DirectoryCache` download pins).
-    in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, InFlightEntry>>>,
+    in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
 }
 
 impl ItemCallback for PinExpireFailedWritesListener {
@@ -426,7 +316,7 @@ impl ItemCallback for PinExpireFailedWritesListener {
 fn register_pin_expire_listener(
     fast_store: &Store,
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
-    in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, InFlightEntry>>>,
+    in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
 ) {
     let listener: Arc<dyn ItemCallback> = Arc::new(PinExpireFailedWritesListener {
         failed_slow_writes,
@@ -464,7 +354,7 @@ pub struct FastSlowStore {
     /// Holds data for blobs whose background slow-store write is still in
     /// progress. If the fast store evicts the blob before the slow write
     /// completes, `get_part` serves from this map to prevent NotFound gaps.
-    in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, InFlightEntry>>>,
+    in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
     /// Notified when in_flight_slow_writes becomes empty. Used by
     /// `flush_slow_writes` to wait for all background writes to complete.
     in_flight_empty_notify: Arc<Notify>,
@@ -633,7 +523,7 @@ impl FastSlowStore {
     pub fn new(spec: &FastSlowSpec, fast_store: Store, slow_store: Store) -> Arc<Self> {
         let failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>> =
             Arc::new(Mutex::new(HashSet::new()));
-        let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, InFlightEntry>>> =
+        let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         register_pin_expire_listener(
             &fast_store,
@@ -670,55 +560,10 @@ impl FastSlowStore {
 
     /// Test-only: insert a synthetic in-flight slow-write entry. Used by the
     /// `flush_slow_writes` lost-wakeup regression test to drive the predicate
-    /// without spinning up the full populate machinery, and by sibling tests
-    /// to install a phantom-positive in-flight entry whose chunks don't sum
-    /// to the digest's claimed size (exercising the size-mismatch guard in
-    /// `get_part`).
-    ///
-    /// The streaming-shape (#203) translates the historical `Vec<Bytes>`
-    /// API into a freshly-constructed [`InFlightEntry`] whose
-    /// [`StreamingBlobInner`] is pre-populated with the supplied chunks
-    /// AND immediately closed (`send_eof`). The `expected_size` is set
-    /// from the supplied chunks' total — for the size-mismatch test
-    /// callers that intentionally pass mismatched chunks, this means
-    /// the SUPPLIED-chunks-total is what `get_part`'s size guard
-    /// compares against the digest's claimed size, exactly preserving
-    /// the legacy semantics.
-    ///
-    /// `async` (B5 fix-up, 2026-04-27): pre-fix this was sync and used
-    /// `futures::executor::block_on` to drive `StreamingBlobWriter::send`
-    /// — that worked only because `send` happens to have zero `.await`
-    /// points in the no-eviction path. The moment `send` adds an
-    /// actual yield (e.g. backpressure on sliding-window eviction),
-    /// the sync `block_on` would deadlock the tokio worker. Making
-    /// the helper `async` removes the landmine.
+    /// without spinning up the full populate machinery.
     #[doc(hidden)]
-    pub async fn test_insert_in_flight(&self, key: StoreKey<'static>, chunks: Vec<Bytes>) {
-        let digest = match key.borrow() {
-            StoreKey::Digest(d) => d,
-            // Synthetic str-key: build a placeholder digest for the
-            // streaming blob's diagnostic logging. Size-mismatch guard
-            // only fires for `StoreKey::Digest`, so the wrong size is
-            // benign here.
-            StoreKey::Str(_) => DigestInfo::new([0u8; 32], 0),
-        };
-        let total: u64 = chunks.iter().map(|c| c.len() as u64).sum();
-        // Use total bytes as the budget so the chunks fit without
-        // sliding-window eviction (callers want to read what they
-        // installed).
-        let entry = InFlightEntry::new(digest, total);
-        // Pre-populate the streaming buffer with the test chunks and
-        // close it. Awaiting in the existing tokio runtime is the
-        // correct discipline (B5 fix-up).
-        let mut writer = StreamingBlobWriter::new(Arc::clone(&entry.inner));
-        for chunk in chunks {
-            writer
-                .send(chunk)
-                .await
-                .expect("test_insert_in_flight: streaming buffer send failed");
-        }
-        let _ = writer.send_eof();
-        self.in_flight_slow_writes.lock().insert(key, entry);
+    pub fn test_insert_in_flight(&self, key: StoreKey<'static>, chunks: Vec<Bytes>) {
+        self.in_flight_slow_writes.lock().insert(key, chunks);
     }
 
     /// Test-only: remove an in-flight slow-write entry and fire
@@ -843,8 +688,8 @@ impl FastSlowStore {
                             "FastSlowStore::flush_slow_writes: timed out waiting \
                              for background writes to complete"
                         );
-                        for (key, entry) in guard.iter() {
-                            let bytes = entry.expected_size;
+                        for (key, chunks) in guard.iter() {
+                            let bytes: usize = chunks.iter().map(|b| b.len()).sum();
                             warn!(
                                 ?key,
                                 bytes,
@@ -912,7 +757,7 @@ impl FastSlowStore {
         other: &Arc<Self>,
     ) -> Arc<Self> {
         let shared = other.failed_slow_writes.clone();
-        let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, InFlightEntry>>> =
+        let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         register_pin_expire_listener(&fast_store, shared.clone(), in_flight_slow_writes.clone());
         Arc::new_cyclic(|weak_self| Self {
@@ -1701,7 +1546,9 @@ impl FastSlowStore {
             if let Some(terminal) = streaming_inner.terminal_result() {
                 return terminal;
             }
-            let mut reader = StreamingBlobReader::new(streaming_inner.clone());
+            let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(
+                streaming_inner.clone(),
+            );
             loop {
                 match reader.next_chunk().await {
                     Ok(c) if c.is_empty() => return Ok(()),
@@ -2296,8 +2143,9 @@ impl StoreDriver for FastSlowStore {
                 for (k, result) in key.iter().zip(results.iter_mut()) {
                     if result.is_none() {
                         let owned = k.borrow().into_owned();
-                        if let Some(entry) = in_flight.get(&owned) {
-                            *result = Some(in_flight_reported_size(&owned, entry));
+                        if let Some(chunks) = in_flight.get(&owned) {
+                            let total_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+                            *result = Some(total_len);
                         }
                     }
                 }
@@ -2328,8 +2176,9 @@ impl StoreDriver for FastSlowStore {
                 for (k, result) in key.iter().zip(results.iter_mut()) {
                     if result.is_none() {
                         let owned = k.borrow().into_owned();
-                        if let Some(entry) = in_flight.get(&owned) {
-                            let total_len = in_flight_reported_size(&owned, entry);
+                        if let Some(chunks) = in_flight.get(&owned) {
+                            let total_len: u64 =
+                                chunks.iter().map(|c| c.len() as u64).sum();
                             debug!(
                                 key = %owned.as_str(),
                                 data_len = total_len,
@@ -2442,19 +2291,11 @@ impl StoreDriver for FastSlowStore {
             ))
         });
 
-        // Streaming write (#203): the data_stream feeds chunks
-        // CONCURRENTLY into (a) fast_store via fast_tx, (b) the
-        // background slow_store consumer via slow_tx, and (c) the
-        // streaming-blob in_flight entry that bridges fast-store
-        // eviction to slow-store completion for any concurrent
-        // get_part. The slow_store write starts on the FIRST chunk
-        // rather than after the upstream reader is fully drained,
-        // eliminating the prior `Vec<Bytes>` accumulator. Reference
-        // pattern: `worker_proxy_store.rs:883-1056` (3-way
-        // tokio::join! — peer / forward / cache_write). Audit
-        // context: `.claude/audits/streaming-transfer-contract/sites.md`.
+        // Decoupled write: stream to fast store while accumulating data,
+        // then spawn a background task for the slow store write.
+        // This prevents slow-store latency (e.g. ZFS txg sync) from
+        // blocking the fast-store (MemoryStore) write path.
         let (mut fast_tx, fast_rx) = make_buf_channel_pair_with_size(128);
-        let (mut slow_tx, slow_rx) = make_buf_channel_pair_with_size(128);
 
         let update_start = std::time::Instant::now();
         debug!(
@@ -2463,73 +2304,11 @@ impl StoreDriver for FastSlowStore {
             "FastSlowStore::update: start",
         );
 
-        // Determine the expected blob size for the in-flight
-        // streaming-blob entry. Prefer the digest's `size_bytes()`
-        // for `StoreKey::Digest`; fall back to `UploadSizeInfo` when
-        // the key is a string. `MaxSize` is an upper bound only, so
-        // for the str-keyed `MaxSize` path we cap the streaming-buffer
-        // budget at `STREAMING_INFLIGHT_MAXSIZE_BUDGET_BYTES` rather
-        // than letting the upper bound (which can be `u64::MAX` for
-        // unknown sizes) become the buffer ceiling. The actual EOF
-        // still determines the final byte count for `has_with_results`
-        // and the slow-store `update` size_info forwarded below.
-        // B1 fix-up (2026-04-27): pre-fix this collapsed
-        // `ExactSize | MaxSize` to one arm and propagated `u64::MAX`
-        // budgets unbounded into the streaming buffer.
-        let expected_size: u64 = match key.borrow() {
-            StoreKey::Digest(d) => d.size_bytes(),
-            StoreKey::Str(_) => match size_info {
-                UploadSizeInfo::ExactSize(s) => s,
-                UploadSizeInfo::MaxSize(s) => {
-                    s.min(STREAMING_INFLIGHT_MAXSIZE_BUDGET_BYTES)
-                }
-            },
-        };
-        let owned_key = key.borrow().into_owned();
-        let digest_for_inflight = match owned_key.borrow() {
-            StoreKey::Digest(d) => d,
-            StoreKey::Str(_) => DigestInfo::new([0u8; 32], expected_size),
-        };
-        // Pre-create the streaming-blob entry. This is the load-bearing
-        // structural change: the entry's `inner` is shared by the
-        // upstream writer (this fn's data_stream_fut), the background
-        // slow_store consumer (spawned below), AND any concurrent
-        // get_part caller that hits the in-flight map (sees the
-        // partial blob and waits for more chunks via
-        // `StreamingBlobReader::next_chunk`). Insert BEFORE the spawn
-        // and BEFORE the join so a concurrent get_part on the same
-        // digest can find the entry from chunk 1.
-        let entry = InFlightEntry::new(digest_for_inflight, expected_size);
-        let streaming_inner = Arc::clone(&entry.inner);
-        let bytes_streamed_for_producer = Arc::clone(&entry.bytes_streamed);
-        // Shutting-down branch: skip in_flight insertion. The
-        // synchronous `tokio::join!(data_stream_fut, fast_store_fut,
-        // slow_write_fut)` below ensures both fast AND slow stores
-        // are durable before this function returns, so no concurrent
-        // `get_part` can race the eviction window — the entry would
-        // be invisible-and-unneeded. F3 fix-up (2026-04-27): pre-fix
-        // comment claimed "still create the in_flight entry so
-        // flush_slow_writes accounting is consistent during shutdown"
-        // — that was false (the entry is constructed but never
-        // inserted into the map), and the synchronous join makes
-        // accounting via `flush_slow_writes` unnecessary on this path.
-        let is_shutting_down = self.shutting_down.load(Ordering::Acquire);
-        if !is_shutting_down {
-            self.in_flight_slow_writes
-                .lock()
-                .insert(owned_key.clone(), entry);
-        }
-
-        // Build the upstream-reader → (sb_writer, slow_tx, fast_tx)
-        // tee. Each chunk is a `Bytes` clone (O(1) refcount bump);
-        // the actual byte buffer is shared across all three sinks.
-        // Sink order is sb_writer → slow_tx → fast_tx so the LAST
-        // send moves (does not clone) the original `Bytes` —
-        // saves one ~24-byte `Bytes` header allocation per chunk.
-        // I1 fix-up (2026-04-27 perf F1).
-        let mut sb_writer = StreamingBlobWriter::new(Arc::clone(&streaming_inner));
+        // Read from upstream, forward to fast store, collect chunks as
+        // Vec<Bytes> (O(1) refcount bump per chunk, no copying) for the
+        // background slow store write.
         let data_stream_fut = async move {
-            let mut total: u64 = 0;
+            let mut chunks: Vec<Bytes> = Vec::new();
             loop {
                 let buffer = reader
                     .recv()
@@ -2539,54 +2318,9 @@ impl StoreDriver for FastSlowStore {
                     fast_tx.send_eof().err_tip(
                         || "Failed to write eof to fast store in fast_slow store update",
                     )?;
-                    slow_tx.send_eof().err_tip(
-                        || "Failed to write eof to slow store in fast_slow store update",
-                    )?;
-                    sb_writer.send_eof().err_tip(
-                        || "Failed to write eof to streaming buffer in fast_slow store update",
-                    )?;
-                    return Result::<u64, Error>::Ok(total);
+                    return Result::<Vec<Bytes>, Error>::Ok(chunks);
                 }
-                let chunk_len = buffer.len() as u64;
-                total += chunk_len;
-                // Maintain `entry.bytes_streamed` for `has_with_results`
-                // on `StoreKey::Str` + `MaxSize` callers (see
-                // `in_flight_reported_size`). Atomic is `Release` so a
-                // concurrent `has_with_results.load(Acquire)` sees a
-                // monotonic count.
-                bytes_streamed_for_producer.fetch_add(chunk_len, Ordering::Release);
-                // Feed the streaming buffer first so a concurrent
-                // get_part reader can advance immediately. The send is
-                // synchronous-fast (push to deque + notify) but yields
-                // briefly during sliding-window eviction; this is
-                // negligible compared to the buf_channel sends below.
-                sb_writer
-                    .send(buffer.clone())
-                    .await
-                    .err_tip(|| "streaming buffer send in fast_slow store update")?;
-                // Send to slow store consumer. If the slow store is
-                // backpressured this blocks the upstream reader. **B4
-                // (2026-04-27): this is intentional flow control —
-                // slow-store latency now bounds upstream RPC throughput.**
-                // Without the coupling the streaming buffer would grow
-                // unbounded for slow backends (GCS/S3); the prior
-                // Vec<Bytes>-collect shape decoupled them at the cost
-                // of unbounded memory. Operators monitoring slow-store
-                // P99 should expect upstream Bazel ByteStream writes
-                // to stall on slow-store transients; the pre-#203
-                // shape rode out transients via memory accumulation,
-                // and that's exactly the OOM driver this PR addresses.
-                slow_tx.send(buffer.clone()).await.map_err(|e| {
-                    make_err!(
-                        Code::Internal,
-                        "Failed to send message to slow_store in fast_slow_store {:?}",
-                        e
-                    )
-                })?;
-                // Send to fast store last so the original `Bytes` moves
-                // (no extra header alloc). Fast store is typically
-                // MemoryStore — near-instant; serializing it after
-                // slow_tx accept does not affect upstream pacing.
+                chunks.push(buffer.clone());
                 fast_tx.send(buffer).await.map_err(|e| {
                     make_err!(
                         Code::Internal,
@@ -2598,35 +2332,70 @@ impl StoreDriver for FastSlowStore {
         };
 
         let fast_store_fut = self.fast_store.update(key.borrow(), fast_rx, size_info);
-
-        // Shutting-down branch: synchronously join the slow-store
-        // write into the caller's await so we don't spawn a task
-        // that would be killed on graceful shutdown.
-        if is_shutting_down {
-            let slow_write_fut = self
-                .slow_store
-                .update(key.borrow(), slow_rx, size_info);
-            let (data_res, fast_res, slow_res) =
-                tokio::join!(data_stream_fut, fast_store_fut, slow_write_fut);
-            data_res.err_tip(|| "FastSlowStore::update: shutdown data stream")?;
-            fast_res.err_tip(|| "FastSlowStore::update: shutdown fast store")?;
-            slow_res.err_tip(|| "FastSlowStore::update: shutdown slow store")?;
-            // Pin the digest in the fast store. The slow_store write
-            // already succeeded so this is belt-and-suspenders for
-            // any later get_part during the shutdown drain window.
-            if let StoreKey::Digest(digest) = &key {
-                self.fast_store.pin_digests(&[*digest]);
+        let (data_res, fast_res) = join!(data_stream_fut, fast_store_fut);
+        let data = match data_res {
+            Ok(d) => d,
+            Err(err) => {
+                error!(
+                    ?key,
+                    elapsed_ms = update_start.elapsed().as_millis() as u64,
+                    ?err,
+                    "FastSlowStore::update: data stream failed",
+                );
+                return Err(err);
             }
-            return Ok(());
+        };
+        if let Err(err) = &fast_res {
+            error!(
+                ?key,
+                elapsed_ms = update_start.elapsed().as_millis() as u64,
+                ?err,
+                "FastSlowStore::update: fast store write failed",
+            );
+        }
+        fast_res?;
+
+        // Pin the digest in the fast store to prevent eviction until the
+        // server confirms stable storage via BlobsInStableStorage.
+        if let StoreKey::Digest(digest) = &key {
+            self.fast_store.pin_digests(&[*digest]);
         }
 
-        // Spawn the slow-store consumer BEFORE the join: it consumes
-        // chunks from `slow_rx` as they arrive from the data_stream.
-        // The spawn task owns the same in_flight entry removal +
-        // failed-writes bookkeeping that the prior `Vec<Bytes>` design
-        // performed; the shape is preserved exactly so consumers
-        // (PinExpireFailedWritesListener, BlobsInStableStorage,
-        // get_part cache-miss replay) see no semantic change.
+        let bytes_sent: u64 = data.iter().map(|c| c.len() as u64).sum();
+        let fast_elapsed = update_start.elapsed();
+        debug!(
+            ?key,
+            fast_ms = fast_elapsed.as_millis(),
+            total_bytes = bytes_sent,
+            "FastSlowStore::update: fast store complete, spawning background slow write",
+        );
+
+        // During shutdown, write directly to the slow store (blocking the
+        // caller) instead of spawning a background task that would be killed.
+        if self.shutting_down.load(Ordering::Acquire) {
+            let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+            let write_fut = self.slow_store.update(key.borrow(), rx, size_info);
+            let send_fut = async {
+                for chunk in data {
+                    tx.send(chunk).await.map_err(|e| {
+                        make_err!(Code::Internal, "shutdown flush send: {:?}", e)
+                    })?;
+                }
+                tx.send_eof()
+                    .err_tip(|| "shutdown flush send_eof")?;
+                Result::<(), Error>::Ok(())
+            };
+            let (write_result, send_result) = tokio::join!(write_fut, send_fut);
+            return send_result.and(write_result);
+        }
+
+        // Insert into in-flight map so get_part can serve this blob even if
+        // the fast store evicts it before the slow write completes.
+        let owned_key = key.borrow().into_owned();
+        self.in_flight_slow_writes
+            .lock()
+            .insert(owned_key.clone(), data.clone());
+
         let in_flight = self.in_flight_slow_writes.clone();
         let in_flight_empty = self.in_flight_empty_notify.clone();
         let stable_digests_ref = self.stable_digests.clone();
@@ -2638,8 +2407,8 @@ impl StoreDriver for FastSlowStore {
         let spawn_instant = std::time::Instant::now();
         info!(
             ?key,
-            expected_size,
-            "FastSlowStore::update: background slow write spawned (streaming)",
+            bytes_sent,
+            "FastSlowStore::update: background slow write spawned",
         );
         tokio::spawn(async move {
             let schedule_delay_ms = spawn_instant.elapsed().as_millis();
@@ -2647,31 +2416,35 @@ impl StoreDriver for FastSlowStore {
                 warn!(
                     key = ?key_for_bg,
                     schedule_delay_ms,
-                    expected_size,
+                    bytes_sent,
                     "FastSlowStore: background slow write task was \
                      delayed before starting",
                 );
             }
             let slow_start = std::time::Instant::now();
-            // The slow-store write reads from `slow_rx`, which the
-            // data_stream feeds chunk-by-chunk. There's no
-            // intermediate `for chunk in data` loop because the data
-            // never sat in a `Vec` — the upstream reader feeds slow_rx
-            // directly via the data_stream's `slow_tx.send`. This is
-            // the streaming-end-to-end shape (#203) — the prior
-            // design's send_fut + write_fut join is replaced by a
-            // single write_fut that consumes slow_rx.
-            //
-            // Forward the original `size_info` so a `MaxSize`
-            // upload's upper-bound semantics survive the tee. B1
-            // fix-up (2026-04-27): pre-fix this fabricated
-            // `ExactSize(expected_size)` which over-stated the actual
-            // bytes for `MaxSize` uploads (e.g. CompressionStore's
-            // `MaxSize(max_output_size)`); leaf stores like S3 / GCS
-            // could have used that as a sizing hint and rejected
-            // valid short writes.
-            let write_fut =
-                slow_store.update(key_for_bg.borrow(), slow_rx, size_info);
+            // Stream collected chunks to slow store via buf_channel,
+            // avoiding a single large concatenation.
+            let (mut slow_tx, slow_rx) = make_buf_channel_pair_with_size(128);
+            let write_fut = slow_store.update(
+                key_for_bg.borrow(),
+                slow_rx,
+                UploadSizeInfo::ExactSize(bytes_sent),
+            );
+            let send_fut = async {
+                for chunk in data {
+                    slow_tx.send(chunk).await.map_err(|e| {
+                        make_err!(
+                            Code::Internal,
+                            "Failed to send chunk to slow store: {:?}",
+                            e
+                        )
+                    })?;
+                }
+                slow_tx.send_eof().err_tip(
+                    || "Failed to send eof to slow store in background write",
+                )?;
+                Result::<(), Error>::Ok(())
+            };
             // Watchdog: if the slow-write hasn't terminated by
             // SLOW_WRITE_WATCHDOG_SECS, queue the digest for retry on
             // reconnect WITHOUT aborting the in-flight write. The
@@ -2699,7 +2472,7 @@ impl StoreDriver for FastSlowStore {
                         warn!(
                             ?digest,
                             watchdog_secs = SLOW_WRITE_WATCHDOG_SECS,
-                            total_bytes = expected_size,
+                            total_bytes = bytes_sent,
                             "FastSlowStore: background slow write exceeded watchdog \
                              deadline; queueing for retry-on-reconnect (write task NOT \
                              aborted — may still complete)"
@@ -2713,18 +2486,12 @@ impl StoreDriver for FastSlowStore {
                     }
                 })
             };
-            // #203: streaming — slow_store consumes `slow_rx` directly
-            // as the upstream data_stream feeds it. No `send_fut` to
-            // join; the data_stream's `slow_tx.send` IS the producer
-            // side. If the data_stream errors, slow_tx is dropped
-            // un-EOF'd → the slow_store reader observes a closed
-            // channel and returns Err, which becomes our `result`.
-            let write_result = write_fut.await;
+            let (write_result, send_result) = tokio::join!(write_fut, send_fut);
             completed.store(true, Ordering::Release);
             watchdog_handle.abort();
 
             let slow_ms = slow_start.elapsed().as_millis();
-            let mut result = write_result;
+            let mut result = send_result.and(write_result);
 
             // Failpoint: force background slow-write failure regardless of
             // the actual outcome. Used by the race-fix regression test and
@@ -2767,7 +2534,7 @@ impl StoreDriver for FastSlowStore {
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
-                        total_bytes = expected_size,
+                        bytes_sent,
                         "FastSlowStore::update: background slow write complete",
                     );
                 }
@@ -2783,7 +2550,7 @@ impl StoreDriver for FastSlowStore {
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
-                        total_bytes = expected_size,
+                        bytes_sent,
                         error = ?e,
                         "FastSlowStore::update: background slow write FAILED — \
                          blob pinned, will retry on reconnect",
@@ -2801,46 +2568,6 @@ impl StoreDriver for FastSlowStore {
                 }
             }
         });
-
-        // Caller awaits the upstream data_stream + fast_store write.
-        // The spawned slow-store consumer drains `slow_rx` in
-        // parallel; the caller's return condition (fast_store
-        // durable) is unchanged from the prior design — we do NOT
-        // wait for the slow_store. Per project policy
-        // (`feedback_no_sync_slow_write_ack.md`): slow stores are too
-        // slow to gate the caller on.
-        let (data_res, fast_res) = join!(data_stream_fut, fast_store_fut);
-        if let Err(err) = data_res {
-            error!(
-                ?key,
-                elapsed_ms = update_start.elapsed().as_millis() as u64,
-                ?err,
-                "FastSlowStore::update: data stream failed",
-            );
-            return Err(err);
-        }
-        if let Err(err) = &fast_res {
-            error!(
-                ?key,
-                elapsed_ms = update_start.elapsed().as_millis() as u64,
-                ?err,
-                "FastSlowStore::update: fast store write failed",
-            );
-        }
-        fast_res?;
-
-        // Pin the digest in the fast store to prevent eviction until the
-        // server confirms stable storage via BlobsInStableStorage.
-        if let StoreKey::Digest(digest) = &key {
-            self.fast_store.pin_digests(&[*digest]);
-        }
-
-        debug!(
-            ?key,
-            fast_ms = update_start.elapsed().as_millis(),
-            total_bytes = expected_size,
-            "FastSlowStore::update: fast store complete (slow_store streaming in background)",
-        );
 
         Ok(())
     }
@@ -2939,35 +2666,9 @@ impl StoreDriver for FastSlowStore {
 
         // Spawn background slow store write.
         let owned_key = key.borrow().into_owned();
-        // Build a pre-populated streaming-blob entry from the single
-        // `data` chunk so concurrent get_part on a fast-store-evicted
-        // entry can read it via the same code path as the streaming
-        // `update` flow. The streaming-blob holds a single chunk and
-        // is immediately EOF'd; readers see the chunk + EOF without
-        // any wait.
-        let oneshot_digest = match owned_key.borrow() {
-            StoreKey::Digest(d) => d,
-            StoreKey::Str(_) => DigestInfo::new([0u8; 32], data_len as u64),
-        };
-        let oneshot_entry = InFlightEntry::new(oneshot_digest, data_len as u64);
-        {
-            let mut sb_writer = StreamingBlobWriter::new(Arc::clone(&oneshot_entry.inner));
-            // The single chunk fits within the buffer budget (set to
-            // data_len above), so `send` does no eviction and yields
-            // only briefly for `notify_waiters()`. No real I/O happens
-            // here, so polling once via the existing tokio runtime is
-            // sufficient — but `send` is async so we await it below
-            // by spawning the entire setup; for correctness we await
-            // it inline here since we're already in an `async fn`.
-            sb_writer
-                .send(data.clone())
-                .await
-                .err_tip(|| "update_oneshot: streaming buffer send")?;
-            let _ = sb_writer.send_eof();
-        }
         self.in_flight_slow_writes
             .lock()
-            .insert(owned_key.clone(), oneshot_entry);
+            .insert(owned_key.clone(), vec![data.clone()]);
 
         let in_flight = self.in_flight_slow_writes.clone();
         let in_flight_empty = self.in_flight_empty_notify.clone();
@@ -3451,32 +3152,23 @@ impl StoreDriver for FastSlowStore {
         }
 
         // Check in-flight slow writes: the blob may have been evicted from the
-        // fast store while its background slow-store write is still in
-        // progress. With #203's streaming shape, the in-flight entry is a
-        // shared `StreamingBlobInner`; we spawn a fresh `StreamingBlobReader`
-        // and forward chunks (slicing for offset/length) to the outer writer.
-        // If the upstream `data_stream_fut` is still running, our reader
-        // will WAIT for more chunks via `next_chunk`'s `Notified` await
-        // (read-while-write). The slow-store consumer reads from a
-        // separate consumer (the spawned slow_store.update task that
-        // pulls from `slow_rx`), so the two consumers don't interfere.
+        // fast store while its background slow-store write is still in progress.
         {
             let owned_key = key.borrow().into_owned();
-            let maybe_entry = self.in_flight_slow_writes.lock().get(&owned_key).map(
-                |e| (Arc::clone(&e.inner), e.expected_size),
-            );
-            if let Some((sb_inner, entry_expected_size)) = maybe_entry {
+            let maybe_chunks = self.in_flight_slow_writes.lock().get(&owned_key).cloned();
+            if let Some(chunks) = maybe_chunks {
+                let total_len: usize = chunks.iter().map(|c| c.len()).sum();
                 // Defensive guard analogous to the mirror_blobs branch above:
-                // for a non-zero digest, the in-flight entry's expected_size
-                // MUST equal the digest's claimed size. A mismatch indicates
-                // a corrupted in-flight registration; prefer NotFound over
-                // silently serving wrong-sized data.
+                // for a non-zero digest, the in-flight entry MUST sum to the
+                // digest's full size — it's a snapshot of the chunks just
+                // written to the fast store. If it's short, prefer NotFound
+                // over silently serving an empty/truncated stream.
                 if let StoreKey::Digest(d) = key.borrow() {
-                    let expected = d.size_bytes();
-                    if entry_expected_size != expected {
+                    let expected = d.size_bytes() as usize;
+                    if total_len != expected {
                         warn!(
                             digest = %d,
-                            total_len = entry_expected_size,
+                            total_len,
                             expected_size = expected,
                             "in_flight entry size mismatch — returning NotFound \
                              instead of serving short stream"
@@ -3504,56 +3196,38 @@ impl StoreDriver for FastSlowStore {
                         let res: Result<(), Error> = Err(make_err!(
                             Code::NotFound,
                             "in_flight_slow_writes entry for {d} had wrong total \
-                             size ({entry_expected_size} != {expected}) — entry removed"
+                             size ({total_len} != {expected}) — entry removed"
                         ));
                         commit_with_inner_miss_gate(&mut guard, &res, bytes_before);
                         return res;
                     }
                 }
-                // Stream chunks from the in-flight streaming blob to the
-                // outer writer, applying offset/length slicing inline.
-                // Reader will block on `next_chunk` if upstream is still
-                // sending — the same StreamingBlobReader semantics that
-                // service the populate path.
-                let total_len = entry_expected_size as usize;
                 let offset_usize = usize::try_from(offset)
                     .err_tip(|| "Could not convert offset to usize")?;
                 let end = length
                     .and_then(|l| usize::try_from(l).ok())
                     .map(|l| (offset_usize.saturating_add(l)).min(total_len))
                     .unwrap_or(total_len);
-                let mut sb_reader = StreamingBlobReader::new(sb_inner);
-                let mut pos: usize = 0;
-                let mut bytes_emitted: usize = 0;
-                while pos < end {
-                    let chunk = sb_reader
-                        .next_chunk()
-                        .await
-                        .err_tip(|| "in-flight streaming blob next_chunk")?;
-                    if chunk.is_empty() {
-                        // EOF before reaching `end` — the streaming blob
-                        // terminated short of `expected_size`. The
-                        // partial bytes have been emitted; the outer
-                        // writer's commit_eof below signals EOF to the
-                        // consumer (which sees a short read).
-                        break;
-                    }
-                    let chunk_end = pos + chunk.len();
-                    if chunk_end <= offset_usize {
-                        pos = chunk_end;
-                        continue;
-                    }
-                    let start_in_chunk = offset_usize.saturating_sub(pos);
-                    let end_in_chunk = (end - pos).min(chunk.len());
-                    if start_in_chunk < end_in_chunk {
-                        let slice = chunk.slice(start_in_chunk..end_in_chunk);
-                        bytes_emitted += slice.len();
+                if offset_usize < end {
+                    // Walk the chunk list, skipping/slicing to honor offset and length.
+                    let mut pos: usize = 0;
+                    for chunk in &chunks {
+                        let chunk_end = pos + chunk.len();
+                        if chunk_end <= offset_usize {
+                            pos = chunk_end;
+                            continue;
+                        }
+                        if pos >= end {
+                            break;
+                        }
+                        let start_in_chunk = offset_usize.saturating_sub(pos);
+                        let end_in_chunk = (end - pos).min(chunk.len());
                         guard
-                            .send(slice)
+                            .send(chunk.slice(start_in_chunk..end_in_chunk))
                             .await
                             .err_tip(|| "Failed to send in-flight data in fast_slow get_part")?;
+                        pos = chunk_end;
                     }
-                    pos = chunk_end;
                 }
                 guard
                     .commit_eof()
@@ -3561,7 +3235,6 @@ impl StoreDriver for FastSlowStore {
                 debug!(
                     ?key,
                     data_len = total_len,
-                    bytes_emitted,
                     "Served blob from in-flight slow-write buffer (fast store evicted it)",
                 );
                 return Ok(());
@@ -4105,8 +3778,8 @@ impl Drop for FastSlowStore {
             "FastSlowStore: dropping with in-flight slow writes, \
              these blobs will NOT be persisted to the slow store"
         );
-        for (key, entry) in guard.iter() {
-            let bytes = entry.expected_size;
+        for (key, chunks) in guard.iter() {
+            let bytes: usize = chunks.iter().map(|b| b.len()).sum();
             warn!(?key, bytes, "FastSlowStore: unflushed write lost on shutdown");
         }
     }
