@@ -95,11 +95,21 @@ pub(crate) struct InFlightEntry {
     pub(crate) inner: Arc<StreamingBlobInner>,
     /// Total size in bytes the blob is expected to reach at EOF — equals
     /// `digest.size_bytes()` for the digest-keyed case, or the upstream
-    /// `UploadSizeInfo::ExactSize` value when known. Stored separately
-    /// from the streaming blob's running `bytes_written` counter so
-    /// `has_with_results` can report the eventual size without waiting
-    /// for the blob to terminate.
+    /// `UploadSizeInfo::ExactSize` value when known. For `MaxSize` callers
+    /// this is an upper bound (capped at
+    /// `STREAMING_INFLIGHT_MAXSIZE_BUDGET_BYTES`), NOT the actual
+    /// eventual byte count; consult [`Self::bytes_streamed`] for the
+    /// running actual.
     pub(crate) expected_size: u64,
+    /// Running count of bytes written into the streaming blob by
+    /// `data_stream_fut`. For `StoreKey::Digest` callers this converges
+    /// to `expected_size` at EOF; for `StoreKey::Str` + `MaxSize` callers
+    /// this is the only honest answer for `has_with_results`. Updated
+    /// once per chunk inside the producer loop. Held separately from
+    /// `StreamingBlobInner`'s private `bytes_written` so this crate can
+    /// observe it without exporting an extra getter from
+    /// `nativelink-util/streaming_blob.rs`.
+    pub(crate) bytes_streamed: Arc<AtomicU64>,
 }
 
 impl InFlightEntry {
@@ -117,7 +127,28 @@ impl InFlightEntry {
         Self {
             inner,
             expected_size,
+            bytes_streamed: Arc::new(AtomicU64::new(0)),
         }
+    }
+}
+
+/// Pick the size value to report from `has_with_results` for an in-flight
+/// streaming-blob entry. For `StoreKey::Digest`, the digest's
+/// `size_bytes()` is the source of truth — it equals `entry.expected_size`
+/// for digest-keyed CAS uploads (verified by the size-mismatch guard in
+/// `get_part`). For `StoreKey::Str` (the only path where `entry.expected_size`
+/// may differ from the actual eventual byte count — `MaxSize`-callers can
+/// over-state the upper bound), report `entry.bytes_streamed` so the
+/// answer reflects bytes-actually-streamed rather than the upper-bound
+/// upper bound. B1 fix-up (2026-04-27): pre-fix this always reported
+/// `entry.expected_size`, which over-stated the eventual size for
+/// `MaxSize`-keyed Str uploads (no current production caller — verified
+/// 2026-04-27 — but the wire-correctness regression for
+/// `FindMissingBlobs` was real and is now defensive).
+fn in_flight_reported_size(owned: &StoreKey<'static>, entry: &InFlightEntry) -> u64 {
+    match owned {
+        StoreKey::Digest(d) => d.size_bytes(),
+        StoreKey::Str(_) => entry.bytes_streamed.load(Ordering::Acquire),
     }
 }
 
@@ -148,6 +179,21 @@ const LOCAL_ONLY_READS_BATCH_CONCURRENCY: usize = 16;
 /// fired. The pin-expiry callback (registered on the fast store) is the
 /// secondary safety net for hangs longer than 120s.
 const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
+
+/// Cap on the streaming-buffer budget when the caller supplies
+/// `UploadSizeInfo::MaxSize(s)` instead of `ExactSize(s)`. `MaxSize` is an
+/// UPPER BOUND only (see `UploadSizeInfo` doc) — for example
+/// `CompressionStore::update` forwards `MaxSize(max_output_size)` where the
+/// actual encoded length can be much smaller than the bound. Treating that
+/// upper bound as the streaming-buffer ceiling would let
+/// `StreamingBlobInner::max_buffer_bytes` grow to many GiB for a small
+/// blob, defeating the sliding-window eviction. Cap at 64 MiB which is the
+/// same magnitude as `max_bytes_per_stream` in worker upload paths and well
+/// above any realistic single-blob streaming window. Reviewer audit (#203
+/// fix-up B1, 2026-04-27): production composition does NOT include
+/// `CompressionStore`, so no MaxSize+Str caller currently reaches
+/// `FastSlowStore::update`; this is defense-in-depth.
+const STREAMING_INFLIGHT_MAXSIZE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 tokio::task_local! {
     /// Per-call opt-in: when set on the calling task, the populate-NotFound
@@ -638,8 +684,16 @@ impl FastSlowStore {
     /// the SUPPLIED-chunks-total is what `get_part`'s size guard
     /// compares against the digest's claimed size, exactly preserving
     /// the legacy semantics.
+    ///
+    /// `async` (B5 fix-up, 2026-04-27): pre-fix this was sync and used
+    /// `futures::executor::block_on` to drive `StreamingBlobWriter::send`
+    /// — that worked only because `send` happens to have zero `.await`
+    /// points in the no-eviction path. The moment `send` adds an
+    /// actual yield (e.g. backpressure on sliding-window eviction),
+    /// the sync `block_on` would deadlock the tokio worker. Making
+    /// the helper `async` removes the landmine.
     #[doc(hidden)]
-    pub fn test_insert_in_flight(&self, key: StoreKey<'static>, chunks: Vec<Bytes>) {
+    pub async fn test_insert_in_flight(&self, key: StoreKey<'static>, chunks: Vec<Bytes>) {
         let digest = match key.borrow() {
             StoreKey::Digest(d) => d,
             // Synthetic str-key: build a placeholder digest for the
@@ -654,15 +708,13 @@ impl FastSlowStore {
         // installed).
         let entry = InFlightEntry::new(digest, total);
         // Pre-populate the streaming buffer with the test chunks and
-        // close it. This is synchronous: `send` may yield only during
-        // the sliding-window eviction path, which we've sized to fit
-        // all test chunks, so polling once is sufficient. We use
-        // `futures::executor::block_on` only on the small chunks
-        // (test-synthesized — typically 1-100 bytes); production never
-        // touches this path.
+        // close it. Awaiting in the existing tokio runtime is the
+        // correct discipline (B5 fix-up).
         let mut writer = StreamingBlobWriter::new(Arc::clone(&entry.inner));
         for chunk in chunks {
-            futures::executor::block_on(writer.send(chunk))
+            writer
+                .send(chunk)
+                .await
                 .expect("test_insert_in_flight: streaming buffer send failed");
         }
         let _ = writer.send_eof();
@@ -2245,11 +2297,7 @@ impl StoreDriver for FastSlowStore {
                     if result.is_none() {
                         let owned = k.borrow().into_owned();
                         if let Some(entry) = in_flight.get(&owned) {
-                            // #203: report `expected_size` rather than the
-                            // streaming blob's running `bytes_written` —
-                            // `has` callers want the eventual size, not a
-                            // mid-stream snapshot.
-                            *result = Some(entry.expected_size);
+                            *result = Some(in_flight_reported_size(&owned, entry));
                         }
                     }
                 }
@@ -2281,7 +2329,7 @@ impl StoreDriver for FastSlowStore {
                     if result.is_none() {
                         let owned = k.borrow().into_owned();
                         if let Some(entry) = in_flight.get(&owned) {
-                            let total_len = entry.expected_size;
+                            let total_len = in_flight_reported_size(&owned, entry);
                             debug!(
                                 key = %owned.as_str(),
                                 data_len = total_len,
@@ -2417,14 +2465,24 @@ impl StoreDriver for FastSlowStore {
 
         // Determine the expected blob size for the in-flight
         // streaming-blob entry. Prefer the digest's `size_bytes()`
-        // for `StoreKey::Digest`; fall back to `UploadSizeInfo::ExactSize`
-        // when the key is a string. `MaxSize` is an upper bound only,
-        // so we conservatively use it as the streaming buffer budget;
-        // the actual EOF determines the final byte count.
+        // for `StoreKey::Digest`; fall back to `UploadSizeInfo` when
+        // the key is a string. `MaxSize` is an upper bound only, so
+        // for the str-keyed `MaxSize` path we cap the streaming-buffer
+        // budget at `STREAMING_INFLIGHT_MAXSIZE_BUDGET_BYTES` rather
+        // than letting the upper bound (which can be `u64::MAX` for
+        // unknown sizes) become the buffer ceiling. The actual EOF
+        // still determines the final byte count for `has_with_results`
+        // and the slow-store `update` size_info forwarded below.
+        // B1 fix-up (2026-04-27): pre-fix this collapsed
+        // `ExactSize | MaxSize` to one arm and propagated `u64::MAX`
+        // budgets unbounded into the streaming buffer.
         let expected_size: u64 = match key.borrow() {
             StoreKey::Digest(d) => d.size_bytes(),
             StoreKey::Str(_) => match size_info {
-                UploadSizeInfo::ExactSize(s) | UploadSizeInfo::MaxSize(s) => s,
+                UploadSizeInfo::ExactSize(s) => s,
+                UploadSizeInfo::MaxSize(s) => {
+                    s.min(STREAMING_INFLIGHT_MAXSIZE_BUDGET_BYTES)
+                }
             },
         };
         let owned_key = key.borrow().into_owned();
@@ -2443,11 +2501,18 @@ impl StoreDriver for FastSlowStore {
         // digest can find the entry from chunk 1.
         let entry = InFlightEntry::new(digest_for_inflight, expected_size);
         let streaming_inner = Arc::clone(&entry.inner);
-        // shutting_down case: don't spawn — inline the slow_store
-        // write into the caller's join so the caller blocks until
-        // both fast and slow are durable. We still create the
-        // in_flight entry so flush_slow_writes accounting is
-        // consistent during shutdown.
+        let bytes_streamed_for_producer = Arc::clone(&entry.bytes_streamed);
+        // Shutting-down branch: skip in_flight insertion. The
+        // synchronous `tokio::join!(data_stream_fut, fast_store_fut,
+        // slow_write_fut)` below ensures both fast AND slow stores
+        // are durable before this function returns, so no concurrent
+        // `get_part` can race the eviction window — the entry would
+        // be invisible-and-unneeded. F3 fix-up (2026-04-27): pre-fix
+        // comment claimed "still create the in_flight entry so
+        // flush_slow_writes accounting is consistent during shutdown"
+        // — that was false (the entry is constructed but never
+        // inserted into the map), and the synchronous join makes
+        // accounting via `flush_slow_writes` unnecessary on this path.
         let is_shutting_down = self.shutting_down.load(Ordering::Acquire);
         if !is_shutting_down {
             self.in_flight_slow_writes
@@ -2455,9 +2520,13 @@ impl StoreDriver for FastSlowStore {
                 .insert(owned_key.clone(), entry);
         }
 
-        // Build the upstream-reader → (fast_tx, slow_tx, streaming_inner)
+        // Build the upstream-reader → (sb_writer, slow_tx, fast_tx)
         // tee. Each chunk is a `Bytes` clone (O(1) refcount bump);
         // the actual byte buffer is shared across all three sinks.
+        // Sink order is sb_writer → slow_tx → fast_tx so the LAST
+        // send moves (does not clone) the original `Bytes` —
+        // saves one ~24-byte `Bytes` header allocation per chunk.
+        // I1 fix-up (2026-04-27 perf F1).
         let mut sb_writer = StreamingBlobWriter::new(Arc::clone(&streaming_inner));
         let data_stream_fut = async move {
             let mut total: u64 = 0;
@@ -2478,7 +2547,14 @@ impl StoreDriver for FastSlowStore {
                     )?;
                     return Result::<u64, Error>::Ok(total);
                 }
-                total += buffer.len() as u64;
+                let chunk_len = buffer.len() as u64;
+                total += chunk_len;
+                // Maintain `entry.bytes_streamed` for `has_with_results`
+                // on `StoreKey::Str` + `MaxSize` callers (see
+                // `in_flight_reported_size`). Atomic is `Release` so a
+                // concurrent `has_with_results.load(Acquire)` sees a
+                // monotonic count.
+                bytes_streamed_for_producer.fetch_add(chunk_len, Ordering::Release);
                 // Feed the streaming buffer first so a concurrent
                 // get_part reader can advance immediately. The send is
                 // synchronous-fast (push to deque + notify) but yields
@@ -2488,25 +2564,33 @@ impl StoreDriver for FastSlowStore {
                     .send(buffer.clone())
                     .await
                     .err_tip(|| "streaming buffer send in fast_slow store update")?;
-                // Send to fast store (typically MemoryStore — near-instant).
-                fast_tx.send(buffer.clone()).await.map_err(|e| {
-                    make_err!(
-                        Code::Internal,
-                        "Failed to send message to fast_store in fast_slow_store {:?}",
-                        e
-                    )
-                })?;
                 // Send to slow store consumer. If the slow store is
-                // backpressured this blocks the upstream reader, which
-                // is the desired flow-control behavior — without it
-                // the streaming buffer would grow unbounded for slow
-                // backends. Today the slow store is GrpcStore (network)
-                // or MemoryStore (instant); GCS/S3 backends in other
-                // configs benefit from the backpressure.
-                slow_tx.send(buffer).await.map_err(|e| {
+                // backpressured this blocks the upstream reader. **B4
+                // (2026-04-27): this is intentional flow control —
+                // slow-store latency now bounds upstream RPC throughput.**
+                // Without the coupling the streaming buffer would grow
+                // unbounded for slow backends (GCS/S3); the prior
+                // Vec<Bytes>-collect shape decoupled them at the cost
+                // of unbounded memory. Operators monitoring slow-store
+                // P99 should expect upstream Bazel ByteStream writes
+                // to stall on slow-store transients; the pre-#203
+                // shape rode out transients via memory accumulation,
+                // and that's exactly the OOM driver this PR addresses.
+                slow_tx.send(buffer.clone()).await.map_err(|e| {
                     make_err!(
                         Code::Internal,
                         "Failed to send message to slow_store in fast_slow_store {:?}",
+                        e
+                    )
+                })?;
+                // Send to fast store last so the original `Bytes` moves
+                // (no extra header alloc). Fast store is typically
+                // MemoryStore — near-instant; serializing it after
+                // slow_tx accept does not affect upstream pacing.
+                fast_tx.send(buffer).await.map_err(|e| {
+                    make_err!(
+                        Code::Internal,
+                        "Failed to send message to fast_store in fast_slow_store {:?}",
                         e
                     )
                 })?;
@@ -2577,11 +2661,17 @@ impl StoreDriver for FastSlowStore {
             // the streaming-end-to-end shape (#203) — the prior
             // design's send_fut + write_fut join is replaced by a
             // single write_fut that consumes slow_rx.
-            let write_fut = slow_store.update(
-                key_for_bg.borrow(),
-                slow_rx,
-                UploadSizeInfo::ExactSize(expected_size),
-            );
+            //
+            // Forward the original `size_info` so a `MaxSize`
+            // upload's upper-bound semantics survive the tee. B1
+            // fix-up (2026-04-27): pre-fix this fabricated
+            // `ExactSize(expected_size)` which over-stated the actual
+            // bytes for `MaxSize` uploads (e.g. CompressionStore's
+            // `MaxSize(max_output_size)`); leaf stores like S3 / GCS
+            // could have used that as a sizing hint and rejected
+            // valid short writes.
+            let write_fut =
+                slow_store.update(key_for_bg.borrow(), slow_rx, size_info);
             // Watchdog: if the slow-write hasn't terminated by
             // SLOW_WRITE_WATCHDOG_SECS, queue the digest for retry on
             // reconnect WITHOUT aborting the in-flight write. The

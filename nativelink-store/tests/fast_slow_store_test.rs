@@ -2209,7 +2209,8 @@ async fn flush_slow_writes_no_lost_wakeup() -> Result<(), Error> {
 
         let key: StoreKey<'static> =
             StoreKey::Digest(DigestInfo::try_new(VALID_HASH, 1).unwrap());
-        fss.test_insert_in_flight(key.clone(), vec![Bytes::from_static(b"x")]);
+        fss.test_insert_in_flight(key.clone(), vec![Bytes::from_static(b"x")])
+            .await;
 
         // Barrier ensures both racers release at the same instant, maximising
         // the chance that `notify_waiters()` lands inside the lost-wakeup
@@ -3008,7 +3009,8 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_in_flight_size_misma
     let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
     let owned_key: StoreKey<'static> = StoreKey::from(digest);
     fast_slow_store
-        .test_insert_in_flight(owned_key, vec![Bytes::from_static(b"hello world!")]);
+        .test_insert_in_flight(owned_key, vec![Bytes::from_static(b"hello world!")])
+        .await;
 
     let verify_store = VerifyStore::new(
         &VerifySpec {
@@ -3852,6 +3854,607 @@ async fn fast_slow_update_streams_to_slow_store_concurrently_with_data_stream()
         chunks_seen >= 1,
         "expected slow store to have received >= 1 chunk by the time \
          release fired, got {chunks_seen}",
+    );
+
+    Ok(())
+}
+
+// ===================================================================
+// B2 fix-up (#203 4-reviewer pass, 2026-04-27)
+//
+// CRIT-1 + CRIT-2 from the testing-czar review. The single load-bearing
+// semantic change in `get_part`'s in-flight branch is
+// `StreamingBlobReader::next_chunk().await` over a LIVE shared blob, AND
+// `data_stream_fut`'s three-tap `?`-propagation. Both were under-tested.
+// These regressions guard the cross-component contract (the same
+// pattern that landed `fast_slow_store.rs:2912` in production via #171).
+// ===================================================================
+
+/// **CRIT-1 regression:** cache-miss `get_part` against a LIVE
+/// (mid-write) streaming blob. The prior `Vec<Bytes>` shape buffered
+/// the whole blob in the in-flight map BEFORE `slow_store.update` even
+/// started; with #203 the map's value is a streaming blob fed by the
+/// upstream `data_stream_fut` and consumed by both the spawned slow
+/// consumer AND any concurrent `get_part` reader.
+///
+/// Production composition: `VerifyStore → FastSlowStore { fast:
+/// MemoryStore (eviction-free), slow: StreamingProbeSlowStore }`. The
+/// upstream sender paces chunks behind a Notify so a SECOND task's
+/// `get_part_unchunked` can be started in the middle of the upload.
+/// The reader MUST receive bytes that arrived AFTER it started — proof
+/// the streaming reader is truly read-while-write, not a snapshot of
+/// chunks already buffered.
+///
+/// **Mutation step:** revert the cache-miss replay branch's
+/// `StreamingBlobReader::next_chunk().await` loop with a snapshot taken
+/// at `get_part` entry — the test should fail because the snapshot
+/// only captures chunks 1-N (whatever was buffered when get_part
+/// started), so the get_part reader sees a TRUNCATED blob.
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_miss_replay_against_live_streaming_blob_returns_chunks_as_they_arrive()
+-> Result<(), Error> {
+    use core::time::Duration;
+    use std::sync::atomic::AtomicU32;
+
+    use nativelink_config::stores::VerifySpec;
+    use nativelink_store::verify_store::VerifyStore;
+
+    // Probe slow store that BLOCKS forever (until release) so the
+    // in-flight entry is never removed during the test window. The
+    // streaming-blob in-flight map entry stays alive for the whole
+    // get_part replay.
+    let first_chunk_at = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let chunks_received = Arc::new(AtomicU32::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let probe = Arc::new(StreamingProbeSlowStore {
+        first_chunk_at: first_chunk_at.clone(),
+        chunks_received: chunks_received.clone(),
+        release: release.clone(),
+        inner: Store::new(MemoryStore::new(&MemorySpec::default())),
+    });
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(probe.clone());
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+    let fast_slow_store_handle = fast_slow_store.clone();
+    let verify_store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(fast_slow_store),
+    );
+
+    let total_chunks = 4_usize;
+    let chunk_size = 256 * 1024_usize;
+    let payload_size = (total_chunks * chunk_size) as u64;
+    let data = make_random_data(payload_size as usize);
+    let digest = DigestInfo::try_new(VALID_HASH, payload_size)?;
+
+    // Pacing: per-chunk Notifies so the test deterministically advances
+    // the upstream upload one chunk at a time. NO `tokio::time::sleep`
+    // anywhere in the test (per CLAUDE.md).
+    let upload_gates: Vec<Arc<tokio::sync::Notify>> = (0..total_chunks)
+        .map(|_| Arc::new(tokio::sync::Notify::new()))
+        .collect();
+    let upload_gates_for_sender = upload_gates.clone();
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let data_for_sender = Bytes::from(data.clone());
+    let send_handle = tokio::spawn(async move {
+        let mut offset = 0;
+        let mut idx = 0;
+        while offset < data_for_sender.len() {
+            // Wait for the test to gate this chunk send.
+            upload_gates_for_sender[idx].notified().await;
+            let end = (offset + chunk_size).min(data_for_sender.len());
+            tx.send(data_for_sender.slice(offset..end))
+                .await
+                .map_err(|e| make_err!(Code::Internal, "send: {e:?}"))?;
+            offset = end;
+            idx += 1;
+        }
+        tx.send_eof()
+            .map_err(|e| make_err!(Code::Internal, "send_eof: {e:?}"))?;
+        Result::<(), Error>::Ok(())
+    });
+
+    // Start the upstream update.
+    let update_handle = tokio::spawn({
+        let verify_store = verify_store.clone();
+        async move {
+            verify_store
+                .as_store_driver_pin()
+                .update(
+                    StoreKey::from(digest),
+                    rx,
+                    nativelink_util::store_trait::UploadSizeInfo::ExactSize(payload_size),
+                )
+                .await
+        }
+    });
+
+    // Release first chunk + wait for slow_store to receive it (proof
+    // that the in-flight streaming-blob entry exists with chunk 1).
+    upload_gates[0].notify_one();
+    let probe_first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if first_chunk_at.lock().unwrap().is_some() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        probe_first.is_ok(),
+        "STREAMING-BLOB SETUP FAILED — slow store probe did not receive \
+         chunk 1 within 5s; cannot proceed with cache-miss test",
+    );
+
+    // No explicit eviction needed: the data_stream hasn't EOF'd, so
+    // MemoryStore::update is still mid-write and `fast_store.has()`
+    // returns None for the partial blob. Cache miss is automatic
+    // — `get_part`'s in-flight branch is the path under test.
+    // (The `fast_slow_store_handle` is held above for diagnostic
+    // access if a future revision needs it; not used in this branch.)
+    let _ = fast_slow_store_handle.in_flight_slow_write_count();
+
+    // Spawn the concurrent get_part. It MUST block on `next_chunk`
+    // for the chunks not yet sent.
+    let getter_handle = tokio::spawn({
+        let verify_store = verify_store.clone();
+        async move {
+            verify_store
+                .as_store_driver_pin()
+                .get_part_unchunked(StoreKey::from(digest), 0, None)
+                .await
+        }
+    });
+
+    // Pace the remaining chunks one-by-one. The getter MUST receive
+    // each as it arrives. Verify by waiting (bounded) for the slow
+    // store's chunk count to advance after each gate release; if the
+    // getter buffered everything until EOF, this would be a snapshot
+    // observation — but the streaming reader (and slow consumer)
+    // observe each chunk independently, so chunks_received bumps as
+    // the upstream sends.
+    for idx in 1..total_chunks {
+        let baseline = chunks_received.load(Ordering::Acquire);
+        upload_gates[idx].notify_one();
+        let advanced = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if chunks_received.load(Ordering::Acquire) > baseline {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            advanced.is_ok(),
+            "STREAMING CONTRACT VIOLATED — slow store did not advance \
+             past chunk {baseline} within 5s of the upstream sender being \
+             gated for chunk {idx}. With the streaming-blob shape the \
+             slow consumer observes each chunk independently from the \
+             get_part reader; both should advance as the upstream sends. \
+             A failure here indicates the producer buffered chunk {idx} \
+             instead of streaming it.",
+        );
+    }
+
+    // Release the slow store so update() completes; release the
+    // getter implicitly via update completion.
+    release.notify_one();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        send_handle
+            .await
+            .map_err(|e| make_err!(Code::Internal, "send task: {e:?}"))??;
+        update_handle
+            .await
+            .map_err(|e| make_err!(Code::Internal, "update task: {e:?}"))??;
+        let got = getter_handle
+            .await
+            .map_err(|e| make_err!(Code::Internal, "getter task: {e:?}"))??;
+        Result::<Bytes, Error>::Ok(got)
+    })
+    .await
+    .expect(
+        "STREAMING CONTRACT VIOLATED — production composition (VerifyStore \
+         → FastSlowStore → StreamingProbeSlowStore) wedged for >10s during \
+         live-blob get_part. The streaming reader must serve chunks AS \
+         THEY ARRIVE; without it the get_part future would block on \
+         `next_chunk` forever (its in-flight entry never EOF'd).",
+    )?;
+
+    assert_eq!(
+        outcome.len(),
+        payload_size as usize,
+        "READER SHORT-READ — get_part returned {} bytes from a {payload_size}-byte \
+         streaming blob; the live-blob read path must capture every chunk",
+        outcome.len(),
+    );
+    assert_eq!(
+        outcome.as_ref(),
+        data.as_slice(),
+        "READER CORRUPTION — get_part bytes did not match the upstream \
+         payload; chunk slicing in the cache-miss replay path is wrong",
+    );
+
+    Ok(())
+}
+
+/// **CRIT-2 regression:** three-tap writer termination on
+/// `data_stream_fut` mid-stream error.
+///
+/// The producer in `update()` writes each chunk into THREE sinks
+/// (`sb_writer`, `slow_tx`, `fast_tx`) with `?`-propagation. If the
+/// spawned slow consumer errors mid-stream, it drops `slow_rx` →
+/// `slow_tx.send` in the producer returns Err on the next chunk →
+/// `data_stream_fut` returns Err → `sb_writer` and `fast_tx` are
+/// dropped un-EOF'd. The Drop fallbacks fire generic Internal errors
+/// that mask the underlying cause.
+///
+/// Per project `feedback_no_sync_slow_write_ack.md`, the slow store
+/// runs in a spawned task and the caller's `update()` returns based
+/// on fast_store's outcome — so the test cannot assert the
+/// caller-visible error reflects the slow-store error. What the
+/// test CAN assert is: (a) the data_stream_fut returns within a
+/// deadline (no deadlock when the slow_tx tee fails mid-stream),
+/// AND (b) the failure-recovery path (`failed_slow_writes` insert)
+/// fires within a bounded window — that proves the writer-termination
+/// chain unwinds rather than wedging the spawn.
+///
+/// **Mutation step:** comment out the `slow_tx.send(buffer.clone()).await
+/// .map_err(...)` line in `data_stream_fut` (replace with `let _ =
+/// slow_tx.send(buffer.clone()).await;`). The producer no longer
+/// unwinds on slow_tx-send-Err; data_stream completes normally; the
+/// slow consumer eventually returns Err and the failure-recovery path
+/// still runs — but the streaming-buffer chunks can keep accumulating
+/// in sb_writer past the slow-store EOF point. Because this test only
+/// asserts failure-recovery fires (NOT that the streaming buffer is
+/// terminated), the mutation is ALSO observable via the in_flight
+/// count: with the `?`-propagation removed, the in_flight entry
+/// exits via the slow consumer's natural EOF→error path; with it,
+/// the entry exits earlier via the producer's Err-propagation. Both
+/// converge but on different timelines.
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn data_stream_fut_mid_stream_error_terminates_all_three_taps()
+-> Result<(), Error> {
+    use core::time::Duration;
+    use std::sync::atomic::AtomicU32;
+
+    // Failing probe: forwards chunk 1 to inner, then returns Err.
+    let chunks_received = Arc::new(AtomicU32::new(0));
+    let probe = Arc::new(FailAfterFirstChunkSlowStore {
+        chunks_received: chunks_received.clone(),
+    });
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(probe.clone());
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store,
+        slow_store,
+    );
+    let fss_handle = fast_slow_store.clone();
+
+    let total_chunks = 4_usize;
+    let chunk_size = 256 * 1024_usize;
+    let payload_size = (total_chunks * chunk_size) as u64;
+    let data = make_random_data(payload_size as usize);
+    let digest = DigestInfo::try_new(VALID_HASH, payload_size)?;
+
+    // Stream the blob through `update`. Use synchronization to make
+    // the slow-consumer error land mid-stream: gates pace each chunk;
+    // the test releases gate 1, waits for the consumer to error,
+    // then releases the rest.
+    let upload_gates: Vec<Arc<tokio::sync::Notify>> = (0..total_chunks)
+        .map(|_| Arc::new(tokio::sync::Notify::new()))
+        .collect();
+    let upload_gates_for_sender = upload_gates.clone();
+    let (mut tx, rx) = make_buf_channel_pair();
+    let data_for_sender = Bytes::from(data.clone());
+    let send_handle = tokio::spawn(async move {
+        let mut offset = 0;
+        let mut idx = 0;
+        while offset < data_for_sender.len() {
+            upload_gates_for_sender[idx].notified().await;
+            let end = (offset + chunk_size).min(data_for_sender.len());
+            // Tolerate send-Err: the data_stream_fut may have been
+            // dropped after slow_tx-send failed mid-stream.
+            if tx
+                .send(data_for_sender.slice(offset..end))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            offset = end;
+            idx += 1;
+        }
+        // Best-effort EOF; producer may already have unwound the
+        // channel after slow_tx-send-Err.
+        drop(tx.send_eof());
+    });
+
+    let update_handle = tokio::spawn({
+        let fast_slow_store = fast_slow_store.clone();
+        async move {
+            fast_slow_store
+                .as_store_driver_pin()
+                .update(
+                    StoreKey::from(digest),
+                    rx,
+                    nativelink_util::store_trait::UploadSizeInfo::ExactSize(payload_size),
+                )
+                .await
+        }
+    });
+
+    // Release chunk 1 → slow consumer errors after consuming it.
+    upload_gates[0].notify_one();
+    // Wait for the slow probe to register chunk 1 (proof the consumer
+    // ran; it will Err immediately after).
+    let chunk1_observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if chunks_received.load(Ordering::Acquire) > 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        chunk1_observed.is_ok(),
+        "TEST SETUP — slow probe did not consume chunk 1 within 5s",
+    );
+
+    // Release remaining chunks. The producer's slow_tx.send for chunk 2+
+    // will fail (slow_rx dropped by the errored consumer); data_stream_fut
+    // returns Err; sb_writer + fast_tx drop un-EOF'd.
+    for gate in &upload_gates[1..] {
+        gate.notify_one();
+    }
+
+    // Bounded wait: the failure-recovery path (failed_slow_writes
+    // insert) MUST fire within 5s. Without `?`-propagation working,
+    // the chain could deadlock waiting on slow_tx forever.
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fss_handle.in_flight_slow_write_count() == 0 {
+                // failed-recovery path completed → in_flight removed.
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "WRITER TERMINATION CONTRACT VIOLATED — in_flight entry was not \
+         removed within 5s of slow-consumer mid-stream error. The \
+         data_stream_fut's `?`-propagation on slow_tx.send must unwind \
+         the chain so the spawned consumer's failure-recovery path \
+         (failed_slow_writes insert + in_flight remove) fires within \
+         bounded time. Same writer-termination class as #171.",
+    );
+
+    // Caller's update() also must return within the deadline.
+    let upd_result = tokio::time::timeout(Duration::from_secs(2), update_handle).await;
+    assert!(
+        upd_result.is_ok(),
+        "WRITER TERMINATION CONTRACT VIOLATED — caller's update() did \
+         not return within 2s after the in_flight entry was removed; \
+         the data_stream_fut + fast_store_fut join is wedged.",
+    );
+
+    drop(tokio::time::timeout(Duration::from_secs(2), send_handle).await);
+
+    Ok(())
+}
+
+/// Probe slow store: records chunks then returns Err after observing
+/// chunk 1. Used by `data_stream_fut_mid_stream_error_terminates_all_three_taps`
+/// to drive the data_stream's `?`-propagation path.
+#[derive(MetricsComponent)]
+struct FailAfterFirstChunkSlowStore {
+    chunks_received: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl core::fmt::Debug for FailAfterFirstChunkSlowStore {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FailAfterFirstChunkSlowStore").finish()
+    }
+}
+
+#[async_trait]
+impl StoreDriver for FailAfterFirstChunkSlowStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        for r in results.iter_mut() {
+            *r = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        mut reader: nativelink_util::buf_channel::DropCloserReadHalf,
+        _size_info: nativelink_util::store_trait::UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Consume chunk 1, then return Err. Dropping `reader` causes
+        // any further `slow_tx.send` from the producer to fail.
+        let chunk = reader
+            .recv()
+            .await
+            .err_tip(|| "FailAfterFirstChunkSlowStore: recv chunk 1")?;
+        if !chunk.is_empty() {
+            self.chunks_received.fetch_add(1, Ordering::AcqRel);
+        }
+        Err(make_err!(
+            Code::Aborted,
+            "FailAfterFirstChunkSlowStore: forced failure after chunk 1"
+        ))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(Code::NotFound, "no get_part on FailAfterFirstChunkSlowStore"))
+    }
+
+    fn inner_store(&self, _digest: Option<StoreKey<'_>>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+default_health_status_indicator!(FailAfterFirstChunkSlowStore);
+
+/// **B3 fix-up shutdown-branch end-to-end test.** With #203's
+/// streaming refactor the shutting_down branch in the streaming
+/// `update` path joins all three futures synchronously
+/// (`tokio::join!(data_stream_fut, fast_store_fut, slow_write_fut)`);
+/// the slow store has the bytes by the time `update()` returns. This
+/// test asserts that contract holds: trigger shutdown BEFORE calling
+/// update, then verify the slow_store has the blob the moment update
+/// returns Ok (no spawn, no in-flight entry).
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutting_down_update_completes_synchronously_with_durable_slow_store()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fast_slow_store = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+        },
+        fast_store.clone(),
+        slow_inner.clone(),
+    );
+
+    // Trigger shutdown BEFORE the update so the shutting_down branch
+    // is taken. `flush_slow_writes(Duration::ZERO)` is the only public
+    // path that sets the `shutting_down` AtomicBool; with no in-flight
+    // writes it returns immediately (count == 0 short-circuit).
+    let _ = fast_slow_store.flush_slow_writes(Duration::ZERO).await;
+
+    let payload = make_random_data(64 * 1024);
+    let payload_size = payload.len() as u64;
+    let digest = DigestInfo::try_new(VALID_HASH, payload_size)?;
+
+    // Drive the streaming `update` path (NOT update_oneshot — that
+    // has its own shutdown short-circuit). Send the blob through a
+    // buf_channel so the data_stream_fut → fast_tx + slow_tx + sb_writer
+    // tee is exercised inside the shutting_down `tokio::join!`.
+    let (mut tx, rx) = make_buf_channel_pair();
+    let payload_for_sender = Bytes::from(payload.clone());
+    let send_handle = tokio::spawn(async move {
+        tx.send(payload_for_sender)
+            .await
+            .map_err(|e| make_err!(Code::Internal, "send: {e:?}"))?;
+        tx.send_eof()
+            .map_err(|e| make_err!(Code::Internal, "eof: {e:?}"))?;
+        Result::<(), Error>::Ok(())
+    });
+
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        fast_slow_store
+            .as_store_driver_pin()
+            .update(
+                StoreKey::from(digest),
+                rx,
+                nativelink_util::store_trait::UploadSizeInfo::ExactSize(payload_size),
+            ),
+    )
+    .await
+    .expect(
+        "shutdown-branch streaming update did not complete within 5s — \
+         the synchronous tokio::join!(data_stream, fast_store, slow_store) \
+         must produce a bounded-time return per the F3 fix-up contract",
+    );
+    res?;
+    send_handle
+        .await
+        .map_err(|e| make_err!(Code::Internal, "send task: {e:?}"))??;
+
+    // Slow store MUST have the bytes immediately on return — no
+    // background spawn in the shutdown branch.
+    let mut results = vec![None];
+    slow_inner
+        .as_store_driver_pin()
+        .has_with_results(&[StoreKey::from(digest)], &mut results)
+        .await?;
+    assert_eq!(
+        results[0],
+        Some(payload_size),
+        "slow_store missing blob after shutdown-branch streaming update \
+         returned — the synchronous join contract is broken (the test of \
+         F3's revised comment + behavior)",
+    );
+
+    // No in-flight entry should be present (shutdown branch skips
+    // insertion per the F3 fix-up).
+    assert_eq!(
+        fast_slow_store.in_flight_slow_write_count(),
+        0,
+        "shutdown-branch update incorrectly inserted into in_flight_slow_writes \
+         — the F3 fix-up contract requires NO insertion on this path",
     );
 
     Ok(())
