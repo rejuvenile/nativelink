@@ -14,6 +14,7 @@
 
 pub mod ac_utils;
 pub mod azure_blob_store;
+pub mod batch_read_coalescer;
 pub mod callback_utils;
 pub mod cas_utils;
 #[cfg(feature = "chunked_fast_slow")]
