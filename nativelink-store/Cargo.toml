@@ -133,6 +133,13 @@ failpoints = ["dep:fail", "fail/failpoints", "nativelink-util/failpoints"]
 # builds MUST NOT enable this feature — these hooks bypass safety
 # invariants for testing convenience.
 test-utils = []
+# Phase 1 SKELETON for #212 (chunked-streaming architecture). Gates the
+# `chunked` module — no production data path consumes it yet, so the
+# default build is byte-identical to before this flag existed. Phase 2
+# PRs will wire up admission, the per-blob driver, the new
+# `WriteChunked` RPC, and the FilesystemStore `pwrite`-at-offset APIs.
+# Default: OFF.
+chunked_fast_slow = []
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
