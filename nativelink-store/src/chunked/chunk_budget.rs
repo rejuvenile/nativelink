@@ -197,7 +197,13 @@ impl MetricsComponent for ChunkBudget {
         nativelink_metric::publish!(
             "chunk_budget_used_bytes",
             &used_bytes,
-            nativelink_metric::MetricKind::Counter,
+            // Gauge — the value goes UP and DOWN with permit
+            // acquire/release. `nativelink_metric` has no dedicated
+            // `Gauge` variant; `Default` is the convention for
+            // non-monotone numeric metrics (the sibling
+            // `chunk_resource_exhausted_rejections_total` IS a
+            // monotone counter and uses `Counter`).
+            nativelink_metric::MetricKind::Default,
             "Bytes currently held by in-flight chunked transfers (gauge derived from the global Semaphore; upper bound = 4 GiB per #212 Q4)"
         );
         nativelink_metric::publish!(
