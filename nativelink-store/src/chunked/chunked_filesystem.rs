@@ -1,0 +1,991 @@
+// Copyright 2024 The NativeLink Authors. All rights reserved.
+//
+// Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    See LICENSE file for details
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Phase 2.1 SKELETON for #212 chunked-streaming architecture.
+//!
+//! Per-chunk write-at-offset + atomic-commit primitives that the
+//! Phase 2.3 per-blob driver will consume. NOT yet wired into the
+//! `StoreDriver` trait — these are `pub(crate)` APIs internal to
+//! `nativelink-store` per design Q10=(a) (chunked APIs internal to
+//! FastSlowStore + FilesystemStore + GrpcStore only, no trait-surface
+//! changes).
+//!
+//! Design source of truth: `.claude/plans/212-chunk-pinned-async-slow-writes.md`
+//! (v4.5). The decisions that bear on this file:
+//!
+//! - **Q2=(a) sparse file + `pwrite`-at-offset** (in-memory-only sidecar
+//!   per v4.5). One inode per partial; out-of-order writes safe because
+//!   each `pwrite` is atomic per syscall. Sparse semantics extend the
+//!   file to the highest-offset write; the kernel + ZFS handle the gap.
+//! - **Q3=(a) 1 MiB chunk size** matches the ZFS `recordsize=1M` on
+//!   `fast/nativelink/work` exactly — no partial-record write
+//!   amplification.
+//! - **Q7=(c) drop partial-recoverable read; trust file length only on
+//!   recovery; NO `fsync`.** Crash recovery just `stat()`s the partial
+//!   and either renames-to-final (if `len == declared_size`) or GCs
+//!   (mirror re-uploads). NO synchronous-write primitives anywhere —
+//!   ZFS `sync=disabled` is the durability model.
+//! - **Q10=(a) chunked APIs internal.** No `StoreDriver` change; these
+//!   methods are `pub(crate)` and consumed only by Phase 2.3's per-blob
+//!   driver.
+//!
+//! Hard rules per CLAUDE.md re-stated for the implementer:
+//! - NO `fsync`, `fdatasync`, `sync_file_range`, `msync`, `O_SYNC`,
+//!   `O_DSYNC`, `O_DIRECT`. Audit any new dependency for these.
+//! - NEVER block a tokio worker thread. All file I/O goes through
+//!   `tokio::task::spawn_blocking` (sync `pwrite` is the natural
+//!   primitive; `tokio::fs::File` does not expose `pwrite` directly).
+//! - Never hold locks across `.await`. Per-blob serialization uses a
+//!   `tokio::sync::Mutex` so the lock guard CAN await on the
+//!   spawn_blocking join handle inside the critical section.
+//!
+//! Phase 2.3 will:
+//! - Plumb these APIs into the per-blob `ChunkedDriver` (currently the
+//!   skeleton in `chunked_driver.rs` increments a counter + drops).
+//! - Wire driver completion into `commit_chunked` / `discard_chunked`
+//!   from the §6.7 termination triggers.
+//! - Add length-bitmap correlation in the in-memory sidecar so the
+//!   driver can detect "all chunks landed → commit" without re-scanning
+//!   the disk.
+
+// Phase 2.1 ships the file-system primitives; the call-sites land in
+// Phase 2.3 (per-blob driver) per §6.7. The dead-code allow disappears
+// when Phase 2.3 wires the driver to consume `write_chunk_at_offset`
+// / `commit_chunked` / `discard_chunked`.
+#![allow(dead_code, reason = "Phase 2.1 SKELETON; consumers land in Phase 2.3 (#212)")]
+
+use core::fmt::Debug;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use nativelink_error::{Code, Error, ResultExt, make_err};
+use nativelink_util::common::DigestInfo;
+use parking_lot::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::{debug, error, warn};
+
+/// In-flight chunked-blob state held by the FilesystemStore for the
+/// lifetime of an in-progress chunked upload. One entry per digest.
+///
+/// The `file` field is wrapped in a `tokio::sync::Mutex` (not
+/// `parking_lot::Mutex`) because callers acquire the lock and then
+/// immediately `.await` on a `spawn_blocking` join handle to do the
+/// actual `pwrite`. A `parking_lot::Mutex` cannot be held across an
+/// `.await` per CLAUDE.md ("Async & Concurrency"); a `tokio::sync::Mutex`
+/// can. Critical-section length is one `pwrite` syscall (~µs on local
+/// disk, ~ms worst-case under contention), short enough that the
+/// async-mutex overhead is negligible.
+///
+/// `try_clone` is NOT used to allow parallel pwrites — the design's
+/// per-blob lock invariant says concurrent chunks for the same blob
+/// serialize. Cross-blob parallelism is preserved by the `HashMap` key
+/// (different digests → different `ChunkInProgress` → no contention).
+///
+/// `path` is held for `discard_chunked` (file removal) and
+/// `commit_chunked` (rename source). Stored as `PathBuf` rather than
+/// recomputing each call, both to centralize the layout decision and
+/// to avoid recomputing the shard prefix on every chunk.
+pub(crate) struct ChunkInProgress {
+    /// Absolute on-disk path to the partial temp file:
+    /// `<temp_path>/d/<XX>/<hash>-<size>.partial`. The shard prefix
+    /// matches the layout used by the rest of `FilesystemStore` so
+    /// recovery + tooling can reuse the existing directory walks.
+    path: PathBuf,
+    /// `std::fs::File` (not `tokio::fs::File`) because every operation
+    /// happens inside `spawn_blocking` and the std handle is what the
+    /// `std::os::unix::fs::FileExt::write_at` (Unix `pwrite`) call
+    /// requires. Wrapped in an async-mutex so concurrent `write_chunk_at_offset`
+    /// callers serialize cleanly without blocking a tokio worker.
+    file: AsyncMutex<std::fs::File>,
+    /// Pinned digest size copy. Not load-bearing for `write_chunk_at_offset`
+    /// (the caller passes `expected_size` to `commit_chunked`) but
+    /// useful for log messages.
+    declared_size: u64,
+}
+
+impl Debug for ChunkInProgress {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ChunkInProgress")
+            .field("path", &self.path)
+            .field("declared_size", &self.declared_size)
+            .field("file", &"<async-mutex<std::fs::File>>")
+            .finish()
+    }
+}
+
+/// Process-internal map of digest → in-flight chunked partial. Owned
+/// by `FilesystemStore` (one per store; chunked partials are tied to
+/// the store's `temp_path` layout).
+///
+/// `parking_lot::Mutex` is correct: every critical section is short
+/// (HashMap insert / remove / get-and-clone) and never holds across
+/// an `.await`. The per-blob `ChunkInProgress` is `Arc`-shared so the
+/// outer map lock releases immediately after the `Arc::clone`, leaving
+/// the long-running `pwrite` to serialize only on the per-blob async
+/// mutex inside.
+#[derive(Debug, Default)]
+pub(crate) struct ChunkedPartialsMap {
+    inner: Mutex<HashMap<DigestInfo, Arc<ChunkInProgress>>>,
+}
+
+impl ChunkedPartialsMap {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the current in-flight chunked-blob count. Test + future
+    /// metric hook; non-load-bearing for the I/O path.
+    #[allow(dead_code, reason = "wired in Phase 2.3 driver instrumentation")]
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.inner.lock().len()
+    }
+
+    /// Returns `true` if the given digest currently has an in-flight
+    /// chunked partial. Used by tests; Phase 2.3 driver checks via
+    /// the `commit_chunked` / `discard_chunked` return code instead.
+    #[allow(dead_code, reason = "test-only observation; Phase 2.3 may use during drain")]
+    pub(crate) fn contains(&self, digest: &DigestInfo) -> bool {
+        self.inner.lock().contains_key(digest)
+    }
+}
+
+/// Build the on-disk path for a partial chunked upload. Layout:
+/// `<temp_path>/d/<XX>/<hash>-<size>.partial`. The `XX` shard matches
+/// the existing `digest_shard_prefix` used by the legacy temp / content
+/// layout (created by `create_subdirs` during `FilesystemStore::new`),
+/// so the directories are guaranteed to exist before the first call.
+///
+/// `.partial` suffix exists for two reasons: (1) it makes the recovery
+/// sweep's filename match (`*.partial`) cheap and unambiguous, (2) it
+/// guarantees a chunked-partial file path NEVER collides with a
+/// finalized CAS file path inside `temp_path` (the legacy `update`
+/// flow uses `make_temp_key` to mint a fresh randomized digest and
+/// writes to the same directory; without the `.partial` suffix a
+/// recovery sweep based on filename pattern alone could mistakenly
+/// GC or rename a legacy temp file).
+pub(crate) fn partial_temp_path(temp_path_root: &str, digest: &DigestInfo) -> PathBuf {
+    const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
+    let first_byte = digest.packed_hash()[0];
+    let shard_arr = [
+        HEX_LUT[(first_byte >> 4) as usize],
+        HEX_LUT[(first_byte & 0x0f) as usize],
+    ];
+    // SAFETY: shard_arr bytes are sourced from HEX_LUT which is ASCII.
+    let shard_str = unsafe { core::str::from_utf8_unchecked(&shard_arr) };
+    let mut path = PathBuf::from(temp_path_root);
+    path.push("d");
+    path.push(shard_str);
+    path.push(format!("{digest}.partial"));
+    path
+}
+
+/// Open or create the sparse temp file for a chunked partial. Idempotent
+/// for the same digest within one process: a second call returns the
+/// existing `ChunkInProgress` from the map without re-opening the file.
+///
+/// Cross-process, this would NOT be safe (two processes opening the
+/// same path with `create+write` would race). Per design §7.3 there is
+/// only one writer process per `FilesystemStore` deployment; the
+/// recovery sweep on startup GCs any stale `.partial` files left from
+/// a previous process.
+async fn open_or_create_partial(
+    map: &ChunkedPartialsMap,
+    digest: DigestInfo,
+    temp_path_root: &str,
+) -> Result<Arc<ChunkInProgress>, Error> {
+    // Fast path: entry already exists. Avoid the spawn_blocking on the
+    // hot per-chunk path when the file is already open.
+    if let Some(existing) = map.inner.lock().get(&digest).cloned() {
+        return Ok(existing);
+    }
+
+    // Slow path: open the file. Done in `spawn_blocking` because
+    // `OpenOptions::open` is a blocking syscall that on a slow ZFS
+    // pool can take milliseconds.
+    let path = partial_temp_path(temp_path_root, &digest);
+    let path_for_blocking = path.clone();
+    let opened = tokio::task::spawn_blocking(move || -> Result<std::fs::File, std::io::Error> {
+        // create(true) + write(true) — sparse semantics handled by the
+        // kernel + ZFS on first pwrite at a non-zero offset. NO O_SYNC,
+        // NO O_DSYNC, NO O_DIRECT (CLAUDE.md hard rule).
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path_for_blocking)
+    })
+    .await
+    .map_err(|join_err| make_err!(Code::Internal, "spawn_blocking join error opening chunked partial: {join_err:?}"))?
+    .map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "failed to open chunked partial temp file {}: {io_err:?}",
+            path.display()
+        )
+    })?;
+
+    let new_entry = Arc::new(ChunkInProgress {
+        path,
+        file: AsyncMutex::new(opened),
+        declared_size: digest.size_bytes(),
+    });
+
+    // Race resolution: another caller may have created the entry
+    // between our `cloned()` check above and the `open_or_create_partial`
+    // re-acquire here. If so, drop our just-opened file and use theirs.
+    // Cost: one extra `open` + `close` syscall for the loser. Not on
+    // the steady-state hot path (only first chunk per digest).
+    let mut guard = map.inner.lock();
+    if let Some(existing) = guard.get(&digest).cloned() {
+        debug!(?digest, "chunked partial open race resolved; using existing entry");
+        drop(guard);
+        // `new_entry`'s file dropped here — the actual on-disk file
+        // remains (both opens went to the SAME path so the second open
+        // just re-opened the same inode). The race-loser's open
+        // dropped its fd; the winner still holds theirs.
+        return Ok(existing);
+    }
+    guard.insert(digest, Arc::clone(&new_entry));
+    Ok(new_entry)
+}
+
+/// Write one chunk at the given byte offset into the sparse partial.
+/// Per Q2=(a): out-of-order safe via `pwrite` (atomic per syscall on
+/// Linux + macOS), and the per-blob async mutex serializes concurrent
+/// callers within the same digest.
+///
+/// On first chunk for a digest: opens / creates the temp file with
+/// sparse semantics. On subsequent chunks: reuses the open fd from
+/// the map.
+///
+/// **NO `fsync`** anywhere in this function or the call chain. The
+/// CLAUDE.md hard rule (2026-04-28) prohibits sync-write primitives;
+/// ZFS `sync=disabled` is the durability model. Mirror + BIS ack
+/// covers crash-recovery durability.
+pub(crate) async fn write_chunk_at_offset(
+    map: &ChunkedPartialsMap,
+    temp_path_root: &str,
+    digest: &DigestInfo,
+    chunk_offset: u64,
+    chunk_bytes: Bytes,
+) -> Result<(), Error> {
+    if chunk_bytes.is_empty() {
+        // Defensive: a zero-length chunk is a no-op. Don't open the
+        // file for nothing. Phase 2.3 driver should never produce
+        // zero-length chunks but the contract here is permissive.
+        return Ok(());
+    }
+
+    let entry = open_or_create_partial(map, *digest, temp_path_root).await?;
+
+    // Acquire the per-blob async mutex. We hold this across the
+    // spawn_blocking await so that concurrent chunks for the SAME
+    // digest serialize on the file handle. Different digests use
+    // different `ChunkInProgress` instances and never contend.
+    //
+    // Cloning `chunk_bytes` is cheap (Bytes is refcounted). The actual
+    // payload moves into the spawn_blocking closure.
+    let len = chunk_bytes.len();
+    let file_guard = entry.file.lock().await;
+
+    // SAFETY of write_at: the `std::os::unix::fs::FileExt::write_at`
+    // method writes `bytes.len()` bytes at the given offset. It does
+    // NOT use the file's seek position, so concurrent calls on the
+    // SAME fd at DIFFERENT offsets are safe at the syscall level
+    // (Linux + macOS). The async-mutex above is belt-and-suspenders
+    // for cross-call ordering and short-write retries.
+    let bytes_for_blocking = chunk_bytes;
+    // We need a `try_clone` of the file so we can move it into the
+    // spawn_blocking and still keep the mutex guard's exclusive
+    // access pattern intact. Alternative: take the lock around a
+    // `&std::fs::File` reference and pass `&` into spawn_blocking —
+    // but the spawned closure has a `'static` bound, so we need an
+    // owned handle. `try_clone` is cheap (one `dup` syscall) and
+    // gives us another fd referring to the same open-file-description.
+    let file_clone = file_guard
+        .try_clone()
+        .map_err(|io_err| make_err!(Code::Internal, "try_clone for chunked pwrite failed: {io_err:?}"))?;
+
+    let result = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::FileExt;
+            // `write_at` performs a `pwrite(2)`. A short write returns
+            // `Ok(written < bytes.len())`; loop until the full buffer
+            // is consumed. Per pwrite(2) man page: "If the file
+            // offset is past the end of the file, the file shall be
+            // extended" — sparse semantics on the gap.
+            let mut written = 0usize;
+            let bytes_slice = bytes_for_blocking.as_ref();
+            while written < bytes_slice.len() {
+                let n = file_clone.write_at(
+                    &bytes_slice[written..],
+                    chunk_offset + written as u64,
+                )?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "pwrite returned 0 bytes — disk full or ENOSPC?",
+                    ));
+                }
+                written += n;
+            }
+            Ok(())
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            // No portable `pwrite` on non-unix; the chunked-fast-slow
+            // feature is currently only built for unix targets. Phase
+            // 2.x will revisit if Windows support becomes a goal.
+            let _ = (file_clone, bytes_for_blocking, chunk_offset);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "chunked pwrite-at-offset not supported on non-unix targets",
+            ))
+        }
+    })
+    .await;
+
+    drop(file_guard);
+
+    let blocking_result = result.map_err(|join_err| {
+        make_err!(Code::Internal, "spawn_blocking join error in chunked pwrite: {join_err:?}")
+    })?;
+
+    blocking_result.map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "chunked pwrite at offset {chunk_offset} ({len} bytes) failed: {io_err:?}"
+        )
+    })?;
+    Ok(())
+}
+
+/// Atomic finalize: verify the partial's actual length matches the
+/// declared `expected_size` (per Q7=(c) trust file length only), then
+/// rename to the final CAS path with mode 0o555.
+///
+/// On length mismatch: returns `Err(Code::InvalidArgument, ...)` and
+/// LEAVES the temp file in place. The caller (driver) is responsible
+/// for cleaning up via `discard_chunked` — `commit_chunked` does NOT
+/// auto-discard. Rationale: the driver may want to inspect the temp
+/// file for debugging, retry the missing chunks, or take other action
+/// before committing to a discard.
+///
+/// On success: removes the in-flight state entry from the map. After
+/// this call returns Ok, subsequent `commit_chunked` / `discard_chunked`
+/// for the same digest will return `Code::NotFound` (no in-flight
+/// state for this digest).
+///
+/// Does NOT touch the FilesystemStore's `evicting_map`. Phase 2.3
+/// driver code is responsible for inserting the new file entry into
+/// the EvictingMap after `commit_chunked` succeeds (analogous to the
+/// `emplace_file` path that the legacy `update` calls).
+pub(crate) async fn commit_chunked(
+    map: &ChunkedPartialsMap,
+    digest: &DigestInfo,
+    expected_size: u64,
+    final_path: PathBuf,
+) -> Result<(), Error> {
+    // Get the entry but DO NOT remove it yet — if length validation
+    // fails we want the entry to remain so `discard_chunked` (called
+    // by the caller) can find it.
+    let entry = {
+        let guard = map.inner.lock();
+        guard.get(digest).cloned()
+    };
+    let entry = entry.ok_or_else(|| {
+        make_err!(
+            Code::NotFound,
+            "no in-flight chunked partial for {digest} — already committed, discarded, or never opened"
+        )
+    })?;
+
+    // Stat the file to verify length. spawn_blocking because
+    // `metadata()` is a syscall and on a slow pool can take ms.
+    let path_for_stat = entry.path.clone();
+    let actual_len = tokio::task::spawn_blocking(move || -> Result<u64, std::io::Error> {
+        std::fs::metadata(&path_for_stat).map(|m| m.len())
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(Code::Internal, "spawn_blocking join error in commit_chunked stat: {join_err:?}")
+    })?
+    .map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "failed to stat chunked partial {} during commit: {io_err:?}",
+            entry.path.display()
+        )
+    })?;
+
+    if actual_len != expected_size {
+        // Per spec: leave the temp file in place. Caller calls
+        // discard_chunked. DO NOT remove from map.
+        warn!(
+            ?digest,
+            actual_len,
+            expected_size,
+            "chunked commit length mismatch; partial left in place for caller to discard"
+        );
+        return Err(make_err!(
+            Code::InvalidArgument,
+            "chunked commit length mismatch: temp={actual_len} expected={expected_size}"
+        ));
+    }
+
+    // Length OK. Atomic rename + chmod inside spawn_blocking so we
+    // don't block a tokio worker on the rename syscall (slow on ZFS
+    // under txg-sync wait, even with sync=disabled the metadata path
+    // can stall).
+    //
+    // We do this BEFORE removing from the map so that, if the rename
+    // fails, the entry stays in the map for the caller to retry or
+    // discard. Rename failure on a same-filesystem rename is rare
+    // (EPERM, ENOSPC) but possible.
+    let from_path = entry.path.clone();
+    let to_path = final_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        std::fs::rename(&from_path, &to_path)?;
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Match the existing `emplace_file` convention: CAS files
+            // are 0o555 so hardlinked copies don't need a per-file
+            // chmod during input materialization.
+            let perms = std::fs::Permissions::from_mode(0o555);
+            if let Err(err) = std::fs::set_permissions(&to_path, perms) {
+                tracing::warn!(?err, path = ?to_path, "Failed to set CAS file permissions to 0o555 after chunked commit");
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(Code::Internal, "spawn_blocking join error in commit_chunked rename: {join_err:?}")
+    })?
+    .map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "failed to rename chunked partial {} -> {}: {io_err:?}",
+            entry.path.display(),
+            final_path.display()
+        )
+    })?;
+
+    // Remove from the in-flight map. Drop the Arc<ChunkInProgress>
+    // after the lock is released to keep the lock critical section
+    // short. The file fd inside `ChunkInProgress` will close on the
+    // last Arc drop, which may happen on this thread.
+    let removed = map.inner.lock().remove(digest);
+    drop(removed);
+
+    Ok(())
+}
+
+/// Discard an in-flight chunked partial: remove the temp file +
+/// remove the in-flight state entry. Idempotent — safe to call when
+/// the digest has no in-flight state (returns Ok with no error;
+/// commit-after-discard is the failure case, not double-discard).
+///
+/// Used by:
+/// - The Phase 2.3 driver on a length-mismatch `commit_chunked`
+///   failure.
+/// - The §6.7 termination triggers (panic, shutdown, retry exhaustion).
+/// - The startup recovery sweep (per Q7=(c)) when finding stale
+///   `.partial` files from a previous process.
+pub(crate) async fn discard_chunked(
+    map: &ChunkedPartialsMap,
+    digest: &DigestInfo,
+) -> Result<(), Error> {
+    // Take the entry out of the map under the lock. If absent: caller
+    // may have already discarded (idempotent). The on-disk file may
+    // still exist if discard_chunked is called WITHOUT a corresponding
+    // open call in this process (e.g. startup-orphan path), but
+    // `discard_chunked` only knows about in-process state. The
+    // recovery sweep handles disk-only orphans.
+    let entry = map.inner.lock().remove(digest);
+
+    // If we have an in-process entry, delete its on-disk file. If not,
+    // there's nothing to do — return Ok (idempotent).
+    let Some(entry) = entry else {
+        debug!(?digest, "discard_chunked: no in-flight state, nothing to do");
+        return Ok(());
+    };
+
+    let path = entry.path.clone();
+    // Drop our reference to the entry BEFORE the spawn_blocking so the
+    // file fd closes promptly (the spawn_blocking's `remove_file`
+    // doesn't need the fd; closing it before unlink avoids holding
+    // an extra open-file-description over a syscall).
+    drop(entry);
+
+    let unlink_result = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(Code::Internal, "spawn_blocking join error in discard_chunked unlink: {join_err:?}")
+    })?;
+
+    unlink_result.map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "failed to unlink discarded chunked partial: {io_err:?}"
+        )
+    })?;
+    Ok(())
+}
+
+/// Startup recovery sweep stub per Q7=(c). Walks `<temp_path>/d/XX/`
+/// looking for `*.partial` files and unlinks them. Returns the count
+/// removed.
+///
+/// Phase 2.1 ships the GC-everything strategy explicitly chosen by
+/// Q7=(c): "drop partial-recoverable read entirely". A future phase
+/// MAY add the rename-if-length-matches behavior described in §7.4
+/// (recovery rename → downstream VerifyStore validates digest), but
+/// that requires Phase 2.3's driver to have written digest-aware
+/// validation that the bare recovery sweep doesn't have access to.
+/// For Phase 2.1 the scope is: GC everything, mirror re-uploads what
+/// didn't land. Matches the user's locked decision exactly.
+///
+/// Spawned as a background task by `FilesystemStore::new` (when the
+/// `chunked_fast_slow` feature is on) so it does NOT block startup.
+/// The cost is one `read_dir` per shard subdirectory + one `unlink`
+/// per stale `.partial` file. For a normal startup with zero stale
+/// partials this is 256 cheap `read_dir` calls returning empty.
+pub(crate) async fn recover_partials_on_startup(
+    temp_path_root: &str,
+) -> Result<u64, Error> {
+    let root = PathBuf::from(temp_path_root).join("d");
+    let mut total_gc = 0u64;
+
+    // Iterate the 256 shard subdirs (00..ff) — these are
+    // pre-created by `FilesystemStore::new`'s `create_subdirs`.
+    // Spawn_blocking the whole sweep so we batch the syscalls and
+    // don't ping-pong the runtime for each entry.
+    let scan_result = tokio::task::spawn_blocking(move || -> Result<u64, std::io::Error> {
+        let mut count = 0u64;
+        // 256 shards. If the directory doesn't exist (e.g. older
+        // store layout), short-circuit to zero.
+        let read_root = match std::fs::read_dir(&root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        for shard_entry in read_root {
+            let shard_entry = shard_entry?;
+            let shard_path = shard_entry.path();
+            // Only scan directories (the shard subdirs); skip stray
+            // files in d/ itself — the legacy code didn't put files
+            // there but defensive against future drift.
+            let metadata = match shard_entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            let read_shard = match std::fs::read_dir(&shard_path) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for file_entry in read_shard {
+                let Ok(file_entry) = file_entry else { continue };
+                let path = file_entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("partial") {
+                    continue;
+                }
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        count += 1;
+                    }
+                    Err(e) => {
+                        // Best effort — log and continue.
+                        error!(?path, ?e, "failed to remove stale chunked partial during recovery sweep");
+                    }
+                }
+            }
+        }
+        Ok(count)
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(Code::Internal, "spawn_blocking join error in recover_partials_on_startup: {join_err:?}")
+    })?
+    .err_tip(|| format!("scanning {temp_path_root}/d for stale chunked partials"))?;
+
+    total_gc += scan_result;
+    if total_gc > 0 {
+        warn!(total_gc, %temp_path_root, "recovered chunked partial files at startup (per Q7=(c) GC everything)");
+    } else {
+        debug!(%temp_path_root, "recovery sweep found no stale chunked partials");
+    }
+    Ok(total_gc)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::time::Duration;
+
+    use bytes::Bytes;
+    use nativelink_macro::nativelink_test;
+    use nativelink_util::common::DigestInfo;
+
+    use super::super::CHUNK_SIZE;
+    use super::{
+        ChunkedPartialsMap, commit_chunked, discard_chunked, partial_temp_path,
+        recover_partials_on_startup, write_chunk_at_offset,
+    };
+
+    /// Test-only helper: creates a fresh temp dir under `TEST_TMPDIR`
+    /// (or the system temp dir) with the FilesystemStore's expected
+    /// shard layout (`d/00`..`d/ff`) so the chunked partial path's
+    /// parent directory exists.
+    async fn make_chunked_test_root() -> String {
+        let base = std::env::var("TEST_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string());
+        let nonce: u64 = rand::random();
+        let root = format!("{base}/{nonce}/chunked-fs-test");
+        // Pre-create the shard dirs the legacy FilesystemStore::new
+        // creates. We can't call FilesystemStore::new directly here
+        // because we are under #[cfg(test)] of the chunked submodule
+        // and don't want to drag in the whole evicting-map machinery.
+        let root_d = format!("{root}/d");
+        tokio::fs::create_dir_all(&root_d).await.unwrap();
+        for byte in 0u8..=255 {
+            let shard = format!("{root_d}/{byte:02x}");
+            tokio::fs::create_dir_all(&shard).await.unwrap();
+        }
+        root
+    }
+
+    fn make_test_digest(seed: u8, size: u64) -> DigestInfo {
+        let mut hash = [0u8; 32];
+        hash[0] = seed;
+        // Set a unique tail so different seeds produce different
+        // digests + different shard prefixes.
+        hash[31] = seed;
+        DigestInfo::new(hash, size)
+    }
+
+    /// Per Q3=(a): the on-disk path is shaped as
+    /// `<temp_path>/d/<XX>/<digest>.partial`. The shard prefix is the
+    /// first byte's two-hex-char representation.
+    #[test]
+    fn partial_temp_path_uses_sharded_layout() {
+        let digest = DigestInfo::new([0xab; 32], 1234);
+        let path = partial_temp_path("/tmp/store", &digest);
+        let s = path.to_str().unwrap();
+        assert!(s.starts_with("/tmp/store/d/ab/"), "got {s}");
+        assert!(s.ends_with(".partial"), "got {s}");
+    }
+
+    /// Three chunks IN ORDER, commit, file at the right path with
+    /// correct contents. Uses 4 KiB micro-chunks to keep tests fast;
+    /// the production CHUNK_SIZE is 1 MiB.
+    #[nativelink_test]
+    async fn write_three_chunks_in_order_then_commit_succeeds() {
+        const CHUNK: usize = 4 * 1024;
+        let total: u64 = 3 * CHUNK as u64;
+        let root = make_chunked_test_root().await;
+        let map = ChunkedPartialsMap::new();
+        let digest = make_test_digest(0x01, total as i64 as u64);
+        let final_path =
+            std::path::PathBuf::from(format!("{root}/d/01/{digest}"));
+
+        let chunks: Vec<Bytes> = (0..3u8)
+            .map(|i| Bytes::from(vec![0xa0 + i; CHUNK]))
+            .collect();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (i, c) in chunks.iter().enumerate() {
+                write_chunk_at_offset(&map, &root, &digest, (i * CHUNK) as u64, c.clone())
+                    .await
+                    .expect("in-order chunk write must succeed");
+            }
+            commit_chunked(&map, &digest, total, final_path.clone())
+                .await
+                .expect("in-order commit must succeed");
+        })
+        .await
+        .expect("in-order chunks + commit must finish within 5s");
+
+        // Final file exists, has correct length + contents.
+        let bytes = tokio::fs::read(&final_path)
+            .await
+            .expect("final file must be readable");
+        assert_eq!(bytes.len() as u64, total);
+        for (i, byte) in bytes.iter().enumerate() {
+            let chunk_idx = i / CHUNK;
+            assert_eq!(
+                *byte,
+                0xa0u8 + chunk_idx as u8,
+                "byte {i} (chunk {chunk_idx}): got {byte:#x}"
+            );
+        }
+
+        // After commit, in-flight state is gone.
+        assert!(!map.contains(&digest), "commit must remove in-flight state");
+        assert_eq!(map.in_flight_count(), 0);
+    }
+
+    /// Three chunks OUT OF ORDER (offsets 2*N, 0, N), commit. The
+    /// sparse `pwrite` semantics MUST handle out-of-order arrivals;
+    /// final file contents are correct regardless of arrival order.
+    #[nativelink_test]
+    async fn write_three_chunks_out_of_order_then_commit_succeeds() {
+        const CHUNK: usize = 4 * 1024;
+        let total: u64 = 3 * CHUNK as u64;
+        let root = make_chunked_test_root().await;
+        let map = ChunkedPartialsMap::new();
+        let digest = make_test_digest(0x02, total);
+        let final_path =
+            std::path::PathBuf::from(format!("{root}/d/02/{digest}"));
+
+        // Three chunks; we send them in order 2, 0, 1 to exercise
+        // sparse-file pwrite semantics. Each chunk is filled with a
+        // distinctive byte so we can verify position-correctness in
+        // the final file.
+        let c0 = Bytes::from(vec![0xc0u8; CHUNK]);
+        let c1 = Bytes::from(vec![0xc1u8; CHUNK]);
+        let c2 = Bytes::from(vec![0xc2u8; CHUNK]);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Offset 2 first — extends the sparse file to 12 KiB.
+            write_chunk_at_offset(&map, &root, &digest, 2 * CHUNK as u64, c2.clone())
+                .await
+                .expect("out-of-order chunk @ offset 2 must succeed");
+            // Offset 0 next — fills the head.
+            write_chunk_at_offset(&map, &root, &digest, 0, c0.clone())
+                .await
+                .expect("out-of-order chunk @ offset 0 must succeed");
+            // Offset 1 last — fills the middle.
+            write_chunk_at_offset(&map, &root, &digest, CHUNK as u64, c1.clone())
+                .await
+                .expect("out-of-order chunk @ offset 1 must succeed");
+
+            commit_chunked(&map, &digest, total, final_path.clone())
+                .await
+                .expect("out-of-order commit must succeed");
+        })
+        .await
+        .expect("out-of-order chunks + commit must finish within 5s");
+
+        let bytes = tokio::fs::read(&final_path).await.unwrap();
+        assert_eq!(bytes.len() as u64, total);
+        // Verify each region is its expected byte. The whole point of
+        // the test: no chunk overwrote another's region.
+        for i in 0..CHUNK {
+            assert_eq!(bytes[i], 0xc0u8, "chunk-0 region byte {i}");
+            assert_eq!(bytes[CHUNK + i], 0xc1u8, "chunk-1 region byte {i}");
+            assert_eq!(bytes[2 * CHUNK + i], 0xc2u8, "chunk-2 region byte {i}");
+        }
+    }
+
+    /// Commit with the wrong expected_size returns
+    /// `Err(InvalidArgument)` with the SPECIFIC error message AND
+    /// LEAVES the temp file in place (not auto-cleaned — caller calls
+    /// discard).
+    #[nativelink_test]
+    async fn commit_with_wrong_expected_size_returns_invalid_argument_and_keeps_temp() {
+        const CHUNK: usize = 4 * 1024;
+        let actual: u64 = 2 * CHUNK as u64;
+        let lying_expected: u64 = 3 * CHUNK as u64;
+        let root = make_chunked_test_root().await;
+        let map = ChunkedPartialsMap::new();
+        let digest = make_test_digest(0x03, actual);
+        let final_path =
+            std::path::PathBuf::from(format!("{root}/d/03/{digest}"));
+
+        let c0 = Bytes::from(vec![0x10u8; CHUNK]);
+        let c1 = Bytes::from(vec![0x11u8; CHUNK]);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            write_chunk_at_offset(&map, &root, &digest, 0, c0).await.unwrap();
+            write_chunk_at_offset(&map, &root, &digest, CHUNK as u64, c1).await.unwrap();
+            let err = commit_chunked(&map, &digest, lying_expected, final_path.clone())
+                .await
+                .expect_err("commit with wrong expected size must fail");
+            assert_eq!(
+                err.code,
+                nativelink_error::Code::InvalidArgument,
+                "wrong size must be classified as InvalidArgument; got {err:?}"
+            );
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("chunked commit length mismatch"),
+                "error message must name the contract; got {msg}"
+            );
+            assert!(
+                msg.contains(&format!("temp={actual}")),
+                "error must report actual length; got {msg}"
+            );
+            assert!(
+                msg.contains(&format!("expected={lying_expected}")),
+                "error must report claimed expected length; got {msg}"
+            );
+        })
+        .await
+        .expect("must not deadlock — commit should fast-fail on length mismatch");
+
+        // Temp file MUST still exist (caller responsibility to discard).
+        let temp_path = partial_temp_path(&root, &digest);
+        let meta = tokio::fs::metadata(&temp_path).await;
+        assert!(
+            meta.is_ok(),
+            "commit failure must NOT auto-discard temp file; got: {meta:?}"
+        );
+        assert_eq!(meta.unwrap().len(), actual);
+
+        // Final file MUST NOT exist.
+        let final_meta = tokio::fs::metadata(&final_path).await;
+        assert!(
+            final_meta.is_err(),
+            "failed commit must NOT create final file; got: {final_meta:?}"
+        );
+
+        // In-flight state MUST still be present (so caller can
+        // discard).
+        assert!(
+            map.contains(&digest),
+            "failed commit must leave in-flight state for discard"
+        );
+    }
+
+    /// Discard removes the temp file + the in-flight state entry, and
+    /// commit-after-discard returns Err(NotFound).
+    #[nativelink_test]
+    async fn discard_removes_temp_and_state_then_commit_returns_not_found() {
+        const CHUNK: usize = 4 * 1024;
+        let total: u64 = 2 * CHUNK as u64;
+        let root = make_chunked_test_root().await;
+        let map = ChunkedPartialsMap::new();
+        let digest = make_test_digest(0x04, total);
+        let final_path =
+            std::path::PathBuf::from(format!("{root}/d/04/{digest}"));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            write_chunk_at_offset(&map, &root, &digest, 0, Bytes::from(vec![0x40u8; CHUNK]))
+                .await
+                .unwrap();
+            write_chunk_at_offset(
+                &map,
+                &root,
+                &digest,
+                CHUNK as u64,
+                Bytes::from(vec![0x41u8; CHUNK]),
+            )
+            .await
+            .unwrap();
+            assert!(map.contains(&digest), "writes must register in-flight state");
+
+            discard_chunked(&map, &digest)
+                .await
+                .expect("discard must succeed");
+
+            // Temp file gone.
+            let temp_path = partial_temp_path(&root, &digest);
+            let temp_meta = tokio::fs::metadata(&temp_path).await;
+            assert!(
+                temp_meta.is_err(),
+                "discard must remove temp file; got: {temp_meta:?}"
+            );
+            // In-flight state gone.
+            assert!(
+                !map.contains(&digest),
+                "discard must remove in-flight state"
+            );
+            // Idempotent: second discard is Ok.
+            discard_chunked(&map, &digest)
+                .await
+                .expect("discard must be idempotent");
+
+            // Commit-after-discard fails with NotFound.
+            let err = commit_chunked(&map, &digest, total, final_path)
+                .await
+                .expect_err("commit-after-discard must fail");
+            assert_eq!(
+                err.code,
+                nativelink_error::Code::NotFound,
+                "commit-after-discard must return NotFound; got {err:?}"
+            );
+        })
+        .await
+        .expect("must not deadlock — discard + commit-after-discard cycle");
+    }
+
+    /// Drop the ChunkedPartialsMap mid-write: the temp file MUST
+    /// remain on disk (drop is graceful, not destructive). The
+    /// recovery sweep on next startup will GC it per Q7=(c).
+    #[nativelink_test]
+    async fn dropping_partials_map_leaves_temp_file_for_recovery_sweep() {
+        const CHUNK: usize = 4 * 1024;
+        let root = make_chunked_test_root().await;
+        let digest = make_test_digest(0x05, CHUNK as u64);
+        let temp_path = partial_temp_path(&root, &digest);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let map = ChunkedPartialsMap::new();
+            write_chunk_at_offset(&map, &root, &digest, 0, Bytes::from(vec![0x50u8; CHUNK]))
+                .await
+                .unwrap();
+            assert!(map.contains(&digest), "write must register in-flight state");
+            // Drop the map — entry's Arc<ChunkInProgress> drops, but
+            // the on-disk file is NOT auto-removed.
+            drop(map);
+        })
+        .await
+        .expect("write + drop cycle must finish within 5s");
+
+        // Temp file MUST still exist after map is dropped.
+        let meta = tokio::fs::metadata(&temp_path).await;
+        assert!(
+            meta.is_ok(),
+            "dropping the map must NOT delete on-disk partial; got {meta:?}"
+        );
+        assert_eq!(meta.unwrap().len(), CHUNK as u64);
+
+        // Recovery sweep on the same temp_path GCs it.
+        let gc_count = recover_partials_on_startup(&root)
+            .await
+            .expect("recovery sweep must succeed");
+        assert!(
+            gc_count >= 1,
+            "recovery sweep must find + GC at least the orphaned partial; got {gc_count}"
+        );
+        // After sweep, the temp file is gone.
+        let post_sweep = tokio::fs::metadata(&temp_path).await;
+        assert!(
+            post_sweep.is_err(),
+            "recovery sweep must remove the orphaned partial; got {post_sweep:?}"
+        );
+    }
+
+    /// Sanity: production CHUNK_SIZE matches the spec (1 MiB).
+    /// Tests above use 4 KiB micro-chunks to stay fast, but the
+    /// production system uses CHUNK_SIZE — guard against accidental
+    /// drift.
+    #[test]
+    fn chunk_size_constant_pinned_for_chunked_filesystem_callers() {
+        assert_eq!(CHUNK_SIZE, 1024 * 1024);
+    }
+}

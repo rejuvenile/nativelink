@@ -39,6 +39,7 @@
 
 pub(crate) mod chunk_budget;
 pub(crate) mod chunked_driver;
+pub(crate) mod chunked_filesystem;
 
 /// Fixed chunk size for the #212 chunked transport / on-disk layout.
 ///

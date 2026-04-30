@@ -47,6 +47,12 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::callback_utils::ItemCallbackHolder;
 use crate::cas_utils::is_zero_digest;
+#[cfg(feature = "chunked_fast_slow")]
+use crate::chunked::chunked_filesystem::{
+    ChunkedPartialsMap, commit_chunked as chunked_commit, discard_chunked as chunked_discard,
+    recover_partials_on_startup as chunked_recover_partials,
+    write_chunk_at_offset as chunked_write_chunk_at_offset,
+};
 
 // Default size to allocate memory of the buffer when reading files.
 // 256 KiB reduces syscalls by 4x compared to 64 KiB. At 10Gbps, 64 KiB reads
@@ -869,6 +875,17 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     large_read_semaphore: Option<tokio::sync::Semaphore>,
     #[metric(help = "Size threshold for large read limiting")]
     large_read_threshold: u64,
+    /// Per-blob in-flight state for chunked-streaming uploads (#212
+    /// Phase 2.1). Holds the open temp-file handle + per-blob async
+    /// mutex so concurrent `pwrite` calls for the same digest serialize
+    /// safely. Different digests use disjoint entries, so cross-blob
+    /// chunks proceed in parallel. Zero memory cost when the
+    /// `chunked_fast_slow` feature is OFF (the field is `cfg`-gated
+    /// out of the struct entirely, so `MetricsComponent` derive +
+    /// production binaries are byte-identical to the pre-Phase-2.1
+    /// build).
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_partials: Arc<ChunkedPartialsMap>,
 }
 
 impl<Fe: FileEntry> FilesystemStore<Fe> {
@@ -944,6 +961,41 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             None
         };
         evicting_map.start_background_eviction();
+
+        // #212 Phase 2.1 recovery sweep (per Q7=(c)): GC any orphaned
+        // `*.partial` files left in `<temp_path>/d/XX/` from a previous
+        // process. Spawn as a background task so startup is NOT
+        // blocked; one missing-file `read_dir` per shard subdir is
+        // ~256 cheap syscalls + however many `unlink`s for stale
+        // partials. The mirror protocol re-uploads what the previous
+        // process didn't fully land. Feature-gated to keep the default
+        // build byte-identical.
+        #[cfg(feature = "chunked_fast_slow")]
+        {
+            let temp_path_for_sweep = shared_context.temp_path.clone();
+            background_spawn!("filesystem_chunked_recovery_sweep", async move {
+                match chunked_recover_partials(&temp_path_for_sweep).await {
+                    Ok(0) => {
+                        debug!(temp_path = %temp_path_for_sweep, "chunked recovery sweep: no stale partials");
+                    }
+                    Ok(n) => {
+                        info!(
+                            temp_path = %temp_path_for_sweep,
+                            gc_count = n,
+                            "chunked recovery sweep removed stale partials"
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            temp_path = %temp_path_for_sweep,
+                            ?err,
+                            "chunked recovery sweep failed (non-fatal; mirror covers re-upload)"
+                        );
+                    }
+                }
+            });
+        }
+
         Ok(Arc::new_cyclic(|weak_self| Self {
             shared_context,
             evicting_map,
@@ -960,6 +1012,8 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
                 None
             },
             large_read_threshold: spec.large_read_threshold_bytes,
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_partials: Arc::new(ChunkedPartialsMap::new()),
         }))
     }
 
@@ -1294,6 +1348,118 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         })
         .await
         .err_tip(|| "Failed to create spawn in filesystem store update_file")?
+    }
+}
+
+// =============================================================================
+// #212 Phase 2.1 — chunked-streaming primitives (Q10=(a) internal API).
+// =============================================================================
+//
+// Per-chunk write-at-offset + atomic-commit + discard primitives that the
+// Phase 2.3 per-blob driver consumes. Behind the `chunked_fast_slow`
+// feature flag; the entire impl block is `cfg`-gated out of the default
+// build, preserving byte-identity per Phase 1's invariant.
+//
+// The actual I/O lives in `crate::chunked::chunked_filesystem`; this
+// impl block is a thin adapter that (a) routes through the
+// FilesystemStore's per-store `chunked_partials` map (so two
+// FilesystemStore instances on disjoint temp paths don't share state)
+// and (b) constructs the final CAS path from the existing
+// `to_full_path_from_key` layout (so committed chunked blobs land at
+// the SAME on-disk path as legacy `update`-produced blobs and are
+// discoverable by the existing `add_files_to_cache` startup walk).
+//
+// **NO behavior changes** to existing `update`, `update_oneshot`,
+// `get_part`, `has`, `has_with_results`. Phase 2.3 will plumb the new
+// APIs from the per-blob driver without touching any of the existing
+// trait methods. Composability with outer layers (VerifyStore,
+// ExistenceCacheStore, etc.) is preserved because outer layers only
+// see the unchanged `StoreDriver` surface.
+#[cfg(feature = "chunked_fast_slow")]
+#[allow(dead_code, reason = "Phase 2.1 SKELETON; consumers land in Phase 2.3 (#212)")]
+impl<Fe: FileEntry> FilesystemStore<Fe> {
+    /// Write a chunk at the given byte offset for an in-flight chunked
+    /// upload. On first call for a digest: creates a sparse temp file at
+    /// `<temp_path>/d/<XX>/<digest>.partial`. Subsequent calls reuse the
+    /// open fd. Concurrent calls for the SAME digest serialize via a
+    /// per-blob async mutex; concurrent calls for DIFFERENT digests
+    /// proceed in parallel.
+    ///
+    /// Per design Q2=(a): out-of-order safe (offsets may arrive in any
+    /// order — sparse `pwrite` semantics extend the file as needed).
+    /// Per Q3=(a): callers should use `CHUNK_SIZE`-aligned offsets in
+    /// production (1 MiB), matching the ZFS `recordsize=1M` to avoid
+    /// partial-record write amplification; this method does NOT enforce
+    /// alignment because Phase 2.x tests want to exercise sub-chunk
+    /// offsets.
+    ///
+    /// **NO `fsync`.** Per CLAUDE.md hard rule and Q7=(c) durability
+    /// model. Crash recovery uses file length only; mirror covers
+    /// re-upload of unflushed bytes.
+    ///
+    /// Phase 2.3 wiring: the per-blob driver task calls this from its
+    /// `recv()` loop on each `ChunkWork` item. The `ChunkWork`'s
+    /// `_permit` (held by the driver) is released when the driver
+    /// drops the `ChunkWork`, which happens after this call returns.
+    pub(crate) async fn write_chunk_at_offset(
+        &self,
+        digest: &DigestInfo,
+        chunk_offset: u64,
+        chunk_bytes: Bytes,
+    ) -> Result<(), Error> {
+        chunked_write_chunk_at_offset(
+            &self.chunked_partials,
+            &self.shared_context.temp_path,
+            digest,
+            chunk_offset,
+            chunk_bytes,
+        )
+        .await
+    }
+
+    /// Atomic finalize: verify the temp file's actual length matches
+    /// `expected_size` (per Q7=(c) trust file length only), then
+    /// rename to the final CAS path with mode 0o555.
+    ///
+    /// On length mismatch: returns `Err(Code::InvalidArgument, ...)`
+    /// and LEAVES the temp file in place + the in-flight state entry
+    /// in the map. The caller (driver) MUST follow up with
+    /// `discard_chunked` to clean up. This split lets the driver
+    /// inspect / log the failed partial before discarding.
+    ///
+    /// On success: removes the in-flight state entry. The new CAS file
+    /// is **NOT** automatically inserted into the FilesystemStore's
+    /// `evicting_map` — Phase 2.3's driver is responsible for that
+    /// (analogous to the legacy `update` path's `emplace_file` insert).
+    /// Splitting commit-from-emplace this way lets the driver atomically
+    /// validate-and-emplace under its own lock + bump metrics in one
+    /// place.
+    pub(crate) async fn commit_chunked(
+        &self,
+        digest: &DigestInfo,
+        expected_size: u64,
+    ) -> Result<(), Error> {
+        let key: StoreKey<'static> = (*digest).into();
+        let final_os = to_full_path_from_key(&self.shared_context.content_path, &key);
+        let final_path = std::path::PathBuf::from(final_os);
+        chunked_commit(&self.chunked_partials, digest, expected_size, final_path).await
+    }
+
+    /// Discard an in-flight chunked partial: removes the temp file +
+    /// the in-flight state entry. Idempotent — calling on a digest
+    /// that has no in-flight state returns `Ok(())` (the on-disk file
+    /// is unlinked best-effort). Callers MUST distinguish
+    /// "already-committed" (commit removed the state, subsequent
+    /// commit returns `NotFound`) from "discard-after-discard"
+    /// (returns `Ok`).
+    ///
+    /// Used by:
+    /// - The Phase 2.3 driver after a length-mismatch `commit_chunked`
+    ///   failure.
+    /// - The §6.7 termination triggers (panic, shutdown, retry
+    ///   exhaustion).
+    pub(crate) async fn discard_chunked(&self, digest: &DigestInfo) -> Result<(), Error> {
+        chunked_discard(&self.chunked_partials, digest).await
     }
 }
 
