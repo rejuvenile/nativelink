@@ -80,6 +80,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
 use nativelink_util::common::DigestInfo;
+use nativelink_util::digest_hasher::{DigestHasherFunc, default_digest_hasher_func};
+use nativelink_util::store_trait::IS_WORKER_REQUEST;
+use opentelemetry::context::{Context, FutureExt as _};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, trace};
@@ -114,10 +117,17 @@ pub const SUGGESTED_CALLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// map (or present with `Err`) is a per-digest failure for that batch.
 /// The coalescer surfaces such per-digest results to each waiting
 /// caller individually — one bad digest does not poison the others.
+///
+/// The `DigestHasherFunc` argument is the hasher to embed in the
+/// outgoing `BatchReadBlobsRequest.digest_function`; the drainer
+/// captures it from the FIRST `submit()` call in a batch (callers are
+/// expected to share a hasher per peer-fetch fanout — Bazel switches
+/// hashers only at session boundaries).
 pub type BatchFn = Arc<
     dyn Fn(
             Arc<str>,
             Vec<DigestInfo>,
+            DigestHasherFunc,
         ) -> futures::future::BoxFuture<
             'static,
             HashMap<DigestInfo, Result<Bytes, Error>>,
@@ -125,12 +135,43 @@ pub type BatchFn = Arc<
         + Sync,
 >;
 
-/// One pending request: digest + the oneshot reply slot.
+/// One pending request: digest + the oneshot reply slot + the
+/// task-local context to re-establish around the batched RPC.
+///
+/// Why captured per-request: `tokio::spawn` does NOT inherit either
+/// `tokio::task_local!` storage (e.g. `IS_WORKER_REQUEST`) NOR the
+/// OpenTelemetry `Context` (which carries `DigestHasherFunc`). The
+/// drainer is `tokio::spawn`'d on first use, so it sees neither unless
+/// each submission ferries them across the spawn boundary.
+///
+/// The drainer uses the FIRST item in each batch as the "batch
+/// context": `IS_WORKER_REQUEST` (always `true` from the proxy) is
+/// scoped around the BatchFn invocation so the receiving worker's
+/// `batch_read_blobs` sets the `x-nativelink-worker` header (loop
+/// terminator at depth 1). The `DigestHasherFunc` is forwarded to the
+/// BatchFn so the outgoing `BatchReadBlobsRequest.digest_function`
+/// matches the caller's hasher (Blake3 or SHA-256) — without this, a
+/// non-SHA-256 caller silently degrades to SHA-256 + per-digest
+/// `InvalidArgument` from the worker side.
 struct PendingRead {
     digest: DigestInfo,
     /// Oneshot used to deliver the result to the caller. The drainer
     /// fans out per-digest results to all dedup'd siblings.
     reply: oneshot::Sender<Result<Bytes, Error>>,
+    /// Captured `IS_WORKER_REQUEST` flag at submit-time. The drainer
+    /// uses the FIRST request's value for the batch's
+    /// `IS_WORKER_REQUEST.scope(...)` wrapper. Defaults to `false` if
+    /// the caller wasn't in any scope.
+    is_worker_request: bool,
+    /// Captured `DigestHasherFunc` at submit-time (read from the
+    /// OpenTelemetry `Context`). Defaults to
+    /// `default_digest_hasher_func()` if no hasher was set.
+    digest_function: DigestHasherFunc,
+    /// Captured OpenTelemetry `Context` at submit-time. Used to
+    /// re-establish context around the batched RPC inside the
+    /// drainer — without this, downstream tracing spans + any other
+    /// `Context::current()` reads see an empty context.
+    otel_context: Context,
 }
 
 /// Per-endpoint queue state. The drainer task holds the `Receiver`;
@@ -255,43 +296,79 @@ impl BatchReadCoalescer {
     /// touch any writer — the writer-termination contract stays with
     /// the caller).
     ///
+    /// `endpoint` is borrowed; the per-endpoint queue (keyed by
+    /// `Arc<str>`) is allocated only on the first submission per
+    /// endpoint. Steady-state submissions reuse the existing key with
+    /// no allocation.
+    ///
+    /// # Task-local capture
+    ///
+    /// `tokio::spawn` does NOT inherit `tokio::task_local!` storage
+    /// (`IS_WORKER_REQUEST`) or the OpenTelemetry `Context`
+    /// (`DigestHasherFunc`). `submit` captures both at call-time and
+    /// passes them via `PendingRead` so the drainer can re-establish
+    /// them around the BatchFn — preserving the "workers NEVER chain
+    /// externally" loop-terminator invariant and the caller's hasher
+    /// choice (Blake3 / SHA-256).
+    ///
     /// # Eligibility
     ///
     /// Caller MUST gate on `is_eligible(digest, offset, length)` first.
     /// The coalescer assumes whole-blob reads only.
     pub async fn submit(
         &self,
-        endpoint: Arc<str>,
+        endpoint: &str,
         digest: DigestInfo,
     ) -> Result<Bytes, Error> {
         let (tx, rx) = oneshot::channel();
-        let item = PendingRead { digest, reply: tx };
+        // Capture task-local + OpenTelemetry context BEFORE the
+        // `tokio::spawn` boundary inside the queue-spawn branch (and
+        // for symmetry on the queue-already-exists branch — the values
+        // ride with the request to the drainer regardless).
+        let is_worker_request =
+            IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
+        let otel_context = Context::current();
+        let digest_function = otel_context
+            .get::<DigestHasherFunc>()
+            .copied()
+            .unwrap_or_else(default_digest_hasher_func);
+        let item = PendingRead {
+            digest,
+            reply: tx,
+            is_worker_request,
+            digest_function,
+            otel_context: otel_context.clone(),
+        };
 
         // Acquire-or-spawn the per-endpoint queue. Lock held only across
         // HashMap entry resolution + tx clone; no `.await` under lock.
-        let sender = {
+        // The endpoint `Arc<str>` is allocated ONLY on the insert-miss
+        // path (first submission per endpoint); steady-state hits reuse
+        // the cached key.
+        let (sender, endpoint_for_err) = {
             let mut queues = self.queues.lock();
-            if let Some(state) = queues.get(&endpoint) {
-                state.sender.clone()
+            if let Some((key, state)) = queues.get_key_value(endpoint) {
+                (state.sender.clone(), key.clone())
             } else {
+                let key: Arc<str> = Arc::from(endpoint);
                 let (sender, receiver) =
                     mpsc::channel::<PendingRead>(self.queue_capacity);
                 queues.insert(
-                    endpoint.clone(),
+                    key.clone(),
                     PerEndpointState {
                         sender: sender.clone(),
                     },
                 );
                 drop(queues);
                 tokio::spawn(drainer_task(
-                    endpoint.clone(),
+                    key.clone(),
                     receiver,
                     self.batch_fn.clone(),
                     self.max_batch_bytes,
                     self.counters.clone(),
                 ));
-                trace!(%endpoint, "BatchReadCoalescer: spawned drainer for endpoint");
-                sender
+                trace!(%key, "BatchReadCoalescer: spawned drainer for endpoint");
+                (sender, key)
             }
         };
 
@@ -302,7 +379,8 @@ impl BatchReadCoalescer {
             return Err(make_err!(
                 Code::ResourceExhausted,
                 "BatchReadCoalescer: per-endpoint queue full or closed: {send_err:?} \
-                 (endpoint={endpoint}, digest={digest}); caller must fall back to ByteStream Read"
+                 (endpoint={endpoint_for_err}, digest={digest}); \
+                 caller must fall back to ByteStream Read"
             ));
         }
 
@@ -318,7 +396,7 @@ impl BatchReadCoalescer {
             Err(_canceled) => Err(make_err!(
                 Code::Internal,
                 "BatchReadCoalescer: reply oneshot was dropped before delivery \
-                 (drainer exited mid-batch?); endpoint={endpoint}, digest={digest}"
+                 (drainer exited mid-batch?); endpoint={endpoint_for_err}, digest={digest}"
             )),
         }
     }
@@ -353,6 +431,19 @@ async fn drainer_task(
             HashMap::new();
         let mut digests_in_order: Vec<DigestInfo> = Vec::new();
         let mut total_bytes: u64 = 0;
+
+        // Capture the FIRST request's task-local + OTel context as the
+        // batch context. `tokio::spawn` did NOT inherit these into this
+        // drainer task — `submit()` ferried them across via PendingRead.
+        // The wrapping `IS_WORKER_REQUEST.scope(...)` ensures the
+        // BatchFn's downstream `batch_read_blobs` sees the correct flag
+        // (loop-terminator invariant: peer worker enters responder mode
+        // and refuses to chain externally). The captured
+        // `digest_function` flows directly to the BatchFn for the
+        // outgoing `BatchReadBlobsRequest.digest_function` field.
+        let batch_is_worker_request = first.is_worker_request;
+        let batch_digest_function = first.digest_function;
+        let batch_otel_context = first.otel_context.clone();
 
         admit_request(
             first,
@@ -422,7 +513,20 @@ async fn drainer_task(
             "BatchReadCoalescer drainer: dispatching batch"
         );
 
-        let results = (batch_fn)(endpoint.clone(), digests_in_order.clone()).await;
+        // Re-establish the captured task-local (`IS_WORKER_REQUEST`) and
+        // OpenTelemetry context (`DigestHasherFunc`) around the BatchFn.
+        // Without these wrappers the drainer sees an empty context (it
+        // is `tokio::spawn`'d) and any downstream `IS_WORKER_REQUEST.try_with`
+        // / `Context::current().get::<DigestHasherFunc>()` would silently
+        // default — breaking the loop-terminator invariant and silently
+        // degrading non-SHA-256 callers to SHA-256 + InvalidArgument.
+        let batch_fut = (batch_fn)(
+            endpoint.clone(),
+            digests_in_order.clone(),
+            batch_digest_function,
+        );
+        let scoped = IS_WORKER_REQUEST.scope(batch_is_worker_request, batch_fut);
+        let results = scoped.with_context(batch_otel_context).await;
         counters
             .batches_dispatched
             .fetch_add(1, Ordering::Relaxed);
@@ -497,7 +601,12 @@ mod tests {
     use bytes::Bytes;
     use futures::FutureExt;
     use nativelink_error::Code;
+    use nativelink_macro::nativelink_test;
     use nativelink_util::common::DigestInfo;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::store_trait::IS_WORKER_REQUEST;
+    use opentelemetry::Context;
+    use opentelemetry::context::FutureExt as _OtelFutureExt;
     use parking_lot::Mutex as PLMutex;
 
     use super::*;
@@ -514,52 +623,66 @@ mod tests {
     struct CallRecord {
         endpoint: Arc<str>,
         digests: Vec<DigestInfo>,
+        digest_function: Option<DigestHasherFunc>,
+        is_worker_request: bool,
     }
 
     /// A test fake that records each invocation and returns
-    /// caller-supplied per-digest bytes/errors.
+    /// caller-supplied per-digest bytes/errors. The fake observes
+    /// `IS_WORKER_REQUEST` (via `try_with`) at BatchFn invocation time
+    /// — this is the same point `grpc_store::batch_read_blobs` reads
+    /// the flag for the `x-nativelink-worker` header.
     fn make_fake(
         per_digest: Arc<PLMutex<HashMap<DigestInfo, Result<Bytes, Error>>>>,
         recorded: Arc<PLMutex<Vec<CallRecord>>>,
     ) -> BatchFn {
-        Arc::new(move |endpoint: Arc<str>, digests: Vec<DigestInfo>| {
-            let per_digest = per_digest.clone();
-            let recorded = recorded.clone();
-            async move {
-                recorded.lock().push(CallRecord {
-                    endpoint: endpoint.clone(),
-                    digests: digests.clone(),
-                });
-                let table = per_digest.lock();
-                let mut out: HashMap<DigestInfo, Result<Bytes, Error>> = HashMap::new();
-                for digest in digests {
-                    let value = table.get(&digest).cloned().unwrap_or_else(|| {
-                        Err(make_err!(
-                            Code::NotFound,
-                            "fake batch_fn: no per-digest entry for {digest}"
-                        ))
+        Arc::new(
+            move |endpoint: Arc<str>,
+                  digests: Vec<DigestInfo>,
+                  digest_function: DigestHasherFunc| {
+                let per_digest = per_digest.clone();
+                let recorded = recorded.clone();
+                async move {
+                    let is_worker_request =
+                        IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
+                    recorded.lock().push(CallRecord {
+                        endpoint: endpoint.clone(),
+                        digests: digests.clone(),
+                        digest_function: Some(digest_function),
+                        is_worker_request,
                     });
-                    out.insert(digest, value);
+                    let table = per_digest.lock();
+                    let mut out: HashMap<DigestInfo, Result<Bytes, Error>> =
+                        HashMap::new();
+                    for digest in digests {
+                        let value = table.get(&digest).cloned().unwrap_or_else(|| {
+                            Err(make_err!(
+                                Code::NotFound,
+                                "fake batch_fn: no per-digest entry for {digest}"
+                            ))
+                        });
+                        out.insert(digest, value);
+                    }
+                    out
                 }
-                out
-            }
-            .boxed()
-        })
+                .boxed()
+            },
+        )
     }
 
-    #[tokio::test]
+    #[nativelink_test]
     async fn is_eligible_rejects_above_threshold() {
         let big = d(1, SMALL_BLOB_THRESHOLD as u64 + 1);
         assert!(!BatchReadCoalescer::is_eligible(big, 0, None));
     }
 
-    #[tokio::test]
+    #[nativelink_test]
     async fn is_eligible_rejects_nonzero_offset() {
         let small = d(1, 100);
         assert!(!BatchReadCoalescer::is_eligible(small, 1, None));
     }
 
-    #[tokio::test]
+    #[nativelink_test]
     async fn is_eligible_accepts_full_read_with_permissive_length() {
         let small = d(1, 100);
         assert!(BatchReadCoalescer::is_eligible(small, 0, None));
@@ -574,7 +697,7 @@ mod tests {
 
     /// Five concurrent small-blob requests against the same endpoint
     /// MUST coalesce into ONE outgoing batch.
-    #[tokio::test]
+    #[nativelink_test]
     async fn five_concurrent_requests_become_one_batch() {
         let per_digest = Arc::new(PLMutex::new(HashMap::new()));
         let recorded = Arc::new(PLMutex::new(Vec::new()));
@@ -591,7 +714,7 @@ mod tests {
             let c = coalescer.clone();
             let ep = endpoint.clone();
             handles.push(tokio::spawn(async move {
-                tokio::time::timeout(DEADLOCK, c.submit(ep, d(i, 100)))
+                tokio::time::timeout(DEADLOCK, c.submit(&ep, d(i, 100)))
                     .await
                     .expect(
                         "must not deadlock — coalescer drainer must deliver per-digest \
@@ -632,7 +755,7 @@ mod tests {
 
     /// Three concurrent requests for the SAME digest MUST result in
     /// one slot in the batch + all three callers receiving the bytes.
-    #[tokio::test]
+    #[nativelink_test]
     async fn same_digest_concurrent_requests_dedup() {
         let per_digest = Arc::new(PLMutex::new(HashMap::new()));
         let recorded = Arc::new(PLMutex::new(Vec::new()));
@@ -647,7 +770,7 @@ mod tests {
             let c = coalescer.clone();
             let ep = endpoint.clone();
             handles.push(tokio::spawn(async move {
-                tokio::time::timeout(DEADLOCK, c.submit(ep, d(7, 200)))
+                tokio::time::timeout(DEADLOCK, c.submit(&ep, d(7, 200)))
                     .await
                     .expect(
                         "must not deadlock — same-digest dedup must deliver to all waiters",
@@ -680,7 +803,7 @@ mod tests {
     /// Partial-failure response: 3 OK + 2 NotFound. Each caller MUST
     /// receive its own per-digest result; one bad digest does NOT
     /// poison the batch.
-    #[tokio::test]
+    #[nativelink_test]
     async fn partial_failure_response_surfaces_per_digest_errors() {
         let per_digest = Arc::new(PLMutex::new(HashMap::new()));
         let recorded = Arc::new(PLMutex::new(Vec::new()));
@@ -703,7 +826,7 @@ mod tests {
             let c = coalescer.clone();
             let ep = endpoint.clone();
             handles.push(tokio::spawn(async move {
-                let res = tokio::time::timeout(DEADLOCK, c.submit(ep, d(i, 100)))
+                let res = tokio::time::timeout(DEADLOCK, c.submit(&ep, d(i, 100)))
                     .await
                     .expect("must not deadlock");
                 (i, res)
@@ -732,12 +855,152 @@ mod tests {
     /// Above-threshold blobs MUST NOT be admitted by the eligibility
     /// helper. The caller is the gate; this lets the proxy fall back
     /// to ByteStream Read for large reads.
-    #[tokio::test]
+    #[nativelink_test]
     async fn above_threshold_blob_is_not_eligible_for_batch() {
         let too_big = d(1, SMALL_BLOB_THRESHOLD as u64 + 1);
         assert!(
             !BatchReadCoalescer::is_eligible(too_big, 0, None),
             "blob > SMALL_BLOB_THRESHOLD MUST NOT be eligible — caller must use ByteStream Read"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // B1 regression: IS_WORKER_REQUEST captured at submit-time MUST be
+    // re-established around the BatchFn inside the spawned drainer.
+    // Without this fix, the loop-terminator invariant ("workers NEVER
+    // chain externally") silently breaks because `tokio::spawn` does
+    // NOT inherit `tokio::task_local!` storage.
+    //
+    // Mutation: comment out the `IS_WORKER_REQUEST.scope(...)` wrapper
+    // around `batch_fut` in `drainer_task` and verify this test fails
+    // with the specific message.
+    // ----------------------------------------------------------------------
+    #[nativelink_test]
+    async fn drainer_propagates_is_worker_request_across_spawn() {
+        let per_digest = Arc::new(PLMutex::new(HashMap::new()));
+        let recorded = Arc::new(PLMutex::new(Vec::new()));
+        per_digest
+            .lock()
+            .insert(d(11, 50), Ok(Bytes::from(vec![11u8; 50])));
+        let coalescer = BatchReadCoalescer::new(make_fake(per_digest, recorded.clone()));
+
+        let endpoint: Arc<str> = Arc::from("grpc://peer-bw:50071");
+        let ep = endpoint.clone();
+        let c = coalescer.clone();
+        // Submit FROM WITHIN an `IS_WORKER_REQUEST.scope(true, ...)`,
+        // which is exactly the production composition (see
+        // `worker_proxy_store::get_part_and_cache:1370`).
+        let result = IS_WORKER_REQUEST
+            .scope(true, async move {
+                tokio::time::timeout(DEADLOCK, c.submit(&ep, d(11, 50)))
+                    .await
+                    .expect("must not deadlock — drainer must deliver bytes")
+            })
+            .await;
+        assert!(result.is_ok(), "submission must succeed");
+
+        let calls = recorded.lock();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].is_worker_request,
+            "B1 regression — IS_WORKER_REQUEST must propagate across the \
+             tokio::spawn'd drainer; without the scope wrapper around BatchFn, \
+             try_with returns Err and the receiving worker would not enter \
+             responder mode (loop-terminator invariant: workers NEVER chain \
+             externally)"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // B2 regression: the captured `DigestHasherFunc` from the FIRST
+    // request in a batch MUST flow into the BatchFn so the outgoing
+    // BatchReadBlobsRequest.digest_function field matches the caller's
+    // hasher (Blake3 or SHA-256). Without this fix, the drainer
+    // silently defaults to SHA-256 (Context::current() returns empty
+    // across spawn) and Blake3 callers get InvalidArgument from the
+    // worker side for every batch — degrading 100% of non-SHA-256
+    // deployments.
+    //
+    // Mutation: replace `batch_digest_function` with
+    // `default_digest_hasher_func()` at the BatchFn call site and
+    // verify this test fails with the specific message.
+    // ----------------------------------------------------------------------
+    #[nativelink_test]
+    async fn drainer_propagates_digest_hasher_across_spawn() {
+        let per_digest = Arc::new(PLMutex::new(HashMap::new()));
+        let recorded = Arc::new(PLMutex::new(Vec::new()));
+        per_digest
+            .lock()
+            .insert(d(13, 50), Ok(Bytes::from(vec![13u8; 50])));
+        let coalescer = BatchReadCoalescer::new(make_fake(per_digest, recorded.clone()));
+
+        let endpoint: Arc<str> = Arc::from("grpc://peer-blake:50071");
+        let ep = endpoint.clone();
+        let c = coalescer.clone();
+        // Submit with Blake3 set in the OpenTelemetry context. This is
+        // the production pattern (the request handler installs the
+        // hasher into the OTel Context before dispatching). We use
+        // `with_context()` from `opentelemetry::context::FutureExt` so
+        // the future polls inside the Blake3 context.
+        let blake_ctx = Context::current().with_value(DigestHasherFunc::Blake3);
+        let submit_result = tokio::time::timeout(
+            DEADLOCK,
+            async { c.submit(&ep, d(13, 50)).await }.with_context(blake_ctx),
+        )
+        .await
+        .expect("must not deadlock");
+        assert!(submit_result.is_ok(), "submission must succeed");
+
+        let calls = recorded.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].digest_function,
+            Some(DigestHasherFunc::Blake3),
+            "B2 regression — DigestHasherFunc captured at submit-time \
+             must reach the BatchFn through the spawned drainer; without \
+             this propagation, non-SHA-256 callers silently degrade to \
+             SHA-256 and the worker rejects every batch with InvalidArgument"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // M1 regression: `submit` takes `&str` and must NOT allocate an
+    // `Arc<str>` on the steady-state hit path (only on first
+    // submission per endpoint when the per-endpoint queue is created).
+    //
+    // We can't directly count allocations from a unit test, but we can
+    // assert the API shape compiles with `&str` (compile-time guard
+    // against silent regression to `Arc<str>`).
+    // ----------------------------------------------------------------------
+    #[nativelink_test]
+    async fn submit_signature_takes_borrowed_str() {
+        let per_digest = Arc::new(PLMutex::new(HashMap::new()));
+        let recorded = Arc::new(PLMutex::new(Vec::new()));
+        per_digest
+            .lock()
+            .insert(d(21, 10), Ok(Bytes::from(vec![21u8; 10])));
+        per_digest
+            .lock()
+            .insert(d(22, 10), Ok(Bytes::from(vec![22u8; 10])));
+        let coalescer = BatchReadCoalescer::new(make_fake(per_digest, recorded.clone()));
+
+        let endpoint_str: &str = "grpc://hot:50071";
+        // First submission: spawns the drainer and allocates the
+        // per-endpoint Arc<str> key.
+        let _ = tokio::time::timeout(DEADLOCK, coalescer.submit(endpoint_str, d(21, 10)))
+            .await
+            .expect("must not deadlock");
+        // Steady-state hits: should reuse the existing key, no
+        // additional Arc<str> allocations on the hot path.
+        let _ = tokio::time::timeout(DEADLOCK, coalescer.submit(endpoint_str, d(22, 10)))
+            .await
+            .expect("must not deadlock");
+
+        let calls = recorded.lock();
+        assert_eq!(
+            calls.len(),
+            2,
+            "two distinct submissions => two batches against the same endpoint key"
         );
     }
 }
