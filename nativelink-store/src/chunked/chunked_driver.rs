@@ -39,7 +39,7 @@
 //!   guard, per §6.7 termination trigger (d) (panic) and (b)
 //!   (shutdown).
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -104,6 +104,15 @@ pub(crate) struct ChunkedDriver {
     /// Phase 1 so the test harness can observe what the driver did
     /// without instrumenting the whole spawn lifecycle.
     chunks_received: Arc<AtomicU64>,
+    /// Flipped to `true` by the spawned task IMMEDIATELY after the
+    /// `recv()` loop exits cleanly (mpsc closed). Load-bearing for
+    /// the §6.7 trigger (a) regression test: distinguishes "driver
+    /// observed `recv() → None` and exited" from "driver wedged in an
+    /// infinite loop after consuming all chunks." Without this flag
+    /// the happy-path exit contract ships untested at the unit
+    /// boundary (the chunks_received and budget-recovery signals fire
+    /// even if the loop never exits).
+    loop_exited: Arc<AtomicBool>,
     /// Drop guard for the spawned task. On `Drop` of `ChunkedDriver`,
     /// the join handle is `abort()`'d if still running (§6.7 panic
     /// belt). `JoinHandleDropGuard` is `must_use`, hence the
@@ -130,6 +139,8 @@ impl ChunkedDriver {
         let (tx, mut rx) = mpsc::channel::<ChunkWork>(capacity);
         let chunks_received = Arc::new(AtomicU64::new(0));
         let chunks_received_for_task = Arc::clone(&chunks_received);
+        let loop_exited = Arc::new(AtomicBool::new(false));
+        let loop_exited_for_task = Arc::clone(&loop_exited);
 
         let handle = spawn!("212_chunked_driver_skeleton", async move {
             // Receive loop. Each iteration: take one ChunkWork, bump
@@ -146,12 +157,19 @@ impl ChunkedDriver {
                 );
                 drop(work);
             }
+            // Load-bearing for the §6.7 trigger (a) regression test:
+            // signals the recv loop observed `None` and is about to
+            // return. MUST be the last statement before the spawned
+            // future returns. Comment this out to red-fail
+            // `driver_drains_chunks_then_exits_cleanly_on_sender_drop`.
+            loop_exited_for_task.store(true, Ordering::Release);
         });
 
         (
             Self {
                 digest,
                 chunks_received,
+                loop_exited,
                 _handle: handle,
             },
             tx,
@@ -163,6 +181,18 @@ impl ChunkedDriver {
     #[must_use]
     pub(crate) fn chunks_received(&self) -> u64 {
         self.chunks_received.load(Ordering::Relaxed)
+    }
+
+    /// Observation hook for the §6.7 trigger (a) regression test:
+    /// returns `true` once the spawned receive loop has observed
+    /// `recv() → None` and is about to return. NOT meaningful before
+    /// that — the test must poll under `tokio::time::timeout` after
+    /// dropping the sender. Phase 2 may also use this for a graceful
+    /// shutdown drain check.
+    #[must_use]
+    #[allow(dead_code, reason = "test-only observation; Phase 2 may use during drain")]
+    pub(crate) fn loop_exited(&self) -> bool {
+        self.loop_exited.load(Ordering::Acquire)
     }
 
     /// Read-only accessor used by Phase 2 logging / metric labels.
@@ -236,29 +266,35 @@ mod tests {
         );
 
         // Drop the sender. The driver's `rx.recv().await` MUST return
-        // None and the task must exit. Because the driver holds a
-        // JoinHandleDropGuard, awaiting it directly would consume the
-        // guard; instead we observe permit-budget recovery as a proxy
-        // for "the spawned task dropped its work items + exited."
+        // None and the task must exit. We assert on `loop_exited()` —
+        // a flag flipped to `true` by the spawned task IMMEDIATELY
+        // after the recv loop returns. Permit-recovery alone CANNOT
+        // distinguish "loop exited cleanly" from "loop wedged after
+        // consuming all chunks" because all 3 ChunkWorks were already
+        // dropped during processing (hence permits already returned)
+        // before `drop(tx)`. The flag is the only observation that
+        // proves the §6.7 trigger (a) (mpsc-close → exit) contract.
         drop(tx);
 
-        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+        let exited = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                // After all 3 ChunkWorks have been dropped, the budget
-                // must show 3 permits available again. The driver task
-                // also exits; if it did not the spawned future would
-                // hold no chunks (we already drained them) and the
-                // permit count is the load-bearing observation.
-                if budget.available_chunks() >= 3 {
+                if driver.loop_exited() {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await;
-        recovered.expect(
+        exited.expect(
+            "driver loop must exit within 2s after sender-drop — \
+             §6.7 trigger (a) violated: driver did not observe recv()→None",
+        );
+
+        // Sanity: budget should still reflect baseline (no leaked permits).
+        assert!(
+            budget.available_chunks() >= 3,
             "ChunkBudget permits must return to baseline after sender-drop — \
-             writer-termination contract violated (driver leaked permits)",
+             driver leaked permits",
         );
     }
 
