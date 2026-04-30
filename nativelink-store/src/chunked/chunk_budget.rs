@@ -35,7 +35,7 @@
 //! feature.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
@@ -139,6 +139,33 @@ impl Default for ChunkBudget {
     }
 }
 
+/// Process-wide singleton holder. `OnceLock` chosen over constructor
+/// injection because:
+/// - The budget is a process-global resource (4 GiB cap is per-process,
+///   not per-store).
+/// - Phase 2 wires admission from MULTIPLE owners (FastSlowStore::update,
+///   WorkerProxyStore::get_part_and_cache, the WriteChunked RPC handler);
+///   constructor injection would require threading the budget through
+///   every call-site.
+/// - The metric publication path (Phase 2) uses
+///   `chunk_budget_singleton().publish(...)` from a parent
+///   `MetricsComponent`-deriving struct that holds an `&'static
+///   ChunkBudget` field.
+///
+/// `OnceLock::get_or_init` is lock-free after first init and
+/// thread-safe; the contract matches the per-process singleton
+/// semantics.
+static CHUNK_BUDGET_SINGLETON: OnceLock<ChunkBudget> = OnceLock::new();
+
+/// Returns the process-wide `ChunkBudget` singleton, initializing it
+/// on first call. Phase 2 admission code calls this once per chunk
+/// arrival; the cost is one `OnceLock::get_or_init` (atomic load + a
+/// branch in the hot path after first call).
+#[allow(dead_code, reason = "Phase 1 SKELETON; consumers land in Phase 2 (#212)")]
+pub(crate) fn chunk_budget_singleton() -> &'static ChunkBudget {
+    CHUNK_BUDGET_SINGLETON.get_or_init(ChunkBudget::new)
+}
+
 /// Manual `MetricsComponent` impl: the two metrics published are NOT
 /// stored fields (one is derived from the live Semaphore, the other is
 /// the live atomic), so the derive macro cannot generate them.
@@ -184,7 +211,7 @@ impl MetricsComponent for ChunkBudget {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_SIZE, ChunkBudget, TOTAL_CHUNK_PERMITS};
+    use super::{CHUNK_SIZE, ChunkBudget, TOTAL_CHUNK_PERMITS, chunk_budget_singleton};
 
     /// Sanity: the budget is 4096 permits at construction.
     #[test]
@@ -246,6 +273,25 @@ mod tests {
             assert!(b.try_acquire_chunk().is_none());
         }
         assert_eq!(b.rejections_total(), 100);
+    }
+
+    /// Singleton accessor returns the same `&'static ChunkBudget`
+    /// across calls — the load-bearing property the metric wiring
+    /// depends on (parent struct holds `&'static ChunkBudget`, so a
+    /// fresh budget per get would surface zero-permit metrics).
+    #[test]
+    fn singleton_returns_same_reference_across_calls() {
+        let a = chunk_budget_singleton();
+        let b = chunk_budget_singleton();
+        assert!(
+            core::ptr::eq(a, b),
+            "OnceLock singleton must return the same reference",
+        );
+        // And that reference behaves like a fresh budget (or one
+        // already partially consumed by another test — we don't
+        // assume the count, only that the contract holds).
+        let _hold = a.try_acquire_chunk();
+        // Drop happens at end-of-test.
     }
 
     /// Smaller-scale variant of the above so the test file documents
