@@ -136,7 +136,12 @@ enum ChunkAttemptOutcome {
 /// `Error { code: Internal, messages: ["Tried to send while stream is closed", ...] }`.
 /// `Unavailable` / `Unknown` cover RST_STREAM / catch-all h2 mappings.
 /// `ResourceExhausted` covers the rare case where tonic surfaces
-/// `ENHANCE_YOUR_CALM` directly (server's GOAWAY reason).
+/// `ENHANCE_YOUR_CALM` directly (server's GOAWAY reason) — but ONLY
+/// when the error does NOT carry a `BackpressureSignal` discriminator
+/// detail. With the discriminator present, the peer is asserting
+/// honest #212 Q8 backpressure (per-blob mpsc full or global byte
+/// budget exhausted) and evicting the h2 channel would tear down the
+/// connection at backpressure rate. See design §13.1.1 point 2.
 ///
 /// `Internal` is gated on a message check to avoid evicting on
 /// server-app `make_err!(Internal, ...)` from valid RPCs. The h2 GOAWAY
@@ -151,7 +156,14 @@ enum ChunkAttemptOutcome {
 ///   * "broken pipe" — write to a half-closed socket.
 fn looks_like_dead_channel(err: &Error) -> bool {
     match err.code {
-        Code::Unavailable | Code::Unknown | Code::ResourceExhausted => true,
+        Code::Unavailable | Code::Unknown => true,
+        Code::ResourceExhausted => {
+            // #212 §13.1.1 point 2: a `BackpressureSignal` discriminator
+            // means the peer is asserting honest backpressure. NEVER
+            // evict the h2 channel in that case — production saturation
+            // would replay #147 at backpressure rate.
+            !crate::chunked_signal::error_has_backpressure_signal(err)
+        }
         Code::Internal => err.messages.iter().any(|m| {
             m.contains("Tried to send while stream is closed")
                 || m.contains("h2 protocol error")
@@ -2542,6 +2554,10 @@ mod tests {
     /// channel must return true; application-level codes must return false.
     /// `Internal` is special-cased on message content to avoid evicting on
     /// healthy server-app `make_err!(Internal, ...)` errors.
+    /// `ResourceExhausted` is special-cased on detail content (#212
+    /// §13.1.1 point 2): a `BackpressureSignal` discriminator means the
+    /// peer is asserting honest backpressure, NOT a dead channel — must
+    /// NOT evict.
     #[test]
     fn looks_like_dead_channel_classifies_codes() {
         // True for the transport-shaped non-Internal codes.
@@ -2604,6 +2620,48 @@ mod tests {
         }
     }
 
+    /// #212 §13.1.1 point 2: `Code::ResourceExhausted` carrying a
+    /// `BackpressureSignal` detail must NOT classify as a dead channel.
+    /// If the peer is asserting honest backpressure (per Q8), evicting
+    /// the underlying h2 channel reproduces the production #147
+    /// stale-channel-reuse trace at backpressure rate (potentially
+    /// hundreds/sec at saturation). Without this discriminator, every
+    /// per-blob-mpsc-full event would tear down the h2 connection.
+    ///
+    /// ResourceExhausted WITHOUT the discriminator continues to be
+    /// classified as dead channel — preserves the existing #147
+    /// post-GOAWAY recovery shape (h2 ENHANCE_YOUR_CALM emerges as bare
+    /// `Code::ResourceExhausted` with no detail).
+    #[test]
+    fn looks_like_dead_channel_respects_backpressure_signal() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
+
+        use crate::chunked_signal::encode_backpressure_signal_any;
+
+        // ResourceExhausted + backpressure signal → false (do NOT evict).
+        for reason in [
+            backpressure_signal::Reason::GlobalChunkBudgetExhausted,
+            backpressure_signal::Reason::PerBlobMpscFull,
+        ] {
+            let any = encode_backpressure_signal_any(reason, 100);
+            let err = Error::resource_exhausted_backpressure("backpressure", any);
+            assert!(
+                !looks_like_dead_channel(&err),
+                "ResourceExhausted with BackpressureSignal({reason:?}) must NOT \
+                 evict h2 channel — that's the #212 §13.1.1 point 2 fix",
+            );
+        }
+
+        // ResourceExhausted WITHOUT the discriminator → true (still
+        // treated as dead channel for the legacy h2 ENHANCE_YOUR_CALM
+        // shape). This preserves the #147 post-GOAWAY recovery path.
+        let raw = make_err!(Code::ResourceExhausted, "no signal attached");
+        assert!(
+            looks_like_dead_channel(&raw),
+            "bare ResourceExhausted (no BackpressureSignal) must continue to \
+             classify as dead channel — preserves #147 GOAWAY recovery",
+        );
+    }
 
     /// Bug B regression: a clean `Status::OK` trailer (`clean_eof = true`)
     /// with `bytes_received < chunk_length` must classify as
