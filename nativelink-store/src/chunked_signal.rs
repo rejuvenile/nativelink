@@ -70,6 +70,13 @@ pub(crate) fn encode_backpressure_signal_any(
 /// that even if the body is unreadable.
 #[must_use]
 pub(crate) fn error_has_backpressure_signal(err: &Error) -> bool {
+    // Short-circuit on the dominant case: errors without details
+    // never carry our backpressure discriminator. Avoids iterator
+    // setup on the hot classifier path (`looks_like_dead_channel`
+    // runs on every gRPC client error).
+    if err.details.is_empty() {
+        return false;
+    }
     err.details
         .iter()
         .any(|any| any.type_url == BACKPRESSURE_SIGNAL_TYPE_URL)
