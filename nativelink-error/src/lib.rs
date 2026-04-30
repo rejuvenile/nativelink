@@ -270,6 +270,31 @@ impl Error {
             details: vec![detail],
         }
     }
+
+    /// Construct a `Code::ResourceExhausted` error tagged with a
+    /// #212 `BackpressureSignal` proto detail. Phase 2 admission code
+    /// (FastSlowStore + WorkerProxyStore) calls this on global-budget /
+    /// per-blob-mpsc rejections so the receiver-side
+    /// `looks_like_dead_channel` classifier in
+    /// `nativelink-store/src/grpc_store.rs` can distinguish honest
+    /// backpressure from the historic dead-h2-channel mapping.
+    ///
+    /// The detail bytes are the encoded
+    /// `BackpressureSignal { reason, retry_after_ms }` proto. The
+    /// type_url MUST match the `BACKPRESSURE_SIGNAL_TYPE_URL` constant
+    /// in `nativelink-proto` — both ends compare against that exact
+    /// string. Wire-stable per design §3.
+    #[must_use]
+    pub fn resource_exhausted_backpressure(
+        msg: impl Into<String>,
+        detail: prost_types::Any,
+    ) -> Self {
+        Self {
+            code: Code::ResourceExhausted,
+            messages: vec![msg.into()],
+            details: vec![detail],
+        }
+    }
 }
 
 impl core::error::Error for Error {}

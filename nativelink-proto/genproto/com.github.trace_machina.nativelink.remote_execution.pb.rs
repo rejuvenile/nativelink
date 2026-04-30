@@ -650,6 +650,86 @@ pub struct HistoricalExecuteResponse {
         super::super::super::super::super::build::bazel::remote::execution::v2::ExecuteResponse,
     >,
 }
+/// / Wire-stable detail message attached to a `tonic::Status` with
+/// / `Code::ResourceExhausted` to discriminate #212 Q8 backpressure
+/// / rejections from genuine dead-channel ResourceExhausted signals
+/// / (the historic h2 ENHANCE_YOUR_CALM mapping handled by
+/// / `looks_like_dead_channel` in `nativelink-store/src/grpc_store.rs`).
+/// /
+/// / Phase 1 only adds the message; Phase 2 will emit it from the
+/// / FastSlowStore admission path AND tighten `looks_like_dead_channel`
+/// / to require its absence before classifying a `ResourceExhausted` as
+/// / dead-channel. Without this discriminator, every per-blob mpsc-full
+/// / event would evict the underlying h2 channel and reproduce the
+/// / production #147 stale-channel-reuse trace.
+/// /
+/// / Wire stability: per design §3 wire-stability commitment, the field
+/// / tags AND the `Reason` enum values are CONTRACTUAL once a release
+/// / emits this proto. Changes are additive only; no value
+/// / reassignment.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct BackpressureSignal {
+    #[prost(enumeration = "backpressure_signal::Reason", tag = "1")]
+    pub reason: i32,
+    /// / Server-suggested backoff hint in milliseconds. Client may apply
+    /// / jitter or its own backoff curve. Zero = no specific hint.
+    #[prost(uint64, tag = "2")]
+    pub retry_after_ms: u64,
+}
+/// Nested message and enum types in `BackpressureSignal`.
+pub mod backpressure_signal {
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum Reason {
+        Unspecified = 0,
+        /// / Global byte budget (`Arc<Semaphore>` with 4 GiB cap per Q4)
+        /// / exhausted. Caller should retry after `retry_after_ms`.
+        GlobalChunkBudgetExhausted = 1,
+        /// / Per-blob mpsc(16) full. Caller should retry after
+        /// / `retry_after_ms`; backoff target is shorter than the global
+        /// / case because per-blob queues drain faster.
+        PerBlobMpscFull = 2,
+    }
+    impl Reason {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "REASON_UNSPECIFIED",
+                Self::GlobalChunkBudgetExhausted => "GLOBAL_CHUNK_BUDGET_EXHAUSTED",
+                Self::PerBlobMpscFull => "PER_BLOB_MPSC_FULL",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "REASON_UNSPECIFIED" => Some(Self::Unspecified),
+                "GLOBAL_CHUNK_BUDGET_EXHAUSTED" => Some(Self::GlobalChunkBudgetExhausted),
+                "PER_BLOB_MPSC_FULL" => Some(Self::PerBlobMpscFull),
+                _ => None,
+            }
+        }
+    }
+}
+/// `BackpressureSignal` proto type URL for `prost_types::Any.type_url`.
+/// Centralized constant so the encoder (`nativelink-error`) and decoder
+/// (`looks_like_dead_channel` in `nativelink-store/src/grpc_store.rs`)
+/// agree on the exact wire string. See design §13.1.1 point 2 for the
+/// load-bearing classifier interaction.
+pub const BACKPRESSURE_SIGNAL_TYPE_URL: &str =
+    "type.googleapis.com/com.github.trace_machina.nativelink.remote_execution.BackpressureSignal";
 /// Generated client implementations.
 pub mod worker_api_client {
     #![allow(

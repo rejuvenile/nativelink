@@ -631,3 +631,37 @@ message HistoricalExecuteResponse {
     build.bazel.remote.execution.v2.Digest action_digest = 1;
     build.bazel.remote.execution.v2.ExecuteResponse execute_response = 3;
 }
+
+/// Wire-stable detail message attached to a `tonic::Status` with
+/// `Code::ResourceExhausted` to discriminate #212 Q8 backpressure
+/// rejections from genuine dead-channel ResourceExhausted signals
+/// (the historic h2 ENHANCE_YOUR_CALM mapping handled by
+/// `looks_like_dead_channel` in `nativelink-store/src/grpc_store.rs`).
+///
+/// Phase 1 only adds the message; Phase 2 will emit it from the
+/// FastSlowStore admission path AND tighten `looks_like_dead_channel`
+/// to require its absence before classifying a `ResourceExhausted` as
+/// dead-channel. Without this discriminator, every per-blob mpsc-full
+/// event would evict the underlying h2 channel and reproduce the
+/// production #147 stale-channel-reuse trace.
+///
+/// Wire stability: per design §3 wire-stability commitment, the field
+/// tags AND the `Reason` enum values are CONTRACTUAL once a release
+/// emits this proto. Changes are additive only; no value
+/// reassignment.
+message BackpressureSignal {
+    enum Reason {
+        REASON_UNSPECIFIED = 0;
+        /// Global byte budget (`Arc<Semaphore>` with 4 GiB cap per Q4)
+        /// exhausted. Caller should retry after `retry_after_ms`.
+        GLOBAL_CHUNK_BUDGET_EXHAUSTED = 1;
+        /// Per-blob mpsc(16) full. Caller should retry after
+        /// `retry_after_ms`; backoff target is shorter than the global
+        /// case because per-blob queues drain faster.
+        PER_BLOB_MPSC_FULL = 2;
+    }
+    Reason reason = 1;
+    /// Server-suggested backoff hint in milliseconds. Client may apply
+    /// jitter or its own backoff curve. Zero = no specific hint.
+    uint64 retry_after_ms = 2;
+}

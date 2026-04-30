@@ -18,6 +18,7 @@ pub mod callback_utils;
 pub mod cas_utils;
 #[cfg(feature = "chunked_fast_slow")]
 mod chunked;
+mod chunked_signal;
 pub mod common_s3_utils;
 pub mod completeness_checking_store;
 pub mod compression_store;
