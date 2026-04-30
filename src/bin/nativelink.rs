@@ -332,6 +332,12 @@ async fn inner_main(
                         locality_map.clone(),
                     )
                 };
+                // #88: pre-initialize the BatchReadCoalescer so the
+                // operator-flippable batch-small-blob-reads kill-switch
+                // can engage at runtime without first triggering
+                // construction. Default-OFF — only active when
+                // `enable_batch_small_blob_reads` is called.
+                proxy_arc.init_batch_read_coalescer();
                 worker_proxy_stores.insert(store_name.clone(), proxy_arc.clone());
                 let proxy_store = nativelink_util::store_trait::Store::new(proxy_arc);
                 store_manager.add_store(store_name, proxy_store);

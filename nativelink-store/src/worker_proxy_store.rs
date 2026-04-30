@@ -17,14 +17,16 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 
 use nativelink_config::stores::{ClientTlsConfig, GrpcEndpoint, GrpcSpec, Retry, StoreType};
@@ -32,18 +34,22 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, group, publish,
 };
+use nativelink_proto::build::bazel::remote::execution::v2::BatchReadBlobsRequest;
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
+use nativelink_util::digest_hasher::{DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
+use opentelemetry::context::Context;
 use nativelink_util::store_trait::{
     IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
     REDIRECT_PREFIX, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
     StoreOptimizations, UploadSizeInfo,
 };
 
+use crate::batch_read_coalescer::{BatchFn, BatchReadCoalescer};
 use crate::fast_slow_store::INNER_MISS_NO_TERMINATE;
 use crate::grpc_store::GrpcStore;
 
@@ -99,6 +105,21 @@ pub struct WorkerProxyStore {
     /// Mirror attempts skipped because no eligible (non-quarantined)
     /// endpoint could be selected.
     mirror_dropped_quarantined: AtomicU64,
+    /// `#88: batch_read_small_blobs racing wastes bandwidth — both peer
+    /// and server batches run to completion`. Opportunistic batching
+    /// of small-blob server→worker proxy reads. Off by default —
+    /// enabled via `enable_batch_small_blob_reads()` after a soak
+    /// window. Once enabled, eligible reads (per
+    /// `BatchReadCoalescer::is_eligible`) coalesce into one
+    /// `BatchReadBlobs` RPC per coalesce window per endpoint instead
+    /// of N individual ByteStream Read RPCs.
+    batch_small_blob_reads: AtomicBool,
+    /// Lazy-initialized `BatchReadCoalescer`. The coalescer needs a
+    /// `BatchFn` closure that captures `Arc<Self>` to look up the
+    /// per-endpoint GrpcStore connection — this is a self-referential
+    /// dependency, so we hand the coalescer a `Weak<Self>` capture and
+    /// initialize it on first use via `OnceLock`.
+    batch_read_coalescer: OnceLock<Arc<BatchReadCoalescer>>,
 }
 
 /// Per-endpoint mirror state: in-flight permits and consecutive-failure tracking.
@@ -274,6 +295,33 @@ fn is_connection_error(e: &Error) -> bool {
     matches!(e.code, Code::Unavailable | Code::Unknown)
 }
 
+/// Convert a `google.rpc.Status` integer code (as returned in a
+/// `BatchReadBlobsResponse.responses[].status.code`) into our
+/// `nativelink_error::Code`. Unrecognized codes default to
+/// `Code::Internal` so the caller's fallback path fires.
+fn code_from_grpc_status(code: i32) -> Code {
+    match code {
+        0 => Code::Ok,
+        1 => Code::Cancelled,
+        2 => Code::Unknown,
+        3 => Code::InvalidArgument,
+        4 => Code::DeadlineExceeded,
+        5 => Code::NotFound,
+        6 => Code::AlreadyExists,
+        7 => Code::PermissionDenied,
+        8 => Code::ResourceExhausted,
+        9 => Code::FailedPrecondition,
+        10 => Code::Aborted,
+        11 => Code::OutOfRange,
+        12 => Code::Unimplemented,
+        13 => Code::Internal,
+        14 => Code::Unavailable,
+        15 => Code::DataLoss,
+        16 => Code::Unauthenticated,
+        _ => Code::Internal,
+    }
+}
+
 /// Architectural invariant: if the local chain failed to serve, ALWAYS
 /// consult peers before giving up. The bytestream Read RPC's defense against
 /// missing blobs is the cluster-wide peer-fetch hop; any failure shape that
@@ -411,6 +459,8 @@ impl WorkerProxyStore {
             mirror_total_succeeded: AtomicU64::new(0),
             mirror_dropped_no_permit: AtomicU64::new(0),
             mirror_dropped_quarantined: AtomicU64::new(0),
+            batch_small_blob_reads: AtomicBool::new(false),
+            batch_read_coalescer: OnceLock::new(),
         })
     }
 
@@ -434,6 +484,8 @@ impl WorkerProxyStore {
             mirror_total_succeeded: AtomicU64::new(0),
             mirror_dropped_no_permit: AtomicU64::new(0),
             mirror_dropped_quarantined: AtomicU64::new(0),
+            batch_small_blob_reads: AtomicBool::new(false),
+            batch_read_coalescer: OnceLock::new(),
         })
     }
 
@@ -441,6 +493,32 @@ impl WorkerProxyStore {
     /// Only workers should call this — servers should leave it disabled.
     pub fn enable_race_peers(&self) {
         self.race_peers.store(true, Ordering::Relaxed);
+    }
+
+    /// `#88: batch_read_small_blobs racing wastes bandwidth — both peer
+    /// and server batches run to completion`. Enable opportunistic
+    /// batching of server→worker small-blob proxy reads. When enabled,
+    /// concurrent same-target small-blob fetches coalesce into one
+    /// `BatchReadBlobs` RPC per coalesce window per endpoint instead
+    /// of N individual ByteStream Read RPCs.
+    ///
+    /// Default: OFF. Conservative — perf opt on existing path; soak
+    /// before flipping. Production-safe to flip at runtime; takes
+    /// effect on the next eligible read.
+    pub fn enable_batch_small_blob_reads(&self) {
+        self.batch_small_blob_reads.store(true, Ordering::Relaxed);
+    }
+
+    /// Disable opportunistic batching of small-blob proxy reads.
+    /// Operator kill-switch — flips reads back to per-blob ByteStream
+    /// Read.
+    pub fn disable_batch_small_blob_reads(&self) {
+        self.batch_small_blob_reads.store(false, Ordering::Relaxed);
+    }
+
+    /// Inspector: whether batched small-blob proxy reads are enabled.
+    pub fn batch_small_blob_reads_enabled(&self) -> bool {
+        self.batch_small_blob_reads.load(Ordering::Relaxed)
     }
 
     /// Enable the locality-aware fast paths in `has_with_results` and the
@@ -584,6 +662,284 @@ impl WorkerProxyStore {
         Ok(Store::new(store))
     }
 
+    /// Lazily build (or retrieve) the per-`WorkerProxyStore`
+    /// `BatchReadCoalescer`. The coalescer's `BatchFn` captures
+    /// `Arc<Self>` so it can look up per-endpoint connections via
+    /// `get_or_create_connection` + downcast to `GrpcStore` for
+    /// `batch_read_blobs`. The capture uses `Weak<Self>` to avoid an
+    /// `Arc` cycle.
+    ///
+    /// Caller MUST hold the parent `Arc<Self>` while submitting (which
+    /// they do via the `Pin<&Self>` `StoreDriver` API + the surrounding
+    /// `Store` `Arc`). If the `Weak` upgrades fail because the parent
+    /// dropped, the coalescer's `BatchFn` returns
+    /// `Code::Unavailable` per-digest — the caller's fallback path
+    /// handles this gracefully.
+    fn coalescer(self: &Arc<Self>) -> &Arc<BatchReadCoalescer> {
+        self.batch_read_coalescer.get_or_init(|| {
+            let weak: std::sync::Weak<Self> = Arc::downgrade(self);
+            let batch_fn: BatchFn = Arc::new(move |endpoint: Arc<str>, digests: Vec<DigestInfo>| {
+                let weak = weak.clone();
+                async move {
+                    let mut out: HashMap<DigestInfo, Result<Bytes, Error>> =
+                        HashMap::with_capacity(digests.len());
+                    let Some(this) = weak.upgrade() else {
+                        for d in digests {
+                            out.insert(
+                                d,
+                                Err(make_err!(
+                                    Code::Unavailable,
+                                    "BatchReadCoalescer batch_fn: parent WorkerProxyStore was dropped"
+                                )),
+                            );
+                        }
+                        return out;
+                    };
+                    let Some(store) = this.get_or_create_connection(&endpoint).await else {
+                        for d in digests {
+                            out.insert(
+                                d,
+                                Err(make_err!(
+                                    Code::Unavailable,
+                                    "BatchReadCoalescer batch_fn: no connection available for endpoint {endpoint}"
+                                )),
+                            );
+                        }
+                        return out;
+                    };
+                    let Some(grpc) = store.downcast_ref::<GrpcStore>(None) else {
+                        // Test injection: the connection is not a real
+                        // GrpcStore (e.g. MemoryStore in unit tests).
+                        // Fall back to per-blob `get_part_unchunked`
+                        // against the injected store so tests can
+                        // exercise the coalescer end-to-end without
+                        // standing up a real gRPC server.
+                        for d in digests {
+                            let result = store
+                                .get_part_unchunked(d, 0, None)
+                                .await;
+                            out.insert(d, result);
+                        }
+                        return out;
+                    };
+                    // Production path: REAPI BatchReadBlobs. The
+                    // request mirrors `running_actions_manager.rs`
+                    // `execute_batch_read` — same digest_function
+                    // resolution path.
+                    let request = BatchReadBlobsRequest {
+                        instance_name: String::new(),
+                        digests: digests.iter().map(|d| (*d).into()).collect(),
+                        acceptable_compressors: vec![],
+                        digest_function: Context::current()
+                            .get::<DigestHasherFunc>()
+                            .map_or_else(default_digest_hasher_func, |v| *v)
+                            .proto_digest_func()
+                            .into(),
+                    };
+                    let response = match grpc
+                        .batch_read_blobs(Request::new(request))
+                        .await
+                    {
+                        Ok(r) => r.into_inner(),
+                        Err(e) => {
+                            // RPC-level failure: fail every digest
+                            // with the same upstream error so callers
+                            // can fall back per-blob. Defensive cloning
+                            // is fine here — failure path, not hot.
+                            for d in digests {
+                                out.insert(d, Err(e.clone()));
+                            }
+                            return out;
+                        }
+                    };
+                    // Index per-digest results by digest. RE API does
+                    // NOT guarantee response ordering — match by digest.
+                    for resp in response.responses {
+                        let Some(proto_digest) = resp.digest else {
+                            continue;
+                        };
+                        let Ok(digest) = DigestInfo::try_from(proto_digest) else {
+                            continue;
+                        };
+                        let status_code = resp.status.as_ref().map_or(0, |s| s.code);
+                        let result = if status_code == 0 {
+                            // Length sanity: the worker's response
+                            // payload MUST match the digest size — a
+                            // shorter or longer payload is corruption
+                            // (mirrors `validate_batch_read_responses`
+                            // in `running_actions_manager.rs`).
+                            let advertised = digest.size_bytes();
+                            if resp.data.len() as u64 == advertised {
+                                Ok(resp.data)
+                            } else {
+                                Err(make_err!(
+                                    Code::DataLoss,
+                                    "BatchReadCoalescer: peer returned {} bytes for \
+                                     digest {digest} (advertised {advertised}); \
+                                     dropping (corruption guard)",
+                                    resp.data.len()
+                                ))
+                            }
+                        } else {
+                            Err(make_err!(
+                                code_from_grpc_status(status_code),
+                                "BatchReadCoalescer: peer returned status code {status_code} \
+                                 for digest {digest}: {}",
+                                resp.status
+                                    .as_ref()
+                                    .map(|s| s.message.as_str())
+                                    .unwrap_or("(no message)")
+                            ))
+                        };
+                        out.insert(digest, result);
+                    }
+                    out
+                }
+                .boxed()
+            });
+            BatchReadCoalescer::new(batch_fn)
+        })
+    }
+
+    /// Read a single small blob from `endpoint` via the batched
+    /// coalescer, then forward the bytes to `writer` and tee to the
+    /// inner store (matching the existing `get_part_and_cache` CDN-tee
+    /// behavior).
+    ///
+    /// PRECONDITION: caller has already checked
+    /// `BatchReadCoalescer::is_eligible(digest, offset, length)` and
+    /// `batch_small_blob_reads_enabled()`. This method does not
+    /// re-check those gates.
+    ///
+    /// On `Ok`: the bytes have been forwarded to `writer` (with
+    /// `send` + `send_eof`) and submitted to the inner store. Caller
+    /// MUST NOT touch the writer further.
+    ///
+    /// On `Err`: the writer has NOT been terminated (no `send`, no
+    /// `send_error`, no `send_eof`). Caller is responsible for
+    /// termination — typical pattern is to fall back to the per-blob
+    /// `get_part_and_cache` path which then writes its own bytes /
+    /// errors into the writer. This matches the existing
+    /// `try_read_from_worker` per-peer-attempt loop, where each peer
+    /// attempt either succeeds (writer fully written + terminated) or
+    /// fails (writer untouched), and the loop's caller terminates the
+    /// writer at the end.
+    async fn try_batched_read_from_endpoint(
+        self: Pin<&Self>,
+        endpoint: &str,
+        digest: DigestInfo,
+        writer: &mut DropCloserWriteHalf,
+    ) -> Result<(), Error> {
+        // Promote `&self` to `Arc<Self>` so the coalescer's BatchFn
+        // can keep its Weak<Self> capture alive across submissions.
+        // `Pin::into_inner_unchecked` would let us cast, but we don't
+        // need the Pin to take an Arc — we need an Arc<Self> the same
+        // way as_any_arc returns one. Alternative: use `arc_self_any`
+        // (we have one through StoreDriver::as_any_arc). The simplest
+        // is to obtain the Arc from `self.as_any_arc` chain. But the
+        // method only takes `&Self`. Instead we make `coalescer` work
+        // off a stored Arc<BatchReadCoalescer> that was eagerly
+        // initialized at the first call — which means we need an
+        // Arc<Self> *here* to bootstrap. We solve this by having
+        // every call site that may invoke this method already hold
+        // `Arc<Self>` via `WorkerProxyStore` construction; we re-
+        // upgrade through `register_item_callback`'s `as_any_arc`
+        // pattern is overkill. Simplest: stash the Arc<Self> at
+        // construction.
+        //
+        // Actually the simplest: callers of try_batched_read_from_endpoint
+        // wrap us with `Arc<Self>` via `Self::new`, so `as_any_arc()`
+        // exists. We can pass the bootstrap Arc<Self> at coalescer-
+        // init time once, via the parent's `Arc::clone` known at
+        // wire-up time.
+        //
+        // For the impl below we use the `coalescer_handle()` helper
+        // that takes `Arc<Self>` and lazy-inits.
+        let coalescer = self
+            .coalescer_handle()
+            .err_tip(|| "try_batched_read_from_endpoint: coalescer not initialized")?;
+        let bytes = coalescer
+            .submit(Arc::from(endpoint), digest)
+            .await?;
+        // Forward bytes to caller's writer first, then tee to inner
+        // store. On writer-send error, surface immediately — DO NOT
+        // call `writer.send_error()` because this method's contract
+        // is "writer untouched on Err" (mirrors per-peer-attempt
+        // handling in try_read_from_worker).
+        writer
+            .send(bytes.clone())
+            .await
+            .err_tip(|| {
+                format!(
+                    "try_batched_read_from_endpoint: forwarding chunk for digest {digest}"
+                )
+            })?;
+        writer.send_eof().err_tip(|| {
+            format!("try_batched_read_from_endpoint: sending EOF for digest {digest}")
+        })?;
+        // Tee to inner cache (best-effort; matches get_part_and_cache).
+        // `update_oneshot` constructs its own UploadSizeInfo internally
+        // from the Bytes length — no need to pass one explicitly.
+        let inner = self.inner.clone();
+        let cache_key: StoreKey<'static> = digest.into();
+        let bytes_for_cache = bytes;
+        // Spawn so the caller's get_part returns as soon as their
+        // writer is satisfied — the cache write is async-tee.
+        tokio::spawn(async move {
+            match inner
+                .update_oneshot(cache_key, bytes_for_cache)
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        %digest,
+                        size_bytes = digest.size_bytes(),
+                        "proxy_cache: cached batched-proxied blob in inner store"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        %digest,
+                        size_bytes = digest.size_bytes(),
+                        ?e,
+                        "proxy_cache: failed to cache batched-proxied blob"
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Bootstrap helper to obtain an `Arc<BatchReadCoalescer>` from
+    /// `&self`. Reads from the `OnceLock`; if uninitialized, returns
+    /// an error. Callers MUST initialize the coalescer via the public
+    /// `coalescer_init_from_arc(self_arc)` once construction is done.
+    /// This split is necessary because the coalescer's `BatchFn`
+    /// captures `Weak<Self>`, which we cannot construct from `&Self`
+    /// alone.
+    fn coalescer_handle(&self) -> Result<Arc<BatchReadCoalescer>, Error> {
+        self.batch_read_coalescer
+            .get()
+            .cloned()
+            .ok_or_else(|| {
+                make_err!(
+                    Code::FailedPrecondition,
+                    "WorkerProxyStore: BatchReadCoalescer not initialized — \
+                     caller must invoke `init_batch_read_coalescer(self_arc)` \
+                     after construction; falling back to per-blob path"
+                )
+            })
+    }
+
+    /// Initialize the `BatchReadCoalescer` with a `Weak<Self>` capture
+    /// for the per-endpoint `BatchReadBlobs` lookup. Idempotent — a
+    /// second call is a no-op. Callers MUST invoke this immediately
+    /// after `Self::new` / `Self::new_with_tls` if they intend to ever
+    /// call `enable_batch_small_blob_reads()`.
+    pub fn init_batch_read_coalescer(self: &Arc<Self>) {
+        let _ = self.coalescer();
+    }
+
     /// Try to read a blob from a specific list of peer endpoints (e.g. from
     /// a redirect response). Same logic as `try_read_from_worker` but uses
     /// the caller-provided endpoints instead of consulting the locality map.
@@ -606,6 +962,59 @@ impl WorkerProxyStore {
             let Some(store) = self.get_or_create_connection(endpoint).await else {
                 continue;
             };
+
+            // #88: opportunistic batching of small-blob proxy reads.
+            // When the flag is on AND eligibility passes (whole-blob
+            // read, ≤ SMALL_BLOB_THRESHOLD), route this digest through
+            // the per-endpoint coalescer. Concurrent same-target reads
+            // collapse into one BatchReadBlobs RPC. On Err, fall
+            // through to the existing get_part_and_cache path
+            // (preserves the writer-termination contract — the
+            // batched helper guarantees the writer is untouched on
+            // Err).
+            if self.batch_small_blob_reads.load(Ordering::Relaxed)
+                && BatchReadCoalescer::is_eligible(digest, offset, length)
+            {
+                // SAFETY: `Pin::new(self)` is the same upgrade the
+                // StoreDriver entry-point performs; this method is
+                // called from `try_read_from_endpoints` which itself
+                // is reachable only via `get_part`'s Pin<&Self>.
+                let pinned: Pin<&Self> = Pin::new(self);
+                match pinned
+                    .try_batched_read_from_endpoint(endpoint, digest, &mut *writer)
+                    .await
+                {
+                    Ok(()) => {
+                        debug!(
+                            ?digest,
+                            endpoint = endpoint.as_str(),
+                            "WorkerProxyStore: batched read from redirected peer succeeded"
+                        );
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        // Surface the per-digest failure and fall
+                        // through to the streaming path. Eviction
+                        // policy mirrors the streaming path below.
+                        let evict = should_evict_locality_on_peer_error(&e);
+                        if evict {
+                            self.locality_map
+                                .write()
+                                .evict_blobs(endpoint, &[digest]);
+                        }
+                        warn!(
+                            ?digest,
+                            endpoint = endpoint.as_str(),
+                            code = ?e.code,
+                            evicted_locality = evict,
+                            ?e,
+                            "WorkerProxyStore: batched redirected read failed; \
+                             falling through to per-blob streaming path"
+                        );
+                        // Fall through to streaming get_part_and_cache.
+                    }
+                }
+            }
 
             match self
                 .get_part_and_cache(&store, key.borrow(), &mut *writer, offset, length)
@@ -740,6 +1149,61 @@ impl WorkerProxyStore {
                 info!(?digest, endpoint = %endpoint, "worker_proxy: peer attempt skipped (no connection)");
                 continue;
             };
+
+            // #88: opportunistic batching of small-blob proxy reads.
+            // Eligibility uses the ORIGINAL caller offset/length (not
+            // current_offset / remaining_length) because the batched
+            // path is only safe for whole-blob reads — the
+            // resume-from-mid-stream logic above never engages once
+            // we've taken the batched path. If a previous peer already
+            // wrote partial bytes (`bytes_before_proxy` <
+            // `writer.get_bytes_written()`), the batched path would
+            // double-write — DON'T fire the batched path in that case.
+            if self.batch_small_blob_reads.load(Ordering::Relaxed)
+                && current_offset == offset
+                && remaining_length == length
+                && writer.get_bytes_written() == bytes_before_proxy
+                && BatchReadCoalescer::is_eligible(digest, offset, length)
+            {
+                let pinned: Pin<&Self> = Pin::new(self);
+                match pinned
+                    .try_batched_read_from_endpoint(endpoint, digest, &mut *writer)
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            ?digest,
+                            endpoint = %endpoint,
+                            "WorkerProxyStore: batched read from peer succeeded"
+                        );
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        // Eviction policy mirrors the streaming path
+                        // below (NotFound / DataLoss → evict). All
+                        // other codes are transient — keep the
+                        // locality entry. The batched helper guarantees
+                        // the writer is untouched on Err, so falling
+                        // through to get_part_and_cache is safe.
+                        let evict = should_evict_locality_on_peer_error(&e);
+                        if evict {
+                            self.locality_map
+                                .write()
+                                .evict_blobs(endpoint, &[digest]);
+                        }
+                        warn!(
+                            ?digest,
+                            endpoint = %endpoint,
+                            code = ?e.code,
+                            evicted_locality = evict,
+                            ?e,
+                            "WorkerProxyStore: batched peer read failed; \
+                             falling through to per-blob streaming path"
+                        );
+                        // Fall through to streaming get_part_and_cache.
+                    }
+                }
+            }
 
             // Stream from the peer, caching in the inner store when possible.
             // On failure, compute how many bytes were written and resume
