@@ -103,6 +103,7 @@ impl ChunkBudget {
     /// dropped, including via the `ChunkWork` that owns it being
     /// dropped on driver-task panic — this is what makes the budget
     /// safe under arbitrary task death (see §6.7 termination triggers).
+    #[must_use = "the permit must be held by the ChunkWork or dropped explicitly to release budget"]
     pub(crate) fn try_acquire_chunk(&self) -> Option<OwnedSemaphorePermit> {
         match Arc::clone(&self.sem).try_acquire_owned() {
             Ok(permit) => Some(permit),
