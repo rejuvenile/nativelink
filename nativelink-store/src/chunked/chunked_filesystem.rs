@@ -77,6 +77,8 @@ use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 
+use crate::filesystem_store::digest_shard_prefix;
+
 /// In-flight chunked-blob state held by the FilesystemStore for the
 /// lifetime of an in-progress chunked upload. One entry per digest.
 ///
@@ -177,13 +179,15 @@ impl ChunkedPartialsMap {
 /// recovery sweep based on filename pattern alone could mistakenly
 /// GC or rename a legacy temp file).
 pub(crate) fn partial_temp_path(temp_path_root: &str, digest: &DigestInfo) -> PathBuf {
-    const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
-    let first_byte = digest.packed_hash()[0];
-    let shard_arr = [
-        HEX_LUT[(first_byte >> 4) as usize],
-        HEX_LUT[(first_byte & 0x0f) as usize],
-    ];
-    // SAFETY: shard_arr bytes are sourced from HEX_LUT which is ASCII.
+    // Reuse `digest_shard_prefix` from `filesystem_store` so the on-disk
+    // shard-layout decision lives in exactly one place. If the legacy
+    // CAS layout ever changes (e.g. 4-byte sharding for very large
+    // stores), the chunked partials follow automatically — and the
+    // `unsafe { from_utf8_unchecked }` block exists in only one file
+    // (rust-crate-reviewer M1).
+    let shard_arr = digest_shard_prefix(digest);
+    // SAFETY: shard_arr bytes are sourced from HEX_LUT (ASCII) inside
+    // `digest_shard_prefix`. Same invariant as `to_full_path_from_key`.
     let shard_str = unsafe { core::str::from_utf8_unchecked(&shard_arr) };
     let mut path = PathBuf::from(temp_path_root);
     path.push("d");

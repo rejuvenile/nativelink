@@ -190,8 +190,14 @@ impl Drop for EncodedFilePath {
 /// the first byte of the packed hash. This gives 256 subdirectories
 /// (00-ff), reducing per-directory file count from hundreds of thousands
 /// to ~1,500 on typical deployments.
+///
+/// `pub(crate)` so the chunked-streaming partial-path helper in
+/// `crate::chunked::chunked_filesystem` can reuse the same on-disk
+/// shard layout decision (one source of truth — if the layout ever
+/// changes, both the chunked partials and the legacy CAS files move
+/// together).
 #[inline]
-fn digest_shard_prefix(digest_info: &DigestInfo) -> [u8; 2] {
+pub(crate) fn digest_shard_prefix(digest_info: &DigestInfo) -> [u8; 2] {
     const HEX_LUT: &[u8; 16] = b"0123456789abcdef";
     let first_byte = digest_info.packed_hash()[0];
     [
