@@ -71,11 +71,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use nativelink_error::{Code, Error, ResultExt, make_err};
+use nativelink_error::{Code, Error, make_err};
 use nativelink_util::common::DigestInfo;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 /// In-flight chunked-blob state held by the FilesystemStore for the
 /// lifetime of an in-progress chunked upload. One entry per digest.
@@ -554,93 +554,24 @@ pub(crate) async fn discard_chunked(
     Ok(())
 }
 
-/// Startup recovery sweep stub per Q7=(c). Walks `<temp_path>/d/XX/`
-/// looking for `*.partial` files and unlinks them. Returns the count
-/// removed.
-///
-/// Phase 2.1 ships the GC-everything strategy explicitly chosen by
-/// Q7=(c): "drop partial-recoverable read entirely". A future phase
-/// MAY add the rename-if-length-matches behavior described in §7.4
-/// (recovery rename → downstream VerifyStore validates digest), but
-/// that requires Phase 2.3's driver to have written digest-aware
-/// validation that the bare recovery sweep doesn't have access to.
-/// For Phase 2.1 the scope is: GC everything, mirror re-uploads what
-/// didn't land. Matches the user's locked decision exactly.
-///
-/// Spawned as a background task by `FilesystemStore::new` (when the
-/// `chunked_fast_slow` feature is on) so it does NOT block startup.
-/// The cost is one `read_dir` per shard subdirectory + one `unlink`
-/// per stale `.partial` file. For a normal startup with zero stale
-/// partials this is 256 cheap `read_dir` calls returning empty.
-pub(crate) async fn recover_partials_on_startup(
-    temp_path_root: &str,
-) -> Result<u64, Error> {
-    let root = PathBuf::from(temp_path_root).join("d");
-    let mut total_gc = 0u64;
-
-    // Iterate the 256 shard subdirs (00..ff) — these are
-    // pre-created by `FilesystemStore::new`'s `create_subdirs`.
-    // Spawn_blocking the whole sweep so we batch the syscalls and
-    // don't ping-pong the runtime for each entry.
-    let scan_result = tokio::task::spawn_blocking(move || -> Result<u64, std::io::Error> {
-        let mut count = 0u64;
-        // 256 shards. If the directory doesn't exist (e.g. older
-        // store layout), short-circuit to zero.
-        let read_root = match std::fs::read_dir(&root) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e),
-        };
-        for shard_entry in read_root {
-            let shard_entry = shard_entry?;
-            let shard_path = shard_entry.path();
-            // Only scan directories (the shard subdirs); skip stray
-            // files in d/ itself — the legacy code didn't put files
-            // there but defensive against future drift.
-            let metadata = match shard_entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if !metadata.is_dir() {
-                continue;
-            }
-            let read_shard = match std::fs::read_dir(&shard_path) {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
-            for file_entry in read_shard {
-                let Ok(file_entry) = file_entry else { continue };
-                let path = file_entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("partial") {
-                    continue;
-                }
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {
-                        count += 1;
-                    }
-                    Err(e) => {
-                        // Best effort — log and continue.
-                        error!(?path, ?e, "failed to remove stale chunked partial during recovery sweep");
-                    }
-                }
-            }
-        }
-        Ok(count)
-    })
-    .await
-    .map_err(|join_err| {
-        make_err!(Code::Internal, "spawn_blocking join error in recover_partials_on_startup: {join_err:?}")
-    })?
-    .err_tip(|| format!("scanning {temp_path_root}/d for stale chunked partials"))?;
-
-    total_gc += scan_result;
-    if total_gc > 0 {
-        warn!(total_gc, %temp_path_root, "recovered chunked partial files at startup (per Q7=(c) GC everything)");
-    } else {
-        debug!(%temp_path_root, "recovery sweep found no stale chunked partials");
-    }
-    Ok(total_gc)
-}
+// Crash-recovery for chunked partials is handled by the legacy
+// `prune_temp_path` (in `filesystem_store.rs`), which runs synchronously
+// during `FilesystemStore::new` and unconditionally `remove_file`s every
+// entry in `<temp_path>/d/` and `<temp_path>/d/XX/` shards — including
+// all `.partial` files this module produces. That is one valid form of
+// the spec's Q7=(c) recovery (GC-everything; mirror re-uploads what
+// didn't land). The spec's length-aware rename-recovery
+// (`if stat.len() == declared_size, rename → VerifyStore validates`;
+// see plan `.claude/plans/212-chunk-pinned-async-slow-writes.md` §4 Q7
+// + §7.4) is intentionally deferred to a later Phase 2.x because it
+// requires digest-aware validation that the bare prune sweep doesn't
+// have. Shipping a parallel chunked-only sweep here would be dead code
+// (prune already removed every `.partial` before our sweep would run)
+// AND would lock in the GC-everything degraded form rather than the
+// spec's length-aware behavior.
+//
+// TODO(#212): implement length-aware rename-recovery per spec §4 Q7
+// and §7.4 once the Phase 2.3 driver lands.
 
 #[cfg(test)]
 mod tests {
@@ -653,7 +584,7 @@ mod tests {
     use super::super::CHUNK_SIZE;
     use super::{
         ChunkedPartialsMap, commit_chunked, discard_chunked, partial_temp_path,
-        recover_partials_on_startup, write_chunk_at_offset,
+        write_chunk_at_offset,
     };
 
     /// Test-only helper: creates a fresh temp dir under `TEST_TMPDIR`
@@ -934,10 +865,12 @@ mod tests {
     }
 
     /// Drop the ChunkedPartialsMap mid-write: the temp file MUST
-    /// remain on disk (drop is graceful, not destructive). The
-    /// recovery sweep on next startup will GC it per Q7=(c).
+    /// remain on disk (drop is graceful, not destructive). The legacy
+    /// `prune_temp_path` (run synchronously during the next
+    /// `FilesystemStore::new`) GCs it per Q7=(c) (degraded form;
+    /// length-aware rename-recovery deferred to Phase 2.x).
     #[nativelink_test]
-    async fn dropping_partials_map_leaves_temp_file_for_recovery_sweep() {
+    async fn dropping_partials_map_leaves_temp_file_on_disk() {
         const CHUNK: usize = 4 * 1024;
         let root = make_chunked_test_root().await;
         let digest = make_test_digest(0x05, CHUNK as u64);
@@ -950,11 +883,13 @@ mod tests {
                 .unwrap();
             assert!(map.contains(&digest), "write must register in-flight state");
             // Drop the map — entry's Arc<ChunkInProgress> drops, but
-            // the on-disk file is NOT auto-removed.
+            // the on-disk file is NOT auto-removed (Drop is graceful;
+            // recovery is deferred to the legacy `prune_temp_path`
+            // sweep run on the next `FilesystemStore::new`).
             drop(map);
         })
         .await
-        .expect("write + drop cycle must finish within 5s");
+        .expect("must not deadlock — write + drop cycle should be graceful");
 
         // Temp file MUST still exist after map is dropped.
         let meta = tokio::fs::metadata(&temp_path).await;
@@ -963,21 +898,6 @@ mod tests {
             "dropping the map must NOT delete on-disk partial; got {meta:?}"
         );
         assert_eq!(meta.unwrap().len(), CHUNK as u64);
-
-        // Recovery sweep on the same temp_path GCs it.
-        let gc_count = recover_partials_on_startup(&root)
-            .await
-            .expect("recovery sweep must succeed");
-        assert!(
-            gc_count >= 1,
-            "recovery sweep must find + GC at least the orphaned partial; got {gc_count}"
-        );
-        // After sweep, the temp file is gone.
-        let post_sweep = tokio::fs::metadata(&temp_path).await;
-        assert!(
-            post_sweep.is_err(),
-            "recovery sweep must remove the orphaned partial; got {post_sweep:?}"
-        );
     }
 
     /// Sanity: production CHUNK_SIZE matches the spec (1 MiB).

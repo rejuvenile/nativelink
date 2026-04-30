@@ -50,7 +50,6 @@ use crate::cas_utils::is_zero_digest;
 #[cfg(feature = "chunked_fast_slow")]
 use crate::chunked::chunked_filesystem::{
     ChunkedPartialsMap, commit_chunked as chunked_commit, discard_chunked as chunked_discard,
-    recover_partials_on_startup as chunked_recover_partials,
     write_chunk_at_offset as chunked_write_chunk_at_offset,
 };
 
@@ -962,39 +961,19 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         };
         evicting_map.start_background_eviction();
 
-        // #212 Phase 2.1 recovery sweep (per Q7=(c)): GC any orphaned
-        // `*.partial` files left in `<temp_path>/d/XX/` from a previous
-        // process. Spawn as a background task so startup is NOT
-        // blocked; one missing-file `read_dir` per shard subdir is
-        // ~256 cheap syscalls + however many `unlink`s for stale
-        // partials. The mirror protocol re-uploads what the previous
-        // process didn't fully land. Feature-gated to keep the default
-        // build byte-identical.
-        #[cfg(feature = "chunked_fast_slow")]
-        {
-            let temp_path_for_sweep = shared_context.temp_path.clone();
-            background_spawn!("filesystem_chunked_recovery_sweep", async move {
-                match chunked_recover_partials(&temp_path_for_sweep).await {
-                    Ok(0) => {
-                        debug!(temp_path = %temp_path_for_sweep, "chunked recovery sweep: no stale partials");
-                    }
-                    Ok(n) => {
-                        info!(
-                            temp_path = %temp_path_for_sweep,
-                            gc_count = n,
-                            "chunked recovery sweep removed stale partials"
-                        );
-                    }
-                    Err(err) => {
-                        error!(
-                            temp_path = %temp_path_for_sweep,
-                            ?err,
-                            "chunked recovery sweep failed (non-fatal; mirror covers re-upload)"
-                        );
-                    }
-                }
-            });
-        }
+        // #212 Phase 2.1 chunked-partials recovery: handled by the
+        // existing `prune_temp_path` await above (line ~951), which
+        // unconditionally `remove_file`s every entry in `<temp_path>/d/`
+        // and `<temp_path>/d/XX/` shards — including all `.partial`
+        // files. That is one valid degraded form of Q7=(c) recovery
+        // (GC-everything; mirror re-uploads). The spec'd length-aware
+        // rename-recovery (`if stat.len() == declared_size, rename →
+        // VerifyStore validates downstream`; see plan §4 Q7 +
+        // §7.4) is deferred to a later Phase 2.x — it requires
+        // digest-aware validation that the prune sweep doesn't have.
+        // TODO(#212): implement length-aware rename-recovery per
+        // `.claude/plans/212-chunk-pinned-async-slow-writes.md` §4 Q7
+        // and §7.4 once the Phase 2.3 driver lands.
 
         Ok(Arc::new_cyclic(|weak_self| Self {
             shared_context,
