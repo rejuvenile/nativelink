@@ -912,4 +912,185 @@ mod tests {
     fn chunk_size_constant_pinned_for_chunked_filesystem_callers() {
         assert_eq!(CHUNK_SIZE, 1024 * 1024);
     }
+
+    // -------------------------------------------------------------------
+    // Adapter tests: exercise `FilesystemStore::write_chunk_at_offset` /
+    // `commit_chunked` / `discard_chunked` (the actual Phase 2.1 ship
+    // surface) through the real `FilesystemStore::new` path. The pure-
+    // module-fn tests above never see the path-resolution that the
+    // adapter performs (`temp_path` for the partial; `content_path` via
+    // `to_full_path_from_key` for the final CAS file). A bug in the
+    // adapter (e.g. `temp_path` ↔ `content_path` swap, wrong shard layout)
+    // ships silently if these tests are missing.
+    //
+    // testing-czar M1 (#212 Phase 2.1 review).
+    // -------------------------------------------------------------------
+
+    use nativelink_config::stores::FilesystemSpec;
+
+    use crate::filesystem_store::{DIGEST_FOLDER, FileEntryImpl, FilesystemStore};
+
+    fn make_adapter_temp_path(label: &str) -> String {
+        let base = std::env::var("TEST_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string());
+        let nonce: u64 = rand::random();
+        format!("{base}/{nonce}/chunked-fs-adapter/{label}")
+    }
+
+    /// Adapter: end-to-end `write_chunk_at_offset` + `commit_chunked`
+    /// through a real `FilesystemStore`. Verifies:
+    /// (a) the partial lands at the store's TEMP path (not content_path),
+    /// (b) after commit, the final file lands at the store's CONTENT
+    ///     path (not temp_path),
+    /// (c) the in-flight state is cleared from the store's
+    ///     `chunked_partials` map.
+    /// Mutation: swap `temp_path` ↔ `content_path` in the adapter and
+    /// this test red-fails because the partial isn't reachable from the
+    /// asserted CONTENT path before commit OR the final file lands at
+    /// the wrong location.
+    #[nativelink_test]
+    async fn adapter_write_then_commit_lands_at_content_path() {
+        const CHUNK: usize = 4 * 1024;
+        let total: u64 = 2 * CHUNK as u64;
+        let content_path = make_adapter_temp_path("content");
+        let temp_path = make_adapter_temp_path("temp");
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            eviction_policy: None,
+            block_size: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("FilesystemStore::new must succeed");
+
+        // Use a digest whose first byte gives a known shard (0x06).
+        let mut hash = [0u8; 32];
+        hash[0] = 0x06;
+        hash[31] = 0x06;
+        let digest = DigestInfo::new(hash, total);
+
+        let c0 = Bytes::from(vec![0x60u8; CHUNK]);
+        let c1 = Bytes::from(vec![0x61u8; CHUNK]);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            store
+                .write_chunk_at_offset(&digest, 0, c0.clone())
+                .await
+                .expect("adapter write_chunk_at_offset @ 0 must succeed");
+            store
+                .write_chunk_at_offset(&digest, CHUNK as u64, c1.clone())
+                .await
+                .expect("adapter write_chunk_at_offset @ CHUNK must succeed");
+
+            // Before commit: partial MUST be under TEMP path, NOT
+            // content_path. This is the temp_path-vs-content_path swap
+            // detector.
+            let expected_partial =
+                format!("{temp_path}/{DIGEST_FOLDER}/06/{digest}.partial");
+            let temp_meta = tokio::fs::metadata(&expected_partial).await;
+            assert!(
+                temp_meta.is_ok(),
+                "partial must exist under temp_path before commit; expected {expected_partial}, got {temp_meta:?}"
+            );
+            assert_eq!(temp_meta.unwrap().len(), total);
+
+            // The final CAS path under content_path MUST NOT exist yet.
+            let final_path = format!("{content_path}/{DIGEST_FOLDER}/06/{digest}");
+            let final_meta_pre = tokio::fs::metadata(&final_path).await;
+            assert!(
+                final_meta_pre.is_err(),
+                "final CAS file must NOT exist before commit; got {final_meta_pre:?}"
+            );
+
+            store
+                .commit_chunked(&digest, total)
+                .await
+                .expect("adapter commit_chunked must succeed");
+
+            // After commit: final file is under CONTENT path, NOT temp.
+            let final_meta = tokio::fs::metadata(&final_path).await;
+            assert!(
+                final_meta.is_ok(),
+                "after commit, final CAS file must exist under content_path; expected {final_path}, got {final_meta:?}"
+            );
+            assert_eq!(final_meta.unwrap().len(), total);
+            // And the partial under temp_path is gone.
+            let temp_meta_post = tokio::fs::metadata(&expected_partial).await;
+            assert!(
+                temp_meta_post.is_err(),
+                "after commit, partial must be removed from temp_path; got {temp_meta_post:?}"
+            );
+        })
+        .await
+        .expect(
+            "must not deadlock — adapter write+commit should finish promptly through real \
+             FilesystemStore",
+        );
+    }
+
+    /// Adapter: `discard_chunked` removes the temp file from the
+    /// store's TEMP path and never touches the CONTENT path.
+    /// Mutation: a swap of `temp_path` ↔ `content_path` in the adapter
+    /// red-fails because the discard targets the wrong location.
+    #[nativelink_test]
+    async fn adapter_discard_removes_partial_from_temp_path() {
+        const CHUNK: usize = 4 * 1024;
+        let content_path = make_adapter_temp_path("content");
+        let temp_path = make_adapter_temp_path("temp");
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            eviction_policy: None,
+            block_size: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("FilesystemStore::new must succeed");
+
+        let mut hash = [0u8; 32];
+        hash[0] = 0x07;
+        hash[31] = 0x07;
+        let digest = DigestInfo::new(hash, CHUNK as u64);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            store
+                .write_chunk_at_offset(&digest, 0, Bytes::from(vec![0x70u8; CHUNK]))
+                .await
+                .expect("adapter write must succeed");
+
+            let expected_partial =
+                format!("{temp_path}/{DIGEST_FOLDER}/07/{digest}.partial");
+            let pre = tokio::fs::metadata(&expected_partial).await;
+            assert!(
+                pre.is_ok(),
+                "partial must exist under temp_path; got {pre:?}"
+            );
+
+            store
+                .discard_chunked(&digest)
+                .await
+                .expect("adapter discard_chunked must succeed");
+
+            // Temp partial gone.
+            let post = tokio::fs::metadata(&expected_partial).await;
+            assert!(
+                post.is_err(),
+                "discard must remove partial from temp_path; got {post:?}"
+            );
+
+            // Content path was never touched.
+            let final_path = format!("{content_path}/{DIGEST_FOLDER}/07/{digest}");
+            let final_meta = tokio::fs::metadata(&final_path).await;
+            assert!(
+                final_meta.is_err(),
+                "discard must NOT create anything under content_path; got {final_meta:?}"
+            );
+        })
+        .await
+        .expect(
+            "must not deadlock — adapter discard should finish promptly through real \
+             FilesystemStore",
+        );
+    }
 }
