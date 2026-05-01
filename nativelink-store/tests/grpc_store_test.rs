@@ -1,5 +1,6 @@
 use core::pin::Pin;
 use core::time::Duration;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_lock::Mutex;
@@ -21,8 +22,11 @@ use nativelink_util::background_spawn;
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{StoreLike, UploadSizeInfo};
+use nativelink_util::telemetry::ClientHeaders;
+use opentelemetry::Context;
 use regex::Regex;
 use tokio::time::timeout;
+use tonic::metadata::KeyAndValueRef;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, Streaming};
@@ -49,6 +53,8 @@ fn test_spec<T: Into<String>>(endpoint: T, use_legacy_resource_names: bool) -> G
         connections_per_endpoint: 0,
         rpc_timeout_s: 1,
         use_legacy_resource_names,
+        headers: HashMap::new(),
+        forward_headers: vec![],
     }
 }
 
@@ -71,9 +77,15 @@ async fn fast_find_missing_blobs() -> Result<(), Error> {
 }
 
 #[derive(Debug, Clone)]
+struct ReadRequestHolder {
+    request: ReadRequest,
+    metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
 struct FakeStreamServer {
     write_requests: Arc<Mutex<Vec<WriteRequest>>>,
-    read_requests: Arc<Mutex<Vec<ReadRequest>>>,
+    read_requests: Arc<Mutex<Vec<ReadRequestHolder>>>,
 }
 
 impl FakeStreamServer {
@@ -99,8 +111,26 @@ impl ByteStream for FakeStreamServer {
         &self,
         grpc_request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
+        let mut request_metadata: HashMap<String, String> = HashMap::new();
+        for kv in grpc_request.metadata().iter() {
+            match kv {
+                KeyAndValueRef::Ascii(metadata_key, metadata_value) => {
+                    request_metadata.insert(
+                        metadata_key.to_string(),
+                        metadata_value.to_str().unwrap().to_string(),
+                    );
+                }
+                KeyAndValueRef::Binary(metadata_key, metadata_value) => {
+                    request_metadata
+                        .insert(metadata_key.to_string(), format!("{metadata_value:#?}"));
+                }
+            }
+        }
         let read_request = grpc_request.into_inner();
-        self.read_requests.lock().await.push(read_request);
+        self.read_requests.lock().await.push(ReadRequestHolder {
+            request: read_request,
+            metadata: request_metadata,
+        });
 
         let folded = unfold(ReaderState { responded: false }, async move |state| {
             if state.responded {
@@ -208,15 +238,19 @@ async fn write_update_works_with_legacy_resource_names() -> Result<(), Error> {
     write_update_works_core(true, upload_pattern).await
 }
 
-async fn read_works_core(
+async fn read_works_core<F>(
     use_legacy_resource_names: bool,
     upload_pattern: &str,
-) -> Result<(), Error> {
+    edit_spec: F,
+) -> Result<ReadRequestHolder, Error>
+where
+    F: FnOnce(GrpcSpec) -> GrpcSpec,
+{
     let (server, port) = make_fake_bytestream_server().await;
-    let spec = test_spec(
+    let spec = edit_spec(test_spec(
         format!("http://localhost:{port}"),
         use_legacy_resource_names,
-    );
+    ));
     let store = GrpcStore::new(&spec).await?;
     let digest = DigestInfo::try_new(VALID_HASH, RAW_INPUT.len()).unwrap();
 
@@ -228,21 +262,63 @@ async fn read_works_core(
     let read_requests = server.read_requests.lock().await;
     assert_eq!(read_requests.len(), 1);
     let read_request = read_requests.first().unwrap();
-    assert_eq!(upload_pattern, &read_request.resource_name,);
+    assert_eq!(upload_pattern, &read_request.request.resource_name);
 
-    Ok(())
+    Ok(read_request.clone())
 }
 
 #[nativelink_test]
 async fn read_works() -> Result<(), Error> {
     let upload_pattern =
         "/blobs/sha256/0123456789abcdef000000000000000000010000000000000123456789abcdef/3";
-    read_works_core(false, upload_pattern).await
+    read_works_core(false, upload_pattern, core::convert::identity)
+        .await
+        .unwrap();
+    Ok(())
 }
 
 #[nativelink_test]
 async fn read_works_with_legacy_resource_names() -> Result<(), Error> {
     let upload_pattern =
         "/blobs/0123456789abcdef000000000000000000010000000000000123456789abcdef/3";
-    read_works_core(true, upload_pattern).await
+    read_works_core(true, upload_pattern, core::convert::identity)
+        .await
+        .unwrap();
+    Ok(())
+}
+
+#[nativelink_test]
+async fn read_works_with_headers() -> Result<(), Error> {
+    fn set_spec(mut spec: GrpcSpec) -> GrpcSpec {
+        spec.headers.insert("foo".into(), "bar".into());
+        // Testing with mixed case, as it gets lowercased internally
+        spec.forward_headers.push("SomeTHING".into());
+        spec
+    }
+
+    let upload_pattern =
+        "/blobs/sha256/0123456789abcdef000000000000000000010000000000000123456789abcdef/3";
+
+    let client_headers = {
+        let mut headers: HashMap<String, String> = HashMap::new();
+        // We're inserting a lowercase one here as the telemetry insertion uses a lowercase one
+        headers.insert("something".to_string(), "From outside".to_string());
+        ClientHeaders(Arc::new(headers))
+    };
+
+    let cx_guard = Context::map_current(|cx| cx.with_value(client_headers)).attach();
+
+    let read_request = read_works_core(false, upload_pattern, set_spec)
+        .await
+        .unwrap();
+    assert_eq!(read_request.metadata.get("foo"), Some(&"bar".to_string()));
+    assert_eq!(
+        read_request.metadata.get("something"),
+        Some(&"From outside".to_string()),
+        "{:#?}",
+        read_request.metadata
+    );
+    drop(cx_guard);
+
+    Ok(())
 }
