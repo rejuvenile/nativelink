@@ -39,6 +39,20 @@ service WorkerApi {
     /// properties and the first response will be a ConnectionResult to tell
     /// the worker what worker ID to place in action results.
     rpc ConnectWorker(stream UpdateForScheduler) returns (stream UpdateForWorker);
+
+    /// #212 chunked streaming-write RPC. Worker (or any peer that we
+    /// control both sides of, per design Q1=(b)) opens a client-streaming
+    /// upload of one CAS blob as a sequence of `WriteChunk` messages.
+    /// Server admits each chunk to a per-blob driver task that performs
+    /// `pwrite`-at-offset on a sparse partial file, tracks coverage
+    /// in an in-memory bitmap, and on the `finish_chunk=true` message
+    /// commits the partial via atomic rename + end-to-end SHA-256
+    /// verification. Returns the committed digest + size on success.
+    ///
+    /// Behind `chunked_fast_slow` feature flag (default OFF). The server
+    /// returns `Code::Unimplemented` if the feature is off; clients must
+    /// gate calls on a capability discovery mechanism (Phase 2.6).
+    rpc WriteChunked(stream WriteChunk) returns (WriteChunkedResponse);
 }
 
 /// Request object for keep alive requests.
@@ -664,4 +678,48 @@ message BackpressureSignal {
     /// Server-suggested backoff hint in milliseconds. Client may apply
     /// jitter or its own backoff curve. Zero = no specific hint.
     uint64 retry_after_ms = 2;
+}
+
+/// #212 Phase 2.2: one chunk of a `WriteChunked` client-streaming
+/// upload. The first message identifies the blob via `digest`; every
+/// subsequent message in the stream MUST carry the SAME `digest` (the
+/// server validates and rejects with `InvalidArgument` on mismatch).
+///
+/// `chunk_offset` MUST be a multiple of `CHUNK_SIZE` (1 MiB per design
+/// Q3=(a)). `chunk_bytes.len()` MUST be exactly `CHUNK_SIZE` for every
+/// chunk EXCEPT the FINAL chunk (`finish_chunk=true`), where the final
+/// chunk's length is the trailing remainder
+/// (`expected_size mod CHUNK_SIZE`, or `CHUNK_SIZE` if size is an
+/// exact multiple).
+///
+/// `chunk_sha256` is the SHA-256 of `chunk_bytes` (per design §8.3.1).
+/// The server validates per-chunk on arrival (on `spawn_blocking` per
+/// #213 perf-opt NMA1) and rejects with `Code::InvalidArgument` on
+/// mismatch.
+///
+/// `finish_chunk=true` marks the FINAL chunk. Triggers the per-blob
+/// driver's commit path: wait for all chunks to land, atomic rename,
+/// end-to-end SHA-256 verification.
+message WriteChunk {
+    build.bazel.remote.execution.v2.Digest digest = 1;
+    uint64 chunk_offset = 2;
+    bytes chunk_bytes = 3;
+    bytes chunk_sha256 = 4;
+    bool finish_chunk = 5;
+}
+
+/// #212 Phase 2.2: server response to a complete `WriteChunked` stream.
+/// Returned ONCE on success after the per-blob driver's commit path
+/// has run (synchronous-commit option α — design ambiguity resolved
+/// in Phase 2.2/2.3 implementation). The caller (worker, or any peer
+/// the server trusts via the existing worker auth path) may immediately
+/// reference the blob via `has` after receiving this response.
+///
+/// On stream error (per-chunk SHA-256 mismatch, length mismatch,
+/// end-to-end SHA-256 mismatch, mid-stream disconnect, ResourceExhausted
+/// admission) the server returns the error via the gRPC status; this
+/// message is only emitted on the success path.
+message WriteChunkedResponse {
+    build.bazel.remote.execution.v2.Digest committed_digest = 1;
+    uint64 committed_size = 2;
 }
