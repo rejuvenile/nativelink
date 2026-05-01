@@ -34,6 +34,13 @@ prost = { version = "0.14.3", default-features = false }
 prost-types = { version = "0.14.3", default-features = false, features = [
   "std",
 ] }
+# `sha2` is `optional` because it is only consumed by the
+# `chunked_fast_slow`-gated `WriteChunked` handler (per-chunk SHA-256
+# verify on `spawn_blocking`, #213 perf-opt NMA1). Default-feature
+# builds do not link sha2 into nativelink-service. Already a
+# dev-dependency below; the `optional = true` upgrade lets the gated
+# code path use it from the lib too.
+sha2 = { version = "0.10.8", default-features = false, features = ["asm"], optional = true }
 rand = { version = "0.9.0", default-features = false, features = [
   "thread_rng",
 ] }
@@ -67,6 +74,13 @@ failpoints = ["fail/failpoints"]
 # capacity-plumbing integration test can assert that BlobsAvailable
 # capacity fields reach the picker.
 test-utils = ["nativelink-store/test-utils"]
+# #212 Phase 2.2/2.3: server-side `WriteChunked` RPC handler + per-blob
+# `ChunkedDriver` behavior. Default OFF; production data path does not
+# consume it yet. Forwarded to nativelink-store so the chunked module
+# (driver, budget, filesystem adapters) compiles in too. Also enables
+# `sha2` (used by the per-chunk SHA-256 verify step on `spawn_blocking`
+# per #213 perf-opt NMA1).
+chunked_fast_slow = ["nativelink-store/chunked_fast_slow", "dep:sha2"]
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }

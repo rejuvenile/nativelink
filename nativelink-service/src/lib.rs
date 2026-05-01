@@ -17,6 +17,8 @@ pub mod bep_server;
 pub mod bytestream_server;
 pub mod capabilities_server;
 pub mod cas_server;
+#[cfg(feature = "chunked_fast_slow")]
+pub mod chunked_write_handler;
 pub mod execution_server;
 pub mod fetch_server;
 pub mod health_server;

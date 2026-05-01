@@ -105,6 +105,16 @@ pub struct WorkerApiServer {
     /// `mark_stable_has_with_results_failures` counter.
     #[metric(group = "worker_api")]
     metrics: Arc<WorkerApiMetrics>,
+    /// #212 Phase 2.2/2.3: optional handler for the `WriteChunked` RPC.
+    /// `None` when the `chunked_fast_slow` feature is OFF (the default)
+    /// or when the server config did not wire it in. With the handler
+    /// absent, the trait method's default impl returns
+    /// `Code::Unimplemented` to clients. With the feature OFF the field
+    /// itself is `cfg`-gated out so production binaries are byte-identical
+    /// to before this PR.
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_write_handler:
+        Option<Arc<crate::chunked_write_handler::ChunkedWriteHandler>>,
 }
 
 impl RootMetricsComponent for WorkerApiServer {}
@@ -252,6 +262,8 @@ impl WorkerApiServer {
             small_blob_dispatcher,
             endpoint_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             metrics: Arc::new(WorkerApiMetrics::default()),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_write_handler: None,
         })
     }
 
@@ -260,6 +272,19 @@ impl WorkerApiServer {
     /// mark_stable / backfill counters directly.
     pub fn metrics(&self) -> Arc<WorkerApiMetrics> {
         self.metrics.clone()
+    }
+
+    /// #212 Phase 2.2/2.3: install the WriteChunked handler. Server
+    /// wiring (in `src/bin/nativelink.rs`) calls this once at startup
+    /// when the feature flag is on AND the operator config requests
+    /// chunked writes. Without this call, `WriteChunked` returns
+    /// `Code::Unimplemented` (the trait's default impl).
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn install_chunked_write_handler(
+        &mut self,
+        handler: Arc<crate::chunked_write_handler::ChunkedWriteHandler>,
+    ) {
+        self.chunked_write_handler = Some(handler);
     }
 
     pub fn into_service(self) -> Server<Self> {
@@ -512,6 +537,32 @@ impl WorkerApi for WorkerApiServer {
             debug!(return = "Ok(<stream>)");
         }
         resp
+    }
+
+    /// #212 Phase 2.2: WriteChunked RPC override. Forwards to the
+    /// installed `ChunkedWriteHandler` when present; otherwise the
+    /// trait's default impl (called via `unimplemented` here) returns
+    /// `Code::Unimplemented`.
+    #[cfg(feature = "chunked_fast_slow")]
+    async fn write_chunked(
+        &self,
+        request: tonic::Request<
+            tonic::Streaming<
+                nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WriteChunk,
+            >,
+        >,
+    ) -> Result<
+        Response<
+            nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WriteChunkedResponse,
+        >,
+        Status,
+    > {
+        let Some(ref handler) = self.chunked_write_handler else {
+            return Err(Status::unimplemented(
+                "WriteChunked is not enabled on this server (no ChunkedWriteHandler installed)",
+            ));
+        };
+        handler.write_chunked(request).await
     }
 }
 
