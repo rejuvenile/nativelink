@@ -1386,7 +1386,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// `recv()` loop on each `ChunkWork` item. The `ChunkWork`'s
     /// `_permit` (held by the driver) is released when the driver
     /// drops the `ChunkWork`, which happens after this call returns.
-    pub(crate) async fn write_chunk_at_offset(
+    pub async fn write_chunk_at_offset(
         &self,
         digest: &DigestInfo,
         chunk_offset: u64,
@@ -1400,6 +1400,15 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             chunk_bytes,
         )
         .await
+    }
+
+    /// Read-only accessor for the content_path the store is rooted at.
+    /// Used by the Phase 2.3 chunked driver to compute the final CAS
+    /// path for end-to-end SHA-256 verification (re-reading the
+    /// committed file). Not on a hot path; metric / test use only
+    /// otherwise.
+    pub fn content_path_for_chunked(&self) -> &str {
+        &self.shared_context.content_path
     }
 
     /// Atomic finalize: verify the temp file's actual length matches
@@ -1419,7 +1428,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// Splitting commit-from-emplace this way lets the driver atomically
     /// validate-and-emplace under its own lock + bump metrics in one
     /// place.
-    pub(crate) async fn commit_chunked(
+    pub async fn commit_chunked(
         &self,
         digest: &DigestInfo,
         expected_size: u64,
@@ -1443,7 +1452,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     ///   failure.
     /// - The §6.7 termination triggers (panic, shutdown, retry
     ///   exhaustion).
-    pub(crate) async fn discard_chunked(&self, digest: &DigestInfo) -> Result<(), Error> {
+    pub async fn discard_chunked(&self, digest: &DigestInfo) -> Result<(), Error> {
         chunked_discard(&self.chunked_partials, digest).await
     }
 }

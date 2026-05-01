@@ -17,8 +17,13 @@ pub mod azure_blob_store;
 pub mod batch_read_coalescer;
 pub mod callback_utils;
 pub mod cas_utils;
+// `chunked` is `pub` (gated) so the `nativelink-service` crate's
+// `WriteChunked` RPC handler (Phase 2.2) can hold `ChunkedDriver` +
+// `ChunkBudget` directly without re-exporting through a wrapper. The
+// module is `dead_code`-allowed in Phase 1; Phase 2.2/2.3 wires the
+// consumer.
 #[cfg(feature = "chunked_fast_slow")]
-mod chunked;
+pub mod chunked;
 mod chunked_signal;
 pub mod common_s3_utils;
 pub mod completeness_checking_store;

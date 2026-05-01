@@ -49,7 +49,7 @@ use super::CHUNK_SIZE;
 /// `ChunkBudget::new`) so the metric formula
 /// `chunk_budget_used_bytes = (TOTAL - available) * CHUNK_SIZE` has
 /// a single source of truth.
-pub(crate) const TOTAL_CHUNK_PERMITS: usize = (4 * 1024 * 1024 * 1024) / CHUNK_SIZE;
+pub const TOTAL_CHUNK_PERMITS: usize = (4 * 1024 * 1024 * 1024) / CHUNK_SIZE;
 
 /// Global per-process byte budget for in-flight chunked traffic.
 ///
@@ -67,7 +67,7 @@ pub(crate) const TOTAL_CHUNK_PERMITS: usize = (4 * 1024 * 1024 * 1024) / CHUNK_S
 /// `Arc::clone` per admission, negligible vs the chunk's wire/disk
 /// I/O.
 #[derive(Debug)]
-pub(crate) struct ChunkBudget {
+pub struct ChunkBudget {
     /// `Arc` because every successful `try_acquire_chunk` clones the
     /// semaphore handle to mint an `OwnedSemaphorePermit` (which holds
     /// its own `Arc` to the underlying semaphore).
@@ -85,7 +85,7 @@ impl ChunkBudget {
     /// the constructor of whichever owner first registers the budget;
     /// see Phase 2 wiring for the chosen ownership model.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             sem: Arc::new(Semaphore::new(TOTAL_CHUNK_PERMITS)),
             rejections_total: AtomicU64::new(0),
@@ -104,7 +104,7 @@ impl ChunkBudget {
     /// dropped on driver-task panic — this is what makes the budget
     /// safe under arbitrary task death (see §6.7 termination triggers).
     #[must_use = "the permit must be held by the ChunkWork or dropped explicitly to release budget"]
-    pub(crate) fn try_acquire_chunk(&self) -> Option<OwnedSemaphorePermit> {
+    pub fn try_acquire_chunk(&self) -> Option<OwnedSemaphorePermit> {
         match Arc::clone(&self.sem).try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
@@ -119,7 +119,7 @@ impl ChunkBudget {
     /// race-free vs concurrent admission — a value of `N` does NOT
     /// guarantee the next `N` `try_acquire_chunk` calls all succeed.
     #[must_use]
-    pub(crate) fn available_chunks(&self) -> usize {
+    pub fn available_chunks(&self) -> usize {
         self.sem.available_permits()
     }
 
@@ -129,7 +129,7 @@ impl ChunkBudget {
     /// §13.1.1 point 1 step 2).
     #[must_use]
     #[allow(dead_code, reason = "wired in Phase 2 admission path")]
-    pub(crate) fn rejections_total(&self) -> u64 {
+    pub fn rejections_total(&self) -> u64 {
         self.rejections_total.load(Ordering::Relaxed)
     }
 }
@@ -162,8 +162,7 @@ static CHUNK_BUDGET_SINGLETON: OnceLock<ChunkBudget> = OnceLock::new();
 /// on first call. Phase 2 admission code calls this once per chunk
 /// arrival; the cost is one `OnceLock::get_or_init` (atomic load + a
 /// branch in the hot path after first call).
-#[allow(dead_code, reason = "Phase 1 SKELETON; consumers land in Phase 2 (#212)")]
-pub(crate) fn chunk_budget_singleton() -> &'static ChunkBudget {
+pub fn chunk_budget_singleton() -> &'static ChunkBudget {
     CHUNK_BUDGET_SINGLETON.get_or_init(ChunkBudget::new)
 }
 

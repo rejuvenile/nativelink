@@ -30,16 +30,15 @@
 //! build).
 
 #![cfg(feature = "chunked_fast_slow")]
-// Phase 1 ships infrastructure with no production call-sites — every
-// public-in-module item is only consumed by the Phase 1 test harness.
-// Phase 2 PRs replace this allow with real wiring (admission point in
-// FastSlowStore, driver storage in BlobInFlightState, metric
-// registration in cas_STORE).
-#![allow(dead_code, reason = "Phase 1 SKELETON; consumers land in Phase 2 (#212)")]
+// Phase 2.2/2.3 wires the consumer (`nativelink-service`'s WriteChunked
+// RPC handler). Some items remain dead-code-allowed because they are
+// future-Phase observation hooks (e.g. `chunks_received()` for the
+// metric gauge wiring in Phase 2.5+).
+#![allow(dead_code, reason = "Phase 2.2/2.3 wires part of this; Phase 2.5+ wires the rest (#212)")]
 
-pub(crate) mod chunk_budget;
-pub(crate) mod chunked_driver;
-pub(crate) mod chunked_filesystem;
+pub mod chunk_budget;
+pub mod chunked_driver;
+pub mod chunked_filesystem;
 
 /// Fixed chunk size for the #212 chunked transport / on-disk layout.
 ///
@@ -50,7 +49,7 @@ pub(crate) mod chunked_filesystem;
 /// changing the chunk size would change the wire-stable contract for
 /// `BackpressureSignal` permit weighting AND for the on-disk sparse
 /// file layout.
-pub(crate) const CHUNK_SIZE: usize = 1024 * 1024;
+pub const CHUNK_SIZE: usize = 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

@@ -12,156 +12,244 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Per-blob driver task SKELETON for the #212 chunked architecture.
+//! Phase 2.3: per-blob driver task that consumes `ChunkWork` items from
+//! a bounded mpsc, performs the slow-tier `pwrite` via the
+//! FilesystemStore adapters, tracks per-chunk arrival in an in-memory
+//! sidecar bitmap, and finalizes via `commit_chunked` (with end-to-end
+//! SHA-256 verification per design §8.3.1) or `discard_chunked` on
+//! failure.
 //!
-//! This is INFRASTRUCTURE ONLY — Phase 1 ships the spawn/lifecycle/drop
-//! plumbing with NO behavior. The receive loop currently increments a
-//! counter and drops each `ChunkWork`; it does NOT write to slow tier,
-//! does NOT touch `failed_writes`, does NOT update sidecar state. Those
-//! semantics arrive in Phase 2 alongside the FilesystemStore
-//! `pwrite`-at-offset APIs (§7.1) and the FastSlowStore admission
-//! point (§6.1).
+//! Lifecycle (per design §6.7 termination contract):
 //!
-//! The shape we DO commit to in Phase 1, because every later phase
-//! depends on it (see §6.7 termination contract):
+//! - **Trigger (a) — happy path:** the upstream RPC handler closes the
+//!   sender after admitting the final `finish` chunk. The driver
+//!   processes any remaining chunks, then `recv() → None`. If
+//!   `finish_seen` is true, the driver attempts `commit` and signals
+//!   the result on the `completion_tx` oneshot. Then exits cleanly.
+//! - **Trigger (b) — shutdown:** parent drops `ChunkedDriver`. The
+//!   `JoinHandleDropGuard` aborts the spawned task. Any in-flight
+//!   partial is left on disk (legacy `prune_temp_path` GCs it on next
+//!   `FilesystemStore::new`).
+//! - **Trigger (c) — bounded retry exhausted:** per-chunk SHA-256
+//!   mismatch OR commit-time end-to-end SHA-256 mismatch. The driver
+//!   discards the partial, signals the error on `completion_tx`, and
+//!   exits.
+//! - **Trigger (d) — panic safety:** any panic inside the spawned task
+//!   propagates through `JoinHandleDropGuard`'s `JoinError`. The driver
+//!   on-panic owes nothing to the filesystem (the pwrite was either
+//!   atomic-success or atomic-failure at the syscall boundary; the
+//!   state map entry remains and `prune_temp_path` GCs it on restart).
 //!
-//! - The driver task is `tokio::spawn`'d on first chunk arrival; the
-//!   returned `JoinHandle` is wrapped in a `JoinHandleDropGuard`.
-//! - Each `ChunkWork` carries an `OwnedSemaphorePermit` from the
-//!   `ChunkBudget`. Permit lifetime = `ChunkWork` lifetime; on
-//!   driver-task panic the permit drops automatically (no separate
-//!   reclamation path).
-//! - The mpsc is bounded at 16 per Q4. Phase 2 admission code calls
-//!   `try_send` (never `send().await`) so a full per-blob mpsc surfaces
-//!   as a `BackpressureSignal { reason: PER_BLOB_MPSC_FULL }` instead
-//!   of upstream-blocking — that's the §13.1.1 point 1 trap shape.
-//! - Drop closes the mpsc (sender side) and awaits the join via the
-//!   guard, per §6.7 termination trigger (d) (panic) and (b)
-//!   (shutdown).
+//! Anti-#203 invariant (design §6.7):
+//!   `update()` MUST NOT block on slow-tier drain.
+//! For the WriteChunked RPC the upstream caller IS the producer
+//! (worker), so the RPC handler explicitly OPTS-IN to wait on the
+//! commit via `await_completion()` — the driver itself does not couple
+//! the upstream RPC's `Ok(WriteChunkedResponse)` to anything beyond
+//! the commit it is performing on behalf of THAT RPC. The historical
+//! #203 cascade (Bazel-facing FastSlowStore::update synchronously
+//! awaiting the slow tier) is a different code path and remains async.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use nativelink_error::{Code, Error, make_err};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::spawn;
 use nativelink_util::task::JoinHandleDropGuard;
+use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc;
-use tracing::trace;
+use tokio::sync::oneshot;
+use tracing::{debug, error, info, trace, warn};
+
+use crate::filesystem_store::{FileEntry, FilesystemStore};
 
 /// Per-blob mpsc capacity. Q4: 16 chunks-in-flight per blob is the
 /// upper bound on per-blob memory pressure (16 × 1 MiB = 16 MiB).
 /// Together with the global `ChunkBudget` cap this gives a 12-16 GiB
 /// worst-case server RSS bound (§13.2).
-pub(crate) const PER_BLOB_MPSC_CAP: usize = 16;
+pub const PER_BLOB_MPSC_CAP: usize = 16;
 
-/// One unit of work consumed by the per-blob driver. Carries the chunk
-/// payload + metadata + the `ChunkBudget` permit minted at admission.
-/// Phase 2 driver code will: (a) write the chunk to the slow tier at
-/// `chunk_offset` via FilesystemStore's `pwrite`-at-offset API
-/// (§7.1), (b) verify `chunk_sha256`, (c) record arrival in the
-/// in-memory sidecar bitmap (§7.2), (d) drop the permit on
-/// completion. Phase 1 just drops the whole struct on receive.
+/// One unit of work consumed by the per-blob driver.
+///
+/// Carries the chunk payload + per-chunk SHA-256 (already verified at
+/// admission time per #213 perf-opt NMA1, on a `spawn_blocking` so the
+/// hash burn does not block a tokio worker) + the `ChunkBudget`
+/// `OwnedSemaphorePermit` minted at admission.
+///
+/// `finish` marks the FINAL chunk of the blob. The driver waits until
+/// every chunk in the bitmap has landed, then runs commit + end-to-end
+/// SHA-256 verification.
+///
+/// Permit lifetime = `ChunkWork` lifetime; on driver-task panic the
+/// permit drops automatically (no separate reclamation path).
 #[derive(Debug)]
-pub(crate) struct ChunkWork {
-    pub(crate) chunk_offset: u64,
-    pub(crate) chunk_bytes: Bytes,
-    pub(crate) chunk_sha256: [u8; 32],
+pub struct ChunkWork {
+    pub chunk_offset: u64,
+    pub chunk_bytes: Bytes,
+    pub chunk_sha256: [u8; 32],
+    /// True iff this is the LAST chunk of the blob. Triggers commit
+    /// once all preceding chunks have landed.
+    pub finish: bool,
     /// Permit lifetime = `ChunkWork` lifetime. Per §13.1.1 point 1:
     /// admission moved this permit out of the global `ChunkBudget`
     /// into the `ChunkWork`; dropping the work releases the permit.
-    /// Intentionally `_`-prefixed here since Phase 1 just drops it.
-    pub(crate) _permit: OwnedSemaphorePermit,
+    pub _permit: OwnedSemaphorePermit,
 }
 
-/// Sender half of the per-blob mpsc. Phase 2 admission code holds one
-/// of these per in-flight blob and `try_send`s `ChunkWork` items.
+/// Sender half of the per-blob mpsc.
+///
 /// Closing the sender (drop) is the §6.7 happy-path termination
 /// trigger — the driver loop exits cleanly when the channel closes.
-pub(crate) type ChunkWorkSender = mpsc::Sender<ChunkWork>;
+pub type ChunkWorkSender = mpsc::Sender<ChunkWork>;
 
-/// Per-blob driver task handle. The `JoinHandleDropGuard` ensures the
-/// task is aborted on `Drop` (panic-safety belt for §6.7 trigger d).
-/// In the happy path the task exits before drop because the mpsc
-/// closes when admission drops its sender.
+/// Result of a complete chunked write.
+#[derive(Debug, Clone)]
+pub struct ChunkedCommitResult {
+    /// Total bytes committed. Equals the digest's declared size on
+    /// success (the commit refuses to rename when actual length differs
+    /// from declared size — see `commit_chunked` adapter).
+    pub committed_size: u64,
+}
+
+/// Per-blob in-memory sidecar state per design §7.2 (in-memory only
+/// per v4.5; no on-disk sidecar).
 ///
-/// Phase 1 exposes:
-/// - `spawn_driver(digest, capacity)` — spawns the task, returns
-///   `(ChunkedDriver, ChunkWorkSender)`.
-/// - `chunks_received()` — observability for tests + the metric
-///   gauge wiring in Phase 2.
+/// Tracks which chunks have landed via offset-keyed `BTreeSet`. The
+/// commit code path waits until `landed_offsets` has the cardinality
+/// equal to the expected chunk count, then verifies full coverage.
 ///
-/// NOT yet stored anywhere. Phase 2 adds a `BlobInFlightState` map
-/// keyed by `DigestInfo` that owns `ChunkedDriver` per-blob.
+/// `parking_lot::Mutex` is correct: every critical section is short
+/// (insert + check) and never holds across an `.await`.
+#[derive(Debug, Default)]
+struct SidecarState {
+    /// Set of byte-offsets where chunks have successfully landed on
+    /// disk. The handler may admit chunks out-of-order, so we cannot
+    /// just count `n == expected_chunks` — we must track WHICH
+    /// offsets have landed to detect coverage gaps.
+    landed_offsets: BTreeSet<u64>,
+    /// True once the final chunk has been received. The driver does
+    /// NOT commit until both (a) `finish_seen == true` AND
+    /// (b) every expected offset has landed.
+    finish_seen: bool,
+}
+
+/// Per-blob driver task handle.
+///
+/// The `JoinHandleDropGuard` ensures the task is aborted on `Drop`
+/// (panic-safety belt for §6.7 trigger d). In the happy path the task
+/// exits before drop because the mpsc closes when admission drops its
+/// sender AND the commit completes.
+///
+/// Holds a `oneshot::Receiver` for the commit-result so the upstream
+/// RPC handler can `await_completion()` (synchronous-commit option α
+/// per Phase 2.2/2.3 design call).
 #[derive(Debug)]
-pub(crate) struct ChunkedDriver {
-    /// Identifies the blob this driver belongs to. Phase 2 logging /
-    /// metrics will scope by digest; today it's load-bearing only for
-    /// observability spans.
+pub struct ChunkedDriver {
+    /// Identifies the blob this driver belongs to. Logging / metrics
+    /// will scope by digest.
     digest: DigestInfo,
-    /// Counter incremented on every `ChunkWork` received. Pinned in
-    /// Phase 1 so the test harness can observe what the driver did
-    /// without instrumenting the whole spawn lifecycle.
+    /// Counter incremented on every `ChunkWork` received. Used by
+    /// tests + the metric gauge wiring in Phase 2.5+.
     chunks_received: Arc<AtomicU64>,
+    /// Counter incremented on every chunk that lands successfully on
+    /// disk. Diverges from `chunks_received` on per-chunk-write
+    /// failure (the chunk was received but the pwrite errored).
+    chunks_committed: Arc<AtomicU64>,
     /// Flipped to `true` by the spawned task IMMEDIATELY after the
-    /// `recv()` loop exits cleanly (mpsc closed). Load-bearing for
-    /// the §6.7 trigger (a) regression test: distinguishes "driver
-    /// observed `recv() → None` and exited" from "driver wedged in an
-    /// infinite loop after consuming all chunks." Without this flag
-    /// the happy-path exit contract ships untested at the unit
-    /// boundary (the chunks_received and budget-recovery signals fire
-    /// even if the loop never exits).
+    /// `recv()` loop exits. Load-bearing for the §6.7 trigger (a)
+    /// regression test.
     loop_exited: Arc<AtomicBool>,
+    /// Receiver for the commit-result. The upstream RPC handler
+    /// awaits this AFTER admitting the final chunk to learn whether
+    /// the commit succeeded. The Sender lives inside the spawned
+    /// task; on driver-task panic the Sender drops and the Receiver
+    /// observes `Err(_)` (which the handler maps to `Code::Internal`).
+    completion_rx: parking_lot::Mutex<Option<oneshot::Receiver<Result<ChunkedCommitResult, Error>>>>,
     /// Drop guard for the spawned task. On `Drop` of `ChunkedDriver`,
     /// the join handle is `abort()`'d if still running (§6.7 panic
-    /// belt). `JoinHandleDropGuard` is `must_use`, hence the
-    /// `_handle` name to make the never-awaited intent explicit;
-    /// Phase 2 may explicitly `await` it during shutdown drain.
+    /// belt).
     _handle: JoinHandleDropGuard<()>,
 }
 
 impl ChunkedDriver {
-    /// Spawn the per-blob driver task. Returns the driver handle plus
-    /// the sender side of the bounded mpsc. The receiver side moves
-    /// into the spawned task. `capacity` is the mpsc bound; admission
-    /// code MUST pass `PER_BLOB_MPSC_CAP` in production — the
-    /// argument is here so Phase 1 tests can exercise smaller channels
-    /// without a 16-`ChunkWork` setup.
+    /// Spawn the per-blob driver task.
     ///
-    /// The spawned task is the SKELETON loop: receive → increment
-    /// counter → drop. NO slow-tier I/O. Phase 2 will replace the
-    /// drop with the §7.1 `pwrite_at_offset` call.
-    pub(crate) fn spawn_driver(
+    /// `filesystem_store` is the slow-tier backend. `digest` identifies
+    /// the blob. `expected_size` is the declared blob length (from the
+    /// digest); the driver uses it to compute the expected chunk count
+    /// and to pass to `commit_chunked` for length validation.
+    /// `capacity` is the mpsc bound; admission code MUST pass
+    /// `PER_BLOB_MPSC_CAP` in production — the argument is here so
+    /// tests can exercise smaller channels without a 16-`ChunkWork`
+    /// setup.
+    ///
+    /// `chunk_size` is the contractual chunk size used to compute the
+    /// expected chunk-count for the bitmap completeness check. Production
+    /// uses `super::CHUNK_SIZE` (1 MiB); tests can pass smaller values
+    /// so a 12 KiB blob exercises real out-of-order arrival logic.
+    pub fn spawn_driver<Fe: FileEntry>(
+        filesystem_store: Arc<FilesystemStore<Fe>>,
         digest: DigestInfo,
+        expected_size: u64,
+        chunk_size: usize,
         capacity: usize,
     ) -> (Self, ChunkWorkSender) {
-        let (tx, mut rx) = mpsc::channel::<ChunkWork>(capacity);
+        let (tx, rx) = mpsc::channel::<ChunkWork>(capacity);
         let chunks_received = Arc::new(AtomicU64::new(0));
-        let chunks_received_for_task = Arc::clone(&chunks_received);
+        let chunks_committed = Arc::new(AtomicU64::new(0));
         let loop_exited = Arc::new(AtomicBool::new(false));
+        let (completion_tx, completion_rx) = oneshot::channel();
+
+        let chunks_received_for_task = Arc::clone(&chunks_received);
+        let chunks_committed_for_task = Arc::clone(&chunks_committed);
         let loop_exited_for_task = Arc::clone(&loop_exited);
 
-        let handle = spawn!("212_chunked_driver_skeleton", async move {
-            // Receive loop. Each iteration: take one ChunkWork, bump
-            // the counter, drop. The drop releases the permit (Q8 budget
-            // returned). Loop exits when the sender side drops (§6.7
-            // happy-path / shutdown trigger).
-            while let Some(work) = rx.recv().await {
-                chunks_received_for_task.fetch_add(1, Ordering::Relaxed);
+        // Compute the expected chunk count from declared size + chunk
+        // size. For a blob of N bytes with chunk size C, the expected
+        // count is `ceil(N / C)`. A zero-byte blob has zero chunks
+        // (the producer should send a single `finish` chunk with
+        // empty bytes; the driver handles this as the "no offsets
+        // ever landed" path that still triggers commit).
+        let expected_chunk_count = if expected_size == 0 {
+            0
+        } else {
+            let chunk_size_u64 = chunk_size as u64;
+            usize::try_from(expected_size.div_ceil(chunk_size_u64))
+                .expect("ceil(expected_size / chunk_size) must fit in usize for any practical blob")
+        };
+
+        let handle = spawn!("212_chunked_driver", async move {
+            let sidecar: Arc<Mutex<SidecarState>> = Arc::new(Mutex::new(SidecarState::default()));
+            let task_result = run_driver(
+                rx,
+                filesystem_store,
+                digest,
+                expected_size,
+                expected_chunk_count,
+                Arc::clone(&sidecar),
+                Arc::clone(&chunks_received_for_task),
+                Arc::clone(&chunks_committed_for_task),
+            )
+            .await;
+            // Send commit result. The Receiver may have been dropped
+            // (caller didn't care about the result, or panic'd); ignore
+            // the send-error in that case — the result is logged below
+            // on Err for diagnostic completeness.
+            if let Err(send_err) = completion_tx.send(task_result.clone()) {
                 trace!(
                     target: "nativelink_store::chunked",
-                    chunk_offset = work.chunk_offset,
-                    chunk_len = work.chunk_bytes.len(),
-                    "phase1 skeleton: dropping chunk (no slow-tier write yet)",
+                    "completion_tx receiver dropped before driver finished; result was: {:?}",
+                    send_err,
                 );
-                drop(work);
             }
             // Load-bearing for the §6.7 trigger (a) regression test:
-            // signals the recv loop observed `None` and is about to
-            // return. MUST be the last statement before the spawned
-            // future returns. Comment this out to red-fail
-            // `driver_drains_chunks_then_exits_cleanly_on_sender_drop`.
+            // signals the recv loop has returned. MUST be the last
+            // statement before the spawned future returns.
             loop_exited_for_task.store(true, Ordering::Release);
         });
 
@@ -169,49 +257,372 @@ impl ChunkedDriver {
             Self {
                 digest,
                 chunks_received,
+                chunks_committed,
                 loop_exited,
+                completion_rx: parking_lot::Mutex::new(Some(completion_rx)),
                 _handle: handle,
             },
             tx,
         )
     }
 
-    /// Observation hook for Phase 1 tests. Phase 2 will export this as
+    /// Take the completion receiver. Returns `None` on the second call;
+    /// upstream code is expected to await the result exactly once.
+    /// Returns `Err(Code::Internal)` if the spawned task dropped the
+    /// Sender without sending (driver-task panic).
+    pub async fn await_completion(&self) -> Result<ChunkedCommitResult, Error> {
+        let rx = self
+            .completion_rx
+            .lock()
+            .take()
+            .ok_or_else(|| make_err!(Code::Internal, "ChunkedDriver::await_completion called twice"))?;
+        match rx.await {
+            Ok(result) => result,
+            Err(_recv_err) => Err(make_err!(
+                Code::Internal,
+                "ChunkedDriver task ended without signalling commit result (driver task panicked or aborted)"
+            )),
+        }
+    }
+
+    /// Observation hook. Phase 2.5+ will export this as
     /// `chunked_chunks_received_total{digest=...}` per-blob.
     #[must_use]
-    pub(crate) fn chunks_received(&self) -> u64 {
+    pub fn chunks_received(&self) -> u64 {
         self.chunks_received.load(Ordering::Relaxed)
     }
 
-    /// Observation hook for the §6.7 trigger (a) regression test:
-    /// returns `true` once the spawned receive loop has observed
-    /// `recv() → None` and is about to return. NOT meaningful before
-    /// that — the test must poll under `tokio::time::timeout` after
-    /// dropping the sender. Phase 2 may also use this for a graceful
-    /// shutdown drain check.
+    /// Observation hook. Phase 2.5+ will export this as
+    /// `chunked_chunks_committed_total{digest=...}` per-blob.
     #[must_use]
-    #[allow(dead_code, reason = "test-only observation; Phase 2 may use during drain")]
-    pub(crate) fn loop_exited(&self) -> bool {
+    pub fn chunks_committed(&self) -> u64 {
+        self.chunks_committed.load(Ordering::Relaxed)
+    }
+
+    /// Observation hook for the §6.7 trigger (a) regression test:
+    /// returns `true` once the spawned task's recv loop has returned.
+    /// Phase 2 may also use this for a graceful shutdown drain check.
+    #[must_use]
+    pub fn loop_exited(&self) -> bool {
         self.loop_exited.load(Ordering::Acquire)
     }
 
-    /// Read-only accessor used by Phase 2 logging / metric labels.
+    /// Read-only accessor used by logging / metric labels.
     #[must_use]
-    #[allow(dead_code, reason = "wired in Phase 2 driver instrumentation")]
-    pub(crate) fn digest(&self) -> &DigestInfo {
+    pub fn digest(&self) -> &DigestInfo {
         &self.digest
     }
+}
+
+/// The per-blob driver loop. Pulled out of `spawn_driver` so the body
+/// can early-return via `?` and the post-loop completion-tx + `loop_exited`
+/// flag can be set from the SAME closure regardless of the result.
+///
+/// On per-chunk error: returns `Err`, the Sender drops, the upstream
+/// handler sees `Code::*`. The driver does NOT auto-discard mid-stream
+/// — chunks already on disk remain so a retry CAN reuse them (Phase
+/// 2.x retry path will be wired in a later phase). For Phase 2.3 the
+/// caller is expected to issue `discard_chunked` on the FilesystemStore
+/// directly when its commit returns Err.
+///
+/// `expected_chunk_count == 0` corresponds to a zero-byte blob; the
+/// driver still expects a single `finish` chunk (with empty bytes) and
+/// commits with `expected_size = 0`.
+async fn run_driver<Fe: FileEntry>(
+    mut rx: mpsc::Receiver<ChunkWork>,
+    filesystem_store: Arc<FilesystemStore<Fe>>,
+    digest: DigestInfo,
+    expected_size: u64,
+    expected_chunk_count: usize,
+    sidecar: Arc<Mutex<SidecarState>>,
+    chunks_received: Arc<AtomicU64>,
+    chunks_committed: Arc<AtomicU64>,
+) -> Result<ChunkedCommitResult, Error> {
+    while let Some(work) = rx.recv().await {
+        chunks_received.fetch_add(1, Ordering::Relaxed);
+        let ChunkWork {
+            chunk_offset,
+            chunk_bytes,
+            chunk_sha256,
+            finish,
+            _permit,
+        } = work;
+
+        let chunk_len = chunk_bytes.len();
+        trace!(
+            target: "nativelink_store::chunked",
+            ?digest,
+            chunk_offset,
+            chunk_len,
+            finish,
+            "driver received chunk",
+        );
+
+        // Per design §8.3.1: per-chunk SHA-256 is verified at the RPC
+        // handler (admission) on `spawn_blocking` per #213 perf-opt
+        // NMA1, so the driver does not re-verify. We DO carry
+        // `chunk_sha256` here for diagnostic correlation if a future
+        // phase wants to defer verification or re-verify after retry.
+        let _ = chunk_sha256;
+
+        // Write the chunk via the FilesystemStore adapter (which is
+        // already on `spawn_blocking` internally — see
+        // `chunked_filesystem::write_chunk_at_offset`).
+        let bytes_for_write = chunk_bytes.clone();
+        if let Err(write_err) = filesystem_store
+            .write_chunk_at_offset(&digest, chunk_offset, bytes_for_write)
+            .await
+        {
+            warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                chunk_offset,
+                chunk_len,
+                ?write_err,
+                "chunked driver: per-chunk pwrite failed; aborting blob",
+            );
+            // Abort the blob: discard the partial. Best-effort;
+            // discard errors are logged but not surfaced (the original
+            // write error is the operator-actionable one).
+            if let Err(discard_err) = filesystem_store.discard_chunked(&digest).await {
+                error!(
+                    target: "nativelink_store::chunked",
+                    ?digest,
+                    ?discard_err,
+                    "chunked driver: discard after per-chunk write failure also failed",
+                );
+            }
+            return Err(write_err);
+        }
+        chunks_committed.fetch_add(1, Ordering::Relaxed);
+
+        // Update the in-memory sidecar bitmap. parking_lot::Mutex
+        // critical section is just an insert + a flag set; never
+        // crosses an `.await`.
+        {
+            let mut state = sidecar.lock();
+            let inserted = state.landed_offsets.insert(chunk_offset);
+            if !inserted {
+                // Duplicate offset — this is a producer protocol
+                // error (the WriteChunked schema says each chunk has a
+                // unique offset). We tolerate the pwrite (idempotent
+                // at the syscall level) but log a warning.
+                warn!(
+                    target: "nativelink_store::chunked",
+                    ?digest,
+                    chunk_offset,
+                    "chunked driver: duplicate offset received; producer protocol violation",
+                );
+            }
+            if finish {
+                state.finish_seen = true;
+            }
+        }
+
+        // If finish has been seen AND every expected offset has landed,
+        // attempt commit. We re-check inside the lock to avoid racing
+        // with another finish-arrival (which shouldn't happen since
+        // the producer only sends one finish chunk, but we are
+        // defensive).
+        let ready_to_commit = {
+            let state = sidecar.lock();
+            state.finish_seen && state.landed_offsets.len() == expected_chunk_count
+        };
+        if ready_to_commit {
+            return commit_and_verify(&filesystem_store, &digest, expected_size).await;
+        }
+    }
+
+    // The mpsc closed without commit triggering. Two cases:
+    //  (i) `finish_seen == false`: upstream RPC dropped before the
+    //      final chunk arrived. The partial is left on disk for
+    //      `prune_temp_path` to GC on next FilesystemStore::new (per
+    //      Q7=(c) drop-partial-recoverable-read).
+    //  (ii) `finish_seen == true` but coverage incomplete: producer
+    //       protocol violation (sent `finish` before all chunks). The
+    //       partial is ALSO left on disk; the operator-visible error
+    //       below tells them why.
+    let state = sidecar.lock();
+    if state.finish_seen {
+        let landed = state.landed_offsets.len();
+        warn!(
+            target: "nativelink_store::chunked",
+            ?digest,
+            landed,
+            expected_chunk_count,
+            "chunked driver: finish observed but coverage incomplete; not committing"
+        );
+        Err(make_err!(
+            Code::InvalidArgument,
+            "chunked write protocol violation: finish observed with {landed}/{expected_chunk_count} chunks"
+        ))
+    } else {
+        debug!(
+            target: "nativelink_store::chunked",
+            ?digest,
+            received = chunks_received.load(Ordering::Relaxed),
+            "chunked driver: upstream dropped without finish; not committing",
+        );
+        Err(make_err!(
+            Code::Aborted,
+            "chunked write upstream dropped without finish; not committing"
+        ))
+    }
+}
+
+/// Run the final commit + end-to-end SHA-256 verify per design §8.3.1.
+///
+/// Steps:
+/// 1. `commit_chunked` — atomic rename + length validation.
+/// 2. Re-read the committed file on `spawn_blocking` and compute its
+///    SHA-256 (per design §8.3.1).
+/// 3. If the SHA-256 matches `digest.packed_hash()`, return success.
+/// 4. If mismatched, the file IS the canonical CAS file at this point
+///    (commit already renamed). Best-effort `remove_file` then return
+///    InvalidArgument.
+///
+/// Note: this runs the SHA-256 on `spawn_blocking` per #213 perf-opt
+/// NMA1; SHA-256 of a multi-MiB blob at line rate burns CPU cycles
+/// that should not block a tokio worker.
+async fn commit_and_verify<Fe: FileEntry>(
+    filesystem_store: &Arc<FilesystemStore<Fe>>,
+    digest: &DigestInfo,
+    expected_size: u64,
+) -> Result<ChunkedCommitResult, Error> {
+    // Step 1: atomic commit (rename + length check).
+    if let Err(commit_err) = filesystem_store.commit_chunked(digest, expected_size).await {
+        warn!(
+            target: "nativelink_store::chunked",
+            ?digest,
+            ?commit_err,
+            "chunked driver: commit_chunked failed; discarding partial"
+        );
+        // Discard the partial so we don't leak. commit_chunked leaves
+        // the temp file in place on length-mismatch per spec.
+        if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
+            error!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                ?discard_err,
+                "chunked driver: discard after commit failure also failed",
+            );
+        }
+        return Err(commit_err);
+    }
+
+    // Step 2: end-to-end SHA-256 over the committed file.
+    let final_path = crate::filesystem_store::digest_content_path(
+        filesystem_store.content_path_for_chunked(),
+        digest,
+    );
+    let final_path_pb = std::path::PathBuf::from(&final_path);
+    let computed = tokio::task::spawn_blocking({
+        let path = final_path_pb.clone();
+        move || -> Result<[u8; 32], std::io::Error> {
+            // sha2's `Sha256::digest(slice)` would require loading the
+            // whole file into memory; for a 100 MiB blob that is 100 MiB
+            // of allocation. Stream via `std::io::Read` + `Sha256::update`
+            // to keep peak memory at the read-buffer size only.
+            use std::io::Read;
+            let mut file = std::fs::File::open(&path)?;
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            let out = hasher.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(out.as_ref());
+            Ok(bytes)
+        }
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(
+            Code::Internal,
+            "spawn_blocking join error in commit-time SHA-256: {join_err:?}"
+        )
+    })?
+    .map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "failed to re-read committed file for SHA-256 verification: {io_err:?}"
+        )
+    })?;
+
+    // `packed_hash()` returns `&PackedHash`, which derefs to `&[u8; 32]`.
+    // The double-deref + Copy gives an owned `[u8; 32]` for comparison.
+    let declared: [u8; 32] = **digest.packed_hash();
+    if computed != declared {
+        // End-to-end hash mismatch — the per-chunk hashes all passed
+        // but the assembled file does not match the declared digest.
+        // Per spec: discard the WHOLE blob (not retain). Best-effort
+        // remove_file; the file path exists at the canonical CAS path.
+        warn!(
+            target: "nativelink_store::chunked",
+            ?digest,
+            computed = ?hex::encode(computed),
+            declared = ?hex::encode(declared),
+            "chunked driver: end-to-end SHA-256 mismatch; discarding committed file"
+        );
+        let path_for_unlink = final_path_pb.clone();
+        let unlink_result = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+            match std::fs::remove_file(&path_for_unlink) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
+        if let Err(join_err) = unlink_result {
+            error!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                ?join_err,
+                "chunked driver: spawn_blocking join error during post-mismatch unlink",
+            );
+        } else if let Ok(Err(io_err)) = unlink_result {
+            error!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                ?io_err,
+                "chunked driver: failed to unlink committed file after SHA-256 mismatch",
+            );
+        }
+        return Err(make_err!(
+            Code::InvalidArgument,
+            "chunked write end-to-end SHA-256 mismatch for digest {digest}"
+        ));
+    }
+
+    info!(
+        target: "nativelink_store::chunked",
+        ?digest,
+        size = expected_size,
+        "chunked driver: blob committed + SHA-256 verified"
+    );
+    Ok(ChunkedCommitResult {
+        committed_size: expected_size,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use core::time::Duration;
 
+    use bytes::Bytes;
+    use nativelink_config::stores::FilesystemSpec;
     use nativelink_macro::nativelink_test;
     use nativelink_util::common::DigestInfo;
+    use sha2::{Digest as _, Sha256};
 
     use super::super::chunk_budget::ChunkBudget;
     use super::{ChunkWork, ChunkedDriver, PER_BLOB_MPSC_CAP};
+    use crate::filesystem_store::{FileEntryImpl, FilesystemStore};
 
     /// Capacity constant pin: any change is ARCHITECTURAL — re-read
     /// design §4 Q4 before bumping.
@@ -220,123 +631,335 @@ mod tests {
         assert_eq!(PER_BLOB_MPSC_CAP, 16);
     }
 
-    /// Send three chunks through the driver, close the sender, and
-    /// wait for the driver to drain + exit. Per CLAUDE.md timeout
-    /// discipline the test is wrapped in `tokio::time::timeout(2s)`
-    /// and the failure message names the contract that was violated
-    /// (§6.7 termination trigger (a)/(d): driver MUST exit when the
-    /// mpsc closes).
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let out = h.finalize();
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&out);
+        a
+    }
+
+    /// Build a real `FilesystemStore` rooted at a fresh per-test temp
+    /// directory. Returns the store + content_path so tests can stat
+    /// the final CAS file directly.
+    async fn make_test_store() -> (
+        std::sync::Arc<FilesystemStore<FileEntryImpl>>,
+        String,
+    ) {
+        let base = std::env::var("TEST_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string());
+        let nonce: u64 = rand::random();
+        let content_path = format!("{base}/{nonce}/chunked-driver-test/content");
+        let temp_path = format!("{base}/{nonce}/chunked-driver-test/temp");
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path,
+            eviction_policy: None,
+            block_size: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("FilesystemStore::new must succeed");
+        (std::sync::Arc::new(store), content_path)
+    }
+
+    /// Driver receives 3 chunks IN ORDER + finish → commits successfully
+    /// AND the committed file's SHA-256 matches the digest.
     #[nativelink_test]
-    async fn driver_drains_chunks_then_exits_cleanly_on_sender_drop() {
-        let budget = ChunkBudget::new();
-        let digest = DigestInfo::new([0x42u8; 32], 3 * 1024 * 1024);
-        let (driver, tx) = ChunkedDriver::spawn_driver(digest, PER_BLOB_MPSC_CAP);
+    async fn driver_in_order_chunks_then_finish_commits_with_sha256_verify() {
+        const CHUNK: usize = 4 * 1024;
+        const N: usize = 3;
+        let total = (N * CHUNK) as u64;
 
-        // Send 3 ChunkWorks. Permits come from the live ChunkBudget so
-        // the test exercises the real admission shape.
-        for i in 0..3u64 {
-            let permit = budget
-                .try_acquire_chunk()
-                .expect("ChunkBudget must admit 3 permits in a fresh budget");
-            tx.send(ChunkWork {
-                chunk_offset: i * (1024 * 1024),
-                chunk_bytes: bytes::Bytes::from(vec![0u8; 1024 * 1024]),
-                chunk_sha256: [0u8; 32],
-                _permit: permit,
-            })
-            .await
-            .expect("driver mpsc receiver must still be alive");
+        // Build the blob bytes + the matching digest so the SHA-256
+        // verify path actually succeeds.
+        let mut blob = Vec::with_capacity(N * CHUNK);
+        for i in 0..N {
+            blob.extend(std::iter::repeat(0xa0u8 + i as u8).take(CHUNK));
         }
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
 
-        // Wait for all 3 to be received before triggering shutdown.
-        // Polling loop with explicit timeout per CLAUDE.md (no sleep
-        // as synchronization).
-        let drained = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if driver.chunks_received() == 3 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        drained.expect(
-            "driver must process 3 chunks within 2s — \
-             skeleton receive loop is broken or never spawned",
+        let (store, content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+
+        let (driver, tx) = ChunkedDriver::spawn_driver(
+            store.clone(),
+            digest,
+            total,
+            CHUNK,
+            PER_BLOB_MPSC_CAP,
         );
 
-        // Drop the sender. The driver's `rx.recv().await` MUST return
-        // None and the task must exit. We assert on `loop_exited()` —
-        // a flag flipped to `true` by the spawned task IMMEDIATELY
-        // after the recv loop returns. Permit-recovery alone CANNOT
-        // distinguish "loop exited cleanly" from "loop wedged after
-        // consuming all chunks" because all 3 ChunkWorks were already
-        // dropped during processing (hence permits already returned)
-        // before `drop(tx)`. The flag is the only observation that
-        // proves the §6.7 trigger (a) (mpsc-close → exit) contract.
-        drop(tx);
-
-        let exited = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if driver.loop_exited() {
-                    break;
-                }
-                tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for i in 0..N {
+                let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
+                let permit = budget.try_acquire_chunk().expect("permit");
+                let chunk_sha = sha256(&bytes);
+                tx.send(ChunkWork {
+                    chunk_offset: (i * CHUNK) as u64,
+                    chunk_bytes: bytes,
+                    chunk_sha256: chunk_sha,
+                    finish: i == N - 1,
+                    _permit: permit,
+                })
+                .await
+                .expect("driver mpsc still alive");
             }
+            drop(tx);
+            let result = driver
+                .await_completion()
+                .await
+                .expect("commit must succeed for hash-matching blob");
+            assert_eq!(result.committed_size, total);
         })
-        .await;
-        exited.expect(
-            "driver loop must exit within 2s after sender-drop — \
-             §6.7 trigger (a) violated: driver did not observe recv()→None",
+        .await
+        .expect("must not deadlock — in-order commit should be prompt");
+
+        // Final file exists at content_path with correct length.
+        let final_path = format!(
+            "{}/{}/{:02x}/{}",
+            content_path,
+            crate::filesystem_store::DIGEST_FOLDER,
+            digest.packed_hash()[0],
+            digest
+        );
+        let meta = tokio::fs::metadata(&final_path)
+            .await
+            .expect("final file must exist");
+        assert_eq!(meta.len(), total);
+    }
+
+    /// Driver receives 3 chunks OUT OF ORDER + finish → commits
+    /// successfully (relies on Phase 2.1's pwrite-at-offset).
+    #[nativelink_test]
+    async fn driver_out_of_order_chunks_then_finish_commits_successfully() {
+        const CHUNK: usize = 4 * 1024;
+        const N: usize = 3;
+        let total = (N * CHUNK) as u64;
+
+        let mut blob = Vec::with_capacity(N * CHUNK);
+        for i in 0..N {
+            blob.extend(std::iter::repeat(0xb0u8 + i as u8).take(CHUNK));
+        }
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
+
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+
+        let (driver, tx) = ChunkedDriver::spawn_driver(
+            store.clone(),
+            digest,
+            total,
+            CHUNK,
+            PER_BLOB_MPSC_CAP,
         );
 
-        // Sanity: budget should still reflect baseline (no leaked permits).
+        // Send order: 2, 0, 1 (finish on the LAST sent, which is offset 1).
+        let order = [2usize, 0, 1];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (idx, &i) in order.iter().enumerate() {
+                let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
+                let permit = budget.try_acquire_chunk().expect("permit");
+                let chunk_sha = sha256(&bytes);
+                tx.send(ChunkWork {
+                    chunk_offset: (i * CHUNK) as u64,
+                    chunk_bytes: bytes,
+                    chunk_sha256: chunk_sha,
+                    finish: idx == order.len() - 1,
+                    _permit: permit,
+                })
+                .await
+                .expect("send");
+            }
+            drop(tx);
+            let result = driver
+                .await_completion()
+                .await
+                .expect("out-of-order commit must succeed");
+            assert_eq!(result.committed_size, total);
+        })
+        .await
+        .expect("must not deadlock — out-of-order commit");
+    }
+
+    /// End-to-end SHA-256 mismatch: chunks are individually well-formed
+    /// (sha256 placeholder) but the assembled blob does not match the
+    /// digest's hash → driver returns InvalidArgument and unlinks the
+    /// committed file.
+    #[nativelink_test]
+    async fn driver_e2e_sha256_mismatch_returns_invalid_argument_and_unlinks_file() {
+        const CHUNK: usize = 4 * 1024;
+        const N: usize = 2;
+        let total = (N * CHUNK) as u64;
+
+        let mut blob = Vec::with_capacity(N * CHUNK);
+        for i in 0..N {
+            blob.extend(std::iter::repeat(0xc0u8 + i as u8).take(CHUNK));
+        }
+        // Use a LIE — the digest's hash is not the actual blob hash.
+        // commit_chunked still succeeds (length matches); end-to-end
+        // SHA-256 verify fails.
+        let lying_hash = [0xffu8; 32];
+        let digest = DigestInfo::new(lying_hash, total);
+
+        let (store, content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+        let (driver, tx) = ChunkedDriver::spawn_driver(
+            store.clone(),
+            digest,
+            total,
+            CHUNK,
+            PER_BLOB_MPSC_CAP,
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for i in 0..N {
+                let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
+                let permit = budget.try_acquire_chunk().expect("permit");
+                tx.send(ChunkWork {
+                    chunk_offset: (i * CHUNK) as u64,
+                    chunk_bytes: bytes,
+                    chunk_sha256: [0u8; 32],
+                    finish: i == N - 1,
+                    _permit: permit,
+                })
+                .await
+                .unwrap();
+            }
+            drop(tx);
+            let err = driver
+                .await_completion()
+                .await
+                .expect_err("e2e SHA-256 mismatch must surface as Err");
+            assert_eq!(
+                err.code,
+                nativelink_error::Code::InvalidArgument,
+                "e2e SHA-256 mismatch must be classified as InvalidArgument; got {err:?}"
+            );
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("end-to-end SHA-256 mismatch"),
+                "error must name the contract; got {msg}"
+            );
+        })
+        .await
+        .expect("must not deadlock — e2e mismatch path");
+
+        // The committed file MUST have been unlinked.
+        let final_path = format!(
+            "{}/{}/{:02x}/{}",
+            content_path,
+            crate::filesystem_store::DIGEST_FOLDER,
+            lying_hash[0],
+            digest
+        );
+        let meta = tokio::fs::metadata(&final_path).await;
         assert!(
-            budget.available_chunks() >= 3,
-            "ChunkBudget permits must return to baseline after sender-drop — \
-             driver leaked permits",
+            meta.is_err(),
+            "post-mismatch unlink must remove the file; stat should fail; got {meta:?}"
         );
     }
 
-    /// Dropping the `ChunkedDriver` aborts the spawned task even if the
-    /// sender side is held alive elsewhere (panic-safety belt per §6.7
-    /// trigger (d)). This is the second half of the lifetime contract:
-    /// trigger (a)/(b) tested above, trigger (d) tested here.
+    /// Upstream drops the sender BEFORE finish → driver's await_completion
+    /// returns Err(Aborted), partial NOT committed (no final file).
     #[nativelink_test]
-    async fn driver_drop_aborts_spawned_task() {
+    async fn driver_upstream_drop_before_finish_returns_aborted_no_commit() {
+        const CHUNK: usize = 4 * 1024;
+        let total: u64 = 2 * CHUNK as u64;
+        let blob_hash = sha256(&vec![0xddu8; total as usize]);
+        let digest = DigestInfo::new(blob_hash, total);
+        let (store, content_path) = make_test_store().await;
         let budget = ChunkBudget::new();
-        let digest = DigestInfo::new([0x55u8; 32], 1024 * 1024);
-        let (driver, tx) = ChunkedDriver::spawn_driver(digest, PER_BLOB_MPSC_CAP);
+        let (driver, tx) =
+            ChunkedDriver::spawn_driver(store.clone(), digest, total, CHUNK, PER_BLOB_MPSC_CAP);
 
-        // Send one chunk so the task has done some work.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Send only one chunk (no finish).
+            let permit = budget.try_acquire_chunk().expect("permit");
+            tx.send(ChunkWork {
+                chunk_offset: 0,
+                chunk_bytes: Bytes::from(vec![0xddu8; CHUNK]),
+                chunk_sha256: [0u8; 32],
+                finish: false,
+                _permit: permit,
+            })
+            .await
+            .unwrap();
+            // Drop tx without finish.
+            drop(tx);
+            let err = driver
+                .await_completion()
+                .await
+                .expect_err("dropped-without-finish must surface as Err");
+            assert_eq!(
+                err.code,
+                nativelink_error::Code::Aborted,
+                "dropped-without-finish must be Aborted; got {err:?}"
+            );
+        })
+        .await
+        .expect("must not deadlock — drop-without-finish path");
+
+        // No final file was produced.
+        let final_path = format!(
+            "{}/{}/{:02x}/{}",
+            content_path,
+            crate::filesystem_store::DIGEST_FOLDER,
+            blob_hash[0],
+            digest
+        );
+        let meta = tokio::fs::metadata(&final_path).await;
+        assert!(
+            meta.is_err(),
+            "no final file must exist when finish never arrived; got {meta:?}"
+        );
+    }
+
+    /// Driver Drop mid-stream (panic-safety belt per §6.7d):
+    /// - sender is held alive elsewhere; we drop the driver,
+    /// - the JoinHandleDropGuard MUST abort the spawned task,
+    /// - the budget recovers (ChunkWork dropped, permit released).
+    #[nativelink_test]
+    async fn driver_drop_aborts_spawned_task_and_recovers_budget() {
+        const CHUNK: usize = 4 * 1024;
+        let total: u64 = CHUNK as u64;
+        let blob_hash = sha256(&vec![0xeeu8; CHUNK]);
+        let digest = DigestInfo::new(blob_hash, total);
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+        let (driver, tx) =
+            ChunkedDriver::spawn_driver(store.clone(), digest, total, CHUNK, PER_BLOB_MPSC_CAP);
+
+        // Send one chunk and wait for it to be observed.
         let permit = budget.try_acquire_chunk().expect("permit");
         tx.send(ChunkWork {
             chunk_offset: 0,
-            chunk_bytes: bytes::Bytes::from_static(b"x"),
-            chunk_sha256: [1u8; 32],
+            chunk_bytes: Bytes::from(vec![0xeeu8; CHUNK]),
+            chunk_sha256: [0u8; 32],
+            finish: false,
             _permit: permit,
         })
         .await
-        .expect("send to live driver");
-
-        // Wait until the chunk has been observed.
+        .expect("send");
         tokio::time::timeout(Duration::from_secs(2), async {
             while driver.chunks_received() < 1 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("driver must observe the first chunk within 2s");
+        .expect("driver must observe chunk within 2s");
 
-        // Drop the driver while the sender is still alive. The
-        // JoinHandleDropGuard MUST abort the spawned task. After
-        // drop, the budget recovers because the in-flight `Bytes`
-        // (and hence its permit) is inside the dropped task.
+        // Drop the driver while sender is still alive.
         drop(driver);
 
+        // Budget recovers (the dropped ChunkWork's permit is released
+        // through the spawned task being aborted + dropped).
         let recovered = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if budget.available_chunks() == 4096 {
+                if budget.available_chunks() == super::super::chunk_budget::TOTAL_CHUNK_PERMITS {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -344,19 +967,54 @@ mod tests {
         })
         .await;
         recovered.expect(
-            "ChunkBudget must return to full capacity after driver-drop — \
+            "budget must return to full capacity after driver-drop — \
              JoinHandleDropGuard did not abort the spawned task (#212 §6.7d)",
         );
+    }
 
-        // Sender is now dangling; sending into it must error because
-        // the spawned receiver was aborted (or surface as channel-full
-        // depending on timing). EITHER outcome is a proof of life of
-        // the abort. We don't assert on which; we just assert no panic.
-        let _ = tx.try_send(ChunkWork {
+    /// Driver completes happily — `loop_exited()` flips after recv loop
+    /// returns. The §6.7 trigger (a) regression contract.
+    #[nativelink_test]
+    async fn driver_loop_exits_after_commit_path_completes() {
+        const CHUNK: usize = 4 * 1024;
+        let total = CHUNK as u64;
+        let blob = vec![0xa1u8; CHUNK];
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+        let (driver, tx) =
+            ChunkedDriver::spawn_driver(store.clone(), digest, total, CHUNK, PER_BLOB_MPSC_CAP);
+
+        let permit = budget.try_acquire_chunk().expect("permit");
+        tx.send(ChunkWork {
             chunk_offset: 0,
-            chunk_bytes: bytes::Bytes::from_static(b"y"),
-            chunk_sha256: [2u8; 32],
-            _permit: budget.try_acquire_chunk().expect("permit"),
-        });
+            chunk_bytes: Bytes::from(blob),
+            chunk_sha256: [0u8; 32],
+            finish: true,
+            _permit: permit,
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Await the completion result so the driver can finish its
+            // commit + SHA-256 verify before we drop the sender.
+            let _ = driver
+                .await_completion()
+                .await
+                .expect("commit must succeed for hash-matching blob");
+            drop(tx);
+            // After tx drops, the recv loop returns and loop_exited
+            // flips.
+            loop {
+                if driver.loop_exited() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("driver must exit loop within 5s after commit + sender-drop");
     }
 }
