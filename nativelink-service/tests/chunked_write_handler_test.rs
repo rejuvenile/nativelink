@@ -238,10 +238,15 @@ async fn handler_streams_three_chunks_then_finish_commits_blob() {
 }
 
 /// Two concurrent streams for the SAME digest → second is rejected
-/// with Code::AlreadyExists. (Phase 2.2/2.3 simplification — design
-/// admits long-term coalescing as a future extension.)
+/// with `Code::Aborted` + a `BackpressureSignal` retry hint (M-code-2
+/// fixup). The historical `AlreadyExists` was misleading — gRPC
+/// convention treats `AlreadyExists` as "the resource is durably
+/// committed at the target," which a worker-side BIS-style auto-unpinner
+/// could read as a license to drop its mirror pin. With `Aborted` the
+/// worker correctly interprets this as "transaction failed, retry";
+/// it must NOT unpin its mirror entry on this code.
 #[nativelink_test]
-async fn handler_concurrent_streams_for_same_digest_returns_already_exists() {
+async fn handler_concurrent_streams_for_same_digest_returns_aborted_with_retry_hint() {
     const CHUNK: usize = 4 * 1024;
     let total = CHUNK as u64;
     let blob = vec![0xb0u8; CHUNK];
@@ -290,11 +295,24 @@ async fn handler_concurrent_streams_for_same_digest_returns_already_exists() {
         .expect("must not deadlock — second stream must reject promptly")
         .expect("second writer task must not panic");
     let status_b =
-        result_b.expect_err("second stream must return Err (AlreadyExists)");
+        result_b.expect_err("second stream must return Err (Aborted)");
     assert_eq!(
         status_b.code(),
-        tonic::Code::AlreadyExists,
-        "second concurrent stream for same digest must be AlreadyExists; got {status_b:?}"
+        tonic::Code::Aborted,
+        "second concurrent stream for same digest must be Aborted (NOT AlreadyExists — \
+         that gRPC code carries 'resource exists at target' wire semantics that a worker-side \
+         auto-unpinner could mis-interpret as durable commit; M-code-2 fixup); got {status_b:?}"
+    );
+    // Verify the BackpressureSignal retry hint is present so clients
+    // can back off. The detail doubles as a discriminator for the
+    // §13.1.1 point 2 dead-channel classifier.
+    let err: nativelink_error::Error = status_b.into();
+    assert!(
+        err.details
+            .iter()
+            .any(|any| any.type_url == BACKPRESSURE_SIGNAL_TYPE_URL),
+        "Aborted concurrent-stream rejection must carry a BackpressureSignal retry hint; got details={:?}",
+        err.details
     );
 
     // Tear down the first stream cleanly so the test exits.

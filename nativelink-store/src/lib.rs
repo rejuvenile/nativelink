@@ -24,7 +24,7 @@ pub mod cas_utils;
 // consumer.
 #[cfg(feature = "chunked_fast_slow")]
 pub mod chunked;
-mod chunked_signal;
+pub mod chunked_signal;
 pub mod common_s3_utils;
 pub mod completeness_checking_store;
 pub mod compression_store;

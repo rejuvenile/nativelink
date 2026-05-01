@@ -49,7 +49,11 @@ use crate::callback_utils::ItemCallbackHolder;
 use crate::cas_utils::is_zero_digest;
 #[cfg(feature = "chunked_fast_slow")]
 use crate::chunked::chunked_filesystem::{
-    ChunkedPartialsMap, commit_chunked as chunked_commit, discard_chunked as chunked_discard,
+    ChunkedPartialsMap, commit_chunked_to_holding as chunked_commit_to_holding,
+    discard_chunked as chunked_discard, finalize_holding as chunked_finalize_holding,
+    holding_content_path as chunked_holding_path,
+    prune_holding_partials as chunked_prune_holding_partials,
+    unlink_holding as chunked_unlink_holding,
     write_chunk_at_offset as chunked_write_chunk_at_offset,
 };
 
@@ -955,6 +959,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         .await?;
         prune_temp_path(&shared_context.temp_path).await?;
 
+        // #212 Phase 2.2-3 B1 fixup: GC any leftover `.holding` files
+        // from a process killed between stage 1 (rename to .holding)
+        // and stage 2 (rename to canonical). The .holding files live
+        // under `content_path/d/XX/`, which `prune_temp_path` does NOT
+        // touch (it only sweeps `temp_path`). NoOp on first startup.
+        #[cfg(feature = "chunked_fast_slow")]
+        chunked_prune_holding_partials(&shared_context.content_path).await?;
+
         let read_buffer_size = if spec.read_buffer_size == 0 {
             DEFAULT_BUFF_SIZE
         } else {
@@ -1433,10 +1445,44 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         digest: &DigestInfo,
         expected_size: u64,
     ) -> Result<(), Error> {
+        // B1 fixup: stage 1 only — rename to `.holding`. Stage 2
+        // (finalize_holding) runs from the driver AFTER the end-to-end
+        // SHA-256 verify on the .holding file. Splitting the rename
+        // collapses the cancellation window where a corrupt-but-canonically-
+        // named file could land at the CAS path.
+        let holding_path = chunked_holding_path(&self.shared_context.content_path, digest);
+        chunked_commit_to_holding(&self.chunked_partials, digest, expected_size, holding_path)
+            .await
+    }
+
+    /// B1 fixup: stage 2 of the two-stage commit. Renames the
+    /// `<digest>.holding` file to the canonical CAS path and chmods to
+    /// 0o555. Removes the in-flight tracker entry on success.
+    /// Used by the Phase 2.3 `commit_and_verify` driver code AFTER
+    /// the end-to-end SHA-256 verify against the holding file passes.
+    pub async fn finalize_holding(&self, digest: &DigestInfo) -> Result<(), Error> {
+        let holding_path = chunked_holding_path(&self.shared_context.content_path, digest);
         let key: StoreKey<'static> = (*digest).into();
         let final_os = to_full_path_from_key(&self.shared_context.content_path, &key);
         let final_path = std::path::PathBuf::from(final_os);
-        chunked_commit(&self.chunked_partials, digest, expected_size, final_path).await
+        chunked_finalize_holding(&self.chunked_partials, digest, holding_path, final_path).await
+    }
+
+    /// B1 fixup: best-effort unlink of the holding file. Used by the
+    /// Phase 2.3 `commit_and_verify` driver code on end-to-end SHA-256
+    /// mismatch. Idempotent.
+    pub async fn unlink_holding(&self, digest: &DigestInfo) -> Result<(), Error> {
+        let holding_path = chunked_holding_path(&self.shared_context.content_path, digest);
+        chunked_unlink_holding(holding_path).await
+    }
+
+    /// B1 fixup: read-only accessor for the canonical CAS path of a
+    /// digest. The Phase 2.3 driver uses this for opening the
+    /// `.holding` file during end-to-end SHA-256 verify. Returns the
+    /// path under `content_path/d/XX/<digest>.holding` so the driver
+    /// can open it for hashing without recomputing the layout.
+    pub fn holding_content_path(&self, digest: &DigestInfo) -> std::path::PathBuf {
+        chunked_holding_path(&self.shared_context.content_path, digest)
     }
 
     /// Discard an in-flight chunked partial: removes the temp file +

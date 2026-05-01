@@ -196,6 +196,91 @@ pub(crate) fn partial_temp_path(temp_path_root: &str, digest: &DigestInfo) -> Pa
     path
 }
 
+/// B1 fixup: build the on-disk path for the *holding* file produced by
+/// the first stage of the two-stage rename (post-pwrite, pre-SHA-256
+/// verify). Layout: `<content_path>/d/<XX>/<hash>-<size>.holding`.
+///
+/// The holding file lives under `content_path` (NOT `temp_path`) because
+/// the final atomic rename in stage 2 is `holding → final`; same-
+/// directory rename is atomic on Linux + macOS regardless of fs type.
+/// Putting the holding file in `temp_path` would force the stage-2 rename
+/// to cross filesystems if `temp_path` and `content_path` happen to be
+/// on different mounts, which would convert the rename into a copy +
+/// unlink (non-atomic, and may also fail on EXDEV).
+///
+/// The `.holding` suffix prevents read-side traffic from accidentally
+/// resolving to a not-yet-verified file: `FilesystemStore::has` /
+/// `get_part` look up keys via `to_full_path_from_key` which produces
+/// `<digest>` (no suffix), so a `<digest>.holding` file is invisible.
+///
+/// Crash recovery: any `.holding` file from a process killed between
+/// stage 1 and stage 2 is GC'd by `prune_holding_partials` on the next
+/// `FilesystemStore::new`.
+pub(crate) fn holding_content_path(content_path_root: &str, digest: &DigestInfo) -> PathBuf {
+    let shard_arr = digest_shard_prefix(digest);
+    // SAFETY: shard_arr bytes are sourced from HEX_LUT (ASCII).
+    let shard_str = unsafe { core::str::from_utf8_unchecked(&shard_arr) };
+    let mut path = PathBuf::from(content_path_root);
+    path.push("d");
+    path.push(shard_str);
+    path.push(format!("{digest}.holding"));
+    path
+}
+
+/// B1 fixup: GC any leftover `.holding` files under `content_path` from
+/// a previous process killed between stage 1 (rename to `.holding`) and
+/// stage 2 (rename to canonical). Called from `FilesystemStore::new`
+/// AFTER `prune_temp_path` (which sweeps `<temp_path>/d/`).
+///
+/// Best-effort sweep: errors per-file are logged at `warn!` and skipped;
+/// a missing shard directory is OK (first-startup, before
+/// `create_subdirs` ran).
+pub(crate) async fn prune_holding_partials(content_path_root: &str) -> Result<(), Error> {
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::ReadDirStream;
+
+    let digest_dir = format!("{content_path_root}/d");
+    for byte in 0u8..=255 {
+        let shard_dir = format!("{digest_dir}/{byte:02x}");
+        let read_dir = match tokio::fs::read_dir(&shard_dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue, // shard dir absent; ignore
+        };
+        let mut stream = ReadDirStream::new(read_dir);
+        while let Some(entry_res) = stream.next().await {
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(err) => {
+                    warn!(
+                        ?shard_dir,
+                        ?err,
+                        "prune_holding_partials: read_dir entry error; skipping"
+                    );
+                    continue;
+                }
+            };
+            let path = entry.path();
+            // Only sweep `*.holding` files; never touch canonical CAS
+            // entries (which have no suffix).
+            let is_holding = path
+                .extension()
+                .map(|ext| ext == "holding")
+                .unwrap_or(false);
+            if !is_holding {
+                continue;
+            }
+            if let Err(err) = tokio::fs::remove_file(&path).await {
+                warn!(
+                    ?path,
+                    ?err,
+                    "prune_holding_partials: failed to unlink leftover .holding file; skipping"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Open or create the sparse temp file for a chunked partial. Idempotent
 /// for the same digest within one process: a second call returns the
 /// existing `ChunkInProgress` from the map without re-opening the file.
@@ -378,31 +463,42 @@ pub(crate) async fn write_chunk_at_offset(
     Ok(())
 }
 
-/// Atomic finalize: verify the partial's actual length matches the
-/// declared `expected_size` (per Q7=(c) trust file length only), then
-/// rename to the final CAS path with mode 0o555.
+/// B1 fixup: stage 1 of the two-stage commit. Verifies the partial's
+/// actual length matches `expected_size`, then atomically renames
+/// `<temp_path>/d/XX/<digest>.partial` → `<content_path>/d/XX/<digest>.holding`.
+///
+/// **Crucially does NOT yet land at the canonical CAS path.** End-to-end
+/// SHA-256 verification runs against the `.holding` file in the driver;
+/// only on hash match does stage 2 (`finalize_holding`) atomically
+/// rename `.holding` → `<digest>` (the canonical name).
+///
+/// **Why two stages:** before this fixup, `commit_chunked` renamed
+/// directly to the canonical path and THEN re-opened the file to verify
+/// SHA-256. If the handler future was cancelled (tonic RST, upstream
+/// timeout) between rename and verify, the only `Arc<ChunkedDriver>`
+/// dropped, the spawned task was aborted via `JoinHandleDropGuard`, and
+/// the file sat at the canonical CAS path — fully readable, chmod 0o555,
+/// but never end-to-end-verified. Per-chunk SHA-256 only verifies that
+/// each chunk matches the producer's per-chunk hash (which a malicious
+/// producer can lie about consistently). Result: CAS poisoning. The
+/// two-stage rename collapses the cancellation window — the abort can
+/// at worst leave a `.holding` file that `prune_holding_partials` GCs
+/// on next startup; the canonical path is only created AFTER hash match.
 ///
 /// On length mismatch: returns `Err(Code::InvalidArgument, ...)` and
-/// LEAVES the temp file in place. The caller (driver) is responsible
-/// for cleaning up via `discard_chunked` — `commit_chunked` does NOT
-/// auto-discard. Rationale: the driver may want to inspect the temp
-/// file for debugging, retry the missing chunks, or take other action
-/// before committing to a discard.
+/// LEAVES the temp file in place + the in-flight state entry in the
+/// map. The caller (driver) is responsible for cleanup via
+/// `discard_chunked`. Same on rename failure.
 ///
-/// On success: removes the in-flight state entry from the map. After
-/// this call returns Ok, subsequent `commit_chunked` / `discard_chunked`
-/// for the same digest will return `Code::NotFound` (no in-flight
-/// state for this digest).
-///
-/// Does NOT touch the FilesystemStore's `evicting_map`. Phase 2.3
-/// driver code is responsible for inserting the new file entry into
-/// the EvictingMap after `commit_chunked` succeeds (analogous to the
-/// `emplace_file` path that the legacy `update` calls).
-pub(crate) async fn commit_chunked(
+/// **DOES NOT remove the in-flight state entry.** That happens in
+/// `finalize_holding` (stage 2) AFTER the SHA-256 verify. Holding the
+/// in-flight entry across the verify avoids the cancellation race
+/// described above (M-perf-3).
+pub(crate) async fn commit_chunked_to_holding(
     map: &ChunkedPartialsMap,
     digest: &DigestInfo,
     expected_size: u64,
-    final_path: PathBuf,
+    holding_path: PathBuf,
 ) -> Result<(), Error> {
     // Get the entry but DO NOT remove it yet — if length validation
     // fails we want the entry to remain so `discard_chunked` (called
@@ -426,12 +522,12 @@ pub(crate) async fn commit_chunked(
     })
     .await
     .map_err(|join_err| {
-        make_err!(Code::Internal, "spawn_blocking join error in commit_chunked stat: {join_err:?}")
+        make_err!(Code::Internal, "spawn_blocking join error in commit_chunked_to_holding stat: {join_err:?}")
     })?
     .map_err(|io_err| {
         make_err!(
             Code::Internal,
-            "failed to stat chunked partial {} during commit: {io_err:?}",
+            "failed to stat chunked partial {} during commit_to_holding: {io_err:?}",
             entry.path.display()
         )
     })?;
@@ -451,53 +547,111 @@ pub(crate) async fn commit_chunked(
         ));
     }
 
-    // Length OK. Atomic rename + chmod inside spawn_blocking so we
-    // don't block a tokio worker on the rename syscall (slow on ZFS
-    // under txg-sync wait, even with sync=disabled the metadata path
-    // can stall).
-    //
-    // We do this BEFORE removing from the map so that, if the rename
-    // fails, the entry stays in the map for the caller to retry or
-    // discard. Rename failure on a same-filesystem rename is rare
-    // (EPERM, ENOSPC) but possible.
+    // Length OK. Atomic rename to the holding path inside spawn_blocking
+    // so we don't block a tokio worker on the rename syscall.
     let from_path = entry.path.clone();
+    let to_path_for_blocking = holding_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        std::fs::rename(&from_path, &to_path_for_blocking)
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(Code::Internal, "spawn_blocking join error in commit_chunked_to_holding rename: {join_err:?}")
+    })?
+    .map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "failed to rename chunked partial {} -> {} (holding): {io_err:?}",
+            entry.path.display(),
+            holding_path.display()
+        )
+    })?;
+
+    // DO NOT remove from the in-flight map here — `finalize_holding`
+    // does that after the SHA-256 verify (M-perf-3 + B1 coupling).
+    Ok(())
+}
+
+/// B1 fixup: stage 2 of the two-stage commit. Atomically renames
+/// `<content_path>/d/XX/<digest>.holding` → `<content_path>/d/XX/<digest>`
+/// (canonical CAS path) AND chmods to 0o555 to match the existing
+/// `emplace_file` convention. Removes the in-flight state entry from
+/// the map ONLY after the rename succeeds.
+///
+/// Same-directory rename is atomic on Linux + macOS regardless of the
+/// underlying filesystem (POSIX guarantee); `holding_content_path` and
+/// the canonical path are intentionally co-located in the shard
+/// directory.
+pub(crate) async fn finalize_holding(
+    map: &ChunkedPartialsMap,
+    digest: &DigestInfo,
+    holding_path: PathBuf,
+    final_path: PathBuf,
+) -> Result<(), Error> {
+    let from_path = holding_path.clone();
     let to_path = final_path.clone();
     tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
         std::fs::rename(&from_path, &to_path)?;
         #[cfg(target_family = "unix")]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Match the existing `emplace_file` convention: CAS files
-            // are 0o555 so hardlinked copies don't need a per-file
-            // chmod during input materialization.
             let perms = std::fs::Permissions::from_mode(0o555);
             if let Err(err) = std::fs::set_permissions(&to_path, perms) {
-                tracing::warn!(?err, path = ?to_path, "Failed to set CAS file permissions to 0o555 after chunked commit");
+                tracing::warn!(?err, path = ?to_path, "Failed to set CAS file permissions to 0o555 after chunked commit (stage 2)");
             }
         }
         Ok(())
     })
     .await
     .map_err(|join_err| {
-        make_err!(Code::Internal, "spawn_blocking join error in commit_chunked rename: {join_err:?}")
+        make_err!(Code::Internal, "spawn_blocking join error in finalize_holding rename: {join_err:?}")
     })?
     .map_err(|io_err| {
         make_err!(
             Code::Internal,
-            "failed to rename chunked partial {} -> {}: {io_err:?}",
-            entry.path.display(),
+            "failed to rename holding {} -> final {}: {io_err:?}",
+            holding_path.display(),
             final_path.display()
         )
     })?;
 
-    // Remove from the in-flight map. Drop the Arc<ChunkInProgress>
-    // after the lock is released to keep the lock critical section
-    // short. The file fd inside `ChunkInProgress` will close on the
-    // last Arc drop, which may happen on this thread.
+    // Remove from the in-flight map AFTER the final rename succeeds.
+    // Drop the Arc<ChunkInProgress> after the lock is released to keep
+    // the lock critical section short. The file fd inside
+    // `ChunkInProgress` closes on the last Arc drop; the partial path
+    // it referred to has already been renamed → unlinked from its
+    // original directory entry, so the closing fd is a no-op WRT the
+    // canonical CAS file (a different inode at this point).
     let removed = map.inner.lock().remove(digest);
     drop(removed);
-
     Ok(())
+}
+
+/// B1 fixup: best-effort unlink of the holding file (used on SHA-256
+/// mismatch in stage 2). Idempotent: NotFound is treated as success.
+/// Does NOT touch the in-flight state entry; the caller is expected to
+/// follow up with `discard_chunked` to drop the (now-renamed-away)
+/// in-flight tracker entry.
+pub(crate) async fn unlink_holding(holding_path: PathBuf) -> Result<(), Error> {
+    let path_for_blocking = holding_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        match std::fs::remove_file(&path_for_blocking) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(Code::Internal, "spawn_blocking join error in unlink_holding: {join_err:?}")
+    })?
+    .map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "failed to unlink holding {}: {io_err:?}",
+            holding_path.display()
+        )
+    })
 }
 
 /// Discard an in-flight chunked partial: remove the temp file +
@@ -587,9 +741,32 @@ mod tests {
 
     use super::super::CHUNK_SIZE;
     use super::{
-        ChunkedPartialsMap, commit_chunked, discard_chunked, partial_temp_path,
-        write_chunk_at_offset,
+        ChunkedPartialsMap, commit_chunked_to_holding, discard_chunked, finalize_holding,
+        partial_temp_path, write_chunk_at_offset,
     };
+
+    /// Test-only convenience: run BOTH stages of the B1 two-stage
+    /// commit (rename to .holding + rename .holding → final + chmod),
+    /// matching the legacy single-shot `commit_chunked` semantics. The
+    /// driver does the same flow in `commit_and_verify`.
+    async fn commit_chunked_test_compat(
+        map: &ChunkedPartialsMap,
+        digest: &nativelink_util::common::DigestInfo,
+        expected_size: u64,
+        final_path: std::path::PathBuf,
+    ) -> Result<(), nativelink_error::Error> {
+        // Reconstruct the holding path by replacing the parent dir
+        // (content_path/d/XX/) — the tests use the SAME root for content
+        // and temp, so the holding sibling lives next to the final path.
+        let holding_path = {
+            let mut p = final_path.clone();
+            let fname = p.file_name().unwrap().to_string_lossy().into_owned();
+            p.set_file_name(format!("{fname}.holding"));
+            p
+        };
+        commit_chunked_to_holding(map, digest, expected_size, holding_path.clone()).await?;
+        finalize_holding(map, digest, holding_path, final_path).await
+    }
 
     /// Test-only helper: creates a fresh temp dir under `TEST_TMPDIR`
     /// (or the system temp dir) with the FilesystemStore's expected
@@ -657,7 +834,7 @@ mod tests {
                     .await
                     .expect("in-order chunk write must succeed");
             }
-            commit_chunked(&map, &digest, total, final_path.clone())
+            commit_chunked_test_compat(&map, &digest, total, final_path.clone())
                 .await
                 .expect("in-order commit must succeed");
         })
@@ -718,7 +895,7 @@ mod tests {
                 .await
                 .expect("out-of-order chunk @ offset 1 must succeed");
 
-            commit_chunked(&map, &digest, total, final_path.clone())
+            commit_chunked_test_compat(&map, &digest, total, final_path.clone())
                 .await
                 .expect("out-of-order commit must succeed");
         })
@@ -757,7 +934,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             write_chunk_at_offset(&map, &root, &digest, 0, c0).await.unwrap();
             write_chunk_at_offset(&map, &root, &digest, CHUNK as u64, c1).await.unwrap();
-            let err = commit_chunked(&map, &digest, lying_expected, final_path.clone())
+            let err = commit_chunked_test_compat(&map, &digest, lying_expected, final_path.clone())
                 .await
                 .expect_err("commit with wrong expected size must fail");
             assert_eq!(
@@ -855,7 +1032,7 @@ mod tests {
                 .expect("discard must be idempotent");
 
             // Commit-after-discard fails with NotFound.
-            let err = commit_chunked(&map, &digest, total, final_path)
+            let err = commit_chunked_test_compat(&map, &digest, total, final_path)
                 .await
                 .expect_err("commit-after-discard must fail");
             assert_eq!(

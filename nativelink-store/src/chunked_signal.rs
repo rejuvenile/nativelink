@@ -42,8 +42,14 @@ use prost::Message;
 /// Phase 2 callers wrap the result in
 /// `Error::resource_exhausted_backpressure(...)` to produce the
 /// tagged status that the §13.1.1 point 2 classifier matches against.
+///
+/// `pub` (not `pub(crate)`): both `nativelink-store` (admission /
+/// FastSlowStore::update) AND `nativelink-service` (the WriteChunked
+/// RPC handler) mint this detail. Promoting from `pub(crate)` to
+/// `pub` collapses the previously-duplicated 13-line copy in
+/// `chunked_write_handler.rs` (rust-crate F2 fixup).
 #[must_use]
-pub(crate) fn encode_backpressure_signal_any(
+pub fn encode_backpressure_signal_any(
     reason: backpressure_signal::Reason,
     retry_after_ms: u64,
 ) -> prost_types::Any {
@@ -69,7 +75,7 @@ pub(crate) fn encode_backpressure_signal_any(
 /// backpressure, not a dead channel" — the classifier should respect
 /// that even if the body is unreadable.
 #[must_use]
-pub(crate) fn error_has_backpressure_signal(err: &Error) -> bool {
+pub fn error_has_backpressure_signal(err: &Error) -> bool {
     // Short-circuit on the dominant case: errors without details
     // never carry our backpressure discriminator. Avoids iterator
     // setup on the hot classifier path (`looks_like_dead_channel`

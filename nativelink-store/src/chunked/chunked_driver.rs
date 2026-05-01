@@ -472,14 +472,31 @@ async fn run_driver<Fe: FileEntry>(
 
 /// Run the final commit + end-to-end SHA-256 verify per design §8.3.1.
 ///
-/// Steps:
-/// 1. `commit_chunked` — atomic rename + length validation.
-/// 2. Re-read the committed file on `spawn_blocking` and compute its
-///    SHA-256 (per design §8.3.1).
-/// 3. If the SHA-256 matches `digest.packed_hash()`, return success.
-/// 4. If mismatched, the file IS the canonical CAS file at this point
-///    (commit already renamed). Best-effort `remove_file` then return
+/// **B1 fixup (two-stage rename):**
+/// 1. `commit_chunked` — rename `<digest>.partial` → `<digest>.holding`
+///    (NOT canonical CAS path) + length validation. The in-flight
+///    tracker entry is held by the FilesystemStore until step 4
+///    completes.
+/// 2. Re-open the `.holding` file on `spawn_blocking`, stream-hash it
+///    with SHA-256.
+/// 3. If the SHA-256 matches: `finalize_holding` atomically renames
+///    `.holding` → `<digest>` (canonical) and chmods 0o555. The
+///    in-flight tracker entry is removed AFTER the rename succeeds
+///    (M-perf-3 + B1 coupling).
+/// 4. If mismatched: `unlink_holding` removes the `.holding` file and
+///    `discard_chunked` drops the in-flight entry. Returns
 ///    InvalidArgument.
+///
+/// **Why two-stage:** before the fixup, the rename landed at the
+/// canonical CAS path BEFORE the SHA-256 verify. A handler-future
+/// cancellation between rename and verify aborted the spawned task
+/// (the only `Arc<ChunkedDriver>` held by the cancellable handler
+/// dropped → JoinHandleDropGuard fired), leaving an unverified file
+/// at the canonical CAS path. Subsequent reads returned wrong-but-named
+/// bytes — CAS poisoning. With two-stage rename, an abort can at worst
+/// leave a `.holding` file that `prune_holding_partials` GCs on next
+/// `FilesystemStore::new`; the canonical path is only created AFTER
+/// hash match.
 ///
 /// Note: this runs the SHA-256 on `spawn_blocking` per #213 perf-opt
 /// NMA1; SHA-256 of a multi-MiB blob at line rate burns CPU cycles
@@ -489,16 +506,16 @@ async fn commit_and_verify<Fe: FileEntry>(
     digest: &DigestInfo,
     expected_size: u64,
 ) -> Result<ChunkedCommitResult, Error> {
-    // Step 1: atomic commit (rename + length check).
+    // Step 1: rename to holding path + length check.
     if let Err(commit_err) = filesystem_store.commit_chunked(digest, expected_size).await {
         warn!(
             target: "nativelink_store::chunked",
             ?digest,
             ?commit_err,
-            "chunked driver: commit_chunked failed; discarding partial"
+            "chunked driver: commit_chunked (rename to holding) failed; discarding partial"
         );
-        // Discard the partial so we don't leak. commit_chunked leaves
-        // the temp file in place on length-mismatch per spec.
+        // Discard the partial so we don't leak. commit_chunked_to_holding
+        // leaves the temp file in place on length-mismatch per spec.
         if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
             error!(
                 target: "nativelink_store::chunked",
@@ -510,23 +527,23 @@ async fn commit_and_verify<Fe: FileEntry>(
         return Err(commit_err);
     }
 
-    // Step 2: end-to-end SHA-256 over the committed file.
-    let final_path = crate::filesystem_store::digest_content_path(
-        filesystem_store.content_path_for_chunked(),
-        digest,
-    );
-    let final_path_pb = std::path::PathBuf::from(&final_path);
+    // Step 2: end-to-end SHA-256 over the holding file.
+    let holding_path_pb = filesystem_store.holding_content_path(digest);
     let computed = tokio::task::spawn_blocking({
-        let path = final_path_pb.clone();
+        let path = holding_path_pb.clone();
         move || -> Result<[u8; 32], std::io::Error> {
             // sha2's `Sha256::digest(slice)` would require loading the
             // whole file into memory; for a 100 MiB blob that is 100 MiB
             // of allocation. Stream via `std::io::Read` + `Sha256::update`
             // to keep peak memory at the read-buffer size only.
+            //
+            // Buffer = 1 MiB to match ZFS recordsize=1M on `fast/nativelink/work`
+            // (perf-optimizer MINOR-1 fixup); avoids 16× syscalls per record
+            // vs the previous 64 KiB.
             use std::io::Read;
             let mut file = std::fs::File::open(&path)?;
             let mut hasher = Sha256::new();
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf = vec![0u8; 1024 * 1024];
             loop {
                 let n = file.read(&mut buf)?;
                 if n == 0 {
@@ -550,7 +567,7 @@ async fn commit_and_verify<Fe: FileEntry>(
     .map_err(|io_err| {
         make_err!(
             Code::Internal,
-            "failed to re-read committed file for SHA-256 verification: {io_err:?}"
+            "failed to re-read holding file for SHA-256 verification: {io_err:?}"
         )
     })?;
 
@@ -560,37 +577,30 @@ async fn commit_and_verify<Fe: FileEntry>(
     if computed != declared {
         // End-to-end hash mismatch — the per-chunk hashes all passed
         // but the assembled file does not match the declared digest.
-        // Per spec: discard the WHOLE blob (not retain). Best-effort
-        // remove_file; the file path exists at the canonical CAS path.
+        // The .holding file is at content_path/d/XX/<digest>.holding;
+        // the canonical CAS path is NOT yet created. Stage-2 cleanup:
+        // unlink the holding file, drop the in-flight tracker entry.
         warn!(
             target: "nativelink_store::chunked",
             ?digest,
             computed = ?hex::encode(computed),
             declared = ?hex::encode(declared),
-            "chunked driver: end-to-end SHA-256 mismatch; discarding committed file"
+            "chunked driver: end-to-end SHA-256 mismatch; unlinking holding file"
         );
-        let path_for_unlink = final_path_pb.clone();
-        let unlink_result = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
-            match std::fs::remove_file(&path_for_unlink) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            }
-        })
-        .await;
-        if let Err(join_err) = unlink_result {
+        if let Err(unlink_err) = filesystem_store.unlink_holding(digest).await {
             error!(
                 target: "nativelink_store::chunked",
                 ?digest,
-                ?join_err,
-                "chunked driver: spawn_blocking join error during post-mismatch unlink",
+                ?unlink_err,
+                "chunked driver: failed to unlink holding file after SHA-256 mismatch",
             );
-        } else if let Ok(Err(io_err)) = unlink_result {
+        }
+        if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
             error!(
                 target: "nativelink_store::chunked",
                 ?digest,
-                ?io_err,
-                "chunked driver: failed to unlink committed file after SHA-256 mismatch",
+                ?discard_err,
+                "chunked driver: failed to discard in-flight state after SHA-256 mismatch",
             );
         }
         return Err(make_err!(
@@ -599,11 +609,46 @@ async fn commit_and_verify<Fe: FileEntry>(
         ));
     }
 
+    // Step 3: SHA-256 verified — atomically rename .holding → canonical.
+    // The in-flight tracker entry is removed inside finalize_holding
+    // ONLY after the rename succeeds. This couples with M-perf-3:
+    // until the rename completes, the in-flight entry's
+    // `Arc<ChunkInProgress>` is alive, so a handler-future cancellation
+    // can't drop the partial state mid-finalize.
+    if let Err(finalize_err) = filesystem_store.finalize_holding(digest).await {
+        error!(
+            target: "nativelink_store::chunked",
+            ?digest,
+            ?finalize_err,
+            "chunked driver: finalize_holding (stage 2 rename) failed; cleaning up holding"
+        );
+        // Best-effort cleanup: unlink the holding file (which may still
+        // be there if the rename failed before completing) and drop the
+        // in-flight tracker entry.
+        if let Err(unlink_err) = filesystem_store.unlink_holding(digest).await {
+            warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                ?unlink_err,
+                "chunked driver: failed to unlink holding after finalize failure",
+            );
+        }
+        if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
+            warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                ?discard_err,
+                "chunked driver: failed to discard in-flight state after finalize failure",
+            );
+        }
+        return Err(finalize_err);
+    }
+
     info!(
         target: "nativelink_store::chunked",
         ?digest,
         size = expected_size,
-        "chunked driver: blob committed + SHA-256 verified"
+        "chunked driver: blob committed + SHA-256 verified (two-stage rename)"
     );
     Ok(ChunkedCommitResult {
         committed_size: expected_size,
@@ -661,7 +706,7 @@ mod tests {
         })
         .await
         .expect("FilesystemStore::new must succeed");
-        (std::sync::Arc::new(store), content_path)
+        (store, content_path)
     }
 
     /// Driver receives 3 chunks IN ORDER + finish → commits successfully

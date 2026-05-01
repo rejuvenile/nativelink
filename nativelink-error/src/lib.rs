@@ -295,6 +295,30 @@ impl Error {
             details: vec![detail],
         }
     }
+
+    /// Construct a `Code::Aborted` error carrying an arbitrary
+    /// `prost_types::Any` detail. Used by the #212 WriteChunked handler
+    /// to signal "another stream is racing you for the same digest;
+    /// retry after a backoff" with a `BackpressureSignal` retry hint
+    /// inside the detail. `Aborted` is preferred over `AlreadyExists`
+    /// here because gRPC convention treats `AlreadyExists` as "the
+    /// resource exists at the target" — a wire interpretation a
+    /// worker-side BIS-style auto-unpinner could read as a license to
+    /// drop its mirror pin (losing the only durable copy if the OTHER
+    /// in-flight stream then errors on commit). `Aborted` carries the
+    /// "transaction failed, retry" semantics that match the producer's
+    /// real situation.
+    #[must_use]
+    pub fn aborted_with_detail(
+        msg: impl Into<String>,
+        detail: prost_types::Any,
+    ) -> Self {
+        Self {
+            code: Code::Aborted,
+            messages: vec![msg.into()],
+            details: vec![detail],
+        }
+    }
 }
 
 impl core::error::Error for Error {}
