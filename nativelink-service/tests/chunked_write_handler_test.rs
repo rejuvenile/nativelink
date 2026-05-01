@@ -717,3 +717,380 @@ async fn handler_empty_stream_returns_invalid_argument() {
 fn chunk_size_constant_pinned_for_handler_tests() {
     assert_eq!(CHUNK_SIZE, 1024 * 1024);
 }
+
+// ----------------------------------------------------------------------
+// M-code-1 fixup tests: zero-byte blob path
+// ----------------------------------------------------------------------
+
+/// SHA-256 of the empty string, pinned constant.
+const EMPTY_SHA256: [u8; 32] = [
+    0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9,
+    0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
+    0xb8, 0x55,
+];
+
+/// Bazel emits the empty-string digest (`e3b0c44…-0`) frequently for
+/// empty stdout/stderr in successful actions. Before the M-code-1
+/// fixup, the per-blob driver expected `expected_chunk_count == 0` but
+/// the producer MUST send a single finish chunk to terminate the
+/// stream — the bitmap check rejected every empty-blob upload as
+/// `InvalidArgument`.
+#[nativelink_test]
+async fn handler_zero_byte_blob_commits_with_single_finish_chunk() {
+    const CHUNK: usize = 4 * 1024;
+    let digest = DigestInfo::new(EMPTY_SHA256, 0);
+    let (store, content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // Single chunk: offset=0, empty bytes, finish=true,
+        // chunk_sha256 = SHA-256("").
+        let chunk = WriteChunk {
+            digest: Some(digest.into()),
+            chunk_offset: 0,
+            chunk_bytes: Vec::new(),
+            chunk_sha256: EMPTY_SHA256.to_vec(),
+            finish_chunk: true,
+        };
+        tx.send(frame_chunk(&chunk))
+            .await
+            .expect("send empty-blob chunk");
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock — empty-blob single-chunk path");
+
+    let resp = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock — empty-blob handler must respond promptly")
+        .expect("writer task must not panic")
+        .expect(
+            "empty-blob commit must succeed — M-code-1 fixup ensures the zero-byte path \
+             bypasses the driver bitmap check that previously rejected every empty digest",
+        );
+    let inner = resp.into_inner();
+    assert_eq!(
+        inner.committed_size, 0,
+        "empty-blob committed_size must be 0; got {}",
+        inner.committed_size
+    );
+
+    // Final empty file exists at the canonical CAS path.
+    let final_path = format!(
+        "{}/d/{:02x}/{}",
+        content_path,
+        digest.packed_hash()[0],
+        digest
+    );
+    let meta = tokio::fs::metadata(&final_path)
+        .await
+        .expect("empty-blob final file must exist");
+    assert_eq!(meta.len(), 0, "empty-blob final file must be 0 bytes");
+
+    // In-flight tracker stayed empty — handler did NOT register a
+    // driver entry for the zero-byte path.
+    assert_eq!(
+        in_flight.in_flight_count(),
+        0,
+        "empty-blob path must not register an in-flight driver entry"
+    );
+}
+
+/// Empty-blob path: producer lies about size (declares size>0 with
+/// the empty SHA, OR declares size=0 with non-empty chunk_sha256). We
+/// verify the second case (digest hash != EMPTY_SHA256) returns
+/// InvalidArgument.
+#[nativelink_test]
+async fn handler_zero_byte_blob_rejects_non_empty_digest_hash() {
+    const CHUNK: usize = 4 * 1024;
+    // size=0 but a non-empty hash → producer is lying.
+    let lying_hash = [0xcc_u8; 32];
+    let digest = DigestInfo::new(lying_hash, 0);
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, _in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    let chunk = WriteChunk {
+        digest: Some(digest.into()),
+        chunk_offset: 0,
+        chunk_bytes: Vec::new(),
+        chunk_sha256: EMPTY_SHA256.to_vec(),
+        finish_chunk: true,
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tx.send(frame_chunk(&chunk)).await.unwrap();
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock — handler must reject promptly")
+        .expect("writer task must not panic");
+    let status = result
+        .expect_err("zero-byte blob with non-empty digest hash must return Err (InvalidArgument)");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "non-empty digest hash on zero-size blob must be InvalidArgument; got {status:?}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// M-code-3 fixup tests: chunk-shape validation
+// ----------------------------------------------------------------------
+
+/// `chunk_offset` MUST be a multiple of CHUNK_SIZE — a producer that
+/// sends an unaligned offset (here: 1 byte off) is rejected with
+/// `InvalidArgument`. Without M-code-3 the driver would silently
+/// `pwrite` to a sparse-file hole that coincidentally lines up.
+#[nativelink_test]
+async fn handler_chunk_offset_not_multiple_of_chunk_size_returns_invalid_argument() {
+    const CHUNK: usize = 4 * 1024;
+    let total: u64 = 2 * CHUNK as u64;
+    let blob = vec![0xa3_u8; total as usize];
+    let digest = DigestInfo::new(sha256(&blob), total);
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, _in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    // Unaligned offset (1 byte off). chunk_sha256 here is irrelevant —
+    // the shape validation runs BEFORE the SHA-256 verify (M-perf-1
+    // ordering, but specifically the cheap shape checks come first
+    // even before the budget acquire).
+    let bad = WriteChunk {
+        digest: Some(digest.into()),
+        chunk_offset: 1,
+        chunk_bytes: vec![0u8; CHUNK],
+        chunk_sha256: sha256(&vec![0u8; CHUNK]).to_vec(),
+        finish_chunk: false,
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tx.send(frame_chunk(&bad)).await.unwrap();
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock")
+        .expect("writer task must not panic");
+    let status = result.expect_err("unaligned offset must return Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "unaligned chunk_offset must be InvalidArgument; got {status:?}"
+    );
+    assert!(
+        status.message().contains("multiple of CHUNK_SIZE"),
+        "error must name the contract; got {}",
+        status.message()
+    );
+}
+
+/// Non-final chunk with `chunk_bytes.len()` != CHUNK_SIZE is rejected.
+/// Without M-code-3 a producer could send oversized chunks that bypass
+/// the per-permit byte accounting.
+#[nativelink_test]
+async fn handler_non_final_chunk_with_wrong_length_returns_invalid_argument() {
+    const CHUNK: usize = 4 * 1024;
+    let total: u64 = 2 * CHUNK as u64;
+    let blob = vec![0xa4_u8; total as usize];
+    let digest = DigestInfo::new(sha256(&blob), total);
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, _in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    // Non-final but only half a chunk — protocol violation.
+    let payload = vec![0u8; CHUNK / 2];
+    let bad = WriteChunk {
+        digest: Some(digest.into()),
+        chunk_offset: 0,
+        chunk_bytes: payload.clone(),
+        chunk_sha256: sha256(&payload).to_vec(),
+        finish_chunk: false,
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tx.send(frame_chunk(&bad)).await.unwrap();
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock")
+        .expect("writer task must not panic");
+    let status = result.expect_err("non-final-wrong-length must return Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "non-final wrong-length must be InvalidArgument; got {status:?}"
+    );
+    assert!(
+        status.message().contains("equal CHUNK_SIZE"),
+        "error must name the contract; got {}",
+        status.message()
+    );
+}
+
+// ----------------------------------------------------------------------
+// B1 fixup test: end-to-end SHA-256 mismatch never lands at canonical
+// CAS path (two-stage rename collapses the cancellation window).
+// ----------------------------------------------------------------------
+
+/// Producer streams chunks whose per-chunk SHA-256 hashes are honest
+/// (the verify step passes) but the assembled blob's hash does NOT
+/// match the digest's declared hash (i.e. producer is lying about the
+/// blob's true SHA-256). Without B1's two-stage rename, the file would
+/// land at the canonical CAS path BEFORE the e2e SHA-256 verify; a
+/// concurrent reader would see the wrong-but-canonically-named bytes
+/// (CAS poisoning). With the fixup, the file lives at
+/// `<digest>.holding` until verify passes; on mismatch it is unlinked.
+/// The canonical CAS path MUST never exist.
+#[nativelink_test]
+async fn handler_e2e_sha256_mismatch_never_lands_at_canonical_cas_path() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    let total = (N * CHUNK) as u64;
+    let mut blob = Vec::with_capacity(N * CHUNK);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xc1u8 + i as u8).take(CHUNK));
+    }
+    // Lie about the digest's hash — declare an all-0xff hash that does
+    // not match the actual blob's SHA-256.
+    let lying_hash = [0xff_u8; 32];
+    let digest = DigestInfo::new(lying_hash, total);
+
+    let (store, content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, _in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0..N {
+            let bytes = &blob[i * CHUNK..(i + 1) * CHUNK];
+            let chunk = make_chunk(digest, (i * CHUNK) as u64, bytes, i == N - 1);
+            tx.send(frame_chunk(&chunk)).await.unwrap();
+        }
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock — sending hash-lying blob");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock — handler must reject lying blob within 5s")
+        .expect("writer task must not panic");
+    let status = result.expect_err("e2e SHA-256 mismatch must return Err (InvalidArgument)");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "e2e SHA-256 mismatch must be InvalidArgument; got {status:?}"
+    );
+
+    // CRITICAL: no file at the canonical CAS path. This is the B1
+    // contract — without two-stage rename, the file would land at the
+    // canonical path BEFORE the e2e SHA verify, and a concurrent
+    // reader would see wrong-but-canonically-named bytes.
+    let final_path = format!(
+        "{}/d/{:02x}/{}",
+        content_path,
+        digest.packed_hash()[0],
+        digest
+    );
+    let meta = tokio::fs::metadata(&final_path).await;
+    assert!(
+        meta.is_err(),
+        "B1 contract violated: file landed at canonical CAS path despite e2e SHA-256 \
+         mismatch — CAS poisoning. Two-stage rename must keep the file at .holding \
+         until verify passes; got {meta:?}"
+    );
+
+    // Also: no .holding file leftover after the mismatch — driver
+    // unlink_holding ran and the path should be gone.
+    let holding_path = format!(
+        "{}/d/{:02x}/{}.holding",
+        content_path,
+        digest.packed_hash()[0],
+        digest
+    );
+    let holding_meta = tokio::fs::metadata(&holding_path).await;
+    assert!(
+        holding_meta.is_err(),
+        "after e2e mismatch, the .holding file must be unlinked; got {holding_meta:?}"
+    );
+}
+
+/// Final chunk with `chunk_offset + chunk_bytes.len()` != size_bytes
+/// is rejected.
+#[nativelink_test]
+async fn handler_final_chunk_total_length_mismatch_returns_invalid_argument() {
+    const CHUNK: usize = 4 * 1024;
+    let total: u64 = 2 * CHUNK as u64;
+    let blob = vec![0xa5_u8; total as usize];
+    let digest = DigestInfo::new(sha256(&blob), total);
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, _in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    // Send a final chunk at offset 0 with a half-size payload — total
+    // length CHUNK/2 != declared 2*CHUNK.
+    let payload = vec![0u8; CHUNK / 2];
+    let bad = WriteChunk {
+        digest: Some(digest.into()),
+        chunk_offset: 0,
+        chunk_bytes: payload.clone(),
+        chunk_sha256: sha256(&payload).to_vec(),
+        finish_chunk: true,
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tx.send(frame_chunk(&bad)).await.unwrap();
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock")
+        .expect("writer task must not panic");
+    let status = result.expect_err("total-length-mismatch on final chunk must return Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "final-chunk-length-math mismatch must be InvalidArgument; got {status:?}"
+    );
+    assert!(
+        status.message().contains("equal digest.size_bytes")
+            || status.message().contains("digest.size_bytes"),
+        "error must name the contract; got {}",
+        status.message()
+    );
+}

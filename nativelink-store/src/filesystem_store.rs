@@ -1423,6 +1423,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         &self.shared_context.content_path
     }
 
+    /// Read-only accessor for the temp_path the store is rooted at.
+    /// Used by the Phase 2.3 chunked driver / tests to observe the
+    /// `.partial` file path for the M-testing-2 §6.7 trigger (b)
+    /// shutdown-deadline regression test.
+    pub fn temp_path_for_chunked(&self) -> &str {
+        &self.shared_context.temp_path
+    }
+
     /// Atomic finalize: verify the temp file's actual length matches
     /// `expected_size` (per Q7=(c) trust file length only), then
     /// rename to the final CAS path with mode 0o555.

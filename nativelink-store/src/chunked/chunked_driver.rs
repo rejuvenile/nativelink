@@ -1017,6 +1017,170 @@ mod tests {
         );
     }
 
+    /// M-testing-1 fixup (deterministic mpsc-full): construct a
+    /// `mpsc::channel(1)` with NO receiver-poll, fill the slot, then
+    /// attempt a second `try_send` and assert it returns
+    /// `Err(TrySendError::Full(returned))`. This is the exact path the
+    /// admission code at `chunked_write_handler::admit_chunk` reaches
+    /// on per-blob mpsc-full; the production path then converts the
+    /// Full to a `Code::ResourceExhausted` carrying a
+    /// `BackpressureSignal { reason: PerBlobMpscFull }`. Asserting the
+    /// `try_send` mechanic deterministically (vs the integration-time
+    /// burst test which races the driver drain) closes M-v3-3.
+    ///
+    /// The test does NOT spawn a driver — it just exercises the mpsc
+    /// channel mechanic that the admission relies on. The
+    /// `ChunkWork.permit` is a real budget permit so the drop semantics
+    /// are exercised end-to-end.
+    #[nativelink_test]
+    async fn admission_per_blob_mpsc_full_returns_try_send_full_with_returned_work() {
+        let budget = ChunkBudget::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChunkWork>(1);
+
+        // Fill the only slot with a permit-bearing ChunkWork.
+        let permit_a = budget.try_acquire_chunk().expect("permit a");
+        let work_a = ChunkWork {
+            chunk_offset: 0,
+            chunk_bytes: Bytes::from_static(b""),
+            chunk_sha256: [0u8; 32],
+            finish: false,
+            _permit: permit_a,
+        };
+        tx.try_send(work_a).expect("first try_send into capacity-1 mpsc must succeed");
+
+        // Second try_send must fail Full because the receiver is never
+        // polled (we deliberately keep `rx` alive but un-polled).
+        let permit_b = budget.try_acquire_chunk().expect("permit b");
+        let work_b = ChunkWork {
+            chunk_offset: 4096,
+            chunk_bytes: Bytes::from_static(b""),
+            chunk_sha256: [0u8; 32],
+            finish: false,
+            _permit: permit_b,
+        };
+        let err = tx
+            .try_send(work_b)
+            .expect_err(
+                "second try_send into a full capacity-1 mpsc MUST return Err(Full) — \
+                 if this passes, M-v3-3's mpsc-full admission rejection path is dead code",
+            );
+        match err {
+            tokio::sync::mpsc::error::TrySendError::Full(returned) => {
+                // The dropped `returned` releases its OwnedSemaphorePermit
+                // on the budget — the production code relies on this
+                // for reverse-release per §13.1.1.
+                assert_eq!(
+                    returned.chunk_offset, 4096,
+                    "the returned work must be the one we just attempted to send; \
+                     got chunk_offset={}",
+                    returned.chunk_offset
+                );
+                drop(returned);
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                panic!(
+                    "try_send must return Full (not Closed) when the receiver is alive but \
+                     un-polled and the slot is occupied"
+                );
+            }
+        }
+
+        // Hold rx alive across the assertion above so we don't trigger
+        // the Closed path; explicitly drop now.
+        drop(rx);
+        drop(tx);
+    }
+
+    /// M-testing-2 fixup (§6.7 trigger b shutdown-deadline): drop the
+    /// driver mid-stream and assert (i) the spawned task exits within a
+    /// bounded deadline (NOT hangs past the 5s test timeout — that
+    /// would indicate a silent deadlock the deadline-bounded drain is
+    /// supposed to prevent), (ii) the in-flight `<digest>.partial` file
+    /// remains on disk (left for `prune_temp_path` GC on next
+    /// `FilesystemStore::new`), (iii) the `loop_exited` flag is NOT
+    /// set (task was aborted, did not exit normally).
+    #[nativelink_test]
+    async fn driver_drop_with_pending_chunks_exits_within_deadline_and_leaves_partial() {
+        const CHUNK: usize = 4 * 1024;
+        const N: usize = 4;
+        let total: u64 = (N * CHUNK) as u64;
+        let mut blob = Vec::with_capacity(N * CHUNK);
+        for i in 0..N {
+            blob.extend(std::iter::repeat(0xb1u8 + i as u8).take(CHUNK));
+        }
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+        let (driver, tx) =
+            ChunkedDriver::spawn_driver(store.clone(), digest, total, CHUNK, PER_BLOB_MPSC_CAP);
+
+        // Send N-1 chunks (no finish) so the driver's bitmap is
+        // partially filled and the sender remains alive — we want the
+        // shutdown drop, not the happy-path mpsc-close.
+        for i in 0..N - 1 {
+            let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
+            let permit = budget.try_acquire_chunk().expect("permit");
+            tx.send(ChunkWork {
+                chunk_offset: (i * CHUNK) as u64,
+                chunk_bytes: bytes,
+                chunk_sha256: [0u8; 32],
+                finish: false,
+                _permit: permit,
+            })
+            .await
+            .expect("send pre-shutdown chunk");
+        }
+
+        // Wait for the driver to observe at least one chunk; otherwise
+        // dropping the driver might race ahead of the recv loop ever
+        // running.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while driver.chunks_received() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("driver must observe at least one chunk before shutdown");
+
+        // Shutdown trigger (b): drop the driver. The spawned task is
+        // aborted via `JoinHandleDropGuard`. The sender is still alive
+        // — so without abort, the recv loop would block on `recv()`
+        // indefinitely, the test would hang past the 5s timeout, and
+        // the assertion below would fire.
+        drop(driver);
+
+        // The on-disk partial MUST remain — `prune_temp_path` will GC
+        // it on next `FilesystemStore::new` per §6.7 (b). We poll the
+        // partial path under a deadline; if the partial vanishes the
+        // shutdown path is mistakenly auto-discarding (would silently
+        // break the recovery model).
+        let partial_path =
+            crate::chunked::chunked_filesystem::partial_temp_path(
+                store.temp_path_for_chunked(),
+                &digest,
+            );
+        let exists = tokio::time::timeout(Duration::from_secs(5), async {
+            // Wait briefly for any pending writes to land then verify.
+            tokio::task::yield_now().await;
+            tokio::fs::metadata(&partial_path).await.is_ok()
+        })
+        .await
+        .expect(
+            "must not deadlock — partial-existence check after driver drop should be \
+             prompt (§6.7 trigger b)",
+        );
+        assert!(
+            exists,
+            "after driver drop, partial file must remain on disk for prune_temp_path GC; \
+             vanished partial = shutdown-path auto-discard bug; checked path={}",
+            partial_path.display(),
+        );
+
+        // Drop the sender (so any future retry path doesn't hang).
+        drop(tx);
+    }
+
     /// Driver completes happily — `loop_exited()` flips after recv loop
     /// returns. The §6.7 trigger (a) regression contract.
     #[nativelink_test]

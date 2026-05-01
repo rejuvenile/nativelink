@@ -1180,18 +1180,48 @@ mod tests {
                 "final CAS file must NOT exist before commit; got {final_meta_pre:?}"
             );
 
+            // Stage 1 (rename to .holding):
             store
                 .commit_chunked(&digest, total)
                 .await
-                .expect("adapter commit_chunked must succeed");
+                .expect("adapter commit_chunked (stage 1: rename to .holding) must succeed");
 
-            // After commit: final file is under CONTENT path, NOT temp.
+            // After stage 1: the .holding file lives under content_path
+            // (not the canonical CAS name); the canonical CAS file
+            // does NOT yet exist (B1 fixup contract).
+            let holding_path =
+                format!("{content_path}/{DIGEST_FOLDER}/06/{digest}.holding");
+            let holding_meta_mid = tokio::fs::metadata(&holding_path).await;
+            assert!(
+                holding_meta_mid.is_ok(),
+                "after stage-1 commit, .holding file must exist under content_path; got {holding_meta_mid:?}"
+            );
+            assert_eq!(holding_meta_mid.unwrap().len(), total);
+            let final_meta_mid = tokio::fs::metadata(&final_path).await;
+            assert!(
+                final_meta_mid.is_err(),
+                "after stage-1 commit, canonical CAS file must NOT yet exist (B1 contract); got {final_meta_mid:?}"
+            );
+
+            // Stage 2 (rename .holding → final + chmod 0o555):
+            store
+                .finalize_holding(&digest)
+                .await
+                .expect("adapter finalize_holding (stage 2 rename) must succeed");
+
+            // After stage 2: final file is under CONTENT path with
+            // canonical name; .holding sibling is gone.
             let final_meta = tokio::fs::metadata(&final_path).await;
             assert!(
                 final_meta.is_ok(),
-                "after commit, final CAS file must exist under content_path; expected {final_path}, got {final_meta:?}"
+                "after stage-2 commit, final CAS file must exist under content_path; expected {final_path}, got {final_meta:?}"
             );
             assert_eq!(final_meta.unwrap().len(), total);
+            let holding_meta_post = tokio::fs::metadata(&holding_path).await;
+            assert!(
+                holding_meta_post.is_err(),
+                "after stage-2 commit, .holding file must be gone; got {holding_meta_post:?}"
+            );
             // And the partial under temp_path is gone.
             let temp_meta_post = tokio::fs::metadata(&expected_partial).await;
             assert!(
