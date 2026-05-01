@@ -33,6 +33,7 @@ harness = false
 
 [features]
 default = ["io-uring"]
+chunked_fast_slow = ["nativelink-store/chunked_fast_slow", "nativelink-service/chunked_fast_slow"]
 io-uring = ["nativelink-util/io-uring", "nativelink-store/io-uring"]
 nix = ["nativelink-worker/nix"]
 pprof = ["nativelink-util/pprof", "nativelink-worker/pprof"]
