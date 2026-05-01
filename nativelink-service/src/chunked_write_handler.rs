@@ -155,10 +155,20 @@ impl ChunkedWriteInFlight {
 ///
 /// One instance per server process; cheap to clone (all fields are
 /// `Arc` / `&'static`).
+///
+/// `chunk_size` is the contractual chunk size used when constructing
+/// per-blob `ChunkedDriver`s (drives the bitmap completeness check).
+/// In production this is `CHUNK_SIZE` (1 MiB). The field exists so
+/// tests can use smaller chunks for speed without depending on the
+/// production constant — admission still rejects mis-aligned chunks
+/// in the per-chunk SHA-256 step (the producer error surface),
+/// because the driver only commits when the bitmap matches the
+/// expected count.
 pub struct ChunkedWriteHandler<Fe: FileEntry = FileEntryImpl> {
     filesystem_store: Arc<FilesystemStore<Fe>>,
     in_flight: Arc<ChunkedWriteInFlight>,
     chunk_budget: &'static ChunkBudget,
+    chunk_size: usize,
 }
 
 impl<Fe: FileEntry> core::fmt::Debug for ChunkedWriteHandler<Fe> {
@@ -174,15 +184,16 @@ impl<Fe: FileEntry> core::fmt::Debug for ChunkedWriteHandler<Fe> {
 
 impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     /// Construct a handler bound to a particular `FilesystemStore` and
-    /// to the process-wide `ChunkBudget` singleton. The in-flight map
-    /// is owned by this handler so two handlers do not share state
-    /// (uncommon — production deploys one handler per server).
+    /// to the process-wide `ChunkBudget` singleton. Production callers
+    /// use this constructor; the chunk size is the production CHUNK_SIZE
+    /// (1 MiB).
     #[must_use]
     pub fn new(filesystem_store: Arc<FilesystemStore<Fe>>) -> Self {
         Self {
             filesystem_store,
             in_flight: ChunkedWriteInFlight::new(),
             chunk_budget: nativelink_store::chunked::chunk_budget::chunk_budget_singleton(),
+            chunk_size: CHUNK_SIZE,
         }
     }
 
@@ -200,6 +211,27 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             filesystem_store,
             in_flight,
             chunk_budget,
+            chunk_size: CHUNK_SIZE,
+        }
+    }
+
+    /// Construct a handler with externally-provided state AND an
+    /// explicit chunk size. Used by integration tests that exercise
+    /// out-of-order arrival + bitmap completeness with smaller chunks
+    /// (a 4 KiB chunk is fast; a 1 MiB chunk burns memory + time).
+    /// NOT for production use.
+    #[must_use]
+    pub fn new_with_state_and_chunk_size_for_test(
+        filesystem_store: Arc<FilesystemStore<Fe>>,
+        in_flight: Arc<ChunkedWriteInFlight>,
+        chunk_budget: &'static ChunkBudget,
+        chunk_size: usize,
+    ) -> Self {
+        Self {
+            filesystem_store,
+            in_flight,
+            chunk_budget,
+            chunk_size,
         }
     }
 
@@ -266,7 +298,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 Arc::clone(&self.filesystem_store),
                 digest,
                 digest.size_bytes(),
-                CHUNK_SIZE,
+                self.chunk_size,
                 PER_BLOB_MPSC_CAP,
             );
             let driver_arc = Arc::new(driver);
