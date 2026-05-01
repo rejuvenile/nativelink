@@ -37,6 +37,7 @@
 #![allow(dead_code, reason = "Phase 2.2/2.3 wires part of this; Phase 2.5+ wires the rest (#212)")]
 
 pub mod chunk_budget;
+pub mod chunked_client;
 pub mod chunked_driver;
 pub mod chunked_filesystem;
 
