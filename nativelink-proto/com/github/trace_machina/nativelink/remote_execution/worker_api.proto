@@ -673,6 +673,14 @@ message BackpressureSignal {
         /// `retry_after_ms`; backoff target is shorter than the global
         /// case because per-blob queues drain faster.
         PER_BLOB_MPSC_FULL = 2;
+        /// #212 Phase 2.6: a `MemoryStore` write would have forced
+        /// eviction of a recently-inserted blob to make room for the
+        /// new write. Operator opted into emission via the
+        /// `MemoryStore::set_emit_backpressure_for_test` runtime
+        /// kill-switch (default OFF preserves the historic
+        /// silent-evict behavior). Caller should retry after
+        /// `retry_after_ms`.
+        MEMORY_STORE_AT_CAPACITY = 3;
     }
     Reason reason = 1;
     /// Server-suggested backoff hint in milliseconds. Client may apply

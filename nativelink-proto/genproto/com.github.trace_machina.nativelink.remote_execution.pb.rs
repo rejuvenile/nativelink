@@ -699,6 +699,14 @@ pub mod backpressure_signal {
         /// / `retry_after_ms`; backoff target is shorter than the global
         /// / case because per-blob queues drain faster.
         PerBlobMpscFull = 2,
+        /// / #212 Phase 2.6: a `MemoryStore` write would have forced
+        /// / eviction of a recently-inserted blob to make room for the
+        /// / new write. Operator opted into emission via the
+        /// / `MemoryStore::set_emit_backpressure_for_test` runtime
+        /// / kill-switch (default OFF preserves the historic
+        /// / silent-evict behavior). Caller should retry after
+        /// / `retry_after_ms`.
+        MemoryStoreAtCapacity = 3,
     }
     impl Reason {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -710,6 +718,7 @@ pub mod backpressure_signal {
                 Self::Unspecified => "REASON_UNSPECIFIED",
                 Self::GlobalChunkBudgetExhausted => "GLOBAL_CHUNK_BUDGET_EXHAUSTED",
                 Self::PerBlobMpscFull => "PER_BLOB_MPSC_FULL",
+                Self::MemoryStoreAtCapacity => "MEMORY_STORE_AT_CAPACITY",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -718,6 +727,7 @@ pub mod backpressure_signal {
                 "REASON_UNSPECIFIED" => Some(Self::Unspecified),
                 "GLOBAL_CHUNK_BUDGET_EXHAUSTED" => Some(Self::GlobalChunkBudgetExhausted),
                 "PER_BLOB_MPSC_FULL" => Some(Self::PerBlobMpscFull),
+                "MEMORY_STORE_AT_CAPACITY" => Some(Self::MemoryStoreAtCapacity),
                 _ => None,
             }
         }
