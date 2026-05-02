@@ -1399,19 +1399,21 @@ async fn handler_subsequent_chunk_parse_digest_err_eagerly_discards_partial() {
     );
 }
 
-/// Sibling test for `chunked_write_handler.rs:511` `admit_chunk` Err
-/// on a subsequent chunk. Send chunk 0 (partial created on disk),
-/// then send chunk 1 with WRONG `chunk_sha256` — `admit_chunk` ->
-/// `verify_and_prepare_chunk`'s SHA-256 verify fails with
-/// InvalidArgument. The eager GC MUST fire and remove the partial
-/// before the handler returns.
+/// Sibling test for the subsequent-chunk `admit_chunk` Err arm in
+/// `chunked_write_handler.rs::write_chunked_inner`. Send chunk 0
+/// (partial created on disk), then send chunk 1 with WRONG
+/// `chunk_sha256` — `admit_chunk` -> `verify_and_prepare_chunk`'s
+/// SHA-256 verify fails with InvalidArgument. The eager GC MUST
+/// fire and remove the partial before the handler returns.
 ///
 /// Production composition: same shape as the parse_digest sibling.
 ///
 /// Mutation step: comment out the `discard_partial_best_effort(...)`
 /// call in the `if let Err(err) = self.admit_chunk(next, ...)` arm
-/// at line 511; this test's final assertion fires with the SPECIFIC
-/// d-s-r MAJOR-1 message.
+/// (the subsequent-chunk admit_chunk Err arm — line numbers drift
+/// with file edits; identify by the loop-body conditional matching
+/// `next` not `first_chunk`); this test's final assertion fires with
+/// the SPECIFIC d-s-r MAJOR-1 message.
 #[nativelink_test]
 async fn handler_subsequent_chunk_admit_err_eagerly_discards_partial() {
     use std::path::PathBuf;
@@ -1477,8 +1479,124 @@ async fn handler_subsequent_chunk_admit_err_eagerly_discards_partial() {
     assert!(
         !exists,
         "partial file MUST be GC'd by discard_partial_best_effort on admit_chunk-Err \
-         on subsequent chunk (#213 d-s-r MAJOR-1 line 511 sibling) — without the eager GC, \
-         the partial persists until next FilesystemStore::new sweep; checked path={}",
+         on subsequent chunk (#213 d-s-r MAJOR-1 subsequent-chunk admit_chunk Err arm sibling) — \
+         without the eager GC, the partial persists until next FilesystemStore::new sweep; \
+         checked path={}",
         partial_path.display(),
+    );
+}
+
+/// #213 reviewer round-2 MAJOR-B (M2 mutation test): asserts that
+/// the handler's `discard_partial_best_effort` is bounded by
+/// `tokio::time::timeout(DISCARD_PARTIAL_TIMEOUT, ...)`. Without
+/// the wrap, a wedged slow tier (filesystem `discard_chunked` hung)
+/// would hang the handler forever and the gRPC stream would stay
+/// open — strictly worse than the pre-fix "partial persists" bug
+/// because it wedges the upstream caller too.
+///
+/// **Wedge mechanism.** Registers a 30s `discard_chunked` delay via
+/// the `set_test_pre_discard_delay_ms` test hook on FilesystemStore.
+/// Triggers a malformed-subsequent-chunk path (digest=None) so the
+/// handler hits `discard_partial_best_effort` on its way out. The
+/// test then asserts the handler returns within 7s (5s wrap timeout
+/// + 2s slop for chunked-driver wind-down + scheduler jitter).
+///
+/// Production composition: real FilesystemStore + real
+/// ChunkedWriteHandler under a 7s `tokio::time::timeout` deadlock
+/// detector with a SPECIFIC `must not deadlock — handler must
+/// bound discard_chunked under wedge` assertion message.
+///
+/// Mutation step: revert the
+/// `tokio::time::timeout(DISCARD_PARTIAL_TIMEOUT, ...)` wrap in
+/// `discard_partial_best_effort` to a bare
+/// `filesystem_store.discard_chunked(digest).await`; the wedge then
+/// holds the handler for the full 30s and the SPECIFIC deadlock
+/// assertion fires within 7s. (Reverted in checked-in code.)
+#[nativelink_test]
+async fn handler_bounds_discard_partial_under_wedged_slow_tier() {
+    use std::path::PathBuf;
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    const WEDGE_MS: u64 = 30_000;
+    const ASSERT_BOUND_SECS: u64 = 7;
+    let total: u64 = (N * CHUNK) as u64;
+    let mut blob = Vec::with_capacity(N * CHUNK);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xb1u8 + i as u8).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), total);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    // Wedge `discard_chunked` for this digest. RAII guard so a panic
+    // inside the test doesn't leak the entry across siblings.
+    store.set_test_pre_discard_delay_ms(&digest, WEDGE_MS);
+    struct ResetDiscardDelay {
+        store: Arc<FilesystemStore<FileEntryImpl>>,
+        digest: DigestInfo,
+    }
+    impl Drop for ResetDiscardDelay {
+        fn drop(&mut self) {
+            self.store.clear_test_pre_discard_delay(&self.digest);
+        }
+    }
+    let _reset_guard = ResetDiscardDelay {
+        store: Arc::clone(&store),
+        digest,
+    };
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    let partial_path: PathBuf = store.partial_path_for_digest(&digest);
+
+    // Send chunk 0 to seed the partial; wait for it to land.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let chunk0 = make_chunk(digest, 0, &blob[0..CHUNK], false);
+        tx.send(frame_chunk(&chunk0)).await.unwrap();
+        loop {
+            if tokio::fs::metadata(&partial_path).await.is_ok()
+                && store.has_in_flight_chunked_partial(&digest)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Send a malformed second chunk (digest=None) to force the
+        // handler down the parse_digest-Err arm; that arm calls
+        // `discard_partial_best_effort` on its way out — the bounded
+        // wrap is what we're testing.
+        let bad = WriteChunk {
+            digest: None,
+            chunk_offset: CHUNK as u64,
+            chunk_bytes: Bytes::copy_from_slice(&blob[CHUNK..2 * CHUNK]),
+            chunk_sha256: sha256(&blob[CHUNK..2 * CHUNK]).to_vec(),
+            finish_chunk: true,
+        };
+        tx.send(frame_chunk(&bad)).await.unwrap();
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock — chunk0 + bad-digest send");
+
+    // The contract under test: handler returns within 5s wrap + 2s
+    // slop, even though `discard_chunked` is wedged for 30s. Without
+    // the wrap, this fires within 7s and the test panics with the
+    // bespoke message naming the contract.
+    let result = tokio::time::timeout(Duration::from_secs(ASSERT_BOUND_SECS), writer)
+        .await
+        .expect(
+            "must not deadlock — handler must bound discard_chunked under wedge \
+             (#213 reviewer round-2 MAJOR-B M2 mutation guard)",
+        )
+        .expect("writer task must not panic");
+    let status = result.expect_err("malformed subsequent chunk must return Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "bad-digest second chunk must classify as InvalidArgument; got {status:?}"
     );
 }

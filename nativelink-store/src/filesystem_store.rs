@@ -1445,6 +1445,20 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// because the `nativelink-service/test-utils` feature pulls in
     /// `nativelink-store/test-utils`. `#[doc(hidden)]` keeps this out
     /// of the rendered API docs.
+    ///
+    /// **Why `#[cfg(any(test, feature = "test-utils"))]` + `pub` rather
+    /// than `pub(crate)`?** Two narrowing strategies coexist in this
+    /// codebase: (a) `pub(crate)` for purely intra-crate test/internal
+    /// helpers (e.g. `chunked_filesystem`'s
+    /// `partial_temp_path` / `discard_chunked` consumed by
+    /// `chunked_driver` in the SAME crate); (b) `#[cfg(any(test,
+    /// feature = "test-utils"))]` + `#[doc(hidden)]` + `pub` for
+    /// CROSS-CRATE test surfaces that integration tests in OTHER
+    /// crates need to reach. `pub(crate)` won't traverse a crate
+    /// boundary; `pub` alone leaks into production builds. The
+    /// double-narrow form (`#[cfg]` to compile out of production +
+    /// `#[doc(hidden)]` to suppress rustdoc + `pub` to allow the
+    /// cross-crate import under the feature) gives both.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn partial_path_for_digest(&self, digest: &nativelink_util::common::DigestInfo) -> std::path::PathBuf {
@@ -1466,6 +1480,55 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     #[doc(hidden)]
     pub fn has_in_flight_chunked_partial(&self, digest: &nativelink_util::common::DigestInfo) -> bool {
         self.chunked_partials.contains(digest)
+    }
+
+    /// #213 reviewer round-2 MAJOR-B (M2 mutation test): register a
+    /// per-digest pre-discard delay so a downstream
+    /// `chunked_filesystem::discard_chunked` await sleeps for
+    /// `delay_ms` before doing the actual unlink. Used by integration
+    /// tests that exercise the post-error cleanup contract — the
+    /// `tokio::time::timeout(DISCARD_PARTIAL_TIMEOUT, ...)` /
+    /// `tokio::time::timeout(DISCARD_AFTER_FAILURE_TIMEOUT, ...)`
+    /// wraps must FIRE under wedged-slow-tier conditions and the
+    /// caller must observe a result within the bound, instead of
+    /// hanging forever.
+    ///
+    /// Gated on `#[cfg(any(test, feature = "test-utils"))]` so
+    /// production builds cannot register a delay (the
+    /// `chunked_filesystem`-side lookup is also gated under
+    /// `#[cfg(test)]`, so production binaries compile out the entire
+    /// path). Cross-crate access from `nativelink-service`'s
+    /// integration tests works via the existing
+    /// `nativelink-service/test-utils → nativelink-store/test-utils`
+    /// feature chain. `#[doc(hidden)]` keeps this out of the rendered
+    /// API docs.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_test_pre_discard_delay_ms(
+        &self,
+        digest: &nativelink_util::common::DigestInfo,
+        delay_ms: u64,
+    ) {
+        crate::chunked::chunked_filesystem::TEST_PRE_DISCARD_DELAY_MS_BY_DIGEST
+            .lock()
+            .insert(*digest, delay_ms);
+    }
+
+    /// #213 reviewer round-2 MAJOR-B (M2 mutation test): cleanup
+    /// counterpart to [`Self::set_test_pre_discard_delay_ms`]. Tests
+    /// MUST call this (or use a `Drop`-based scope guard) so a panic
+    /// doesn't leak the entry across tests.
+    ///
+    /// Gated identically to the setter.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn clear_test_pre_discard_delay(
+        &self,
+        digest: &nativelink_util::common::DigestInfo,
+    ) {
+        crate::chunked::chunked_filesystem::TEST_PRE_DISCARD_DELAY_MS_BY_DIGEST
+            .lock()
+            .remove(digest);
     }
 
     /// Atomic finalize: verify the temp file's actual length matches

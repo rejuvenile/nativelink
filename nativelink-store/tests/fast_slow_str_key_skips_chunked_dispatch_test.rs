@@ -114,6 +114,7 @@ fn make_fast_slow() -> (Arc<FastSlowStore>, Store, Store) {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
             slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
         },
         fast.clone(),
         slow.clone(),

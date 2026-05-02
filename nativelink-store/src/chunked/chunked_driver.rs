@@ -119,6 +119,25 @@ pub const PER_CHUNK_WRITE_TIMEOUT: core::time::Duration =
 /// Counter is `pub` for downstream metrics surfaces (the workspace's
 /// MetricsComponent macro doesn't gate on visibility, but explicit
 /// `pub` makes it discoverable from tracing instrumentation tests).
+///
+/// **Why free-standing static rather than `MetricsComponent`?**
+/// `MetricsComponent` requires a host struct + a `#[metric(help =
+/// "...")]` field. `chunked_driver.rs` is a free-standing module
+/// (no per-driver state struct lives long enough to host this — the
+/// `ChunkedDriver` is a per-blob handle that drops on commit; the
+/// counter must persist across blobs, across drivers, for the
+/// lifetime of the process). A static fits the cardinality
+/// (process-wide, not per-blob, not per-store-instance). Wiring it
+/// into a `MetricsComponent` would require either (a) creating a
+/// new singleton just to host the field, or (b) hosting it on
+/// `FilesystemStore`'s metric struct — but the counter is
+/// chunked-specific, not filesystem-specific. The
+/// `tracing::warn!` rate-limited fire (see
+/// [`record_pwrite_timeout_and_maybe_warn`]) AND the explicit
+/// `pub` accessor (consumed by tests + future scrape integration)
+/// give equivalent observability without taking on the
+/// MetricsComponent host-struct overhead. (#213 reviewer round-2
+/// MINOR-3.)
 pub static CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Sliding-window threshold: warn loudly when this many per-chunk
@@ -2152,52 +2171,17 @@ mod tests {
         drop(tx);
     }
 
-    /// #213 NMA2 fixup test (§6.7 trigger b shutdown-deadline drain
-    /// against wedged slow tier). The production constant
-    /// [`super::PER_CHUNK_WRITE_TIMEOUT`] bounds how long the driver
-    /// waits for a single `write_chunk_at_offset` await before
-    /// abandoning the blob. Without the timeout, a wedged slow tier
-    /// would leave the driver task hung indefinitely on its `.await`,
-    /// defeating §6.7 (b)'s "best-effort drain bounded by the
-    /// graceful-shutdown deadline" promise.
-    ///
-    /// **Wedge mechanism.** `chunked_filesystem::write_chunk_at_offset`
-    /// hosts a `#[cfg(test)]` per-digest delay map
-    /// (`TEST_PRE_WRITE_DELAY_MS_BY_DIGEST`); this test registers
-    /// `digest -> 500 ms` and constructs the driver via
-    /// `spawn_driver_with_per_chunk_timeout(...,
-    /// Duration::from_millis(50))`. The 50 ms driver timeout fires
-    /// before the 500 ms wedge completes — deterministic on any
-    /// machine within ~10× CI jitter.
-    ///
-    /// Production composition: wraps the chunked driver in a real
-    /// FilesystemStore (production slow tier), under a 5 s
-    /// `tokio::time::timeout` deadlock detector, asserts the driver
-    /// returns `Err(DeadlineExceeded)` with the SPECIFIC error message
-    /// naming the timeout duration.
-    ///
-    /// **Mutation-step failure mode (#213 reviewer M5 — corrected
-    /// from the prior overstated docstring).** Two orthogonal mutations
-    /// kill the test:
-    /// - **Mutation A — revert `tokio::time::timeout(per_chunk_timeout,
-    ///   write_fut).await` in `run_driver` to a bare `write_fut.await`.**
-    ///   The 500 ms wedge sleeps, the pwrite then succeeds, the driver
-    ///   commits, and `await_completion()` returns `Ok(_)`. The inner
-    ///   `expect_err("per-chunk timeout MUST surface as Err")` panic
-    ///   fires within ~500 ms, well inside the outer 5 s
-    ///   deadlock-detector. The OUTER `must not deadlock` panic does
-    ///   NOT fire — the test STILL kills the mutation, just via the
-    ///   inner `expect_err` instead of the outer detector.
-    /// - **Mutation B — replace `Code::DeadlineExceeded` with another
-    ///   classification.** The `assert_eq!(err.code,
-    ///   Code::DeadlineExceeded, ...)` panic fires.
-    ///
-    /// The outer `must not deadlock` deadlock-detector kicks in only
-    /// if `await_completion` itself stalls past 5 s — e.g., if a
-    /// future change drops the completion oneshot without sending
-    /// (the panic-safety belt is the only path that gets there
-    /// today). It is NOT the primary mutation guard for the
-    /// per-chunk-timeout contract.
+    /// #213 NMA2 fixup test: per-chunk pwrite-timeout contract under
+    /// a wedged slow tier. Wedges `write_chunk_at_offset` 500 ms,
+    /// runs driver with 50 ms `per_chunk_timeout`, asserts
+    /// `await_completion()` returns `Err(DeadlineExceeded)` naming
+    /// the contract. The 5 s outer detector is the deadlock alarm
+    /// (fires only if the spawned task neither sends nor drops the
+    /// completion oneshot — see round-2 NIT-1 reword); the inner
+    /// `expect_err` + `assert_eq!(err.code, DeadlineExceeded)` are
+    /// the primary mutation guards. Reverting the
+    /// `tokio::time::timeout(per_chunk_timeout, write_fut)` wrap
+    /// triggers `expect_err`; reclassifying triggers `assert_eq!`.
     #[nativelink_test]
     async fn driver_per_chunk_pwrite_timeout_returns_deadline_exceeded() {
         const CHUNK: usize = 4 * 1024;
@@ -2350,47 +2334,31 @@ mod tests {
         drop(tx);
     }
 
-    /// #213 testing-czar M2 fixup (§6.7 trigger d panic safety direct
-    /// test). Inject a panic mid-loop by sending a `ChunkWork` whose
-    /// `chunk_bytes` is constructed in a way that triggers a panic in
-    /// the driver's processing path. Since the driver is mostly
-    /// failsafe by construction (errors return Err, not panic), we use
-    /// a contrived approach: drive the driver to completion normally,
-    /// then construct a SECOND scenario that panics by wrapping the
-    /// `spawn_driver` task in a local `tokio::spawn` and triggering an
-    /// abort via the JoinHandleDropGuard. This is the closest we can
-    /// get without modifying production code paths to inject panics.
+    /// #213 testing-czar M2 fixup (round-2 MAJOR-C: renamed from
+    /// `driver_panic_safety_completion_resolves_err_and_pin_permits_drop`
+    /// because the test does NOT inject a real panic — it tests the
+    /// observable consequence of `JoinHandleDropGuard::drop` ⇒
+    /// `abort()` on the spawned task, which is also the §6.7(d)
+    /// panic-safety belt's effective signal but reached via the
+    /// drop-the-parent path, not via a real panic).
     ///
     /// The §6.7 trigger (d) contract says: on driver panic, (i) the
     /// completion oneshot's sender drops → receiver gets `Err(_)`;
     /// (ii) per-chunk SemaphorePermits owned by ChunkWorks drop
     /// independently via Drop; (iii) the in-flight map cleanup fires
-    /// via the JoinHandleDropGuard. This test exercises (i) + (ii)
-    /// directly via a panic-injection path: we spawn a task that
-    /// holds the driver's sender and panics; the spawned panic
-    /// propagates through the task and the driver's recv-loop sees
-    /// the channel close.
+    /// via the JoinHandleDropGuard. This test asserts (i) + (ii) on
+    /// the abort-on-drop path: we drop the driver, the
+    /// JoinHandleDropGuard aborts the spawned task, completion_tx
+    /// drops without sending, and the per-chunk permits return.
     ///
-    /// **Direct panic injection path:** the driver calls
-    /// `tokio::task::spawn_blocking` for each pwrite. We can't easily
-    /// inject a panic into spawn_blocking from outside. Instead we
-    /// validate the contract via the OBSERVABLE consequence: the
-    /// JoinHandleDropGuard's `abort()` causes the spawned task to
-    /// return at the next yield point, dropping any in-flight
-    /// ChunkWork (and their permits). We assert the budget recovers
-    /// fully within bounded wall-clock — the same test shape as
-    /// `driver_drop_aborts_spawned_task_and_recovers_budget` but
-    /// invoked under conditions that exercise mid-pwrite panic-like
-    /// behavior (chunk in flight, driver dropped, budget MUST
-    /// reclaim).
-    ///
-    /// The most realistic in-process panic injection is a failed
-    /// `assert!` inside a spawn_blocking closure — but we can't reach
-    /// inside `chunked_filesystem::write_chunk_at_offset` to inject
-    /// it without modifying production code. Instead, this test
-    /// asserts the OUTER contract (§6.7 (d) bullet (i): completion
-    /// resolves Err on driver-task termination via abort, which is
-    /// the panic-safety belt's effective behavior).
+    /// **Coverage of §6.7(d).** This test covers the observable
+    /// consequence (abort-on-drop ⇒ Err on completion + permits
+    /// reclaimed). Real panic injection inside the spawn_blocking
+    /// closure (or anywhere in the run_driver loop) is deferred to a
+    /// future test using the `failpoints` crate (or equivalent
+    /// fault-injection harness); without an injection mechanism, the
+    /// outermost driver panic is not directly observable from a
+    /// black-box integration test.
     ///
     /// Mutation step: comment out the `_handle: handle` field's
     /// `JoinHandleDropGuard` wrapping (changing `JoinHandleDropGuard`
@@ -2398,10 +2366,10 @@ mod tests {
     /// aborted on driver Drop, the completion sender would never
     /// drop, and the test's `tokio::time::timeout(Duration::from_secs(5), ...)`
     /// would fire — the SPECIFIC `.expect("must not deadlock — \
-    /// driver-task panic-safety belt must abort and surface Err")`
-    /// panic naming the contract.
+    /// driver-task abort-on-drop must surface Err")` panic naming
+    /// the contract.
     #[nativelink_test]
-    async fn driver_panic_safety_completion_resolves_err_and_pin_permits_drop() {
+    async fn driver_drop_releases_pin_permits_within_bound_after_abort() {
         const CHUNK: usize = 4 * 1024;
         let total: u64 = CHUNK as u64;
         let blob_hash = sha256(&vec![0xeeu8; CHUNK]);
@@ -2452,7 +2420,7 @@ mod tests {
 
         // Bullet (i): completion oneshot resolves Err within bound.
         let result = tokio::time::timeout(Duration::from_secs(5), completion).await
-            .expect("must not deadlock — driver-task panic-safety belt must abort and surface Err (§6.7 d)");
+            .expect("must not deadlock — driver-task abort-on-drop must surface Err (§6.7 d observable consequence)");
         assert!(
             result.is_err(),
             "after driver-task abort (panic-safety belt), completion_tx must drop without sending; got Ok(_)",
@@ -2477,5 +2445,195 @@ mod tests {
         );
 
         drop(tx);
+    }
+
+    /// #213 reviewer round-2 MAJOR-B (M8 mutation test): asserts that
+    /// the per-chunk pwrite timeout-Err arm increments
+    /// [`super::CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL`] by exactly 1
+    /// per timeout. Without this, a future change that drops the
+    /// `record_pwrite_timeout_and_maybe_warn()` call (or the
+    /// `fetch_add(1, ...)` inside it) would silently disable the
+    /// blocking-pool-leak observability without any test failing.
+    ///
+    /// **Mutation step:** comment out the `record_pwrite_timeout_and_maybe_warn();`
+    /// call in `run_driver`'s pwrite-timeout-Err arm; rerun this
+    /// test; the `assert_eq!(delta, 1, ...)` panic with the bespoke
+    /// message MUST fire. (Reverted in checked-in code.)
+    ///
+    /// Uses a baseline-snapshot pattern (read counter before, read
+    /// after, compute delta) so this test is robust to other tests
+    /// having incremented the global counter — the delta from THIS
+    /// test must equal 1.
+    #[nativelink_test]
+    async fn driver_per_chunk_pwrite_timeout_increments_total_counter_exactly_once() {
+        const CHUNK: usize = 4 * 1024;
+        let total: u64 = CHUNK as u64;
+        let blob = vec![0xb3u8; CHUNK];
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+
+        // Inject the wedge so the per-chunk timeout fires.
+        const WEDGE_MS: u64 = 500;
+        const TIMEOUT_MS: u64 = 50;
+        super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
+            .lock()
+            .insert(digest, WEDGE_MS);
+        struct ResetWriteDelay(DigestInfo);
+        impl Drop for ResetWriteDelay {
+            fn drop(&mut self) {
+                super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
+                    .lock()
+                    .remove(&self.0);
+            }
+        }
+        let _reset_guard = ResetWriteDelay(digest);
+
+        // Baseline-snapshot the global counter so this test is robust
+        // to other tests in the same binary having incremented it.
+        let baseline = super::CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL
+            .load(core::sync::atomic::Ordering::Relaxed);
+
+        let (driver, tx) = ChunkedDriver::spawn_driver_with_per_chunk_timeout(
+            store.clone(),
+            digest,
+            total,
+            CHUNK,
+            PER_BLOB_MPSC_CAP,
+            Duration::from_millis(TIMEOUT_MS),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let permit = budget.try_acquire_chunk().expect("permit");
+            tx.send(ChunkWork {
+                chunk_offset: 0,
+                chunk_bytes: Bytes::from(blob.clone()),
+                chunk_sha256: [0u8; 32],
+                finish: true,
+                _permit: permit,
+                _pin_permit: None,
+            })
+            .await
+            .expect("send");
+            let _ = driver
+                .await_completion()
+                .await
+                .expect_err("per-chunk timeout MUST surface as Err");
+            drop(tx);
+        })
+        .await
+        .expect(
+            "must not deadlock — per-chunk pwrite timeout fires within bound (#213 reviewer M8 counter)",
+        );
+
+        let after = super::CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let delta = after.saturating_sub(baseline);
+        assert_eq!(
+            delta, 1,
+            "CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL must increment by EXACTLY 1 per timeout — \
+             record_pwrite_timeout_and_maybe_warn() in pwrite-timeout-Err arm dropped? \
+             (#213 reviewer round-2 MAJOR-B M8 mutation guard) baseline={baseline} after={after}",
+        );
+    }
+
+    /// #213 reviewer round-2 MAJOR-A mutation test: asserts that the
+    /// `discard_chunked` await in `commit_and_verify`'s end-to-end
+    /// SHA-256 mismatch arm is bounded by
+    /// `tokio::time::timeout(DISCARD_AFTER_FAILURE_TIMEOUT, ...)`.
+    /// Without the wrap, a wedged slow tier (filesystem
+    /// `discard_chunked` hung) would hang the driver task forever on
+    /// the SHA-mismatch cleanup path, breaking the post-error
+    /// cleanup contract.
+    ///
+    /// **Wedge mechanism.** Registers a 30 s `discard_chunked` delay
+    /// via `TEST_PRE_DISCARD_DELAY_MS_BY_DIGEST`. Drives an e2e
+    /// SHA-256 mismatch (lying digest) so `commit_and_verify` enters
+    /// the mismatch arm and calls `discard_chunked` (which is now
+    /// wedged). With the timeout wrap, the driver returns within 5 s
+    /// (DISCARD_AFTER_FAILURE_TIMEOUT) + 5 s slop. Without it, the
+    /// 30 s wedge holds and the bespoke deadlock assertion fires.
+    ///
+    /// Mutation step: comment out one of the
+    /// `tokio::time::timeout(DISCARD_AFTER_FAILURE_TIMEOUT, ...)`
+    /// wraps in `commit_and_verify` (e.g. line 1146 — discard after
+    /// SHA-256 mismatch); this test panics with the bespoke message
+    /// within 10 s. (Reverted in checked-in code.)
+    #[nativelink_test]
+    async fn driver_bounds_post_sha_mismatch_discard_under_wedged_slow_tier() {
+        const CHUNK: usize = 4 * 1024;
+        const N: usize = 2;
+        const WEDGE_MS: u64 = 30_000;
+        const ASSERT_BOUND_SECS: u64 = 10;
+        let total = (N * CHUNK) as u64;
+        let mut blob = Vec::with_capacity(N * CHUNK);
+        for i in 0..N {
+            blob.extend(std::iter::repeat(0xc4u8 + i as u8).take(CHUNK));
+        }
+        // LIE: digest hash does not match the actual blob → e2e SHA-256
+        // verify will fail at commit_and_verify, driving the mismatch
+        // cleanup arm that calls unlink_holding + discard_chunked.
+        let lying_hash = [0xeeu8; 32];
+        let digest = DigestInfo::new(lying_hash, total);
+
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+
+        // Wedge `discard_chunked` for this digest. RAII guard so a
+        // panic doesn't leak the entry across siblings.
+        super::super::chunked_filesystem::TEST_PRE_DISCARD_DELAY_MS_BY_DIGEST
+            .lock()
+            .insert(digest, WEDGE_MS);
+        struct ResetDiscardDelay(DigestInfo);
+        impl Drop for ResetDiscardDelay {
+            fn drop(&mut self) {
+                super::super::chunked_filesystem::TEST_PRE_DISCARD_DELAY_MS_BY_DIGEST
+                    .lock()
+                    .remove(&self.0);
+            }
+        }
+        let _reset_guard = ResetDiscardDelay(digest);
+
+        let (driver, tx) = ChunkedDriver::spawn_driver(
+            store.clone(),
+            digest,
+            total,
+            CHUNK,
+            PER_BLOB_MPSC_CAP,
+        );
+
+        tokio::time::timeout(Duration::from_secs(ASSERT_BOUND_SECS), async {
+            for i in 0..N {
+                let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
+                let permit = budget.try_acquire_chunk().expect("permit");
+                tx.send(ChunkWork {
+                    chunk_offset: (i * CHUNK) as u64,
+                    chunk_bytes: bytes,
+                    chunk_sha256: [0u8; 32],
+                    finish: i == N - 1,
+                    _permit: permit,
+                    _pin_permit: None,
+                })
+                .await
+                .expect("send");
+            }
+            drop(tx);
+            let err = driver
+                .await_completion()
+                .await
+                .expect_err("e2e SHA-256 mismatch must surface as Err");
+            assert_eq!(
+                err.code,
+                nativelink_error::Code::InvalidArgument,
+                "e2e SHA-256 mismatch must classify as InvalidArgument; got {err:?}",
+            );
+        })
+        .await
+        .expect(
+            "must not deadlock — driver must bound discard_chunked under wedge in \
+             commit_and_verify SHA-mismatch arm \
+             (#213 reviewer round-2 MAJOR-A mutation guard)",
+        );
     }
 }

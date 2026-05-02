@@ -106,6 +106,27 @@ pub(crate) static TEST_PRE_WRITE_DELAY_MS_BY_DIGEST: std::sync::LazyLock<
     parking_lot::Mutex<HashMap<DigestInfo, u64>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
+/// #213 reviewer round-2 MAJOR-B (M2 mutation test): per-digest
+/// millisecond delay injected at the start of [`discard_chunked`]
+/// (test builds + the `test-utils` feature). Tests that exercise the
+/// driver/handler post-error cleanup contract — bound on
+/// `discard_chunked` / `unlink_holding` awaits via
+/// `tokio::time::timeout(...)` — register their digest here so the
+/// discard sleeps for `delay_ms` before removing the file. Combined
+/// with a `tokio::time::timeout(...)` wrap around the discard, this
+/// lets the test verify the wrap FIRES (the timeout-Elapsed branch
+/// is reached) without needing to wedge an actual filesystem.
+///
+/// Visibility: gated on `#[cfg(any(test, feature = "test-utils"))]`
+/// so cross-crate integration tests in `nativelink-service` can
+/// reach it (via the wrapper APIs on `FilesystemStore`); production
+/// binaries (no `test-utils` feature, no `cfg(test)`) compile the
+/// lookup out entirely.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) static TEST_PRE_DISCARD_DELAY_MS_BY_DIGEST: std::sync::LazyLock<
+    parking_lot::Mutex<HashMap<DigestInfo, u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
 /// In-flight chunked-blob state held by the FilesystemStore for the
 /// lifetime of an in-progress chunked upload. One entry per digest.
 ///
@@ -711,6 +732,22 @@ pub(crate) async fn discard_chunked(
     map: &ChunkedPartialsMap,
     digest: &DigestInfo,
 ) -> Result<(), Error> {
+    // #213 reviewer round-2 MAJOR-B test hook: when the per-digest
+    // test-only delay is set, sleep BEFORE the actual discard so the
+    // driver/handler `tokio::time::timeout(DISCARD_AFTER_FAILURE_TIMEOUT,
+    // ...)` / `tokio::time::timeout(DISCARD_PARTIAL_TIMEOUT, ...)` wraps
+    // can fire deterministically. Per-digest scoping keeps parallel
+    // tests from bleeding into each other. Production binaries (no
+    // `test-utils` feature, no `cfg(test)`) compile this branch out.
+    #[cfg(any(test, feature = "test-utils"))]
+    let discard_delay = TEST_PRE_DISCARD_DELAY_MS_BY_DIGEST.lock().get(digest).copied();
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(delay_ms) = discard_delay {
+        if delay_ms > 0 {
+            tokio::time::sleep(core::time::Duration::from_millis(delay_ms)).await;
+        }
+    }
+
     // Take the entry out of the map under the lock. If absent: caller
     // may have already discarded (idempotent). The on-disk file may
     // still exist if discard_chunked is called WITHOUT a corresponding
