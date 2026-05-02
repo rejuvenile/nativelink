@@ -2897,16 +2897,23 @@ mod tests {
         use crate::chunked_signal::encode_backpressure_signal_any;
 
         // ResourceExhausted + backpressure signal → false (do NOT evict).
+        // Includes the new #212 fixup variants: MemoryStoreAtCapacity
+        // (Phase 2.6) AND PinnedBytesExhausted (Phase 2.5/2.7 fixup B1).
+        // Both MUST be treated as transient backpressure (NOT dead
+        // channel) so the existing h2 channel survives.
         for reason in [
             backpressure_signal::Reason::GlobalChunkBudgetExhausted,
             backpressure_signal::Reason::PerBlobMpscFull,
+            backpressure_signal::Reason::MemoryStoreAtCapacity,
+            backpressure_signal::Reason::PinnedBytesExhausted,
         ] {
             let any = encode_backpressure_signal_any(reason, 100);
             let err = Error::resource_exhausted_backpressure("backpressure", any);
             assert!(
                 !looks_like_dead_channel(&err),
                 "ResourceExhausted with BackpressureSignal({reason:?}) must NOT \
-                 evict h2 channel — that's the #212 §13.1.1 point 2 fix",
+                 evict h2 channel — transient backpressure is not a dead-channel \
+                 signal (#212 §13.1.1 point 2 fix; new variants per fixups Phase 2.6 + B1)",
             );
         }
 

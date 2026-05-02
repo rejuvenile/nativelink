@@ -192,6 +192,34 @@ impl ChunkedReadRegistry {
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Snapshot of the pin-hit counter. Used by tests (S2 E2E) to
+    /// assert the cascade-step-2 pin path actually fired during a read.
+    /// Monotone counter; safe to compare pre/post-test snapshots even
+    /// across parallel test runs (each test compares a delta).
+    #[must_use]
+    pub fn pin_hits_total(&self) -> u64 {
+        self.metrics
+            .pin_hits_total
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot of the pin-miss counter (no driver entry for the
+    /// digest). Tests use this to assert the OFF kill-switch path.
+    #[must_use]
+    pub fn pin_misses_total(&self) -> u64 {
+        self.metrics
+            .pin_misses_total
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Snapshot of the pin-partial-miss counter.
+    #[must_use]
+    pub fn pin_partial_misses_total(&self) -> u64 {
+        self.metrics
+            .pin_partial_misses_total
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Internal helper: increment the pin-miss counter (no driver
     /// entry for the digest). Called by `FastSlowStore::get_part`.
     pub(crate) fn record_pin_miss(&self) {

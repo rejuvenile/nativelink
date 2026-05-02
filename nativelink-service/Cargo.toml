@@ -145,3 +145,11 @@ required-features = ["chunked_fast_slow", "test-utils"]
 [[test]]
 name = "bazel_facing_internal_chunking_test"
 required-features = ["chunked_fast_slow", "test-utils"]
+
+# #212 Phase 2.5/2.7 fixup S2 — end-to-end integration test (combined
+# Phase 2.5 read cascade + Phase 2.7 chunked dispatch). Run with:
+#   `cargo test -p nativelink-service --features chunked_fast_slow,test-utils \
+#       --test chunked_p25_p27_e2e_test`
+[[test]]
+name = "chunked_p25_p27_e2e_test"
+required-features = ["chunked_fast_slow", "test-utils"]

@@ -179,4 +179,43 @@ mod tests {
             "helper does NOT gate on Code; callers must do that",
         );
     }
+
+    /// #212 fixup S3 (testing-czar B3): the new fixup variants
+    /// `MemoryStoreAtCapacity` (Phase 2.6) and `PinnedBytesExhausted`
+    /// (fixup B1) MUST also encode/decode round-trip and MUST be
+    /// detected by `error_has_backpressure_signal` with the same
+    /// type_url as the older variants. Wire-stability + classifier
+    /// coverage in one test.
+    #[test]
+    fn new_fixup_variants_roundtrip_and_classify() {
+        for (reason, retry_ms) in [
+            (backpressure_signal::Reason::MemoryStoreAtCapacity, 25u64),
+            (backpressure_signal::Reason::PinnedBytesExhausted, 100u64),
+        ] {
+            let any = encode_backpressure_signal_any(reason, retry_ms);
+            assert_eq!(
+                any.type_url, BACKPRESSURE_SIGNAL_TYPE_URL,
+                "type_url MUST match the contractual constant for variant {reason:?}",
+            );
+            let decoded = BackpressureSignal::decode(&*any.value)
+                .expect("encoded BackpressureSignal must decode cleanly");
+            assert_eq!(
+                decoded.reason, reason as i32,
+                "decoded reason MUST round-trip exactly for variant {reason:?}",
+            );
+            assert_eq!(
+                decoded.retry_after_ms, retry_ms,
+                "decoded retry_after_ms MUST round-trip exactly",
+            );
+            // Classifier round-trip: detail-presence check sees the
+            // discriminator regardless of which variant we encode.
+            let err = Error::resource_exhausted_backpressure("backpressure", any);
+            assert!(
+                error_has_backpressure_signal(&err),
+                "error_has_backpressure_signal MUST detect variant {reason:?} \
+                 (otherwise looks_like_dead_channel will treat the rejection as \
+                 a dead channel and evict the h2 pool — #147 regression risk)",
+            );
+        }
+    }
 }
