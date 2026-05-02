@@ -756,6 +756,58 @@ async fn run_driver<Fe: FileEntry>(
 /// Note: this runs the SHA-256 on `spawn_blocking` per #213 perf-opt
 /// NMA1; SHA-256 of a multi-MiB blob at line rate burns CPU cycles
 /// that should not block a tokio worker.
+/// 2026-05-02 diagnostic for the production chunked-write SHA mismatch
+/// burst. Capped at 64 preserved files per process boot to bound disk
+/// usage; subsequent mismatches just log+unlink as before. Returns the
+/// preserved path on success (or `None` if cap reached / copy failed).
+///
+/// The preserved file is left at `<content_path>/d/<XX>/<digest>.<ts>.diag`
+/// — same shard directory as the holding file (cheap rename, atomic on
+/// any filesystem) so we can read it back via `sudo` without ZFS-cross-
+/// dataset issues.
+static DIAG_PRESERVED_COUNT: AtomicU64 = AtomicU64::new(0);
+const DIAG_PRESERVE_CAP: u64 = 64;
+
+async fn preserve_mismatched_holding_for_diag<Fe: FileEntry>(
+    filesystem_store: &Arc<FilesystemStore<Fe>>,
+    digest: &DigestInfo,
+) -> Option<std::path::PathBuf> {
+    if DIAG_PRESERVED_COUNT.fetch_add(1, Ordering::Relaxed) >= DIAG_PRESERVE_CAP {
+        return None;
+    }
+    let holding = filesystem_store.holding_content_path(digest);
+    let mut diag = holding.clone();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    diag.set_file_name(format!("{digest}.{ts}.diag"));
+    let from = holding.clone();
+    let to = diag.clone();
+    let copy_res = tokio::task::spawn_blocking(move || std::fs::copy(&from, &to)).await;
+    match copy_res {
+        Ok(Ok(_n)) => Some(diag),
+        Ok(Err(io_err)) => {
+            warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                ?io_err,
+                "diag preserve: copy holding -> diag failed",
+            );
+            None
+        }
+        Err(join_err) => {
+            warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                ?join_err,
+                "diag preserve: spawn_blocking join failed",
+            );
+            None
+        }
+    }
+}
+
 async fn commit_and_verify<Fe: FileEntry>(
     filesystem_store: &Arc<FilesystemStore<Fe>>,
     digest: &DigestInfo,
@@ -835,11 +887,24 @@ async fn commit_and_verify<Fe: FileEntry>(
         // The .holding file is at content_path/d/XX/<digest>.holding;
         // the canonical CAS path is NOT yet created. Stage-2 cleanup:
         // unlink the holding file, drop the in-flight tracker entry.
+        //
+        // 2026-05-02 diagnostic (#212 v4.5 fix-forward): production is
+        // hitting this path on every >=1 MiB write since deploy of the
+        // CasExtensions routing fix. Unit tests with the production
+        // handler+filesystem stack PASS for multi-chunk geometry, so
+        // bytes diverge somewhere upstream of the handler. Preserve the
+        // holding file under `<content_path>/d/<XX>/<digest>.<ts>.diag`
+        // so we can inspect actual on-disk bytes vs declared offline.
+        // RATE-LIMITED: only the FIRST 64 mismatches per process boot
+        // are preserved (avoids filling /srv/bulk if the bug fires
+        // continuously). Subsequent mismatches still log + unlink.
+        let preserved_path = preserve_mismatched_holding_for_diag(filesystem_store, digest).await;
         warn!(
             target: "nativelink_store::chunked",
             ?digest,
             computed = ?hex::encode(computed),
             declared = ?hex::encode(declared),
+            preserved = ?preserved_path,
             "chunked driver: end-to-end SHA-256 mismatch; unlinking holding file"
         );
         if let Err(unlink_err) = filesystem_store.unlink_holding(digest).await {
