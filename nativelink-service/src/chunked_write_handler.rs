@@ -904,6 +904,26 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     }
 }
 
+/// #212 v4.5: `CasExtensions` trait impl. The wire-routing fix moves
+/// `WriteChunked` off `WorkerApi` (port 50061 in production, never
+/// reachable from `GrpcStore`'s outbound CAS-endpoint channel) onto the
+/// CAS-adjacent `CasExtensions` service so it lands on the same listener
+/// as `cas` / `bytestream` (port 50071) — see `bin/nativelink.rs` for
+/// registration. The implementation just delegates to the inherent
+/// `write_chunked` method to keep the call-site shape unchanged.
+#[async_trait::async_trait]
+impl<Fe: FileEntry>
+    nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_server::CasExtensions
+    for ChunkedWriteHandler<Fe>
+{
+    async fn write_chunked(
+        &self,
+        request: Request<Streaming<WriteChunk>>,
+    ) -> Result<Response<WriteChunkedResponse>, Status> {
+        ChunkedWriteHandler::write_chunked(self, request).await
+    }
+}
+
 /// On any path that exits write_chunked_inner WITHOUT having explicitly
 /// removed the in-flight entry, this guard removes it. Also handles
 /// the case where the request future is cancelled mid-handler (tonic

@@ -21,9 +21,11 @@
 //! picks it up and immediately re-fails.
 //!
 //! Test geometry:
-//! - Bind an in-process `WorkerApi` server whose `write_chunked`
+//! - Bind an in-process `CasExtensions` server whose `write_chunked`
 //!   returns `Code::Unavailable` (transport-shaped — passes
-//!   `looks_like_dead_channel`).
+//!   `looks_like_dead_channel`). #212 v4.5: WriteChunked moved off
+//!   `WorkerApi` to `CasExtensions` so it routes via the worker's
+//!   outbound CAS-endpoint channel.
 //! - Build a `GrpcStore` against the in-process server, enable the
 //!   chunked-write kill-switch, push a >=CHUNK_SIZE blob.
 //! - Capture `tracing` output and assert the
@@ -48,7 +50,7 @@ use nativelink_macro::nativelink_test;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     ConnectWorkerRequest, UpdateForScheduler, UpdateForWorker, WriteChunk,
     WriteChunkedResponse,
-    worker_api_server::{WorkerApi, WorkerApiServer},
+    cas_extensions_server::{CasExtensions, CasExtensionsServer},
 };
 use nativelink_store::chunked::CHUNK_SIZE;
 use nativelink_store::grpc_store::GrpcStore;
@@ -57,30 +59,24 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{StoreKey, StoreLike, UploadSizeInfo};
 use sha2::{Digest as _, Sha256};
 
-/// Fake WorkerApi that always returns `Code::Unavailable` for
-/// `write_chunked` — the production GOAWAY-shaped error class that
-/// triggers the #147 eviction.
+/// Fake `CasExtensions` server that always returns `Code::Unavailable`
+/// for `write_chunked` — the production GOAWAY-shaped error class that
+/// triggers the #147 eviction. #212 v4.5: routed via `CasExtensions`
+/// (CAS endpoint) rather than `WorkerApi` (worker_api endpoint).
 struct UnavailableOnWriteChunked;
 
 #[tonic::async_trait]
-impl WorkerApi for UnavailableOnWriteChunked {
-    type ConnectWorkerStream = futures::stream::Empty<
-        Result<UpdateForWorker, tonic::Status>,
-    >;
-
-    async fn connect_worker(
-        &self,
-        _request: tonic::Request<tonic::Streaming<UpdateForScheduler>>,
-    ) -> Result<tonic::Response<Self::ConnectWorkerStream>, tonic::Status> {
-        // Acknowledge the unused request type so prost imports are not dropped.
-        let _ = ConnectWorkerRequest::default();
-        Err(tonic::Status::unimplemented("connect_worker not used in this test"))
-    }
-
+impl CasExtensions for UnavailableOnWriteChunked {
     async fn write_chunked(
         &self,
         _request: tonic::Request<tonic::Streaming<WriteChunk>>,
     ) -> Result<tonic::Response<WriteChunkedResponse>, tonic::Status> {
+        // Pull in the unused proto symbols so cargo's dead-code lint
+        // does not trip on the imports the test no longer uses for
+        // its dispatcher trait.
+        let _ = ConnectWorkerRequest::default();
+        let _ = std::marker::PhantomData::<UpdateForScheduler>;
+        let _ = std::marker::PhantomData::<UpdateForWorker>;
         Err(tonic::Status::unavailable(
             "fake worker: GOAWAY-shaped failure for #147 eviction test",
         ))
@@ -110,7 +106,7 @@ async fn chunked_path_evicts_pool_on_transport_err() -> Result<(), Error> {
 
     let server_handle = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(WorkerApiServer::new(UnavailableOnWriteChunked))
+            .add_service(CasExtensionsServer::new(UnavailableOnWriteChunked))
             .serve_with_incoming(incoming)
             .await;
     });
