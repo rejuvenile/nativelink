@@ -21,7 +21,9 @@
 //! caller), splits them into `CHUNK_SIZE`-aligned chunks, computes a
 //! per-chunk SHA-256 on `spawn_blocking` per #213 perf-opt NMA1, and
 //! sends each chunk as a `WriteChunk` proto over a single
-//! `WorkerApi/WriteChunked` client-streaming RPC.
+//! `CasExtensions/WriteChunked` client-streaming RPC. (#212 v4.5:
+//! moved off `WorkerApi` so it routes via the worker's outbound
+//! CAS-endpoint channel; see `cas_extensions.proto`.)
 //!
 //! ## Lifecycle (anti-#203 invariant)
 //!
@@ -79,7 +81,7 @@ use core::pin::Pin;
 
 use bytes::{Bytes, BytesMut};
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
-use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_client::CasExtensionsClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     BackpressureSignal, WriteChunk, WriteChunkedResponse,
 };
@@ -102,8 +104,9 @@ use crate::chunked_signal::error_has_backpressure_signal;
 pub type DispatchFuture =
     Pin<Box<dyn Future<Output = Result<WriteChunkedResponse, Error>> + Send + 'static>>;
 
-/// Transport-agnostic dispatcher for one `WorkerApi/WriteChunked`
-/// RPC. Decoupling the chunked-write logic from the underlying
+/// Transport-agnostic dispatcher for one `CasExtensions/WriteChunked`
+/// RPC. (#212 v4.5: was `WorkerApi/WriteChunked` before the routing
+/// fix.) Decoupling the chunked-write logic from the underlying
 /// transport (a) keeps generic monomorphization shallow (the deep
 /// generic stack of `tonic::client::GrpcService<...>` blew up
 /// rustc's `optimized_mir` query during initial implementation) and
@@ -197,13 +200,18 @@ where
         Box::pin(async move {
             let channel = factory().await?;
             let stream = tokio_stream::iter(chunks);
-            let mut client = WorkerApiClient::new(channel);
+            // #212 v4.5: route via CasExtensions (CAS-endpoint
+            // listener) rather than WorkerApi (worker_api-endpoint
+            // listener). GrpcStore's outbound channel is the CAS
+            // endpoint; the previous WorkerApi route was unreachable
+            // from the worker's deployed transport.
+            let mut client = CasExtensionsClient::new(channel);
             let response: Response<WriteChunkedResponse> = client
                 .write_chunked(stream)
                 .await
                 .map_err(|status| {
                     let err: Error = status.into();
-                    err.append("WorkerApi/WriteChunked RPC failed".to_string())
+                    err.append("CasExtensions/WriteChunked RPC failed".to_string())
                 })?;
             Ok(response.into_inner())
         })
@@ -282,7 +290,8 @@ impl Default for ChunkedClientOptions {
     }
 }
 
-/// Send a single CAS blob via the `WorkerApi/WriteChunked` RPC.
+/// Send a single CAS blob via the `CasExtensions/WriteChunked` RPC.
+/// (#212 v4.5: routed via CasExtensions, not WorkerApi.)
 ///
 /// `channel` is a tonic `GrpcService`-shaped transport (typically a
 /// `Connection` from `ConnectionManager` or a `tonic::transport::Channel`).

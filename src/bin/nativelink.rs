@@ -299,6 +299,23 @@ async fn inner_main(
         String,
         Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>,
     > = HashMap::new();
+    // #212 v4.5: per-CAS-store ChunkedWriteHandler instances keyed by
+    // store_name. Populated below in the chunked-dispatcher wiring
+    // block when the slow tier is a direct
+    // FilesystemStore<FileEntryImpl>. Consumed by the per-listener
+    // loop to register a `CasExtensionsServer` on every listener that
+    // hosts that CAS store. Empty when the `chunked_fast_slow`
+    // feature is OFF (the type is still declared so the per-listener
+    // loop can be feature-uniform).
+    #[cfg(feature = "chunked_fast_slow")]
+    let mut chunked_write_handlers: HashMap<
+        String,
+        Arc<
+            nativelink_service::chunked_write_handler::ChunkedWriteHandler<
+                nativelink_store::filesystem_store::FileEntryImpl,
+            >,
+        >,
+    > = HashMap::new();
     let cas_store_names: HashSet<String> = {
         let mut names: HashSet<String> = HashSet::new();
         for server_cfg in &server_cfgs {
@@ -590,11 +607,29 @@ async fn inner_main(
             };
             let _dispatcher =
                 nativelink_service::chunked_write_handler::wire_bazel_chunked_dispatcher(
-                    fss, fs_arc,
+                    fss,
+                    Arc::clone(&fs_arc),
                 );
+            // #212 v4.5: also build the worker→server WriteChunked
+            // handler keyed by this store_name so the per-listener
+            // wiring below can register `CasExtensionsServer` on any
+            // listener that hosts this CAS store (port 50071 in
+            // production). Without this registration the worker's
+            // outbound chunked stream lands on a Routes builder that
+            // has no CasExtensions service and gets Code::Unimplemented
+            // — the production bug this commit fixes.
+            chunked_write_handlers.insert(
+                store_name.clone(),
+                Arc::new(
+                    nativelink_service::chunked_write_handler::ChunkedWriteHandler::<FileEntryImpl>::new(
+                        fs_arc,
+                    ),
+                ),
+            );
             info!(
                 store_name,
-                "chunked-dispatcher wiring: installed registry + dispatcher (#212 fixup S1; \
+                "chunked-dispatcher wiring: installed registry + dispatcher + \
+                 ChunkedWriteHandler (#212 fixup S1; #212 v4.5 routing fix; \
                  kill-switches default OFF — read: enable_chunked_reads(); \
                  write: set_bazel_facing_internal_chunking_enabled(true))"
             );
@@ -727,6 +762,62 @@ async fn inner_main(
                 service
             }};
         }
+
+        // #212 v4.5: precompute the optional CasExtensionsServer for
+        // this listener. We register it whenever the listener hosts a
+        // `cas` service AND a ChunkedWriteHandler exists for that
+        // listener's CAS store name. Multiple CAS configs per listener
+        // share a handler when they share a store_name; if the
+        // handlers differ across configs we pick the first match
+        // (this reflects today's production layout — one CAS store per
+        // listener). The handler is `Arc`-shared so registering the
+        // same handler on multiple listeners is correct (only one
+        // in-flight tracker / budget across the process).
+        #[cfg(feature = "chunked_fast_slow")]
+        let cas_extensions_handler: Option<
+            Arc<
+                nativelink_service::chunked_write_handler::ChunkedWriteHandler<
+                    nativelink_store::filesystem_store::FileEntryImpl,
+                >,
+            >,
+        > = services
+            .cas
+            .as_ref()
+            .and_then(|cas_cfgs| {
+                cas_cfgs
+                    .iter()
+                    .find_map(|c| chunked_write_handlers.get(&c.config.cas_store).cloned())
+            });
+
+        // Builder helper for the CasExtensions service (#212 v4.5).
+        // Returns Some(service) only when the feature is on AND a
+        // handler exists for this listener; otherwise None so the
+        // Routes builder skips it cleanly.
+        #[cfg(feature = "chunked_fast_slow")]
+        let make_cas_extensions_service = |handler: Option<Arc<nativelink_service::chunked_write_handler::ChunkedWriteHandler<nativelink_store::filesystem_store::FileEntryImpl>>>| -> Option<
+            nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_server::CasExtensionsServer<
+                nativelink_service::chunked_write_handler::ChunkedWriteHandler<
+                    nativelink_store::filesystem_store::FileEntryImpl,
+                >,
+            >,
+        > {
+            let handler = handler?;
+            let mut service = nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_server::CasExtensionsServer::from_arc(handler);
+            service = service.max_decoding_message_size(max_decoding);
+            service = service.max_encoding_message_size(max_encoding);
+            if let ListenerConfig::Http(ref http_config) = server_cfg.listener {
+                let send_algo = &http_config.compression.send_compression_algorithm;
+                if let Some(encoding) = into_encoding(send_algo.unwrap_or(HttpCompressionAlgorithm::None)) {
+                    service = service.send_compressed(encoding);
+                }
+                for encoding in http_config.compression.accepted_compression_algorithms.iter()
+                    .filter_map(|from: &HttpCompressionAlgorithm| into_encoding(*from))
+                {
+                    service = service.accept_compressed(encoding);
+                }
+            }
+            Some(service)
+        };
 
         let execution_server = services
             .execution
@@ -888,6 +979,21 @@ async fn inner_main(
                     })
                     .err_tip(|| "Could not create BEP service")?,
             );
+
+        // #212 v4.5: register CasExtensions on the same Routes builder
+        // as `cas` / `bytestream` so worker→server WriteChunked lands
+        // on the CAS-port listener (port 50071 in production) where
+        // the worker's GrpcStore-backed outbound channel can actually
+        // reach it. Without this registration the request hits the
+        // Routes builder's fallback handler and gets
+        // Code::Unimplemented; every >=1 MiB chunked write fails.
+        // Cfg-gated on `chunked_fast_slow` because the handler type
+        // itself is gated on that feature; in non-feature builds the
+        // shadowed binding is omitted entirely so the chain remains
+        // identical to the pre-fix layout.
+        #[cfg(feature = "chunked_fast_slow")]
+        let tonic_services = tonic_services
+            .add_optional_service(make_cas_extensions_service(cas_extensions_handler));
 
         let health_registry = health_registry_builder.lock().await.build();
 
