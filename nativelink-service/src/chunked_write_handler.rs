@@ -641,9 +641,11 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             }
         }
 
-        // Convert the prost-allocated `Vec<u8>` to `Bytes` (zero-copy
-        // via `Bytes::from(Vec<u8>)`).
-        let chunk_bytes_bytes: Bytes = Bytes::from(chunk_bytes);
+        // After #212 Phase 2.4 fixup B1 part 2 the prost field is
+        // already `bytes::Bytes` (was `Vec<u8>`); the conversion below
+        // is a refcount move. Kept the binding to preserve the rest
+        // of the function's `chunk_bytes_bytes` references.
+        let chunk_bytes_bytes: Bytes = chunk_bytes;
 
         // Step 2 (M-perf-1): try_acquire the global budget BEFORE the
         // SHA-256 spawn. `try_acquire` is cheap (single atomic + branch);

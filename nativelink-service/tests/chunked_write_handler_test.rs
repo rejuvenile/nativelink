@@ -148,7 +148,7 @@ fn make_chunk(
     WriteChunk {
         digest: Some(digest.into()),
         chunk_offset,
-        chunk_bytes: chunk_bytes.to_vec(),
+        chunk_bytes: Bytes::copy_from_slice(chunk_bytes),
         chunk_sha256: sha256(chunk_bytes).to_vec(),
         finish_chunk: finish,
     }
@@ -753,7 +753,7 @@ async fn handler_zero_byte_blob_commits_with_single_finish_chunk() {
         let chunk = WriteChunk {
             digest: Some(digest.into()),
             chunk_offset: 0,
-            chunk_bytes: Vec::new(),
+            chunk_bytes: Bytes::new(),
             chunk_sha256: EMPTY_SHA256.to_vec(),
             finish_chunk: true,
         };
@@ -822,7 +822,7 @@ async fn handler_zero_byte_blob_rejects_non_empty_digest_hash() {
     let chunk = WriteChunk {
         digest: Some(digest.into()),
         chunk_offset: 0,
-        chunk_bytes: Vec::new(),
+        chunk_bytes: Bytes::new(),
         chunk_sha256: EMPTY_SHA256.to_vec(),
         finish_chunk: true,
     };
@@ -875,7 +875,7 @@ async fn handler_chunk_offset_not_multiple_of_chunk_size_returns_invalid_argumen
     let bad = WriteChunk {
         digest: Some(digest.into()),
         chunk_offset: 1,
-        chunk_bytes: vec![0u8; CHUNK],
+        chunk_bytes: Bytes::from(vec![0u8; CHUNK]),
         chunk_sha256: sha256(&vec![0u8; CHUNK]).to_vec(),
         finish_chunk: false,
     };
@@ -925,7 +925,7 @@ async fn handler_non_final_chunk_with_wrong_length_returns_invalid_argument() {
     let bad = WriteChunk {
         digest: Some(digest.into()),
         chunk_offset: 0,
-        chunk_bytes: payload.clone(),
+        chunk_bytes: Bytes::from(payload.clone()),
         chunk_sha256: sha256(&payload).to_vec(),
         finish_chunk: false,
     };
@@ -1066,7 +1066,7 @@ async fn handler_final_chunk_total_length_mismatch_returns_invalid_argument() {
     let bad = WriteChunk {
         digest: Some(digest.into()),
         chunk_offset: 0,
-        chunk_bytes: payload.clone(),
+        chunk_bytes: Bytes::from(payload.clone()),
         chunk_sha256: sha256(&payload).to_vec(),
         finish_chunk: true,
     };

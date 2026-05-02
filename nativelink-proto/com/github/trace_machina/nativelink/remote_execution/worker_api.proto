@@ -703,6 +703,12 @@ message BackpressureSignal {
 message WriteChunk {
     build.bazel.remote.execution.v2.Digest digest = 1;
     uint64 chunk_offset = 2;
+    // `chunk_bytes` is decoded as `bytes::Bytes` via prost (`#[prost(bytes = "bytes")]`
+    // in the matching `.pb.rs`). The wire format is unchanged — only the
+    // Rust-side in-memory representation differs (refcounted `Bytes` vs
+    // allocated `Vec<u8>`), which eliminates the per-retry full memcpy
+    // that the chunked-write client would otherwise pay (#212 Phase 2.4
+    // fixup B1 part 2).
     bytes chunk_bytes = 3;
     bytes chunk_sha256 = 4;
     bool finish_chunk = 5;

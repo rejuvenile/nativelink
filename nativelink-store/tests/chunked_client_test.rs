@@ -641,7 +641,7 @@ async fn end_to_end_one_byte_blob_succeeds() {
     assert_eq!(result, 1);
     let chunks = dispatcher.first_attempt_chunks();
     assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].chunk_bytes, vec![0x42u8]);
+    assert_eq!(chunks[0].chunk_bytes.as_ref(), &[0x42u8][..]);
     assert!(chunks[0].finish_chunk);
     assert_eq!(chunks[0].chunk_offset, 0);
 }

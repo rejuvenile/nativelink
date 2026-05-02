@@ -740,8 +740,16 @@ pub struct WriteChunk {
     >,
     #[prost(uint64, tag = "2")]
     pub chunk_offset: u64,
-    #[prost(bytes = "vec", tag = "3")]
-    pub chunk_bytes: ::prost::alloc::vec::Vec<u8>,
+    /// `chunk_bytes` is decoded as `bytes::Bytes` via prost (the
+    /// `#[prost(bytes = "bytes")]` annotation maps the proto `bytes`
+    /// type to a refcounted `Bytes` instead of an allocated
+    /// `Vec<u8>`). The wire format is unchanged — both encodings emit
+    /// the same `bytes` field on the wire; only the in-memory Rust
+    /// representation differs. This eliminates the per-retry full
+    /// memcpy that `Vec<u8>` forced on the chunked-write client (#212
+    /// Phase 2.4 fixup B1 part 2).
+    #[prost(bytes = "bytes", tag = "3")]
+    pub chunk_bytes: ::prost::bytes::Bytes,
     #[prost(bytes = "vec", tag = "4")]
     pub chunk_sha256: ::prost::alloc::vec::Vec<u8>,
     #[prost(bool, tag = "5")]

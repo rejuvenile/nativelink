@@ -514,11 +514,18 @@ struct PreparedChunk {
 }
 
 impl PreparedChunk {
+    /// Build the wire-side `WriteChunk` proto. The `chunk_bytes`
+    /// field is `bytes::Bytes` after the #212 Phase 2.4 fixup
+    /// (`#[prost(bytes = "bytes")]` on the proto struct), so the
+    /// move below is a refcount bump — no per-retry deep copy. The
+    /// previous implementation called `chunk_bytes.to_vec()`, which
+    /// memcpyed the full chunk into a fresh `Vec<u8>` on every
+    /// attempt; that was the M1 finding from the perf-optimizer review.
     fn into_proto(self, digest: DigestInfo) -> WriteChunk {
         WriteChunk {
             digest: Some(digest.into()),
             chunk_offset: self.chunk_offset,
-            chunk_bytes: self.chunk_bytes.to_vec(),
+            chunk_bytes: self.chunk_bytes,
             chunk_sha256: self.chunk_sha256.to_vec(),
             finish_chunk: self.finish,
         }
