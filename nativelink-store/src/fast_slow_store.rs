@@ -2983,18 +2983,20 @@ impl StoreDriver for FastSlowStore {
 
         // #212 Phase 2.7: Bazel-facing internal chunking branch.
         //
-        // When (a) the kill-switch is ON, (b) a chunked dispatcher has
-        // been installed, AND (c) the blob is at least the chunked
-        // size threshold (production: CHUNK_SIZE = 1 MiB; tests can
-        // override via `set_chunked_size_threshold_for_test`), hand the
-        // upstream to the dispatcher. The dispatcher returns Ok as
-        // soon as the final chunk is admitted (β async-commit;
-        // anti-#203). The fast-tier (MemoryStore) write happens inline
-        // below in the standard path; for chunked-dispatch we MUST
-        // still mirror the fast-tier write so the in-memory replica
-        // covers the async-commit window. We therefore tee the bytes
-        // into the dispatcher AND the fast tier in parallel, mirroring
-        // the existing `tokio::join!(data_stream_fut, fast_store_fut)`
+        // When (a) the key is `StoreKey::Digest` (Str-keyed AC entries
+        // are not eligible — see fixup D6 below), (b) the kill-switch
+        // is ON, (c) a chunked dispatcher has been installed, AND
+        // (d) the blob is at least the chunked size threshold
+        // (production: CHUNK_SIZE = 1 MiB; tests can override via
+        // `set_chunked_size_threshold_for_test`), hand the upstream to
+        // the dispatcher. The dispatcher returns Ok as soon as the
+        // final chunk is admitted (β async-commit; anti-#203). The
+        // fast-tier (MemoryStore) write happens inline below in the
+        // standard path; for chunked-dispatch we MUST still mirror the
+        // fast-tier write so the in-memory replica covers the
+        // async-commit window. We therefore tee the bytes into the
+        // dispatcher AND the fast tier in parallel, mirroring the
+        // existing `tokio::join!(data_stream_fut, fast_store_fut)`
         // pattern.
         //
         // The kill-switch defaults OFF; flipping it ON in production
@@ -3002,10 +3004,27 @@ impl StoreDriver for FastSlowStore {
         // `feedback_async_to_sync_requires_explicit_signoff`.
         #[cfg(feature = "chunked_fast_slow")]
         {
-            if crate::chunked::bazel_facing_internal_chunking_enabled() {
-                let digest = key.borrow().into_digest();
-                if digest.size_bytes() >= self.chunked_size_threshold() {
+            // #212 Phase 2.7 fixup D6 (code-reviewer §MAJOR 3): gate on
+            // KEY SHAPE first — only `StoreKey::Digest` is eligible for
+            // chunked dispatch. AC-store entries are `StoreKey::Str`
+            // (sub-KiB ActionResult protos); they cannot exceed the
+            // 1 MiB CHUNK_SIZE threshold under any realistic workload,
+            // and the `BazelChunkedDispatcher::dispatch` API requires a
+            // real `DigestInfo` (the per-blob `ChunkedDriver` machinery
+            // keys on the CAS digest). Inverting the gate avoids the
+            // hot-path `into_digest()` Blake3 hash on every Str-keyed
+            // `update()` once the kill-switch is flipped ON in
+            // production. (This is also a latent correctness fix:
+            // `StoreKey::Str::into_digest()` would synthesize a digest
+            // whose `size_bytes` equals the key length, never the blob
+            // payload, so the size-threshold check was meaningless for
+            // Str-keys anyway.)
+            if let StoreKey::Digest(digest) = &key {
+                if crate::chunked::bazel_facing_internal_chunking_enabled()
+                    && digest.size_bytes() >= self.chunked_size_threshold()
+                {
                     if let Some(dispatcher) = self.bazel_chunked_dispatcher() {
+                        let digest = *digest;
                         return self
                             .update_via_chunked_dispatcher(
                                 key,
