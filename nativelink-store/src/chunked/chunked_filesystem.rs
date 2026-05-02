@@ -95,10 +95,16 @@ use crate::filesystem_store::digest_shard_prefix;
 /// Tests should clean up via `TEST_PRE_WRITE_DELAY_MS_BY_DIGEST.lock().remove(&digest)`
 /// or use a manual `Drop`-based scope guard so a panic doesn't leak
 /// the entry.
+///
+/// #213 reviewer M4 fixup: switched from
+/// `Mutex<Option<HashMap<...>>>` to `LazyLock<Mutex<HashMap<...>>>`
+/// so the `Option` unwrap dance disappears at the call site
+/// (matches the workspace idiom in `metrics.rs`, `pin_budget.rs`,
+/// `dedup_store.rs`, `worker_proxy_store.rs`).
 #[cfg(test)]
-pub(crate) static TEST_PRE_WRITE_DELAY_MS_BY_DIGEST: parking_lot::Mutex<
-    Option<HashMap<DigestInfo, u64>>,
-> = parking_lot::Mutex::new(None);
+pub(crate) static TEST_PRE_WRITE_DELAY_MS_BY_DIGEST: std::sync::LazyLock<
+    parking_lot::Mutex<HashMap<DigestInfo, u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// In-flight chunked-blob state held by the FilesystemStore for the
 /// lifetime of an in-progress chunked upload. One entry per digest.
@@ -406,10 +412,7 @@ pub(crate) async fn write_chunk_at_offset(
     // bleeding into each other. Production binaries compile this branch
     // out via `#[cfg(test)]`.
     #[cfg(test)]
-    let delay = {
-        let guard = TEST_PRE_WRITE_DELAY_MS_BY_DIGEST.lock();
-        guard.as_ref().and_then(|m| m.get(digest).copied())
-    };
+    let delay = TEST_PRE_WRITE_DELAY_MS_BY_DIGEST.lock().get(digest).copied();
     #[cfg(test)]
     if let Some(delay_ms) = delay {
         if delay_ms > 0 {

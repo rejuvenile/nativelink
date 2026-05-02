@@ -1290,3 +1290,195 @@ async fn handler_upstream_drop_mid_blob_eagerly_discards_partial_on_disk() {
         partial_path.display(),
     );
 }
+
+// =============================================================================
+// #213 reviewer M6 fixup: sibling-bug audit coverage for the d-s-r
+// MAJOR-1 eager-GC contract. The original commit covered only the
+// `Ok(None)` branch (`handler_upstream_drop_mid_blob_eagerly_discards_partial_on_disk`).
+// Per CLAUDE.md sibling-audit rule, every other early-Err in the
+// chunked_write_handler.rs:470-516 loop must also fire eager GC. The
+// tests below cover the two highest-frequency siblings:
+// - parse_digest-Err on a non-first chunk (M1 fix added a new GC site)
+// - admit_chunk-Err on a non-first chunk (line 511, sha-256 mismatch)
+//
+// Both assertions are the SPECIFIC "partial MUST be GC'd" message
+// naming the d-s-r MAJOR-1 contract; mutation steps comment out the
+// respective `discard_partial_best_effort(...)` and confirm the
+// assertion fires.
+// =============================================================================
+
+/// Sibling test for `chunked_write_handler.rs:501` `parse_digest`
+/// (M1 fixup). Send chunk 0 (partial created on disk), then send a
+/// malformed chunk with `digest=None` — `parse_digest` returns
+/// InvalidArgument. The eager GC MUST fire and remove the partial
+/// before the handler returns.
+///
+/// Production composition: real FilesystemStore (sharded layout, real
+/// chunked_partials map, real adapter methods) wrapped under 5s
+/// `tokio::time::timeout` deadlock detector with SPECIFIC assertion
+/// messages.
+///
+/// Mutation step: comment out the `discard_partial_best_effort(...)`
+/// call in the new `parse_digest` Err arm; this test's final
+/// assertion fires with the SPECIFIC d-s-r MAJOR-1 message.
+#[nativelink_test]
+async fn handler_subsequent_chunk_parse_digest_err_eagerly_discards_partial() {
+    use std::path::PathBuf;
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    let total: u64 = (N * CHUNK) as u64;
+    let mut blob = Vec::with_capacity(N * CHUNK);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xa7u8 + i as u8).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), total);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    let partial_path: PathBuf = store.partial_path_for_digest(&digest);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let chunk0 = make_chunk(digest, 0, &blob[0..CHUNK], false);
+        tx.send(frame_chunk(&chunk0)).await.unwrap();
+        // Wait for the partial to land on disk + map (race-free per
+        // the comment in the d-s-r MAJOR-1 test above).
+        loop {
+            if tokio::fs::metadata(&partial_path).await.is_ok()
+                && store.has_in_flight_chunked_partial(&digest)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Now send a chunk with `digest=None` — parse_digest returns
+        // InvalidArgument. This drives chunked_write_handler.rs:501.
+        let bad = WriteChunk {
+            digest: None,
+            chunk_offset: CHUNK as u64,
+            chunk_bytes: Bytes::copy_from_slice(&blob[CHUNK..2 * CHUNK]),
+            chunk_sha256: sha256(&blob[CHUNK..2 * CHUNK]).to_vec(),
+            finish_chunk: true,
+        };
+        tx.send(frame_chunk(&bad)).await.unwrap();
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock — chunk0 + malformed digest=None send");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock — handler must reject parse_digest-Err within 5s")
+        .expect("writer task must not panic");
+    let status = result.expect_err("parse_digest=None on subsequent chunk must return Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "missing-digest on subsequent chunk must classify as InvalidArgument; got {status:?}"
+    );
+
+    nativelink_service::chunked_write_handler::wait_for_no_in_flight(
+        &in_flight,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("must not deadlock — in-flight tracker must drain after handler returns Err");
+
+    let exists = tokio::fs::metadata(&partial_path).await.is_ok();
+    assert!(
+        !exists,
+        "partial file MUST be GC'd by discard_partial_best_effort on parse_digest-Err \
+         (#213 reviewer M1 sibling) — without the eager GC, the partial persists until next \
+         FilesystemStore::new sweep; checked path={}",
+        partial_path.display(),
+    );
+}
+
+/// Sibling test for `chunked_write_handler.rs:511` `admit_chunk` Err
+/// on a subsequent chunk. Send chunk 0 (partial created on disk),
+/// then send chunk 1 with WRONG `chunk_sha256` — `admit_chunk` ->
+/// `verify_and_prepare_chunk`'s SHA-256 verify fails with
+/// InvalidArgument. The eager GC MUST fire and remove the partial
+/// before the handler returns.
+///
+/// Production composition: same shape as the parse_digest sibling.
+///
+/// Mutation step: comment out the `discard_partial_best_effort(...)`
+/// call in the `if let Err(err) = self.admit_chunk(next, ...)` arm
+/// at line 511; this test's final assertion fires with the SPECIFIC
+/// d-s-r MAJOR-1 message.
+#[nativelink_test]
+async fn handler_subsequent_chunk_admit_err_eagerly_discards_partial() {
+    use std::path::PathBuf;
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    let total: u64 = (N * CHUNK) as u64;
+    let mut blob = Vec::with_capacity(N * CHUNK);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xa8u8 + i as u8).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), total);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    let partial_path: PathBuf = store.partial_path_for_digest(&digest);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let chunk0 = make_chunk(digest, 0, &blob[0..CHUNK], false);
+        tx.send(frame_chunk(&chunk0)).await.unwrap();
+        loop {
+            if tokio::fs::metadata(&partial_path).await.is_ok()
+                && store.has_in_flight_chunked_partial(&digest)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Send chunk 1 with WRONG sha256 → admit_chunk's SHA-256
+        // verify fails (line 511 path).
+        let mut bad = make_chunk(digest, CHUNK as u64, &blob[CHUNK..2 * CHUNK], true);
+        bad.chunk_sha256 = vec![0xffu8; 32]; // intentionally wrong
+        tx.send(frame_chunk(&bad)).await.unwrap();
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock — chunk0 + bad-sha-chunk1 send");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock — handler must reject admit_chunk-Err within 5s")
+        .expect("writer task must not panic");
+    let status = result.expect_err("admit_chunk-Err on subsequent chunk must return Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "wrong-sha on subsequent chunk must classify as InvalidArgument; got {status:?}"
+    );
+
+    nativelink_service::chunked_write_handler::wait_for_no_in_flight(
+        &in_flight,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("must not deadlock — in-flight tracker must drain after handler returns Err");
+
+    let exists = tokio::fs::metadata(&partial_path).await.is_ok();
+    assert!(
+        !exists,
+        "partial file MUST be GC'd by discard_partial_best_effort on admit_chunk-Err \
+         on subsequent chunk (#213 d-s-r MAJOR-1 line 511 sibling) — without the eager GC, \
+         the partial persists until next FilesystemStore::new sweep; checked path={}",
+        partial_path.display(),
+    );
+}

@@ -1436,6 +1436,17 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// disk state across the §6.7 termination triggers (especially
     /// the #213 d-s-r MAJOR-1 eager-GC test). Pure function over
     /// `temp_path_for_chunked()` + `digest`; no I/O.
+    ///
+    /// #213 reviewer M3 fixup: test-only API (no production caller);
+    /// gated on `#[cfg(any(test, feature = "test-utils"))]` so
+    /// production builds cannot reach it. Cross-crate access from the
+    /// `nativelink-service` `chunked_write_handler_test` integration
+    /// test (which already requires the `test-utils` feature) works
+    /// because the `nativelink-service/test-utils` feature pulls in
+    /// `nativelink-store/test-utils`. `#[doc(hidden)]` keeps this out
+    /// of the rendered API docs.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn partial_path_for_digest(&self, digest: &nativelink_util::common::DigestInfo) -> std::path::PathBuf {
         crate::chunked::chunked_filesystem::partial_temp_path(self.temp_path_for_chunked(), digest)
     }
@@ -1448,6 +1459,11 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// can succeed before the map insert completes (the file is
     /// created during `open_or_create_partial` BEFORE the map insert),
     /// so a race-free test must check map registration too.
+    ///
+    /// #213 reviewer M3 fixup: test-only API (no production caller);
+    /// gated on `#[cfg(any(test, feature = "test-utils"))]`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn has_in_flight_chunked_partial(&self, digest: &nativelink_util::common::DigestInfo) -> bool {
         self.chunked_partials.contains(digest)
     }

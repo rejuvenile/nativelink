@@ -98,6 +98,95 @@ pub const PER_BLOB_MPSC_CAP: usize = 16;
 pub const PER_CHUNK_WRITE_TIMEOUT: core::time::Duration =
     core::time::Duration::from_secs(5);
 
+/// #213 reviewer M8 (RECONSIDER red-team): when
+/// `tokio::time::timeout` fires on a `spawn_blocking` pwrite, the
+/// blocking-pool task continues to completion BUT its result is
+/// discarded — the JoinHandle is dropped on the timeout-Err arm.
+/// `spawn_blocking` is uncancellable per tokio API contract, so the
+/// underlying syscall keeps the blocking-pool thread occupied until
+/// the kernel resolves the wedge (kernel I/O timeout, on the order
+/// of tens of seconds). Repeated wedges leak threads from the
+/// 512-thread default pool until none remain, at which point all
+/// further `spawn_blocking` calls queue indefinitely.
+///
+/// To make this leak observable BEFORE it's catastrophic, we
+/// increment a counter on every per-chunk pwrite timeout and warn
+/// when more than [`PWRITE_TIMEOUT_WARN_THRESHOLD`] timeouts occur
+/// within a [`PWRITE_TIMEOUT_WARN_WINDOW`]. The SRE can correlate
+/// against `tokio::runtime::RuntimeMetrics::num_blocking_threads()`
+/// to confirm the pool is approaching saturation.
+///
+/// Counter is `pub` for downstream metrics surfaces (the workspace's
+/// MetricsComponent macro doesn't gate on visibility, but explicit
+/// `pub` makes it discoverable from tracing instrumentation tests).
+pub static CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Sliding-window threshold: warn loudly when this many per-chunk
+/// pwrite timeouts fire inside a [`PWRITE_TIMEOUT_WARN_WINDOW`].
+/// Chosen low enough that an early warning surfaces before all 512
+/// pool threads are leaked, but high enough that a single transient
+/// slow-tier blip doesn't trigger.
+const PWRITE_TIMEOUT_WARN_THRESHOLD: u64 = 10;
+
+/// Sliding window for the warn rate trigger. 60 seconds is the
+/// typical scrape interval for monitoring agents; if more than
+/// `PWRITE_TIMEOUT_WARN_THRESHOLD` timeouts land in the same window
+/// the SRE will see the warn alongside the next scrape.
+const PWRITE_TIMEOUT_WARN_WINDOW: core::time::Duration =
+    core::time::Duration::from_secs(60);
+
+/// Last-warn timestamp + count baseline (paired). When the elapsed
+/// since `last_warn_at` exceeds the window OR the delta from
+/// `count_at_last_warn` exceeds the threshold, we re-warn and reset
+/// the baseline. Single-writer (the run_driver Err arm), so a plain
+/// parking_lot mutex over a 16-byte tuple is enough.
+static PWRITE_TIMEOUT_WARN_STATE: parking_lot::Mutex<Option<(std::time::Instant, u64)>> =
+    parking_lot::Mutex::new(None);
+
+/// Helper called from the per-chunk pwrite timeout-Err arm: bumps
+/// the counter and emits a warn! when the rate exceeds threshold
+/// within the window. No-op when the rate is healthy.
+fn record_pwrite_timeout_and_maybe_warn() {
+    let new_total = CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = std::time::Instant::now();
+    let mut guard = PWRITE_TIMEOUT_WARN_STATE.lock();
+    let baseline = guard.unwrap_or((now, new_total.saturating_sub(1)));
+    let (last_at, count_at_last) = baseline;
+    let delta = new_total.saturating_sub(count_at_last);
+    let elapsed = now.duration_since(last_at);
+    if delta >= PWRITE_TIMEOUT_WARN_THRESHOLD && elapsed <= PWRITE_TIMEOUT_WARN_WINDOW {
+        warn!(
+            target: "nativelink_store::chunked",
+            total_timeouts = new_total,
+            timeouts_in_window = delta,
+            window_secs = PWRITE_TIMEOUT_WARN_WINDOW.as_secs(),
+            "chunked driver: per-chunk pwrite timeouts exceeding {PWRITE_TIMEOUT_WARN_THRESHOLD}/window — \
+             blocking-pool threads may be leaking; correlate with \
+             tokio::runtime::RuntimeMetrics::num_blocking_threads() (#213 reviewer M8)",
+        );
+        *guard = Some((now, new_total));
+    } else if elapsed > PWRITE_TIMEOUT_WARN_WINDOW {
+        // Reset baseline; healthy rate.
+        *guard = Some((now, new_total));
+    } else {
+        // First-call seed.
+        if guard.is_none() {
+            *guard = Some(baseline);
+        }
+    }
+}
+
+/// #213 reviewer M2 fixup: wall-clock bound on the post-failure
+/// `discard_chunked` await in `run_driver`. Without this, a wedged
+/// slow tier — the SAME failure mode that motivates
+/// [`PER_CHUNK_WRITE_TIMEOUT`] — would hang the driver task
+/// indefinitely on the post-error cleanup, defeating §6.7 trigger
+/// (b)'s "best-effort drain bounded by the graceful-shutdown
+/// deadline" promise. 5 s matches the per-chunk timeout (same root
+/// cause; same upper bound).
+pub const DISCARD_AFTER_FAILURE_TIMEOUT: core::time::Duration =
+    core::time::Duration::from_secs(5);
+
 /// One unit of work consumed by the per-blob driver.
 ///
 /// Carries the chunk payload + per-chunk SHA-256 (already verified at
@@ -304,11 +393,17 @@ impl ChunkedDriver {
     /// Same as [`Self::spawn_driver`] but accepts a custom per-chunk
     /// pwrite timeout. Production callers MUST use [`Self::spawn_driver`]
     /// (which passes [`PER_CHUNK_WRITE_TIMEOUT`]); this entry point is
-    /// for tests that need to exercise the timeout path with a short
+    /// shared with tests that exercise the timeout path under a short
     /// bound, so a wedged-slow-tier scenario fires the timeout in
     /// bounded test wall-clock instead of waiting for the production
     /// 5 s constant.
-    pub fn spawn_driver_with_per_chunk_timeout<Fe: FileEntry>(
+    ///
+    /// #213 reviewer M3 fixup: visibility narrowed from `pub` to
+    /// `pub(crate)`. The only callers are `Self::spawn_driver` (which
+    /// hard-codes the production constant) and the in-file unit test
+    /// `driver_per_chunk_pwrite_timeout_returns_deadline_exceeded`; no
+    /// external consumer should ever pass a non-production timeout.
+    pub(crate) fn spawn_driver_with_per_chunk_timeout<Fe: FileEntry>(
         filesystem_store: Arc<FilesystemStore<Fe>>,
         digest: DigestInfo,
         expected_size: u64,
@@ -663,13 +758,38 @@ async fn run_driver<Fe: FileEntry>(
                     "chunked driver: per-chunk pwrite exceeded timeout; aborting blob \
                      (slow tier wedged?)",
                 );
-                if let Err(discard_err) = filesystem_store.discard_chunked(&digest).await {
-                    error!(
+                // #213 reviewer M8: record timeout + warn if rate
+                // exceeds threshold (helps SREs spot blocking-pool
+                // thread leak before catastrophic saturation).
+                record_pwrite_timeout_and_maybe_warn();
+                // Per #213 reviewer M2: bound the post-timeout discard
+                // by [`DISCARD_AFTER_FAILURE_TIMEOUT`]. The original
+                // `discard_chunked(&digest).await` was unbounded and a
+                // wedged slow tier (the same scenario that motivated
+                // the per-chunk pwrite timeout) would hang the driver
+                // task forever, defeating §6.7 trigger (b)'s
+                // "best-effort drain bounded by deadline" promise.
+                match tokio::time::timeout(
+                    DISCARD_AFTER_FAILURE_TIMEOUT,
+                    filesystem_store.discard_chunked(&digest),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(discard_err)) => error!(
                         target: "nativelink_store::chunked",
                         ?digest,
                         ?discard_err,
                         "chunked driver: discard after per-chunk pwrite timeout also failed",
-                    );
+                    ),
+                    Err(_) => error!(
+                        target: "nativelink_store::chunked",
+                        ?digest,
+                        timeout_ms = DISCARD_AFTER_FAILURE_TIMEOUT.as_millis() as u64,
+                        "chunked driver: discard after per-chunk pwrite timeout also timed out; \
+                         partial persists until next FilesystemStore::new sweep \
+                         (#213 reviewer M2: driver-task bound, GC abandoned)",
+                    ),
                 }
                 return Err(make_err!(
                     Code::DeadlineExceeded,
@@ -689,13 +809,31 @@ async fn run_driver<Fe: FileEntry>(
             // Abort the blob: discard the partial. Best-effort;
             // discard errors are logged but not surfaced (the original
             // write error is the operator-actionable one).
-            if let Err(discard_err) = filesystem_store.discard_chunked(&digest).await {
-                error!(
+            //
+            // Per #213 reviewer M2: bound the discard wall-clock so a
+            // wedged slow tier cannot hang the driver task here either
+            // (same rationale as the timeout-arm above).
+            match tokio::time::timeout(
+                DISCARD_AFTER_FAILURE_TIMEOUT,
+                filesystem_store.discard_chunked(&digest),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(discard_err)) => error!(
                     target: "nativelink_store::chunked",
                     ?digest,
                     ?discard_err,
                     "chunked driver: discard after per-chunk write failure also failed",
-                );
+                ),
+                Err(_) => error!(
+                    target: "nativelink_store::chunked",
+                    ?digest,
+                    timeout_ms = DISCARD_AFTER_FAILURE_TIMEOUT.as_millis() as u64,
+                    "chunked driver: discard after per-chunk write failure also timed out; \
+                     partial persists until next FilesystemStore::new sweep \
+                     (#213 reviewer M2: driver-task bound, GC abandoned)",
+                ),
             }
             return Err(write_err);
         }
@@ -1938,13 +2076,14 @@ mod tests {
     /// defeating §6.7 (b)'s "best-effort drain bounded by the
     /// graceful-shutdown deadline" promise.
     ///
-    /// This test does NOT wedge the slow tier (no easy injection
-    /// point); instead it passes a deliberately tiny per-chunk timeout
-    /// (`Duration::from_nanos(1)`) so the timeout fires before the
-    /// real `write_chunk_at_offset` completes (the spawn_blocking
-    /// dispatch + open + try_clone + pwrite chain takes microseconds
-    /// minimum). The path under test is the same `tokio::time::timeout`
-    /// at `run_driver`; only the bound differs.
+    /// **Wedge mechanism.** `chunked_filesystem::write_chunk_at_offset`
+    /// hosts a `#[cfg(test)]` per-digest delay map
+    /// (`TEST_PRE_WRITE_DELAY_MS_BY_DIGEST`); this test registers
+    /// `digest -> 500 ms` and constructs the driver via
+    /// `spawn_driver_with_per_chunk_timeout(...,
+    /// Duration::from_millis(50))`. The 50 ms driver timeout fires
+    /// before the 500 ms wedge completes — deterministic on any
+    /// machine within ~10× CI jitter.
     ///
     /// Production composition: wraps the chunked driver in a real
     /// FilesystemStore (production slow tier), under a 5 s
@@ -1952,10 +2091,28 @@ mod tests {
     /// returns `Err(DeadlineExceeded)` with the SPECIFIC error message
     /// naming the timeout duration.
     ///
-    /// Mutation step: revert the `tokio::time::timeout(per_chunk_timeout, ...)`
-    /// wrap in `run_driver` to a bare `.await`; this test then hangs
-    /// past the 5 s outer timeout and the `.expect("must not deadlock — \
-    /// per-chunk pwrite timeout fires within bound")` panic fires.
+    /// **Mutation-step failure mode (#213 reviewer M5 — corrected
+    /// from the prior overstated docstring).** Two orthogonal mutations
+    /// kill the test:
+    /// - **Mutation A — revert `tokio::time::timeout(per_chunk_timeout,
+    ///   write_fut).await` in `run_driver` to a bare `write_fut.await`.**
+    ///   The 500 ms wedge sleeps, the pwrite then succeeds, the driver
+    ///   commits, and `await_completion()` returns `Ok(_)`. The inner
+    ///   `expect_err("per-chunk timeout MUST surface as Err")` panic
+    ///   fires within ~500 ms, well inside the outer 5 s
+    ///   deadlock-detector. The OUTER `must not deadlock` panic does
+    ///   NOT fire — the test STILL kills the mutation, just via the
+    ///   inner `expect_err` instead of the outer detector.
+    /// - **Mutation B — replace `Code::DeadlineExceeded` with another
+    ///   classification.** The `assert_eq!(err.code,
+    ///   Code::DeadlineExceeded, ...)` panic fires.
+    ///
+    /// The outer `must not deadlock` deadlock-detector kicks in only
+    /// if `await_completion` itself stalls past 5 s — e.g., if a
+    /// future change drops the completion oneshot without sending
+    /// (the panic-safety belt is the only path that gets there
+    /// today). It is NOT the primary mutation guard for the
+    /// per-chunk-timeout contract.
     #[nativelink_test]
     async fn driver_per_chunk_pwrite_timeout_returns_deadline_exceeded() {
         const CHUNK: usize = 4 * 1024;
@@ -1974,21 +2131,19 @@ mod tests {
         // the same binary do NOT collide.
         const WEDGE_MS: u64 = 500;
         const TIMEOUT_MS: u64 = 50;
-        {
-            let mut guard = super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST.lock();
-            guard.get_or_insert_with(std::collections::HashMap::new).insert(digest, WEDGE_MS);
-        }
+        // #213 reviewer M4 fixup: LazyLock<Mutex<HashMap>> means no
+        // `Option` dance — straight `.lock().insert(digest, ...)`.
+        super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
+            .lock()
+            .insert(digest, WEDGE_MS);
         // Manual scope-guard so a test panic still cleans up the
         // per-digest entry (`scopeguard` crate is not a dep).
         struct ResetWriteDelay(DigestInfo);
         impl Drop for ResetWriteDelay {
             fn drop(&mut self) {
-                if let Some(map) = super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
+                super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
                     .lock()
-                    .as_mut()
-                {
-                    map.remove(&self.0);
-                }
+                    .remove(&self.0);
             }
         }
         let _reset_guard = ResetWriteDelay(digest);

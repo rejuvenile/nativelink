@@ -68,7 +68,7 @@ use parking_lot::Mutex;
 use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use nativelink_error::{Code, Error, make_err, make_input_err};
 use nativelink_metric::{
@@ -498,7 +498,21 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                     )));
                 }
             };
-            let next_digest = parse_digest(&next)?;
+            // #213 reviewer M1 fixup: sibling miss — `parse_digest`
+            // must trigger the same eager-GC discard as every other
+            // early-Err in this loop. Without this, a chunk with an
+            // unparseable digest field after the first chunk leaves
+            // the on-disk partial behind until the next
+            // FilesystemStore::new sweep (matches the d-s-r MAJOR-1
+            // contract for the other 6 sites).
+            let next_digest = match parse_digest(&next) {
+                Ok(d) => d,
+                Err(err) => {
+                    discard_partial_best_effort(&self.filesystem_store, &stream_digest).await;
+                    drop(cleanup_guard);
+                    return Err(err);
+                }
+            };
             if next_digest != stream_digest {
                 discard_partial_best_effort(&self.filesystem_store, &stream_digest).await;
                 drop(cleanup_guard);
@@ -990,6 +1004,19 @@ fn err_to_status(err: Error) -> Status {
     Status::from(err)
 }
 
+/// #213 reviewer M2 fixup: wall-clock bound on the eager-GC discard.
+/// Without this, a wedged slow tier (the SAME failure mode that
+/// motivates the per-chunk pwrite timeout in chunked_driver.rs) would
+/// hang `discard_partial_best_effort` forever and the handler future
+/// would never return — strictly worse than the original "partial
+/// persists" bug because the handler hang propagates upstream as a
+/// gRPC stream stuck open. 5 s matches the `PER_CHUNK_WRITE_TIMEOUT`
+/// constant; under wedge conditions the handler abandons GC, lets
+/// the file linger until next FilesystemStore::new sweep (the
+/// pre-fix behavior), but the handler still returns within the
+/// bound.
+const DISCARD_PARTIAL_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
+
 /// #213 d-s-r MAJOR-1 helper: best-effort GC of an in-flight chunked
 /// partial after `update()` returns Err. Called from
 /// [`dispatch_chunks_to_driver`]'s early-Err exits (chunk-stream pull
@@ -1005,17 +1032,40 @@ fn err_to_status(err: Error) -> Status {
 ///
 /// Best-effort: discard errors are logged at `warn!` and ignored.
 /// The original upstream error is what surfaces to the producer.
+///
+/// #213 reviewer M2 fixup: wrapped under
+/// [`DISCARD_PARTIAL_TIMEOUT`] so a wedged slow tier cannot hang the
+/// handler. Timeout fires → log at `error!`, partial persists until
+/// next FilesystemStore::new sweep (pre-fix behavior). The handler
+/// still returns within the bound.
 async fn discard_partial_best_effort<Fe: FileEntry>(
     filesystem_store: &Arc<FilesystemStore<Fe>>,
     digest: &DigestInfo,
 ) {
-    if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
-        warn!(
-            ?digest,
-            ?discard_err,
-            "WriteChunked: discard_chunked after dispatch Err failed; partial may persist \
-             until next FilesystemStore::new sweep (#213 d-s-r MAJOR-1 best-effort GC)"
-        );
+    match tokio::time::timeout(
+        DISCARD_PARTIAL_TIMEOUT,
+        filesystem_store.discard_chunked(digest),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(discard_err)) => {
+            warn!(
+                ?digest,
+                ?discard_err,
+                "WriteChunked: discard_chunked after dispatch Err failed; partial may persist \
+                 until next FilesystemStore::new sweep (#213 d-s-r MAJOR-1 best-effort GC)"
+            );
+        }
+        Err(_elapsed) => {
+            error!(
+                ?digest,
+                timeout_ms = DISCARD_PARTIAL_TIMEOUT.as_millis() as u64,
+                "WriteChunked: discard_chunked timed out (slow tier wedged?); \
+                 partial persists until next FilesystemStore::new sweep \
+                 (#213 reviewer M2: handler bound, GC abandoned)"
+            );
+        }
     }
 }
 
