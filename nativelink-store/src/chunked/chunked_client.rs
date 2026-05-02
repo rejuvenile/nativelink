@@ -683,6 +683,7 @@ async fn hash_chunk_blocking(bytes: Bytes) -> Result<[u8; 32], Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nativelink_macro::nativelink_test;
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal::Reason;
     use nativelink_util::buf_channel::make_buf_channel_pair;
 
@@ -700,7 +701,7 @@ mod tests {
     /// `collect_and_hash_chunks` produces the expected number of
     /// chunks for a perfectly aligned blob and tags the LAST one
     /// with `finish=true`.
-    #[tokio::test]
+    #[nativelink_test]
     async fn collect_aligned_blob_4_chunks_finish_on_last() {
         const CHUNK: usize = 4 * 1024;
         const N: usize = 4;
@@ -736,7 +737,7 @@ mod tests {
     /// Blob whose size is NOT a multiple of CHUNK_SIZE produces a
     /// final chunk that is smaller than CHUNK_SIZE and carries
     /// finish=true.
-    #[tokio::test]
+    #[nativelink_test]
     async fn collect_unaligned_blob_final_chunk_is_partial() {
         const CHUNK: usize = 1024;
         let blob: Vec<u8> = (0..(CHUNK * 2 + 17)).map(|i| (i & 0xff) as u8).collect();
@@ -768,7 +769,7 @@ mod tests {
     /// Reader producing fewer bytes than declared digest.size errors
     /// before any chunk is sent. Guards against a partial-read
     /// silently shipping an inconsistent committed_size to the server.
-    #[tokio::test]
+    #[nativelink_test]
     async fn collect_short_blob_returns_input_err() {
         const CHUNK: usize = 1024;
         let actual: Vec<u8> = vec![0u8; 500];
@@ -794,7 +795,7 @@ mod tests {
     }
 
     /// Reader producing MORE bytes than declared digest.size errors.
-    #[tokio::test]
+    #[nativelink_test]
     async fn collect_long_blob_returns_input_err() {
         const CHUNK: usize = 1024;
         let actual: Vec<u8> = vec![0u8; 1500];
@@ -821,8 +822,8 @@ mod tests {
 
     /// `classify_retryable` recognizes Aborted + BackpressureSignal
     /// as retryable.
-    #[test]
-    fn classify_aborted_with_backpressure_is_retry() {
+    #[nativelink_test]
+    async fn classify_aborted_with_backpressure_is_retry() {
         let any = encode_backpressure_signal_any(Reason::PerBlobMpscFull, 250);
         let err = Error::aborted_with_detail("concurrent-stream", any);
         match classify_retryable(&err) {
@@ -836,8 +837,8 @@ mod tests {
 
     /// `classify_retryable` recognizes ResourceExhausted +
     /// BackpressureSignal as retryable.
-    #[test]
-    fn classify_resource_exhausted_with_backpressure_is_retry() {
+    #[nativelink_test]
+    async fn classify_resource_exhausted_with_backpressure_is_retry() {
         let any =
             encode_backpressure_signal_any(Reason::GlobalChunkBudgetExhausted, 100);
         let err = Error::resource_exhausted_backpressure("budget", any);
@@ -855,8 +856,8 @@ mod tests {
     /// `classify_retryable` does NOT retry on bare ResourceExhausted
     /// (no signal). That's the legacy h2 dead-channel shape; retrying
     /// here would mask a real transport issue.
-    #[test]
-    fn classify_bare_resource_exhausted_is_abort() {
+    #[nativelink_test]
+    async fn classify_bare_resource_exhausted_is_abort() {
         let err = make_err!(Code::ResourceExhausted, "no signal");
         matches!(classify_retryable(&err), RetryDecision::Abort)
             .then_some(())
@@ -866,8 +867,8 @@ mod tests {
     /// `classify_retryable` does NOT retry on InvalidArgument even
     /// if the server (incorrectly) attached a BackpressureSignal —
     /// the producer must not retry malformed-input errors.
-    #[test]
-    fn classify_invalid_argument_with_signal_is_abort() {
+    #[nativelink_test]
+    async fn classify_invalid_argument_with_signal_is_abort() {
         let any = encode_backpressure_signal_any(Reason::PerBlobMpscFull, 100);
         let mut err = make_input_err!("malformed");
         err.details.push(any);
@@ -877,8 +878,8 @@ mod tests {
     }
 
     /// `decode_retry_after` caps absurd hints at `MAX_RETRY_AFTER`.
-    #[test]
-    fn classify_retry_after_capped_at_max() {
+    #[nativelink_test]
+    async fn classify_retry_after_capped_at_max() {
         let any = encode_backpressure_signal_any(Reason::PerBlobMpscFull, u64::MAX);
         let err = Error::aborted_with_detail("crazy hint", any);
         match classify_retryable(&err) {
