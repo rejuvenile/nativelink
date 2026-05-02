@@ -250,3 +250,12 @@ required-features = ["chunked_fast_slow"]
 [[test]]
 name = "chunked_read_cascade_test"
 required-features = ["chunked_fast_slow"]
+
+# #212 Phase 2.7 fixup D6: regression test that Str-keyed `update()` on
+# `FastSlowStore` skips the chunked-dispatch gate entirely (avoiding the
+# `into_digest()` Blake3 hash on AC entries' string keys when the
+# kill-switch is ON). Requires `test-utils` for
+# `set_chunked_size_threshold_for_test`.
+[[test]]
+name = "fast_slow_str_key_skips_chunked_dispatch_test"
+required-features = ["chunked_fast_slow", "test-utils"]
