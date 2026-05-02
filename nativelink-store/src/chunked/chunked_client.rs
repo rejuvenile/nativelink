@@ -324,17 +324,29 @@ pub async fn write_chunked_stream(
 
     // Read the entire payload into chunks ONCE up-front. The buf-channel
     // reader is single-pass; we cannot reset it between retry attempts.
-    // For typical worker mirror traffic the blob is <=64 MiB so peak
-    // RSS is bounded; for the rare large-blob case the cost is still
-    // O(blob_size) which the in-order ByteStream path also pays
-    // (just spread differently). Computed SHA-256 hashes are
-    // cached so the per-chunk hash burn happens ONCE even across
-    // retries.
+    // The dispatch path is gated by `MAX_CHUNKED_BLOB_SIZE` (256 MiB,
+    // see #212 Phase 2.4 fixup B1 part 1) so peak in-memory cost is
+    // bounded. Computed SHA-256 hashes are cached so the per-chunk
+    // hash burn happens ONCE even across retries. Streaming retry
+    // (which would lift the cap) is deferred to Phase 2.5+.
     let chunks = collect_and_hash_chunks(&mut reader, &digest, options.chunk_size).await?;
+
+    // #212 Phase 2.4 fixup M2 (perf-optimizer): build the wire-side
+    // `Vec<WriteChunk>` ONCE outside the retry loop. Each retry
+    // attempt clones it (Bytes payload is refcounted so the chunk
+    // bodies share a single backing buffer; only the Vec header +
+    // per-chunk WriteChunk struct are duplicated — bounded at
+    // ~CHUNK_COUNT * sizeof(WriteChunk) per retry). The previous
+    // shape rebuilt the Vec per attempt, which doubled the small-
+    // alloc churn under the retry path.
+    let proto_chunks_template: Vec<WriteChunk> = chunks
+        .into_iter()
+        .map(|c| c.into_proto(digest))
+        .collect();
 
     let mut last_err: Option<Error> = None;
     for attempt in 1..=options.max_attempts {
-        match send_one_attempt(dispatcher, digest, &chunks).await {
+        match send_one_attempt(dispatcher, digest, &proto_chunks_template).await {
             Ok(committed_size) => {
                 metrics.succeeded_total.fetch_add(1, Ordering::Relaxed);
                 metrics
@@ -489,13 +501,17 @@ fn decode_retry_after(err: &Error) -> Duration {
 /// One attempt at a full WriteChunked stream. Sends every prepared
 /// chunk via the dispatcher and waits for the server's
 /// `WriteChunkedResponse`.
+///
+/// `proto_chunks_template` is the wire-side `Vec<WriteChunk>` built
+/// ONCE upstream (M2 fixup); per-attempt cost is the Vec clone
+/// (header + per-chunk struct dup; the `Bytes` payloads are refcounted
+/// shares of the original chunk buffers — no deep copy).
 async fn send_one_attempt(
     dispatcher: &dyn WriteChunkedDispatcher,
     digest: DigestInfo,
-    chunks: &[PreparedChunk],
+    proto_chunks_template: &[WriteChunk],
 ) -> Result<u64, Error> {
-    let proto_chunks: Vec<WriteChunk> =
-        chunks.iter().map(|c| c.clone().into_proto(digest)).collect();
+    let proto_chunks: Vec<WriteChunk> = proto_chunks_template.to_vec();
     let response = dispatcher
         .dispatch(proto_chunks)
         .await
