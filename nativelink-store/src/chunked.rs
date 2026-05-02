@@ -52,6 +52,22 @@ pub mod chunked_filesystem;
 /// file layout.
 pub const CHUNK_SIZE: usize = 1024 * 1024;
 
+/// Maximum blob size eligible for the worker-side chunked-write path.
+///
+/// Blobs larger than this fall back to the legacy in-order ByteStream
+/// Write path. Cap exists because the v1 chunked client buffers the
+/// entire payload in memory up-front (see
+/// `chunked_client::collect_and_hash_chunks`) so retry attempts can
+/// re-send from a single-pass `DropCloserReadHalf` — peak per-blob
+/// memory is therefore O(blob_size). At 256 MiB the worst-case
+/// per-blob client memory is bounded so concurrent multi-GB writes
+/// cannot OOM a worker (#203 cascade pattern).
+///
+/// Streaming retry (which would eliminate this cap) is deferred to
+/// Phase 2.5+; tracked alongside the upfront-buffering note in
+/// `chunked_client.rs::collect_and_hash_chunks`.
+pub const MAX_CHUNKED_BLOB_SIZE: u64 = 256 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::CHUNK_SIZE;

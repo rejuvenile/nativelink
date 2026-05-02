@@ -2487,9 +2487,16 @@ impl StoreDriver for GrpcStore {
         // helper that takes the unboxed reference (no Arc::upgrade
         // retry chain); the retry loop inside `write_chunked_stream`
         // re-uses the dispatcher's stored transport via `Clone`.
+        // The upper bound (`MAX_CHUNKED_BLOB_SIZE`) is the v1
+        // safety cap: the chunked client buffers the entire payload in
+        // memory up-front so retries can resend from a single-pass
+        // `DropCloserReadHalf`. Without this cap a multi-GB blob would
+        // peak the worker's RSS at O(blob_size). Streaming retry that
+        // would let us lift the cap is deferred to Phase 2.5+.
         #[cfg(feature = "chunked_fast_slow")]
         if self.chunked_writes_enabled.load(Ordering::Relaxed)
             && digest.size_bytes() >= crate::chunked::CHUNK_SIZE as u64
+            && digest.size_bytes() <= crate::chunked::MAX_CHUNKED_BLOB_SIZE
         {
             return self.update_via_chunked_inner(digest, reader).await;
         }
