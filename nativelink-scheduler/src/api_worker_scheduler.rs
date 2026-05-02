@@ -96,9 +96,14 @@ pub struct SchedulerMetrics {
     /// the per-worker overflow cap. A non-zero value means at least one
     /// worker is misbehaving (never acking BIS chunks while still
     /// holding a connection slot) and the server is silently dropping
-    /// replay state to bound memory. Sustained non-zero growth is the
-    /// operator-visible signal that #214's cap is the load-bearing
-    /// defence against a worker-driven server DoS.
+    /// replay state to bound memory.
+    ///
+    /// **Operator visibility today:** SchedulerMetrics is internal-only
+    /// (no `#[derive(MetricsComponent)]` exporter wired); this counter
+    /// is *not* yet visible on a `/metrics` endpoint. The operator-
+    /// visible signal is the per-(endpoint, broadcast_id) `warn!` at
+    /// `bis_chunked_dispatch` — greppable from journald. See #231 to
+    /// surface the counter through the metrics exporter.
     pub bis_replay_buffer_overflow_drops: AtomicU64,
 }
 
@@ -131,11 +136,15 @@ pub(crate) const BIS_DIGESTS_PER_CHUNK: usize = 4096;
 /// worker-03 grew 33,120 → 34,980 in 12 minutes; replays never
 /// completed because new reconnects fired mid-stream).
 ///
-/// At ~160 KiB per chunk (`BIS_DIGESTS_PER_CHUNK` × ~40 B), 100,000
-/// chunks ≈ 16 GiB per worker — already well past anything that
-/// should appear in steady state, but bounded enough that a fleet
-/// of misbehaving workers cannot drive the server to OOM via this
-/// surface alone (compare: deployed `MemoryMax` is 80 GiB).
+/// Wire-encoded chunks are ~160 KiB (`BIS_DIGESTS_PER_CHUNK` × ~40 B
+/// serialized), but the buffer holds *decoded* `Digest` structs that
+/// expand to ~96 B each in heap, plus prost framing. Realistic per-
+/// worker heap at the cap: ~38 GiB. With deployed `MemoryMax` = 80 GiB,
+/// the cap defends against a SINGLE misbehaving worker driving the
+/// server to OOM via this surface alone — but two simultaneously-
+/// misbehaving workers can still get tight; combine with #215
+/// (per-worker reconnect rate-limit) and #216 (stale-worker rejection)
+/// for full defense-in-depth.
 ///
 /// Overflow policy: **drop oldest** ((broadcast_id, sequence)
 /// lex-min) one chunk at a time until the buffer fits. Older
