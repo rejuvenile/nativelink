@@ -241,3 +241,12 @@ required-features = ["chunked_fast_slow"]
 [[test]]
 name = "memory_store_backpressure_emission_test"
 required-features = ["chunked_fast_slow"]
+
+# #212 Phase 2.5 production-composition tests for the chunked-pin read
+# cascade (FastSlowStore::get_part consults ChunkedReadRegistry between
+# the legacy in-flight-slow-writes step and the slow store). Wraps the
+# FastSlowStore in a real VerifyStore so the writer-termination
+# contract is validated end-to-end.
+[[test]]
+name = "chunked_read_cascade_test"
+required-features = ["chunked_fast_slow"]

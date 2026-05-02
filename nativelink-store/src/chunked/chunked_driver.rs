@@ -1440,4 +1440,283 @@ mod tests {
         .await
         .expect("driver must exit loop within 5s after commit + sender-drop");
     }
+
+    /// Phase 2.5 unit: driver receives all 3 chunks; the in-memory pin
+    /// covers the entire blob; `try_get_chunk_from_pin(0, total)`
+    /// returns Some with the assembled bytes EQUAL to the original
+    /// blob. This is the design §6.3 step 2 hit case.
+    ///
+    /// The test sends chunks WITHOUT `finish` so commit_and_verify
+    /// does NOT fire (which would clear the pin) — we need to observe
+    /// the pin while it's still populated, simulating the read-arriving-
+    /// while-write-still-in-flight production case.
+    #[nativelink_test]
+    async fn pin_accessor_full_range_hits_after_all_chunks_landed() {
+        const CHUNK: usize = 4 * 1024;
+        const N: usize = 3;
+        let total = (N * CHUNK) as u64;
+
+        let mut blob = Vec::with_capacity(N * CHUNK);
+        for i in 0..N {
+            blob.extend(std::iter::repeat(0x10u8 + i as u8).take(CHUNK));
+        }
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
+
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+        let (driver, tx) =
+            ChunkedDriver::spawn_driver(store.clone(), digest, total, CHUNK, PER_BLOB_MPSC_CAP);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Send all N chunks without finish — pin is populated, but
+            // commit_and_verify doesn't fire (and so the pin doesn't
+            // get cleared by the spawning task's post-loop drop).
+            for i in 0..N {
+                let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
+                let permit = budget.try_acquire_chunk().expect("permit");
+                tx.send(ChunkWork {
+                    chunk_offset: (i * CHUNK) as u64,
+                    chunk_bytes: bytes,
+                    chunk_sha256: [0u8; 32],
+                    finish: false,
+                    _permit: permit,
+                })
+                .await
+                .expect("send");
+            }
+            // Wait for the driver to commit all N chunks to disk so the
+            // pin is fully populated (the pin update is sequenced
+            // AFTER the pwrite per the run_driver ordering).
+            loop {
+                if driver.chunks_committed() == N as u64 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("must not deadlock — pin population path");
+
+        // Pin assertions: every byte covered, total cached, count == N.
+        assert_eq!(driver.pinned_chunk_count(), N);
+        assert_eq!(driver.pinned_bytes(), total);
+
+        // Full-range read returns the whole blob.
+        let assembled = driver
+            .try_get_chunk_from_pin(0, total)
+            .expect("full-range pin read must succeed when all chunks landed");
+        assert_eq!(assembled.len(), blob.len());
+        assert_eq!(&assembled[..], &blob[..]);
+
+        // Sub-range read also works (chunk-aligned).
+        let mid = driver
+            .try_get_chunk_from_pin(CHUNK as u64, CHUNK as u64)
+            .expect("mid-chunk pin read must succeed");
+        assert_eq!(&mid[..], &blob[CHUNK..2 * CHUNK]);
+
+        // Cross-chunk sub-range (spans two chunks).
+        let cross_off = (CHUNK / 2) as u64;
+        let cross_len = CHUNK as u64;
+        let cross = driver
+            .try_get_chunk_from_pin(cross_off, cross_len)
+            .expect("cross-chunk pin read must succeed");
+        let cross_off_us = cross_off as usize;
+        assert_eq!(
+            &cross[..],
+            &blob[cross_off_us..cross_off_us + CHUNK]
+        );
+
+        drop(tx);
+    }
+
+    /// Phase 2.5 unit: chunks 0 and 2 of a 3-chunk blob have landed
+    /// but chunk 1 has NOT — the request `try_get_chunk_from_pin(0,
+    /// total)` returns None because the range is not contiguously
+    /// covered. The accessor MUST detect the gap and refuse to serve
+    /// partial bytes (per the all-or-nothing contract documented on
+    /// the accessor).
+    #[nativelink_test]
+    async fn pin_accessor_gap_returns_none() {
+        const CHUNK: usize = 4 * 1024;
+        const N: usize = 3;
+        let total = (N * CHUNK) as u64;
+
+        let mut blob = Vec::with_capacity(N * CHUNK);
+        for i in 0..N {
+            blob.extend(std::iter::repeat(0x20u8 + i as u8).take(CHUNK));
+        }
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
+
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+        let (driver, tx) =
+            ChunkedDriver::spawn_driver(store.clone(), digest, total, CHUNK, PER_BLOB_MPSC_CAP);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // Send chunks 0 and 2 — chunk 1 is the gap. No finish.
+            for &i in &[0usize, 2usize] {
+                let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
+                let permit = budget.try_acquire_chunk().expect("permit");
+                tx.send(ChunkWork {
+                    chunk_offset: (i * CHUNK) as u64,
+                    chunk_bytes: bytes,
+                    chunk_sha256: [0u8; 32],
+                    finish: false,
+                    _permit: permit,
+                })
+                .await
+                .expect("send");
+            }
+            // Wait for both committed.
+            loop {
+                if driver.chunks_committed() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("must not deadlock — gap-pin population path");
+
+        assert_eq!(driver.pinned_chunk_count(), 2);
+        // Full-range request: includes the gap → None.
+        assert!(
+            driver.try_get_chunk_from_pin(0, total).is_none(),
+            "full-range read across a gap MUST return None — pin accessor served a partial range",
+        );
+
+        // Range that lies entirely in chunk 0 → Some.
+        let head = driver
+            .try_get_chunk_from_pin(0, CHUNK as u64)
+            .expect("range entirely within landed chunk 0 must succeed");
+        assert_eq!(&head[..], &blob[..CHUNK]);
+
+        // Range that lies entirely in chunk 2 → Some.
+        let tail_off = (2 * CHUNK) as u64;
+        let tail = driver
+            .try_get_chunk_from_pin(tail_off, CHUNK as u64)
+            .expect("range entirely within landed chunk 2 must succeed");
+        assert_eq!(&tail[..], &blob[2 * CHUNK..3 * CHUNK]);
+
+        // Range overlapping the gap (chunks 1+2) → None.
+        let mid_off = CHUNK as u64;
+        assert!(
+            driver
+                .try_get_chunk_from_pin(mid_off, (2 * CHUNK) as u64)
+                .is_none(),
+            "range overlapping gap (chunks 1+2) MUST return None — accessor leaked partial coverage",
+        );
+
+        drop(tx);
+    }
+
+    /// Phase 2.5 unit: range that overruns the declared blob size
+    /// returns None (defensive — caller bug; falls through so the
+    /// slow store can return its own well-defined OutOfRange).
+    #[nativelink_test]
+    async fn pin_accessor_overrun_returns_none() {
+        const CHUNK: usize = 4 * 1024;
+        let total = CHUNK as u64;
+        let blob = vec![0x30u8; CHUNK];
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
+
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+        let (driver, tx) =
+            ChunkedDriver::spawn_driver(store.clone(), digest, total, CHUNK, PER_BLOB_MPSC_CAP);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let permit = budget.try_acquire_chunk().expect("permit");
+            tx.send(ChunkWork {
+                chunk_offset: 0,
+                chunk_bytes: Bytes::from(blob.clone()),
+                chunk_sha256: [0u8; 32],
+                finish: false,
+                _permit: permit,
+            })
+            .await
+            .expect("send");
+            loop {
+                if driver.chunks_committed() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("must not deadlock — overrun setup");
+
+        // Request 1 byte beyond the end of the blob → None.
+        assert!(
+            driver.try_get_chunk_from_pin(0, total + 1).is_none(),
+            "overrun read MUST return None — pin accessor served past EOF",
+        );
+        // Pure-overrun request (offset == size, length 1) → None.
+        assert!(
+            driver.try_get_chunk_from_pin(total, 1).is_none(),
+            "offset-at-EOF read MUST return None",
+        );
+
+        drop(tx);
+    }
+
+    /// Phase 2.5 unit: after commit_and_verify completes successfully,
+    /// the spawning task clears the pin — subsequent reads return
+    /// None and the cascade falls through to the slow store. This is
+    /// the lifetime contract that prevents the pin from leaking
+    /// memory after the canonical CAS file is on disk.
+    #[nativelink_test]
+    async fn pin_accessor_cleared_after_successful_commit() {
+        const CHUNK: usize = 4 * 1024;
+        let total = CHUNK as u64;
+        let blob = vec![0x40u8; CHUNK];
+        let blob_hash = sha256(&blob);
+        let digest = DigestInfo::new(blob_hash, total);
+
+        let (store, _content_path) = make_test_store().await;
+        let budget = ChunkBudget::new();
+        let (driver, tx) =
+            ChunkedDriver::spawn_driver(store.clone(), digest, total, CHUNK, PER_BLOB_MPSC_CAP);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let permit = budget.try_acquire_chunk().expect("permit");
+            tx.send(ChunkWork {
+                chunk_offset: 0,
+                chunk_bytes: Bytes::from(blob.clone()),
+                chunk_sha256: [0u8; 32],
+                finish: true,
+                _permit: permit,
+            })
+            .await
+            .expect("send");
+            // Await commit so the post-loop pin clear has run.
+            let r = driver
+                .await_completion()
+                .await
+                .expect("commit must succeed");
+            assert_eq!(r.committed_size, total);
+            // The clear runs AFTER commit_and_verify returns but BEFORE
+            // completion_tx.send — yield once to let the task progress.
+            loop {
+                if driver.pinned_chunk_count() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("must not deadlock — post-commit clear path");
+
+        assert_eq!(driver.pinned_chunk_count(), 0);
+        assert_eq!(driver.pinned_bytes(), 0);
+        assert!(
+            driver.try_get_chunk_from_pin(0, total).is_none(),
+            "post-commit pin read MUST return None — clear didn't fire",
+        );
+
+        drop(tx);
+    }
 }
