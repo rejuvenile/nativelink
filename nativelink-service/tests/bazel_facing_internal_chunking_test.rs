@@ -486,6 +486,8 @@ async fn dispatch_chunks_to_driver_synchronous_commits_blob() {
             Arc::clone(&fs_store),
             Arc::clone(&in_flight),
             budget,
+            None, // pin_budget
+            None, // chunked_read_registry
             CHUNK,
             digest,
             stream,
@@ -565,6 +567,8 @@ async fn dispatch_chunks_to_driver_async_commit_returns_promptly_then_drains() {
             Arc::clone(&fs_store),
             Arc::clone(&in_flight),
             budget,
+            None, // pin_budget
+            None, // chunked_read_registry
             CHUNK,
             digest,
             stream,

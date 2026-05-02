@@ -627,6 +627,29 @@ impl FastSlowStore {
         self.in_flight_slow_writes.lock().len()
     }
 
+    /// #212 fixup B2: shared handle to the `in_flight_slow_writes` map.
+    /// The Phase 2.7 `BazelChunkedDispatcherImpl` registers + removes
+    /// digests in this map for the duration of the chunked dispatch so
+    /// the existing visibility surface (`has_with_results`,
+    /// graceful-shutdown drain `flush_slow_writes`, get_part read-cascade
+    /// step 1) covers chunked-path blobs uniformly.
+    #[must_use]
+    pub fn in_flight_slow_writes_handle(
+        &self,
+    ) -> Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> {
+        self.in_flight_slow_writes.clone()
+    }
+
+    /// #212 fixup B2: shared handle to the empty-notify so the dispatcher
+    /// reaper can fire it when the in_flight_slow_writes map drains. The
+    /// `flush_slow_writes` waiter relies on this notify to wake on
+    /// chunked-path drains the same way it wakes on legacy spawn-task
+    /// drains.
+    #[must_use]
+    pub fn in_flight_empty_notify_handle(&self) -> Arc<Notify> {
+        self.in_flight_empty_notify.clone()
+    }
+
     /// #212 Phase 2.7 helper: dispatch a Bazel-facing write through
     /// the chunked path. Tees the upstream bytes into BOTH the fast
     /// tier (MemoryStore — in-memory replica satisfying ≥2-replica
@@ -812,6 +835,16 @@ impl FastSlowStore {
     #[must_use]
     pub fn slow_store_handle(&self) -> &Store {
         &self.slow_store
+    }
+
+    /// #212 fixup S1: clone the slow-tier `Store` (one `Arc` bump). The
+    /// production wiring at server startup (in `src/bin/nativelink.rs`)
+    /// uses this to get the slow-tier `Arc<dyn StoreDriver>`, which it
+    /// downcasts to `Arc<FilesystemStore<FileEntryImpl>>` for
+    /// constructing the chunked dispatcher.
+    #[must_use]
+    pub fn slow_store_clone(&self) -> Store {
+        self.slow_store.clone()
     }
 
     /// Phase 2.7 chunked size threshold (cached on this store). Reads
