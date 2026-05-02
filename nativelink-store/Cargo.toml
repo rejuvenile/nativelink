@@ -207,3 +207,11 @@ ignored = ["tracing-test"]
 [[test]]
 name = "mirror_durability_test"
 required-features = ["test-utils"]
+
+# #212 Phase 2.4 production-composition tests for the worker-side
+# `WriteChunked` client. Gated on the `chunked_fast_slow` feature so
+# the default `cargo test` skips them; run explicitly via
+# `cargo test -p nativelink-store --features chunked_fast_slow --test chunked_client_test`.
+[[test]]
+name = "chunked_client_test"
+required-features = ["chunked_fast_slow"]
