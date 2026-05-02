@@ -2468,7 +2468,7 @@ mod tests {
     /// race. The mutation guard is unchanged: removing the increment
     /// drops delta to 0, failing `>= 1`.
     #[nativelink_test]
-    async fn driver_per_chunk_pwrite_timeout_increments_total_counter_exactly_once() {
+    async fn driver_per_chunk_pwrite_timeout_increments_total_counter_at_least_once() {
         const CHUNK: usize = 4 * 1024;
         let total: u64 = CHUNK as u64;
         let blob = vec![0xb3u8; CHUNK];
