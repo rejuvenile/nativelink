@@ -1094,3 +1094,199 @@ async fn handler_final_chunk_total_length_mismatch_returns_invalid_argument() {
         status.message()
     );
 }
+
+/// #213 testing-czar M4 fixup (§13.1.1 step 2 `Err(Closed)` driver-gone
+/// admission). When the per-blob driver task has terminated (panic, abort,
+/// or happy-path exit raced with an admission), `mpsc::Sender::try_send`
+/// returns `Err(Closed)`. The admission path MUST:
+///   1. drop the returned `ChunkWork` (releases the global ChunkBudget
+///      permit and any PinBudget permit via `Drop`);
+///   2. surface `Code::Aborted` to the producer (NOT `Code::ResourceExhausted`,
+///      because the classifier-tightened `looks_like_dead_channel`
+///      treats `ResourceExhausted` as backpressure not a dead channel —
+///      see §13.1.1 point 2; the driver-gone case is a NEW stream
+///      situation, not a transient backpressure event).
+///
+/// Test approach: bypass the full handler stack and call
+/// [`nativelink_service::chunked_write_handler::admit_prepared_chunk`]
+/// directly with an mpsc whose receiver has been DROPPED (so try_send
+/// returns Closed). Under a 5s timeout deadlock detector with a
+/// SPECIFIC `.expect(...)` message naming the contract.
+///
+/// Mutation step: revert the `Code::Aborted` arm in `admit_prepared_chunk`
+/// to `Code::Internal`; this test then sees `Code::Internal` instead of
+/// `Code::Aborted` and the assertion fires with the SPECIFIC message.
+/// Also verified: revert to `Code::ResourceExhausted` would mis-label the
+/// driver-gone case as backpressure and the assertion would catch that
+/// too (different code).
+#[nativelink_test]
+async fn admit_prepared_chunk_returns_aborted_when_driver_mpsc_closed() {
+    use nativelink_service::chunked_write_handler::{
+        ChunkedWriteHandlerMetrics, PreparedChunk, admit_prepared_chunk,
+    };
+    use nativelink_store::chunked::chunked_driver::ChunkWork;
+
+    const CHUNK: usize = 4 * 1024;
+    let blob = vec![0xb6u8; CHUNK];
+    let digest = DigestInfo::new(sha256(&blob), CHUNK as u64);
+    let budget = make_test_budget();
+
+    // Construct an mpsc with a CLOSED receiver. The receiver is
+    // dropped IMMEDIATELY after construction so the very first
+    // try_send returns Err(Closed) (not Full — Full requires a live
+    // but un-polled receiver).
+    let (tx, rx) = mpsc::channel::<ChunkWork>(16);
+    drop(rx);
+
+    let metrics = ChunkedWriteHandlerMetrics::default();
+    let prepared = PreparedChunk {
+        chunk_offset: 0,
+        chunk_bytes: Bytes::from(blob.clone()),
+        chunk_sha256: sha256(&blob),
+        finish: true,
+    };
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        admit_prepared_chunk(prepared, &tx, budget, None, CHUNK, digest, &metrics)
+    })
+    .await
+    .expect(
+        "must not deadlock — admit_prepared_chunk on a closed mpsc must return promptly \
+         (#213 testing-czar M4)",
+    );
+
+    let err = result.expect_err(
+        "must not deadlock — writer-termination contract violated for chunked driver: \
+         driver-gone admission must return Err(Aborted), not Ok",
+    );
+    assert_eq!(
+        err.code,
+        nativelink_error::Code::Aborted,
+        "driver-gone admission must classify as Code::Aborted (NOT Internal, NOT ResourceExhausted); got {err:?}"
+    );
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("driver task gone")
+            || msg.contains("closed before finish_chunk"),
+        "error must name the driver-gone contract; got {msg}"
+    );
+
+    // Reverse-release: dropping the returned ChunkWork inside
+    // admit_prepared_chunk must have released the global ChunkBudget
+    // permit so the budget gauge is unchanged.
+    assert_eq!(
+        budget.available_chunks(),
+        TOTAL_CHUNK_PERMITS,
+        "ChunkBudget permit MUST be released on Closed admission (reverse-release per §13.1.1 step 2); \
+         got available_chunks={}",
+        budget.available_chunks(),
+    );
+}
+
+/// #213 d-s-r MAJOR-1 fixup: when an upstream stream closes
+/// mid-blob (`Ok(None)` before `finish_chunk`), the WriteChunked
+/// handler must explicitly discard the in-flight partial via
+/// `discard_chunked` BEFORE returning the upstream error. Without
+/// this eager-GC trigger the partial accumulates on disk until the
+/// next FilesystemStore::new sweep — a long-running server under
+/// sustained client-disconnect storms would degrade the
+/// `chunk_budget_used_bytes` Q4 budget monotonically.
+///
+/// This test exercises the upstream-disconnect path specifically:
+///   1. Send chunk 0 successfully → admitted, driver writes the
+///      partial file at `<temp>/d/<XX>/<digest>.partial`.
+///   2. Drop the upstream sender WITHOUT sending `finish_chunk`.
+///   3. The WriteChunked handler observes `Ok(None)` from
+///      `stream.message()`, returns `Err(Code::Aborted)`.
+///   4. Pre-fix: partial file persists on disk. Post-fix:
+///      `discard_partial_best_effort` removes it before returning.
+///
+/// Production composition: real FilesystemStore (sharded layout, real
+/// chunked_partials map, real adapter methods). Wrapped under 5s
+/// `tokio::time::timeout` deadlock detector with SPECIFIC assertion
+/// messages naming the contract.
+///
+/// Mutation step: comment out the `discard_partial_best_effort(...)`
+/// call in the `Ok(None)` arm of WriteChunked's loop; the partial
+/// persists and this test's assertion fires with the SPECIFIC
+/// message naming the d-s-r MAJOR-1 contract.
+#[nativelink_test]
+async fn handler_upstream_drop_mid_blob_eagerly_discards_partial_on_disk() {
+    use std::path::PathBuf;
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    let total: u64 = (N * CHUNK) as u64;
+    // Two-chunk blob so chunk 0 has a successful admission + partial
+    // write, then disconnect happens before chunk 1.
+    let mut blob = Vec::with_capacity(N * CHUNK);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xa3u8 + i as u8).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), total);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    let partial_path: PathBuf = store.partial_path_for_digest(&digest);
+
+    // Send chunk 0 (NOT finish), wait for the partial file to appear
+    // on disk AND the chunked_partials map to register the entry,
+    // then drop the sender to simulate upstream disconnect.
+    //
+    // Both signals are required to avoid a race: `open_or_create_partial`
+    // creates the on-disk file BEFORE inserting into the map, so a test
+    // that waits only for the file would see "no in-flight state" in
+    // discard_chunked and the file would linger (failing the assertion
+    // for the WRONG reason).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let chunk0 = make_chunk(digest, 0, &blob[0..CHUNK], false);
+        tx.send(frame_chunk(&chunk0)).await.unwrap();
+        loop {
+            if tokio::fs::metadata(&partial_path).await.is_ok()
+                && store.has_in_flight_chunked_partial(&digest)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Now drop the sender → upstream observes Ok(None).
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock — chunk0 send + partial-file wait + sender drop");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock — handler must respond promptly to upstream disconnect")
+        .expect("writer task must not panic");
+    let status = result.expect_err("upstream disconnect mid-blob must return Err");
+    assert_eq!(
+        status.code(),
+        tonic::Code::Aborted,
+        "upstream disconnect before finish_chunk must classify as Aborted; got {status:?}"
+    );
+
+    // Wait for the in-flight tracker to clear (handler's cleanup_guard
+    // drop) so any post-Err discard has had a chance to run.
+    nativelink_service::chunked_write_handler::wait_for_no_in_flight(
+        &in_flight,
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("must not deadlock — in-flight tracker must drain after handler returns Err");
+
+    // Post-fix: the partial MUST be gone. Pre-fix: this assertion fires.
+    let exists = tokio::fs::metadata(&partial_path).await.is_ok();
+    assert!(
+        !exists,
+        "partial file MUST be GC'd by discard_partial_best_effort on upstream disconnect \
+         (#213 d-s-r MAJOR-1) — without the eager GC, the partial persists until next \
+         FilesystemStore::new sweep; checked path={}",
+        partial_path.display(),
+    );
+}

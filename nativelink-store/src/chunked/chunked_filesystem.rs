@@ -79,6 +79,27 @@ use tracing::{debug, warn};
 
 use crate::filesystem_store::digest_shard_prefix;
 
+/// #213 NMA2 test hook: per-digest millisecond delay injected at
+/// the start of [`write_chunk_at_offset`] (test builds only). Tests
+/// that exercise the chunked_driver's per-chunk pwrite timeout
+/// register their digest here so the await sleeps for `delay_ms`
+/// before opening the file — long enough for
+/// `tokio::time::timeout(per_chunk_timeout, ...)` to fire
+/// deterministically. The map is keyed by `DigestInfo` so parallel
+/// tests never collide (each test uses a unique digest).
+///
+/// Production builds compile out the lookup via the `#[cfg(test)]`
+/// block in `write_chunk_at_offset`; the symbol exists only under
+/// `#[cfg(test)]`.
+///
+/// Tests should clean up via `TEST_PRE_WRITE_DELAY_MS_BY_DIGEST.lock().remove(&digest)`
+/// or use a manual `Drop`-based scope guard so a panic doesn't leak
+/// the entry.
+#[cfg(test)]
+pub(crate) static TEST_PRE_WRITE_DELAY_MS_BY_DIGEST: parking_lot::Mutex<
+    Option<HashMap<DigestInfo, u64>>,
+> = parking_lot::Mutex::new(None);
+
 /// In-flight chunked-blob state held by the FilesystemStore for the
 /// lifetime of an in-progress chunked upload. One entry per digest.
 ///
@@ -376,6 +397,24 @@ pub(crate) async fn write_chunk_at_offset(
         // file for nothing. Phase 2.3 driver should never produce
         // zero-length chunks but the contract here is permissive.
         return Ok(());
+    }
+
+    // #213 NMA2 test hook: when the per-digest test-only delay is set,
+    // sleep BEFORE the actual write so the chunked_driver's per-chunk
+    // `tokio::time::timeout(per_chunk_timeout, ...)` can fire
+    // deterministically. Per-digest scoping keeps parallel tests from
+    // bleeding into each other. Production binaries compile this branch
+    // out via `#[cfg(test)]`.
+    #[cfg(test)]
+    let delay = {
+        let guard = TEST_PRE_WRITE_DELAY_MS_BY_DIGEST.lock();
+        guard.as_ref().and_then(|m| m.get(digest).copied())
+    };
+    #[cfg(test)]
+    if let Some(delay_ms) = delay {
+        if delay_ms > 0 {
+            tokio::time::sleep(core::time::Duration::from_millis(delay_ms)).await;
+        }
     }
 
     let entry = open_or_create_partial(map, *digest, temp_path_root).await?;

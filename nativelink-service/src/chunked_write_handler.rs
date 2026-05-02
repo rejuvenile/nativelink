@@ -452,12 +452,18 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // Process the first chunk + every subsequent chunk in the
         // stream. On finish_chunk we `await` the driver's commit and
         // return the response.
+        //
+        // #213 d-s-r MAJOR-1: every early-Err path in this loop must
+        // discard the on-disk partial via `discard_partial_best_effort`
+        // BEFORE returning. Otherwise sustained client-disconnect storms
+        // accumulate `<digest>.partial` files until next FilesystemStore::new.
         if let Err(err) = self.admit_chunk(first_chunk, &sender, stream_digest).await {
             warn!(
                 ?stream_digest,
                 ?err,
                 "WriteChunked: first chunk admission failed"
             );
+            discard_partial_best_effort(&self.filesystem_store, &stream_digest).await;
             return Err(err);
         }
 
@@ -470,6 +476,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                         ?stream_digest,
                         "WriteChunked: client stream closed before finish_chunk; abandoning blob"
                     );
+                    discard_partial_best_effort(&self.filesystem_store, &stream_digest).await;
                     drop(cleanup_guard);
                     return Err(make_err!(
                         Code::Aborted,
@@ -483,6 +490,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                         status_msg = %status.message(),
                         "WriteChunked: client stream errored mid-blob"
                     );
+                    discard_partial_best_effort(&self.filesystem_store, &stream_digest).await;
                     drop(cleanup_guard);
                     let err: Error = status.into();
                     return Err(err.append(format!(
@@ -492,13 +500,17 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             };
             let next_digest = parse_digest(&next)?;
             if next_digest != stream_digest {
+                discard_partial_best_effort(&self.filesystem_store, &stream_digest).await;
                 drop(cleanup_guard);
                 return Err(make_input_err!(
                     "WriteChunked stream switched digest mid-stream: started {stream_digest}, got {next_digest}"
                 ));
             }
             let is_last = next.finish_chunk;
-            self.admit_chunk(next, &sender, stream_digest).await?;
+            if let Err(err) = self.admit_chunk(next, &sender, stream_digest).await {
+                discard_partial_best_effort(&self.filesystem_store, &stream_digest).await;
+                return Err(err);
+            }
             if is_last {
                 break;
             }
@@ -978,6 +990,35 @@ fn err_to_status(err: Error) -> Status {
     Status::from(err)
 }
 
+/// #213 d-s-r MAJOR-1 helper: best-effort GC of an in-flight chunked
+/// partial after `update()` returns Err. Called from
+/// [`dispatch_chunks_to_driver`]'s early-Err exits (chunk-stream pull
+/// failure OR admission failure) so the on-disk partial is discarded
+/// promptly instead of waiting for next-startup `prune_temp_path`.
+///
+/// Without this, sustained client-disconnect storms (network flap,
+/// cancellation cascades) would accumulate `<digest>.partial` files
+/// on disk AND keep `chunked_partials` map entries alive (the
+/// per-blob `ChunkInProgress` entry holds the file fd until the map
+/// entry is removed). The accumulation degrades the
+/// `chunk_budget_used_bytes` Q4 budget monotonically until restart.
+///
+/// Best-effort: discard errors are logged at `warn!` and ignored.
+/// The original upstream error is what surfaces to the producer.
+async fn discard_partial_best_effort<Fe: FileEntry>(
+    filesystem_store: &Arc<FilesystemStore<Fe>>,
+    digest: &DigestInfo,
+) {
+    if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
+        warn!(
+            ?digest,
+            ?discard_err,
+            "WriteChunked: discard_chunked after dispatch Err failed; partial may persist \
+             until next FilesystemStore::new sweep (#213 d-s-r MAJOR-1 best-effort GC)"
+        );
+    }
+}
+
 /// Wait helper used by the integration tests: poll for an in-flight
 /// entry to disappear under a tokio::time::timeout. The polling loop
 /// uses `yield_now` rather than `sleep` per CLAUDE.md test-discipline.
@@ -1206,10 +1247,22 @@ pub fn admit_prepared_chunk(
             ))
         }
         Err(mpsc::error::TrySendError::Closed(returned)) => {
+            // #213 testing-czar M4 / design §13.1.1 step 2 Err(Closed):
+            // the per-blob driver task has terminated (panic, abort, or
+            // happy-path exit raced with an admission). Drop the
+            // ChunkWork — its OwnedSemaphorePermit returns to the
+            // global ChunkBudget via `Drop` (reverse-release) and the
+            // optional PinBudget permit returns the same way. Wire
+            // status: `Code::Aborted` per spec — distinct from
+            // `Code::ResourceExhausted` (admission backpressure) so the
+            // classifier-tightened `looks_like_dead_channel` does not
+            // treat this as a stale h2 channel; the producer should
+            // start a fresh stream rather than retry on the same
+            // session.
             drop(returned);
             Err(make_err!(
-                Code::Internal,
-                "chunked dispatch: per-blob driver task closed before finish_chunk (digest {stream_digest})"
+                Code::Aborted,
+                "chunked dispatch: per-blob driver task gone (closed before finish_chunk) for digest {stream_digest} offset {chunk_offset}; restart the stream"
             ))
         }
     }
@@ -1324,6 +1377,18 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
         let chunk = match chunk_result {
             Ok(c) => c,
             Err(err) => {
+                // #213 d-s-r MAJOR-1 fixup: explicit GC trigger on
+                // update() Err. Per §6.7 "On upstream client drop
+                // mid-update()", the partial file on disk would
+                // otherwise persist until next FilesystemStore::new
+                // (Q7=(c) restart-only sweep). Eagerly discard now so
+                // the partial does NOT accumulate on long-running
+                // servers under sustained client-disconnect storms
+                // (which would otherwise degrade the chunk_budget
+                // monotonically until restart). Best-effort: discard
+                // errors are logged but do NOT mask the original
+                // upstream error.
+                discard_partial_best_effort(&filesystem_store, &stream_digest).await;
                 drop(cleanup_guard);
                 return Err(err);
             }
@@ -1337,6 +1402,8 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             stream_digest,
             &metrics,
         ) {
+            // #213 d-s-r MAJOR-1 fixup: same eager-GC trigger as above.
+            discard_partial_best_effort(&filesystem_store, &stream_digest).await;
             drop(cleanup_guard);
             return Err(err);
         }

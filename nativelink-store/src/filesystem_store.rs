@@ -1431,6 +1431,27 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         &self.shared_context.temp_path
     }
 
+    /// Read-only accessor returning the on-disk `.partial` path for a
+    /// chunked in-flight blob. Used by integration tests that observe
+    /// disk state across the §6.7 termination triggers (especially
+    /// the #213 d-s-r MAJOR-1 eager-GC test). Pure function over
+    /// `temp_path_for_chunked()` + `digest`; no I/O.
+    pub fn partial_path_for_digest(&self, digest: &nativelink_util::common::DigestInfo) -> std::path::PathBuf {
+        crate::chunked::chunked_filesystem::partial_temp_path(self.temp_path_for_chunked(), digest)
+    }
+
+    /// Read-only accessor returning whether a chunked partial for
+    /// `digest` is currently registered in the in-process
+    /// `chunked_partials` map. Used by integration tests to wait for
+    /// the in-flight entry to be fully registered before triggering
+    /// upstream-disconnect — `partial_path_for_digest`'s `metadata()`
+    /// can succeed before the map insert completes (the file is
+    /// created during `open_or_create_partial` BEFORE the map insert),
+    /// so a race-free test must check map registration too.
+    pub fn has_in_flight_chunked_partial(&self, digest: &nativelink_util::common::DigestInfo) -> bool {
+        self.chunked_partials.contains(digest)
+    }
+
     /// Atomic finalize: verify the temp file's actual length matches
     /// `expected_size` (per Q7=(c) trust file length only), then
     /// rename to the final CAS path with mode 0o555.
