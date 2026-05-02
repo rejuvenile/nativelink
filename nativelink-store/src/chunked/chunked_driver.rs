@@ -177,13 +177,18 @@ fn record_pwrite_timeout_and_maybe_warn() {
 }
 
 /// #213 reviewer M2 fixup: wall-clock bound on the post-failure
-/// `discard_chunked` await in `run_driver`. Without this, a wedged
-/// slow tier — the SAME failure mode that motivates
-/// [`PER_CHUNK_WRITE_TIMEOUT`] — would hang the driver task
-/// indefinitely on the post-error cleanup, defeating §6.7 trigger
-/// (b)'s "best-effort drain bounded by the graceful-shutdown
-/// deadline" promise. 5 s matches the per-chunk timeout (same root
-/// cause; same upper bound).
+/// `discard_chunked` / `unlink_holding` awaits in `run_driver` and
+/// `commit_and_verify`. Without this, a wedged slow tier — the SAME
+/// failure mode that motivates [`PER_CHUNK_WRITE_TIMEOUT`] — would
+/// hang the driver task indefinitely on the post-error cleanup
+/// path, breaking the **post-error cleanup contract**: the driver
+/// promises to settle every error path in bounded wall-clock so
+/// that the spawning task's `await_completion()` returns within a
+/// predictable upper bound (per-chunk timeout + a small constant).
+/// This bounds trigger (a)'s commit-failure cleanup AND trigger
+/// (c)'s mismatch-failure cleanup; trigger (b) is already bounded
+/// by `JoinHandleDropGuard` aborting the spawned task. 5 s matches
+/// the per-chunk timeout (same root cause; same upper bound).
 pub const DISCARD_AFTER_FAILURE_TIMEOUT: core::time::Duration =
     core::time::Duration::from_secs(5);
 
@@ -1047,13 +1052,30 @@ async fn commit_and_verify<Fe: FileEntry>(
         );
         // Discard the partial so we don't leak. commit_chunked_to_holding
         // leaves the temp file in place on length-mismatch per spec.
-        if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
-            error!(
+        // Per #213 reviewer M2 (round-2 MAJOR-A): bound the discard
+        // wall-clock so a wedged slow tier cannot hang the driver task
+        // here either (post-error cleanup contract).
+        match tokio::time::timeout(
+            DISCARD_AFTER_FAILURE_TIMEOUT,
+            filesystem_store.discard_chunked(digest),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(discard_err)) => error!(
                 target: "nativelink_store::chunked",
                 ?digest,
                 ?discard_err,
                 "chunked driver: discard after commit failure also failed",
-            );
+            ),
+            Err(_) => error!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                timeout_ms = DISCARD_AFTER_FAILURE_TIMEOUT.as_millis() as u64,
+                "chunked driver: discard after commit failure also timed out; \
+                 partial persists until next FilesystemStore::new sweep \
+                 (#213 reviewer M2 round-2 MAJOR-A: driver-task bound, GC abandoned)",
+            ),
         }
         return Err(commit_err);
     }
@@ -1135,21 +1157,53 @@ async fn commit_and_verify<Fe: FileEntry>(
             preserved = ?preserved_path,
             "chunked driver: end-to-end SHA-256 mismatch; unlinking holding file"
         );
-        if let Err(unlink_err) = filesystem_store.unlink_holding(digest).await {
-            error!(
+        // Per #213 reviewer M2 (round-2 MAJOR-A): bound the unlink/
+        // discard wall-clock so a wedged slow tier cannot hang the
+        // driver task on the mismatch cleanup path (post-error
+        // cleanup contract).
+        match tokio::time::timeout(
+            DISCARD_AFTER_FAILURE_TIMEOUT,
+            filesystem_store.unlink_holding(digest),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(unlink_err)) => error!(
                 target: "nativelink_store::chunked",
                 ?digest,
                 ?unlink_err,
                 "chunked driver: failed to unlink holding file after SHA-256 mismatch",
-            );
+            ),
+            Err(_) => error!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                timeout_ms = DISCARD_AFTER_FAILURE_TIMEOUT.as_millis() as u64,
+                "chunked driver: unlink_holding after SHA-256 mismatch timed out; \
+                 holding file persists until next FilesystemStore::new sweep \
+                 (#213 reviewer M2 round-2 MAJOR-A: driver-task bound, GC abandoned)",
+            ),
         }
-        if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
-            error!(
+        match tokio::time::timeout(
+            DISCARD_AFTER_FAILURE_TIMEOUT,
+            filesystem_store.discard_chunked(digest),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(discard_err)) => error!(
                 target: "nativelink_store::chunked",
                 ?digest,
                 ?discard_err,
                 "chunked driver: failed to discard in-flight state after SHA-256 mismatch",
-            );
+            ),
+            Err(_) => error!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                timeout_ms = DISCARD_AFTER_FAILURE_TIMEOUT.as_millis() as u64,
+                "chunked driver: discard after SHA-256 mismatch timed out; \
+                 in-flight entry persists until next FilesystemStore::new sweep \
+                 (#213 reviewer M2 round-2 MAJOR-A: driver-task bound, GC abandoned)",
+            ),
         }
         return Err(make_err!(
             Code::InvalidArgument,
@@ -1172,22 +1226,53 @@ async fn commit_and_verify<Fe: FileEntry>(
         );
         // Best-effort cleanup: unlink the holding file (which may still
         // be there if the rename failed before completing) and drop the
-        // in-flight tracker entry.
-        if let Err(unlink_err) = filesystem_store.unlink_holding(digest).await {
-            warn!(
+        // in-flight tracker entry. Per #213 reviewer M2 (round-2
+        // MAJOR-A): bound the unlink/discard wall-clock so a wedged
+        // slow tier cannot hang the driver task on the finalize
+        // cleanup path (post-error cleanup contract).
+        match tokio::time::timeout(
+            DISCARD_AFTER_FAILURE_TIMEOUT,
+            filesystem_store.unlink_holding(digest),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(unlink_err)) => warn!(
                 target: "nativelink_store::chunked",
                 ?digest,
                 ?unlink_err,
                 "chunked driver: failed to unlink holding after finalize failure",
-            );
+            ),
+            Err(_) => warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                timeout_ms = DISCARD_AFTER_FAILURE_TIMEOUT.as_millis() as u64,
+                "chunked driver: unlink_holding after finalize failure timed out; \
+                 holding file persists until next FilesystemStore::new sweep \
+                 (#213 reviewer M2 round-2 MAJOR-A: driver-task bound, GC abandoned)",
+            ),
         }
-        if let Err(discard_err) = filesystem_store.discard_chunked(digest).await {
-            warn!(
+        match tokio::time::timeout(
+            DISCARD_AFTER_FAILURE_TIMEOUT,
+            filesystem_store.discard_chunked(digest),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(discard_err)) => warn!(
                 target: "nativelink_store::chunked",
                 ?digest,
                 ?discard_err,
                 "chunked driver: failed to discard in-flight state after finalize failure",
-            );
+            ),
+            Err(_) => warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                timeout_ms = DISCARD_AFTER_FAILURE_TIMEOUT.as_millis() as u64,
+                "chunked driver: discard after finalize failure timed out; \
+                 in-flight entry persists until next FilesystemStore::new sweep \
+                 (#213 reviewer M2 round-2 MAJOR-A: driver-task bound, GC abandoned)",
+            ),
         }
         return Err(finalize_err);
     }

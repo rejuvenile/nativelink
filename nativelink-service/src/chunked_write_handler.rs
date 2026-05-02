@@ -1008,13 +1008,15 @@ fn err_to_status(err: Error) -> Status {
 /// Without this, a wedged slow tier (the SAME failure mode that
 /// motivates the per-chunk pwrite timeout in chunked_driver.rs) would
 /// hang `discard_partial_best_effort` forever and the handler future
-/// would never return — strictly worse than the original "partial
-/// persists" bug because the handler hang propagates upstream as a
-/// gRPC stream stuck open. 5 s matches the `PER_CHUNK_WRITE_TIMEOUT`
-/// constant; under wedge conditions the handler abandons GC, lets
-/// the file linger until next FilesystemStore::new sweep (the
-/// pre-fix behavior), but the handler still returns within the
-/// bound.
+/// would never return — violating the **post-error cleanup contract**
+/// (handler promises bounded wall-clock on every failure path so
+/// upstream gRPC streams cannot wedge open on a stalled cleanup);
+/// strictly worse than the original "partial persists" bug because
+/// the handler hang propagates upstream as a gRPC stream stuck open.
+/// 5 s matches the `PER_CHUNK_WRITE_TIMEOUT` constant; under wedge
+/// conditions the handler abandons GC, lets the file linger until
+/// next FilesystemStore::new sweep (the pre-fix behavior), but the
+/// handler still returns within the bound.
 const DISCARD_PARTIAL_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
 
 /// #213 d-s-r MAJOR-1 helper: best-effort GC of an in-flight chunked
@@ -1035,9 +1037,11 @@ const DISCARD_PARTIAL_TIMEOUT: core::time::Duration = core::time::Duration::from
 ///
 /// #213 reviewer M2 fixup: wrapped under
 /// [`DISCARD_PARTIAL_TIMEOUT`] so a wedged slow tier cannot hang the
-/// handler. Timeout fires → log at `error!`, partial persists until
-/// next FilesystemStore::new sweep (pre-fix behavior). The handler
-/// still returns within the bound.
+/// handler. Bounds the **post-error cleanup contract** (caller will
+/// always observe a Result within bounded wall-clock). Timeout fires
+/// → log at `error!`, partial persists until next
+/// FilesystemStore::new sweep (pre-fix behavior). The handler still
+/// returns within the bound.
 async fn discard_partial_best_effort<Fe: FileEntry>(
     filesystem_store: &Arc<FilesystemStore<Fe>>,
     digest: &DigestInfo,
