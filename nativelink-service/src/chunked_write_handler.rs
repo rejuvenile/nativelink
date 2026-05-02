@@ -12,49 +12,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! #212 Phase 2.2: server-side `WriteChunked` RPC handler.
+//! #212 Phase 2.2/2.7: server-side chunked-write dispatch.
 //!
-//! End-to-end chunked-write path:
+//! Two production producers feed the same per-blob `ChunkedDriver`
+//! plumbing:
 //!
-//! ```text
-//!   Worker (or any peer the server trusts via worker auth)
-//!        │  client-streaming WriteChunk { digest, chunk_offset, chunk_bytes,
-//!        │                                chunk_sha256, finish_chunk }
-//!        ▼
-//!   ChunkedWriteHandler::write_chunked()
-//!        │
-//!        ├─ first chunk: spawn `ChunkedDriver` per (digest); insert into
-//!        │   in-flight map keyed by `DigestInfo`
-//!        ├─ each chunk: per-chunk SHA-256 verify on `spawn_blocking`
-//!        │   (#213 perf-opt NMA1) → admit
-//!        │     1. ChunkBudget::try_acquire_chunk() → ResourceExhausted
-//!        │        on full (with BackpressureSignal type_url for the
-//!        │        §13.1.1 point 2 dead-channel discriminator)
-//!        │     2. mpsc::Sender::try_send(...) → ResourceExhausted on full
-//!        │        (per §13.1.1 admission-ordering reverse-release)
-//!        ├─ on finish_chunk=true: admit, then await driver completion
-//!        │   (option α — synchronous commit; the WriteChunked caller
-//!        │   IS the slow-tier producer, not Bazel-facing — design Q1=(b))
-//!        ▼
-//!   FilesystemStore::commit_chunked() + end-to-end SHA-256 verify
-//!        ▼
-//!   `WriteChunkedResponse { committed_digest, committed_size }`
-//! ```
+//! - **Phase 2.2 — `WriteChunked` RPC** (`ChunkedWriteHandler::write_chunked`):
+//!   worker→server upload via the new `WriteChunked(stream WriteChunk)`
+//!   RPC. The producer (worker) is itself the slow-tier writer, so
+//!   commit is **synchronous (option α)** — the RPC returns Ok only
+//!   after the on-disk file lands at the canonical CAS path + SHA-256
+//!   passes.
+//! - **Phase 2.7 — Bazel-facing internal chunking**
+//!   (`dispatch_bazel_facing_internal_chunking`): Bazel's standard
+//!   ByteStream Write hits `FastSlowStore::update`; for blobs ≥
+//!   `CHUNK_SIZE` and behind the `bazel_facing_internal_chunking`
+//!   AtomicBool kill-switch, the server batches the in-order bytes into
+//!   1 MiB chunks (computing per-chunk SHA-256 on `spawn_blocking` per
+//!   #213 NMA1) and dispatches into the same per-blob driver. Commit is
+//!   **asynchronous (option β)** — `update()` returns Ok as soon as the
+//!   final chunk is admitted to the per-blob mpsc; the driver completes
+//!   on its own task. The fast-tier (MemoryStore) write that already
+//!   happens in `update()` provides the in-memory replica that satisfies
+//!   the ≥2-replica invariant; the chunked-driver's drain to disk is
+//!   the slow-tier replica. The reason this asymmetry vs option α exists
+//!   is the **anti-#203 invariant** (CLAUDE.md
+//!   `feedback_async_to_sync_requires_explicit_signoff`): if a Bazel-
+//!   facing write blocks on slow-tier latency, the precise mechanism
+//!   that caused the 2026-04-28 OOM cascade is reproduced.
 //!
-//! Anti-#203 invariant: this handler returns Ok ONLY after the per-blob
-//! commit completes (option α). The historical #203 cascade was upstream
-//! Bazel-facing latency coupling to slow-tier writes; the WriteChunked
-//! RPC's caller IS the slow-tier producer (worker), so the latency lives
-//! at the natural place. The Bazel-facing FastSlowStore::update path
-//! remains async per the unchanged production design.
+//! The two paths share `dispatch_chunks_to_driver`, which:
+//!   1. Looks up or creates the per-blob driver in the in-flight map.
+//!   2. Admits each prepared chunk via `admit_prepared_chunk` (validate +
+//!      global-budget try_acquire + mpsc try_send; reverse-release on
+//!      Err). The per-chunk SHA-256 is supplied by the caller — the
+//!      `WriteChunked` RPC carries it on the wire; the Bazel-facing
+//!      path computes it server-side on `spawn_blocking`.
+//!   3. After the final chunk is admitted, drops the sender. In
+//!      `CommitMode::Synchronous` it then awaits the driver's commit
+//!      result; in `CommitMode::AsyncCommit` it returns Ok with the
+//!      declared blob size (driver continues in the background, in-flight
+//!      map still owns the `Arc<ChunkedDriver>`).
 
 #![cfg(feature = "chunked_fast_slow")]
 
+use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::Stream;
+use futures::StreamExt as _;
 use parking_lot::Mutex;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
@@ -75,6 +84,7 @@ use nativelink_store::chunked::chunked_driver::{
 };
 use nativelink_store::chunked_signal::encode_backpressure_signal_any;
 use nativelink_store::filesystem_store::{FileEntry, FileEntryImpl, FilesystemStore};
+use nativelink_util::buf_channel::DropCloserReadHalf;
 use nativelink_util::common::DigestInfo;
 
 /// Backoff hint suggested to the client on global-budget exhaustion.
@@ -558,23 +568,56 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     ///      blocks; per §13.1.1 point 1) — BEFORE the SHA-256 spawn so a
     ///      malicious peer streaming garbage at line rate can't burn CPU
     ///      on `spawn_blocking` SHA work that gets rejected anyway.
-    ///   3. `spawn_blocking` SHA-256 verify (#213 perf-opt NMA1). On
-    ///      mismatch: explicitly drop the permit (reverse-release) and
-    ///      surface `Code::InvalidArgument`.
-    ///   4. `try_send` the `ChunkWork` into the per-blob mpsc. On Full:
-    ///      reverse-release the permit and surface
-    ///      `ResourceExhausted` with `PER_BLOB_MPSC_FULL`.
+    ///
+    /// Step 3 (`spawn_blocking` SHA-256 verify) is performed BEFORE this
+    /// function via `verify_write_chunk_sha256` so the producer's wire-
+    /// supplied hash is checked against the bytes; only on success do we
+    /// build a `PreparedChunk` and hand it to the shared
+    /// `admit_prepared_chunk` helper. Splitting the steps keeps the
+    /// shared dispatch path symmetric with the Bazel-facing path (which
+    /// computes the SHA-256 itself rather than verifying a wire-supplied
+    /// one).
     ///
     /// The reorder bounds CPU burn under bad-peer attack to the budget
     /// cap (4 GiB worth of in-flight chunks, then rejection). The happy
-    /// path cost is unchanged (the SHA work still runs; it's just under
-    /// permit ownership now).
+    /// path cost is unchanged (the SHA work still runs; it's just split
+    /// across two helpers now).
     async fn admit_chunk(
         &self,
         chunk: WriteChunk,
         sender: &mpsc::Sender<ChunkWork>,
         stream_digest: DigestInfo,
     ) -> Result<(), Error> {
+        let prepared = self
+            .verify_and_prepare_chunk(chunk, stream_digest)
+            .await?;
+        admit_prepared_chunk(
+            prepared,
+            sender,
+            self.chunk_budget,
+            self.chunk_size,
+            stream_digest,
+            &self.metrics,
+        )
+    }
+
+    /// Convert a wire `WriteChunk` into a `PreparedChunk` by:
+    ///   1. Validating `chunk_sha256` byte-shape (must be 32 bytes).
+    ///   2. Validating chunk-shape (offset alignment, length per
+    ///      finish flag, total-length math) — these checks duplicate
+    ///      `admit_prepared_chunk`'s validation but firing earlier
+    ///      keeps the SHA-256 spawn off the failed-shape path.
+    ///   3. Computing the actual SHA-256 of `chunk_bytes` on
+    ///      `spawn_blocking` (#213 NMA1) and verifying it equals the
+    ///      wire-supplied `chunk_sha256`.
+    ///
+    /// Mismatch on any of (1)–(3) is an `InvalidArgument` rejection
+    /// against the producer.
+    async fn verify_and_prepare_chunk(
+        &self,
+        chunk: WriteChunk,
+        stream_digest: DigestInfo,
+    ) -> Result<PreparedChunk, Error> {
         let WriteChunk {
             digest: _,
             chunk_offset,
@@ -583,7 +626,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             finish_chunk,
         } = chunk;
 
-        // Step 1a: per-chunk SHA-256 byte shape (cheap; pre-permit).
+        // Step 1: per-chunk SHA-256 byte shape.
         let chunk_sha256_arr: [u8; 32] = match chunk_sha256.as_slice().try_into() {
             Ok(a) => a,
             Err(_) => {
@@ -594,18 +637,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             }
         };
 
-        // Step 1b (M-code-3): chunk-shape validation. The proto
-        // contract says (proto file 688-693): `chunk_offset` MUST be a
-        // multiple of `CHUNK_SIZE`; `chunk_bytes.len()` MUST be exactly
-        // `CHUNK_SIZE` for non-final chunks and at most `CHUNK_SIZE`
-        // for the final chunk; the final chunk's `chunk_offset +
-        // chunk_bytes.len()` MUST equal `digest.size_bytes`. Without
-        // enforcement here, a malformed producer can:
-        //   - send arbitrary offsets that pass per-chunk SHA (it's the
-        //     producer's hash) and write into sparse-file holes that
-        //     coincidentally match `digest.size_bytes`, OR
-        //   - send oversized chunks that bypass the per-permit byte
-        //     accounting (one permit = one CHUNK_SIZE).
+        // Step 2 (M-code-3): chunk-shape validation.
         let chunk_size_u64 = self.chunk_size as u64;
         if !chunk_offset.is_multiple_of(chunk_size_u64) {
             return Err(make_input_err!(
@@ -643,109 +675,27 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
 
         // After #212 Phase 2.4 fixup B1 part 2 the prost field is
         // already `bytes::Bytes` (was `Vec<u8>`); the conversion below
-        // is a refcount move. Kept the binding to preserve the rest
-        // of the function's `chunk_bytes_bytes` references.
+        // is a refcount move.
         let chunk_bytes_bytes: Bytes = chunk_bytes;
 
-        // Step 2 (M-perf-1): try_acquire the global budget BEFORE the
-        // SHA-256 spawn. `try_acquire` is cheap (single atomic + branch);
-        // doing it first means a rogue peer streaming bad chunks at line
-        // rate gets rejected without burning a `spawn_blocking` worker
-        // on SHA work that we already know we won't accept.
-        let permit = match self.chunk_budget.try_acquire_chunk() {
-            Some(p) => p,
-            None => {
-                self.metrics
-                    .global_budget_exhausted_rejections_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let detail = encode_backpressure_signal_any(
-                    backpressure_signal::Reason::GlobalChunkBudgetExhausted,
-                    GLOBAL_BUDGET_RETRY_AFTER_MS,
-                );
-                return Err(Error::resource_exhausted_backpressure(
-                    format!(
-                        "WriteChunked: global ChunkBudget exhausted (digest {stream_digest}, offset {chunk_offset})"
-                    ),
-                    detail,
-                ));
-            }
-        };
-
-        // Step 3: per-chunk SHA-256 on `spawn_blocking` (#213 NMA1) so a
-        // 1 MiB chunk's hash burn does not block a tokio worker. We hold
-        // the permit across this await; on mismatch we explicitly drop
-        // the permit before returning to release it back to the budget.
-        let bytes_for_hash = chunk_bytes_bytes.clone();
-        let computed_sha = tokio::task::spawn_blocking(move || -> [u8; 32] {
-            let mut h = Sha256::new();
-            h.update(&bytes_for_hash);
-            let out = h.finalize();
-            let mut a = [0u8; 32];
-            a.copy_from_slice(out.as_ref());
-            a
-        })
-        .await
-        .map_err(|join_err| {
-            // Permit is dropped on the early return.
-            make_err!(
-                Code::Internal,
-                "spawn_blocking join error in per-chunk SHA-256 verify: {join_err:?}"
-            )
-        })?;
+        // Step 3: SHA-256 verify on `spawn_blocking` (#213 NMA1).
+        let computed_sha = compute_sha256_blocking(chunk_bytes_bytes.clone()).await?;
         if computed_sha != chunk_sha256_arr {
             self.metrics
                 .sha256_per_chunk_mismatches_total
                 .fetch_add(1, Ordering::Relaxed);
-            // Reverse-release: drop the permit so the budget recovers.
-            drop(permit);
             return Err(make_err!(
                 Code::InvalidArgument,
                 "WriteChunk per-chunk SHA-256 mismatch for digest {stream_digest} at offset {chunk_offset}"
             ));
         }
 
-        // Step 4: try_send into the per-blob mpsc. On Full → release
-        // the permit (reverse-release) and reject with ResourceExhausted
-        // + PER_BLOB_MPSC_FULL.
-        let work = ChunkWork {
+        Ok(PreparedChunk {
             chunk_offset,
             chunk_bytes: chunk_bytes_bytes,
             chunk_sha256: chunk_sha256_arr,
             finish: finish_chunk,
-            _permit: permit,
-        };
-        match sender.try_send(work) {
-            Ok(()) => {
-                self.metrics
-                    .chunks_admitted_total
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Full(returned)) => {
-                // Drop `returned` — releases the permit. Done.
-                drop(returned);
-                self.metrics
-                    .mpsc_full_rejections_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let detail = encode_backpressure_signal_any(
-                    backpressure_signal::Reason::PerBlobMpscFull,
-                    PER_BLOB_MPSC_RETRY_AFTER_MS,
-                );
-                Err(Error::resource_exhausted_backpressure(
-                    format!(
-                        "WriteChunked: per-blob mpsc full (digest {stream_digest}, offset {chunk_offset})"
-                    ),
-                    detail,
-                ))
-            }
-            Err(mpsc::error::TrySendError::Closed(returned)) => {
-                drop(returned);
-                Err(make_err!(
-                    Code::Internal,
-                    "WriteChunked: per-blob driver task closed before finish_chunk (digest {stream_digest})"
-                ))
-            }
-        }
+        })
     }
 
     /// M-code-1 fixup: zero-byte blob shortcut. Bypasses the per-blob
@@ -980,4 +930,750 @@ pub async fn wait_for_no_in_flight(
     })
     .await
     .map_err(|_| "in-flight entries did not drain within timeout")
+}
+
+// =============================================================================
+// Phase 2.7 — shared dispatch helper for WriteChunked (RPC) AND
+// Bazel-facing internal chunking.
+// =============================================================================
+
+/// A chunk that has already passed per-chunk SHA-256 verification and
+/// shape validation; ready for global-budget admission + per-blob mpsc
+/// `try_send`. Producer responsibility for the SHA-256: the
+/// `WriteChunked` RPC verifies the wire-supplied hash; the Bazel-facing
+/// internal-chunking path computes it on `spawn_blocking` (#213 NMA1)
+/// from the bytes itself.
+#[derive(Debug)]
+pub struct PreparedChunk {
+    pub chunk_offset: u64,
+    pub chunk_bytes: Bytes,
+    pub chunk_sha256: [u8; 32],
+    pub finish: bool,
+}
+
+/// Outcome of a chunked-dispatch session.
+///
+/// `committed_size` is the post-commit byte count for `Synchronous` mode
+/// and the producer-declared `digest.size_bytes()` for `AsyncCommit`
+/// (the actual commit may not have happened yet).
+#[derive(Debug)]
+pub struct DispatchOutcome {
+    pub committed_size: u64,
+}
+
+/// Selects whether `dispatch_chunks_to_driver` waits for the commit
+/// before returning.
+///
+/// - **`Synchronous`** (option α — Phase 2.2 `WriteChunked` RPC):
+///   wait for the driver to finish commit + e2e SHA-256 verify, return
+///   the actual committed size (or Err on commit failure). The producer
+///   IS the slow-tier writer, so the latency lives at the natural
+///   place — there is no upstream to back-pressure.
+///
+/// - **`AsyncCommit`** (option β — Phase 2.7 Bazel-facing internal
+///   chunking): return Ok as soon as the final chunk is admitted to
+///   the per-blob mpsc. The driver continues on its own task; the
+///   in-flight map keeps the `Arc<ChunkedDriver>` alive until commit
+///   completes. The fast-tier write that already happened in
+///   `FastSlowStore::update` is the in-memory replica that satisfies
+///   the ≥2-replica invariant. **THIS IS THE ANTI-#203 INVARIANT** —
+///   blocking the Bazel-facing handler on slow-tier latency is the
+///   exact mechanism the 2026-04-28 OOM cascade exhibited; CLAUDE.md
+///   `feedback_async_to_sync_requires_explicit_signoff` requires
+///   explicit user sign-off before flipping the kill-switch on.
+#[derive(Debug, Clone, Copy)]
+pub enum CommitMode {
+    Synchronous,
+    AsyncCommit,
+}
+
+/// Admit a `PreparedChunk` (sha256 already checked) to the per-blob
+/// driver. Mirror of `ChunkedWriteHandler::admit_chunk` minus the
+/// per-chunk SHA-256 verify (the caller has already done it). All the
+/// shape-validation + reverse-release accounting still applies.
+///
+/// `chunk_size` must equal the producer's chunk size; it is used for
+/// alignment + size validation (see §13.1.1).
+pub fn admit_prepared_chunk(
+    chunk: PreparedChunk,
+    sender: &mpsc::Sender<ChunkWork>,
+    chunk_budget: &'static ChunkBudget,
+    chunk_size: usize,
+    stream_digest: DigestInfo,
+    metrics: &ChunkedWriteHandlerMetrics,
+) -> Result<(), Error> {
+    let PreparedChunk {
+        chunk_offset,
+        chunk_bytes,
+        chunk_sha256,
+        finish,
+    } = chunk;
+
+    // Shape validation. Mirrors the production check in
+    // `ChunkedWriteHandler::admit_chunk` (M-code-3) — the Bazel-facing
+    // internal chunking path SHOULD always produce shape-correct chunks
+    // (we generate them here), but defense in depth catches arithmetic
+    // bugs in the chunker.
+    let chunk_size_u64 = chunk_size as u64;
+    if !chunk_offset.is_multiple_of(chunk_size_u64) {
+        return Err(make_input_err!(
+            "PreparedChunk.chunk_offset must be a multiple of CHUNK_SIZE ({} bytes); \
+             got chunk_offset={chunk_offset} for digest {stream_digest}",
+            chunk_size
+        ));
+    }
+    let chunk_bytes_len = chunk_bytes.len();
+    if !finish && chunk_bytes_len != chunk_size {
+        return Err(make_input_err!(
+            "PreparedChunk.chunk_bytes.len() must equal CHUNK_SIZE ({}) for non-final chunks; \
+             got {chunk_bytes_len} for digest {stream_digest} at offset {chunk_offset}",
+            chunk_size
+        ));
+    }
+    if finish && chunk_bytes_len > chunk_size {
+        return Err(make_input_err!(
+            "PreparedChunk.chunk_bytes.len() must be <= CHUNK_SIZE ({}) for the final chunk; \
+             got {chunk_bytes_len} for digest {stream_digest} at offset {chunk_offset}",
+            chunk_size
+        ));
+    }
+    if finish {
+        let declared_size = stream_digest.size_bytes();
+        let chunk_end = chunk_offset.saturating_add(chunk_bytes_len as u64);
+        if chunk_end != declared_size {
+            return Err(make_input_err!(
+                "final PreparedChunk.chunk_offset + chunk_bytes.len() must equal \
+                 digest.size_bytes ({declared_size}); got {chunk_end} for digest \
+                 {stream_digest} at offset {chunk_offset} with len {chunk_bytes_len}"
+            ));
+        }
+    }
+
+    // Global-budget try_acquire (per §13.1.1 step 1).
+    let permit = match chunk_budget.try_acquire_chunk() {
+        Some(p) => p,
+        None => {
+            metrics
+                .global_budget_exhausted_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            let detail = encode_backpressure_signal_any(
+                backpressure_signal::Reason::GlobalChunkBudgetExhausted,
+                GLOBAL_BUDGET_RETRY_AFTER_MS,
+            );
+            return Err(Error::resource_exhausted_backpressure(
+                format!(
+                    "chunked dispatch: global ChunkBudget exhausted (digest {stream_digest}, offset {chunk_offset})"
+                ),
+                detail,
+            ));
+        }
+    };
+
+    // try_send into the per-blob mpsc (per §13.1.1 step 2).
+    let work = ChunkWork {
+        chunk_offset,
+        chunk_bytes,
+        chunk_sha256,
+        finish,
+        _permit: permit,
+    };
+    match sender.try_send(work) {
+        Ok(()) => {
+            metrics
+                .chunks_admitted_total
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Full(returned)) => {
+            // Drop releases the permit (reverse-release).
+            drop(returned);
+            metrics
+                .mpsc_full_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            let detail = encode_backpressure_signal_any(
+                backpressure_signal::Reason::PerBlobMpscFull,
+                PER_BLOB_MPSC_RETRY_AFTER_MS,
+            );
+            Err(Error::resource_exhausted_backpressure(
+                format!(
+                    "chunked dispatch: per-blob mpsc full (digest {stream_digest}, offset {chunk_offset})"
+                ),
+                detail,
+            ))
+        }
+        Err(mpsc::error::TrySendError::Closed(returned)) => {
+            drop(returned);
+            Err(make_err!(
+                Code::Internal,
+                "chunked dispatch: per-blob driver task closed before finish_chunk (digest {stream_digest})"
+            ))
+        }
+    }
+}
+
+/// Shared dispatch helper for both the WriteChunked RPC and the Bazel-
+/// facing internal-chunking path. Owns:
+///   1. In-flight driver lookup / spawn (rejecting concurrent same-
+///      digest streams with `Code::Aborted` + `BackpressureSignal`).
+///   2. Per-chunk admission via `admit_prepared_chunk`.
+///   3. Sender-drop + entry-cleanup ordering (M-perf-3 + B1 coupling).
+///   4. `Synchronous` vs `AsyncCommit` post-admit behaviour.
+///
+/// Shutdown / cancellation safety:
+/// - The in-flight map's `Arc<ChunkedDriver>` keeps the spawned task
+///   alive even if the caller's future is cancelled mid-dispatch.
+/// - On any error path that happens BEFORE all chunks are admitted,
+///   the in-flight entry is removed (the driver hasn't seen `finish`,
+///   so its mpsc-recv loop will exit cleanly when the sender drops).
+pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
+    filesystem_store: Arc<FilesystemStore<Fe>>,
+    in_flight: Arc<ChunkedWriteInFlight>,
+    chunk_budget: &'static ChunkBudget,
+    chunk_size: usize,
+    digest: DigestInfo,
+    chunks: Pin<Box<dyn Stream<Item = Result<PreparedChunk, Error>> + Send>>,
+    commit_mode: CommitMode,
+    metrics: Arc<ChunkedWriteHandlerMetrics>,
+) -> Result<DispatchOutcome, Error> {
+    let stream_digest = digest;
+
+    // Insert / reject-on-conflict in the in-flight map.
+    let (sender, driver) = {
+        let mut guard = in_flight.inner.lock();
+        if guard.contains_key(&digest) {
+            metrics
+                .concurrent_same_digest_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            let detail = encode_backpressure_signal_any(
+                backpressure_signal::Reason::PerBlobMpscFull,
+                CONCURRENT_SAME_DIGEST_RETRY_AFTER_MS,
+            );
+            return Err(Error::aborted_with_detail(
+                format!(
+                    "chunked dispatch: another stream is already writing digest {digest}; \
+                     retry after a backoff (concurrent-stream rejection, NOT durable commit)"
+                ),
+                detail,
+            ));
+        }
+        let (driver, sender) = ChunkedDriver::spawn_driver(
+            Arc::clone(&filesystem_store),
+            digest,
+            digest.size_bytes(),
+            chunk_size,
+            PER_BLOB_MPSC_CAP,
+        );
+        let driver_arc = Arc::new(driver);
+        guard.insert(
+            digest,
+            InFlightEntry {
+                sender: sender.clone(),
+                driver: Arc::clone(&driver_arc),
+            },
+        );
+        (sender, driver_arc)
+    };
+
+    // Cleanup guard: removes the in-flight entry on any panic or early
+    // exit. We `core::mem::forget` it on the happy path after explicit
+    // cleanup so we don't double-remove.
+    let cleanup_guard = InFlightCleanup {
+        in_flight: Arc::clone(&in_flight),
+        digest,
+    };
+
+    // Pin the chunks stream so we can iterate it inline.
+    let mut chunks = chunks;
+
+    // Admit chunks one-by-one. The chunk stream itself is responsible
+    // for shape (the WriteChunked RPC stream pulls from
+    // `tonic::Streaming`; the Bazel-facing path pulls from a
+    // `DropCloserReadHalf`-fed batcher).
+    while let Some(chunk_result) = chunks.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(err) => {
+                drop(cleanup_guard);
+                return Err(err);
+            }
+        };
+        if let Err(err) = admit_prepared_chunk(
+            chunk,
+            &sender,
+            chunk_budget,
+            chunk_size,
+            stream_digest,
+            &metrics,
+        ) {
+            drop(cleanup_guard);
+            return Err(err);
+        }
+    }
+
+    // M-perf-3 + B1 coupling: drop EVERY sender clone (local + the one
+    // stored in InFlightEntry) so the driver's recv loop sees None and
+    // proceeds to commit. The driver Arc remains in the map until we
+    // explicitly remove it post-commit (Synchronous) or until the
+    // driver completes on its own task (AsyncCommit — which removes it
+    // from the map via... actually no, let me explain below).
+    drop(sender);
+    {
+        let mut guard = in_flight.inner.lock();
+        if let Some(entry) = guard.get_mut(&stream_digest) {
+            let (placeholder_tx, _placeholder_rx) =
+                mpsc::channel::<ChunkWork>(1);
+            let stored_sender =
+                core::mem::replace(&mut entry.sender, placeholder_tx);
+            drop(stored_sender);
+            drop(_placeholder_rx);
+        }
+    }
+
+    match commit_mode {
+        CommitMode::Synchronous => {
+            // Wait for commit + e2e SHA-256 verify.
+            let commit_result = driver.await_completion().await;
+
+            // Remove the in-flight entry now that the driver has
+            // signaled completion. The cleanup_guard would also do
+            // this; we forget it because we explicitly removed.
+            let removed_entry = in_flight.inner.lock().remove(&stream_digest);
+            drop(removed_entry);
+            core::mem::forget(cleanup_guard);
+
+            let commit_result = match commit_result {
+                Ok(r) => r,
+                Err(err) => {
+                    metrics
+                        .commit_failures_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if err.code == Code::InvalidArgument
+                        && err
+                            .message_string()
+                            .contains("end-to-end SHA-256 mismatch")
+                    {
+                        metrics
+                            .sha256_e2e_mismatches_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(err);
+                }
+            };
+
+            metrics
+                .chunks_committed_total
+                .fetch_add(1, Ordering::Relaxed);
+            info!(
+                ?stream_digest,
+                committed_size = commit_result.committed_size,
+                mode = "synchronous",
+                "chunked dispatch: blob committed"
+            );
+
+            Ok(DispatchOutcome {
+                committed_size: commit_result.committed_size,
+            })
+        }
+        CommitMode::AsyncCommit => {
+            // Anti-#203 (β): return Ok as soon as admission is done.
+            // The driver's `Arc<ChunkedDriver>` is still in the
+            // in-flight map (entry.driver), so the spawned task stays
+            // alive even though our local `driver` Arc drops below.
+            //
+            // We MUST NOT forget the cleanup_guard — the driver will
+            // remove its OWN map entry when the commit completes, but
+            // for that to work the driver task must run to completion.
+            // Solution: spawn a small reaper task that awaits the
+            // driver's completion (which is `oneshot::Receiver::await`
+            // under the hood) and removes the entry. This decouples
+            // entry removal from the upstream RPC future.
+            //
+            // The cleanup_guard's forget is correct here too because
+            // the reaper handles removal — keeping the guard would
+            // race with the reaper and double-remove (harmless but
+            // noisy in logs).
+            core::mem::forget(cleanup_guard);
+
+            let in_flight_for_reaper = Arc::clone(&in_flight);
+            let metrics_for_reaper = Arc::clone(&metrics);
+            let driver_for_reaper = Arc::clone(&driver);
+            // Drop our local `driver` Arc — the reaper holds its own
+            // strong ref and the in-flight entry holds another. The
+            // explicit `drop(driver)` here documents that we transfer
+            // ownership to the reaper.
+            drop(driver);
+            // `filesystem_store` was consumed by `spawn_driver` above (it
+            // lives inside the `Arc<ChunkedDriver>`); nothing for us to
+            // do with it here.
+            tokio::spawn(async move {
+                let commit_result = driver_for_reaper.await_completion().await;
+                let removed_entry =
+                    in_flight_for_reaper.inner.lock().remove(&stream_digest);
+                drop(removed_entry);
+                match commit_result {
+                    Ok(r) => {
+                        metrics_for_reaper
+                            .chunks_committed_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            ?stream_digest,
+                            committed_size = r.committed_size,
+                            mode = "async",
+                            "chunked dispatch: blob committed (Bazel-facing reaper)"
+                        );
+                    }
+                    Err(err) => {
+                        metrics_for_reaper
+                            .commit_failures_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        if err.code == Code::InvalidArgument
+                            && err
+                                .message_string()
+                                .contains("end-to-end SHA-256 mismatch")
+                        {
+                            metrics_for_reaper
+                                .sha256_e2e_mismatches_total
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        warn!(
+                            ?stream_digest,
+                            ?err,
+                            mode = "async",
+                            "chunked dispatch: async-commit FAILED \
+                             (Bazel-facing); blob is NOT durable on slow tier — \
+                             upstream's fast-tier write is the only in-memory \
+                             replica until mirror re-uploads"
+                        );
+                    }
+                }
+            });
+
+            Ok(DispatchOutcome {
+                committed_size: stream_digest.size_bytes(),
+            })
+        }
+    }
+}
+
+/// Production implementation of the
+/// `nativelink_store::chunked::BazelChunkedDispatcher` trait. Owns
+/// shared references to the FilesystemStore (slow tier), in-flight
+/// tracker, chunk budget, and metrics; on `dispatch()` invokes
+/// `dispatch_bazel_facing_internal_chunking` with `CommitMode::AsyncCommit`.
+///
+/// Production wiring (Phase 2.7 deployment): construct one instance
+/// per server, install on the FastSlowStore via
+/// `set_bazel_chunked_dispatcher`. Toggle production behaviour with
+/// `nativelink_store::chunked::set_bazel_facing_internal_chunking_enabled`.
+///
+/// (β) async-commit mandatory; the dispatch returns Ok as soon as
+/// admission is complete, NOT after on-disk commit.
+#[derive(Debug)]
+pub struct BazelChunkedDispatcherImpl<Fe: FileEntry = FileEntryImpl> {
+    filesystem_store: Arc<FilesystemStore<Fe>>,
+    in_flight: Arc<ChunkedWriteInFlight>,
+    chunk_budget: &'static ChunkBudget,
+    chunk_size: usize,
+    metrics: Arc<ChunkedWriteHandlerMetrics>,
+}
+
+impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
+    /// Construct a production-grade dispatcher pointed at the shared
+    /// in-flight tracker + chunk-budget singleton. The `filesystem_store`
+    /// is the slow tier of the FastSlowStore that will install this
+    /// dispatcher; the `chunk_size` is the production CHUNK_SIZE.
+    #[must_use]
+    pub fn new(filesystem_store: Arc<FilesystemStore<Fe>>) -> Self {
+        Self {
+            filesystem_store,
+            in_flight: ChunkedWriteInFlight::new(),
+            chunk_budget: nativelink_store::chunked::chunk_budget::chunk_budget_singleton(),
+            chunk_size: CHUNK_SIZE,
+            metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
+        }
+    }
+
+    /// Construct a dispatcher with externally-supplied state. Used by
+    /// tests so each test can have its own in-flight tracker + chunk
+    /// budget + metrics + chunk size (smaller chunks make tests faster).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_with_state_for_test(
+        filesystem_store: Arc<FilesystemStore<Fe>>,
+        in_flight: Arc<ChunkedWriteInFlight>,
+        chunk_budget: &'static ChunkBudget,
+        chunk_size: usize,
+    ) -> Self {
+        Self {
+            filesystem_store,
+            in_flight,
+            chunk_budget,
+            chunk_size,
+            metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
+        }
+    }
+
+    /// Read-only accessor on the in-flight tracker. Tests use this to
+    /// observe driver lifecycle (e.g. assert the entry persists during
+    /// async-commit and drains after).
+    #[must_use]
+    pub fn in_flight(&self) -> &Arc<ChunkedWriteInFlight> {
+        &self.in_flight
+    }
+
+    /// Read-only accessor on the metrics. Tests + production scrape.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<ChunkedWriteHandlerMetrics> {
+        &self.metrics
+    }
+}
+
+#[async_trait::async_trait]
+impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
+    for BazelChunkedDispatcherImpl<Fe>
+{
+    async fn dispatch(
+        &self,
+        digest: DigestInfo,
+        reader: DropCloserReadHalf,
+    ) -> Result<u64, Error> {
+        let outcome = dispatch_bazel_facing_internal_chunking(
+            Arc::clone(&self.filesystem_store),
+            Arc::clone(&self.in_flight),
+            self.chunk_budget,
+            Arc::clone(&self.metrics),
+            self.chunk_size,
+            digest,
+            reader,
+        )
+        .await?;
+        Ok(outcome.committed_size)
+    }
+}
+
+/// Phase 2.7 — Bazel-facing internal chunking.
+///
+/// Pulls bytes from `reader` (the `DropCloserReadHalf` end of the
+/// FastSlowStore::update buf channel), batches into `chunk_size`-sized
+/// chunks, computes per-chunk SHA-256 on `spawn_blocking` (#213 NMA1),
+/// and dispatches into the shared `dispatch_chunks_to_driver` helper in
+/// `CommitMode::AsyncCommit` mode (anti-#203).
+///
+/// Returns Ok as soon as the final chunk is admitted to the per-blob
+/// mpsc (NOT after commit). The driver continues in the background;
+/// the in-flight map's `Arc<ChunkedDriver>` keeps it alive.
+///
+/// **Caller contract:** the upstream `FastSlowStore::update` MUST have
+/// already written the bytes to the fast tier (MemoryStore) BEFORE
+/// invoking this dispatch — that fast-tier write is the in-memory
+/// replica that satisfies the ≥2-replica invariant during the
+/// async-commit window. If the fast-tier write is skipped, async-commit
+/// produces a single-replica window between admission and disk landing,
+/// violating durability. (FastSlowStore::update's existing
+/// `tokio::join!(data_stream_fut, fast_store_fut)` provides this
+/// ordering.)
+pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
+    filesystem_store: Arc<FilesystemStore<Fe>>,
+    in_flight: Arc<ChunkedWriteInFlight>,
+    chunk_budget: &'static ChunkBudget,
+    metrics: Arc<ChunkedWriteHandlerMetrics>,
+    chunk_size: usize,
+    digest: DigestInfo,
+    reader: DropCloserReadHalf,
+) -> Result<DispatchOutcome, Error> {
+    debug!(
+        ?digest,
+        chunk_size,
+        size = digest.size_bytes(),
+        "bazel-facing internal chunking dispatch: start"
+    );
+
+    let chunks_stream = build_bazel_chunk_stream(reader, chunk_size, digest);
+    dispatch_chunks_to_driver(
+        filesystem_store,
+        in_flight,
+        chunk_budget,
+        chunk_size,
+        digest,
+        chunks_stream,
+        CommitMode::AsyncCommit,
+        metrics,
+    )
+    .await
+}
+
+/// Build a stream of `PreparedChunk` from a `DropCloserReadHalf` of
+/// raw bytes. Per-chunk SHA-256 is computed on `spawn_blocking`. The
+/// final `PreparedChunk` carries `finish=true` and may be smaller than
+/// `chunk_size` (the residual bytes of the blob).
+///
+/// On `reader.recv()` Err: yields a single Err and terminates.
+/// On EOF before declared bytes consumed: yields an Err describing the
+/// short read.
+fn build_bazel_chunk_stream(
+    reader: DropCloserReadHalf,
+    chunk_size: usize,
+    digest: DigestInfo,
+) -> Pin<Box<dyn Stream<Item = Result<PreparedChunk, Error>> + Send>> {
+    use bytes::BytesMut;
+
+    /// State machine driven by `futures::stream::unfold`. Carries the
+    /// reader, an accumulator buffer, and progress counters; emits one
+    /// `PreparedChunk` per polled iteration until `Done`.
+    enum State {
+        Active {
+            reader: DropCloserReadHalf,
+            buf: BytesMut,
+            chunk_offset: u64,
+            bytes_consumed: u64,
+        },
+        Done,
+    }
+
+    let total_bytes = digest.size_bytes();
+    let initial = State::Active {
+        reader,
+        buf: BytesMut::with_capacity(chunk_size),
+        chunk_offset: 0,
+        bytes_consumed: 0,
+    };
+
+    let stream = futures::stream::unfold(initial, move |state| async move {
+        let State::Active {
+            mut reader,
+            mut buf,
+            chunk_offset,
+            bytes_consumed,
+        } = state
+        else {
+            return None;
+        };
+
+        // Drain reader until either the chunk is full OR EOF.
+        let eof = loop {
+            if buf.len() >= chunk_size {
+                break false;
+            }
+            match reader.recv().await {
+                Ok(b) if b.is_empty() => break true,
+                Ok(b) => buf.extend_from_slice(&b),
+                Err(err) => {
+                    return Some((
+                        Err(err
+                            .append("bazel-facing internal-chunking: reader.recv()")),
+                        State::Done,
+                    ));
+                }
+            }
+        };
+
+        if eof {
+            let buffered = buf.len() as u64;
+            if bytes_consumed + buffered != total_bytes {
+                let err = make_input_err!(
+                    "bazel-facing internal-chunking: short read for digest {digest}; \
+                     consumed={bytes_consumed} buffered={buffered} declared={total_bytes}"
+                );
+                return Some((Err(err), State::Done));
+            }
+            if buf.is_empty() {
+                if total_bytes == 0 {
+                    let err = make_err!(
+                        Code::Internal,
+                        "bazel-facing internal-chunking: zero-byte blob must use \
+                         empty-blob shortcut, not chunked dispatch (digest {digest})"
+                    );
+                    return Some((Err(err), State::Done));
+                }
+                // Reaching here without bytes means the previous
+                // iteration already emitted finish=true (caller saw
+                // None as terminator).
+                return None;
+            }
+            let final_bytes = buf.split().freeze();
+            let chunk_sha256 = match compute_sha256_blocking(final_bytes.clone()).await {
+                Ok(v) => v,
+                Err(err) => return Some((Err(err), State::Done)),
+            };
+            let item = PreparedChunk {
+                chunk_offset,
+                chunk_bytes: final_bytes,
+                chunk_sha256,
+                finish: true,
+            };
+            return Some((Ok(item), State::Done));
+        }
+
+        let chunk_bytes = buf.split_to(chunk_size).freeze();
+        let chunk_len = chunk_bytes.len() as u64;
+        let new_consumed = bytes_consumed + chunk_len;
+        let is_finish = new_consumed == total_bytes;
+        let chunk_sha256 = match compute_sha256_blocking(chunk_bytes.clone()).await {
+            Ok(v) => v,
+            Err(err) => return Some((Err(err), State::Done)),
+        };
+        if is_finish {
+            // Defensive: drain residual reader bytes; producing
+            // anything past declared size is a protocol violation.
+            match reader.recv().await {
+                Ok(b) if b.is_empty() => {}
+                Ok(_) => {
+                    let err = make_input_err!(
+                        "bazel-facing internal-chunking: producer sent bytes \
+                         after declared size {total_bytes} for digest {digest}"
+                    );
+                    return Some((Err(err), State::Done));
+                }
+                Err(err) => {
+                    return Some((
+                        Err(err.append(
+                            "bazel-facing internal-chunking: post-finish drain",
+                        )),
+                        State::Done,
+                    ));
+                }
+            }
+            let item = PreparedChunk {
+                chunk_offset,
+                chunk_bytes,
+                chunk_sha256,
+                finish: true,
+            };
+            return Some((Ok(item), State::Done));
+        }
+
+        let item = PreparedChunk {
+            chunk_offset,
+            chunk_bytes,
+            chunk_sha256,
+            finish: false,
+        };
+        let next_state = State::Active {
+            reader,
+            buf,
+            chunk_offset: chunk_offset.saturating_add(chunk_size as u64),
+            bytes_consumed: new_consumed,
+        };
+        Some((Ok(item), next_state))
+    });
+    Box::pin(stream)
+}
+
+async fn compute_sha256_blocking(bytes: Bytes) -> Result<[u8; 32], Error> {
+    tokio::task::spawn_blocking(move || -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let out = h.finalize();
+        let mut a = [0u8; 32];
+        a.copy_from_slice(out.as_ref());
+        a
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(
+            Code::Internal,
+            "spawn_blocking join error in bazel-facing per-chunk SHA-256: {join_err:?}"
+        )
+    })
 }

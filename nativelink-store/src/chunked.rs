@@ -42,6 +42,91 @@ pub mod chunked_driver;
 pub mod chunked_filesystem;
 pub mod chunked_read_registry;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use nativelink_error::Error;
+use nativelink_util::buf_channel::DropCloserReadHalf;
+use nativelink_util::common::DigestInfo;
+
+/// Process-wide kill-switch for #212 Phase 2.7 Bazel-facing internal
+/// chunking. Default: OFF.
+///
+/// When `false`, `FastSlowStore::update` for Bazel-facing writes uses
+/// the legacy single-stream code path (fast tier in line + background
+/// `tokio::spawn` for slow tier). When `true` AND the
+/// `chunked_fast_slow` feature is compiled in AND a
+/// `BazelChunkedDispatcher` has been installed AND
+/// `digest.size_bytes() >= CHUNK_SIZE`, the path internally chunks the
+/// in-order ByteStream into 1 MiB pieces and dispatches them through
+/// the per-blob `ChunkedDriver` machinery.
+///
+/// Per CLAUDE.md `feedback_async_to_sync_requires_explicit_signoff`,
+/// the (β) async-commit semantic of the Bazel-facing path is an
+/// architectural change. **Flipping this on in production requires
+/// explicit user sign-off** — the kill-switch ships OFF and stays OFF
+/// until the user signs off on the `update()` returning Ok before
+/// commit completes (visibility via Phase 2.5's `failed_writes` /
+/// in-flight pin).
+static BAZEL_FACING_INTERNAL_CHUNKING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set the Phase 2.7 Bazel-facing internal-chunking kill-switch.
+///
+/// Returns the previous value. Test code uses this to toggle the
+/// switch on per-test.
+pub fn set_bazel_facing_internal_chunking_enabled(enabled: bool) -> bool {
+    BAZEL_FACING_INTERNAL_CHUNKING_ENABLED.swap(enabled, Ordering::SeqCst)
+}
+
+/// Read the current value of the Phase 2.7 Bazel-facing internal
+/// chunking kill-switch.
+#[must_use]
+pub fn bazel_facing_internal_chunking_enabled() -> bool {
+    BAZEL_FACING_INTERNAL_CHUNKING_ENABLED.load(Ordering::Acquire)
+}
+
+/// Pluggable dispatcher for Phase 2.7 Bazel-facing internal chunking.
+///
+/// `nativelink-store::FastSlowStore` calls this when the kill-switch is
+/// on and the blob is large enough; the implementation lives in
+/// `nativelink-service` (where the per-blob `ChunkedDriver` machinery
+/// is wired into the RPC layer) and is INJECTED via
+/// `FastSlowStore::set_bazel_chunked_dispatcher`. This avoids the
+/// circular dependency that would result from `nativelink-store`
+/// directly depending on `nativelink-service`.
+///
+/// The dispatcher MUST consume the entire `reader` (drain to EOF or
+/// error). It MUST return Ok as soon as the final chunk has been
+/// admitted to the per-blob `ChunkedDriver`'s mpsc — NOT after commit
+/// completes. This is the (β) async-commit contract per the anti-#203
+/// invariant; blocking on slow-tier latency reproduces the 2026-04-28
+/// OOM cascade mechanism.
+#[async_trait]
+pub trait BazelChunkedDispatcher: Send + Sync + core::fmt::Debug {
+    /// Dispatch the bytes from `reader` (sourced from
+    /// `FastSlowStore::update`'s upstream Bazel byte stream) into the
+    /// per-blob chunked driver. Returns Ok with the declared blob size
+    /// AS SOON AS admission completes; the driver continues in the
+    /// background.
+    ///
+    /// On reader error: terminate dispatch, return Err. On admission
+    /// rejection (global-budget exhausted, mpsc full, concurrent
+    /// duplicate): return the corresponding `Error` with
+    /// `BackpressureSignal` detail (Code::ResourceExhausted /
+    /// Code::Aborted).
+    async fn dispatch(
+        &self,
+        digest: DigestInfo,
+        reader: DropCloserReadHalf,
+    ) -> Result<u64, Error>;
+}
+
+/// Shared `Arc` alias for the dispatcher trait object. Used as the
+/// optional field on `FastSlowStore` so the runtime decision to use
+/// chunked dispatch is one atomic-load + one Option-check.
+pub type BazelChunkedDispatcherArc = Arc<dyn BazelChunkedDispatcher>;
+
 /// Fixed chunk size for the #212 chunked transport / on-disk layout.
 ///
 /// Per design §4 Q3=(a): 1 MiB matches the h2 frame tuning (commit

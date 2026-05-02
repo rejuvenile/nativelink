@@ -481,6 +481,33 @@ pub struct FastSlowStore {
     /// design §14.x phased rollout.
     #[cfg(feature = "chunked_fast_slow")]
     chunked_reads_enabled: AtomicBool,
+    /// #212 Phase 2.7 Bazel-facing internal chunking dispatcher.
+    ///
+    /// When `Some(_)` AND the
+    /// `crate::chunked::bazel_facing_internal_chunking_enabled()`
+    /// kill-switch returns true AND the incoming blob is at least
+    /// `crate::chunked::CHUNK_SIZE` bytes, `update()` hands the upstream
+    /// `DropCloserReadHalf` to the dispatcher instead of the legacy
+    /// background-spawn slow-tier write path. The dispatcher returns Ok
+    /// as soon as the last chunk is admitted to the per-blob driver
+    /// mpsc (β async-commit; anti-#203). The fast-tier (MemoryStore)
+    /// write that already happens in `update()` provides the in-memory
+    /// replica during the async-commit window.
+    ///
+    /// When `None` (the default for production today) OR the
+    /// kill-switch is OFF, `update()` uses the legacy code path with
+    /// no behavior change.
+    ///
+    /// Wrapped in `parking_lot::Mutex<Option<Arc<dyn _>>>` so it can be
+    /// installed AFTER `Arc<FastSlowStore>` construction (the
+    /// dispatcher's implementation in `nativelink-service` requires the
+    /// FilesystemStore that lives inside the FastSlowStore's slow tier;
+    /// circular construction is avoided by post-hoc wiring). Reads
+    /// take the lock briefly on every `update()` call; the value is
+    /// `Arc::clone`'d out and the lock released BEFORE any `.await`.
+    #[cfg(feature = "chunked_fast_slow")]
+    bazel_chunked_dispatcher:
+        parking_lot::Mutex<Option<crate::chunked::BazelChunkedDispatcherArc>>,
 }
 
 /// Pending mirror-blob deltas. `added` and `removed` are mutually exclusive
@@ -580,11 +607,183 @@ impl FastSlowStore {
             chunked_read_registry: Mutex::new(None),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_reads_enabled: AtomicBool::new(false),
+            #[cfg(feature = "chunked_fast_slow")]
+            bazel_chunked_dispatcher: parking_lot::Mutex::new(None),
         })
     }
 
     pub fn in_flight_slow_write_count(&self) -> usize {
         self.in_flight_slow_writes.lock().len()
+    }
+
+    /// #212 Phase 2.7 helper: dispatch a Bazel-facing write through
+    /// the chunked path. Tees the upstream bytes into BOTH the fast
+    /// tier (MemoryStore — in-memory replica satisfying ≥2-replica
+    /// during the async-commit window) AND the chunked dispatcher
+    /// (which drives the per-blob `ChunkedDriver`).
+    ///
+    /// Returns Ok as soon as the dispatcher's admission completes (not
+    /// after commit). The driver continues on its own task; reads
+    /// during the async-commit window are served from the fast tier
+    /// (inline write below) OR via Phase 2.5's `failed_writes` /
+    /// in-flight pin once that lands.
+    ///
+    /// (β) async-commit. Anti-#203 mandatory.
+    #[cfg(feature = "chunked_fast_slow")]
+    async fn update_via_chunked_dispatcher(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        size_info: UploadSizeInfo,
+        digest: DigestInfo,
+        dispatcher: crate::chunked::BazelChunkedDispatcherArc,
+        update_start: std::time::Instant,
+    ) -> Result<(), Error> {
+        debug!(
+            ?key,
+            ?size_info,
+            size_bytes = digest.size_bytes(),
+            "FastSlowStore::update: chunked-dispatch path (Phase 2.7)",
+        );
+
+        // Build two channels: one to the fast tier (existing
+        // contract), one to the chunked dispatcher. The data-stream
+        // future tees each chunk into both.
+        let (mut fast_tx, fast_rx) = make_buf_channel_pair_with_size(128);
+        let (mut chunk_tx, chunk_rx) = make_buf_channel_pair_with_size(128);
+
+        let data_stream_fut = async move {
+            loop {
+                let buffer = reader
+                    .recv()
+                    .await
+                    .err_tip(|| "Failed to read buffer in fast_slow chunked dispatch")?;
+                if buffer.is_empty() {
+                    fast_tx
+                        .send_eof()
+                        .err_tip(|| "Failed to send eof to fast store (chunked path)")?;
+                    chunk_tx
+                        .send_eof()
+                        .err_tip(|| "Failed to send eof to chunked dispatcher")?;
+                    return Result::<(), Error>::Ok(());
+                }
+                let buf_for_chunk = buffer.clone();
+                fast_tx.send(buffer).await.map_err(|e| {
+                    make_err!(
+                        Code::Internal,
+                        "Failed to send to fast store in chunked dispatch: {:?}",
+                        e
+                    )
+                })?;
+                chunk_tx.send(buf_for_chunk).await.map_err(|e| {
+                    make_err!(
+                        Code::Internal,
+                        "Failed to send to chunked dispatcher: {:?}",
+                        e
+                    )
+                })?;
+            }
+        };
+
+        let fast_store_fut = self.fast_store.update(key.borrow(), fast_rx, size_info);
+        let dispatch_fut = dispatcher.dispatch(digest, chunk_rx);
+
+        let (data_res, fast_res, dispatch_res) =
+            futures::future::join3(data_stream_fut, fast_store_fut, dispatch_fut).await;
+
+        let data_elapsed = update_start.elapsed();
+
+        if let Err(err) = data_res {
+            error!(
+                ?key,
+                elapsed_ms = data_elapsed.as_millis() as u64,
+                ?err,
+                "FastSlowStore::update (chunked): data stream failed",
+            );
+            return Err(err);
+        }
+        if let Err(err) = &fast_res {
+            error!(
+                ?key,
+                elapsed_ms = data_elapsed.as_millis() as u64,
+                ?err,
+                "FastSlowStore::update (chunked): fast store write failed",
+            );
+        }
+        fast_res?;
+
+        // Pin the digest in the fast store: this is what guarantees the
+        // in-memory replica survives until the chunked driver's commit
+        // lands (or until BlobsInStableStorage acks).
+        if let StoreKey::Digest(d) = &key {
+            self.fast_store.pin_digests(&[*d]);
+        }
+
+        let dispatch_committed_size = match dispatch_res {
+            Ok(size) => size,
+            Err(err) => {
+                // Admission rejection (global budget, mpsc full, dup
+                // digest) or in-stream error. The fast tier already has
+                // the blob; record the digest for retry-on-reconnect so
+                // the mirror protocol can recover.
+                if let StoreKey::Digest(d) = &key {
+                    self.failed_slow_writes.lock().insert(*d);
+                    self.fast_store.pin_digests(&[*d]);
+                }
+                error!(
+                    ?key,
+                    elapsed_ms = data_elapsed.as_millis() as u64,
+                    ?err,
+                    "FastSlowStore::update (chunked): dispatcher admission FAILED — \
+                     blob pinned in fast tier, will retry on reconnect"
+                );
+                return Err(err);
+            }
+        };
+
+        info!(
+            ?key,
+            elapsed_ms = data_elapsed.as_millis() as u64,
+            size_bytes = digest.size_bytes(),
+            committed_size = dispatch_committed_size,
+            "FastSlowStore::update (chunked): admission complete; \
+             driver continues async (β commit)"
+        );
+
+        Ok(())
+    }
+
+    /// #212 Phase 2.7: install the Bazel-facing internal-chunking
+    /// dispatcher. The dispatcher's implementation lives in
+    /// `nativelink-service` (the per-blob `ChunkedDriver` machinery is
+    /// wired into the RPC layer there); we accept the trait object here
+    /// to break the otherwise-circular dependency.
+    ///
+    /// Production wiring: call this from the server bootstrap AFTER
+    /// constructing the FastSlowStore + FilesystemStore (see
+    /// `src/bin/nativelink.rs` slow-tier setup; chunked-dispatch
+    /// installation is a no-op when `chunked_fast_slow` is not
+    /// compiled in).
+    ///
+    /// The actual decision to USE this dispatcher per-call is gated on
+    /// `crate::chunked::bazel_facing_internal_chunking_enabled()` (the
+    /// kill-switch defaulting to OFF) AND blob size; see `update()`.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn set_bazel_chunked_dispatcher(
+        &self,
+        dispatcher: crate::chunked::BazelChunkedDispatcherArc,
+    ) {
+        *self.bazel_chunked_dispatcher.lock() = Some(dispatcher);
+    }
+
+    /// Read-only accessor for the chunked dispatcher; tests use this
+    /// to confirm wiring. Returns `None` if no dispatcher is installed.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[must_use]
+    pub fn bazel_chunked_dispatcher(
+        &self,
+    ) -> Option<crate::chunked::BazelChunkedDispatcherArc> {
+        self.bazel_chunked_dispatcher.lock().clone()
     }
 
     /// Test-only: insert a synthetic in-flight slow-write entry. Used by the
@@ -1036,6 +1235,8 @@ impl FastSlowStore {
             chunked_read_registry: Mutex::new(None),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_reads_enabled: AtomicBool::new(false),
+            #[cfg(feature = "chunked_fast_slow")]
+            bazel_chunked_dispatcher: parking_lot::Mutex::new(None),
         })
     }
 
@@ -2610,13 +2811,52 @@ impl StoreDriver for FastSlowStore {
             ))
         });
 
+        let update_start = std::time::Instant::now();
+
+        // #212 Phase 2.7: Bazel-facing internal chunking branch.
+        //
+        // When (a) the kill-switch is ON, (b) a chunked dispatcher has
+        // been installed, AND (c) the blob is at least CHUNK_SIZE
+        // bytes, hand the upstream to the dispatcher. The dispatcher
+        // returns Ok as soon as the final chunk is admitted (β
+        // async-commit; anti-#203). The fast-tier (MemoryStore) write
+        // happens inline below in the standard path; for chunked-dispatch
+        // we MUST still mirror the fast-tier write so the in-memory
+        // replica covers the async-commit window. We therefore tee the
+        // bytes into the dispatcher AND the fast tier in parallel,
+        // mirroring the existing `tokio::join!(data_stream_fut,
+        // fast_store_fut)` pattern.
+        //
+        // The kill-switch defaults OFF; flipping it ON in production
+        // requires explicit user sign-off per CLAUDE.md
+        // `feedback_async_to_sync_requires_explicit_signoff`.
+        #[cfg(feature = "chunked_fast_slow")]
+        {
+            if crate::chunked::bazel_facing_internal_chunking_enabled() {
+                let digest = key.borrow().into_digest();
+                if digest.size_bytes() >= crate::chunked::CHUNK_SIZE as u64 {
+                    if let Some(dispatcher) = self.bazel_chunked_dispatcher() {
+                        return self
+                            .update_via_chunked_dispatcher(
+                                key,
+                                reader,
+                                size_info,
+                                digest,
+                                dispatcher,
+                                update_start,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
         // Decoupled write: stream to fast store while accumulating data,
         // then spawn a background task for the slow store write.
         // This prevents slow-store latency (e.g. ZFS txg sync) from
         // blocking the fast-store (MemoryStore) write path.
         let (mut fast_tx, fast_rx) = make_buf_channel_pair_with_size(128);
 
-        let update_start = std::time::Instant::now();
         debug!(
             ?key,
             ?size_info,
