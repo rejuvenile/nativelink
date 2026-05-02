@@ -2370,6 +2370,21 @@ impl GrpcStore {
                 write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
             }
         };
+        // #212 Phase 2.4 fixup B2 (perf-optimizer): mirror the #147
+        // pool-eviction path that the legacy ByteStream `write` /
+        // `get_part` paths run on transport-shaped errors. Without
+        // this, a chunked-stream attempt that fails with a GOAWAY-
+        // shaped error leaves the dead channel sitting in the
+        // `ConnectionManager` pool; the next request picks it up and
+        // immediately re-fails. The classifier (`looks_like_dead_channel`
+        // inside `evict_pool_on_transport_err`) is the same one the
+        // legacy paths use, so there is no risk of evicting a
+        // BackpressureSignal-carrying ResourceExhausted (which is
+        // explicitly NOT classified as dead-channel — see the
+        // unit test `bare_resource_exhausted_looks_like_dead_channel`).
+        if let Err(ref err) = result {
+            self.evict_pool_on_transport_err(err);
+        }
         result.err_tip(|| format!("in GrpcStore::update_via_chunked_inner for digest {digest}"))?;
         Ok(())
     }

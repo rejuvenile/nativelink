@@ -215,3 +215,19 @@ required-features = ["test-utils"]
 [[test]]
 name = "chunked_client_test"
 required-features = ["chunked_fast_slow"]
+
+# #212 Phase 2.4 fixup B2: regression test that the chunked-write path
+# triggers `evict_pool_on_transport_err` on transport-shaped failures
+# (mirrors the existing #147 pool-eviction wiring on the legacy
+# ByteStream path). Gated on `chunked_fast_slow`.
+[[test]]
+name = "chunked_grpc_eviction_test"
+required-features = ["chunked_fast_slow"]
+
+# #212 Phase 2.4 fixup B1 part 1: regression test for the
+# MAX_CHUNKED_BLOB_SIZE upper-bound cap (blobs > 256 MiB fall back to
+# the legacy ByteStream path because the v1 chunked client buffers the
+# entire payload in memory).
+[[test]]
+name = "chunked_size_cap_test"
+required-features = ["chunked_fast_slow"]
