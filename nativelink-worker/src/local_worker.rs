@@ -2420,6 +2420,9 @@ pub async fn new_local_worker(
             slow: nativelink_config::stores::StoreSpec::Noop(Default::default()),
             fast_direction: fast_slow_store.fast_direction(),
             slow_direction: fast_slow_store.slow_direction(),
+            // Worker-side wrapper FSS; the chunked-read cascade lives
+            // on the server, never on the worker, so leave OFF.
+            chunked_reads_enabled: false,
         };
         let new_fss = FastSlowStore::new(&fss_spec, fast_store, proxy_store);
         info!(
@@ -2520,6 +2523,9 @@ pub async fn new_local_worker(
             slow: nativelink_config::stores::StoreSpec::Noop(Default::default()),
             fast_direction: effective_cas_store.fast_direction(),
             slow_direction: nativelink_config::stores::StoreDirection::ReadOnly,
+            // Worker-side wrapper FSS; the chunked-read cascade lives
+            // on the server, never on the worker, so leave OFF.
+            chunked_reads_enabled: false,
         };
         FastSlowStore::new_with_shared_failed_writes(
             &fss_spec,

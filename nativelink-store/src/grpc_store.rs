@@ -401,6 +401,15 @@ impl GrpcStore {
             );
         }
 
+        // #212 Phase 2.4: honor the production config knob. The
+        // `enable_chunked_writes()` runtime API still exists for tests
+        // and operator admin tooling, but production opts in through
+        // the JSON config field landed in the same series.
+        #[cfg(feature = "chunked_fast_slow")]
+        if spec.chunked_writes_enabled {
+            store.enable_chunked_writes();
+        }
+
         Ok(store)
     }
 

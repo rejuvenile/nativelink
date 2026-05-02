@@ -481,14 +481,39 @@ async fn inner_main(
         }
     };
 
+    // #212 Phase 2.7 production wire-up: honor the
+    // `bazel_facing_internal_chunking_enabled` kill-switch from
+    // `GlobalConfig` (production sign-off 2026-05-02). When the
+    // feature is compiled in AND the operator has set the field to
+    // true, flip the process-wide AtomicBool here so subsequent
+    // `FastSlowStore::update` calls dispatch through the per-blob
+    // ChunkedDriver machinery once the dispatcher is installed below.
+    // The runtime setter
+    // `chunked::set_bazel_facing_internal_chunking_enabled(bool)`
+    // remains available for tests and admin tooling.
+    #[cfg(feature = "chunked_fast_slow")]
+    if cfg
+        .global
+        .as_ref()
+        .is_some_and(|g| g.bazel_facing_internal_chunking_enabled)
+    {
+        nativelink_store::chunked::set_bazel_facing_internal_chunking_enabled(true);
+        info!(
+            "GlobalConfig: bazel_facing_internal_chunking_enabled=true \
+             (process-wide chunked-dispatch ON; #212 Phase 2.7)"
+        );
+    }
+
     // #212 Phase 2.5/2.7 fixup S1: wire the chunked-read registry +
     // Bazel-facing chunked dispatcher into every CAS-backing
-    // FastSlowStore whose slow tier is a FilesystemStore. Default-OFF
-    // kill-switches per CLAUDE.md `feedback_async_to_sync_requires_explicit_signoff`:
-    //   - read-side: `FastSlowStore::enable_chunked_reads()`
-    //   - write-side: `nativelink_store::chunked::set_bazel_facing_internal_chunking_enabled(true)`
-    // Both flips require explicit user sign-off; until then the wiring
-    // is dead-store memory and the legacy paths remain byte-identical.
+    // FastSlowStore whose slow tier is a FilesystemStore. The kill
+    // switches are now driven by JSON config (production sign-off
+    // 2026-05-02): per-FastSlowStore `chunked_reads_enabled` (Phase
+    // 2.5) and process-wide `bazel_facing_internal_chunking_enabled`
+    // (Phase 2.7, set above). The runtime APIs
+    // (`FastSlowStore::enable_chunked_reads()`,
+    // `chunked::set_bazel_facing_internal_chunking_enabled(true)`)
+    // remain available for tests and admin tooling.
     #[cfg(feature = "chunked_fast_slow")]
     {
         use nativelink_store::existence_cache_store::ExistenceCacheStore;

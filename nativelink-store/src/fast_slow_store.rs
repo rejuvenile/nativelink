@@ -601,7 +601,7 @@ impl FastSlowStore {
             failed_slow_writes.clone(),
             in_flight_slow_writes.clone(),
         );
-        Arc::new_cyclic(|weak_self| Self {
+        let store = Arc::new_cyclic(|weak_self| Self {
             fast_store,
             fast_direction: spec.fast_direction,
             slow_store,
@@ -631,7 +631,16 @@ impl FastSlowStore {
             bazel_chunked_dispatcher: parking_lot::Mutex::new(None),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_size_threshold: AtomicU64::new(crate::chunked::CHUNK_SIZE as u64),
-        })
+        });
+        // #212 Phase 2.5: honor the production config knob. The
+        // `enable_chunked_reads()` runtime API still exists for tests
+        // and operator admin tooling, but production opts in through
+        // the JSON config field landed in the same series.
+        #[cfg(feature = "chunked_fast_slow")]
+        if spec.chunked_reads_enabled {
+            store.enable_chunked_reads();
+        }
+        store
     }
 
     pub fn in_flight_slow_write_count(&self) -> usize {
@@ -1335,7 +1344,7 @@ impl FastSlowStore {
         let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         register_pin_expire_listener(&fast_store, shared.clone(), in_flight_slow_writes.clone());
-        Arc::new_cyclic(|weak_self| Self {
+        let store = Arc::new_cyclic(|weak_self| Self {
             fast_store,
             fast_direction: spec.fast_direction,
             slow_store,
@@ -1365,7 +1374,14 @@ impl FastSlowStore {
             bazel_chunked_dispatcher: parking_lot::Mutex::new(None),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_size_threshold: AtomicU64::new(crate::chunked::CHUNK_SIZE as u64),
-        })
+        });
+        // #212 Phase 2.5: honor the production config knob (mirror of
+        // `new`).
+        #[cfg(feature = "chunked_fast_slow")]
+        if spec.chunked_reads_enabled {
+            store.enable_chunked_reads();
+        }
+        store
     }
 
     /// Flip on `local_only_reads` mode. See the field-level comment for the

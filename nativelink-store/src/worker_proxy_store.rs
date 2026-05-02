@@ -627,6 +627,10 @@ impl WorkerProxyStore {
             // observed during write bursts; tighter would false-positive
             // healthy-but-busy workers (cf. perf review on Proposal 3).
             connection_acquire_timeout_ms: Some(3000),
+            // Server→worker mirror connections never use the worker-side
+            // chunked-write path; the chunked-write path is from worker
+            // to server, not the reverse direction. Leave OFF.
+            chunked_writes_enabled: false,
         };
         let store = GrpcStore::new(&spec)
             .await

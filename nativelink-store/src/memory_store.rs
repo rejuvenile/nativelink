@@ -164,11 +164,21 @@ impl MemoryStore {
         let eviction_policy = spec.eviction_policy.as_ref().unwrap_or(&empty_policy);
         let evicting_map = Arc::new(MokaEvictingMap::with_anchor(eviction_policy, SystemTime::now()));
         evicting_map.start_background_eviction();
-        Arc::new(Self {
+        let store = Arc::new(Self {
             evicting_map,
             #[cfg(feature = "chunked_fast_slow")]
             emit_backpressure_enabled: AtomicBool::new(false),
-        })
+        });
+        // #212 Phase 2.6: honor the production config knob. The
+        // `set_emit_backpressure_for_test` runtime setter still exists
+        // for tests; production opts in through the JSON config field
+        // landed in the same series via the `set_emit_backpressure`
+        // production setter below.
+        #[cfg(feature = "chunked_fast_slow")]
+        if spec.emit_backpressure_enabled {
+            store.set_emit_backpressure(true);
+        }
+        store
     }
 
     /// Returns the number of key-value pairs that are currently in the the cache.
@@ -187,12 +197,11 @@ impl MemoryStore {
     /// to refuse over-capacity writes with `Code::ResourceExhausted +
     /// BackpressureSignal::MemoryStoreAtCapacity`.
     ///
-    /// Named `_for_test` because Phase 2.6 ships only the mechanism —
-    /// production config plumbing (a `MemorySpec` JSON field, an env
-    /// var, or a runtime admin RPC) is a deferred follow-up so that
-    /// (a) the architectural change can be reviewed in isolation and
-    /// (b) the user can sign off on the wire-format / config schema
-    /// before any production deployment touches the gate.
+    /// Retained as `_for_test` for the test suites that wire it
+    /// directly. Production code paths use `set_emit_backpressure`
+    /// (no `_for_test` suffix) which is also called automatically
+    /// from `MemoryStore::new` when `MemorySpec.emit_backpressure_enabled`
+    /// is true (production sign-off 2026-05-02).
     ///
     /// The relaxed orderings are deliberate: the gate is a single
     /// boolean read on a hot path. A torn read in either direction is
@@ -202,6 +211,20 @@ impl MemoryStore {
     /// transient and self-healing within the next call.
     #[cfg(feature = "chunked_fast_slow")]
     pub fn set_emit_backpressure_for_test(&self, on: bool) {
+        self.emit_backpressure_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// #212 Phase 2.6 production runtime setter for the backpressure
+    /// emission kill-switch. Behaves identically to
+    /// `set_emit_backpressure_for_test`, but lives without the
+    /// `_for_test` suffix for the production config wire-up at
+    /// `MemoryStore::new` and any future operator admin tool.
+    ///
+    /// Idempotent. Safe to call multiple times. Takes effect on the
+    /// next `update` / `update_oneshot`; in-flight operations are
+    /// not affected.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn set_emit_backpressure(&self, on: bool) {
         self.emit_backpressure_enabled.store(on, Ordering::Relaxed);
     }
 
