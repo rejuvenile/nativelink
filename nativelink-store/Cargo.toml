@@ -231,3 +231,13 @@ required-features = ["chunked_fast_slow"]
 [[test]]
 name = "chunked_size_cap_test"
 required-features = ["chunked_fast_slow"]
+
+# #212 Phase 2.6: MemoryStore backpressure-emission regression tests.
+# Gated on `chunked_fast_slow` because the new emission path is only
+# reachable with that feature flag; default `cargo test` skips this.
+# Asymmetric-contract coverage (under-action + over-action) plus the
+# VerifyStore production-composition surround and a classifier
+# round-trip check against `error_has_backpressure_signal`.
+[[test]]
+name = "memory_store_backpressure_emission_test"
+required-features = ["chunked_fast_slow"]

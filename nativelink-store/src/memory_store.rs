@@ -17,6 +17,8 @@ use core::borrow::Borrow;
 use core::fmt::Debug;
 use core::ops::Bound;
 use core::pin::Pin;
+#[cfg(feature = "chunked_fast_slow")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -26,6 +28,8 @@ use nativelink_config::stores::MemorySpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use tracing::{debug, error};
 use nativelink_metric::MetricsComponent;
+#[cfg(feature = "chunked_fast_slow")]
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::moka_evicting_map::MokaEvictingMap;
@@ -39,6 +43,16 @@ use nativelink_util::store_trait::{
 
 use crate::callback_utils::ItemCallbackHolder;
 use crate::cas_utils::is_zero_digest;
+#[cfg(feature = "chunked_fast_slow")]
+use crate::chunked_signal::encode_backpressure_signal_any;
+
+/// #212 Phase 2.6: backoff hint clients should observe when
+/// `MemoryStore::update*` rejects with `MemoryStoreAtCapacity`. Memory
+/// eviction drains in milliseconds (faster than slow-tier ack), so the
+/// suggested retry window is short. Operators may override; the
+/// classifier behavior does not depend on this value.
+#[cfg(feature = "chunked_fast_slow")]
+const MEMORY_STORE_BACKPRESSURE_RETRY_MS: u64 = 25;
 
 /// Scatter-gather buffer: stores data as a chain of `Bytes` chunks
 /// (like BSD mbufs / Linux sk_buffs) to avoid concatenation copies.
@@ -130,6 +144,18 @@ pub struct MemoryStore {
         SystemTime,
         ItemCallbackHolder,
     >>,
+    /// #212 Phase 2.6 kill-switch: when true, `update` / `update_oneshot`
+    /// emit `Code::ResourceExhausted` carrying a
+    /// `BackpressureSignal::MemoryStoreAtCapacity` detail INSTEAD of
+    /// silently evicting a recent (potentially still-in-use) blob to
+    /// make room. Default OFF preserves the historic silent-evict
+    /// behavior so this architectural change is no-op until the
+    /// operator explicitly opts in. Toggle via
+    /// `set_emit_backpressure_for_test` (no JSON config plumbing
+    /// yet — Phase 2.6 ships the mechanism, follow-up tracker wires
+    /// the production config knob).
+    #[cfg(feature = "chunked_fast_slow")]
+    emit_backpressure_enabled: AtomicBool,
 }
 
 impl MemoryStore {
@@ -138,7 +164,11 @@ impl MemoryStore {
         let eviction_policy = spec.eviction_policy.as_ref().unwrap_or(&empty_policy);
         let evicting_map = Arc::new(MokaEvictingMap::with_anchor(eviction_policy, SystemTime::now()));
         evicting_map.start_background_eviction();
-        Arc::new(Self { evicting_map })
+        Arc::new(Self {
+            evicting_map,
+            #[cfg(feature = "chunked_fast_slow")]
+            emit_backpressure_enabled: AtomicBool::new(false),
+        })
     }
 
     /// Returns the number of key-value pairs that are currently in the the cache.
@@ -149,6 +179,87 @@ impl MemoryStore {
 
     pub async fn remove_entry(&self, key: StoreKey<'_>) -> bool {
         self.evicting_map.remove(&key.into_owned()).await
+    }
+
+    /// #212 Phase 2.6 runtime kill-switch for backpressure emission on
+    /// over-capacity writes. Default is OFF (silent-evict, the historic
+    /// behavior); calling with `true` flips this MemoryStore instance
+    /// to refuse over-capacity writes with `Code::ResourceExhausted +
+    /// BackpressureSignal::MemoryStoreAtCapacity`.
+    ///
+    /// Named `_for_test` because Phase 2.6 ships only the mechanism —
+    /// production config plumbing (a `MemorySpec` JSON field, an env
+    /// var, or a runtime admin RPC) is a deferred follow-up so that
+    /// (a) the architectural change can be reviewed in isolation and
+    /// (b) the user can sign off on the wire-format / config schema
+    /// before any production deployment touches the gate.
+    ///
+    /// The relaxed orderings are deliberate: the gate is a single
+    /// boolean read on a hot path. A torn read in either direction is
+    /// safe — the worst case is one extra silent-evict (kill-switch
+    /// transitioning ON→OFF) or one spurious backpressure response
+    /// (transitioning OFF→ON) at the moment of the toggle. Both are
+    /// transient and self-healing within the next call.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn set_emit_backpressure_for_test(&self, on: bool) {
+        self.emit_backpressure_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// #212 Phase 2.6: best-effort capacity check shared by `update`
+    /// and `update_oneshot`. Returns `Ok(())` when the insert is
+    /// permitted (the kill-switch is off, OR the cache has headroom);
+    /// returns `Err(ResourceExhausted+BackpressureSignal)` when the
+    /// kill-switch is ON and the predicted post-insert size would
+    /// exceed `max_bytes`.
+    ///
+    /// The predicate is a snapshot of moka's `weighted_size` and is
+    /// eventually-consistent — under heavy concurrent writers the
+    /// answer can be stale by one batch's worth of work. That is
+    /// acceptable for a backpressure signal: the kill-switch is opt-in
+    /// and exists to STOP an over-capacity hot loop, not to enforce
+    /// hard accounting.
+    #[cfg(feature = "chunked_fast_slow")]
+    fn check_backpressure_gate(
+        &self,
+        owned_key: &StoreKey<'static>,
+        incoming_bytes: u64,
+    ) -> Result<(), Error> {
+        if !self.emit_backpressure_enabled.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if !self.evicting_map.would_exceed_capacity(incoming_bytes) {
+            return Ok(());
+        }
+        debug!(
+            key = ?owned_key,
+            incoming_bytes,
+            "MemoryStore: emitting BackpressureSignal::MemoryStoreAtCapacity \
+             (kill-switch ON, insert would exceed cap)",
+        );
+        let detail = encode_backpressure_signal_any(
+            backpressure_signal::Reason::MemoryStoreAtCapacity,
+            MEMORY_STORE_BACKPRESSURE_RETRY_MS,
+        );
+        Err(Error::resource_exhausted_backpressure(
+            format!(
+                "MemoryStore at capacity for key {owned_key:?}: \
+                 incoming {incoming_bytes} bytes would force eviction. \
+                 Retry after ~{MEMORY_STORE_BACKPRESSURE_RETRY_MS}ms."
+            ),
+            detail,
+        ))
+    }
+
+    /// Compile-time no-op when `chunked_fast_slow` is OFF. Keeps the
+    /// caller side a single line regardless of feature gate.
+    #[cfg(not(feature = "chunked_fast_slow"))]
+    #[inline]
+    fn check_backpressure_gate(
+        &self,
+        _owned_key: &StoreKey<'static>,
+        _incoming_bytes: u64,
+    ) -> Result<(), Error> {
+        Ok(())
     }
 }
 
@@ -256,6 +367,12 @@ impl StoreDriver for MemoryStore {
             _ => {}
         }
 
+        // #212 Phase 2.6: kill-switched backpressure gate. No-op when
+        // the operator hasn't opted in (the production default), so the
+        // historic silent-evict behavior is preserved bit-identically
+        // for callers that haven't toggled `set_emit_backpressure_for_test`.
+        self.check_backpressure_gate(&owned_key, total_bytes)?;
+
         self.evicting_map
             .insert(owned_key.clone().into(), BytesWrapper::from_chunks(chunks))
             .await;
@@ -286,6 +403,11 @@ impl StoreDriver for MemoryStore {
             data
         };
         let owned_key = key.into_owned();
+
+        // #212 Phase 2.6: kill-switched backpressure gate. No-op when
+        // the operator hasn't opted in (the production default).
+        self.check_backpressure_gate(&owned_key, data_len as u64)?;
+
         self.evicting_map
             .insert(owned_key.clone().into(), BytesWrapper::from_single(data))
             .await;

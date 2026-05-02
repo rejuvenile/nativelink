@@ -1019,6 +1019,45 @@ where
         self.cache.entry_count() as usize + self.pinned.len()
     }
 
+    /// Returns `true` if a hypothetical insert of `incoming_bytes`
+    /// would push the cache over its configured `max_bytes` ceiling
+    /// (eventually-consistent — moka's `weighted_size()` only refreshes
+    /// after `run_pending_tasks()`, so the answer is a best-effort
+    /// snapshot of the most recent processed batch).
+    ///
+    /// Returns `false` when no byte cap is configured (`max_bytes == 0`)
+    /// so callers without a byte budget never trip the predicate.
+    ///
+    /// Used by `MemoryStore` Phase 2.6 backpressure emission to refuse
+    /// a write that would otherwise force eviction of a recent
+    /// (potentially still-in-use) blob — the alternative is the historic
+    /// silent-evict behavior, which is preserved when the operator
+    /// keeps the kill-switch off.
+    ///
+    /// `weighted_size()` returns the sum of moka weights, which we
+    /// scale by `1024` (the SCALE constant used by the weigher) to
+    /// approximate the byte usage. Because the weigher rounds up to
+    /// KB granularity, this slightly OVER-estimates current usage —
+    /// which biases the predicate toward emitting backpressure
+    /// EARLIER, never later, and so cannot cause a "should-have-evicted
+    /// but didn't" silent-overrun.
+    #[must_use]
+    pub fn would_exceed_capacity(&self, incoming_bytes: u64) -> bool {
+        if self.max_bytes == 0 {
+            return false;
+        }
+        // SCALE matches the weigher in `with_anchor`. Keeping the
+        // multiplier inline avoids exposing the constant publicly while
+        // keeping the byte ↔ weight conversion local to one call-site.
+        const SCALE: u64 = 1024;
+        let current_bytes = self.cache.weighted_size().saturating_mul(SCALE);
+        // Round the incoming size up to KB to match the weigher's
+        // own behavior: a 1-byte insert weighs 1 (=1 KB after scale),
+        // not 0.
+        let incoming_kb_bytes = incoming_bytes.div_ceil(SCALE).saturating_mul(SCALE);
+        current_bytes.saturating_add(incoming_kb_bytes) > self.max_bytes
+    }
+
     // ---------------------------------------------------------------
     // background eviction drainer
     // ---------------------------------------------------------------
