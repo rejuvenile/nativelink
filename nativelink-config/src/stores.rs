@@ -794,6 +794,21 @@ pub struct FastSlowSpec {
     /// and you wish to have an upstream read only store.
     #[serde(default)]
     pub slow_direction: StoreDirection,
+
+    /// #212 Phase 2.5 read-cascade kill-switch on `FastSlowStore`.
+    /// Set true to enable. Production-flipped 2026-05-02 per user
+    /// sign-off.
+    ///
+    /// When true AND the `chunked_fast_slow` feature is compiled in
+    /// AND a `ChunkedReadRegistry` has been installed via
+    /// `FastSlowStore::set_chunked_read_registry`, `get_part`
+    /// consults the registry between the in-flight slow-write check
+    /// and the slow store. With this flag false the registry is
+    /// ignored — preserves the pre-Phase-2.5 read path exactly.
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub chunked_reads_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]
@@ -804,6 +819,22 @@ pub struct MemorySpec {
     /// value will cause items to never be removed from the store causing
     /// infinite memory usage.
     pub eviction_policy: Option<EvictionPolicy>,
+
+    /// #212 Phase 2.6 — emit `BackpressureSignal::MemoryStoreAtCapacity`
+    /// instead of silent eviction at capacity. Production-flipped
+    /// 2026-05-02 per user sign-off.
+    ///
+    /// When true AND the `chunked_fast_slow` feature is compiled in,
+    /// `update` / `update_oneshot` reject over-capacity writes with
+    /// `Code::ResourceExhausted` carrying a structured
+    /// `BackpressureSignal::MemoryStoreAtCapacity` detail INSTEAD of
+    /// silently evicting a recent (potentially still-in-use) blob to
+    /// make room. Default false preserves the historic silent-evict
+    /// behavior.
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub emit_backpressure_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1448,6 +1479,21 @@ pub struct GrpcSpec {
     /// Default: None
     #[serde(default)]
     pub connection_acquire_timeout_ms: Option<u64>,
+
+    /// #212 Phase 2.4 worker-side WriteChunked client kill-switch.
+    /// Set true to enable. Production-flipped 2026-05-02 per user
+    /// sign-off.
+    ///
+    /// When true AND the `chunked_fast_slow` feature is compiled in,
+    /// blobs at or above `CHUNK_SIZE` (1 MiB) are dispatched through
+    /// `chunked::chunked_client::write_chunked_stream` to the
+    /// server's `WorkerApi/WriteChunked` RPC instead of the legacy
+    /// in-order `ByteStream.Write` path. Smaller blobs continue to
+    /// take the legacy path regardless.
+    ///
+    /// Default: false (legacy path)
+    #[serde(default)]
+    pub chunked_writes_enabled: bool,
 }
 
 /// The possible error codes that might occur on an upstream request.

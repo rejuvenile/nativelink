@@ -1144,6 +1144,34 @@ pub struct GlobalConfig {
     /// Default: None
     #[serde(default, deserialize_with = "convert_optional_string_with_shellexpand")]
     pub worker_proxy_tls_key_file: Option<String>,
+
+    /// #212 Phase 2.7 Bazel-facing internal-chunking kill-switch.
+    /// Set true to enable. Production-flipped 2026-05-02 per user
+    /// sign-off.
+    ///
+    /// Lives on `GlobalConfig` (rather than per-store) because the
+    /// underlying gate is a process-wide `AtomicBool` in
+    /// `nativelink_store::chunked` consulted by every `FastSlowStore`
+    /// that has a `BazelChunkedDispatcher` installed. A per-store
+    /// knob would be misleading.
+    ///
+    /// When true AND the `chunked_fast_slow` feature is compiled in
+    /// AND a `BazelChunkedDispatcher` has been installed AND
+    /// `digest.size_bytes() >= CHUNK_SIZE`, `FastSlowStore::update`
+    /// internally chunks the in-order ByteStream into 1 MiB pieces
+    /// and dispatches them through the per-blob `ChunkedDriver`
+    /// machinery (β async-commit semantics). Smaller blobs and the
+    /// default-OFF case continue to use the legacy single-stream
+    /// path (fast tier in line + background `tokio::spawn` for slow
+    /// tier).
+    ///
+    /// Per CLAUDE.md `feedback_async_to_sync_requires_explicit_signoff`,
+    /// this is an architectural change and was explicitly signed off
+    /// on 2026-05-02.
+    ///
+    /// Default: false (legacy single-stream path)
+    #[serde(default)]
+    pub bazel_facing_internal_chunking_enabled: bool,
 }
 
 fn default_disable_otlp() -> bool {

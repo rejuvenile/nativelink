@@ -1834,6 +1834,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             worker_proxy_tls_ca_file: None,
             worker_proxy_tls_cert_file: None,
             worker_proxy_tls_key_file: None,
+            bazel_facing_internal_chunking_enabled: false,
         }
     };
 
