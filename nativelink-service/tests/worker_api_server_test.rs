@@ -178,6 +178,7 @@ async fn setup_api_server_with_task_limit(
     let worker_api_server = WorkerApiServer::new_with_now_fn(
         &WorkerApiConfig {
             scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
         },
         &schedulers,
         now_fn,
@@ -693,6 +694,7 @@ async fn setup_api_server_with_locality(
     let worker_api_server = WorkerApiServer::new_with_now_fn(
         &WorkerApiConfig {
             scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
         },
         &schedulers,
         Box::new(static_now_fn),
@@ -810,6 +812,7 @@ async fn setup_api_server_with_mirror_proxy(
     let worker_api_server = WorkerApiServer::new_with_now_fn(
         &WorkerApiConfig {
             scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
         },
         &schedulers,
         Box::new(static_now_fn),
@@ -1536,6 +1539,7 @@ async fn setup_multi_connect() -> Result<MultiConnectContext, Error> {
     let worker_api_server = WorkerApiServer::new_with_now_fn(
         &WorkerApiConfig {
             scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
         },
         &schedulers,
         Box::new(static_now_fn),
@@ -2041,6 +2045,7 @@ async fn setup_api_server_with_dispatcher(
     let worker_api_server = WorkerApiServer::new_with_now_fn(
         &WorkerApiConfig {
             scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
         },
         &schedulers,
         Box::new(static_now_fn),
@@ -2239,6 +2244,7 @@ async fn setup_dispatcher_with_mirror_enabled(
     let worker_api_server = WorkerApiServer::new_with_now_fn(
         &WorkerApiConfig {
             scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
         },
         &schedulers,
         Box::new(static_now_fn),

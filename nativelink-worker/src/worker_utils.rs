@@ -24,6 +24,7 @@ use nativelink_config::cas_server::WorkerProperty;
 use nativelink_error::{Error, ResultExt, make_err, make_input_err};
 use nativelink_proto::build::bazel::remote::execution::v2::platform::Property;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::ConnectWorkerRequest;
+use nativelink_util::build_sha::build_sha;
 use tokio::process;
 use tracing::info;
 use uuid::Uuid;
@@ -135,5 +136,10 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
         max_inflight_tasks,
         cas_endpoint,
         boot_epoch_id: boot_epoch_id(),
+        // (#216) stale-worker detection: SHA-256 prefix of the worker
+        // binary so the scheduler can reject workers whose build is
+        // not in its `compatible_build_shas` allowlist. Empty string
+        // when binary read fails — see `nativelink_util::build_sha`.
+        build_sha: build_sha().to_string(),
     })
 }

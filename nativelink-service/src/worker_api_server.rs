@@ -20,6 +20,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+// (#216) Allowed build SHAs for stale-worker detection. When set and
+// non-empty, we reject `connect_worker` requests whose
+// `ConnectWorkerRequest.build_sha` is not in the set. Wrapped in
+// `Arc<HashSet>` so cheap clone-on-handoff to the per-connection
+// validation path; `HashSet` (rather than `Vec`) so the membership
+// test is O(1) — connect frequency is low (one per worker reconnect)
+// but the cost of an O(n) scan grows with allowlist length and the
+// expected operator pattern is "current SHA + previous 10".
+
 use futures::stream::unfold;
 use futures::{Stream, StreamExt};
 use nativelink_config::cas_server::WorkerApiConfig;
@@ -98,6 +107,13 @@ pub struct WorkerApiServer {
     /// disconnect-cleanup task — both of which operate inside this
     /// server, not the scheduler.
     endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
+    /// (#216) Allowed worker build SHAs. `None` = validation disabled
+    /// (every worker is accepted). `Some(set)` with `set` non-empty =
+    /// reject any `ConnectWorkerRequest.build_sha` not present in the
+    /// set with `Code::FailedPrecondition`. An EMPTY set is treated
+    /// as "validation enabled, every SHA mismatches" — operators who
+    /// truly want to disable validation should pass `None`.
+    compatible_build_shas: Option<Arc<HashSet<String>>>,
     /// Counters for the BlobsAvailable mark_stable / backfill pipeline.
     /// Shared across every `WorkerConnection` and its background tasks
     /// so a single counter aggregates server-wide. Wired into the
@@ -149,6 +165,22 @@ pub struct WorkerApiMetrics {
                 upload (each tick recovers, but the counter exposes the rate)."
     )]
     pub mark_stable_has_with_results_failures: AtomicU64,
+
+    /// (#216) Total `connect_worker` requests rejected because the
+    /// worker's reported `build_sha` was not in the configured
+    /// `compatible_build_shas` allowlist. Operators alert on a
+    /// sustained non-zero rate to catch deploys that left a worker
+    /// behind on a stale binary (which previously manifested as
+    /// silent reconnect storms — see the diagnostic at
+    /// `/tmp/wedge-digest-1777583500-SYNTHESIS.md`).
+    #[metric(
+        help = "Total worker connections rejected because the worker's reported \
+                build_sha was not in the compatible_build_shas allowlist. A \
+                sustained non-zero rate indicates a deploy left one or more \
+                workers behind on a stale binary; redeploy the offending host \
+                or expand the allowlist if the rollout is intentional."
+    )]
+    pub stale_workers_rejected_total: AtomicU64,
 }
 
 /// Per-endpoint state for the #141 boot_epoch wipe path. See
@@ -250,6 +282,26 @@ impl WorkerApiServer {
                 )
             })?
             .clone();
+        // (#216) Convert the configured Vec<String> allowlist into an
+        // Arc<HashSet<String>> for O(1) membership checks at connect
+        // time. `None` and `Some(empty)` collapse to `None` here so
+        // both shapes mean "validation disabled" — preserving the
+        // backward-compat behavior. To enable validation with an
+        // empty list (reject EVERY worker), the operator must set
+        // `compatible_build_shas: [""]` (which permits only legacy
+        // empty-SHA workers) or list specific SHAs.
+        let compatible_build_shas = config
+            .compatible_build_shas
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|v| Arc::new(v.iter().cloned().collect::<HashSet<String>>()));
+        if let Some(ref set) = compatible_build_shas {
+            info!(
+                allowlist_size = set.len(),
+                "worker_api: build-SHA allowlist enabled; workers reporting a \
+                 build_sha not in this set will be rejected with FailedPrecondition"
+            );
+        }
         Ok(Self {
             scheduler,
             now_fn: Arc::new(now_fn),
@@ -259,6 +311,7 @@ impl WorkerApiServer {
             worker_proxy,
             small_blob_dispatcher,
             endpoint_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            compatible_build_shas,
             metrics: Arc::new(WorkerApiMetrics::default()),
         })
     }
@@ -293,6 +346,88 @@ impl WorkerApiServer {
                 "First message was not a ConnectWorkerRequest"
             ));
         };
+
+        // (#216 defense-in-depth) Bound the operator-visible string
+        // fields BEFORE we use them as `tracing` field values or
+        // `Display` substitutions. The hello frame is the worker's
+        // first message and the only constraint on string lengths is
+        // the gRPC frame ceiling (multi-MiB). A buggy or malicious
+        // worker could send megabyte-long `worker_id_prefix` /
+        // `cas_endpoint` / `build_sha` values; without a bound,
+        // `warn!` would dump them into the JSON-formatted log stream
+        // and the `Display`-formatted error would propagate them up
+        // through every retrying caller. 256 bytes is generous for
+        // legitimate values (`build_sha` is fixed at 16; UUID-ish
+        // worker_id_prefixes are <32; `grpc://host:port` URIs are
+        // typically <64) and small enough to keep the failure log
+        // line bounded.
+        const MAX_HELLO_STRING_LEN: usize = 256;
+        for (field_name, value) in [
+            ("worker_id_prefix", connect_worker_request.worker_id_prefix.as_str()),
+            ("cas_endpoint", connect_worker_request.cas_endpoint.as_str()),
+            ("build_sha", connect_worker_request.build_sha.as_str()),
+        ] {
+            if value.len() > MAX_HELLO_STRING_LEN {
+                warn!(
+                    field_name,
+                    value_len = value.len(),
+                    max_allowed = MAX_HELLO_STRING_LEN,
+                    "rejecting connect_worker: hello frame field exceeds bound — \
+                     refusing to log the value to avoid log-injection / unbounded memory"
+                );
+                return Err(make_err!(
+                    Code::InvalidArgument,
+                    "Worker hello frame field {:?} length {} exceeds the {}-byte limit; \
+                     reject to bound log noise and avoid log-injection",
+                    field_name,
+                    value.len(),
+                    MAX_HELLO_STRING_LEN
+                ));
+            }
+        }
+
+        // (#216) Stale-worker detection. Reject the connection BEFORE
+        // any side effects (worker_id allocation, locality_map wipe,
+        // dispatcher registration) so a rejected worker leaves zero
+        // residual state. The allowlist is opt-in: when
+        // `compatible_build_shas` is `None`, every reported SHA
+        // (including the empty string from legacy workers) is
+        // accepted unchanged.
+        //
+        // Diagnostic context: the bug at #216 (worker-03 running an
+        // old binary) was silent because the WIRE protocol was still
+        // backward-compatible — the worker accepted the connection
+        // and only the per-frame decode of `BatchWriteSmallBlobs`
+        // failed downstream. Validation here makes the failure mode
+        // EAGER and LOUD: a single WARN per stale-worker connect
+        // attempt + an alertable counter, instead of N kilo-errors
+        // per second buried in the worker log.
+        if let Some(ref allowlist) = self.compatible_build_shas {
+            let reported = connect_worker_request.build_sha.as_str();
+            if !allowlist.contains(reported) {
+                self.metrics
+                    .stale_workers_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    reported_build_sha = %reported,
+                    allowlist_size = allowlist.len(),
+                    worker_id_prefix = %connect_worker_request.worker_id_prefix,
+                    cas_endpoint = %connect_worker_request.cas_endpoint,
+                    "rejecting connect_worker: reported build_sha not in compatible_build_shas \
+                     allowlist; redeploy this worker or extend the allowlist"
+                );
+                return Err(make_err!(
+                    Code::FailedPrecondition,
+                    "Worker build_sha {:?} is not in the scheduler's compatible_build_shas \
+                     allowlist (allowlist contains {} entries). This usually means the worker \
+                     is running a stale binary; redeploy the worker via the project Justfile \
+                     to pick up the current build, or extend the scheduler's \
+                     compatible_build_shas list if the rollout is intentional.",
+                    reported,
+                    allowlist.len()
+                ));
+            }
+        }
 
         let worker_cas_endpoint = connect_worker_request.cas_endpoint.clone();
         let new_boot_epoch = connect_worker_request.boot_epoch_id;

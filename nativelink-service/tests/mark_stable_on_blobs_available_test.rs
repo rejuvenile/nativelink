@@ -302,6 +302,7 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
     let worker_api_server = WorkerApiServer::new_with_now_fn(
         &WorkerApiConfig {
             scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
         },
         &schedulers,
         Box::new(static_now_fn),

@@ -1928,6 +1928,18 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     // slot-based capture is never called.
     nativelink_util::stall_detector::install_dump_signal_handler();
 
+    // (#216) Warm the build-SHA cache BEFORE the tokio runtime starts.
+    // `build_sha()` performs ~67 MiB of streaming I/O + SHA-256 on a
+    // ~67 MiB release binary (~270 ms on a modern CPU). Done lazily
+    // inside an async context (e.g. from
+    // `make_connect_worker_request`) it would block one tokio worker
+    // for the entire hash duration on the first connect; doing it
+    // here makes every later call a nanosecond `OnceLock` hit. The
+    // binary is the same on both server and worker startup paths
+    // (same `nativelink` binary, role chosen by config) so the warm
+    // is correct on both sides.
+    let _ = nativelink_util::build_sha::build_sha();
+
     // Set QoS before runtime creation so tokio worker threads inherit
     // P-core scheduling preference via pthread_create QoS inheritance.
     set_qos_user_initiated();

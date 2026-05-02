@@ -295,13 +295,51 @@ pub struct OldByteStreamConfig {
     pub max_streaming_blob_buffer_bytes: usize,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
 pub struct WorkerApiConfig {
     /// The scheduler name referenced in the `schedulers` map in the main config.
     #[serde(deserialize_with = "convert_string_with_shellexpand")]
     pub scheduler: SchedulerRefName,
+
+    /// (#216) Deployment-drift diagnostic. When set and non-empty,
+    /// the server rejects any `connect_worker` whose
+    /// `ConnectWorkerRequest.build_sha` is not in this list,
+    /// returning `Code::FailedPrecondition` with a redeployment
+    /// hint. The intent is operator-actionable visibility into
+    /// "this worker is running an older binary than the server
+    /// expects" — surface drift BEFORE it manifests as silent
+    /// runtime errors / reconnect storms.
+    ///
+    /// Default: `None` — validation DISABLED, every worker
+    /// accepted. This is the recommended default; operators opt
+    /// in only when they want hard rejection of mismatched
+    /// builds during a coordinated rollout.
+    ///
+    /// **IMPORTANT footgun**: An empty list
+    /// (`compatible_build_shas: []`) is treated IDENTICALLY to
+    /// `None` — validation disabled, every worker accepted. To
+    /// enable validation while admitting legacy (empty-SHA)
+    /// workers, the list MUST contain at least the empty string:
+    /// `compatible_build_shas: [""]`. To reject every worker, the
+    /// list must contain a sentinel value that no worker will
+    /// ever produce — a literal empty list does NOT achieve that.
+    ///
+    /// Each non-empty entry must be a 16-character lowercase hex
+    /// prefix of the SHA-256 digest of the worker binary, matching
+    /// the format produced by
+    /// `nativelink_util::build_sha::build_sha`. Operators rolling
+    /// forward typically populate this with the SHA of the
+    /// deploy-target binary plus the previous N SHAs to allow
+    /// staggered rollouts.
+    ///
+    /// The empty string ("") reported by legacy workers (or any
+    /// worker that fails to read its own binary) is matched
+    /// against the list verbatim — to allow legacy workers,
+    /// include "" in the list explicitly.
+    #[serde(default)]
+    pub compatible_build_shas: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]

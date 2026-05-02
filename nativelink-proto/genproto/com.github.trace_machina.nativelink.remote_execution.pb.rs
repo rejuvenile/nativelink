@@ -78,6 +78,25 @@ pub struct ConnectWorkerRequest {
     /// / (#141: boot_epoch_id one-way wipe on worker restart)
     #[prost(uint64, tag = "7")]
     pub boot_epoch_id: u64,
+    /// / Identifier for the worker's binary build, computed by the worker
+    /// / at startup. The current implementation reads `/proc/self/exe`
+    /// / (or `current_exe()` on macOS) and emits a truncated SHA-256 hex
+    /// / digest of the binary contents (first 16 hex chars / 64 bits).
+    /// / Empty string ("") for legacy workers built before this field
+    /// / existed, OR for any worker that failed to read its own binary
+    /// / at startup (best-effort; failure does NOT crash the worker).
+    /// /
+    /// / The scheduler validates this against its configured
+    /// / `compatible_build_shas` allowlist (`WorkerApiConfig`); on
+    /// / mismatch the connection is rejected with
+    /// / `Code::FailedPrecondition`. The validation is OPT-IN — if the
+    /// / allowlist is empty/None on the server, all build SHAs (including
+    /// / "") are accepted.
+    /// /
+    /// / (#216: stale-worker detection — server rejects workers on
+    /// / incompatible builds)
+    #[prost(string, tag = "8")]
+    pub build_sha: ::prost::alloc::string::String,
 }
 /// / Per-digest info reported by workers in BlobsAvailableNotification.
 /// / The previous `last_access_timestamp` field has been retired now that the
