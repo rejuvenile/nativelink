@@ -355,6 +355,16 @@ pub struct FastSlowStore {
     /// progress. If the fast store evicts the blob before the slow write
     /// completes, `get_part` serves from this map to prevent NotFound gaps.
     in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
+    /// #212 fixup B2: chunked-path in-flight digest set. Separate from
+    /// `in_flight_slow_writes` because the legacy map's `Vec<Bytes>`
+    /// shape would (a) double-count memory vs the chunked-driver pin
+    /// and (b) trip the legacy map's size-mismatch eviction guard
+    /// (which removes entries whose total_len != digest.size_bytes()
+    /// — empty-Vec markers would be evicted on first lookup).
+    /// Populated + drained by `BazelChunkedDispatcherImpl::dispatch`.
+    /// Read by `has_with_results` (returns digest.size_bytes() when
+    /// present) and waited by `flush_slow_writes` (graceful drain).
+    chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>>,
     /// Notified when in_flight_slow_writes becomes empty. Used by
     /// `flush_slow_writes` to wait for all background writes to complete.
     in_flight_empty_notify: Arc<Notify>,
@@ -600,6 +610,7 @@ impl FastSlowStore {
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
             in_flight_slow_writes,
+            chunked_in_flight_digests: Arc::new(Mutex::new(HashSet::new())),
             in_flight_empty_notify: Arc::new(Notify::new()),
             stable_digests: Arc::new(Mutex::new(Vec::new())),
             stable_notify: Arc::new(Notify::new()),
@@ -627,17 +638,26 @@ impl FastSlowStore {
         self.in_flight_slow_writes.lock().len()
     }
 
-    /// #212 fixup B2: shared handle to the `in_flight_slow_writes` map.
+    /// #212 fixup B2: shared handle to the chunked in-flight digest set.
     /// The Phase 2.7 `BazelChunkedDispatcherImpl` registers + removes
-    /// digests in this map for the duration of the chunked dispatch so
-    /// the existing visibility surface (`has_with_results`,
-    /// graceful-shutdown drain `flush_slow_writes`, get_part read-cascade
-    /// step 1) covers chunked-path blobs uniformly.
+    /// digests in this set for the duration of the chunked dispatch.
+    /// Reads from this set are folded into:
+    ///   - `has_with_results` (returns `digest.size_bytes()` when
+    ///     present)
+    ///   - `flush_slow_writes` (graceful-drain waits for this set to
+    ///     empty too)
+    /// This is intentionally SEPARATE from `in_flight_slow_writes`
+    /// because the legacy map stores `Vec<Bytes>` of the actual chunk
+    /// bytes (used by the get_part replay path); chunked writes track
+    /// their bytes via the chunked-driver pin (registered through the
+    /// `ChunkedReadRegistry`) so storing a parallel copy in the legacy
+    /// map would double-count memory AND trip the legacy map's
+    /// size-mismatch eviction guard.
     #[must_use]
-    pub fn in_flight_slow_writes_handle(
+    pub fn chunked_in_flight_digests_handle(
         &self,
-    ) -> Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> {
-        self.in_flight_slow_writes.clone()
+    ) -> Arc<Mutex<HashSet<DigestInfo>>> {
+        self.chunked_in_flight_digests.clone()
     }
 
     /// #212 fixup B2: shared handle to the empty-notify so the dispatcher
@@ -847,6 +867,17 @@ impl FastSlowStore {
         self.slow_store.clone()
     }
 
+    /// #212 fixup S4 test accessor: returns `true` iff the digest is
+    /// currently in `failed_slow_writes`. The set is populated when a
+    /// slow-tier write fails (legacy spawn path OR chunked-dispatch
+    /// admission rejection); the entry is consumed by the
+    /// retry-on-reconnect path (mirror protocol). Tests assert
+    /// presence to verify the failure-recovery hook fired.
+    #[must_use]
+    pub fn failed_slow_writes_contains(&self, digest: &DigestInfo) -> bool {
+        self.failed_slow_writes.lock().contains(digest)
+    }
+
     /// Phase 2.7 chunked size threshold (cached on this store). Reads
     /// from a relaxed atomic; cheap on the `update()` hot path.
     #[cfg(feature = "chunked_fast_slow")]
@@ -964,6 +995,11 @@ impl FastSlowStore {
     /// Fence out new background slow writes and wait for all existing
     /// ones to complete, with a timeout. Returns the number of writes
     /// still pending when the timeout expired (0 = all flushed).
+    ///
+    /// #212 fixup B2: also waits for the chunked-path in-flight digest
+    /// set to drain. Both maps share the same `in_flight_empty_notify`
+    /// (the chunked-dispatch reaper fires it when its set drains) so a
+    /// single notify-wait covers both.
     pub async fn flush_slow_writes(&self, timeout: Duration) -> usize {
         self.shutting_down.store(true, Ordering::Release);
         let deadline = tokio::time::Instant::now() + timeout;
@@ -981,18 +1017,21 @@ impl FastSlowStore {
             let notified = self.in_flight_empty_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let count = self.in_flight_slow_writes.lock().len();
-            if count == 0 {
+            let legacy_count = self.in_flight_slow_writes.lock().len();
+            let chunked_count = self.chunked_in_flight_digests.lock().len();
+            if legacy_count == 0 && chunked_count == 0 {
                 return 0;
             }
             match tokio::time::timeout_at(deadline, notified).await {
                 Ok(()) => continue,
                 Err(_) => {
                     let guard = self.in_flight_slow_writes.lock();
-                    let remaining = guard.len();
+                    let chunked_guard = self.chunked_in_flight_digests.lock();
+                    let remaining = guard.len() + chunked_guard.len();
                     if remaining > 0 {
                         warn!(
-                            remaining,
+                            legacy = guard.len(),
+                            chunked = chunked_guard.len(),
                             "FastSlowStore::flush_slow_writes: timed out waiting \
                              for background writes to complete"
                         );
@@ -1002,6 +1041,12 @@ impl FastSlowStore {
                                 ?key,
                                 bytes,
                                 "FastSlowStore: unflushed write at shutdown"
+                            );
+                        }
+                        for digest in chunked_guard.iter() {
+                            warn!(
+                                ?digest,
+                                "FastSlowStore: unflushed chunked-path write at shutdown"
                             );
                         }
                     }
@@ -1299,6 +1344,7 @@ impl FastSlowStore {
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
             in_flight_slow_writes,
+            chunked_in_flight_digests: Arc::new(Mutex::new(HashSet::new())),
             in_flight_empty_notify: Arc::new(Notify::new()),
             stable_digests: Arc::new(Mutex::new(Vec::new())),
             stable_notify: Arc::new(Notify::new()),
@@ -2752,6 +2798,22 @@ impl StoreDriver for FastSlowStore {
                     }
                 }
             }
+            // #212 fixup B2: chunked in-flight set; size = digest.size_bytes()
+            // because the actual bytes are tracked via the chunked-driver
+            // pin, not stored in this set.
+            {
+                let chunked = self.chunked_in_flight_digests.lock();
+                if !chunked.is_empty() {
+                    for (k, result) in key.iter().zip(results.iter_mut()) {
+                        if result.is_none() {
+                            let digest = k.borrow().into_digest();
+                            if chunked.contains(&digest) {
+                                *result = Some(digest.size_bytes());
+                            }
+                        }
+                    }
+                }
+            }
             {
                 let mirror = self.mirror_blobs.lock();
                 for (k, result) in key.iter().zip(results.iter_mut()) {
@@ -2788,6 +2850,30 @@ impl StoreDriver for FastSlowStore {
                                  (not yet on slow store)",
                             );
                             *result = Some(total_len);
+                        }
+                    }
+                }
+            }
+        }
+        // #212 fixup B2: chunked in-flight digest set. Separate from the
+        // legacy `in_flight_slow_writes` because chunked-path writes
+        // store their bytes in the chunked-driver pin (registered via
+        // ChunkedReadRegistry) rather than in the legacy map. Size =
+        // digest.size_bytes() since the digest fully specifies the
+        // expected payload size.
+        {
+            let chunked = self.chunked_in_flight_digests.lock();
+            if !chunked.is_empty() {
+                for (k, result) in key.iter().zip(results.iter_mut()) {
+                    if result.is_none() {
+                        let digest = k.borrow().into_digest();
+                        if chunked.contains(&digest) {
+                            debug!(
+                                ?digest,
+                                "has_with_results: found blob in chunked-path \
+                                 in-flight set (not yet on slow store)",
+                            );
+                            *result = Some(digest.size_bytes());
                         }
                     }
                 }

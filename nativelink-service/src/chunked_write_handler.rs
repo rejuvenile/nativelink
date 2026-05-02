@@ -199,29 +199,29 @@ impl MetricsComponent for ChunkedWriteInFlight {
 #[derive(Debug, Default, MetricsComponent)]
 pub struct ChunkedWriteHandlerMetrics {
     #[metric(help = "WriteChunked: chunks admitted (per-chunk SHA-256 + budget + mpsc all Ok)")]
-    chunks_admitted_total: AtomicU64,
+    pub chunks_admitted_total: AtomicU64,
     #[metric(help = "WriteChunked: per-chunk SHA-256 verify mismatches (admission rejections)")]
-    sha256_per_chunk_mismatches_total: AtomicU64,
+    pub sha256_per_chunk_mismatches_total: AtomicU64,
     #[metric(
         help = "WriteChunked: end-to-end SHA-256 verify mismatches (assembled blob does not match digest)"
     )]
-    sha256_e2e_mismatches_total: AtomicU64,
+    pub sha256_e2e_mismatches_total: AtomicU64,
     #[metric(help = "WriteChunked: rejections from another in-flight stream owning the same digest")]
-    concurrent_same_digest_rejections_total: AtomicU64,
+    pub concurrent_same_digest_rejections_total: AtomicU64,
     #[metric(help = "WriteChunked: per-blob mpsc full rejections (PER_BLOB_MPSC_FULL signal)")]
-    mpsc_full_rejections_total: AtomicU64,
+    pub mpsc_full_rejections_total: AtomicU64,
     #[metric(
         help = "WriteChunked: global ChunkBudget exhausted rejections (GLOBAL_CHUNK_BUDGET_EXHAUSTED signal)"
     )]
-    global_budget_exhausted_rejections_total: AtomicU64,
+    pub global_budget_exhausted_rejections_total: AtomicU64,
     #[metric(
         help = "WriteChunked: global PinBudget exhausted rejections (PINNED_BYTES_EXHAUSTED signal; #212 fixup B1)"
     )]
-    pin_budget_exhausted_rejections_total: AtomicU64,
+    pub pin_budget_exhausted_rejections_total: AtomicU64,
     #[metric(help = "WriteChunked: blobs committed (commit + e2e SHA-256 verify both OK)")]
-    chunks_committed_total: AtomicU64,
+    pub chunks_committed_total: AtomicU64,
     #[metric(help = "WriteChunked: commit failures (commit_chunked or e2e SHA-256 returned Err)")]
-    commit_failures_total: AtomicU64,
+    pub commit_failures_total: AtomicU64,
 }
 
 /// Server-side handler for the `WriteChunked` RPC. Holds the
@@ -1517,22 +1517,17 @@ pub struct BazelChunkedDispatcherImpl<Fe: FileEntry = FileEntryImpl> {
     /// builder method).
     chunked_read_registry:
         Option<Arc<nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry>>,
-    /// #212 fixup B2: in-flight slow-writes map shared with the
+    /// #212 fixup B2: chunked-path in-flight digest set shared with the
     /// FastSlowStore. The dispatcher inserts the digest on dispatch
     /// entry and removes on dispatch completion — preserving the
-    /// `has_with_results` / #210 graceful-shutdown drain / read-cascade
-    /// step 1 contracts that the legacy spawn-and-track path provides.
-    /// `None` = no in-flight registration (tests that don't care about
-    /// these contracts).
-    in_flight_slow_writes: Option<
-        Arc<
-            parking_lot::Mutex<
-                std::collections::HashMap<
-                    nativelink_util::store_trait::StoreKey<'static>,
-                    Vec<bytes::Bytes>,
-                >,
-            >,
-        >,
+    /// `has_with_results` / #210 graceful-shutdown drain contracts for
+    /// chunked-path blobs. SEPARATE from the legacy
+    /// `in_flight_slow_writes` map (which stores `Vec<Bytes>` of the
+    /// actual chunk bytes; chunked writes track bytes via the
+    /// chunked-driver pin instead). `None` = no in-flight registration
+    /// (tests that don't care about these contracts).
+    chunked_in_flight_digests: Option<
+        Arc<parking_lot::Mutex<std::collections::HashSet<DigestInfo>>>,
     >,
     /// #212 fixup B2: notify shared with the FastSlowStore so the
     /// graceful-drain in `flush_slow_writes` wakes when in-flight goes
@@ -1569,7 +1564,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunk_budget: nativelink_store::chunked::chunk_budget::chunk_budget_singleton(),
             pin_budget: pin_budget_singleton(),
             chunked_read_registry: None,
-            in_flight_slow_writes: None,
+            chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
             chunk_size: CHUNK_SIZE,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
@@ -1594,29 +1589,22 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
     }
 
     /// #212 fixup B2: wire the dispatcher to the FastSlowStore's
-    /// `in_flight_slow_writes` map + the `in_flight_empty_notify`. From
-    /// that point, every `dispatch` registers a placeholder entry in
-    /// the map for the duration of the dispatch (chunk bytes are tracked
-    /// via the chunked driver's pin and the registry; the in-flight map
-    /// just needs the digest presence). On dispatch completion the
-    /// digest is removed and the notify fires when the map empties.
-    /// Preserves the `has_with_results` + #210 graceful-shutdown drain
-    /// + cascade-step-1 contracts that the legacy path provides via the
-    /// `tokio::spawn`'d background slow write.
+    /// `chunked_in_flight_digests` set + `in_flight_empty_notify`. From
+    /// that point, every `dispatch` inserts the digest in the set for
+    /// the duration of the dispatch. On dispatch completion the digest
+    /// is removed and the notify fires when the set empties (waking
+    /// any `flush_slow_writes` waiter). Preserves the
+    /// `has_with_results` + #210 graceful-shutdown drain contracts for
+    /// chunked-path blobs.
     #[must_use]
     pub fn with_in_flight_tracking(
         mut self,
-        in_flight_slow_writes: Arc<
-            parking_lot::Mutex<
-                std::collections::HashMap<
-                    nativelink_util::store_trait::StoreKey<'static>,
-                    Vec<bytes::Bytes>,
-                >,
-            >,
+        chunked_in_flight_digests: Arc<
+            parking_lot::Mutex<std::collections::HashSet<DigestInfo>>,
         >,
         in_flight_empty_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
-        self.in_flight_slow_writes = Some(in_flight_slow_writes);
+        self.chunked_in_flight_digests = Some(chunked_in_flight_digests);
         self.in_flight_empty_notify = Some(in_flight_empty_notify);
         self
     }
@@ -1639,7 +1627,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunk_budget,
             pin_budget: pin_budget_singleton(),
             chunked_read_registry: None,
-            in_flight_slow_writes: None,
+            chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
             chunk_size,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
@@ -1666,7 +1654,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunk_budget,
             pin_budget,
             chunked_read_registry: None,
-            in_flight_slow_writes: None,
+            chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
             chunk_size,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
@@ -1698,19 +1686,17 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
         reader: DropCloserReadHalf,
     ) -> Result<u64, Error> {
         // #212 fixup B2: register the digest in the FastSlowStore's
-        // in_flight_slow_writes map BEFORE dispatch. Preserves these
-        // contracts for chunked-path blobs:
-        //   - has_with_results: in-flight check returns Some.
+        // chunked_in_flight_digests set BEFORE dispatch. Preserves
+        // these contracts for chunked-path blobs:
+        //   - has_with_results: chunked check returns Some(size_bytes).
         //   - flush_slow_writes (#210 graceful drain): waits for the
-        //     entry to drain before returning.
-        //   - get_part read-cascade step 1: in-flight chunks visible.
-        // Stored value is `vec![]` because the actual chunk bytes are
-        // tracked via the chunked driver's pin (registered for cascade
-        // step 2 below); the in-flight map only needs the digest
-        // presence as the lifecycle marker.
-        let key_owned = nativelink_util::store_trait::StoreKey::Digest(digest);
-        if let Some(map) = self.in_flight_slow_writes.as_ref() {
-            map.lock().insert(key_owned.clone(), Vec::new());
+        //     digest set to drain before returning.
+        // The chunked digest set is intentionally separate from the
+        // legacy `in_flight_slow_writes` (`Vec<Bytes>` shape) because
+        // chunked-path bytes are tracked via the chunked-driver pin
+        // (registered through ChunkedReadRegistry for cascade step 2).
+        if let Some(set) = self.chunked_in_flight_digests.as_ref() {
+            set.lock().insert(digest);
         }
         let dispatch_res = dispatch_bazel_facing_internal_chunking(
             Arc::clone(&self.filesystem_store),
@@ -1727,41 +1713,31 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
 
         // Note: the chunked-driver reaper (CommitMode::AsyncCommit)
         // completes ASYNCHRONOUSLY after this returns. We need the
-        // in_flight_slow_writes entry to survive until commit drains
-        // (otherwise B2's #210 graceful-drain contract is violated:
-        // the drainer would return as soon as dispatch returns Ok,
-        // before commit lands). Solution: spawn a small reaper that
-        // waits on the chunked-driver's in_flight tracker emptying for
-        // THIS digest, then removes the in_flight_slow_writes entry +
-        // notifies the empty-notify.
+        // chunked_in_flight_digests entry to survive until commit
+        // drains (otherwise B2's #210 graceful-drain contract is
+        // violated: the drainer would return as soon as dispatch
+        // returns Ok, before commit lands). Solution: spawn a small
+        // reaper that waits on the chunked-driver's in_flight tracker
+        // emptying for THIS digest, then removes the digest from the
+        // set + notifies the empty-notify.
         //
         // On dispatch error (admission rejected before any chunk):
-        // remove the in_flight_slow_writes entry now (no chunked
-        // driver was created or it was torn down by the cleanup_guard).
-        match (dispatch_res, self.in_flight_slow_writes.clone()) {
-            (Ok(outcome), Some(map)) => {
+        // remove the digest now (no chunked driver was created or it
+        // was torn down by the cleanup_guard).
+        match (dispatch_res, self.chunked_in_flight_digests.clone()) {
+            (Ok(outcome), Some(set)) => {
                 let in_flight_for_reaper = Arc::clone(&self.in_flight);
                 let notify = self.in_flight_empty_notify.clone();
-                let key_for_reaper = key_owned.clone();
                 let dig = digest;
                 tokio::spawn(async move {
-                    // Wait for the chunked-driver reaper to remove the
-                    // per-blob in_flight entry (commit success OR
-                    // failure). Bounded wait — chunked drivers self-
-                    // terminate either on commit completion or on driver
-                    // task abort. Polled with `yield_now` rather than
-                    // `sleep` per CLAUDE.md test discipline (also fine
-                    // for production: the chunked path is high-level
-                    // and the poll cost is negligible vs the commit
-                    // latency it's waiting for).
                     loop {
                         if !in_flight_for_reaper.contains_digest(&dig) {
                             break;
                         }
                         tokio::task::yield_now().await;
                     }
-                    let mut guard = map.lock();
-                    guard.remove(&key_for_reaper);
+                    let mut guard = set.lock();
+                    guard.remove(&dig);
                     let became_empty = guard.is_empty();
                     drop(guard);
                     if became_empty {
@@ -1773,9 +1749,9 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                 Ok(outcome.committed_size)
             }
             (Ok(outcome), None) => Ok(outcome.committed_size),
-            (Err(err), Some(map)) => {
-                let mut guard = map.lock();
-                guard.remove(&key_owned);
+            (Err(err), Some(set)) => {
+                let mut guard = set.lock();
+                guard.remove(&digest);
                 let became_empty = guard.is_empty();
                 drop(guard);
                 if became_empty {
@@ -1821,7 +1797,7 @@ pub fn wire_bazel_chunked_dispatcher<Fe: FileEntry>(
         BazelChunkedDispatcherImpl::new(slow_filesystem_store)
             .with_registry(Arc::clone(&registry))
             .with_in_flight_tracking(
-                fast_slow.in_flight_slow_writes_handle(),
+                fast_slow.chunked_in_flight_digests_handle(),
                 fast_slow.in_flight_empty_notify_handle(),
             ),
     );
