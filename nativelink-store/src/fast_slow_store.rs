@@ -508,6 +508,15 @@ pub struct FastSlowStore {
     #[cfg(feature = "chunked_fast_slow")]
     bazel_chunked_dispatcher:
         parking_lot::Mutex<Option<crate::chunked::BazelChunkedDispatcherArc>>,
+    /// Phase 2.7 size threshold above which `update()` engages the
+    /// chunked dispatcher. Production: `CHUNK_SIZE` (1 MiB). Tests
+    /// override via `set_chunked_size_threshold_for_test` so a small
+    /// blob exercises the chunked path without burning megabytes of
+    /// test memory per chunk.
+    ///
+    /// `AtomicU64` so tests can mutate without `Arc::get_mut`.
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_size_threshold: AtomicU64,
 }
 
 /// Pending mirror-blob deltas. `added` and `removed` are mutually exclusive
@@ -609,6 +618,8 @@ impl FastSlowStore {
             chunked_reads_enabled: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
             bazel_chunked_dispatcher: parking_lot::Mutex::new(None),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_size_threshold: AtomicU64::new(crate::chunked::CHUNK_SIZE as u64),
         })
     }
 
@@ -784,6 +795,42 @@ impl FastSlowStore {
         &self,
     ) -> Option<crate::chunked::BazelChunkedDispatcherArc> {
         self.bazel_chunked_dispatcher.lock().clone()
+    }
+
+    /// Read-only accessor for the fast-tier `Store`. Phase 2.7 tests
+    /// use this to verify the fast-tier MemoryStore visibility surface
+    /// during the (β) async-commit window — `FastSlowStore::has()`
+    /// itself does NOT consult the fast tier by default (only slow +
+    /// in_flight_slow_writes + mirror_blobs unless `local_only_reads`
+    /// is set).
+    #[must_use]
+    pub fn fast_store_handle(&self) -> &Store {
+        &self.fast_store
+    }
+
+    /// Read-only accessor for the slow-tier `Store`.
+    #[must_use]
+    pub fn slow_store_handle(&self) -> &Store {
+        &self.slow_store
+    }
+
+    /// Phase 2.7 chunked size threshold (cached on this store). Reads
+    /// from a relaxed atomic; cheap on the `update()` hot path.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[must_use]
+    pub fn chunked_size_threshold(&self) -> u64 {
+        self.chunked_size_threshold.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: override the chunked size threshold (default
+    /// `CHUNK_SIZE` = 1 MiB). Used by Phase 2.7 tests to exercise the
+    /// chunked dispatch path with small blobs without burning megabytes
+    /// per chunk.
+    #[cfg(all(feature = "chunked_fast_slow", any(test, feature = "test-utils")))]
+    #[doc(hidden)]
+    pub fn set_chunked_size_threshold_for_test(&self, threshold: u64) {
+        self.chunked_size_threshold
+            .store(threshold, Ordering::Relaxed);
     }
 
     /// Test-only: insert a synthetic in-flight slow-write entry. Used by the
@@ -1237,6 +1284,8 @@ impl FastSlowStore {
             chunked_reads_enabled: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
             bazel_chunked_dispatcher: parking_lot::Mutex::new(None),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_size_threshold: AtomicU64::new(crate::chunked::CHUNK_SIZE as u64),
         })
     }
 
@@ -2816,16 +2865,18 @@ impl StoreDriver for FastSlowStore {
         // #212 Phase 2.7: Bazel-facing internal chunking branch.
         //
         // When (a) the kill-switch is ON, (b) a chunked dispatcher has
-        // been installed, AND (c) the blob is at least CHUNK_SIZE
-        // bytes, hand the upstream to the dispatcher. The dispatcher
-        // returns Ok as soon as the final chunk is admitted (β
-        // async-commit; anti-#203). The fast-tier (MemoryStore) write
-        // happens inline below in the standard path; for chunked-dispatch
-        // we MUST still mirror the fast-tier write so the in-memory
-        // replica covers the async-commit window. We therefore tee the
-        // bytes into the dispatcher AND the fast tier in parallel,
-        // mirroring the existing `tokio::join!(data_stream_fut,
-        // fast_store_fut)` pattern.
+        // been installed, AND (c) the blob is at least the chunked
+        // size threshold (production: CHUNK_SIZE = 1 MiB; tests can
+        // override via `set_chunked_size_threshold_for_test`), hand the
+        // upstream to the dispatcher. The dispatcher returns Ok as
+        // soon as the final chunk is admitted (β async-commit;
+        // anti-#203). The fast-tier (MemoryStore) write happens inline
+        // below in the standard path; for chunked-dispatch we MUST
+        // still mirror the fast-tier write so the in-memory replica
+        // covers the async-commit window. We therefore tee the bytes
+        // into the dispatcher AND the fast tier in parallel, mirroring
+        // the existing `tokio::join!(data_stream_fut, fast_store_fut)`
+        // pattern.
         //
         // The kill-switch defaults OFF; flipping it ON in production
         // requires explicit user sign-off per CLAUDE.md
@@ -2834,7 +2885,7 @@ impl StoreDriver for FastSlowStore {
         {
             if crate::chunked::bazel_facing_internal_chunking_enabled() {
                 let digest = key.borrow().into_digest();
-                if digest.size_bytes() >= crate::chunked::CHUNK_SIZE as u64 {
+                if digest.size_bytes() >= self.chunked_size_threshold() {
                     if let Some(dispatcher) = self.bazel_chunked_dispatcher() {
                         return self
                             .update_via_chunked_dispatcher(

@@ -135,3 +135,13 @@ required-features = ["test-utils"]
 [[test]]
 name = "chunked_write_handler_test"
 required-features = ["chunked_fast_slow", "test-utils"]
+
+# #212 Phase 2.7 Bazel-facing internal-chunking tests. Wires a real
+# FastSlowStore + a real BazelChunkedDispatcherImpl and exercises the
+# kill-switch + size-threshold + dispatcher branches in
+# `FastSlowStore::update`. Run with:
+#   `cargo test -p nativelink-service --features chunked_fast_slow,test-utils \
+#       --test bazel_facing_internal_chunking_test`
+[[test]]
+name = "bazel_facing_internal_chunking_test"
+required-features = ["chunked_fast_slow", "test-utils"]
