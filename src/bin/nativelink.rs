@@ -537,11 +537,23 @@ async fn inner_main(
         use nativelink_store::fast_slow_store::FastSlowStore;
         use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
         use nativelink_store::verify_store::VerifyStore;
-        use nativelink_util::store_trait::StoreDriver;
+        use nativelink_util::common::DigestInfo;
+        use nativelink_util::store_trait::{StoreDriver, StoreKey};
 
-        // Walk the (potentially wrapped) chain to the FastSlowStore.
-        // Mirrors `find_fast_slow_for_pin` above; deduplicated as a
-        // local closure for clarity at call sites.
+        // Walk the chain with a synthetic large-digest key so that
+        // size-aware wrappers (`SizePartitioningStore`) descend into
+        // their upper branch (the side that holds the >16KiB
+        // FilesystemStore-backed FSS in production). RefStore /
+        // ExistenceCacheStore / VerifyStore are key-agnostic for this
+        // walk; passing the key through them is a no-op. Without the
+        // key, SizePartitioningStore's `inner_store` returns `self` and
+        // the walker bails — the production bug this commit fixes.
+        fn synthetic_large_key() -> StoreKey<'static> {
+            // u64::MAX guarantees we land in upper_store for any
+            // SizePartitioning threshold ≤ u64::MAX.
+            StoreKey::Digest(DigestInfo::new([0u8; 32], u64::MAX))
+        }
+
         fn find_fast_slow_chunked<'a>(
             store: &'a dyn StoreDriver,
         ) -> Option<&'a FastSlowStore> {
@@ -553,19 +565,15 @@ async fn inner_main(
                 .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
             {
                 return find_fast_slow_chunked(
-                    ecs.inner_store().inner_store(
-                        Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                    ),
+                    ecs.inner_store().inner_store(Some(synthetic_large_key())),
                 );
             }
             if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
                 return find_fast_slow_chunked(
-                    vs.inner_store().inner_store(
-                        Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                    ),
+                    vs.inner_store().inner_store(Some(synthetic_large_key())),
                 );
             }
-            let inner = store.inner_store(None);
+            let inner = store.inner_store(Some(synthetic_large_key()));
             if core::ptr::eq(
                 inner as *const dyn StoreDriver,
                 store as *const dyn StoreDriver,
@@ -579,10 +587,14 @@ async fn inner_main(
             let Some(store) = unwrapped_cas_stores.get(store_name) else {
                 continue;
             };
-            let driver: &dyn StoreDriver = store.inner_store(
-                Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-            );
+            let driver: &dyn StoreDriver = store.inner_store(Some(synthetic_large_key()));
             let Some(fss) = find_fast_slow_chunked(driver) else {
+                info!(
+                    store_name,
+                    "chunked-dispatcher wiring: no FastSlowStore found in chain; \
+                     skipping (#212 v4.5 routing fix; production chains with \
+                     RefStore/SizePartitioning are walked via large-key descent)"
+                );
                 continue;
             };
             // Try to get the slow-tier as Arc<FilesystemStore<FileEntryImpl>>.
