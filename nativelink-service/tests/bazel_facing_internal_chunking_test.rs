@@ -136,6 +136,10 @@ async fn make_fast_slow_with_dispatcher(
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
             slow_direction: nativelink_config::stores::StoreDirection::default(),
+            // #212 v4.5: stale-base test catch-up — see commit 65edaa83
+            // (config wire-up). Default-false preserves prior
+            // semantics; this test does not depend on the read-cascade.
+            chunked_reads_enabled: false,
         },
         fast_store,
         slow_store,
@@ -779,6 +783,10 @@ async fn fast_tier_ok_dispatch_err_records_failed_slow_write() {
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
             slow_direction: nativelink_config::stores::StoreDirection::default(),
+            // #212 v4.5: stale-base test catch-up — see commit 65edaa83
+            // (config wire-up). Default-false preserves prior
+            // semantics; this test does not depend on the read-cascade.
+            chunked_reads_enabled: false,
         },
         fast_store,
         slow_store,

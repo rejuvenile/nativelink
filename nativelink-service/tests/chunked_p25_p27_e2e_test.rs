@@ -111,6 +111,13 @@ async fn make_e2e_fast_slow(
             slow: StoreSpec::Filesystem(FilesystemSpec::default()),
             fast_direction: nativelink_config::stores::StoreDirection::default(),
             slow_direction: nativelink_config::stores::StoreDirection::default(),
+            // #212 v4.5: stale-base test catch-up. The
+            // `chunked_reads_enabled` field landed in #212 config
+            // wire-up (commit 65edaa83) AFTER this test was last
+            // touched; without it the test stops compiling under
+            // chunked_fast_slow,test-utils. Default-false matches
+            // production until the kill-switch is flipped.
+            chunked_reads_enabled: false,
         },
         fast_store,
         slow_store,
