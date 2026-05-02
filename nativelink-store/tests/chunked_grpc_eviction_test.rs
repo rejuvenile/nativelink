@@ -40,7 +40,6 @@
 #![cfg(feature = "chunked_fast_slow")]
 
 use core::time::Duration;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use nativelink_config::stores::{GrpcEndpoint, GrpcSpec, Retry, StoreType};
@@ -158,8 +157,8 @@ async fn chunked_path_evicts_pool_on_transport_err() -> Result<(), Error> {
 
     let (mut tx, rx) = make_buf_channel_pair();
     let send_task = tokio::spawn(async move {
-        let _ = tx.send(Bytes::from(blob)).await;
-        let _ = tx.send_eof();
+        drop(tx.send(Bytes::from(blob)).await);
+        drop(tx.send_eof());
     });
 
     // The store should fail (Unavailable) AND we should observe the
@@ -174,9 +173,9 @@ async fn chunked_path_evicts_pool_on_transport_err() -> Result<(), Error> {
     server_handle.abort();
     send_task.abort();
 
-    let _ = result.expect_err(
+    drop(result.expect_err(
         "fake server returns Unavailable; chunked update must propagate Err",
-    );
+    ));
 
     // The #147 eviction trace MUST have fired with predicate_matched=true.
     // The trace is emitted by `evict_pool_on_transport_err` which the B2
