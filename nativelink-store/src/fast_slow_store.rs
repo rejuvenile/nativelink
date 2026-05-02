@@ -456,6 +456,31 @@ pub struct FastSlowStore {
     /// construction; readers see it via `Ordering::Relaxed` since it is
     /// not synchronizing other state.
     local_only_reads: AtomicBool,
+    /// #212 Phase 2.5 read-cascade hook: optional registry of in-flight
+    /// `ChunkedDriver`s. When set AND [`Self::chunked_reads_enabled`]
+    /// is `true`, [`FastSlowStore::get_part`] consults the registry
+    /// between the existing in-flight-slow-writes step and the slow
+    /// store (design §6.3 step 2 — the `failed_writes` per-chunk pin).
+    ///
+    /// `None` when the chunked-write handler has not registered the
+    /// registry on this `FastSlowStore` (default for every existing
+    /// production wiring; the hook lights up only after Phase 2.7
+    /// wires the chunked-write handler). Wrapped in
+    /// `parking_lot::Mutex<Option<...>>` so the registry can be set
+    /// once at startup (after `Arc::new`) without requiring the
+    /// constructor signature to take it.
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_read_registry: Mutex<Option<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>>>,
+    /// #212 Phase 2.5 runtime kill-switch for the read cascade's
+    /// `failed_writes` pin step. Default OFF — even with the
+    /// `chunked_fast_slow` feature compiled in AND a registry wired,
+    /// reads continue to skip the pin step until an operator flips
+    /// this with [`Self::enable_chunked_reads`]. Mirrors the
+    /// `chunked_writes_enabled` kill-switch on `GrpcStore` (Phase
+    /// 2.4) — write-side and read-side are independent toggles per
+    /// design §14.x phased rollout.
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_reads_enabled: AtomicBool,
 }
 
 /// Pending mirror-blob deltas. `added` and `removed` are mutually exclusive
@@ -551,6 +576,10 @@ impl FastSlowStore {
             mirror_changes: Mutex::new(MirrorChanges::default()),
             mirror_changes_notify: Arc::new(Notify::new()),
             local_only_reads: AtomicBool::new(false),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_read_registry: Mutex::new(None),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_reads_enabled: AtomicBool::new(false),
         })
     }
 
@@ -1003,6 +1032,10 @@ impl FastSlowStore {
             mirror_changes: Mutex::new(MirrorChanges::default()),
             mirror_changes_notify: Arc::new(Notify::new()),
             local_only_reads: AtomicBool::new(false),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_read_registry: Mutex::new(None),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_reads_enabled: AtomicBool::new(false),
         })
     }
 
@@ -1022,6 +1055,70 @@ impl FastSlowStore {
     #[inline]
     pub fn local_only_reads(&self) -> bool {
         self.local_only_reads.load(Ordering::Relaxed)
+    }
+
+    /// #212 Phase 2.5: install the in-flight chunked-driver registry
+    /// for the design §6.3 step 2 read cascade. Wired by the chunked-
+    /// write handler (Phase 2.7) at server startup once. The registry
+    /// is consulted from [`Self::get_part`] AFTER the kill-switch
+    /// [`Self::chunked_reads_enabled`] is `true`; absent the switch
+    /// flip, this is dead-store memory and the read cascade behaves
+    /// exactly like origin/main.
+    ///
+    /// Idempotent: a second call replaces the registry. Returns the
+    /// previous registry (if any) so the caller can decide whether the
+    /// displacement is intentional. Today's wiring sets it once at
+    /// server start.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn set_chunked_read_registry(
+        &self,
+        registry: Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>,
+    ) -> Option<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>> {
+        self.chunked_read_registry.lock().replace(registry)
+    }
+
+    /// #212 Phase 2.5: snapshot of the currently-installed registry
+    /// (or `None`). Used by tests to assert the wire-up.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[must_use]
+    pub fn chunked_read_registry(
+        &self,
+    ) -> Option<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>> {
+        self.chunked_read_registry.lock().clone()
+    }
+
+    /// #212 Phase 2.5: flip the read-cascade kill-switch ON. With the
+    /// switch ON AND a registry installed via
+    /// [`Self::set_chunked_read_registry`], [`Self::get_part`] consults
+    /// the registry between the existing in-flight-slow-writes step
+    /// and the slow store. With the switch OFF the registry is
+    /// ignored — preserves the pre-Phase-2.5 read path exactly.
+    ///
+    /// Mirrors the [`crate::grpc_store::GrpcStore`]
+    /// `enable_chunked_writes` ramp pattern (Phase 2.4): compile +
+    /// ship, flip later.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn enable_chunked_reads(&self) {
+        self.chunked_reads_enabled.store(true, Ordering::Relaxed);
+        info!("FastSlowStore: chunked-read cascade ENABLED (Phase 2.5)");
+    }
+
+    /// #212 Phase 2.5: flip the read-cascade kill-switch OFF. Used by
+    /// the operator rollback path AND by tests that wire a registry
+    /// but want to assert the OFF behaviour does not consult it.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn disable_chunked_reads(&self) {
+        self.chunked_reads_enabled.store(false, Ordering::Relaxed);
+        info!("FastSlowStore: chunked-read cascade DISABLED (Phase 2.5)");
+    }
+
+    /// Returns `true` if [`Self::enable_chunked_reads`] has been called
+    /// AND a registry is installed. Read cascade in [`Self::get_part`]
+    /// uses the same composite check.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[must_use]
+    pub fn chunked_reads_enabled(&self) -> bool {
+        self.chunked_reads_enabled.load(Ordering::Relaxed)
     }
 
     /// Remove mirror blobs that the server has confirmed are in stable storage.
@@ -3460,6 +3557,79 @@ impl StoreDriver for FastSlowStore {
                     "Served blob from in-flight slow-write buffer (fast store evicted it)",
                 );
                 return Ok(());
+            }
+        }
+
+        // #212 Phase 2.5: read-cascade step 2 — `failed_writes` per-chunk
+        // pin (design §6.3). If the chunked-write handler currently has a
+        // `ChunkedDriver` in flight for this digest, its in-memory
+        // per-chunk pin may cover the requested byte range BEFORE the
+        // slow-store rename completes. Serve from the pin if covered;
+        // otherwise fall through to the slow store.
+        //
+        // Behind two gates per the operator-rollback contract:
+        //   1. `chunked_fast_slow` cargo feature (compile-time gate).
+        //   2. `chunked_reads_enabled` AtomicBool kill-switch (runtime
+        //      gate). With either gate OFF the cascade is byte-identical
+        //      to origin/main — the registry is never consulted, the
+        //      driver pin is never read.
+        //
+        // Per design §6.3: only digest-keyed reads are eligible (chunked
+        // writes are always digest-keyed). String-keyed reads (AC) skip
+        // this step entirely.
+        #[cfg(feature = "chunked_fast_slow")]
+        if self.chunked_reads_enabled.load(Ordering::Relaxed)
+            && let StoreKey::Digest(digest) = key.borrow()
+        {
+            let registry_snapshot = self.chunked_read_registry.lock().clone();
+            if let Some(registry) = registry_snapshot {
+                if let Some(driver) = registry.get(&digest) {
+                    // Compute the requested byte length: when `length`
+                    // is `None` the caller wants the rest of the blob
+                    // from `offset`. The driver's accessor is
+                    // all-or-nothing for the requested range — partial
+                    // coverage falls through.
+                    let want_len = length.unwrap_or_else(|| {
+                        digest.size_bytes().saturating_sub(offset)
+                    });
+                    if let Some(bytes) = driver.try_get_chunk_from_pin(offset, want_len) {
+                        // Pin hit — serve the whole assembled range
+                        // from memory. Atomic counter; no awaits inside
+                        // the registry critical section.
+                        registry.record_pin_hit();
+                        let bytes_len = bytes.len();
+                        if !bytes.is_empty() {
+                            guard
+                                .send(bytes)
+                                .await
+                                .err_tip(|| "Failed to send chunked-pin data in fast_slow get_part")?;
+                        }
+                        guard
+                            .commit_eof()
+                            .err_tip(|| "Failed to send EOF for chunked-pin data")?;
+                        debug!(
+                            ?key,
+                            offset,
+                            ?length,
+                            served_bytes = bytes_len,
+                            "Served blob from #212 chunked-driver pin (slow-store commit not yet complete)",
+                        );
+                        return Ok(());
+                    }
+                    // Driver registered but range not covered (chunk
+                    // hasn't landed yet) → partial-miss; fall through.
+                    registry.record_pin_partial_miss();
+                    trace!(
+                        ?key,
+                        offset,
+                        ?length,
+                        "chunked-pin partial miss: driver in flight but range not yet covered; falling through to slow store"
+                    );
+                } else {
+                    // Registry installed but no entry for this digest →
+                    // no chunked write in flight; fall through normally.
+                    registry.record_pin_miss();
+                }
             }
         }
 

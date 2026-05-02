@@ -40,6 +40,7 @@ pub mod chunk_budget;
 pub mod chunked_client;
 pub mod chunked_driver;
 pub mod chunked_filesystem;
+pub mod chunked_read_registry;
 
 /// Fixed chunk size for the #212 chunked transport / on-disk layout.
 ///

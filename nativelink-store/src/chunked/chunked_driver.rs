@@ -51,7 +51,7 @@
 //! awaiting the slow tier) is a different code path and remains async.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -138,6 +138,39 @@ struct SidecarState {
     finish_seen: bool,
 }
 
+/// Per-chunk in-memory pin (`failed_writes` per design §6.2 / read
+/// cascade step 2 per §6.3). Chunks land here as they arrive at the
+/// driver and remain reachable from the read accessor
+/// [`ChunkedDriver::try_get_chunk_from_pin`] until the blob commits.
+///
+/// `BTreeMap<offset → Bytes>` so the read accessor can walk in offset
+/// order to assemble a contiguous range, and so duplicate-offset
+/// arrivals (the producer protocol violation already warned about in
+/// `run_driver`) are tolerated by overwrite (idempotent at the byte
+/// level since pwrite already accepted both). The `Bytes` is shared
+/// (no copy) with the same buffer that `write_chunk_at_offset` already
+/// streamed to disk — adding a chunk to the pin is one `clone()` of an
+/// `Arc`-backed `Bytes` per chunk.
+///
+/// `parking_lot::Mutex` is correct for the same reason as
+/// `SidecarState`: every critical section is short (insert + return),
+/// never holds across an `.await`. The accessor builds the assembled
+/// range via successive `Bytes::slice` calls — also non-blocking.
+#[derive(Debug, Default)]
+struct ChunkPin {
+    /// Map of byte-offset → chunk bytes. Memory cost = sum of chunk
+    /// lengths held while the driver is in-flight. Bounded by the
+    /// per-blob mpsc cap (`PER_BLOB_MPSC_CAP * CHUNK_SIZE = 16 MiB`)
+    /// while the driver is consuming, AND further bounded after the
+    /// driver consumed but before commit by the blob size itself —
+    /// already counted toward the global ChunkBudget via the Q8
+    /// per-chunk permits the `ChunkWork` items hold.
+    chunks: BTreeMap<u64, Bytes>,
+    /// Total bytes pinned. Cached so the accessor avoids walking the
+    /// map to compute coverage; updated on every insert.
+    total_bytes: u64,
+}
+
 /// Per-blob driver task handle.
 ///
 /// The `JoinHandleDropGuard` ensures the task is aborted on `Drop`
@@ -170,6 +203,19 @@ pub struct ChunkedDriver {
     /// task; on driver-task panic the Sender drops and the Receiver
     /// observes `Err(_)` (which the handler maps to `Code::Internal`).
     completion_rx: parking_lot::Mutex<Option<oneshot::Receiver<Result<ChunkedCommitResult, Error>>>>,
+    /// Per-chunk in-memory pin (the design §6.2 `failed_writes` /
+    /// §6.3 step 2 pin). Shared with the spawned driver task — the
+    /// task inserts on each landed chunk; [`Self::try_get_chunk_from_pin`]
+    /// reads from it for the read cascade in
+    /// `FastSlowStore::get_part`. Cleared by the driver after a
+    /// successful `commit_and_verify` (the canonical CAS path serves
+    /// the blob from disk after that point).
+    pin: Arc<Mutex<ChunkPin>>,
+    /// Total declared blob size in bytes. Used by the read accessor to
+    /// reject offsets/lengths that overrun the blob, and by callers
+    /// (e.g. `try_get_full_blob_from_pin`) that want to know whether
+    /// every byte is currently pinned.
+    expected_size: u64,
     /// Drop guard for the spawned task. On `Drop` of `ChunkedDriver`,
     /// the join handle is `abort()`'d if still running (§6.7 panic
     /// belt).
@@ -204,10 +250,12 @@ impl ChunkedDriver {
         let chunks_committed = Arc::new(AtomicU64::new(0));
         let loop_exited = Arc::new(AtomicBool::new(false));
         let (completion_tx, completion_rx) = oneshot::channel();
+        let pin: Arc<Mutex<ChunkPin>> = Arc::new(Mutex::new(ChunkPin::default()));
 
         let chunks_received_for_task = Arc::clone(&chunks_received);
         let chunks_committed_for_task = Arc::clone(&chunks_committed);
         let loop_exited_for_task = Arc::clone(&loop_exited);
+        let pin_for_task = Arc::clone(&pin);
 
         // Compute the expected chunk count from declared size + chunk
         // size. For a blob of N bytes with chunk size C, the expected
@@ -232,10 +280,20 @@ impl ChunkedDriver {
                 expected_size,
                 expected_chunk_count,
                 Arc::clone(&sidecar),
+                Arc::clone(&pin_for_task),
                 Arc::clone(&chunks_received_for_task),
                 Arc::clone(&chunks_committed_for_task),
             )
             .await;
+            // Drop the in-memory pin once the driver loop has finished
+            // (commit success → blob is on the canonical CAS path; commit
+            // failure → bytes are not authoritative). Frees per-blob
+            // memory promptly even if the `Arc<ChunkedDriver>` registry
+            // entry survives for a tick of de-registration. Read accessor
+            // calls after this point return `None` and the caller falls
+            // through to the next cascade step (slow store).
+            pin_for_task.lock().chunks.clear();
+            pin_for_task.lock().total_bytes = 0;
             // Send commit result. The Receiver may have been dropped
             // (caller didn't care about the result, or panic'd); ignore
             // the send-error in that case — the result is logged below
@@ -260,6 +318,8 @@ impl ChunkedDriver {
                 chunks_committed,
                 loop_exited,
                 completion_rx: parking_lot::Mutex::new(Some(completion_rx)),
+                pin,
+                expected_size,
                 _handle: handle,
             },
             tx,
@@ -312,6 +372,130 @@ impl ChunkedDriver {
     pub fn digest(&self) -> &DigestInfo {
         &self.digest
     }
+
+    /// Phase 2.5 read-cascade hook (design §6.3 step 2 — the
+    /// `failed_writes` per-chunk pin). Returns `Some(Bytes)` containing
+    /// the assembled byte range `[byte_offset, byte_offset+byte_length)`
+    /// if every covering chunk is currently pinned in memory; returns
+    /// `None` otherwise.
+    ///
+    /// `None` cases (each one falls through to the next cascade step in
+    /// `FastSlowStore::get_part`):
+    /// 1. The driver has already committed (`chunks` cleared) — the
+    ///    blob is now on the canonical CAS path, served by the slow
+    ///    store.
+    /// 2. The requested range is not yet fully covered by landed
+    ///    chunks — partial coverage is intentionally NOT served (per
+    ///    design §6.3 the cascade is per-chunk and the slow-store path
+    ///    can serve already-pwritten chunks at offset, but Phase 2.5
+    ///    keeps that behind the same kill-switch — we only serve from
+    ///    the pin when it has the WHOLE range).
+    /// 3. The requested range overruns the declared blob size — caller
+    ///    bug; falls through so the slow store can return its own
+    ///    well-defined OutOfRange / NotFound.
+    ///
+    /// **Why all-or-nothing for the requested range:** a partial result
+    /// would force `get_part` to compose pin-bytes + slow-store-bytes
+    /// for a single read. Per the design's per-chunk-independence the
+    /// composition is legal, but Phase 2.5's wire-up is intentionally
+    /// the simplest version that still demonstrates the cascade — only
+    /// fully-covered ranges short-circuit. Composition is left for a
+    /// later phase (or for the caller's existing buf_channel writer to
+    /// stitch when a future phase splits the request).
+    ///
+    /// Holds the `parking_lot::Mutex` for the duration of the assembly,
+    /// which is `O(chunks_in_range)` slice operations — bounded by
+    /// `ceil(byte_length / CHUNK_SIZE)` in production
+    /// (worst case ~256 entries for the 256 MiB
+    /// `MAX_CHUNKED_BLOB_SIZE`). Never crosses an `.await`.
+    #[must_use]
+    pub fn try_get_chunk_from_pin(
+        &self,
+        byte_offset: u64,
+        byte_length: u64,
+    ) -> Option<Bytes> {
+        // Range overruns the blob → caller bug; fall through.
+        let end_offset = byte_offset.checked_add(byte_length)?;
+        if end_offset > self.expected_size {
+            return None;
+        }
+        // Empty range → empty Bytes (defensive; production callers go
+        // through the buf_channel which already short-circuits empty).
+        if byte_length == 0 {
+            return Some(Bytes::new());
+        }
+
+        let pin = self.pin.lock();
+        // Driver already committed and cleared the pin.
+        if pin.chunks.is_empty() {
+            return None;
+        }
+
+        // Walk the BTreeMap in offset order, skipping chunks that end
+        // before our range and stopping when we have produced
+        // `byte_length` bytes. Track expected-next-offset to detect
+        // gaps mid-range — any gap means the range is not fully
+        // covered.
+        let mut assembled: Vec<Bytes> = Vec::new();
+        let mut produced: u64 = 0;
+        let mut cursor: u64 = byte_offset;
+        for (&chunk_off, chunk_bytes) in &pin.chunks {
+            let chunk_len = chunk_bytes.len() as u64;
+            let chunk_end = chunk_off.saturating_add(chunk_len);
+            // Skip chunks that end before our cursor.
+            if chunk_end <= cursor {
+                continue;
+            }
+            // Gap detected: the next chunk starts AFTER our cursor.
+            // The requested range is not fully covered.
+            if chunk_off > cursor {
+                return None;
+            }
+            // Slice the chunk to the [cursor, end_offset) overlap.
+            let slice_start = (cursor - chunk_off) as usize;
+            let want = (end_offset - cursor).min(chunk_end - cursor) as usize;
+            let slice_end = slice_start + want;
+            assembled.push(chunk_bytes.slice(slice_start..slice_end));
+            produced += want as u64;
+            cursor += want as u64;
+            if produced == byte_length {
+                break;
+            }
+        }
+        // Trailing-gap detection: we walked off the end of the BTreeMap
+        // without filling the range → not fully covered.
+        if produced != byte_length {
+            return None;
+        }
+        // Single-chunk fast path: avoid concatenation alloc when the
+        // request fit entirely in one pinned chunk.
+        if assembled.len() == 1 {
+            return Some(assembled.into_iter().next().expect("len==1"));
+        }
+        // Multi-chunk: concatenate into one contiguous Bytes. One
+        // BytesMut alloc + one copy per chunk; bounded by
+        // ceil(byte_length / CHUNK_SIZE) chunks (~256 worst-case for
+        // the 256 MiB MAX_CHUNKED_BLOB_SIZE).
+        let mut out = bytes::BytesMut::with_capacity(byte_length as usize);
+        for slice in assembled {
+            out.extend_from_slice(&slice);
+        }
+        Some(out.freeze())
+    }
+
+    /// Diagnostic accessor: returns the total bytes currently held in
+    /// the in-memory pin. Used by tests + future metric wiring.
+    #[must_use]
+    pub fn pinned_bytes(&self) -> u64 {
+        self.pin.lock().total_bytes
+    }
+
+    /// Diagnostic accessor: returns the count of chunks currently
+    /// pinned in memory. Used by tests to assert the post-commit drop.
+    #[must_use]
+    pub fn pinned_chunk_count(&self) -> usize {
+        self.pin.lock().chunks.len()
+    }
 }
 
 /// The per-blob driver loop. Pulled out of `spawn_driver` so the body
@@ -335,6 +519,7 @@ async fn run_driver<Fe: FileEntry>(
     expected_size: u64,
     expected_chunk_count: usize,
     sidecar: Arc<Mutex<SidecarState>>,
+    pin: Arc<Mutex<ChunkPin>>,
     chunks_received: Arc<AtomicU64>,
     chunks_committed: Arc<AtomicU64>,
 ) -> Result<ChunkedCommitResult, Error> {
@@ -368,6 +553,8 @@ async fn run_driver<Fe: FileEntry>(
         // Write the chunk via the FilesystemStore adapter (which is
         // already on `spawn_blocking` internally — see
         // `chunked_filesystem::write_chunk_at_offset`).
+        // The clone is one `Arc` bump (Bytes is ref-counted); the
+        // landed-chunk pin populated below shares the same buffer.
         let bytes_for_write = chunk_bytes.clone();
         if let Err(write_err) = filesystem_store
             .write_chunk_at_offset(&digest, chunk_offset, bytes_for_write)
@@ -395,6 +582,33 @@ async fn run_driver<Fe: FileEntry>(
             return Err(write_err);
         }
         chunks_committed.fetch_add(1, Ordering::Relaxed);
+
+        // Populate the in-memory pin (design §6.2 / §6.3 step 2).
+        // Reachable from `ChunkedDriver::try_get_chunk_from_pin` — the
+        // Phase 2.5 read cascade hook in `FastSlowStore::get_part`.
+        // Cleared by the spawning task on driver exit (commit success
+        // OR failure). Insert AFTER the pwrite has succeeded so the pin
+        // never advertises bytes that aren't on disk yet — preserves the
+        // step-2-then-step-3 ordering of the read cascade (a reader that
+        // looks the pin up while the slow-store rename is in flight will
+        // see the bytes before the slow store does, but never the other
+        // way around).
+        {
+            let mut pin_state = pin.lock();
+            // BTreeMap::insert returns the previous value — on a
+            // duplicate offset (the producer-protocol violation already
+            // warned about below) we replace and adjust total_bytes
+            // accordingly to keep the cached total honest.
+            if let Some(prev) = pin_state
+                .chunks
+                .insert(chunk_offset, chunk_bytes.clone())
+            {
+                pin_state.total_bytes =
+                    pin_state.total_bytes.saturating_sub(prev.len() as u64);
+            }
+            pin_state.total_bytes =
+                pin_state.total_bytes.saturating_add(chunk_len as u64);
+        }
 
         // Update the in-memory sidecar bitmap. parking_lot::Mutex
         // critical section is just an insert + a flag set; never
