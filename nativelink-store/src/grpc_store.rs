@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use core::pin::Pin;
+#[cfg(feature = "chunked_fast_slow")]
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
@@ -245,6 +247,21 @@ pub struct GrpcStore {
     parallel_chunk_retries_succeeded: AtomicU64,
     #[metric(help = "Per-chunk retries in get_part_parallel that exhausted retries and failed")]
     parallel_chunk_retries_failed: AtomicU64,
+    /// #212 Phase 2.4 runtime kill-switch for the worker→server
+    /// chunked-write path. Default OFF — even with the
+    /// `chunked_fast_slow` feature compiled in, blobs continue to take
+    /// the legacy in-order ByteStream Write path until an operator
+    /// flips this with `enable_chunked_writes()`. The "compile + ship,
+    /// flip later" pattern matches `enable_batch_small_blob_reads` /
+    /// `enable_locality_in_has` on `WorkerProxyStore`.
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_writes_enabled: AtomicBool,
+    /// #212 Phase 2.4 metrics for the chunked-write path. Wired into
+    /// the `MetricsComponent` derive once the path is exercised; today
+    /// it lives behind the kill-switch so the counters stay at zero
+    /// until the operator flips on.
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_metrics: Arc<crate::chunked::chunked_client::ChunkedClientMetrics>,
 }
 
 impl GrpcStore {
@@ -366,6 +383,10 @@ impl GrpcStore {
             connection_acquire_timeout_ms: spec.connection_acquire_timeout_ms,
             parallel_chunk_retries_succeeded: AtomicU64::new(0),
             parallel_chunk_retries_failed: AtomicU64::new(0),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_writes_enabled: AtomicBool::new(false),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_metrics: crate::chunked::chunked_client::ChunkedClientMetrics::new(),
         });
 
         if let Some(rx) = batch_rx {
@@ -381,6 +402,57 @@ impl GrpcStore {
         }
 
         Ok(store)
+    }
+
+    /// #212 Phase 2.4 runtime kill-switch: enable the worker→server
+    /// `WorkerApi/WriteChunked` path for blobs ≥ `CHUNK_SIZE` (1 MiB).
+    /// Default OFF; flipping this ON routes large `update()` calls
+    /// to `chunked::chunked_client::write_chunked_stream`. Blobs
+    /// below `CHUNK_SIZE` continue to take the legacy in-order
+    /// ByteStream Write path regardless.
+    ///
+    /// Idempotent. Safe to call multiple times. Takes effect on the
+    /// NEXT `update()` invocation; in-flight calls are not affected.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn enable_chunked_writes(&self) {
+        self.chunked_writes_enabled.store(true, Ordering::Relaxed);
+        tracing::info!(
+            instance_name = %self.instance_name,
+            "GrpcStore: chunked writes enabled (worker→server WriteChunked path active for blobs >= CHUNK_SIZE)",
+        );
+    }
+
+    /// Operator kill-switch: disable the chunked-write path. Blobs
+    /// fall back to the legacy in-order ByteStream Write transport
+    /// for the next `update()` and beyond.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn disable_chunked_writes(&self) {
+        self.chunked_writes_enabled.store(false, Ordering::Relaxed);
+        tracing::info!(
+            instance_name = %self.instance_name,
+            "GrpcStore: chunked writes disabled (legacy ByteStream Write path)",
+        );
+    }
+
+    /// Inspector for the chunked-write kill-switch. `pub` so tests
+    /// can assert state and operators can read the flag through any
+    /// admin tool that gets a `&GrpcStore` handle.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[must_use]
+    pub fn chunked_writes_enabled(&self) -> bool {
+        self.chunked_writes_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Read-only accessor for the chunked-write metrics. Used by
+    /// tests + future Prometheus / metric-publish wiring (the field
+    /// is not yet folded into the `MetricsComponent` derive because
+    /// the path is dormant under the default kill-switch).
+    #[cfg(feature = "chunked_fast_slow")]
+    #[must_use]
+    pub fn chunked_metrics(
+        &self,
+    ) -> &Arc<crate::chunked::chunked_client::ChunkedClientMetrics> {
+        &self.chunked_metrics
     }
 
     /// Acquire a TCP channel for a write-side RPC. When
@@ -2169,6 +2241,138 @@ impl GrpcStore {
 
         Ok(())
     }
+
+    /// #212 Phase 2.4: dispatch a single CAS blob via the
+    /// worker→server `WorkerApi/WriteChunked` RPC. Acquires one
+    /// fresh transport channel, then delegates to
+    /// `chunked::chunked_client::write_chunked_stream`.
+    ///
+    /// Caller (`update`) is responsible for the size-and-kill-switch
+    /// gate; this method ASSUMES it should run.
+    ///
+    /// On Dual transport, picks the TCP leg (matches the existing
+    /// `GrpcStore::write` decision: large streaming writes prefer
+    /// TCP per the 1.1× speed advantage measured in the original
+    /// dual-transport benchmark).
+    ///
+    /// **Per-attempt transport acquisition.** The chunked-client
+    /// retry loop calls `dispatcher.dispatch` once per retry. Each
+    /// `dispatch` invocation runs the channel-acquisition factory
+    /// to get a fresh transport — for TCP this re-enters
+    /// `ConnectionManager::connection`, which rotates among healthy
+    /// slots so a per-attempt transport failure does not pin the
+    /// same dead channel for attempt N+1.
+    ///
+    /// The factory captures a `&'static`-equivalent reference to
+    /// the GrpcStore via the `&Arc<Self>` indirection threaded from
+    /// `update`'s `Pin<&Self>` (recovered via the manually-built
+    /// `Pin<&Self>` cast — sound because the lifetime of the dispatcher
+    /// is bounded by this `await`).
+    #[cfg(feature = "chunked_fast_slow")]
+    async fn update_via_chunked_inner(
+        &self,
+        digest: DigestInfo,
+        reader: DropCloserReadHalf,
+    ) -> Result<(), Error> {
+        use crate::chunked::CHUNK_SIZE;
+        use crate::chunked::chunked_client::{
+            ChunkedClientOptions, WorkerApiWriteChunkedDispatcher,
+            WriteChunkedDispatcher, write_chunked_stream,
+        };
+
+        let options = ChunkedClientOptions {
+            chunk_size: CHUNK_SIZE,
+            ..Default::default()
+        };
+        let metrics = Arc::clone(&self.chunked_metrics);
+
+        // Build a per-call dispatcher whose factory captures the
+        // SHARED transport. For TCP / Dual we hand the factory a
+        // pointer to the stable `ConnectionManager` (`&'self`,
+        // promoted to `'static` via the `'static` bound on the
+        // factory); the inner `acquire_write_channel` await yields
+        // an owned `Connection` that lives only for the single
+        // attempt. For QUIC the factory just clones the shared
+        // `QuicChannel`.
+        //
+        // SAFETY: the factory closure stores raw pointers to
+        // self.transport's internals in disguise via the closure;
+        // `write_chunked_stream` returns BEFORE the `&self` borrow
+        // ends (the `await` boundary holds the borrow), so the
+        // factory's pointer is always valid when called.
+        let result: Result<u64, Error> = match &self.transport {
+            Transport::Tcp(cm) => {
+                // Fresh-Arc-per-call: clone the manager handle so the
+                // factory closure can be `'static`. ConnectionManager
+                // is internally Arc-wrapped, so cloning is cheap.
+                let cm_clone = cm.clone();
+                let acquire_timeout_ms = self.connection_acquire_timeout_ms;
+                let dispatcher: Box<dyn WriteChunkedDispatcher> =
+                    Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
+                        let cm = cm_clone.clone();
+                        Box::pin(async move {
+                            match acquire_timeout_ms {
+                                Some(ms) => {
+                                    cm.connection_with_timeout(
+                                        "worker_api_write_chunked".to_string(),
+                                        Duration::from_millis(ms),
+                                    )
+                                    .await
+                                }
+                                None => {
+                                    cm.connection(
+                                        "worker_api_write_chunked".to_string(),
+                                    )
+                                    .await
+                                }
+                            }
+                            .err_tip(|| "in GrpcStore::update_via_chunked_inner (tcp)")
+                        })
+                    }));
+                write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
+            }
+            #[cfg(feature = "quic")]
+            Transport::Quic(ch) => {
+                let ch = ch.clone();
+                let dispatcher: Box<dyn WriteChunkedDispatcher> =
+                    Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
+                        let ch = ch.clone();
+                        Box::pin(async move { Ok(ch) })
+                    }));
+                write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
+            }
+            #[cfg(feature = "quic")]
+            Transport::Dual { tcp, .. } => {
+                let cm_clone = tcp.clone();
+                let acquire_timeout_ms = self.connection_acquire_timeout_ms;
+                let dispatcher: Box<dyn WriteChunkedDispatcher> =
+                    Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
+                        let cm = cm_clone.clone();
+                        Box::pin(async move {
+                            match acquire_timeout_ms {
+                                Some(ms) => {
+                                    cm.connection_with_timeout(
+                                        "worker_api_write_chunked".to_string(),
+                                        Duration::from_millis(ms),
+                                    )
+                                    .await
+                                }
+                                None => {
+                                    cm.connection(
+                                        "worker_api_write_chunked".to_string(),
+                                    )
+                                    .await
+                                }
+                            }
+                            .err_tip(|| "in GrpcStore::update_via_chunked_inner (dual/tcp)")
+                        })
+                    }));
+                write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
+            }
+        };
+        result.err_tip(|| format!("in GrpcStore::update_via_chunked_inner for digest {digest}"))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -2256,6 +2460,38 @@ impl StoreDriver for GrpcStore {
         let digest = key.into_digest();
         if matches!(self.store_type, nativelink_config::stores::StoreType::Ac) {
             return self.update_action_result_from_bytes(digest, reader).await;
+        }
+
+        // #212 Phase 2.4 dispatch: when (a) the `chunked_fast_slow`
+        // feature is compiled AND (b) the runtime kill-switch is
+        // flipped on AND (c) the blob is at least `CHUNK_SIZE` bytes,
+        // route to the worker→server `WriteChunked` RPC. Smaller
+        // blobs OR the kill-switch off OR the feature absent ⇒
+        // legacy in-order ByteStream Write path (the "Fallback"
+        // section below).
+        //
+        // The dispatch needs `&Arc<Self>` so the async retry loop can
+        // re-acquire a fresh transport channel per attempt (TCP path
+        // calls back into `ConnectionManager::connection`); we
+        // synthesize the Arc via `Arc::new(self_ref.clone())` —
+        // wait, that double-wraps. Instead: reach into the call site
+        // by way of `self_arc()`, which the trait method does NOT
+        // expose. A future refactor could reach an `Arc<Self>` via
+        // a static OnceLock-on-construction or an `Arc::from_raw`
+        // dance, but for Phase 2.4 the production caller is
+        // `Store::new(grpc_arc)` which already holds an Arc — the
+        // `StoreLike::update` thunk above this passes through
+        // `Pin<&Self>`, so we'd need to thread the Arc deeper.
+        //
+        // For now: detect the chunked path here, then delegate to a
+        // helper that takes the unboxed reference (no Arc::upgrade
+        // retry chain); the retry loop inside `write_chunked_stream`
+        // re-uses the dispatcher's stored transport via `Clone`.
+        #[cfg(feature = "chunked_fast_slow")]
+        if self.chunked_writes_enabled.load(Ordering::Relaxed)
+            && digest.size_bytes() >= crate::chunked::CHUNK_SIZE as u64
+        {
+            return self.update_via_chunked_inner(digest, reader).await;
         }
 
         let digest_function = Context::current()

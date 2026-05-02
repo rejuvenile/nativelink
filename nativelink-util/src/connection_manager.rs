@@ -83,7 +83,20 @@ impl ReconnectBackoff {
 
 /// A helper utility that enables management of a suite of connections to an
 /// upstream gRPC endpoint using Tonic.
-#[derive(Debug)]
+/// `Clone` is sound: both fields are tokio mpsc senders (a
+/// `mpsc::Sender` and a `mpsc::UnboundedSender`), each of which is
+/// internally `Arc`-shared. Cloning a `ConnectionManager` produces
+/// another handle to the SAME backing
+/// `ConnectionManagerWorker` — there is no per-handle state, no
+/// per-handle pool of channels, and no on-drop cleanup that
+/// depends on a single owner. The clone is the standard tokio
+/// "share this multi-producer endpoint" pattern.
+///
+/// Cloning is required by the #212 Phase 2.4 chunked-write
+/// dispatcher (`chunked::chunked_client::WorkerApiWriteChunkedDispatcher`),
+/// whose per-attempt `acquire_channel` factory must be `'static`
+/// so the boxed future can outlive the borrow on `&GrpcStore`.
+#[derive(Debug, Clone)]
 pub struct ConnectionManager {
     /// Worker request channel.
     worker_tx: mpsc::Sender<(String, oneshot::Sender<Connection>)>,

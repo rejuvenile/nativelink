@@ -131,33 +131,71 @@ pub trait WriteChunkedDispatcher: Send + Sync {
     fn dispatch(&self, chunks: Vec<WriteChunk>) -> DispatchFuture;
 }
 
+/// Channel-acquisition future. Each `dispatch()` call invokes the
+/// factory to obtain a fresh transport; the factory is responsible
+/// for whatever pool-management / retry-aware acquisition policy
+/// fits the deployment (e.g., `ConnectionManager::connection()` on
+/// the TCP path, or just `Channel::clone()` on QUIC).
+pub type ChannelAcquireFuture<T> =
+    Pin<Box<dyn Future<Output = Result<T, Error>> + Send + 'static>>;
+
 /// Convenience type for callers that want to construct a
 /// dispatcher from a tonic `GrpcService`-shaped channel without
-/// writing a separate trait impl. Wraps the channel + per-call
-/// RPC in a single boxed dispatcher.
+/// writing a separate trait impl. Each `dispatch()` call invokes
+/// the `acquire_channel` factory to obtain a fresh transport (the
+/// wire stream then closes when the dispatcher returns). Used by
+/// `GrpcStore::update_via_chunked` to pull one TCP `Connection` (or
+/// to clone the QUIC channel) per attempt.
 ///
-/// `T: Clone` so the dispatcher can hand a fresh client to each
-/// retry attempt without consuming the channel.
-#[derive(Debug)]
+/// The factory pattern (rather than a stored `T`) avoids requiring
+/// `T: Clone` for callers — `nativelink_util::connection_manager::Connection`
+/// is intentionally non-Cloneable because each instance ties to a
+/// slot in the manager. Acquiring per-attempt also gives the
+/// connection_manager its natural retry-on-transport-error path
+/// (the dropped connection's slot returns to the pool; the next
+/// retry's `acquire_channel().await` may pick a different slot).
 pub struct WorkerApiWriteChunkedDispatcher<T> {
-    /// The transport channel (e.g. `tonic::transport::Channel` or a
-    /// `Connection` from `nativelink_util::connection_manager`). Cloned
-    /// per-attempt; tonic's recommended pattern is "channel is cheap
-    /// to clone".
-    pub channel: T,
+    /// Transport-acquisition factory. Returns a fresh `T` per
+    /// dispatch — the dispatcher does NOT memoize the channel, so
+    /// retries re-acquire from scratch.
+    acquire_channel:
+        Arc<dyn Fn() -> ChannelAcquireFuture<T> + Send + Sync + 'static>,
+}
+
+impl<T> core::fmt::Debug for WorkerApiWriteChunkedDispatcher<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WorkerApiWriteChunkedDispatcher")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> WorkerApiWriteChunkedDispatcher<T> {
+    /// Construct a dispatcher with a custom channel-acquisition
+    /// factory. Used by `GrpcStore::update_via_chunked` to plug in
+    /// `ConnectionManager::connection()` (TCP) or
+    /// `Channel::clone()` (QUIC).
+    pub fn with_factory<F>(acquire_channel: F) -> Self
+    where
+        F: Fn() -> ChannelAcquireFuture<T> + Send + Sync + 'static,
+    {
+        Self {
+            acquire_channel: Arc::new(acquire_channel),
+        }
+    }
 }
 
 impl<T> WriteChunkedDispatcher for WorkerApiWriteChunkedDispatcher<T>
 where
-    T: tonic::client::GrpcService<tonic::body::Body> + Clone + Send + Sync + 'static,
+    T: tonic::client::GrpcService<tonic::body::Body> + Send + 'static,
     T::Error: Into<tonic::codegen::StdError>,
     T::ResponseBody: tonic::codegen::Body<Data = Bytes> + Send + 'static,
     <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
     T::Future: Send,
 {
     fn dispatch(&self, chunks: Vec<WriteChunk>) -> DispatchFuture {
-        let channel = self.channel.clone();
+        let factory = Arc::clone(&self.acquire_channel);
         Box::pin(async move {
+            let channel = factory().await?;
             let stream = tokio_stream::iter(chunks);
             let mut client = WorkerApiClient::new(channel);
             let response: Response<WriteChunkedResponse> = client
