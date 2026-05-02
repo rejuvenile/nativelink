@@ -76,6 +76,7 @@ fn tiny_memory_store() -> std::sync::Arc<MemoryStore> {
             max_bytes: TINY_CAP_BYTES,
             ..Default::default()
         }),
+        emit_backpressure_enabled: false,
     })
 }
 

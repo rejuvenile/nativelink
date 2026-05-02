@@ -213,6 +213,7 @@ async fn mirror_blobs_size_mismatch_does_not_terminate_outer_writer_when_gate_se
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),

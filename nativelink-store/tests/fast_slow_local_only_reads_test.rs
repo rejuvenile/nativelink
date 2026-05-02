@@ -51,6 +51,7 @@ fn make_local_only_fss() -> (Arc<FastSlowStore>, Store, Store) {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
         },
         fast.clone(),
         slow.clone(),

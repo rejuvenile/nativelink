@@ -148,6 +148,7 @@ async fn chunked_path_evicts_pool_on_transport_err() -> Result<(), Error> {
         dual_transport: false,
         zstd_compression: false,
         connection_acquire_timeout_ms: Some(2000),
+        chunked_writes_enabled: false,
     };
     let store = GrpcStore::new(&spec).await?;
     store.enable_chunked_writes();

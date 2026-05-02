@@ -298,6 +298,7 @@ async fn has_checks_content_store() -> Result<(), Error> {
             max_bytes: CACHE_CAP_BYTES,
             ..Default::default()
         }),
+        emit_backpressure_enabled: false,
     });
 
     let store = DedupStore::new(
@@ -371,6 +372,7 @@ async fn has_with_no_existing_index_returns_none_test() -> Result<(), Error> {
             max_count: 10,
             ..Default::default()
         }),
+        emit_backpressure_enabled: false,
     });
 
     let store = DedupStore::new(
@@ -402,6 +404,7 @@ async fn has_with_zero_digest_returns_some_test() -> Result<(), Error> {
             max_count: 10,
             ..Default::default()
         }),
+        emit_backpressure_enabled: false,
     });
 
     let store = DedupStore::new(
@@ -440,6 +443,7 @@ async fn mark_stable_delegates_to_index_store_test() -> Result<(), Error> {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),

@@ -336,6 +336,7 @@ async fn mark_stable_routes_per_digest_to_owning_shard_test() -> Result<(), Erro
                     slow: StoreSpec::Memory(MemorySpec::default()),
                     fast_direction: StoreDirection::default(),
                     slow_direction: StoreDirection::default(),
+                    chunked_reads_enabled: false,
                 },
                 Store::new(MemoryStore::new(&MemorySpec::default())),
                 Store::new(MemoryStore::new(&MemorySpec::default())),

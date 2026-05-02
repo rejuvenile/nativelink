@@ -85,6 +85,7 @@ async fn make_fss(
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
         },
         fast_store.clone(),
         slow_store.clone(),

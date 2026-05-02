@@ -78,6 +78,7 @@ fn make_fss_for_mirror() -> Arc<FastSlowStore> {
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
         },
         fast,
         slow,

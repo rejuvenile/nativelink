@@ -192,6 +192,7 @@ async fn non_wps_slow_store_fallback_err_terminates_writer_with_structured_error
         slow: StoreSpec::Memory(MemorySpec::default()),
         fast_direction: StoreDirection::Both,
         slow_direction: StoreDirection::Both,
+        chunked_reads_enabled: false,
     };
     let fast_slow = FastSlowStore::new(&spec, fast, slow);
 
