@@ -127,20 +127,26 @@ pub struct WorkerProxyStore {
     /// inner cache — without them, audits like #229 had to infer from
     /// log markers and got 88 % silent-failure rates.
     ///
+    /// `Arc<AtomicU64>` (not bare `AtomicU64`) because the cache-write
+    /// task is spawned `tokio::spawn`-detached and outlives the
+    /// `get_part_and_cache` call's `&self` borrow. The Arc lets the
+    /// detached task increment the same counter the
+    /// `MetricsComponent::publish` impl reads.
+    ///
     /// Incremented when the spawned cache task starts (one per eligible
     /// peer-fetch, i.e. full-blob read ≤ `MAX_CACHE_BLOB_SIZE`).
-    cdn_tee_cache_attempts_total: AtomicU64,
+    cdn_tee_cache_attempts_total: Arc<AtomicU64>,
     /// Incremented when the spawned cache task's `inner.update` returned
     /// `Ok` and the task completed within its timeout.
-    cdn_tee_cache_completed_total: AtomicU64,
+    cdn_tee_cache_completed_total: Arc<AtomicU64>,
     /// Incremented when the per-chunk forward loop observed
     /// `cache_tx.try_send` returning `Full` and abandoned the cache-tee
     /// for this blob (continuing forwarding to Bazel only).
-    cdn_tee_cache_abandoned_full_total: AtomicU64,
+    cdn_tee_cache_abandoned_full_total: Arc<AtomicU64>,
     /// Incremented when the consumer (Bazel) disconnected mid-blob
     /// (forward `Err`), causing the forward loop to drop `cache_tx`
     /// and abandon the cache-tee.
-    cdn_tee_cache_abandoned_consumer_eof_total: AtomicU64,
+    cdn_tee_cache_abandoned_consumer_eof_total: Arc<AtomicU64>,
 }
 
 /// Per-endpoint mirror state: in-flight permits and consecutive-failure tracking.
@@ -309,26 +315,26 @@ impl MetricsComponent for WorkerProxyStore {
 
         publish!(
             "cdn_tee_cache_attempts_total",
-            &self.cdn_tee_cache_attempts_total,
+            self.cdn_tee_cache_attempts_total.as_ref(),
             MetricKind::Counter,
             "CDN-tee cache write tasks spawned (eligible peer-fetched blobs)"
         );
         publish!(
             "cdn_tee_cache_completed_total",
-            &self.cdn_tee_cache_completed_total,
+            self.cdn_tee_cache_completed_total.as_ref(),
             MetricKind::Counter,
             "CDN-tee cache write tasks that completed inner.update successfully"
         );
         publish!(
             "cdn_tee_cache_abandoned_full_total",
-            &self.cdn_tee_cache_abandoned_full_total,
+            self.cdn_tee_cache_abandoned_full_total.as_ref(),
             MetricKind::Counter,
             "CDN-tee writes abandoned because cache mpsc was full \
              (cache slower than peer-reader; Bazel kept being served)"
         );
         publish!(
             "cdn_tee_cache_abandoned_consumer_eof_total",
-            &self.cdn_tee_cache_abandoned_consumer_eof_total,
+            self.cdn_tee_cache_abandoned_consumer_eof_total.as_ref(),
             MetricKind::Counter,
             "CDN-tee writes abandoned because Bazel consumer disconnected mid-blob"
         );
@@ -524,10 +530,10 @@ impl WorkerProxyStore {
             mirror_dropped_quarantined: AtomicU64::new(0),
             batch_small_blob_reads: AtomicBool::new(false),
             batch_read_coalescer: OnceLock::new(),
-            cdn_tee_cache_attempts_total: AtomicU64::new(0),
-            cdn_tee_cache_completed_total: AtomicU64::new(0),
-            cdn_tee_cache_abandoned_full_total: AtomicU64::new(0),
-            cdn_tee_cache_abandoned_consumer_eof_total: AtomicU64::new(0),
+            cdn_tee_cache_attempts_total: Arc::new(AtomicU64::new(0)),
+            cdn_tee_cache_completed_total: Arc::new(AtomicU64::new(0)),
+            cdn_tee_cache_abandoned_full_total: Arc::new(AtomicU64::new(0)),
+            cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -553,10 +559,10 @@ impl WorkerProxyStore {
             mirror_dropped_quarantined: AtomicU64::new(0),
             batch_small_blob_reads: AtomicBool::new(false),
             batch_read_coalescer: OnceLock::new(),
-            cdn_tee_cache_attempts_total: AtomicU64::new(0),
-            cdn_tee_cache_completed_total: AtomicU64::new(0),
-            cdn_tee_cache_abandoned_full_total: AtomicU64::new(0),
-            cdn_tee_cache_abandoned_consumer_eof_total: AtomicU64::new(0),
+            cdn_tee_cache_attempts_total: Arc::new(AtomicU64::new(0)),
+            cdn_tee_cache_completed_total: Arc::new(AtomicU64::new(0)),
+            cdn_tee_cache_abandoned_full_total: Arc::new(AtomicU64::new(0)),
+            cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -611,6 +617,23 @@ impl WorkerProxyStore {
     /// consultation is enabled.
     pub fn locality_in_has_enabled(&self) -> bool {
         self.consult_locality_in_has.load(Ordering::Relaxed)
+    }
+
+    /// CDN-tee counter snapshot (#230). Returns
+    /// `(attempts, completed, abandoned_full, abandoned_consumer_eof)`.
+    /// Used by regression tests to assert which abandon path fired and
+    /// to confirm counter-counter equality after a happy-path run. Also
+    /// useful for ad-hoc operator probes when the metrics endpoint is
+    /// not wired (returns the same values that
+    /// `MetricsComponent::publish` exposes via Prometheus).
+    pub fn cdn_tee_counters_snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.cdn_tee_cache_attempts_total.load(Ordering::Relaxed),
+            self.cdn_tee_cache_completed_total.load(Ordering::Relaxed),
+            self.cdn_tee_cache_abandoned_full_total.load(Ordering::Relaxed),
+            self.cdn_tee_cache_abandoned_consumer_eof_total
+                .load(Ordering::Relaxed),
+        )
     }
 
     /// Add a worker endpoint to the connection pool.
@@ -1571,8 +1594,7 @@ impl WorkerProxyStore {
         let inner = self.inner.clone();
         let cache_size = UploadSizeInfo::ExactSize(digest.size_bytes());
         let cache_key: StoreKey<'static> = digest.into();
-        let completed_counter = Arc::new(AtomicU64::new(0));
-        let completed_counter_for_task = completed_counter.clone();
+        let completed_counter = self.cdn_tee_cache_completed_total.clone();
         // Wrap inner.update in a task-level timeout so a wedged inner
         // store cannot leak the spawned task (and its in-flight tracker
         // entry) indefinitely.
@@ -1584,7 +1606,7 @@ impl WorkerProxyStore {
             .await
             {
                 Ok(Ok(())) => {
-                    completed_counter_for_task.fetch_add(1, Ordering::Relaxed);
+                    completed_counter.fetch_add(1, Ordering::Relaxed);
                     info!(
                         %digest,
                         size_bytes = digest.size_bytes(),
@@ -1750,10 +1772,6 @@ impl WorkerProxyStore {
         // attempted/completed/abandoned-* expose its outcome to operators.
         // The handle's drop is a no-op for `tokio::spawn`-detached tasks.
         drop(cache_handle);
-        // Reference completed_counter so the compiler keeps it tied to
-        // the cache task's lifetime (the Arc clone moved in is the
-        // important one; this drop is documentation).
-        drop(completed_counter);
 
         if let Err(get_err) = get_part_result {
             // Peer's get_part errored — surface that. forward result is
