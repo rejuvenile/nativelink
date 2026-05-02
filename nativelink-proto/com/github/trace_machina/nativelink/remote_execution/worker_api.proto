@@ -681,6 +681,14 @@ message BackpressureSignal {
         /// silent-evict behavior). Caller should retry after
         /// `retry_after_ms`.
         MEMORY_STORE_AT_CAPACITY = 3;
+        /// #212 Phase 2.5/2.7 fixup B1: the global pinned-bytes budget
+        /// (`PinBudget`, default 4 GiB cap) is exhausted. Each in-flight
+        /// chunked-driver pin holds bytes until commit; under slow-tier
+        /// pause (txg / FS busy) pinned bytes grow at upload rate × pause
+        /// duration. The cap prevents the #203-shape OOM cascade. Caller
+        /// should retry after `retry_after_ms` once existing chunked
+        /// commits drain.
+        PINNED_BYTES_EXHAUSTED = 4;
     }
     Reason reason = 1;
     /// Server-suggested backoff hint in milliseconds. Client may apply

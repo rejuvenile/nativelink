@@ -175,6 +175,7 @@ async fn pin_serves_request_under_verify_when_enabled() {
                 chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
+                _pin_permit: None,
             })
             .await
             .expect("send");
@@ -282,6 +283,7 @@ async fn pin_skipped_when_kill_switch_off() {
                 chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
+                _pin_permit: None,
             })
             .await
             .expect("send");
@@ -395,6 +397,7 @@ async fn pin_consulted_before_slow_store_when_enabled() {
                 chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
+                _pin_permit: None,
             })
             .await
             .expect("send");
@@ -513,6 +516,7 @@ async fn pin_partial_coverage_falls_through_to_slow_store() {
                 chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
+                _pin_permit: None,
             })
             .await
             .expect("send");

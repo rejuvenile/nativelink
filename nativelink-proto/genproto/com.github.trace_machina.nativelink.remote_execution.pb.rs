@@ -707,6 +707,14 @@ pub mod backpressure_signal {
         /// / silent-evict behavior). Caller should retry after
         /// / `retry_after_ms`.
         MemoryStoreAtCapacity = 3,
+        /// / #212 Phase 2.5/2.7 fixup B1: the global pinned-bytes budget
+        /// / (`PinBudget`, default 4 GiB cap) is exhausted. Each in-flight
+        /// / chunked-driver pin holds bytes until commit; under slow-tier
+        /// / pause (txg / FS busy) pinned bytes grow at upload rate × pause
+        /// / duration. The cap prevents the #203-shape OOM cascade. Caller
+        /// / should retry after `retry_after_ms` once existing chunked
+        /// / commits drain.
+        PinnedBytesExhausted = 4,
     }
     impl Reason {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -719,6 +727,7 @@ pub mod backpressure_signal {
                 Self::GlobalChunkBudgetExhausted => "GLOBAL_CHUNK_BUDGET_EXHAUSTED",
                 Self::PerBlobMpscFull => "PER_BLOB_MPSC_FULL",
                 Self::MemoryStoreAtCapacity => "MEMORY_STORE_AT_CAPACITY",
+                Self::PinnedBytesExhausted => "PINNED_BYTES_EXHAUSTED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -728,6 +737,7 @@ pub mod backpressure_signal {
                 "GLOBAL_CHUNK_BUDGET_EXHAUSTED" => Some(Self::GlobalChunkBudgetExhausted),
                 "PER_BLOB_MPSC_FULL" => Some(Self::PerBlobMpscFull),
                 "MEMORY_STORE_AT_CAPACITY" => Some(Self::MemoryStoreAtCapacity),
+                "PINNED_BYTES_EXHAUSTED" => Some(Self::PinnedBytesExhausted),
                 _ => None,
             }
         }

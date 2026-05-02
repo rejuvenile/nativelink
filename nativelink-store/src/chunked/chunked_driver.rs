@@ -99,6 +99,16 @@ pub struct ChunkWork {
     /// admission moved this permit out of the global `ChunkBudget`
     /// into the `ChunkWork`; dropping the work releases the permit.
     pub _permit: OwnedSemaphorePermit,
+    /// #212 Phase 2.5/2.7 fixup B1: optional `PinBudget` permit. The
+    /// driver, after pwrite + adding the chunk to the in-memory pin,
+    /// transfers this permit into the `ChunkPin` so the byte budget
+    /// remains held until the pin clears (post-commit). `None` for
+    /// callers that don't admit through `PinBudget` (legacy
+    /// `WriteChunked` RPC path; tests that bypass the budget). Carrying
+    /// it on `ChunkWork` (vs admission-side bookkeeping) ensures the
+    /// permit drops cleanly on driver-task panic via `Drop` of
+    /// `ChunkWork` — no separate reclamation path.
+    pub _pin_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Sender half of the per-blob mpsc.
@@ -169,6 +179,18 @@ struct ChunkPin {
     /// Total bytes pinned. Cached so the accessor avoids walking the
     /// map to compute coverage; updated on every insert.
     total_bytes: u64,
+    /// #212 Phase 2.5/2.7 fixup B1: `PinBudget` permits transferred from
+    /// admitted `ChunkWork` items. Each permit covers the byte length
+    /// of one chunk; the permits remain held (and the byte budget
+    /// remains consumed) until the pin clears post-commit. Drop releases
+    /// the permits to the global pool.
+    ///
+    /// Why a `Vec` not a single combined permit: each permit is a
+    /// distinct `OwnedSemaphorePermit` minted at admission with a fixed
+    /// per-chunk byte count. Combining requires `merge` (not stable on
+    /// `tokio::sync::OwnedSemaphorePermit`); a `Vec` is simpler and
+    /// amortizes to one `Arc` bump per chunk.
+    pin_permits: Vec<OwnedSemaphorePermit>,
 }
 
 /// Per-blob driver task handle.
@@ -292,8 +314,17 @@ impl ChunkedDriver {
             // entry survives for a tick of de-registration. Read accessor
             // calls after this point return `None` and the caller falls
             // through to the next cascade step (slow store).
-            pin_for_task.lock().chunks.clear();
-            pin_for_task.lock().total_bytes = 0;
+            //
+            // Single lock acquisition (rust-crate L2: parking_lot is
+            // cheap-but-not-free; one mutex acquire instead of three).
+            // Clearing `pin_permits` releases all PinBudget permits back
+            // to the global pool — load-bearing for the anti-#203 cap.
+            {
+                let mut pin_state = pin_for_task.lock();
+                pin_state.chunks.clear();
+                pin_state.total_bytes = 0;
+                pin_state.pin_permits.clear();
+            }
             // Send commit result. The Receiver may have been dropped
             // (caller didn't care about the result, or panic'd); ignore
             // the send-error in that case — the result is logged below
@@ -531,6 +562,7 @@ async fn run_driver<Fe: FileEntry>(
             chunk_sha256,
             finish,
             _permit,
+            _pin_permit,
         } = work;
 
         let chunk_len = chunk_bytes.len();
@@ -608,6 +640,15 @@ async fn run_driver<Fe: FileEntry>(
             }
             pin_state.total_bytes =
                 pin_state.total_bytes.saturating_add(chunk_len as u64);
+            // #212 Phase 2.5/2.7 fixup B1: transfer the PinBudget permit
+            // (if any) from the ChunkWork into the pin. The permit
+            // remains held until the pin clears post-commit (driver
+            // exit, see `pin_for_task.lock().chunks.clear()`), at which
+            // point the Vec drops and the global pinned-bytes budget
+            // recovers.
+            if let Some(perm) = _pin_permit {
+                pin_state.pin_permits.push(perm);
+            }
         }
 
         // Update the in-memory sidecar bitmap. parking_lot::Mutex
@@ -962,6 +1003,7 @@ mod tests {
                     chunk_sha256: chunk_sha,
                     finish: i == N - 1,
                     _permit: permit,
+                    _pin_permit: None,
                 })
                 .await
                 .expect("driver mpsc still alive");
@@ -1029,6 +1071,7 @@ mod tests {
                     chunk_sha256: chunk_sha,
                     finish: idx == order.len() - 1,
                     _permit: permit,
+                    _pin_permit: None,
                 })
                 .await
                 .expect("send");
@@ -1084,6 +1127,7 @@ mod tests {
                     chunk_sha256: [0u8; 32],
                     finish: i == N - 1,
                     _permit: permit,
+                    _pin_permit: None,
                 })
                 .await
                 .unwrap();
@@ -1144,6 +1188,7 @@ mod tests {
                 chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
+                _pin_permit: None,
             })
             .await
             .unwrap();
@@ -1200,6 +1245,7 @@ mod tests {
             chunk_sha256: [0u8; 32],
             finish: false,
             _permit: permit,
+            _pin_permit: None,
         })
         .await
         .expect("send");
@@ -1259,6 +1305,7 @@ mod tests {
             chunk_sha256: [0u8; 32],
             finish: false,
             _permit: permit_a,
+            _pin_permit: None,
         };
         tx.try_send(work_a).expect("first try_send into capacity-1 mpsc must succeed");
 
@@ -1271,6 +1318,7 @@ mod tests {
             chunk_sha256: [0u8; 32],
             finish: false,
             _permit: permit_b,
+            _pin_permit: None,
         };
         let err = tx
             .try_send(work_b)
@@ -1341,6 +1389,7 @@ mod tests {
                 chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
+                _pin_permit: None,
             })
             .await
             .expect("send pre-shutdown chunk");
@@ -1416,6 +1465,7 @@ mod tests {
             chunk_sha256: [0u8; 32],
             finish: true,
             _permit: permit,
+            _pin_permit: None,
         })
         .await
         .unwrap();
@@ -1481,6 +1531,7 @@ mod tests {
                     chunk_sha256: [0u8; 32],
                     finish: false,
                     _permit: permit,
+                    _pin_permit: None,
                 })
                 .await
                 .expect("send");
@@ -1565,6 +1616,7 @@ mod tests {
                     chunk_sha256: [0u8; 32],
                     finish: false,
                     _permit: permit,
+                    _pin_permit: None,
                 })
                 .await
                 .expect("send");
@@ -1636,6 +1688,7 @@ mod tests {
                 chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
+                _pin_permit: None,
             })
             .await
             .expect("send");
@@ -1689,6 +1742,7 @@ mod tests {
                 chunk_sha256: [0u8; 32],
                 finish: true,
                 _permit: permit,
+                _pin_permit: None,
             })
             .await
             .expect("send");
