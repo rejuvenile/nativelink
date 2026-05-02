@@ -16,7 +16,7 @@ use core::num::NonZeroUsize;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -92,6 +92,14 @@ pub struct SchedulerMetrics {
     pub prefetch_batches_sent: AtomicU64,
     /// Total number of server-side cache warm tasks spawned.
     pub cache_warm_spawned: CounterWithTime,
+    /// (#214) Cumulative number of BIS replay-buffer chunks dropped by
+    /// the per-worker overflow cap. A non-zero value means at least one
+    /// worker is misbehaving (never acking BIS chunks while still
+    /// holding a connection slot) and the server is silently dropping
+    /// replay state to bound memory. Sustained non-zero growth is the
+    /// operator-visible signal that #214's cap is the load-bearing
+    /// defence against a worker-driven server DoS.
+    pub bis_replay_buffer_overflow_drops: AtomicU64,
 }
 
 /// Cached result of `score_and_generate_hints`: endpoint scores (cached
@@ -115,6 +123,38 @@ pub(crate) const PEER_HINTS_PER_CHUNK: usize = 256;
 /// decoder limit. Larger chunks reduce per-chunk ack overhead but
 /// increase the cost of a single resend after a connection drop.
 pub(crate) const BIS_DIGESTS_PER_CHUNK: usize = 4096;
+
+/// (#214) Per-worker cap on buffered, unacked BIS chunks. Defends
+/// against a misbehaving / wedged / never-acking worker that would
+/// otherwise grow its `BisResendBuffer` monotonically across
+/// reconnects (observed 2026-04-30 on buildcache: chunk_count for
+/// worker-03 grew 33,120 → 34,980 in 12 minutes; replays never
+/// completed because new reconnects fired mid-stream).
+///
+/// At ~160 KiB per chunk (`BIS_DIGESTS_PER_CHUNK` × ~40 B), 100,000
+/// chunks ≈ 16 GiB per worker — already well past anything that
+/// should appear in steady state, but bounded enough that a fleet
+/// of misbehaving workers cannot drive the server to OOM via this
+/// surface alone (compare: deployed `MemoryMax` is 80 GiB).
+///
+/// Overflow policy: **drop oldest** ((broadcast_id, sequence)
+/// lex-min) one chunk at a time until the buffer fits. Older
+/// chunks are the ones the worker has had the longest opportunity
+/// to ack; newer broadcasts (more recently relevant) are preserved.
+/// A boot_epoch_id change still fully resets the buffer for healthy
+/// reconnects via `clear_bis_resend_buffer_for_endpoint`; the cap
+/// only fires for the never-acking-but-still-connected pathological
+/// case.
+///
+/// Test override: in `#[cfg(test)]` builds the cap is reduced to 64
+/// so production-composition tests can exercise the cap-fires path
+/// in <1 s of wall-clock without broadcasting hundreds of thousands
+/// of digests. The mechanism under test (drop-oldest + counter +
+/// warn) is identical at any cap.
+#[cfg(not(test))]
+pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 100_000;
+#[cfg(test)]
+pub(crate) const BIS_REPLAY_BUFFER_MAX_CHUNKS: usize = 64;
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::worker::{
@@ -239,19 +279,22 @@ struct ApiWorkerSchedulerImpl {
 /// every buffered chunk is resent so worker reconnects don't lose
 /// unpins.
 ///
-/// Currently UNBOUNDED. Eviction relies on:
+/// Bounded at `BIS_REPLAY_BUFFER_MAX_CHUNKS` (#214). Eviction sources:
 ///   (a) per-broadcast `ack` removal — every successful chunk delivery
 ///       drops one `(broadcast_id, sequence)` slot;
-///   (b) `unregister_worker` clearing the per-endpoint slot on
-///       disconnect (only fires when the connection is recognised as
-///       gone — a long-disconnected-but-not-yet-reaped worker keeps
-///       its slot);
-///   (c) `clear_bis_resend_buffer_for_endpoint` on boot-epoch change.
+///   (b) `clear_bis_resend_buffer_for_endpoint` on boot-epoch change;
+///   (c) overflow trim — when `add` would push `len()` past the cap,
+///       the lex-smallest `(broadcast_id, sequence)` (= oldest
+///       broadcast's earliest unacked chunk) is dropped one at a time
+///       until the buffer fits. Each dropped chunk increments
+///       `overflow_drops` so the operator sees the cap firing.
 ///
-/// A long-disconnected-but-not-yet-reaped worker with a stable
-/// `cas_endpoint` accumulates one chunk per broadcast indefinitely.
-/// TODO(#97-followup): cap by disconnect-timeout — when no ack received
-/// for N seconds, evict the entire per-endpoint slot.
+/// `remove_worker` does NOT clear the buffer (the buffer is keyed by
+/// `cas_endpoint`, which is the stable identity across reconnects;
+/// dropping it on disconnect would lose the unacked unpins the
+/// reconnect is supposed to replay). The cap is the only defence
+/// against a long-disconnected-but-stable-endpoint worker that never
+/// drains its buffer.
 #[derive(Debug, Default)]
 pub(crate) struct BisResendBuffer {
     /// (broadcast_id, sequence) -> Arc-shared chunk. The chunk is
@@ -261,19 +304,61 @@ pub(crate) struct BisResendBuffer {
     /// memcpy'd per worker, which at ~64 workers × ~25 chunks per
     /// 100K-digest broadcast = ~1600 redundant Vec clones per
     /// broadcast.
-    chunks: HashMap<
+    ///
+    /// `BTreeMap` (not `HashMap`) so the overflow trim can pop the
+    /// lex-smallest key in O(log N) without a linear scan. Insert /
+    /// remove / lookup are all O(log N) — at the 100K cap, log2 ≈ 17,
+    /// dominated by allocator and cache effects long before tree
+    /// depth matters.
+    chunks: BTreeMap<
         (u64, u32),
         Arc<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsInStableStorageChunk>,
     >,
+
+    /// (#214) Cumulative count of chunks dropped by the overflow-trim
+    /// policy across this buffer's lifetime. Surfaced via metrics so
+    /// the operator sees the cap firing — a non-zero value means the
+    /// associated worker is misbehaving (never acking) and the server
+    /// is silently dropping replay state.
+    overflow_drops: u64,
 }
 
 impl BisResendBuffer {
+    /// Insert a chunk. If the insert would push the buffer past
+    /// `BIS_REPLAY_BUFFER_MAX_CHUNKS`, drop the lex-smallest existing
+    /// entries (= oldest broadcast's earliest unacked chunks) until
+    /// the buffer fits. Returns the number of pre-existing chunks
+    /// dropped to make room (0 in the common path; non-zero only when
+    /// the cap fires).
     pub(crate) fn add(
         &mut self,
         chunk: Arc<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsInStableStorageChunk>,
-    ) {
-        self.chunks
-            .insert((chunk.broadcast_id, chunk.sequence), chunk);
+    ) -> usize {
+        let key = (chunk.broadcast_id, chunk.sequence);
+        // Insert first so a re-insert of an already-present key (same
+        // broadcast_id/sequence — not a new entry) doesn't trigger a
+        // spurious trim cycle.
+        let was_replace = self.chunks.insert(key, chunk).is_some();
+        if was_replace {
+            return 0;
+        }
+        let mut dropped = 0usize;
+        while self.chunks.len() > BIS_REPLAY_BUFFER_MAX_CHUNKS {
+            // pop_first removes the lex-smallest (broadcast_id,
+            // sequence) — the oldest broadcast's earliest still-
+            // unacked chunk. If the just-inserted chunk happens to be
+            // the lex-smallest (e.g. a delayed retry of a very-old
+            // broadcast_id), it can be the one trimmed; that's
+            // acceptable — the buffer was already past cap, the
+            // worker has misbehaved, and the trim's job is to bound
+            // memory, not to preserve a specific eviction ordering.
+            if self.chunks.pop_first().is_none() {
+                break;
+            }
+            dropped += 1;
+        }
+        self.overflow_drops = self.overflow_drops.saturating_add(dropped as u64);
+        dropped
     }
 
     pub(crate) fn ack(&mut self, broadcast_id: u64, sequence: u32) {
@@ -286,6 +371,13 @@ impl BisResendBuffer {
 
     pub(crate) fn len(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Cumulative overflow-trim drops observed by this buffer.
+    /// Operator-visible signal that the cap is firing.
+    #[cfg(test)]
+    pub(crate) fn overflow_drops(&self) -> u64 {
+        self.overflow_drops
     }
 }
 
@@ -2882,17 +2974,46 @@ impl ApiWorkerScheduler {
         // pass. Previously this loop took a write lock per worker —
         // 64 workers × 25-chunk broadcast = 64 lock-acquire round-trips
         // contending against every other scheduler operation.
-        if !endpoints_to_buffer.is_empty() {
+        //
+        // (#214) Track per-endpoint overflow drops so we can emit a
+        // warn outside the lock with enough context for the operator
+        // to identify the misbehaving worker.
+        let overflow_report: Vec<(Arc<str>, usize)> = if !endpoints_to_buffer.is_empty() {
             let mut inner = self.inner.write().await;
+            let mut report: Vec<(Arc<str>, usize)> = Vec::new();
             for endpoint in &endpoints_to_buffer {
                 let buf = inner
                     .bis_resend_buffers
                     .entry(endpoint.to_string())
                     .or_default();
+                let mut endpoint_dropped = 0usize;
                 for chunk in &chunks {
-                    buf.add(chunk.clone());
+                    endpoint_dropped += buf.add(chunk.clone());
+                }
+                if endpoint_dropped > 0 {
+                    report.push((endpoint.clone(), endpoint_dropped));
                 }
             }
+            report
+        } else {
+            Vec::new()
+        };
+
+        for (endpoint, dropped) in &overflow_report {
+            self.metrics
+                .bis_replay_buffer_overflow_drops
+                .fetch_add(*dropped as u64, Ordering::Relaxed);
+            warn!(
+                target: "nativelink::bis_chunked_dispatch",
+                cas_endpoint = %endpoint,
+                dropped_chunks = dropped,
+                cap = BIS_REPLAY_BUFFER_MAX_CHUNKS,
+                broadcast_id,
+                "BIS replay buffer at cap — dropped oldest unacked chunks. \
+                 Worker is failing to ack BIS broadcasts; pin state for the \
+                 dropped chunks will leak until the worker reconnects with \
+                 a new boot_epoch_id"
+            );
         }
 
         if send_failures > 0 {
@@ -5151,6 +5272,255 @@ mod tests {
             "race must not produce chunk count above dispatched total \
              (got {buffered_after_race}, dispatched {})",
             chunks.len()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (#214) BIS replay buffer cap tests.
+    //
+    // Cap = `BIS_REPLAY_BUFFER_MAX_CHUNKS` (set to 64 under cfg(test)
+    // so these run fast). Both directions of the side-effect contract
+    // are exercised:
+    //   * UNDER-action: cap fires when buffer would exceed the limit
+    //     (test 7). Without the cap, a never-acking worker grows the
+    //     buffer monotonically across reconnects → server OOM.
+    //   * OVER-action: cap does NOT prematurely drop chunks when the
+    //     buffer is well under the limit (tests 8 + 9). A spurious
+    //     drop would mean the worker permanently misses a recent
+    //     unpin → pin state leak in the worker's CAS.
+    // ------------------------------------------------------------------
+
+    /// 7. **UNDER-action.** A worker that never acks accumulates BIS
+    ///    chunks. After enough broadcasts the buffer reaches the cap
+    ///    and stops growing — additional broadcasts trim oldest
+    ///    chunks rather than expanding the buffer. The
+    ///    `bis_replay_buffer_overflow_drops` counter increments by
+    ///    exactly the number of dropped chunks.
+    ///
+    ///    Production composition: real `ApiWorkerScheduler`, real
+    ///    `broadcast_blobs_in_stable_storage_chunked` path, real
+    ///    `BisResendBuffer::add` invocation.
+    ///
+    ///    Mutation step: in `BisResendBuffer::add`, replace the
+    ///    `while self.chunks.len() > BIS_REPLAY_BUFFER_MAX_CHUNKS`
+    ///    body with a no-op (`break`). This test MUST then panic with
+    ///    "buffer must NOT exceed cap" — confirming the test guards
+    ///    the trim, not just an incidental side effect.
+    #[tokio::test]
+    async fn bis_replay_buffer_caps_at_max_chunks() {
+        use tokio::time::{Duration, timeout};
+
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w7.local:50081";
+        // Hold rx alive (otherwise sends fail and chunks aren't
+        // buffered) but never drain or ack — this is the misbehaving-
+        // worker pathology.
+        let _rx = register_worker_endpoint(&scheduler, "worker-7", endpoint).await;
+
+        // Drive enough broadcasts that the buffer would hold
+        // > BIS_REPLAY_BUFFER_MAX_CHUNKS chunks if uncapped. Each
+        // 1-digest broadcast yields exactly 1 chunk (ChunkIter still
+        // emits the terminal is_last chunk for a single-element
+        // stream), so N broadcasts → N chunks attempted.
+        let target_chunks = BIS_REPLAY_BUFFER_MAX_CHUNKS + 16;
+        let exercise = async {
+            for i in 0..target_chunks {
+                let digest = vec![make_digest_info(i as u64)];
+                scheduler
+                    .broadcast_blobs_in_stable_storage_chunked(digest)
+                    .await;
+            }
+        };
+        timeout(Duration::from_secs(10), exercise).await.expect(
+            "must not deadlock — broadcast_blobs_in_stable_storage_chunked \
+             with a never-acking worker must trim and return promptly",
+        );
+
+        let buffered = {
+            let inner = scheduler.inner.read().await;
+            inner
+                .bis_resend_buffers
+                .get(endpoint)
+                .map(|b| b.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            buffered, BIS_REPLAY_BUFFER_MAX_CHUNKS,
+            "buffer must NOT exceed cap (#214). Without the trim, a \
+             never-acking worker grows the buffer monotonically across \
+             every broadcast and DoS's the server via memory exhaustion. \
+             expected={BIS_REPLAY_BUFFER_MAX_CHUNKS} got={buffered}"
+        );
+
+        let drops = scheduler
+            .metrics
+            .bis_replay_buffer_overflow_drops
+            .load(Ordering::Relaxed);
+        let expected_drops = (target_chunks - BIS_REPLAY_BUFFER_MAX_CHUNKS) as u64;
+        assert_eq!(
+            drops, expected_drops,
+            "overflow_drops counter must increment by exactly the number \
+             of chunks the cap dropped (operator-visible signal). \
+             expected={expected_drops} got={drops}"
+        );
+
+        let endpoint_drops = {
+            let inner = scheduler.inner.read().await;
+            inner
+                .bis_resend_buffers
+                .get(endpoint)
+                .map(|b| b.overflow_drops())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            endpoint_drops, expected_drops,
+            "per-buffer overflow_drops must also reflect the dropped \
+             count (so an operator inspecting a specific endpoint's \
+             buffer sees the cap firing for THAT worker). \
+             expected={expected_drops} got={endpoint_drops}"
+        );
+    }
+
+    /// 8. **OVER-action (sibling of test 7).** A normal-volume broadcast
+    ///    sequence that stays well under the cap MUST NOT trigger the
+    ///    trim. Otherwise the cap would silently drop live unpins for
+    ///    a healthy worker, causing the worker to miss recent BIS
+    ///    notifications and leak pin state. This is the
+    ///    asymmetric-contract sibling of test 7: the cap is supposed
+    ///    to fire ONLY when over the limit, never below it.
+    ///
+    ///    Mutation step: in `BisResendBuffer::add`, change
+    ///    `> BIS_REPLAY_BUFFER_MAX_CHUNKS` to `>= 0` (always trim).
+    ///    This test MUST then panic with "buffer must hold every
+    ///    chunk when under cap".
+    #[tokio::test]
+    async fn bis_replay_buffer_no_premature_drops_under_cap() {
+        use tokio::time::{Duration, timeout};
+
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w8.local:50081";
+        let _rx = register_worker_endpoint(&scheduler, "worker-8", endpoint).await;
+
+        // Stay well below the cap. Half-cap is comfortably under and
+        // far enough from 0 to make a spurious always-trim mutation
+        // visible.
+        let n = BIS_REPLAY_BUFFER_MAX_CHUNKS / 2;
+        assert!(
+            n > 0,
+            "test invariant: BIS_REPLAY_BUFFER_MAX_CHUNKS must allow a \
+             non-trivial half-cap"
+        );
+        let exercise = async {
+            for i in 0..n {
+                let digest = vec![make_digest_info(i as u64)];
+                scheduler
+                    .broadcast_blobs_in_stable_storage_chunked(digest)
+                    .await;
+            }
+        };
+        timeout(Duration::from_secs(10), exercise).await.expect(
+            "must not deadlock — broadcast_blobs_in_stable_storage_chunked \
+             must complete promptly even when filling the buffer",
+        );
+
+        let buffered = {
+            let inner = scheduler.inner.read().await;
+            inner
+                .bis_resend_buffers
+                .get(endpoint)
+                .map(|b| b.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            buffered, n,
+            "buffer must hold every chunk when under cap. A premature \
+             drop would mean a healthy worker silently misses recent \
+             BIS unpins and leaks pin state. expected={n} got={buffered}"
+        );
+
+        let drops = scheduler
+            .metrics
+            .bis_replay_buffer_overflow_drops
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            drops, 0,
+            "overflow_drops counter must remain 0 when the buffer never \
+             reached the cap. A non-zero value indicates the trim is \
+             firing spuriously (over-action sibling of test 7's \
+             under-action). got={drops}"
+        );
+    }
+
+    /// 9. **Replay correctness under cap.** When the buffer is at cap
+    ///    and the worker reconnects, replay must emit at most
+    ///    `BIS_REPLAY_BUFFER_MAX_CHUNKS` chunks (the buffer's bounded
+    ///    contents) and the SURVIVING chunks must be the most-recent
+    ///    ones (highest `(broadcast_id, sequence)` lex order). The
+    ///    drop-oldest policy is a conscious trade-off: the worker
+    ///    will miss unpins for the earliest broadcasts (it had the
+    ///    most opportunity to ack those) but recent broadcasts —
+    ///    where the digests are most likely still pinned — are
+    ///    preserved.
+    #[tokio::test]
+    async fn bis_replay_after_cap_drops_oldest_keeps_newest() {
+        use tokio::time::{Duration, timeout};
+
+        let scheduler = make_test_scheduler();
+        let endpoint = "grpc://w9.local:50081";
+        let mut rx1 = register_worker_endpoint(&scheduler, "worker-9a", endpoint).await;
+
+        // Drive cap + delta broadcasts so the OLDEST `delta` are
+        // trimmed. Use 1-digest broadcasts so chunk_count == broadcast_count.
+        let delta = 8usize;
+        let total = BIS_REPLAY_BUFFER_MAX_CHUNKS + delta;
+        let exercise = async {
+            for i in 0..total {
+                let digest = vec![make_digest_info(i as u64)];
+                scheduler
+                    .broadcast_blobs_in_stable_storage_chunked(digest)
+                    .await;
+            }
+        };
+        timeout(Duration::from_secs(10), exercise).await.expect(
+            "must not deadlock — fill-and-trim broadcast loop must \
+             complete promptly",
+        );
+
+        // Drop rx1 and reconnect so replay fires.
+        let dispatched = drain_bis_chunks(&mut rx1).await;
+        assert!(
+            !dispatched.is_empty(),
+            "broadcasts must dispatch at least some chunks before reconnect"
+        );
+        drop(rx1);
+        let _ = scheduler
+            .remove_worker(&WorkerId("worker-9a".to_string()))
+            .await;
+
+        let mut rx2 = register_worker_endpoint(&scheduler, "worker-9b", endpoint).await;
+        let replayed = drain_bis_chunks(&mut rx2).await;
+
+        assert_eq!(
+            replayed.len(),
+            BIS_REPLAY_BUFFER_MAX_CHUNKS,
+            "replay must emit at most cap chunks (the bounded buffer's \
+             contents). expected={BIS_REPLAY_BUFFER_MAX_CHUNKS} got={}",
+            replayed.len()
+        );
+
+        // Surviving chunks must be the NEWEST ones — i.e., the
+        // broadcast_ids in [delta+1, total]. Drop-oldest policy means
+        // broadcast_ids 1..=delta were trimmed.
+        let mut survived_bids: Vec<u64> =
+            replayed.iter().map(|c| c.broadcast_id).collect();
+        survived_bids.sort_unstable();
+        let min_survived = *survived_bids.first().expect("non-empty replay");
+        assert!(
+            min_survived > delta as u64,
+            "drop-oldest policy must trim the earliest broadcast_ids \
+             (1..={delta}); a survivor with broadcast_id <= {delta} \
+             means a NEWER chunk was dropped instead of an older one, \
+             violating the drop-oldest contract. min_survived={min_survived}"
         );
     }
 }
