@@ -25,6 +25,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use parking_lot::RwLock;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
@@ -38,6 +39,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::BatchReadBlobsRequest
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
+    make_buf_channel_pair_with_size,
 };
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -119,6 +121,26 @@ pub struct WorkerProxyStore {
     /// dependency, so we hand the coalescer a `Weak<Self>` capture and
     /// initialize it on first use via `OnceLock`.
     batch_read_coalescer: OnceLock<Arc<BatchReadCoalescer>>,
+    /// CDN-tee counters (#230). Track the cache-write side-task lifecycle
+    /// for the streaming `get_part_and_cache` path. The four counters
+    /// triangulate why a peer-fetched blob did or didn't end up in the
+    /// inner cache — without them, audits like #229 had to infer from
+    /// log markers and got 88 % silent-failure rates.
+    ///
+    /// Incremented when the spawned cache task starts (one per eligible
+    /// peer-fetch, i.e. full-blob read ≤ `MAX_CACHE_BLOB_SIZE`).
+    cdn_tee_cache_attempts_total: AtomicU64,
+    /// Incremented when the spawned cache task's `inner.update` returned
+    /// `Ok` and the task completed within its timeout.
+    cdn_tee_cache_completed_total: AtomicU64,
+    /// Incremented when the per-chunk forward loop observed
+    /// `cache_tx.try_send` returning `Full` and abandoned the cache-tee
+    /// for this blob (continuing forwarding to Bazel only).
+    cdn_tee_cache_abandoned_full_total: AtomicU64,
+    /// Incremented when the consumer (Bazel) disconnected mid-blob
+    /// (forward `Err`), causing the forward loop to drop `cache_tx`
+    /// and abandon the cache-tee.
+    cdn_tee_cache_abandoned_consumer_eof_total: AtomicU64,
 }
 
 /// Per-endpoint mirror state: in-flight permits and consecutive-failure tracking.
@@ -180,6 +202,49 @@ impl MirrorEndpointState {
 /// ~72 MiB in its `buf_channel`. Higher values risk the RSS spike pattern
 /// seen during the 2026-03-25 write burst.
 const MIRROR_PERMITS_PER_WORKER: usize = 16;
+
+/// CDN-tee cache mpsc capacity (#230). Bytes flow as:
+///   peer chunks → forward to Bazel → `try_send` to cache mpsc → cache task
+///                                                              → inner.update
+///
+/// The cap is small on purpose. The CDN-tee is a best-effort fan-out:
+/// the user-explicit contract is "Bazel reader NEVER blocks on cache",
+/// so the per-chunk loop uses `try_send` and abandons on `Full`. A
+/// large buffer would let the cache task lag arbitrarily far behind
+/// the peer-reader; a tiny buffer detects cache stall fast and frees
+/// the abandon path to take over.
+///
+/// Why 4 specifically:
+/// - large enough to absorb a micro-burst (peer delivers 2-3 chunks
+///   back-to-back while cache_task is briefly preempted),
+/// - small enough that a slow inner-store update (sustained cache-tier
+///   latency, e.g. ZFS txg-sync hiccup) trips the abandon path within
+///   one peer-reader "burst" rather than letting the cache task
+///   accumulate hundreds of MiB of buffered chunks behind a stalled
+///   write,
+/// - matches the `mirror_channel = 16` direction the user requested
+///   (tighter back-pressure, less memory) for adjacent fan-out paths,
+///   and is even tighter because the cache-tee can be abandoned with
+///   no correctness loss while a mirror cannot.
+///
+/// Total memory budget per in-flight peer-fetch: 4 chunks × ~3 MiB
+/// `read_buffer_size` ≈ 12 MiB. With ~50 concurrent peer-fetches
+/// across the fleet that is < 1 GiB — well below the 8 GiB MemoryStore
+/// fast-tier budget that motivated the 2026-03-25 OOM tuning.
+const CDN_TEE_CACHE_MPSC_CAP: usize = 4;
+
+/// Wall-clock cap on the CDN-tee spawned cache task (#230). The task runs
+/// `inner.update(cache_rx, ExactSize(digest.size_bytes()))`, which is
+/// bounded only by the cache mpsc and the inner store's own internals.
+/// Without this timeout, a wedged peer (stops sending chunks but never
+/// EOFs cache_tx because `forward_fut` is also stalled) or a wedged
+/// inner store could leak the spawned task and its FilesystemStore
+/// in-flight tracker entry indefinitely.
+///
+/// 60s is the same order of magnitude as the per-chunk write timeout
+/// upstream and gives a real ZFS hiccup time to finish without
+/// hair-trigger abandoning a large blob mid-write.
+const CDN_TEE_CACHE_TASK_TIMEOUT: Duration = Duration::from_secs(60);
 /// Consecutive failures within `MIRROR_FAILURE_WINDOW` that trigger quarantine.
 const MIRROR_FAILURE_THRESHOLD: u32 = 5;
 /// Window over which `MIRROR_FAILURE_THRESHOLD` failures must occur to trigger
@@ -240,6 +305,32 @@ impl MetricsComponent for WorkerProxyStore {
             &self.mirror_dropped_quarantined,
             MetricKind::Counter,
             "Mirrors skipped because no eligible endpoint could be selected"
+        );
+
+        publish!(
+            "cdn_tee_cache_attempts_total",
+            &self.cdn_tee_cache_attempts_total,
+            MetricKind::Counter,
+            "CDN-tee cache write tasks spawned (eligible peer-fetched blobs)"
+        );
+        publish!(
+            "cdn_tee_cache_completed_total",
+            &self.cdn_tee_cache_completed_total,
+            MetricKind::Counter,
+            "CDN-tee cache write tasks that completed inner.update successfully"
+        );
+        publish!(
+            "cdn_tee_cache_abandoned_full_total",
+            &self.cdn_tee_cache_abandoned_full_total,
+            MetricKind::Counter,
+            "CDN-tee writes abandoned because cache mpsc was full \
+             (cache slower than peer-reader; Bazel kept being served)"
+        );
+        publish!(
+            "cdn_tee_cache_abandoned_consumer_eof_total",
+            &self.cdn_tee_cache_abandoned_consumer_eof_total,
+            MetricKind::Counter,
+            "CDN-tee writes abandoned because Bazel consumer disconnected mid-blob"
         );
 
         // Snapshot per-endpoint state under a brief read lock, then publish
@@ -433,6 +524,10 @@ impl WorkerProxyStore {
             mirror_dropped_quarantined: AtomicU64::new(0),
             batch_small_blob_reads: AtomicBool::new(false),
             batch_read_coalescer: OnceLock::new(),
+            cdn_tee_cache_attempts_total: AtomicU64::new(0),
+            cdn_tee_cache_completed_total: AtomicU64::new(0),
+            cdn_tee_cache_abandoned_full_total: AtomicU64::new(0),
+            cdn_tee_cache_abandoned_consumer_eof_total: AtomicU64::new(0),
         })
     }
 
@@ -458,6 +553,10 @@ impl WorkerProxyStore {
             mirror_dropped_quarantined: AtomicU64::new(0),
             batch_small_blob_reads: AtomicBool::new(false),
             batch_read_coalescer: OnceLock::new(),
+            cdn_tee_cache_attempts_total: AtomicU64::new(0),
+            cdn_tee_cache_completed_total: AtomicU64::new(0),
+            cdn_tee_cache_abandoned_full_total: AtomicU64::new(0),
+            cdn_tee_cache_abandoned_consumer_eof_total: AtomicU64::new(0),
         })
     }
 
@@ -1349,10 +1448,56 @@ impl WorkerProxyStore {
     /// Wrapper around a peer's `get_part` that tees the data to both the
     /// caller's writer and a background write to the inner store.
     ///
-    /// For full-blob reads (offset=0, length=None) of blobs within the
-    /// size limit, the data is collected during streaming and written to
-    /// `self.inner` in a background task after success. For partial reads
-    /// or oversized blobs, streams directly without caching.
+    /// For full-blob reads (`offset == 0 && length.is_none()`) of blobs
+    /// within `MAX_CACHE_BLOB_SIZE`, the bytes are forwarded chunk-by-chunk
+    /// to the caller AND fanned out to a spawned cache task that writes
+    /// the blob to `self.inner`. For partial reads or oversized blobs,
+    /// streams directly without caching.
+    ///
+    /// # Architecture (#230 — user-approved 2026-05-02)
+    ///
+    /// The forward path is the SOURCE OF TRUTH. The cache fan-out is a
+    /// best-effort tee that never propagates back-pressure into the
+    /// forward path. Concretely, the per-chunk loop is:
+    ///
+    /// 1. `bazel_writer.send(chunk).await` — awaits ONLY Bazel-side
+    ///    back-pressure. The caller's writer is the only thing that can
+    ///    legitimately make the peer-reader wait.
+    /// 2. `cache_tx.try_send(chunk)` — non-blocking. If the cache mpsc
+    ///    is full, set `cache_alive = false`, drop `cache_tx`, and
+    ///    continue forwarding-only. The next reader that needs this
+    ///    digest triggers another peer-fetch — user-explicit: "if you
+    ///    have to re-read chunks from the worker again, so be it."
+    ///
+    /// The cache task is spawned BEFORE the forward loop and runs
+    /// `inner.update(digest, cache_rx, ExactSize(size))` to completion
+    /// (or `CDN_TEE_CACHE_TASK_TIMEOUT`, whichever comes first). On
+    /// abandon, the cache task sees an EOF before all bytes arrive,
+    /// `inner.update`'s `ExactSize` check trips, and the FilesystemStore
+    /// in-flight tracker drops the partial via `discard_chunked`.
+    ///
+    /// # Why this is NOT `tokio::join!(forward, cache)` per chunk
+    ///
+    /// A per-chunk join would couple Bazel back-pressure to cache
+    /// back-pressure: the chunk loop would not advance until BOTH halves
+    /// drained. The pre-#230 implementation had this shape (a 3-way
+    /// `tokio::join!` over the entire stream) and silently lost ~88 % of
+    /// peer-fetched blobs because the bytestream consumer's `unfold`
+    /// returned `None` on EOF, which dropped the `cache_write_fut`
+    /// mid-`inner.update`. Per-#229 audit at
+    /// `.claude/audits/229-peer-fetch-outcome-coverage.md`.
+    ///
+    /// # Asymmetric contract coverage (per CLAUDE.md §Tests)
+    ///
+    /// State-mutating side effects on the borrowed `&mut writer` here:
+    /// - Under-action: forward-loop fails to send EOF on Bazel-EOF path.
+    ///   Caller's `tokio::join!` over a paired rx would deadlock.
+    /// - Over-action: forward-loop fires `send_error` on the writer in a
+    ///   path where the peer succeeded — wrapping callers (e.g.
+    ///   try_read_from_worker's resume logic) would mistake a cache
+    ///   abandon for a transport failure and trigger a peer cycle.
+    /// Both directions are covered by tests in
+    /// `nativelink-store/tests/worker_proxy_store_test.rs` (`cdn_*`).
     async fn get_part_and_cache(
         &self,
         peer_store: &Store,
@@ -1381,154 +1526,249 @@ impl WorkerProxyStore {
                 .await;
         }
 
-        // Create an intermediate channel so we can tee the data to both the
-        // caller's writer and a concurrent inner store write.
+        // Intermediate buf_channel that the peer's `get_part` writes into;
+        // we then fan the bytes out to (a) the caller's writer and
+        // (b) the cache mpsc.
         let (mut proxy_tx, mut proxy_rx) = make_buf_channel_pair();
-        let (mut cache_tx, cache_rx) = make_buf_channel_pair();
 
-        // Run the peer's get_part concurrently with forwarding, because the
-        // buf_channel has limited capacity and the producer will block if
-        // we don't consume data as it arrives. IS_WORKER_REQUEST=true
-        // propagates to the peer (loop-terminator: peer enters responder
-        // mode and won't chain).
+        // Cache mpsc: tight cap so a slow cache task triggers abandon
+        // fast (#230). NOT shared with the caller's writer — these are
+        // two independent flow-control regimes by design.
+        //
+        // `cache_tx` is wrapped in an Option so the abandon paths can
+        // `take()` it (move-out + None in one step) without fighting
+        // the borrow checker over the `loop` boundary. `cache_alive`
+        // mirrors `Option::is_some` for branch-hint clarity.
+        let (cache_tx_init, cache_rx) =
+            make_buf_channel_pair_with_size(CDN_TEE_CACHE_MPSC_CAP);
+        let mut cache_tx: Option<DropCloserWriteHalf> = Some(cache_tx_init);
+
+        // Spawn the peer-reader. The peer keeps writing into `proxy_tx`
+        // bounded only by `proxy_tx`'s own mpsc capacity; the forward
+        // loop below drives `proxy_rx`.
         let owned_key = key.borrow().into_owned();
         let peer = peer_store.clone();
-        let get_part_fut = async move {
+        let peer_handle: JoinHandle<Result<(), Error>> = tokio::spawn(async move {
             IS_WORKER_REQUEST
                 .scope(
                     true,
                     peer.get_part(owned_key.borrow(), &mut proxy_tx, offset, length),
                 )
                 .await
-        };
+        });
 
-        // Start the inner store write concurrently. If the blob size is known
-        // from the digest, use ExactSize; otherwise MaxSize.
+        // Spawn the cache-write task. It owns `cache_rx` for its full
+        // lifetime; the forward loop owns `cache_tx` and either feeds it
+        // (happy path) or drops it (abandon path). Either way the cache
+        // task observes a finite stream and runs to completion or
+        // abandons cleanly via the inner store's ExactSize check.
+        //
+        // Counter increment is BEFORE the spawn so the attempt count
+        // covers every code path that intends to cache (including ones
+        // where the cache task is immediately dropped because the very
+        // first try_send returns Full).
+        self.cdn_tee_cache_attempts_total.fetch_add(1, Ordering::Relaxed);
         let inner = self.inner.clone();
         let cache_size = UploadSizeInfo::ExactSize(digest.size_bytes());
         let cache_key: StoreKey<'static> = digest.into();
-        let cache_write_fut = async move {
-            inner.update(cache_key, cache_rx, cache_size).await
-        };
+        let completed_counter = Arc::new(AtomicU64::new(0));
+        let completed_counter_for_task = completed_counter.clone();
+        // Wrap inner.update in a task-level timeout so a wedged inner
+        // store cannot leak the spawned task (and its in-flight tracker
+        // entry) indefinitely.
+        let cache_handle: JoinHandle<()> = tokio::spawn(async move {
+            match tokio::time::timeout(
+                CDN_TEE_CACHE_TASK_TIMEOUT,
+                inner.update(cache_key, cache_rx, cache_size),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    completed_counter_for_task.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        %digest,
+                        size_bytes = digest.size_bytes(),
+                        "proxy_cache: cached proxied blob in inner store"
+                    );
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        %digest,
+                        size_bytes = digest.size_bytes(),
+                        ?e,
+                        "proxy_cache: failed to cache proxied blob in inner store"
+                    );
+                }
+                Err(_elapsed) => {
+                    error!(
+                        %digest,
+                        size_bytes = digest.size_bytes(),
+                        timeout_s = CDN_TEE_CACHE_TASK_TIMEOUT.as_secs(),
+                        "proxy_cache: cache write task exceeded timeout — abandoning \
+                         (FilesystemStore in-flight tracker discards partial)"
+                    );
+                }
+            }
+        });
 
+        // Per-chunk forward loop. `cache_tx` is `Some` while the
+        // cache fan-out is active; `take()` on every abandon path
+        // drops it in one move. Once None, never re-arm.
         let mut total_bytes: u64 = 0;
-        let forward_fut = async {
-            loop {
-                match proxy_rx.recv().await {
-                    Ok(chunk) if chunk.is_empty() => {
-                        writer
-                            .send_eof()
-                            .err_tip(|| "get_part_and_cache: forwarding EOF")?;
-                        cache_tx
-                            .send_eof()
-                            .err_tip(|| "get_part_and_cache: cache EOF")?;
-                        break;
+        let mut forward_result: Result<(), Error> = Ok(());
+        loop {
+            match proxy_rx.recv().await {
+                Ok(chunk) if chunk.is_empty() => {
+                    // Peer EOF. Forward EOF to Bazel; finalize cache.
+                    if let Err(e) = writer
+                        .send_eof()
+                        .err_tip(|| "get_part_and_cache: forwarding EOF")
+                    {
+                        forward_result = Err(e);
                     }
-                    Ok(chunk) => {
-                        total_bytes += chunk.len() as u64;
-                        // Send to inner store write (clone is O(1) refcount bump).
-                        if let Err(e) = cache_tx.send(chunk.clone()).await {
-                            // Cache write failed; log but continue serving the caller.
+                    if let Some(mut tx) = cache_tx.take() {
+                        // Best-effort cache EOF. If it errors (cache task
+                        // already gone — unusual but not fatal), log and
+                        // proceed; the dropped tx still tidies up.
+                        if let Err(e) = tx.send_eof() {
                             warn!(
                                 %digest,
                                 ?e,
-                                "get_part_and_cache: cache channel send failed, \
-                                 skipping cache"
+                                "get_part_and_cache: cache_tx send_eof failed \
+                                 (cache task may have errored already)"
                             );
-                            // Drop the cache writer so the cache_write_fut finishes.
-                            drop(cache_tx);
-                            // Forward remaining data without caching.
-                            writer
-                                .send(chunk)
-                                .await
-                                .err_tip(|| "get_part_and_cache: forwarding chunk")?;
-                            loop {
-                                match proxy_rx.recv().await {
-                                    Ok(c) if c.is_empty() => {
-                                        writer.send_eof().err_tip(
-                                            || "get_part_and_cache: forwarding EOF (no cache)",
-                                        )?;
-                                        return Ok::<(), Error>(());
-                                    }
-                                    Ok(c) => {
-                                        writer.send(c).await.err_tip(
-                                            || "get_part_and_cache: forwarding chunk (no cache)",
-                                        )?;
-                                    }
-                                    Err(e) => {
-                                        return Err(e).err_tip(
-                                            || "get_part_and_cache: proxy channel (no cache)",
-                                        );
-                                    }
-                                }
+                        }
+                    }
+                    break;
+                }
+                Ok(chunk) => {
+                    total_bytes += chunk.len() as u64;
+                    // (1) Forward to Bazel — awaits ONLY Bazel-side back-
+                    // pressure. If this errors, the consumer is gone:
+                    // abandon cache, propagate to the caller.
+                    if let Err(e) = writer
+                        .send(chunk.clone())
+                        .await
+                        .err_tip(|| "get_part_and_cache: forwarding chunk")
+                    {
+                        if cache_tx.take().is_some() {
+                            self.cdn_tee_cache_abandoned_consumer_eof_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                %digest,
+                                bytes_sent = total_bytes,
+                                "get_part_and_cache: bazel consumer disconnected \
+                                 mid-blob — abandoning cache fan-out"
+                            );
+                            // take() above already dropped cache_tx; the
+                            // cache task observes EOF before all bytes
+                            // (ExactSize mismatch triggers
+                            // FilesystemStore in-flight discard).
+                        }
+                        forward_result = Err(e);
+                        break;
+                    }
+                    // (2) Best-effort cache fan-out — non-blocking. NEVER
+                    // .await here; the user-explicit contract is "Bazel
+                    // reader NEVER blocks on cache".
+                    if let Some(tx) = cache_tx.as_mut() {
+                        match tx.try_send(chunk) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                self.cdn_tee_cache_abandoned_full_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    %digest,
+                                    bytes_sent = total_bytes,
+                                    cap = CDN_TEE_CACHE_MPSC_CAP,
+                                    "get_part_and_cache: cache mpsc full — \
+                                     abandoning cache fan-out (Bazel reader \
+                                     unaffected; next reader will re-fetch)"
+                                );
+                                cache_tx.take();
+                            }
+                            Err(TrySendError::Closed(_)) => {
+                                // Cache task already returned (errored or
+                                // wedged-and-timed-out). Accounting: NOT
+                                // a Bazel-disconnect; NOT a fill-up.
+                                // Signal-class is "task exited unexpectedly"
+                                // and is already covered by the cache
+                                // task's own warn!/error! log paths.
+                                warn!(
+                                    %digest,
+                                    bytes_sent = total_bytes,
+                                    "get_part_and_cache: cache_rx closed before \
+                                     forward EOF (cache task ended) — abandoning \
+                                     cache fan-out"
+                                );
+                                cache_tx.take();
                             }
                         }
-                        writer
-                            .send(chunk)
-                            .await
-                            .err_tip(|| "get_part_and_cache: forwarding chunk")?;
-                    }
-                    Err(e) => {
-                        return Err(e)
-                            .err_tip(|| "get_part_and_cache: reading from proxy channel");
                     }
                 }
+                Err(e) => {
+                    // Peer side errored. Drop cache_tx so the cache task
+                    // sees a short stream and aborts via ExactSize. The
+                    // outer caller observes the peer-driven error via
+                    // peer_handle below.
+                    cache_tx.take();
+                    forward_result = Err(e)
+                        .err_tip(|| "get_part_and_cache: reading from proxy channel");
+                    break;
+                }
             }
-            Ok::<(), Error>(())
+        }
+
+        // Defensive: ensure cache_tx is dropped before we await the peer
+        // task. Each branch above already takes() it on its own exit
+        // path; this is a no-op when reached via EOF (already None).
+        let cache_alive_at_end = cache_tx.is_some();
+        drop(cache_tx);
+
+        // Resolve the peer-reader task. Error preference: the producer
+        // (peer) is the source of truth — surface its structured upstream
+        // code (NotFound, DataLoss, Unavailable, …) before the forward
+        // loop's derivative artifacts. Sibling pattern to commit 8674bc19
+        // (populate path) and 01b68015 (spawn-detach producer path).
+        //
+        // Cancellation note: if the outer caller is dropped, dropping
+        // this future drops both spawned tasks via JoinHandle's drop
+        // semantics — but the cache task is `tokio::spawn`-detached so
+        // it CONTINUES TO RUN on its own (covered by the per-task
+        // timeout). The peer task is awaited here; if cancellation
+        // drops us mid-await, peer task likewise continues until its
+        // proxy_tx send fails into the dropped proxy_rx, then exits.
+        let get_part_result = match peer_handle.await {
+            Ok(res) => res,
+            Err(join_err) => Err(make_err!(
+                Code::Internal,
+                "get_part_and_cache: peer-reader task join failed: {join_err:?}"
+            )),
         };
 
-        let (get_part_result, forward_result, cache_result) =
-            tokio::join!(get_part_fut, forward_fut, cache_write_fut);
+        // Cache task is detached; we do NOT await it. The counters
+        // attempted/completed/abandoned-* expose its outcome to operators.
+        // The handle's drop is a no-op for `tokio::spawn`-detached tasks.
+        drop(cache_handle);
+        // Reference completed_counter so the compiler keeps it tied to
+        // the cache task's lifetime (the Arc clone moved in is the
+        // important one; this drop is documentation).
+        drop(completed_counter);
 
-        // Error preference: surface the structured upstream code from the
-        // peer's get_part BEFORE the forward path's "Sender dropped before
-        // sending EOF" artifact. When the peer errors mid-stream it drops
-        // its writer (proxy_tx) without EOF, which makes `forward_fut`
-        // observe a generic `Code::Internal` from `proxy_rx.recv()` —
-        // masking the structured code (NotFound, Unavailable, DataLoss,
-        // etc.) that callers up the chain need for connection-pool /
-        // locality / retry decisions. Sibling fix to commit 8674bc19 (the
-        // populate path) and 01b68015 (the spawn-detach producer path):
-        // the producer is the source of truth, the forward channel error
-        // is a secondary symptom.
-        //
-        // Cancellation note: if the outer caller is dropped, all three
-        // futures here drop together via `tokio::join!`. There is no
-        // observer for any of the results, so the ordering is irrelevant
-        // for cancellation; this only changes behavior when the join!
-        // completes naturally with at least one Err.
         if let Err(get_err) = get_part_result {
-            // Peer's get_part errored — surface that. forward/cache
-            // results are derivative and would only confuse the caller.
+            // Peer's get_part errored — surface that. forward result is
+            // derivative.
             return Err(get_err);
         }
-        // Peer's get_part returned Ok. If forwarding failed (e.g.
-        // caller's writer broken), propagate that error.
+        // Peer succeeded. Surface forward error if any.
         forward_result?;
 
-        // Log cache write result (non-fatal).
-        match cache_result {
-            Ok(()) => {
-                // Per-blob (not per-chunk) state transition: a peer-fetched
-                // blob was successfully tee'd into local CAS. info! lets
-                // operators see how often the CDN tee fires in production
-                // without needing to enable debug logging.
-                info!(
-                    %digest,
-                    size_bytes = total_bytes,
-                    "proxy_cache: cached proxied blob in inner store"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    %digest,
-                    size_bytes = total_bytes,
-                    ?e,
-                    "proxy_cache: failed to cache proxied blob in inner store"
-                );
-            }
-        }
-
+        debug!(
+            %digest,
+            size_bytes = total_bytes,
+            cache_alive_at_end,
+            "get_part_and_cache: forward loop completed successfully"
+        );
         Ok(())
     }
 
