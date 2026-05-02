@@ -542,22 +542,37 @@ async fn server_size_mismatch_returns_internal_error() {
 /// EXACTLY when dispatch resolves, and that the reader passed to
 /// the chunked client is consumed by-move (no borrowed reference
 /// outlives the call).
+///
+/// Sync primitives: `entered` (fired by the dispatcher on entry;
+/// proves the chunked-client has reached the dispatch boundary)
+/// and `released` (fired by the test to release the dispatcher
+/// future). Per CLAUDE.md test discipline, NO `tokio::time::sleep`
+/// is used for synchronization; mutation step: comment out the
+/// `entered.notify_one()` call below — the test then waits forever
+/// on `entered.notified()` and fails the 5s outer timeout with the
+/// "must not deadlock — dispatcher must enter before assertion"
+/// message.
 #[nativelink_test]
 async fn anti_203_no_borrowed_reader_held_across_rpc() {
     use tokio::sync::Notify;
 
-    /// Dispatcher that resolves only when its `released` Notify
-    /// fires. Lets the test verify "the function returns the moment
-    /// the dispatcher's future resolves, NOT before."
+    /// Dispatcher that fires `entered` on entry and waits on
+    /// `released` before returning. Lets the test verify (a) the
+    /// chunked-client reached the dispatch boundary AND (b) the
+    /// function returns the moment the dispatcher's future
+    /// resolves, NOT before.
     struct GatedDispatcher {
+        entered: Arc<Notify>,
         released: Arc<Notify>,
         size: u64,
     }
     impl WriteChunkedDispatcher for GatedDispatcher {
         fn dispatch(&self, _chunks: Vec<WriteChunk>) -> DispatchFuture {
+            let entered = Arc::clone(&self.entered);
             let released = Arc::clone(&self.released);
             let size = self.size;
             Box::pin(async move {
+                entered.notify_one();
                 released.notified().await;
                 Ok(WriteChunkedResponse {
                     committed_digest: None,
@@ -569,8 +584,10 @@ async fn anti_203_no_borrowed_reader_held_across_rpc() {
 
     const N: usize = 4 * 1024;
     let (digest, blob) = synth_blob(N);
+    let entered = Arc::new(Notify::new());
     let released = Arc::new(Notify::new());
     let dispatcher = Arc::new(GatedDispatcher {
+        entered: Arc::clone(&entered),
         released: Arc::clone(&released),
         size: N as u64,
     });
@@ -592,10 +609,11 @@ async fn anti_203_no_borrowed_reader_held_across_rpc() {
         .await
     });
 
-    // Give the chunked-client time to enter the dispatcher (which
-    // is now waiting on `released`). With no timeout below the test
-    // would hang — bound it.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for the dispatcher to enter (proves the chunked-client
+    // is now inside `dispatch().await` — no `sleep` race window).
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("must not deadlock — dispatcher must enter before assertion");
     assert!(
         !call.is_finished(),
         "client should still be waiting on dispatcher's gated future"
