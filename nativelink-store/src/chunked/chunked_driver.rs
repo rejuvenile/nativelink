@@ -60,7 +60,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::spawn;
 use nativelink_util::task::JoinHandleDropGuard;
 use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
+use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -839,17 +839,23 @@ async fn commit_and_verify<Fe: FileEntry>(
     let computed = tokio::task::spawn_blocking({
         let path = holding_path_pb.clone();
         move || -> Result<[u8; 32], std::io::Error> {
-            // sha2's `Sha256::digest(slice)` would require loading the
-            // whole file into memory; for a 100 MiB blob that is 100 MiB
-            // of allocation. Stream via `std::io::Read` + `Sha256::update`
-            // to keep peak memory at the read-buffer size only.
+            // Stream via `std::io::Read` + `DigestHasher::update` to keep
+            // peak memory at the read-buffer size only (a 100 MiB blob
+            // would otherwise need 100 MiB of allocation up front).
             //
-            // Buffer = 1 MiB to match ZFS recordsize=1M on `fast/nativelink/work`
-            // (perf-optimizer MINOR-1 fixup); avoids 16× syscalls per record
-            // vs the previous 64 KiB.
+            // Buffer = 1 MiB to match ZFS recordsize=1M on
+            // `fast/nativelink/work` (perf-optimizer MINOR-1 fixup);
+            // avoids 16× syscalls per record vs the previous 64 KiB.
+            //
+            // #228 fix: use the process-wide default digest hasher
+            // (`blake3` in production per `default_digest_hash_function`
+            // in buildcache-native.json5 / worker.json5). The previous
+            // hardcoded Sha256 mismatched every BLAKE3-named declared
+            // digest at the e2e check, rejecting 100% of >=1 MiB writes
+            // in production.
             use std::io::Read;
             let mut file = std::fs::File::open(&path)?;
-            let mut hasher = Sha256::new();
+            let mut hasher = default_digest_hasher_func().hasher();
             let mut buf = vec![0u8; 1024 * 1024];
             loop {
                 let n = file.read(&mut buf)?;
@@ -858,10 +864,8 @@ async fn commit_and_verify<Fe: FileEntry>(
                 }
                 hasher.update(&buf[..n]);
             }
-            let out = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(out.as_ref());
-            Ok(bytes)
+            let info = hasher.finalize_digest();
+            Ok(**info.packed_hash())
         }
     })
     .await

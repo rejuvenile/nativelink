@@ -88,7 +88,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_util::buf_channel::DropCloserReadHalf;
 use nativelink_util::common::DigestInfo;
 use prost::Message as _;
-use sha2::{Digest as _, Sha256};
+use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
 use tonic::Response;
 use tracing::{debug, info, warn};
 
@@ -668,23 +668,23 @@ async fn collect_and_hash_chunks(
     Ok(chunks)
 }
 
-/// SHA-256 a single chunk on `spawn_blocking`. `Bytes::clone()` is
-/// O(1) (refcount bump), so the spawned task gets cheap zero-copy
-/// access to the bytes.
+/// Hash a single chunk on `spawn_blocking` using the process-wide
+/// default digest hasher (BLAKE3 in production, SHA-256 in tests).
+/// `Bytes::clone()` is O(1) (refcount bump), so the spawned task gets
+/// cheap zero-copy access to the bytes. #228 fix: the previous
+/// hardcoded Sha256 mismatched BLAKE3-named declared digests.
 async fn hash_chunk_blocking(bytes: Bytes) -> Result<[u8; 32], Error> {
     tokio::task::spawn_blocking(move || -> [u8; 32] {
-        let mut h = Sha256::new();
+        let mut h = default_digest_hasher_func().hasher();
         h.update(&bytes);
-        let out = h.finalize();
-        let mut a = [0u8; 32];
-        a.copy_from_slice(out.as_ref());
-        a
+        let info = h.finalize_digest();
+        **info.packed_hash()
     })
     .await
     .map_err(|join_err| {
         make_err!(
             Code::Internal,
-            "WriteChunked client: spawn_blocking join error in per-chunk SHA-256: {join_err:?}"
+            "WriteChunked client: spawn_blocking join error in per-chunk hash: {join_err:?}"
         )
     })
 }
@@ -695,6 +695,14 @@ mod tests {
     use nativelink_macro::nativelink_test;
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal::Reason;
     use nativelink_util::buf_channel::make_buf_channel_pair;
+    // Tests pin the digest function to Sha256 (the unit-test default
+    // returned by `default_digest_hasher_func()` when nothing has been
+    // set process-wide) so the production hashing path computes hashes
+    // matching this ground-truth helper. #228 production fix routes
+    // through `DigestHasher` instead of hardcoded sha2 in the
+    // production code; tests stay on sha2 directly so the mismatch
+    // surface is the single equality check.
+    use sha2::{Digest as _, Sha256};
 
     use crate::chunked_signal::encode_backpressure_signal_any;
 

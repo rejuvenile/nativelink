@@ -65,7 +65,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt as _;
 use parking_lot::Mutex;
-use sha2::{Digest as _, Sha256};
+use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
@@ -2045,20 +2045,25 @@ fn build_bazel_chunk_stream(
     Box::pin(stream)
 }
 
+/// Hash a single chunk on `spawn_blocking` using the process-wide
+/// default digest hasher (BLAKE3 in production, SHA-256 in tests).
+/// #228 fix: name preserved (`compute_sha256_blocking`) to avoid a
+/// large rename diff, but the function now dispatches via
+/// `DigestHasher` and produces a hash matching whatever
+/// `default_digest_hasher_func()` returns. Per-blob override per REAPI
+/// v2 `digest_function` can be threaded later.
 async fn compute_sha256_blocking(bytes: Bytes) -> Result<[u8; 32], Error> {
     tokio::task::spawn_blocking(move || -> [u8; 32] {
-        let mut h = Sha256::new();
+        let mut h = default_digest_hasher_func().hasher();
         h.update(&bytes);
-        let out = h.finalize();
-        let mut a = [0u8; 32];
-        a.copy_from_slice(out.as_ref());
-        a
+        let info = h.finalize_digest();
+        **info.packed_hash()
     })
     .await
     .map_err(|join_err| {
         make_err!(
             Code::Internal,
-            "spawn_blocking join error in bazel-facing per-chunk SHA-256: {join_err:?}"
+            "spawn_blocking join error in bazel-facing per-chunk hash: {join_err:?}"
         )
     })
 }
