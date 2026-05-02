@@ -704,24 +704,29 @@ async fn cdn_tee_abandon_full_leaves_no_on_disk_partial() -> Result<(), Error> {
          observed full={full}",
     );
 
-    // Wait for the throttled inner.update to either return or be
-    // discarded. The cache task's per-task timeout (60s) is larger
-    // than our test timeout, so we briefly poll the FilesystemStore
-    // for a definitive verdict.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // No orphan partial file: FilesystemStore must have discarded
-    // the partial (or the throttled wrapper's eventual update
-    // returned an Err that triggered the discard path).
-    let abandoned_partial_present =
-        find_digest_file(&content_path, &digest).await;
+    // Poll the FilesystemStore content_path until either the orphan
+    // file disappears (expected) or the test deadline fires (failure).
+    // Per CLAUDE.md "no `tokio::time::sleep` as synchronization in
+    // tests" — we bound the polling loop by TEST_TIMEOUT and treat the
+    // absence-of-file as the synchronization condition.
+    let poll_deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    let mut abandoned_partial_present = true;
+    while std::time::Instant::now() < poll_deadline {
+        abandoned_partial_present =
+            find_digest_file(&content_path, &digest).await;
+        if !abandoned_partial_present {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert!(
         !abandoned_partial_present,
         "after abandon-full, FilesystemStore content_path={} must NOT \
-         contain a partial file for digest {digest}; orphan partial \
-         would be the symptom of FilesystemStore in-flight discard \
-         not firing on a short cache_rx stream",
+         contain a partial file for digest {digest} within {:?}; \
+         orphan partial would be the symptom of FilesystemStore \
+         in-flight discard not firing on a short cache_rx stream",
         content_path,
+        TEST_TIMEOUT,
     );
 
     Ok(())
@@ -826,6 +831,137 @@ async fn cdn_tee_sustained_cache_slowness_does_not_deadlock_201()
         "with sustained 3s-per-update cache and {blob_count} concurrent \
          fetches, at least one abandon-on-full must have fired; observed \
          full={full}, attempts={attempts}",
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Test 7: M1 (perf-optimizer BLOCK fix) — abandon path with >1024
+// chunks must NOT pin the peer task on `proxy_tx.send().await`.
+// ---------------------------------------------------------------------
+
+/// Regression test for the M1 BLOCK in #230's r1 review.
+///
+/// **Bug**: when the Bazel consumer disconnects mid-blob, the forward
+/// loop's `writer.send(chunk).await` errors and the loop `break`s
+/// without dropping `proxy_rx`. The peer task continues writing into
+/// `proxy_tx` (default capacity = `DEFAULT_BUF_CHANNEL_CAPACITY = 1024`
+/// slots). With a peer chunk size that produces >1024 chunks per blob,
+/// the peer task fills proxy_tx and blocks indefinitely on
+/// `proxy_tx.send().await`. The outer `peer_handle.await` then hangs
+/// forever, pinning a tokio worker per orphaned fetch.
+///
+/// **Fix** (`worker_proxy_store.rs`): drop `proxy_rx` (and
+/// `peer_handle.abort()`) BEFORE awaiting `peer_handle` whenever the
+/// forward loop errored. The peer task's next `send()` then fails with
+/// a closed-channel error and the task exits.
+///
+/// **Reproduction parameters**: 8 KiB chunks × 16 MiB blob = 2048
+/// chunks (well over the 1024-slot proxy_tx cap). Inter-chunk sleep is
+/// kept tiny so the peer task is reliably mid-stream when we drop the
+/// consumer at ~10% received bytes.
+///
+/// **Mutation step**: revert both the `peer_handle.abort()` and the
+/// `drop(proxy_rx)` lines in `get_part_and_cache` (replace with `let
+/// _proxy_rx = proxy_rx; let _peer_handle = &peer_handle;` so the
+/// channel and join handle are still live across the await). The
+/// `tokio::time::timeout(TEST_TIMEOUT)` will fire and the bespoke
+/// `.expect(...)` panics with the message below. Without the fix, the
+/// peer task wedges on send() and `peer_handle.await` never returns.
+#[nativelink_test]
+async fn cdn_tee_consumer_disconnect_with_huge_chunk_count_does_not_pin_peer_task()
+-> Result<(), Error> {
+    // 16 MiB blob × 8 KiB chunks = 2048 chunks. The 1024-slot
+    // proxy_tx mpsc fills on the first 1024 chunks; without the M1
+    // fix, the peer task blocks on send() of chunk 1025+.
+    let value = test_value(16 * 1024 * 1024);
+    let digest = digest_for_size(value.len() as u64);
+
+    let (inner, _content_path) = make_filesystem_inner().await?;
+    // ChunkedPeer with tiny chunks. inter_chunk_sleep_ms=1 keeps the
+    // peer producer alive across the consumer-disconnect window
+    // without the test taking forever.
+    let peer_inner = Store::new(Arc::new(ChunkedPeerStore {
+        payload: Bytes::from(value.clone()),
+        chunk_size: 8 * 1024,
+        inter_chunk_sleep_ms: AtomicU64::new(1),
+    }));
+
+    let (proxy_arc, _locality) = build_proxy_with_peer(
+        inner.clone(),
+        peer_inner,
+        digest,
+        "grpc://cdn-tee-huge-chunk-disconnect-peer:50081",
+    );
+    let proxy = Store::new(proxy_arc.clone());
+
+    // Drive get_part with a writer/reader pair we control. After
+    // receiving ~10% of bytes (well below the 1024-chunk proxy_tx
+    // cap × 8 KiB ≈ 8 MiB-buffered window), drop the reader.
+    let (writer, mut reader) =
+        nativelink_util::buf_channel::make_buf_channel_pair();
+    let key: StoreKey<'static> = digest.into();
+    let proxy_for_get = proxy.clone();
+    let get_handle = tokio::spawn(async move {
+        let mut writer = writer;
+        proxy_for_get
+            .get_part(key, &mut writer, 0, None)
+            .await
+    });
+
+    let disconnect_threshold = value.len() / 10; // ~1.6 MiB
+    let mut received = 0usize;
+    loop {
+        let chunk_res = tokio::time::timeout(TEST_TIMEOUT, reader.recv())
+            .await
+            .expect(
+                "must not deadlock — peer-fetch must produce chunks within \
+                 10s before consumer disconnects (M1: peer task should NOT \
+                 be pinned on proxy_tx.send() with >1024 chunks)",
+            )?;
+        if chunk_res.is_empty() {
+            panic!(
+                "test setup error: blob delivered as a single chunk; cannot \
+                 simulate mid-blob disconnect. received={received}"
+            );
+        }
+        received += chunk_res.len();
+        if received >= disconnect_threshold {
+            break;
+        }
+    }
+    drop(reader); // Consumer disconnect.
+
+    // The get_part task MUST resolve within TEST_TIMEOUT. Without the
+    // M1 fix (drop proxy_rx + abort peer_handle on forward error), the
+    // peer task wedges on `proxy_tx.send().await` once it has produced
+    // 1024 chunks, and `peer_handle.await` in `get_part_and_cache`
+    // never returns — get_handle hangs and the timeout fires with the
+    // bespoke message below.
+    let _get_res = tokio::time::timeout(TEST_TIMEOUT, get_handle)
+        .await
+        .expect(
+            "must not deadlock — peer task pinned by undrained proxy_rx \
+             after consumer disconnect (#230 M1 BLOCK regression)",
+        )
+        .expect("get_part task must not panic");
+
+    // The abandon-on-consumer-eof counter must have fired.
+    let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        let (_, _, _, eof) = proxy_arc.cdn_tee_counters_snapshot();
+        if eof >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let (_attempts, _completed, _full, eof) =
+        proxy_arc.cdn_tee_counters_snapshot();
+    assert_eq!(
+        eof, 1,
+        "abandon-on-consumer-eof MUST fire on the consumer-disconnect \
+         path even when the peer produced >1024 chunks; observed eof={eof}",
     );
 
     Ok(())

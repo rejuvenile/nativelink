@@ -233,10 +233,25 @@ const MIRROR_PERMITS_PER_WORKER: usize = 16;
 ///   and is even tighter because the cache-tee can be abandoned with
 ///   no correctness loss while a mirror cannot.
 ///
-/// Total memory budget per in-flight peer-fetch: 4 chunks × ~3 MiB
-/// `read_buffer_size` ≈ 12 MiB. With ~50 concurrent peer-fetches
-/// across the fleet that is < 1 GiB — well below the 8 GiB MemoryStore
-/// fast-tier budget that motivated the 2026-03-25 OOM tuning.
+/// Total memory budget per in-flight peer-fetch:
+///   - cache mpsc:   4 chunks × ~3 MiB `read_buffer_size` ≈ 12 MiB
+///   - proxy buffer: bounded by `DEFAULT_BUF_CHANNEL_CAPACITY = 1024`
+///     slots × peer chunk size. In practice peer chunks are also
+///     `read_buffer_size`-bounded (~3 MiB on FilesystemStore-backed
+///     peers), so the steady-state budget is dominated by whichever of
+///     `proxy_rx`/cache mpsc the consumer is draining slowest. With the
+///     post-#230 architecture the consumer drains proxy_rx at peer rate
+///     (so it sits near-empty under healthy load); a stalled consumer
+///     fills proxy_rx and the cache abandon path frees the cache mpsc.
+///     Worst-case per fetch is therefore the larger of the two
+///     channels' capacity-times-chunk-size product.
+/// With ~50 concurrent peer-fetches across the fleet, 12 MiB cache + a
+/// near-empty proxy_rx (consumer draining at peer rate) keeps total
+/// well below the 8 GiB MemoryStore fast-tier budget that motivated
+/// the 2026-03-25 OOM tuning. The Bazel-disconnect abandon path drops
+/// `proxy_rx` immediately so the peer task unblocks fast (M1 fix,
+/// 2026-05-02) — without it, proxy_tx could pin up to 1024 chunks per
+/// orphaned fetch indefinitely.
 const CDN_TEE_CACHE_MPSC_CAP: usize = 4;
 
 /// Wall-clock cap on the CDN-tee spawned cache task (#230). The task runs
@@ -1496,8 +1511,10 @@ impl WorkerProxyStore {
     /// `inner.update(digest, cache_rx, ExactSize(size))` to completion
     /// (or `CDN_TEE_CACHE_TASK_TIMEOUT`, whichever comes first). On
     /// abandon, the cache task sees an EOF before all bytes arrive,
-    /// `inner.update`'s `ExactSize` check trips, and the FilesystemStore
-    /// in-flight tracker drops the partial via `discard_chunked`.
+    /// `inner.update`'s `ExactSize` check trips, and the temp file is
+    /// unlinked via `EncodedFilePath::Drop`'s background spawn when
+    /// `update_file` fails before reaching `emplace_file` (see
+    /// `filesystem_store.rs:145-191`).
     ///
     /// # Why this is NOT `tokio::join!(forward, cache)` per chunk
     ///
@@ -1627,7 +1644,8 @@ impl WorkerProxyStore {
                         size_bytes = digest.size_bytes(),
                         timeout_s = CDN_TEE_CACHE_TASK_TIMEOUT.as_secs(),
                         "proxy_cache: cache write task exceeded timeout — abandoning \
-                         (FilesystemStore in-flight tracker discards partial)"
+                         (temp file unlinked by EncodedFilePath::Drop background \
+                         spawn since update_file did not reach emplace_file)"
                     );
                 }
             }
@@ -1744,8 +1762,33 @@ impl WorkerProxyStore {
         // Defensive: ensure cache_tx is dropped before we await the peer
         // task. Each branch above already takes() it on its own exit
         // path; this is a no-op when reached via EOF (already None).
-        let cache_alive_at_end = cache_tx.is_some();
         drop(cache_tx);
+
+        // CRITICAL (#230 perf-optimizer M1 fix): drop `proxy_rx` BEFORE
+        // awaiting `peer_handle`. The peer task writes into `proxy_tx`,
+        // whose default capacity is `DEFAULT_BUF_CHANNEL_CAPACITY = 1024`
+        // slots. On the consumer-disconnect path (bazel writer.send Err),
+        // the forward loop `break`s but `proxy_rx` is still alive in the
+        // function frame; the peer task fills proxy_tx and blocks
+        // indefinitely on `proxy_tx.send().await` — `peer_handle.await`
+        // below would then hang forever, pinning a worker on every
+        // mid-blob Bazel disconnect of a >1024-chunk peer stream.
+        //
+        // Dropping proxy_rx here makes the next peer `send()` fail with
+        // a closed-channel error; the peer task then exits and
+        // peer_handle.await resolves to an Err that we treat as
+        // expected on the abandon path.
+        //
+        // Belt-and-braces: also `peer_handle.abort()` whenever the
+        // forward loop terminated with an error. abort + drop both
+        // unblock the peer task; either alone suffices on this path,
+        // but together they bound recovery time and avoid a window
+        // where the peer task races between an in-flight syscall and
+        // the dropped channel.
+        if forward_result.is_err() {
+            peer_handle.abort();
+        }
+        drop(proxy_rx);
 
         // Resolve the peer-reader task. Error preference: the producer
         // (peer) is the source of truth — surface its structured upstream
@@ -1762,6 +1805,15 @@ impl WorkerProxyStore {
         // proxy_tx send fails into the dropped proxy_rx, then exits.
         let get_part_result = match peer_handle.await {
             Ok(res) => res,
+            // Cancelled is the expected path when we asked for the abort
+            // above (forward_result.is_err()); treat it as Ok so the
+            // caller surfaces the forward-side error instead of a
+            // derivative join error.
+            Err(join_err) if join_err.is_cancelled() => Ok(()),
+            Err(join_err) if join_err.is_panic() => Err(make_err!(
+                Code::Internal,
+                "get_part_and_cache: peer-reader task panicked: {join_err:?}"
+            )),
             Err(join_err) => Err(make_err!(
                 Code::Internal,
                 "get_part_and_cache: peer-reader task join failed: {join_err:?}"
@@ -1784,7 +1836,6 @@ impl WorkerProxyStore {
         debug!(
             %digest,
             size_bytes = total_bytes,
-            cache_alive_at_end,
             "get_part_and_cache: forward loop completed successfully"
         );
         Ok(())
