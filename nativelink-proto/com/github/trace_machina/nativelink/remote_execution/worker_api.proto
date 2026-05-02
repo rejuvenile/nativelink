@@ -40,19 +40,14 @@ service WorkerApi {
     /// the worker what worker ID to place in action results.
     rpc ConnectWorker(stream UpdateForScheduler) returns (stream UpdateForWorker);
 
-    /// #212 chunked streaming-write RPC. Worker (or any peer that we
-    /// control both sides of, per design Q1=(b)) opens a client-streaming
-    /// upload of one CAS blob as a sequence of `WriteChunk` messages.
-    /// Server admits each chunk to a per-blob driver task that performs
-    /// `pwrite`-at-offset on a sparse partial file, tracks coverage
-    /// in an in-memory bitmap, and on the `finish_chunk=true` message
-    /// commits the partial via atomic rename + end-to-end SHA-256
-    /// verification. Returns the committed digest + size on success.
-    ///
-    /// Behind `chunked_fast_slow` feature flag (default OFF). The server
-    /// returns `Code::Unimplemented` if the feature is off; clients must
-    /// gate calls on a capability discovery mechanism (Phase 2.6).
-    rpc WriteChunked(stream WriteChunk) returns (WriteChunkedResponse);
+    // #212 v4.5: WriteChunked moved to the CasExtensions service in
+    // cas_extensions.proto so it routes via the worker's outbound
+    // CAS-endpoint channel. The WorkerApi-listener (port 50061) is
+    // never reachable from a worker's GrpcStore (which only knows the
+    // configured CAS endpoint, port 50071). The schema messages
+    // `WriteChunk` and `WriteChunkedResponse` remain defined below
+    // because they are still in the same proto package and are
+    // referenced by the new service.
 }
 
 /// Request object for keep alive requests.

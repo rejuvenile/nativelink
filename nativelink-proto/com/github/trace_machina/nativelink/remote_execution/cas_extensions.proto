@@ -1,0 +1,47 @@
+// Copyright 2024 The NativeLink Authors. All rights reserved.
+//
+// Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    See LICENSE file for details
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package com.github.trace_machina.nativelink.remote_execution;
+
+import "com/github/trace_machina/nativelink/remote_execution/worker_api.proto";
+
+/// #212 v4.5: NativeLink-owned extensions to the standard REAPI CAS-side
+/// surface. Lives in its OWN service (NOT WorkerApi) so it can be
+/// registered on the same listener as the upstream Bazel `cas` /
+/// `bytestream` services — the worker's only outbound channel from
+/// `GrpcStore` is to the configured CAS endpoint (e.g. port 50071 in
+/// production), and the WorkerApi service is registered on a DIFFERENT
+/// listener (e.g. port 50061), so worker→server `WriteChunked` calls
+/// MUST be routed through this service to reach the CAS-port handler.
+///
+/// `WriteChunk` and `WriteChunkedResponse` are reused from
+/// `worker_api.proto` (the proto package is the same; the messages are
+/// shared schema). Only the routing changes.
+service CasExtensions {
+    /// #212 chunked streaming-write RPC. Worker (or any peer that we
+    /// control both sides of, per design Q1=(b)) opens a client-streaming
+    /// upload of one CAS blob as a sequence of `WriteChunk` messages.
+    /// Server admits each chunk to a per-blob driver task that performs
+    /// `pwrite`-at-offset on a sparse partial file, tracks coverage
+    /// in an in-memory bitmap, and on the `finish_chunk=true` message
+    /// commits the partial via atomic rename + end-to-end SHA-256
+    /// verification. Returns the committed digest + size on success.
+    ///
+    /// Behind `chunked_fast_slow` feature flag (default OFF). The server
+    /// returns `Code::Unimplemented` if the feature is off; clients must
+    /// gate calls on a capability discovery mechanism (Phase 2.6).
+    rpc WriteChunked(stream WriteChunk) returns (WriteChunkedResponse);
+}
