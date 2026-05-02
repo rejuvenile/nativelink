@@ -481,6 +481,101 @@ async fn inner_main(
         }
     };
 
+    // #212 Phase 2.5/2.7 fixup S1: wire the chunked-read registry +
+    // Bazel-facing chunked dispatcher into every CAS-backing
+    // FastSlowStore whose slow tier is a FilesystemStore. Default-OFF
+    // kill-switches per CLAUDE.md `feedback_async_to_sync_requires_explicit_signoff`:
+    //   - read-side: `FastSlowStore::enable_chunked_reads()`
+    //   - write-side: `nativelink_store::chunked::set_bazel_facing_internal_chunking_enabled(true)`
+    // Both flips require explicit user sign-off; until then the wiring
+    // is dead-store memory and the legacy paths remain byte-identical.
+    #[cfg(feature = "chunked_fast_slow")]
+    {
+        use nativelink_store::existence_cache_store::ExistenceCacheStore;
+        use nativelink_store::fast_slow_store::FastSlowStore;
+        use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
+        use nativelink_store::verify_store::VerifyStore;
+        use nativelink_util::store_trait::StoreDriver;
+
+        // Walk the (potentially wrapped) chain to the FastSlowStore.
+        // Mirrors `find_fast_slow_for_pin` above; deduplicated as a
+        // local closure for clarity at call sites.
+        fn find_fast_slow_chunked<'a>(
+            store: &'a dyn StoreDriver,
+        ) -> Option<&'a FastSlowStore> {
+            if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
+                return Some(fss);
+            }
+            if let Some(ecs) = store
+                .as_any()
+                .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
+            {
+                return find_fast_slow_chunked(
+                    ecs.inner_store().inner_store(
+                        Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+                    ),
+                );
+            }
+            if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
+                return find_fast_slow_chunked(
+                    vs.inner_store().inner_store(
+                        Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+                    ),
+                );
+            }
+            let inner = store.inner_store(None);
+            if core::ptr::eq(
+                inner as *const dyn StoreDriver,
+                store as *const dyn StoreDriver,
+            ) {
+                return None;
+            }
+            find_fast_slow_chunked(inner)
+        }
+
+        for store_name in &cas_store_names {
+            let Some(store) = unwrapped_cas_stores.get(store_name) else {
+                continue;
+            };
+            let driver: &dyn StoreDriver = store.inner_store(
+                Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
+            );
+            let Some(fss) = find_fast_slow_chunked(driver) else {
+                continue;
+            };
+            // Try to get the slow-tier as Arc<FilesystemStore<FileEntryImpl>>.
+            // Walk through SizePartitioning if present; the production
+            // FSS layout has the slow tier as a direct FilesystemStore
+            // OR wrapped by SizePartitioningStore (size-based routing).
+            let slow_arc: std::sync::Arc<dyn StoreDriver> =
+                fss.slow_store_clone().into_inner();
+            // Try direct FilesystemStore downcast first.
+            let Ok(fs_arc) = std::sync::Arc::clone(&slow_arc)
+                .as_any_arc()
+                .downcast::<FilesystemStore<FileEntryImpl>>()
+            else {
+                info!(
+                    store_name,
+                    "chunked-dispatcher wiring: slow tier is not a direct \
+                     FilesystemStore<FileEntryImpl>; skipping (#212 fixup S1) — \
+                     non-FilesystemStore slow tiers (e.g. SizePartitioning, \
+                     GrpcStore) are out of scope for the v1 wiring",
+                );
+                continue;
+            };
+            let _dispatcher =
+                nativelink_service::chunked_write_handler::wire_bazel_chunked_dispatcher(
+                    fss, fs_arc,
+                );
+            info!(
+                store_name,
+                "chunked-dispatcher wiring: installed registry + dispatcher (#212 fixup S1; \
+                 kill-switches default OFF — read: enable_chunked_reads(); \
+                 write: set_bazel_facing_internal_chunking_enabled(true))"
+            );
+        }
+    }
+
     // Spawn the BlobsInStableStorage drain-then-fire loop. When any CAS
     // FastSlowStore completes a background slow write it pushes the digest
     // and notifies us. We drain all queued digests and broadcast immediately,
