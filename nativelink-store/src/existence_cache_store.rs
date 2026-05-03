@@ -143,17 +143,17 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheStore<I> {
         &'a self,
         store_key: StoreKey<'a>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        debug!(?store_key, "ExistenceCacheStore: eviction callback received");
         let digest = store_key.borrow().into_digest();
+        info!(%digest, "ExistenceCacheStore: eviction callback received");
         Box::pin(async move {
             if debug_digest_match(&digest) {
                 info!(?digest, source = "callback_inner_eviction", "DEBUG: ExistenceCacheStore removing wedge digest");
             }
             let deleted_key = self.existence_cache.remove(&digest).await;
             if deleted_key {
-                debug!(?store_key, "ExistenceCacheStore: eviction callback removed key from cache");
+                info!(%digest, "ExistenceCacheStore: eviction callback removed key from cache");
             } else {
-                debug!(?store_key, "ExistenceCacheStore: eviction callback key not in cache (already removed or never cached)");
+                info!(%digest, "ExistenceCacheStore: eviction callback key not in cache (already removed or never cached)");
             }
         })
     }
