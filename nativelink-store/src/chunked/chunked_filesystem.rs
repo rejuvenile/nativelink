@@ -73,6 +73,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
 use nativelink_util::common::DigestInfo;
+use nativelink_util::spawn_rate_probe::{record, SpawnSite};
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
@@ -471,6 +472,11 @@ pub(crate) async fn write_chunk_at_offset(
         .try_clone()
         .map_err(|io_err| make_err!(Code::Internal, "try_clone for chunked pwrite failed: {io_err:?}"))?;
 
+    // #239 instrumentation: record spawn_blocking inter-arrival at the
+    // chunked-pwrite hot site (fired once per chunk written). Probe is
+    // sync, no .await, μs hold of a parking_lot::Mutex; safe before a
+    // spawn_blocking submission. See `spawn_rate_probe.rs`.
+    record(SpawnSite::ChunkedPwrite);
     let result = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
         #[cfg(target_family = "unix")]
         {

@@ -87,6 +87,7 @@ use nativelink_store::chunked_signal::encode_backpressure_signal_any;
 use nativelink_store::filesystem_store::{FileEntry, FileEntryImpl, FilesystemStore};
 use nativelink_util::buf_channel::DropCloserReadHalf;
 use nativelink_util::common::DigestInfo;
+use nativelink_util::spawn_rate_probe::{record, SpawnSite};
 
 /// Backoff hint suggested to the client on global-budget exhaustion.
 /// Matches the design §13.1.1 retry-after default for the global axis.
@@ -737,6 +738,10 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         let chunk_bytes_bytes: Bytes = chunk_bytes;
 
         // Step 3: SHA-256 verify on `spawn_blocking` (#213 NMA1).
+        // #239 instrumentation: record spawn_blocking inter-arrival at the
+        // bazel-facing internal-chunking commit-side SHA verify. See
+        // `nativelink_util::spawn_rate_probe`.
+        record(SpawnSite::ChunkedShaCommit);
         let computed_sha = compute_sha256_blocking(chunk_bytes_bytes.clone()).await?;
         if computed_sha != chunk_sha256_arr {
             self.metrics
@@ -2098,6 +2103,9 @@ fn build_bazel_chunk_stream(
                 return None;
             }
             let final_bytes = buf.split().freeze();
+            // #239 instrumentation: sibling site for the EOF-final partial
+            // chunk; same call semantics as the per-chunk loop below.
+            record(SpawnSite::ChunkedShaAdmit);
             let chunk_sha256 = match compute_sha256_blocking(final_bytes.clone()).await {
                 Ok(v) => v,
                 Err(err) => return Some((Err(err), State::Done)),
@@ -2115,6 +2123,11 @@ fn build_bazel_chunk_stream(
         let chunk_len = chunk_bytes.len() as u64;
         let new_consumed = bytes_consumed + chunk_len;
         let is_finish = new_consumed == total_bytes;
+        // #239 instrumentation: record spawn_blocking inter-arrival at the
+        // bazel-facing internal-chunking driver per-chunk SHA-256 (one
+        // call per re-chunked outbound chunk; highest-frequency site
+        // under sustained large-blob ingest). See `spawn_rate_probe`.
+        record(SpawnSite::ChunkedShaAdmit);
         let chunk_sha256 = match compute_sha256_blocking(chunk_bytes.clone()).await {
             Ok(v) => v,
             Err(err) => return Some((Err(err), State::Done)),

@@ -27,6 +27,7 @@ use pprof::ProfilerGuardBuilder;
 use tracing::{info, warn};
 
 use crate::spawn;
+use crate::spawn_rate_probe;
 use crate::task::JoinHandleDropGuard;
 
 /// Default CPU profiling duration in seconds.
@@ -366,6 +367,47 @@ async fn auto_serve_handler(
     }
 }
 
+/// Query parameters for `GET /debug/spawn_rate_probe`. `last_n`
+/// caps how many raw samples are returned in `last_n_raw`. Default
+/// 100 keeps the response small enough for terminal `curl` use
+/// while preserving enough recency for visual scan; the ring still
+/// holds up to [`spawn_rate_probe::RING_CAPACITY`] samples
+/// internally (≈ 96 KiB) so historical p50/p95/p99 are computed
+/// over the full window regardless.
+#[derive(Debug, serde::Deserialize)]
+struct SpawnRateProbeParams {
+    last_n: Option<usize>,
+}
+
+/// Handler for `GET /debug/spawn_rate_probe`. Returns the current
+/// snapshot of the [`spawn_rate_probe`] ring as JSON. See that
+/// module's docs for the full payload shape.
+///
+/// Always-on (no feature gate beyond the existing `pprof` cargo
+/// feature, which gates this whole `pprof_server.rs` module). The
+/// response includes per-site counts and inter-arrival p50/p95/p99
+/// in microseconds — the numbers needed to confirm/refute the #239
+/// chunked-path blocking-pool saturation hypothesis.
+async fn spawn_rate_probe_handler(
+    Query(params): Query<SpawnRateProbeParams>,
+) -> Response {
+    let last_n = params.last_n.unwrap_or(100);
+    let snap = spawn_rate_probe::snapshot(last_n);
+    match serde_json::to_vec_pretty(&snap) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize spawn_rate_probe snapshot: {e:?}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Start the pprof HTTP server on the given port.
 /// Returns a drop guard that keeps the server alive.
 pub fn start_pprof_server(port: u16) -> Result<JoinHandleDropGuard<Result<(), Error>>, Error> {
@@ -380,7 +422,8 @@ pub fn start_pprof_server(port: u16) -> Result<JoinHandleDropGuard<Result<(), Er
         .route("/debug/pprof/profile", get(profile_handler))
         .route("/debug/pprof/flamegraph", get(flamegraph_handler))
         .route("/debug/pprof/auto", get(auto_list_handler))
-        .route("/debug/pprof/auto/{filename}", get(auto_serve_handler));
+        .route("/debug/pprof/auto/{filename}", get(auto_serve_handler))
+        .route("/debug/spawn_rate_probe", get(spawn_rate_probe_handler));
 
     let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
 

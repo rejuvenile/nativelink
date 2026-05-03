@@ -45,6 +45,7 @@ pub mod rayon_pool;
 pub mod resource_info;
 pub mod retry;
 pub mod shutdown_guard;
+pub mod spawn_rate_probe;
 pub mod stall_detector;
 pub mod store_trait;
 pub mod streaming_blob;

@@ -8,7 +8,7 @@ version = "1.0.0"
 
 [features]
 io-uring = ["dep:tokio-epoll-uring", "dep:io-uring"]
-pprof = ["dep:pprof", "dep:axum"]
+pprof = ["dep:pprof", "dep:axum", "dep:serde_json"]
 quic = ["dep:tonic-h3", "dep:h3-util", "dep:quinn", "dep:h3-quinn", "dep:rustls", "dep:socket2"]
 failpoints = ["dep:fail", "fail/failpoints"]
 
@@ -116,6 +116,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "aws_l
 socket2 = { version = "0.5", default-features = false, optional = true }
 axum = { version = "0.8.3", default-features = false, features = ["http1", "query", "tokio"], optional = true }
 pprof = { version = "0.15.0", default-features = false, features = ["flamegraph", "prost-codec"], optional = true }
+serde_json = { version = "1.0.140", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
