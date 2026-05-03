@@ -1502,10 +1502,11 @@ impl WorkerProxyStore {
     ///    back-pressure. The caller's writer is the only thing that can
     ///    legitimately make the peer-reader wait.
     /// 2. `cache_tx.try_send(chunk)` — non-blocking. If the cache mpsc
-    ///    is full, set `cache_alive = false`, drop `cache_tx`, and
-    ///    continue forwarding-only. The next reader that needs this
-    ///    digest triggers another peer-fetch — user-explicit: "if you
-    ///    have to re-read chunks from the worker again, so be it."
+    ///    is full, take and drop `cache_tx` (the `Option::take()`
+    ///    move-out leaves None), and continue forwarding-only. The
+    ///    next reader that needs this digest triggers another
+    ///    peer-fetch — user-explicit: "if you have to re-read chunks
+    ///    from the worker again, so be it."
     ///
     /// The cache task is spawned BEFORE the forward loop and runs
     /// `inner.update(digest, cache_rx, ExactSize(size))` to completion
@@ -1577,8 +1578,9 @@ impl WorkerProxyStore {
         //
         // `cache_tx` is wrapped in an Option so the abandon paths can
         // `take()` it (move-out + None in one step) without fighting
-        // the borrow checker over the `loop` boundary. `cache_alive`
-        // mirrors `Option::is_some` for branch-hint clarity.
+        // the borrow checker over the `loop` boundary. `is_some()`
+        // means the cache fan-out is still live; once None, never
+        // re-arm.
         let (cache_tx_init, cache_rx) =
             make_buf_channel_pair_with_size(CDN_TEE_CACHE_MPSC_CAP);
         let mut cache_tx: Option<DropCloserWriteHalf> = Some(cache_tx_init);
@@ -1796,13 +1798,28 @@ impl WorkerProxyStore {
         // loop's derivative artifacts. Sibling pattern to commit 8674bc19
         // (populate path) and 01b68015 (spawn-detach producer path).
         //
-        // Cancellation note: if the outer caller is dropped, dropping
-        // this future drops both spawned tasks via JoinHandle's drop
-        // semantics — but the cache task is `tokio::spawn`-detached so
-        // it CONTINUES TO RUN on its own (covered by the per-task
-        // timeout). The peer task is awaited here; if cancellation
-        // drops us mid-await, peer task likewise continues until its
-        // proxy_tx send fails into the dropped proxy_rx, then exits.
+        // Cancellation note: in tokio 1.x, `JoinHandle::drop` DETACHES
+        // the spawned task — it does NOT abort or cancel it. So if the
+        // outer caller is dropped while we're awaiting `peer_handle`
+        // here, dropping `peer_handle` alone does not stop the peer
+        // task. The actual wake mechanism that lets the peer task wind
+        // down on outer-future drop is structural: when this future is
+        // dropped, `proxy_rx` (owned by this frame) drops with it; the
+        // peer task's next `proxy_tx.send().await` then returns Err and
+        // the task observes that its consumer is gone and exits.
+        //
+        // The M1 explicit `peer_handle.abort()` + `drop(proxy_rx)` on
+        // the abandon path (above, gated on `forward_result.is_err()`)
+        // is belt-and-suspenders: either alone is sufficient on its
+        // own — `drop(proxy_rx)` produces a closed-channel error on the
+        // peer's next send, and `peer_handle.abort()` cancels the task
+        // at the next await point. Together they bound recovery to one
+        // scheduler tick instead of waiting for the next scheduled send.
+        //
+        // Cancellation can also originate externally — runtime shutdown,
+        // a parent future being cancelled, etc. — not just from our own
+        // abort path. In all such cases the cache task is detached and
+        // proceeds independently (bounded by `CDN_TEE_CACHE_TASK_TIMEOUT`).
         let get_part_result = match peer_handle.await {
             Ok(res) => res,
             // Cancelled is the expected path when we asked for the abort

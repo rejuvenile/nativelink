@@ -862,13 +862,16 @@ async fn cdn_tee_sustained_cache_slowness_does_not_deadlock_201()
 /// kept tiny so the peer task is reliably mid-stream when we drop the
 /// consumer at ~10% received bytes.
 ///
-/// **Mutation step**: revert both the `peer_handle.abort()` and the
-/// `drop(proxy_rx)` lines in `get_part_and_cache` (replace with `let
-/// _proxy_rx = proxy_rx; let _peer_handle = &peer_handle;` so the
-/// channel and join handle are still live across the await). The
-/// `tokio::time::timeout(TEST_TIMEOUT)` will fire and the bespoke
-/// `.expect(...)` panics with the message below. Without the fix, the
-/// peer task wedges on send() and `peer_handle.await` never returns.
+/// **Mutation step**: comment out `peer_handle.abort();` AND replace
+/// `drop(proxy_rx);` with `let _proxy_rx = proxy_rx;` to keep it alive
+/// — the test will trip the bespoke message via 10s timeout. Without
+/// the fix, the peer task wedges on send() once proxy_tx fills past
+/// 1024 chunks and `peer_handle.await` never returns. NOTE: either
+/// drop(proxy_rx) alone OR peer_handle.abort() alone is sufficient
+/// to unblock the peer task; this test only catches the both-removed
+/// regression. (drop(proxy_rx) closes the channel so the peer's next
+/// send returns Err; peer_handle.abort() cancels the task at the next
+/// await. Together they bound recovery to one scheduler tick.)
 #[nativelink_test]
 async fn cdn_tee_consumer_disconnect_with_huge_chunk_count_does_not_pin_peer_task()
 -> Result<(), Error> {
@@ -939,13 +942,17 @@ async fn cdn_tee_consumer_disconnect_with_huge_chunk_count_does_not_pin_peer_tas
     // 1024 chunks, and `peer_handle.await` in `get_part_and_cache`
     // never returns — get_handle hangs and the timeout fires with the
     // bespoke message below.
-    let _get_res = tokio::time::timeout(TEST_TIMEOUT, get_handle)
+    let get_res = tokio::time::timeout(TEST_TIMEOUT, get_handle)
         .await
         .expect(
             "must not deadlock — peer task pinned by undrained proxy_rx \
              after consumer disconnect (#230 M1 BLOCK regression)",
         )
         .expect("get_part task must not panic");
+    assert!(
+        get_res.is_err(),
+        "expected get_part to fail after consumer disconnect; got Ok(())",
+    );
 
     // The abandon-on-consumer-eof counter must have fired.
     let deadline = std::time::Instant::now() + TEST_TIMEOUT;
@@ -962,6 +969,181 @@ async fn cdn_tee_consumer_disconnect_with_huge_chunk_count_does_not_pin_peer_tas
         eof, 1,
         "abandon-on-consumer-eof MUST fire on the consumer-disconnect \
          path even when the peer produced >1024 chunks; observed eof={eof}",
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Test 8: M1 happy-path sibling — over-action regression guard for
+// `peer_handle.abort()`. (testing-czar MINOR-2)
+// ---------------------------------------------------------------------
+
+/// Happy-path twin of
+/// `cdn_tee_consumer_disconnect_with_huge_chunk_count_does_not_pin_peer_task`.
+/// Same parameters (16 MiB / 8 KiB chunks / 2048 chunks, well over the
+/// 1024-slot proxy_tx cap), but the consumer fully drains the stream
+/// instead of disconnecting.
+///
+/// **Regression class guarded:** #230's primary architectural property —
+/// the cache write must complete *fully* even when the consumer-read path
+/// is decoupled and the chunk count vastly exceeds the proxy_tx cap.
+/// Round-2 reviewers initially framed this test as guarding an
+/// "over-action `peer_handle.abort()` regression", but control-flow
+/// analysis (see `.claude/reviews/230-round-2/testing-czar.md` round-3
+/// update) shows that hypothesis does NOT hold: the peer task is already
+/// `Ok(())` by the time the EOF chunk reaches the forward loop, so
+/// `JoinHandle::abort()` on a completed task is a no-op and cannot be
+/// observed by any happy-path assertion. Do NOT re-add an
+/// "unconditional `peer_handle.abort()`" mutation here — it will not
+/// trip this test.
+///
+/// Production composition: real WPS + real FilesystemStore inner +
+/// ChunkedPeerStore producing many >1024 chunks. Asserts:
+///   1. `get_part` returns `Ok(())`.
+///   2. The full 16 MiB lands at the consumer (byte count + checksum).
+///   3. The blob is present in the FilesystemStore inner (poll
+///      `inner.has_with_results` bounded by TEST_TIMEOUT).
+///   4. The cache `completed` counter increments to 1 (peer task
+///      ran to natural EOF; cache task ran `inner.update` to Ok).
+///
+/// **Mutation step (Mutation A — primary):** in
+/// `WorkerProxyStore::get_part_and_cache`, comment out the
+/// `let cache_handle: JoinHandle<()> = tokio::spawn(async move { ... });`
+/// at line ~1620 (the cache-task spawn) — for example, replace its body
+/// with a no-op that drops `cache_rx` immediately. With the cache task
+/// gone, `cache_tx`'s sends still succeed (mpsc has capacity), but
+/// `inner.update` never runs, so the FilesystemStore probe in step 3
+/// observes `None` and the assertion at line ~1110 fires with the
+/// bespoke message naming "regression guard for #230 cache-write/
+/// consumer-read decoupling architecture". The `completed` counter at
+/// step 4 also stays at 0, providing a second tripwire.
+///
+/// **Mutation B (alternative):** comment out `cache_tx.take()` /
+/// `tx.send_eof()` in the EOF branch (line ~1671-1689). The cache task
+/// hangs on `cache_rx.recv()` until `CDN_TEE_CACHE_TASK_TIMEOUT` fires,
+/// or `inner.update` errors on size mismatch — either way the
+/// `completed == 1` assertion fires.
+#[nativelink_test]
+async fn cdn_tee_happy_path_huge_chunk_count_caches_all_bytes()
+-> Result<(), Error> {
+    // Mirror Test 7's parameters: 16 MiB blob × 8 KiB chunks = 2048
+    // chunks (well over the 1024-slot proxy_tx cap). The point is to
+    // catch a regression where `peer_handle.abort()` fires on the
+    // happy path: with this many chunks, an unconditional abort
+    // would race the peer's natural EOF and either truncate the
+    // consumer's bytes or cancel the in-flight cache update.
+    let value = test_value(16 * 1024 * 1024);
+    let digest = digest_for_size(value.len() as u64);
+
+    let (inner, _content_path) = make_filesystem_inner().await?;
+    // Inter-chunk sleep is intentionally tiny so the test completes
+    // well within TEST_TIMEOUT but the producer is reliably mid-stream
+    // for many scheduler ticks (any unconditional abort has many
+    // opportunities to fire mid-stream).
+    let peer_inner = Store::new(Arc::new(ChunkedPeerStore {
+        payload: Bytes::from(value.clone()),
+        chunk_size: 8 * 1024,
+        inter_chunk_sleep_ms: AtomicU64::new(1),
+    }));
+
+    let (proxy_arc, _locality) = build_proxy_with_peer(
+        inner.clone(),
+        peer_inner,
+        digest,
+        "grpc://cdn-tee-happy-huge-chunk-peer:50081",
+    );
+    let proxy = Store::new(proxy_arc.clone());
+
+    // Drive get_part and FULLY drain the consumer. Wrap in
+    // TEST_TIMEOUT as the deadlock detector — if any unconditional
+    // abort kills the peer task mid-stream, recv will hang waiting
+    // for the next chunk and trip the bespoke message.
+    let bytes = tokio::time::timeout(
+        TEST_TIMEOUT,
+        proxy.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "happy-path many-chunk peer-fetch must complete fully — \
+         consumer-read path stalled? regression guard for #230 \
+         cache-write/consumer-read decoupling architecture",
+    )?;
+
+    assert_eq!(
+        bytes.len(),
+        value.len(),
+        "consumer must receive every byte of the 16 MiB blob; \
+         short-read indicates the forward loop terminated early",
+    );
+    assert_eq!(
+        bytes.as_ref(),
+        value.as_slice(),
+        "consumer bytes must match peer payload byte-for-byte",
+    );
+
+    // The cache task is detached. Poll `completed` and the inner
+    // store until the cache write lands or the deadline fires.
+    // Per CLAUDE.md: bounded polling loop, not a fixed sleep.
+    let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    let mut completed_after = 0u64;
+    while std::time::Instant::now() < deadline {
+        completed_after = proxy_arc.cdn_tee_counters_snapshot().1;
+        if completed_after == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        completed_after, 1,
+        "happy-path cache `completed` counter must reach 1 — \
+         decoupled cache write must complete fully on huge-chunk \
+         happy path — regression guard for #230 cache-write/\
+         consumer-read decoupling architecture (mutation: comment \
+         out the `tokio::spawn` for the cache task; cache file never \
+         appears; this assertion fails)",
+    );
+
+    // End-to-end cache-presence probe: bounded poll on the inner
+    // FilesystemStore. The same TEST_TIMEOUT-bounded pattern as
+    // Test 5's m3 fix.
+    let probe_deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    let mut probe_size: Option<u64> = None;
+    while std::time::Instant::now() < probe_deadline {
+        let mut probe = [None];
+        inner
+            .has_with_results(&[digest.into()], &mut probe)
+            .await?;
+        if probe[0].is_some() {
+            probe_size = probe[0];
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        probe_size,
+        Some(value.len() as u64),
+        "FilesystemStore inner MUST have the cached blob within \
+         {:?} after the consumer drained the stream — decoupled \
+         cache write must complete fully on huge-chunk happy path — \
+         regression guard for #230 cache-write/consumer-read \
+         decoupling architecture (mutation: comment out the \
+         `tokio::spawn` for the cache task; cache file never appears; \
+         this assertion fails)",
+        TEST_TIMEOUT,
+    );
+
+    // Sanity: no abandon paths fired on the happy path.
+    let (attempts, _completed, full, eof) =
+        proxy_arc.cdn_tee_counters_snapshot();
+    assert_eq!(attempts, 1, "exactly one cache attempt");
+    assert_eq!(
+        full, 0,
+        "happy path must not abandon-on-full; observed full={full}",
+    );
+    assert_eq!(
+        eof, 0,
+        "happy path must not abandon-on-consumer-eof; observed eof={eof}",
     );
 
     Ok(())
