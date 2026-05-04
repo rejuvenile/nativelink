@@ -1615,6 +1615,17 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// arriving after the driver-task pin clear will find the entry
     /// in `evicting_map`. There is no window where the file is on
     /// disk and indexed in NEITHER structure.
+    ///
+    /// **Cancellation-safety:** the post-rename insert runs inside a
+    /// `background_spawn!` so that if the caller's future is dropped
+    /// after the rename succeeded but before the insert completes,
+    /// the spawned task still runs to completion and the index is
+    /// updated. Without this, an aborted driver task (server
+    /// shutdown, panic, cancellation) could leave the file on disk
+    /// without an `evicting_map` entry — a narrower-window
+    /// re-introduction of #247. Mirrors the `emplace_file`
+    /// `background_spawn!` pattern (filesystem_store.rs:1208) which
+    /// was added for the same reason against nativelink#495.
     pub async fn finalize_holding(&self, digest: &DigestInfo) -> Result<(), Error> {
         let holding_path = chunked_holding_path(&self.shared_context.content_path, digest);
         let key: StoreKey<'static> = (*digest).into();
@@ -1622,38 +1633,62 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         let final_path = std::path::PathBuf::from(final_os);
         chunked_finalize_holding(&self.chunked_partials, digest, holding_path, final_path).await?;
 
-        // CAS-immutable shortcut: if the key already exists, the
-        // pre-existing FileEntry already points at the same canonical
-        // path with byte-identical content (digest defines content).
-        // Skip the insert+unref cycle.
-        if self.content_is_immutable
-            && self.evicting_map.size_for_key(&key).await.is_some()
-        {
-            return Ok(());
-        }
-
-        // Construct a FileEntry pointing at the already-on-disk
-        // canonical CAS file. `data_size = digest.size_bytes()` is
-        // load-bearing: `commit_chunked` enforces that the .holding
-        // file's actual length matches `expected_size = digest.
-        // size_bytes()` (chunked_filesystem.rs length-mismatch path),
-        // so by the time this code runs, on-disk length == digest
-        // size. `block_size` is mirrored from the legacy
-        // `add_files_to_cache` emplace at filesystem_store.rs:550 so
-        // page-rounded LRU accounting matches the startup-walk path.
+        // Move the post-rename index-update onto a background task so
+        // it cannot be cancelled mid-sequence by the caller. From here
+        // to the spawn `tokio::spawn` is sync-only — there is no
+        // `.await` between `chunked_finalize_holding` resolving Ok and
+        // the spawn point — so the rename → insert pair is atomic w.r.t.
+        // caller-cancellation.
+        let evicting_map = self.evicting_map.clone();
+        let content_is_immutable = self.content_is_immutable;
+        let block_size = self.block_size;
+        let shared_context = self.shared_context.clone();
+        let key_for_task: StoreKey<'static> = key.borrow().into_owned();
         let data_size = digest.size_bytes();
-        let entry = Fe::create(
-            data_size,
-            self.block_size,
-            RwLock::new(EncodedFilePath {
-                shared_context: self.shared_context.clone(),
-                path_type: PathType::Content,
-                key: key.borrow().into_owned(),
-            }),
-        );
-        self.evicting_map
-            .insert(key.borrow().into_owned().into(), Arc::new(entry))
-            .await;
+
+        // We need to guarantee that this will get to the end even if the
+        // parent future is dropped. Mirror of `emplace_file`'s pattern;
+        // see https://github.com/TraceMachina/nativelink/issues/495.
+        background_spawn!("filesystem_store_finalize_holding_insert", async move {
+            // CAS-immutable shortcut: if the key already exists, the
+            // pre-existing FileEntry already points at the same
+            // canonical path with byte-identical content (digest
+            // defines content). Skip the insert+unref cycle.
+            if content_is_immutable
+                && evicting_map.size_for_key(&key_for_task).await.is_some()
+            {
+                return;
+            }
+
+            // Construct a FileEntry pointing at the already-on-disk
+            // canonical CAS file. `data_size = digest.size_bytes()` is
+            // load-bearing: `commit_chunked` enforces that the .holding
+            // file's actual length matches `expected_size = digest.
+            // size_bytes()` (chunked_filesystem.rs length-mismatch path),
+            // so by the time this code runs, on-disk length == digest
+            // size. `block_size` is mirrored from the legacy
+            // `add_files_to_cache` emplace at filesystem_store.rs:550 so
+            // page-rounded LRU accounting matches the startup-walk path.
+            let entry = Fe::create(
+                data_size,
+                block_size,
+                RwLock::new(EncodedFilePath {
+                    shared_context,
+                    path_type: PathType::Content,
+                    key: key_for_task.borrow().into_owned(),
+                }),
+            );
+            evicting_map
+                .insert(key_for_task.into_owned().into(), Arc::new(entry))
+                .await;
+        })
+        .await
+        .map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "background_spawn join error in finalize_holding: {e:?}"
+            )
+        })?;
         Ok(())
     }
 
