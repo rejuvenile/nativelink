@@ -320,17 +320,25 @@ impl StoreDriver for CompressionStore {
             // (header serialize, reader.consume, error_if size overshoot,
             // compress_into, mid-stream tx.send, footer serialize, footer
             // tx.send, send_eof) used to drop `tx` silently — `rx.recv()`
-            // in the inner store then synthesized
-            // `Code::Internal "Sender dropped before sending EOF"` instead
-            // of propagating the actionable upstream cause. Sibling of
-            // #245 (`verify_store::inner_check_update`), see audit at
+            // in the inner store then blocked until the OS dropped the
+            // sender, then synthesized
+            // `Code::Internal "Sender dropped before sending EOF"`
+            // instead of returning a structured Err. Sibling of #245
+            // (`verify_store::inner_check_update`), see audit at
             // `.claude/audits/245-fast-slow-store-sender-drop.md`.
             //
-            // Wrap with `WriteHalfGuard`: any `?` exit fires the guard's
-            // Drop fallback (synthesized structured Internal carrying the
-            // greppable "buf_channel: writer dropped without commit"
-            // marker). On the success path, `commit_eof()` suppresses the
-            // fallback after `send_eof()`.
+            // The `WriteHalfGuard` wrap below upgrades the Drop fallback
+            // so on any `?` propagation the guard's `Drop`
+            // (`buf_channel.rs:516-520`) synthesizes a structured Internal
+            // carrying the greppable `"buf_channel: writer dropped without
+            // commit"` marker — the paired `rx.recv()` reader observes
+            // that structured Err immediately instead of the misleading
+            // "Sender dropped" derivative. The OUTER `tokio::join!(...)`
+            // already preserves the actionable upstream cause on its
+            // returned Result; the Drop fallback on the reader is purely
+            // defense-in-depth so it unblocks, not the carrier of the
+            // upstream cause. On the success path, `commit_eof()`
+            // suppresses the fallback after `send_eof()`.
             let mut tx_guard = WriteHalfGuard::new(&mut tx);
             {
                 // Write Header.

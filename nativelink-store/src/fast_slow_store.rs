@@ -723,14 +723,24 @@ impl FastSlowStore {
             // fast_store_fut, dispatch_fut)`: any `?` Err exit below
             // historically dropped `fast_tx` / `chunk_tx` silently, so the
             // sibling `fast_store_fut` (= `inner.update(rx)`) and
-            // `dispatch_fut` (= `dispatcher.dispatch(chunk_rx)`) saw a
-            // generic `"Sender dropped before sending EOF"` Internal
-            // instead of the actionable upstream cause. Latent harden in
-            // the same #245 family — see audit at
+            // `dispatch_fut` (= `dispatcher.dispatch(chunk_rx)`) blocked
+            // on `rx.recv().await` until the OS dropped the senders, then
+            // synthesized a generic `"Sender dropped before sending EOF"`
+            // Internal — drowning out the actionable upstream cause.
+            //
+            // The two `WriteHalfGuard` wraps below upgrade the Drop
+            // fallback so that on any `?` propagation the guards' `Drop`
+            // (`buf_channel.rs:516-520`) synthesizes a structured Internal
+            // carrying the greppable `"buf_channel: writer dropped without
+            // commit"` marker. Both paired readers observe a structured
+            // Err immediately instead of the misleading "Sender dropped"
+            // derivative. The OUTER `join3(...)` result still preserves
+            // the actionable upstream cause via `data_res` — Drop fallback
+            // on the readers is purely defense-in-depth so they unblock,
+            // not the carrier of the upstream cause. Latent harden in the
+            // #245 family — see audit at
             // `.claude/audits/245-fast-slow-store-sender-drop.md` Phase 4
-            // sibling-bug list. Per audit "fast_slow_store.rs:718-749's
-            // chunked data_stream_fut: same harden-by-explicit-termination
-            // on `fast_tx` and `chunk_tx`."
+            // sibling-bug list.
             let mut fast_guard = WriteHalfGuard::new(&mut fast_tx);
             let mut chunk_guard = WriteHalfGuard::new(&mut chunk_tx);
             loop {
@@ -3105,16 +3115,24 @@ impl StoreDriver for FastSlowStore {
             // Writer-termination contract for `join!(data_stream_fut,
             // fast_store_fut)`: any `?` Err exit historically dropped
             // `fast_tx` silently, so the sibling `fast_store_fut`
-            // (= `fast_store.update(fast_rx)`) saw a generic
-            // `"Sender dropped before sending EOF"` Internal instead of
-            // the actionable upstream cause from `reader.recv()`. Latent
-            // harden in the #245 family — see audit at
-            // `.claude/audits/245-fast-slow-store-sender-drop.md` Phase 4
-            // sibling-bug list. Per audit "fast_slow_store.rs:3074-3110's
-            // data_stream_fut: explicit termination of fast_tx on Err
-            // branches so a downstream caller wrapping FastSlowStore in
-            // another tokio::join! sees a structured error instead of a
-            // synthesized 'Sender dropped' Internal."
+            // (= `fast_store.update(fast_rx)`) blocked on `rx.recv().await`
+            // until the OS dropped the sender, then synthesized a generic
+            // `"Sender dropped before sending EOF"` Internal — drowning
+            // out the actionable upstream cause from `reader.recv()`.
+            //
+            // The `WriteHalfGuard` wrap below upgrades the Drop fallback
+            // so on any `?` propagation the guard's `Drop`
+            // (`buf_channel.rs:516-520`) synthesizes a structured Internal
+            // carrying the greppable `"buf_channel: writer dropped without
+            // commit"` marker. The paired fast_store_fut reader observes
+            // a structured Err immediately instead of the misleading
+            // "Sender dropped" derivative. The OUTER `join!(...)` result
+            // still preserves the actionable upstream cause via
+            // `data_res` — Drop fallback on the reader is purely
+            // defense-in-depth so it unblocks, not the carrier of the
+            // upstream cause. Latent harden in the #245 family — see
+            // audit at `.claude/audits/245-fast-slow-store-sender-drop.md`
+            // Phase 4 sibling-bug list.
             let mut fast_guard = WriteHalfGuard::new(&mut fast_tx);
             let mut chunks: Vec<Bytes> = Vec::new();
             loop {

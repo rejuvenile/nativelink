@@ -62,15 +62,28 @@
 //! mask the contract violation.
 //!
 //! **Mutation step (CLAUDE.md TDD step 5; load-bearing line):**
-//! comment out the `let mut tx_guard = WriteHalfGuard::new(&mut tx);`
-//! at the top of `inner_check_update` and revert each `tx_guard.fail(...)`
-//! to a bare `make_input_err!(...)`. The over-shoot test below then
-//! observes the synthesized `"Sender dropped before sending EOF"` in
-//! the recorded inner err, the `assert!(!observed.contains(...))`
-//! check fires with `OVER_ACTION_SIBLING_FALSE` — i.e. the mutation
-//! is detectable by the bespoke message. Without restoring the line
-//! the production `#245` log re-emerges. Verified manually on
-//! 2026-05-04 during the #245 fix (see git-journal entry).
+//! pick any explicit-fail site inside `inner_check_update` (e.g. the
+//! over-shoot site at `verify_store.rs:119`, the under-shoot site at
+//! `:148`, or the hash-mismatch site at `:160`) and replace
+//! `return Err(tx_guard.fail(make_input_err!(...)));` with a bare
+//! `return Err(make_input_err!(...));` — dropping the `tx_guard.fail`
+//! wrap. With the wrap removed, the only termination of `tx` left is
+//! the `WriteHalfGuard::Drop` fallback, which synthesizes
+//! `"buf_channel: writer dropped without commit"` instead of the
+//! structured upstream cause. The corresponding test's load-bearing
+//! `assert!(!observed_err.messages.iter().any(|m| m.contains(
+//! DROP_FALLBACK_IDENTIFIER)))` panics — the assertions live in the
+//! over-shoot / hash-mismatch / under-shoot tests below; grep this
+//! file for `DROP_FALLBACK_IDENTIFIER` to find them. Each carries a
+//! bespoke per-branch message of the form `"Drop-fallback identifier
+//! present on <site>: explicit `tx_guard.fail(...)` was bypassed..."`
+//! so the panic names the site. The companion `EXPECTED_FRAGMENT`
+//! positive assertion (grep this file for `EXPECTED_FRAGMENT`) would
+//! ALSO fail because the inner err no longer carries the upstream
+//! cause. Verified manually on 2026-05-04 during the testing-czar
+//! review (see
+//! `.claude/reviews/245-writer-termination-fix/testing-czar.md`
+//! Mutation step section).
 
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -80,7 +93,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::stores::{MemorySpec, StoreSpec, VerifySpec};
-use nativelink_error::{Error, ResultExt};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_store::verify_store::VerifyStore;
@@ -638,5 +651,233 @@ async fn verify_store_inner_check_update_happy_path_succeeds() -> Result<(), Err
         observing.update_was_called.load(Ordering::Acquire),
         "inner store update must have been invoked",
     );
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Sibling coverage (testing-czar follow-up): the 3 of 6 explicit
+// `tx_guard.fail(...)` sites in `inner_check_update` that the original
+// #245 test set did NOT exercise — recv-err propagation (line 110),
+// peek-EOF non-empty after exact size (line 132), mid-stream send Err
+// (line 188). Each test:
+//   - injects the specific failure at the targeted site,
+//   - asserts the inner store observes a structured upstream cause via
+//     the SAME `terminal_error` machinery the #245 fix established,
+//   - uses a bespoke per-site message so a future regression panics with
+//     a string that names the site,
+//   - is wrapped in `tokio::time::timeout(NO_DEADLOCK_TIMEOUT)` to
+//     surface contract-violation deadlocks rather than hangs.
+// -----------------------------------------------------------------------
+
+/// Drive `VerifyStore::update` with a producer that sends `body` chunks
+/// then injects `tx.send_error(injected)` instead of EOF — triggers
+/// `inner_check_update`'s recv-err Err branch (`verify_store.rs:110`).
+async fn drive_verify_update_inject_recv_err(
+    verify: Arc<VerifyStore>,
+    digest: DigestInfo,
+    body: &[&[u8]],
+    upload_size: UploadSizeInfo,
+    injected: Error,
+) -> Result<(), Error> {
+    let (mut tx, rx) = make_buf_channel_pair();
+    let body_owned: Vec<Bytes> = body.iter().map(|b| Bytes::copy_from_slice(b)).collect();
+    let send_fut = async move {
+        for chunk in body_owned {
+            tx.send(chunk).await?;
+        }
+        // Inject a structured terminal_error on the OUTER tx — the
+        // VerifyStore reader will observe this as the rx.recv() Err
+        // and `inner_check_update` will hit the line 110 site.
+        tx.send_error(injected);
+        Result::<(), Error>::Ok(())
+    };
+    let update_fut = async move {
+        Pin::new(verify.as_ref())
+            .update(StoreKey::Digest(digest), rx, upload_size)
+            .await
+    };
+    let (send_res, update_res) = tokio::join!(send_fut, update_fut);
+    update_res.or_else(|update_err| {
+        if let Err(send_err) = send_res {
+            Err(update_err.merge(send_err))
+        } else {
+            Err(update_err)
+        }
+    })
+}
+
+/// Branch 4 — recv-err propagation at `verify_store.rs:110`.
+///
+/// Producer signals a structured terminal_error on the outer tx after
+/// sending one chunk. `inner_check_update`'s `rx.recv().await.err_tip(...)`
+/// returns Err on the second recv → `.map_err(|err| tx_guard.fail(err))?`
+/// at line 110 propagates the structured upstream cause to the inner
+/// store via `terminal_error`. Without the explicit `tx_guard.fail(err)`,
+/// only the Drop fallback would fire and the inner err would carry
+/// `DROP_FALLBACK_IDENTIFIER` instead of the producer's injected message.
+#[nativelink_test]
+async fn verify_store_inner_check_update_recv_err_propagates_structured_err()
+-> Result<(), Error> {
+    const BODY_CHUNK: &[u8] = b"chunk-bytes";
+    const INJECTED_FRAGMENT: &str = "VERIFY_RECV_ERR_PROPAGATION_PROBE";
+
+    let (verify, observing) = build_verify_around_observing(false, false);
+    // Use a generous declared size so the over-shoot branch doesn't
+    // pre-empt the recv-err path. verify_size=false above also disables
+    // the size cmp entirely.
+    let digest = DigestInfo::try_new(VALID_HASH_HEX, 1024)?;
+    let injected = make_err!(Code::Aborted, "{INJECTED_FRAGMENT}");
+
+    let outer_res = tokio::time::timeout(
+        NO_DEADLOCK_TIMEOUT,
+        drive_verify_update_inject_recv_err(
+            verify,
+            digest,
+            &[BODY_CHUNK],
+            UploadSizeInfo::MaxSize(1024),
+            injected,
+        ),
+    )
+    .await
+    .expect(
+        "WRITER_TERMINATION_VIOLATED_245_recv_err: \
+         VerifyStore::update did not return within 5s when inner_check_update \
+         hit the recv-err Err branch at verify_store.rs:110. The \
+         `tx_guard.fail(err)` (via `.map_err(|e| tx_guard.fail(e))?`) call \
+         must terminate tx so the paired inner store's rx.recv() returns.",
+    );
+
+    assert!(
+        outer_res.is_err(),
+        "outer res must Err on injected recv err; got {outer_res:?}",
+    );
+
+    let observed = observing
+        .last_observed
+        .lock()
+        .as_ref()
+        .expect("inner store must have observed the rx termination")
+        .clone();
+    let observed_err = observed.expect_err(
+        "inner store must observe rx Err when producer injects send_error \
+         (recv-err propagation site at verify_store.rs:110)",
+    );
+
+    assert!(
+        observed_err
+            .messages
+            .iter()
+            .any(|m| m.contains(INJECTED_FRAGMENT)),
+        "verify_store::inner_check_update recv-err site (line 110) must propagate \
+         the producer's structured err to rx via tx_guard.fail. The injected \
+         fragment {INJECTED_FRAGMENT:?} should appear in the inner observed err. \
+         Got inner observed: {observed_err:?}",
+    );
+    assert!(
+        !observed_err
+            .messages
+            .iter()
+            .any(|m| m.contains(SENDER_DROPPED_IDENTIFIER)),
+        "#245 symptom on recv-err site (line 110): inner observed 'Sender dropped' \
+         instead of the structured upstream cause. The line 110 \
+         `.map_err(|err| tx_guard.fail(err))?` is the load-bearing fix. \
+         Got: {observed_err:?}",
+    );
+    assert!(
+        !observed_err
+            .messages
+            .iter()
+            .any(|m| m.contains(DROP_FALLBACK_IDENTIFIER)),
+        "Drop-fallback identifier present on recv-err site (line 110) — explicit \
+         `tx_guard.fail(err)` was bypassed and only the Drop net caught the \
+         contract violation. Use `.map_err(|err| tx_guard.fail(err))?` at the \
+         recv site, not bare `?`. Got: {observed_err:?}",
+    );
+
+    Ok(())
+}
+
+/// Branch 5 — peek-EOF non-empty after exact size at `verify_store.rs:132`.
+///
+/// Producer sends EXACTLY `expected_size` bytes followed by a non-empty
+/// chunk (instead of an EOF chunk). `inner_check_update` enters the
+/// `Equal` arm, calls `rx.peek().await`, observes the non-empty chunk,
+/// returns `Err(tx_guard.fail(make_input_err!("Expected EOF chunk when
+/// exact size was hit on insert in verify store - {expected_size}")))`.
+/// Without the explicit `tx_guard.fail`, only the Drop fallback would
+/// fire and the inner err would carry `DROP_FALLBACK_IDENTIFIER` instead
+/// of the structured "Expected EOF chunk" cause.
+#[nativelink_test]
+async fn verify_store_inner_check_update_peek_eof_non_empty_propagates_structured_err()
+-> Result<(), Error> {
+    const DECLARED_SIZE: u64 = 5;
+    const FIRST_CHUNK: &[u8] = b"abcde"; // exactly 5 bytes
+    const TRAILING_CHUNK: &[u8] = b"X"; // non-empty after the exact-size hit
+    const EXPECTED_FRAGMENT: &str = "Expected EOF chunk when exact size was hit on insert";
+
+    let (verify, observing) = build_verify_around_observing(true, false);
+    let digest = DigestInfo::try_new(VALID_HASH_HEX, DECLARED_SIZE)?;
+
+    let outer_res = tokio::time::timeout(
+        NO_DEADLOCK_TIMEOUT,
+        drive_verify_update(
+            verify,
+            digest,
+            &[FIRST_CHUNK, TRAILING_CHUNK],
+            UploadSizeInfo::ExactSize(DECLARED_SIZE),
+        ),
+    )
+    .await
+    .expect(
+        "WRITER_TERMINATION_VIOLATED_245_peek_eof_non_empty: \
+         VerifyStore::update did not return within 5s when inner_check_update \
+         hit the peek-EOF-non-empty Err branch at verify_store.rs:132. The \
+         `tx_guard.fail(...)` call must terminate tx so the paired inner \
+         store's rx.recv() returns.",
+    );
+
+    assert!(
+        outer_res.is_err(),
+        "outer res must Err when peek sees non-empty chunk after exact size; got {outer_res:?}",
+    );
+
+    let observed = observing
+        .last_observed
+        .lock()
+        .as_ref()
+        .expect("inner store must have observed the rx termination")
+        .clone();
+    let observed_err = observed.expect_err(
+        "inner store must observe rx Err on peek-EOF-non-empty site \
+         (verify_store.rs:132)",
+    );
+
+    assert!(
+        observed_err
+            .messages
+            .iter()
+            .any(|m| m.contains(EXPECTED_FRAGMENT)),
+        "verify_store::inner_check_update peek-EOF-non-empty site (line 132) must \
+         propagate the structured 'Expected EOF chunk' message to rx via \
+         tx_guard.fail. Got inner observed: {observed_err:?}",
+    );
+    assert!(
+        !observed_err
+            .messages
+            .iter()
+            .any(|m| m.contains(SENDER_DROPPED_IDENTIFIER)),
+        "#245 symptom on peek-EOF-non-empty site (line 132): inner observed \
+         'Sender dropped' instead of the structured upstream cause. Got: \
+         {observed_err:?}",
+    );
+    assert!(
+        !observed_err
+            .messages
+            .iter()
+            .any(|m| m.contains(DROP_FALLBACK_IDENTIFIER)),
+        "Drop-fallback identifier present on peek-EOF-non-empty site (line 132) \
+         — explicit `tx_guard.fail(...)` was bypassed. Got: {observed_err:?}",
+    );
+
     Ok(())
 }

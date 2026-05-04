@@ -97,18 +97,17 @@ impl VerifyStore {
         // EXPLICITLY `guard.fail(err.clone())` so the actionable upstream
         // err (e.g. "Hashes do not match") flows through to the merged
         // result rather than the synthesized fallback. Mirrors the
-        // `get_part` pattern at `verify_store.rs:374-388`.
+        // pattern in `verify_store::get_part` (the "Three-way commit"
+        // doc-comment block — search the file for that phrase to land
+        // on the precedent).
         let mut tx_guard = WriteHalfGuard::new(&mut tx);
         let mut sum_size: u64 = 0;
         loop {
-            let chunk = match rx
+            let chunk = rx
                 .recv()
                 .await
                 .err_tip(|| "Failed to read chunk in check_update in verify store")
-            {
-                Ok(c) => c,
-                Err(err) => return Err(tx_guard.fail(err)),
-            };
+                .map_err(|err| tx_guard.fail(err))?;
             sum_size += chunk.len() as u64;
 
             // Ensure if a user sends us too much data we fail quickly.
@@ -181,10 +180,9 @@ impl VerifyStore {
             {
                 // Mid-stream `tx.send` failure means `rx` (the inner
                 // store's read half) was already closed (inner store
-                // errored or the join's other future dropped). Mark
-                // committed so Drop doesn't synthesize a redundant
-                // Internal on top of the underlying err. The send_error
-                // would land in a closed channel anyway.
+                // errored or the join's other future dropped). The
+                // `send_error` is harmless on a closed channel and the
+                // structured err is preserved on the returned Result.
                 return Err(tx_guard.fail(err));
             }
         }
