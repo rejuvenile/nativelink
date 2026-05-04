@@ -53,7 +53,8 @@ use nativelink_service::chunked_write_handler::{
 use nativelink_store::chunked::chunk_budget::{ChunkBudget, TOTAL_CHUNK_PERMITS};
 use nativelink_store::chunked::pin_budget::PinBudget;
 use nativelink_store::chunked::{
-    BazelChunkedDispatcher, set_bazel_facing_internal_chunking_enabled,
+    BazelChunkedDispatcher, disable_bazel_facing_internal_chunking,
+    enable_bazel_facing_internal_chunking,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
@@ -218,8 +219,11 @@ async fn run_update(
         tx.send_eof().expect("tx.send_eof must succeed");
         Result::<(), nativelink_error::Error>::Ok(())
     };
-    let store_call =
-        async move { store_clone.update(key, rx, UploadSizeInfo::ExactSize(total)).await };
+    let store_call = async move {
+        store_clone
+            .update(key, rx, UploadSizeInfo::ExactSize(total))
+            .await
+    };
     let (writer_res, store_res) = tokio::join!(update_fut, store_call);
     writer_res?;
     store_res
@@ -245,7 +249,7 @@ async fn fast_slow_update_kill_switch_off_uses_legacy_path() {
 
     // Hard-set kill-switch OFF (defensive — other tests may have flipped
     // it on without resetting).
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 
     let blob: Vec<u8> = (0..SIZE).map(|i| i as u8).collect();
     let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
@@ -284,7 +288,7 @@ async fn fast_slow_update_kill_switch_on_small_blob_uses_legacy_path() {
     let digest = DigestInfo::new(sha256(&blob), SMALL_SIZE as u64);
 
     let _guard = kill_switch_lock().lock().await;
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     let (fast_slow, _fs_store, _content_path, in_flight_opt) =
         make_fast_slow_with_dispatcher(CHUNK, true).await;
@@ -299,7 +303,7 @@ async fn fast_slow_update_kill_switch_on_small_blob_uses_legacy_path() {
     .expect("must not deadlock — small blob skips chunking");
 
     // Reset kill-switch so subsequent tests start from a clean slate.
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 
     assert_eq!(
         in_flight.in_flight_count(),
@@ -331,7 +335,7 @@ async fn fast_slow_update_chunked_dispatch_engages_for_large_blob() {
     let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
 
     let _guard = kill_switch_lock().lock().await;
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     let (fast_slow, fs_store, content_path, in_flight_opt) =
         make_fast_slow_with_dispatcher(CHUNK, true).await;
@@ -403,7 +407,7 @@ async fn fast_slow_update_chunked_dispatch_engages_for_large_blob() {
         );
 
     // Reset kill-switch.
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 }
 
 /// Kill-switch ON, blob >= CHUNK_SIZE, NO dispatcher installed → legacy
@@ -418,7 +422,7 @@ async fn fast_slow_update_kill_switch_on_no_dispatcher_uses_legacy_path() {
     let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
 
     let _guard = kill_switch_lock().lock().await;
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     // with_dispatcher=false → no dispatcher installed.
     let (fast_slow, _fs_store, _content_path, in_flight_opt) =
@@ -436,7 +440,7 @@ async fn fast_slow_update_kill_switch_on_no_dispatcher_uses_legacy_path() {
     .await
     .expect("must not deadlock — legacy fallback");
 
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 }
 
 // -----------------------------------------------------------------------------
@@ -473,8 +477,7 @@ async fn dispatch_chunks_to_driver_synchronous_commits_blob() {
     // Build a futures::Stream of PreparedChunk.
     let chunks: Vec<Result<PreparedChunk, nativelink_error::Error>> = (0..N)
         .map(|i| {
-            let chunk_bytes =
-                Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
+            let chunk_bytes = Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
             Ok(PreparedChunk {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_sha256: sha256(&chunk_bytes),
@@ -554,8 +557,7 @@ async fn dispatch_chunks_to_driver_async_commit_returns_promptly_then_drains() {
 
     let chunks: Vec<Result<PreparedChunk, nativelink_error::Error>> = (0..N)
         .map(|i| {
-            let chunk_bytes =
-                Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
+            let chunk_bytes = Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
             Ok(PreparedChunk {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_sha256: sha256(&chunk_bytes),
@@ -591,7 +593,9 @@ async fn dispatch_chunks_to_driver_async_commit_returns_promptly_then_drains() {
     // entry to drain (which happens after the commit completes).
     wait_for_no_in_flight(&in_flight, Duration::from_secs(10))
         .await
-        .expect("must drain after async commit — reaper must remove the in-flight entry post-commit");
+        .expect(
+            "must drain after async commit — reaper must remove the in-flight entry post-commit",
+        );
 
     let on_disk_size = wait_for_cas_file(&content_path, &digest, Duration::from_secs(5))
         .await
@@ -770,7 +774,7 @@ async fn fast_tier_ok_dispatch_err_records_failed_slow_write() {
     let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
 
     let _guard = kill_switch_lock().lock().await;
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     // Build a FastSlowStore with a custom dispatcher whose PinBudget
     // is too small to admit even one chunk.
@@ -817,7 +821,7 @@ async fn fast_tier_ok_dispatch_err_records_failed_slow_write() {
          return promptly with Err",
     );
 
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 
     let err = res.expect_err(
         "update MUST return Err when chunked-dispatch admission fails \
@@ -898,7 +902,7 @@ async fn async_commit_digest_mismatch_blocks_canonical_cas_landing() {
     let declared_digest = DigestInfo::new(sha256(&expected), SIZE as u64);
 
     let _guard = kill_switch_lock().lock().await;
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     let (fast_slow, _fs_store, content_path, in_flight_opt) =
         make_fast_slow_with_dispatcher(CHUNK, true).await;
@@ -923,7 +927,7 @@ async fn async_commit_digest_mismatch_blocks_canonical_cas_landing() {
         .await
         .expect("in-flight tracker must drain after async-commit reaper handles mismatch");
 
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 
     // The canonical CAS file MUST NOT have appeared (commit was
     // rejected by e2e SHA-256 verify). We poll for ~1s and assert

@@ -721,10 +721,9 @@ pub mod backpressure_signal {
         /// / #212 Phase 2.6: a `MemoryStore` write would have forced
         /// / eviction of a recently-inserted blob to make room for the
         /// / new write. Operator opted into emission via the
-        /// / `MemoryStore::set_emit_backpressure_for_test` runtime
-        /// / kill-switch (default OFF preserves the historic
-        /// / silent-evict behavior). Caller should retry after
-        /// / `retry_after_ms`.
+        /// / `MemoryStore::enable_emit_backpressure` runtime kill-switch
+        /// / (default OFF preserves the historic silent-evict behavior).
+        /// / Caller should retry after `retry_after_ms`.
         MemoryStoreAtCapacity = 3,
         /// / #212 Phase 2.5/2.7 fixup B1: the global pinned-bytes budget
         /// / (`PinBudget`, default 4 GiB cap) is exhausted. Each in-flight

@@ -505,16 +505,17 @@ async fn inner_main(
     // true, flip the process-wide AtomicBool here so subsequent
     // `FastSlowStore::update` calls dispatch through the per-blob
     // ChunkedDriver machinery once the dispatcher is installed below.
-    // The runtime setter
-    // `chunked::set_bazel_facing_internal_chunking_enabled(bool)`
-    // remains available for tests and admin tooling.
+    // The runtime setters
+    // `chunked::enable_bazel_facing_internal_chunking()` /
+    // `chunked::disable_bazel_facing_internal_chunking()` remain
+    // available for tests and admin tooling.
     #[cfg(feature = "chunked_fast_slow")]
     if cfg
         .global
         .as_ref()
         .is_some_and(|g| g.bazel_facing_internal_chunking_enabled)
     {
-        nativelink_store::chunked::set_bazel_facing_internal_chunking_enabled(true);
+        nativelink_store::chunked::enable_bazel_facing_internal_chunking();
         info!(
             "GlobalConfig: bazel_facing_internal_chunking_enabled=true \
              (process-wide chunked-dispatch ON; #212 Phase 2.7)"
@@ -529,8 +530,8 @@ async fn inner_main(
     // 2.5) and process-wide `bazel_facing_internal_chunking_enabled`
     // (Phase 2.7, set above). The runtime APIs
     // (`FastSlowStore::enable_chunked_reads()`,
-    // `chunked::set_bazel_facing_internal_chunking_enabled(true)`)
-    // remain available for tests and admin tooling.
+    // `chunked::enable_bazel_facing_internal_chunking()`) remain
+    // available for tests and admin tooling.
     #[cfg(feature = "chunked_fast_slow")]
     {
         use nativelink_store::existence_cache_store::ExistenceCacheStore;
@@ -643,7 +644,7 @@ async fn inner_main(
                 "chunked-dispatcher wiring: installed registry + dispatcher + \
                  ChunkedWriteHandler (#212 fixup S1; #212 v4.5 routing fix; \
                  kill-switches default OFF — read: enable_chunked_reads(); \
-                 write: set_bazel_facing_internal_chunking_enabled(true))"
+                 write: enable_bazel_facing_internal_chunking())"
             );
         }
     }

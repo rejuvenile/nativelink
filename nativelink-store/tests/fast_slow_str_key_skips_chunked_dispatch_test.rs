@@ -58,8 +58,8 @@ use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreSpec};
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_store::chunked::{
-    BazelChunkedDispatcher, BazelChunkedDispatcherArc,
-    set_bazel_facing_internal_chunking_enabled,
+    BazelChunkedDispatcher, BazelChunkedDispatcherArc, disable_bazel_facing_internal_chunking,
+    enable_bazel_facing_internal_chunking,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
@@ -126,11 +126,7 @@ fn make_fast_slow() -> (Arc<FastSlowStore>, Store, Store) {
 /// gate lives here, NOT in `update_oneshot`) with a single-shot
 /// payload. Mirrors what the Bazel server's gRPC ByteStream Write
 /// handler does to a `FastSlowStore`.
-async fn drive_update(
-    store: &Store,
-    key: StoreKey<'_>,
-    payload: Bytes,
-) -> Result<(), Error> {
+async fn drive_update(store: &Store, key: StoreKey<'_>, payload: Bytes) -> Result<(), Error> {
     let (mut tx, rx) = make_buf_channel_pair();
     let payload_len = payload.len() as u64;
     let send_fut = async move {
@@ -138,8 +134,7 @@ async fn drive_update(
         tx.send_eof()?;
         Ok::<(), Error>(())
     };
-    let update_fut =
-        store.update(key, rx, UploadSizeInfo::ExactSize(payload_len));
+    let update_fut = store.update(key, rx, UploadSizeInfo::ExactSize(payload_len));
     let (send_res, update_res) = tokio::join!(send_fut, update_fut);
     send_res?;
     update_res
@@ -163,17 +158,19 @@ async fn str_keyed_update_skips_chunked_dispatcher() -> Result<(), Error> {
 
     let (fss, _fast, _slow) = make_fast_slow();
     let invocations = Arc::new(AtomicUsize::new(0));
-    let dispatcher: BazelChunkedDispatcherArc =
-        Arc::new(CountingDispatcher { invocations: invocations.clone() });
+    let dispatcher: BazelChunkedDispatcherArc = Arc::new(CountingDispatcher {
+        invocations: invocations.clone(),
+    });
     fss.set_bazel_chunked_dispatcher(dispatcher);
     // 1-byte threshold so any non-empty payload would otherwise dispatch.
     fss.set_chunked_size_threshold_for_test(1);
 
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     // Str key shaped like a real AC entry name (long enough that an
     // accidental Blake3 hash on it would have a measurable cost).
-    let key_str = "ac/some-instance/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789/4096";
+    let key_str =
+        "ac/some-instance/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789/4096";
     let key = StoreKey::from(key_str);
     let payload = Bytes::from_static(b"AC-style ActionResult payload bytes");
 
@@ -192,7 +189,7 @@ async fn str_keyed_update_skips_chunked_dispatcher() -> Result<(), Error> {
 
     // Restore kill-switch BEFORE the assertion so a failing assert
     // doesn't leak the toggle to sibling tests in the same process.
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 
     assert_eq!(
         n, 0,
@@ -209,7 +206,10 @@ async fn str_keyed_update_skips_chunked_dispatcher() -> Result<(), Error> {
     )
     .await
     .expect("get_part_unchunked must not hang for Str-keyed read-back")?;
-    assert_eq!(read_back, payload, "Str-keyed read-back must equal the payload");
+    assert_eq!(
+        read_back, payload,
+        "Str-keyed read-back must equal the payload"
+    );
 
     Ok(())
 }
@@ -224,12 +224,13 @@ async fn digest_keyed_update_invokes_chunked_dispatcher() -> Result<(), Error> {
 
     let (fss, _fast, _slow) = make_fast_slow();
     let invocations = Arc::new(AtomicUsize::new(0));
-    let dispatcher: BazelChunkedDispatcherArc =
-        Arc::new(CountingDispatcher { invocations: invocations.clone() });
+    let dispatcher: BazelChunkedDispatcherArc = Arc::new(CountingDispatcher {
+        invocations: invocations.clone(),
+    });
     fss.set_bazel_chunked_dispatcher(dispatcher);
     fss.set_chunked_size_threshold_for_test(1);
 
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     // Digest key with size_bytes >= threshold (1 byte) — eligible.
     let payload = Bytes::from_static(b"some payload");
@@ -250,7 +251,7 @@ async fn digest_keyed_update_invokes_chunked_dispatcher() -> Result<(), Error> {
 
     // Restore kill-switch BEFORE the assertion so a failing assert
     // doesn't leak the toggle to sibling tests in the same process.
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 
     assert_eq!(
         n, 1,

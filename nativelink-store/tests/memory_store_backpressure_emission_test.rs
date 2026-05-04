@@ -103,11 +103,9 @@ fn assert_backpressure_signal(err: &Error, expected_reason: backpressure_signal:
     let decoded = BackpressureSignal::decode(&*signal_detail.value)
         .expect("encoded BackpressureSignal must decode cleanly");
     assert_eq!(
-        decoded.reason,
-        expected_reason as i32,
+        decoded.reason, expected_reason as i32,
         "expected reason={:?} got reason={}",
-        expected_reason,
-        decoded.reason,
+        expected_reason, decoded.reason,
     );
 }
 
@@ -117,10 +115,9 @@ fn assert_backpressure_signal(err: &Error, expected_reason: backpressure_signal:
 /// guards against any future regression that could deadlock instead of
 /// returning the error.
 #[nativelink_test]
-async fn emits_resource_exhausted_when_emission_enabled_and_at_capacity()
--> Result<(), Error> {
+async fn emits_resource_exhausted_when_emission_enabled_and_at_capacity() -> Result<(), Error> {
     let store = tiny_memory_store();
-    store.set_emit_backpressure_for_test(true);
+    store.enable_emit_backpressure();
 
     // Fill most of the cap with a 1 KiB blob (the moka weigher rounds
     // up to KB granularity, so this consumes ~1 KB of the 1 KiB
@@ -140,18 +137,13 @@ async fn emits_resource_exhausted_when_emission_enabled_and_at_capacity()
         store.update_oneshot(digest2, payload2.into()),
     )
     .await
-    .expect(
-        "must not deadlock — backpressure-emission must return promptly",
-    );
+    .expect("must not deadlock — backpressure-emission must return promptly");
 
     let err = result.expect_err(
         "second insert MUST return ResourceExhausted when kill-switch is ON \
          (otherwise the silent-evict behavior leaked through the gate)",
     );
-    assert_backpressure_signal(
-        &err,
-        backpressure_signal::Reason::MemoryStoreAtCapacity,
-    );
+    assert_backpressure_signal(&err, backpressure_signal::Reason::MemoryStoreAtCapacity);
     Ok(())
 }
 
@@ -163,7 +155,7 @@ async fn emits_resource_exhausted_when_emission_enabled_and_at_capacity()
 #[nativelink_test]
 async fn preserves_silent_evict_when_emission_disabled() -> Result<(), Error> {
     let store = tiny_memory_store();
-    // Default-OFF; do NOT call set_emit_backpressure_for_test.
+    // Default-OFF; do NOT call enable_emit_backpressure.
 
     let big_payload = vec![0u8; 1024];
     let digest1 = DigestInfo::try_new(VALID_HASH1, big_payload.len() as u64)?;
@@ -194,10 +186,9 @@ async fn preserves_silent_evict_when_emission_disabled() -> Result<(), Error> {
 /// the detail or substituted a different code would mask the
 /// classifier signal in production.
 #[nativelink_test]
-async fn verify_store_around_memory_store_propagates_backpressure_signal()
--> Result<(), Error> {
+async fn verify_store_around_memory_store_propagates_backpressure_signal() -> Result<(), Error> {
     let inner = tiny_memory_store();
-    inner.set_emit_backpressure_for_test(true);
+    inner.enable_emit_backpressure();
 
     let store = VerifyStore::new(
         &VerifySpec {
@@ -238,10 +229,7 @@ async fn verify_store_around_memory_store_propagates_backpressure_signal()
          (otherwise the wrapper is hiding the backpressure signal from the \
          classifier and replaying the production #147 stale-channel-reuse trace)",
     );
-    assert_backpressure_signal(
-        &err,
-        backpressure_signal::Reason::MemoryStoreAtCapacity,
-    );
+    assert_backpressure_signal(&err, backpressure_signal::Reason::MemoryStoreAtCapacity);
     Ok(())
 }
 
@@ -252,10 +240,9 @@ async fn verify_store_around_memory_store_propagates_backpressure_signal()
 /// MemoryStoreAtCapacity event would tear down the h2 channel at
 /// backpressure rate and reproduce #147.
 #[nativelink_test]
-async fn classifier_recognizes_memory_store_at_capacity_signal()
--> Result<(), Error> {
+async fn classifier_recognizes_memory_store_at_capacity_signal() -> Result<(), Error> {
     let store = tiny_memory_store();
-    store.set_emit_backpressure_for_test(true);
+    store.enable_emit_backpressure();
 
     // Fill cap and trigger backpressure to obtain a real production
     // error from the production code path (don't synthesize the error

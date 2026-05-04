@@ -21,6 +21,8 @@ use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::{Arc, Weak};
+#[cfg(feature = "chunked_fast_slow")]
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -476,11 +478,13 @@ pub struct FastSlowStore {
     /// registry on this `FastSlowStore` (default for every existing
     /// production wiring; the hook lights up only after Phase 2.7
     /// wires the chunked-write handler). Wrapped in
-    /// `parking_lot::Mutex<Option<...>>` so the registry can be set
-    /// once at startup (after `Arc::new`) without requiring the
-    /// constructor signature to take it.
+    /// `std::sync::OnceLock<Arc<...>>` (#220 D7): set-once at startup,
+    /// lock-free reads on the `get_part` hot path. The constructor
+    /// signature does NOT take the registry because the registry's
+    /// concrete type lives in `nativelink-store`, but the production
+    /// wiring lives in `nativelink-service` (post-hoc install).
     #[cfg(feature = "chunked_fast_slow")]
-    chunked_read_registry: Mutex<Option<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>>>,
+    chunked_read_registry: OnceLock<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>>,
     /// #212 Phase 2.5 runtime kill-switch for the read cascade's
     /// `failed_writes` pin step. Default OFF — even with the
     /// `chunked_fast_slow` feature compiled in AND a registry wired,
@@ -508,16 +512,15 @@ pub struct FastSlowStore {
     /// kill-switch is OFF, `update()` uses the legacy code path with
     /// no behavior change.
     ///
-    /// Wrapped in `parking_lot::Mutex<Option<Arc<dyn _>>>` so it can be
-    /// installed AFTER `Arc<FastSlowStore>` construction (the
-    /// dispatcher's implementation in `nativelink-service` requires the
-    /// FilesystemStore that lives inside the FastSlowStore's slow tier;
-    /// circular construction is avoided by post-hoc wiring). Reads
-    /// take the lock briefly on every `update()` call; the value is
-    /// `Arc::clone`'d out and the lock released BEFORE any `.await`.
+    /// Wrapped in `std::sync::OnceLock<Arc<dyn _>>` (#220 D7): set-once
+    /// at startup, lock-free reads on the `update()` hot path. The
+    /// dispatcher is installed AFTER `Arc<FastSlowStore>` construction
+    /// (the dispatcher's impl in `nativelink-service` requires the
+    /// `FilesystemStore` that lives inside the `FastSlowStore`'s slow
+    /// tier; circular construction is avoided by post-hoc wiring).
+    /// Symmetric with `chunked_read_registry` above.
     #[cfg(feature = "chunked_fast_slow")]
-    bazel_chunked_dispatcher:
-        parking_lot::Mutex<Option<crate::chunked::BazelChunkedDispatcherArc>>,
+    bazel_chunked_dispatcher: OnceLock<crate::chunked::BazelChunkedDispatcherArc>,
     /// Phase 2.7 size threshold above which `update()` engages the
     /// chunked dispatcher. Production: `CHUNK_SIZE` (1 MiB). Tests
     /// override via `set_chunked_size_threshold_for_test` so a small
@@ -624,11 +627,11 @@ impl FastSlowStore {
             mirror_changes_notify: Arc::new(Notify::new()),
             local_only_reads: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
-            chunked_read_registry: Mutex::new(None),
+            chunked_read_registry: OnceLock::new(),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_reads_enabled: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
-            bazel_chunked_dispatcher: parking_lot::Mutex::new(None),
+            bazel_chunked_dispatcher: OnceLock::new(),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_size_threshold: AtomicU64::new(crate::chunked::CHUNK_SIZE as u64),
         });
@@ -845,22 +848,31 @@ impl FastSlowStore {
     /// The actual decision to USE this dispatcher per-call is gated on
     /// `crate::chunked::bazel_facing_internal_chunking_enabled()` (the
     /// kill-switch defaulting to OFF) AND blob size; see `update()`.
+    ///
+    /// `#220` D7: backed by `OnceLock`. The first install wins; a
+    /// second install attempt is silently ignored (callers today install
+    /// once at startup, so the difference is invisible). The lock-free
+    /// read on the `update()` hot path is the win.
     #[cfg(feature = "chunked_fast_slow")]
     pub fn set_bazel_chunked_dispatcher(
         &self,
         dispatcher: crate::chunked::BazelChunkedDispatcherArc,
     ) {
-        *self.bazel_chunked_dispatcher.lock() = Some(dispatcher);
+        // OnceLock::set returns Err if already initialized; this matches
+        // the production "install once at startup" wiring contract. We
+        // intentionally drop the Err — repeat installs are no-ops.
+        let _ = self.bazel_chunked_dispatcher.set(dispatcher);
     }
 
     /// Read-only accessor for the chunked dispatcher; tests use this
     /// to confirm wiring. Returns `None` if no dispatcher is installed.
+    /// `#220` D7: lock-free `OnceLock::get` + one `Arc::clone`.
     #[cfg(feature = "chunked_fast_slow")]
     #[must_use]
     pub fn bazel_chunked_dispatcher(
         &self,
     ) -> Option<crate::chunked::BazelChunkedDispatcherArc> {
-        self.bazel_chunked_dispatcher.lock().clone()
+        self.bazel_chunked_dispatcher.get().cloned()
     }
 
     /// Read-only accessor for the fast-tier `Store`. Phase 2.7 tests
@@ -1381,11 +1393,11 @@ impl FastSlowStore {
             mirror_changes_notify: Arc::new(Notify::new()),
             local_only_reads: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
-            chunked_read_registry: Mutex::new(None),
+            chunked_read_registry: OnceLock::new(),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_reads_enabled: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
-            bazel_chunked_dispatcher: parking_lot::Mutex::new(None),
+            bazel_chunked_dispatcher: OnceLock::new(),
             #[cfg(feature = "chunked_fast_slow")]
             chunked_size_threshold: AtomicU64::new(crate::chunked::CHUNK_SIZE as u64),
         });
@@ -1424,26 +1436,30 @@ impl FastSlowStore {
     /// flip, this is dead-store memory and the read cascade behaves
     /// exactly like origin/main.
     ///
-    /// Idempotent: a second call replaces the registry. Returns the
-    /// previous registry (if any) so the caller can decide whether the
-    /// displacement is intentional. Today's wiring sets it once at
-    /// server start.
+    /// Set-once: returns `true` when the registry is newly installed,
+    /// `false` when one was already installed (the supplied registry
+    /// is dropped). `#220` D7: backed by `OnceLock` for symmetry with
+    /// [`Self::set_bazel_chunked_dispatcher`] and lock-free reads on
+    /// the `get_part` hot path. Today's production wiring installs once
+    /// at server start, so the second-install branch is exercised only
+    /// by tests intentionally probing idempotence.
     #[cfg(feature = "chunked_fast_slow")]
     pub fn set_chunked_read_registry(
         &self,
         registry: Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>,
-    ) -> Option<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>> {
-        self.chunked_read_registry.lock().replace(registry)
+    ) -> bool {
+        self.chunked_read_registry.set(registry).is_ok()
     }
 
     /// #212 Phase 2.5: snapshot of the currently-installed registry
     /// (or `None`). Used by tests to assert the wire-up.
+    /// `#220` D7: lock-free `OnceLock::get` + one `Arc::clone`.
     #[cfg(feature = "chunked_fast_slow")]
     #[must_use]
     pub fn chunked_read_registry(
         &self,
     ) -> Option<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>> {
-        self.chunked_read_registry.lock().clone()
+        self.chunked_read_registry.get().cloned()
     }
 
     /// #212 Phase 2.5: flip the read-cascade kill-switch ON. With the
@@ -4054,7 +4070,9 @@ impl StoreDriver for FastSlowStore {
         if self.chunked_reads_enabled.load(Ordering::Relaxed)
             && let StoreKey::Digest(digest) = key.borrow()
         {
-            let registry_snapshot = self.chunked_read_registry.lock().clone();
+            // #220 D7: lock-free read of the registry handle from the
+            // post-startup `OnceLock`. One Arc::clone, no contention.
+            let registry_snapshot = self.chunked_read_registry.get().cloned();
             if let Some(registry) = registry_snapshot {
                 if let Some(driver) = registry.get(&digest) {
                     // Compute the requested byte length: when `length`

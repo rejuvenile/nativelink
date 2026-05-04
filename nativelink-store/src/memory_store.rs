@@ -151,9 +151,10 @@ pub struct MemoryStore {
     /// make room. Default OFF preserves the historic silent-evict
     /// behavior so this architectural change is no-op until the
     /// operator explicitly opts in. Toggle via
-    /// `set_emit_backpressure_for_test` (no JSON config plumbing
-    /// yet — Phase 2.6 ships the mechanism, follow-up tracker wires
-    /// the production config knob).
+    /// [`Self::enable_emit_backpressure`] /
+    /// [`Self::disable_emit_backpressure`]; inspect via
+    /// [`Self::emit_backpressure_enabled`]. The production wiring at
+    /// `MemoryStore::new` honors `MemorySpec.emit_backpressure_enabled`.
     #[cfg(feature = "chunked_fast_slow")]
     emit_backpressure_enabled: AtomicBool,
 }
@@ -169,14 +170,13 @@ impl MemoryStore {
             #[cfg(feature = "chunked_fast_slow")]
             emit_backpressure_enabled: AtomicBool::new(false),
         });
-        // #212 Phase 2.6: honor the production config knob. The
-        // `set_emit_backpressure_for_test` runtime setter still exists
-        // for tests; production opts in through the JSON config field
-        // landed in the same series via the `set_emit_backpressure`
-        // production setter below.
+        // #212 Phase 2.6: honor the production config knob. Tests +
+        // admin tools toggle at runtime via
+        // [`Self::enable_emit_backpressure`] /
+        // [`Self::disable_emit_backpressure`].
         #[cfg(feature = "chunked_fast_slow")]
         if spec.emit_backpressure_enabled {
-            store.set_emit_backpressure(true);
+            store.enable_emit_backpressure();
         }
         store
     }
@@ -191,17 +191,22 @@ impl MemoryStore {
         self.evicting_map.remove(&key.into_owned()).await
     }
 
-    /// #212 Phase 2.6 runtime kill-switch for backpressure emission on
-    /// over-capacity writes. Default is OFF (silent-evict, the historic
-    /// behavior); calling with `true` flips this MemoryStore instance
-    /// to refuse over-capacity writes with `Code::ResourceExhausted +
-    /// BackpressureSignal::MemoryStoreAtCapacity`.
+    /// #212 Phase 2.6 runtime kill-switch ARM for backpressure emission
+    /// on over-capacity writes. Default is OFF (silent-evict, the
+    /// historic behavior); calling this flips this `MemoryStore`
+    /// instance to refuse over-capacity writes with
+    /// `Code::ResourceExhausted + BackpressureSignal::MemoryStoreAtCapacity`.
     ///
-    /// Retained as `_for_test` for the test suites that wire it
-    /// directly. Production code paths use `set_emit_backpressure`
-    /// (no `_for_test` suffix) which is also called automatically
-    /// from `MemoryStore::new` when `MemorySpec.emit_backpressure_enabled`
-    /// is true (production sign-off 2026-05-02).
+    /// Mirrors the verb-pair pattern used by `WorkerProxyStore`
+    /// (`enable_X` / `disable_X` / `X_enabled()`) and `FastSlowStore`
+    /// (`enable_chunked_reads` / `disable_chunked_reads` /
+    /// `chunked_reads_enabled()`); see `#220` D2 for the unification.
+    ///
+    /// Idempotent. Safe to call multiple times. Production opt-in is
+    /// the JSON `MemorySpec.emit_backpressure_enabled = true` (auto-
+    /// armed in `MemoryStore::new`). Tests and admin tooling call this
+    /// directly. Takes effect on the next `update` / `update_oneshot`;
+    /// in-flight operations are not affected.
     ///
     /// The relaxed orderings are deliberate: the gate is a single
     /// boolean read on a hot path. A torn read in either direction is
@@ -210,22 +215,26 @@ impl MemoryStore {
     /// (transitioning OFF→ON) at the moment of the toggle. Both are
     /// transient and self-healing within the next call.
     #[cfg(feature = "chunked_fast_slow")]
-    pub fn set_emit_backpressure_for_test(&self, on: bool) {
-        self.emit_backpressure_enabled.store(on, Ordering::Relaxed);
+    pub fn enable_emit_backpressure(&self) {
+        self.emit_backpressure_enabled.store(true, Ordering::Relaxed);
     }
 
-    /// #212 Phase 2.6 production runtime setter for the backpressure
-    /// emission kill-switch. Behaves identically to
-    /// `set_emit_backpressure_for_test`, but lives without the
-    /// `_for_test` suffix for the production config wire-up at
-    /// `MemoryStore::new` and any future operator admin tool.
-    ///
-    /// Idempotent. Safe to call multiple times. Takes effect on the
-    /// next `update` / `update_oneshot`; in-flight operations are
-    /// not affected.
+    /// #212 Phase 2.6 runtime kill-switch RE-ARM for backpressure
+    /// emission. Operator rollback path back to silent-evict; restores
+    /// pre-Phase-2.6 behavior bit-identically. Idempotent.
     #[cfg(feature = "chunked_fast_slow")]
-    pub fn set_emit_backpressure(&self, on: bool) {
-        self.emit_backpressure_enabled.store(on, Ordering::Relaxed);
+    pub fn disable_emit_backpressure(&self) {
+        self.emit_backpressure_enabled.store(false, Ordering::Relaxed);
+    }
+
+    /// #212 Phase 2.6 inspector: returns whether backpressure emission
+    /// is currently armed on this `MemoryStore`. Used by tests + admin
+    /// probes; matches the `*_enabled()` reader half of the verb-pair
+    /// pattern.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[must_use]
+    pub fn emit_backpressure_enabled(&self) -> bool {
+        self.emit_backpressure_enabled.load(Ordering::Relaxed)
     }
 
     /// #212 Phase 2.6: best-effort capacity check shared by `update`
@@ -393,7 +402,7 @@ impl StoreDriver for MemoryStore {
         // #212 Phase 2.6: kill-switched backpressure gate. No-op when
         // the operator hasn't opted in (the production default), so the
         // historic silent-evict behavior is preserved bit-identically
-        // for callers that haven't toggled `set_emit_backpressure_for_test`.
+        // for callers that haven't called `enable_emit_backpressure`.
         self.check_backpressure_gate(&owned_key, total_bytes)?;
 
         self.evicting_map

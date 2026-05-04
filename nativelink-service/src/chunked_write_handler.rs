@@ -1639,7 +1639,8 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
 /// Production wiring (Phase 2.7 deployment): construct one instance
 /// per server, install on the FastSlowStore via
 /// `set_bazel_chunked_dispatcher`. Toggle production behaviour with
-/// `nativelink_store::chunked::set_bazel_facing_internal_chunking_enabled`.
+/// `nativelink_store::chunked::enable_bazel_facing_internal_chunking`
+/// / `disable_bazel_facing_internal_chunking`.
 ///
 /// (β) async-commit mandatory; the dispatch returns Ok as soon as
 /// admission is complete, NOT after on-disk commit.
@@ -1929,10 +1930,10 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
 ///
 /// **Kill-switches still default OFF.** This wiring is the load-bearing
 /// pre-flight for Phase 2.5 + Phase 2.7 to be ENGAGEABLE; flipping
-/// either kill-switch on (`set_bazel_facing_internal_chunking_enabled(true)`
-/// for the write side, `FastSlowStore::enable_chunked_reads()` for the
-/// read side) requires explicit user sign-off per the architectural-
-/// change rule (CLAUDE.md `feedback_async_to_sync_requires_explicit_signoff`).
+/// either kill-switch on (`enable_bazel_facing_internal_chunking()` for
+/// the write side, `FastSlowStore::enable_chunked_reads()` for the read
+/// side) requires explicit user sign-off per the architectural-change
+/// rule (CLAUDE.md `feedback_async_to_sync_requires_explicit_signoff`).
 #[must_use]
 pub fn wire_bazel_chunked_dispatcher<Fe: FileEntry>(
     fast_slow: &nativelink_store::fast_slow_store::FastSlowStore,
@@ -1947,7 +1948,7 @@ pub fn wire_bazel_chunked_dispatcher<Fe: FileEntry>(
                 fast_slow.in_flight_empty_notify_handle(),
             ),
     );
-    let _prev = fast_slow.set_chunked_read_registry(Arc::clone(&registry));
+    let _installed = fast_slow.set_chunked_read_registry(Arc::clone(&registry));
     fast_slow
         .set_bazel_chunked_dispatcher(Arc::clone(&dispatcher) as Arc<dyn nativelink_store::chunked::BazelChunkedDispatcher>);
     debug!(

@@ -72,12 +72,24 @@ use nativelink_util::common::DigestInfo;
 /// in-flight pin).
 static BAZEL_FACING_INTERNAL_CHUNKING_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Set the Phase 2.7 Bazel-facing internal-chunking kill-switch.
+/// Arm the Phase 2.7 Bazel-facing internal-chunking kill-switch.
 ///
-/// Returns the previous value. Test code uses this to toggle the
-/// switch on per-test.
-pub fn set_bazel_facing_internal_chunking_enabled(enabled: bool) -> bool {
-    BAZEL_FACING_INTERNAL_CHUNKING_ENABLED.swap(enabled, Ordering::SeqCst)
+/// Mirrors the verb-pair pattern used by `WorkerProxyStore`
+/// (`enable_X` / `disable_X` / `X_enabled()`) and `FastSlowStore`
+/// (`enable_chunked_reads` / `disable_chunked_reads` /
+/// `chunked_reads_enabled()`); see `#220` D2 for the unification.
+/// Idempotent. Test code uses this to toggle the switch on per-test;
+/// production wires this from `GlobalConfig.bazel_facing_internal_chunking_enabled`
+/// in `src/bin/nativelink.rs`.
+pub fn enable_bazel_facing_internal_chunking() {
+    BAZEL_FACING_INTERNAL_CHUNKING_ENABLED.store(true, Ordering::SeqCst);
+}
+
+/// Re-arm the Phase 2.7 Bazel-facing internal-chunking kill-switch
+/// (operator rollback path back to the legacy single-stream code path).
+/// Idempotent. Test code uses this to clean up after each test.
+pub fn disable_bazel_facing_internal_chunking() {
+    BAZEL_FACING_INTERNAL_CHUNKING_ENABLED.store(false, Ordering::SeqCst);
 }
 
 /// Read the current value of the Phase 2.7 Bazel-facing internal

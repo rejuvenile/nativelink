@@ -38,9 +38,7 @@ use nativelink_config::stores::{
 use nativelink_macro::nativelink_test;
 use nativelink_store::chunked::CHUNK_SIZE;
 use nativelink_store::chunked::chunk_budget::ChunkBudget;
-use nativelink_store::chunked::chunked_driver::{
-    ChunkWork, ChunkedDriver, PER_BLOB_MPSC_CAP,
-};
+use nativelink_store::chunked::chunked_driver::{ChunkWork, ChunkedDriver, PER_BLOB_MPSC_CAP};
 use nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
@@ -147,10 +145,13 @@ async fn pin_serves_request_under_verify_when_enabled() {
 
     // Install a fresh registry and flip the kill-switch ON.
     let registry = ChunkedReadRegistry::new();
-    let prev = fs_arc.set_chunked_read_registry(Arc::clone(&registry));
-    assert!(prev.is_none(), "registry must be a fresh install");
+    let installed = fs_arc.set_chunked_read_registry(Arc::clone(&registry));
+    assert!(installed, "registry must be a fresh install");
     fs_arc.enable_chunked_reads();
-    assert!(fs_arc.chunked_reads_enabled(), "kill-switch must read back ON");
+    assert!(
+        fs_arc.chunked_reads_enabled(),
+        "kill-switch must read back ON"
+    );
 
     // Spin up a real chunked driver, ship all N chunks (no finish so
     // commit doesn't fire and clear the pin).

@@ -12,7 +12,7 @@
 //!     `set_chunked_read_registry` + `enable_chunked_reads()`.
 //!   - Phase 2.7's `BazelChunkedDispatcherImpl` installed via
 //!     `set_bazel_chunked_dispatcher` (with the SAME registry passed
-//!     via `with_registry`) + `set_bazel_facing_internal_chunking_enabled(true)`.
+//!     via `with_registry`) + `enable_bazel_facing_internal_chunking()`.
 //!
 //! The test then drives a Bazel-shaped client write through
 //! `FastSlowStore::update`. The (β) async-commit path returns Ok at
@@ -39,7 +39,8 @@ use nativelink_store::chunked::chunk_budget::ChunkBudget;
 use nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry;
 use nativelink_store::chunked::pin_budget::PinBudget;
 use nativelink_store::chunked::{
-    BazelChunkedDispatcher, set_bazel_facing_internal_chunking_enabled,
+    BazelChunkedDispatcher, disable_bazel_facing_internal_chunking,
+    enable_bazel_facing_internal_chunking,
 };
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
@@ -180,8 +181,11 @@ async fn run_update(
         tx.send_eof().expect("tx.send_eof must succeed");
         Result::<(), nativelink_error::Error>::Ok(())
     };
-    let store_call =
-        async move { store_clone.update(key, rx, UploadSizeInfo::ExactSize(total)).await };
+    let store_call = async move {
+        store_clone
+            .update(key, rx, UploadSizeInfo::ExactSize(total))
+            .await
+    };
     let (writer_res, store_res) = tokio::join!(update_fut, store_call);
     writer_res?;
     store_res
@@ -215,7 +219,7 @@ async fn e2e_dispatcher_registers_driver_in_registry_during_dispatch() {
     let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
 
     let _guard = kill_switch_lock().lock().await;
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     let (fast_slow, _fs_store, registry, _in_flight_chunked, _metrics, _content_path) =
         make_e2e_fast_slow(CHUNK).await;
@@ -266,12 +270,12 @@ async fn e2e_dispatcher_registers_driver_in_registry_during_dispatch() {
         false
     });
 
-    let (writer_res, update_res, observer_res) = tokio::time::timeout(
-        Duration::from_secs(15),
-        async { tokio::join!(writer_fut, update_fut, observer_fut) },
-    )
-    .await
-    .expect("must not deadlock — E2E dispatcher↔registry test");
+    let (writer_res, update_res, observer_res) =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(writer_fut, update_fut, observer_fut)
+        })
+        .await
+        .expect("must not deadlock — E2E dispatcher↔registry test");
 
     writer_res.expect("writer task panic");
     update_res
@@ -324,7 +328,7 @@ async fn e2e_dispatcher_registers_driver_in_registry_during_dispatch() {
         "pin_hits_total counter is monotone (got pre={pre_hits} post={post_hits})",
     );
 
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 }
 
 /// Helper: snapshot the registry's `pin_hits_total` via the metric
@@ -368,7 +372,7 @@ async fn b2_flush_slow_writes_waits_for_chunked_dispatch_commit() {
     let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
 
     let _guard = kill_switch_lock().lock().await;
-    set_bazel_facing_internal_chunking_enabled(true);
+    enable_bazel_facing_internal_chunking();
 
     let (fast_slow, _fs_store, _registry, _in_flight_chunked, _metrics, _content_path) =
         make_e2e_fast_slow(CHUNK).await;
@@ -420,12 +424,12 @@ async fn b2_flush_slow_writes_waits_for_chunked_dispatch_commit() {
         (remaining, drain_start.elapsed())
     });
 
-    let (writer_res, update_res, drain_res) = tokio::time::timeout(
-        Duration::from_secs(20),
-        async { tokio::join!(writer_fut, update_fut, drain_fut) },
-    )
-    .await
-    .expect("must not deadlock — B2 graceful drain test");
+    let (writer_res, update_res, drain_res) =
+        tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(writer_fut, update_fut, drain_fut)
+        })
+        .await
+        .expect("must not deadlock — B2 graceful drain test");
 
     writer_res.expect("writer task panic");
     update_res
@@ -456,5 +460,5 @@ async fn b2_flush_slow_writes_waits_for_chunked_dispatch_commit() {
          not consult chunked_in_flight_digests",
     );
 
-    set_bazel_facing_internal_chunking_enabled(false);
+    disable_bazel_facing_internal_chunking();
 }
