@@ -259,3 +259,12 @@ required-features = ["chunked_fast_slow"]
 [[test]]
 name = "fast_slow_str_key_skips_chunked_dispatch_test"
 required-features = ["chunked_fast_slow", "test-utils"]
+
+# #218 testing-czar M2 + M3 deferred coverage from #212 Phase 2.1
+# `chunked_filesystem.rs` adapter primitives review. M2: per-blob
+# serialization + cross-blob parallelism. M3: discard/commit
+# over-action gaps (never-written discard, double-commit Err,
+# zero-byte commit). Requires `test-utils` for `partial_path_for_digest`.
+[[test]]
+name = "chunked_filesystem_serialization_test"
+required-features = ["chunked_fast_slow", "test-utils"]
