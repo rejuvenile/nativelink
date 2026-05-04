@@ -72,12 +72,11 @@
 
 #![cfg(feature = "chunked_fast_slow")]
 
+use core::future::Future;
+use core::pin::Pin;
 use core::time::Duration;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use core::future::Future;
-use core::pin::Pin;
 
 use bytes::{Bytes, BytesMut};
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
@@ -87,8 +86,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 };
 use nativelink_util::buf_channel::DropCloserReadHalf;
 use nativelink_util::common::DigestInfo;
-use prost::Message as _;
 use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
+use prost::Message as _;
 use tonic::Response;
 use tracing::{debug, info, warn};
 
@@ -384,48 +383,44 @@ pub async fn write_chunked_stream(
                 return Ok(committed_size);
             }
             Err(err) => {
-                let retry_decision = classify_retryable(&err);
-                match retry_decision {
-                    RetryDecision::Retry { reason, retry_after } => {
-                        match reason {
-                            RetryReason::Aborted => {
-                                metrics
-                                    .aborted_retried_total
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            RetryReason::ResourceExhausted => {
-                                metrics
-                                    .resource_exhausted_total
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        if attempt == options.max_attempts {
-                            warn!(
-                                %digest,
-                                attempt,
-                                ?reason,
-                                "WriteChunked client: retry budget exhausted"
-                            );
-                            last_err = Some(err.append(format!(
-                                "WriteChunked client gave up after {attempt} attempts \
-                                 (last reason: {reason:?})"
-                            )));
-                            break;
-                        }
-                        info!(
-                            %digest,
-                            attempt,
-                            ?reason,
-                            retry_after_ms = retry_after.as_millis() as u64,
-                            "WriteChunked client: retrying after server-hinted backoff"
-                        );
-                        tokio::time::sleep(retry_after).await;
-                        continue;
+                let RetryDecision::Retry { reason, retry_after } = classify_retryable(&err)
+                else {
+                    return Err(err);
+                };
+                match reason {
+                    RetryReason::Aborted => {
+                        metrics
+                            .aborted_retried_total
+                            .fetch_add(1, Ordering::Relaxed);
                     }
-                    RetryDecision::Abort => {
-                        return Err(err);
+                    RetryReason::ResourceExhausted => {
+                        metrics
+                            .resource_exhausted_total
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                if attempt == options.max_attempts {
+                    warn!(
+                        %digest,
+                        attempt,
+                        ?reason,
+                        "WriteChunked client: retry budget exhausted"
+                    );
+                    last_err = Some(err.append(format!(
+                        "WriteChunked client gave up after {attempt} attempts \
+                         (last reason: {reason:?})"
+                    )));
+                    break;
+                }
+                info!(
+                    %digest,
+                    attempt,
+                    ?reason,
+                    retry_after_ms = retry_after.as_millis() as u64,
+                    "WriteChunked client: retrying after server-hinted backoff"
+                );
+                tokio::time::sleep(retry_after).await;
+                continue;
             }
         }
     }
@@ -656,12 +651,20 @@ async fn collect_and_hash_chunks(
     } else if let Some(last) = chunks.last_mut() {
         last.finish = true;
     } else {
-        // declared_size > 0 with no chunks AND no current bytes is
-        // impossible (we would have errored on the size mismatch
-        // check above). Defensive return.
+        // Unreachable when the caller honors the production size gate
+        // (`digest.size_bytes() >= CHUNK_SIZE` in `GrpcStore::update`):
+        // a declared-zero blob never enters this function. The
+        // mismatch check above already errors when `total_received !=
+        // declared_size`, so reaching this branch means
+        // `total_received == declared_size == 0` AND no chunks were
+        // pushed — possible only if a future caller passes
+        // `declared_size = 0` directly. Treat as a contract violation
+        // in the caller (per CLAUDE.md, no defensive Ok-fallback for
+        // an unreachable shape; surface the error instead).
         return Err(make_err!(
             Code::Internal,
-            "WriteChunked client: no chunks built for digest {digest} despite declared size > 0"
+            "WriteChunked client: no chunks built for digest {digest} despite declared size > 0; \
+             caller violated the size-gate contract (must pre-check declared_size > 0)"
         ));
     }
 

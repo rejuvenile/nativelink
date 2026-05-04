@@ -256,10 +256,14 @@ pub struct GrpcStore {
     /// `enable_locality_in_has` on `WorkerProxyStore`.
     #[cfg(feature = "chunked_fast_slow")]
     chunked_writes_enabled: AtomicBool,
-    /// #212 Phase 2.4 metrics for the chunked-write path. Wired into
-    /// the `MetricsComponent` derive once the path is exercised; today
-    /// it lives behind the kill-switch so the counters stay at zero
-    /// until the operator flips on.
+    /// #212 Phase 2.4 metrics for the chunked-write path. Counters
+    /// are populated via `chunked_client::write_chunked_stream` and
+    /// readable through the `chunked_metrics()` accessor. Folding into
+    /// the `MetricsComponent` derive (i.e. adding `#[derive(MetricsComponent)]`
+    /// to `ChunkedClientMetrics` plus `#[metric(group = "chunked_writes")]`
+    /// on this field) is deferred to the follow-up commit that flips
+    /// the kill-switch on in production; until then accessors are
+    /// sufficient for tests and ad-hoc inspection.
     #[cfg(feature = "chunked_fast_slow")]
     chunked_metrics: Arc<crate::chunked::chunked_client::ChunkedClientMetrics>,
 }
@@ -2494,26 +2498,17 @@ impl StoreDriver for GrpcStore {
         // legacy in-order ByteStream Write path (the "Fallback"
         // section below).
         //
-        // The dispatch needs `&Arc<Self>` so the async retry loop can
-        // re-acquire a fresh transport channel per attempt (TCP path
-        // calls back into `ConnectionManager::connection`); we
-        // synthesize the Arc via `Arc::new(self_ref.clone())` —
-        // wait, that double-wraps. Instead: reach into the call site
-        // by way of `self_arc()`, which the trait method does NOT
-        // expose. A future refactor could reach an `Arc<Self>` via
-        // a static OnceLock-on-construction or an `Arc::from_raw`
-        // dance, but for Phase 2.4 the production caller is
-        // `Store::new(grpc_arc)` which already holds an Arc — the
-        // `StoreLike::update` thunk above this passes through
-        // `Pin<&Self>`, so we'd need to thread the Arc deeper.
+        // The retry loop inside `write_chunked_stream` re-acquires a
+        // fresh transport per attempt via the dispatcher's
+        // `acquire_channel` factory (`ConnectionManager::connection()`
+        // for TCP, `Channel::clone()` for QUIC) — `Clone` on
+        // `ConnectionManager` (added for #212 Phase 2.4) makes this
+        // work without threading an `Arc<Self>` through the trait
+        // method.
         //
-        // For now: detect the chunked path here, then delegate to a
-        // helper that takes the unboxed reference (no Arc::upgrade
-        // retry chain); the retry loop inside `write_chunked_stream`
-        // re-uses the dispatcher's stored transport via `Clone`.
-        // The upper bound (`MAX_CHUNKED_BLOB_SIZE`) is the v1
-        // safety cap: the chunked client buffers the entire payload in
-        // memory up-front so retries can resend from a single-pass
+        // The upper bound (`MAX_CHUNKED_BLOB_SIZE`) is the v1 safety
+        // cap: the chunked client buffers the entire payload in memory
+        // up-front so retries can resend from a single-pass
         // `DropCloserReadHalf`. Without this cap a multi-GB blob would
         // peak the worker's RSS at O(blob_size). Streaming retry that
         // would let us lift the cap is deferred to Phase 2.5+.
