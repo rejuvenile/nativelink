@@ -26,7 +26,7 @@ use nativelink_config::stores::CompressionSpec;
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{
-    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
+    DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair,
 };
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::spawn;
@@ -314,13 +314,32 @@ impl StoreDriver for CompressionStore {
         );
 
         let write_fut = async move {
+            // Writer-termination contract for `tokio::join!(write_fut, update_fut)`:
+            // `update_fut` (= `inner_store.update(key, rx, ...)`) reads
+            // `rx` paired with `tx`. Any `?`-propagated Err below
+            // (header serialize, reader.consume, error_if size overshoot,
+            // compress_into, mid-stream tx.send, footer serialize, footer
+            // tx.send, send_eof) used to drop `tx` silently — `rx.recv()`
+            // in the inner store then synthesized
+            // `Code::Internal "Sender dropped before sending EOF"` instead
+            // of propagating the actionable upstream cause. Sibling of
+            // #245 (`verify_store::inner_check_update`), see audit at
+            // `.claude/audits/245-fast-slow-store-sender-drop.md`.
+            //
+            // Wrap with `WriteHalfGuard`: any `?` exit fires the guard's
+            // Drop fallback (synthesized structured Internal carrying the
+            // greppable "buf_channel: writer dropped without commit"
+            // marker). On the success path, `commit_eof()` suppresses the
+            // fallback after `send_eof()`.
+            let mut tx_guard = WriteHalfGuard::new(&mut tx);
             {
                 // Write Header.
                 let serialized_header = encode_to_vec(output_state.header, self.bincode_config)
                     .map_err(|e| {
                         make_err!(Code::Internal, "Failed to serialize header : {:?}", e)
                     })?;
-                tx.send(serialized_header.into())
+                (*tx_guard)
+                    .send(serialized_header.into())
                     .await
                     .err_tip(|| "Failed to write compression header on upload")?;
             }
@@ -370,7 +389,8 @@ impl StoreDriver for CompressionStore {
                 );
 
                 // Now send our chunk.
-                tx.send(compressed_data_buf.freeze())
+                (*tx_guard)
+                    .send(compressed_data_buf.freeze())
                     .await
                     .err_tip(|| "Failed to write chunk to inner store in compression store")?;
 
@@ -406,10 +426,12 @@ impl StoreDriver for CompressionStore {
                 footer.put_u32_le(u32::try_from(serialized_footer.len()).unwrap_or(u32::MAX));
                 footer.extend_from_slice(&serialized_footer);
 
-                tx.send(footer.freeze())
+                (*tx_guard)
+                    .send(footer.freeze())
                     .await
                     .err_tip(|| "Failed to write footer to inner store in compression store")?;
-                tx.send_eof()
+                tx_guard
+                    .commit_eof()
                     .err_tip(|| "Failed writing EOF in compression store update")?;
             }
 

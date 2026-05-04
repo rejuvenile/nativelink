@@ -716,29 +716,43 @@ impl FastSlowStore {
         let (mut chunk_tx, chunk_rx) = make_buf_channel_pair_with_size(128);
 
         let data_stream_fut = async move {
+            // Writer-termination contract for `join3(data_stream_fut,
+            // fast_store_fut, dispatch_fut)`: any `?` Err exit below
+            // historically dropped `fast_tx` / `chunk_tx` silently, so the
+            // sibling `fast_store_fut` (= `inner.update(rx)`) and
+            // `dispatch_fut` (= `dispatcher.dispatch(chunk_rx)`) saw a
+            // generic `"Sender dropped before sending EOF"` Internal
+            // instead of the actionable upstream cause. Latent harden in
+            // the same #245 family — see audit at
+            // `.claude/audits/245-fast-slow-store-sender-drop.md` Phase 4
+            // sibling-bug list. Per audit "fast_slow_store.rs:718-749's
+            // chunked data_stream_fut: same harden-by-explicit-termination
+            // on `fast_tx` and `chunk_tx`."
+            let mut fast_guard = WriteHalfGuard::new(&mut fast_tx);
+            let mut chunk_guard = WriteHalfGuard::new(&mut chunk_tx);
             loop {
                 let buffer = reader
                     .recv()
                     .await
                     .err_tip(|| "Failed to read buffer in fast_slow chunked dispatch")?;
                 if buffer.is_empty() {
-                    fast_tx
-                        .send_eof()
+                    fast_guard
+                        .commit_eof()
                         .err_tip(|| "Failed to send eof to fast store (chunked path)")?;
-                    chunk_tx
-                        .send_eof()
+                    chunk_guard
+                        .commit_eof()
                         .err_tip(|| "Failed to send eof to chunked dispatcher")?;
                     return Result::<(), Error>::Ok(());
                 }
                 let buf_for_chunk = buffer.clone();
-                fast_tx.send(buffer).await.map_err(|e| {
+                (*fast_guard).send(buffer).await.map_err(|e| {
                     make_err!(
                         Code::Internal,
                         "Failed to send to fast store in chunked dispatch: {:?}",
                         e
                     )
                 })?;
-                chunk_tx.send(buf_for_chunk).await.map_err(|e| {
+                (*chunk_guard).send(buf_for_chunk).await.map_err(|e| {
                     make_err!(
                         Code::Internal,
                         "Failed to send to chunked dispatcher: {:?}",
@@ -3072,6 +3086,20 @@ impl StoreDriver for FastSlowStore {
         // Vec<Bytes> (O(1) refcount bump per chunk, no copying) for the
         // background slow store write.
         let data_stream_fut = async move {
+            // Writer-termination contract for `join!(data_stream_fut,
+            // fast_store_fut)`: any `?` Err exit historically dropped
+            // `fast_tx` silently, so the sibling `fast_store_fut`
+            // (= `fast_store.update(fast_rx)`) saw a generic
+            // `"Sender dropped before sending EOF"` Internal instead of
+            // the actionable upstream cause from `reader.recv()`. Latent
+            // harden in the #245 family — see audit at
+            // `.claude/audits/245-fast-slow-store-sender-drop.md` Phase 4
+            // sibling-bug list. Per audit "fast_slow_store.rs:3074-3110's
+            // data_stream_fut: explicit termination of fast_tx on Err
+            // branches so a downstream caller wrapping FastSlowStore in
+            // another tokio::join! sees a structured error instead of a
+            // synthesized 'Sender dropped' Internal."
+            let mut fast_guard = WriteHalfGuard::new(&mut fast_tx);
             let mut chunks: Vec<Bytes> = Vec::new();
             loop {
                 let buffer = reader
@@ -3079,13 +3107,13 @@ impl StoreDriver for FastSlowStore {
                     .await
                     .err_tip(|| "Failed to read buffer in fastslow store")?;
                 if buffer.is_empty() {
-                    fast_tx.send_eof().err_tip(
+                    fast_guard.commit_eof().err_tip(
                         || "Failed to write eof to fast store in fast_slow store update",
                     )?;
                     return Result::<Vec<Bytes>, Error>::Ok(chunks);
                 }
                 chunks.push(buffer.clone());
-                fast_tx.send(buffer).await.map_err(|e| {
+                (*fast_guard).send(buffer).await.map_err(|e| {
                     make_err!(
                         Code::Internal,
                         "Failed to send message to fast_store in fast_slow_store {:?}",

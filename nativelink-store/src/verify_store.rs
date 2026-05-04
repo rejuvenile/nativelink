@@ -76,12 +76,39 @@ impl VerifyStore {
         original_hash: &PackedHash,
         mut maybe_hasher: Option<&mut D>,
     ) -> Result<(), Error> {
+        // Writer-termination contract for `tokio::join!(update_fut, check_fut)`:
+        // `update_fut` (= `inner_store.update(digest, rx, ...)`) reads from
+        // `rx`. If `inner_check_update` returns Err WITHOUT terminating
+        // `tx`, `rx.recv()` from the inner store synthesizes a generic
+        // `Code::Internal "Sender dropped before sending EOF"`
+        // (`buf_channel.rs:582`). Because `tokio::join!` does not
+        // short-circuit, the inner store's update keeps polling and
+        // surfaces that derivative log
+        // (`FastSlowStore::update (chunked): data stream failed`) instead
+        // of the actionable upstream cause (size mismatch / hash
+        // mismatch / etc.). #245 in production: ~15 events / 10-min on
+        // ≥18 MB blobs.
+        //
+        // The function takes `tx` BY VALUE, so the guard wraps a local
+        // `&mut` borrow of the owned `tx`. On every Err early return the
+        // guard's `Drop` synthesizes a structured Internal so the paired
+        // `rx.recv()` returns a structured error instead of the generic
+        // "Sender dropped" one — and in the common case below we
+        // EXPLICITLY `guard.fail(err.clone())` so the actionable upstream
+        // err (e.g. "Hashes do not match") flows through to the merged
+        // result rather than the synthesized fallback. Mirrors the
+        // `get_part` pattern at `verify_store.rs:374-388`.
+        let mut tx_guard = WriteHalfGuard::new(&mut tx);
         let mut sum_size: u64 = 0;
         loop {
-            let chunk = rx
+            let chunk = match rx
                 .recv()
                 .await
-                .err_tip(|| "Failed to read chunk in check_update in verify store")?;
+                .err_tip(|| "Failed to read chunk in check_update in verify store")
+            {
+                Ok(c) => c,
+                Err(err) => return Err(tx_guard.fail(err)),
+            };
             sum_size += chunk.len() as u64;
 
             // Ensure if a user sends us too much data we fail quickly.
@@ -89,11 +116,11 @@ impl VerifyStore {
                 match sum_size.cmp(&expected_size) {
                     core::cmp::Ordering::Greater => {
                         self.size_verification_failures.inc();
-                        return Err(make_input_err!(
+                        return Err(tx_guard.fail(make_input_err!(
                             "Expected size {} but already received {} on insert",
                             expected_size,
                             sum_size
-                        ));
+                        )));
                     }
                     core::cmp::Ordering::Equal => {
                         // Ensure our next chunk is the EOF chunk.
@@ -102,10 +129,10 @@ impl VerifyStore {
                         if let Ok(eof_chunk) = rx.peek().await {
                             if !eof_chunk.is_empty() {
                                 self.size_verification_failures.inc();
-                                return Err(make_input_err!(
+                                return Err(tx_guard.fail(make_input_err!(
                                     "Expected EOF chunk when exact size was hit on insert in verify store - {}",
                                     expected_size,
-                                ));
+                                )));
                             }
                         }
                     }
@@ -118,11 +145,11 @@ impl VerifyStore {
                 if let Some(expected_size) = maybe_expected_digest_size {
                     if sum_size != expected_size {
                         self.size_verification_failures.inc();
-                        return Err(make_input_err!(
+                        return Err(tx_guard.fail(make_input_err!(
                             "Expected size {} but got size {} on insert",
                             expected_size,
                             sum_size
-                        ));
+                        )));
                     }
                 }
                 if let Some(hasher) = maybe_hasher.as_mut() {
@@ -130,25 +157,36 @@ impl VerifyStore {
                     let hash_result = digest.packed_hash();
                     if original_hash != hash_result {
                         self.hash_verification_failures.inc();
-                        return Err(make_input_err!(
+                        return Err(tx_guard.fail(make_input_err!(
                             "Hashes do not match, got: {original_hash} but digest hash was {hash_result}",
-                        ));
+                        )));
                     }
                 }
-                tx.send_eof().err_tip(|| "In verify_store::check_update")?;
+                tx_guard
+                    .commit_eof()
+                    .err_tip(|| "In verify_store::check_update")?;
                 break;
             }
 
             // This will allows us to hash while sending data to another thread.
-            let write_future = tx.send(chunk.clone());
+            let write_future = (*tx_guard).send(chunk.clone());
 
             if let Some(hasher) = maybe_hasher.as_mut() {
                 hasher.update(chunk.as_ref());
             }
 
-            write_future
+            if let Err(err) = write_future
                 .await
-                .err_tip(|| "Failed to write chunk to inner store in verify store")?;
+                .err_tip(|| "Failed to write chunk to inner store in verify store")
+            {
+                // Mid-stream `tx.send` failure means `rx` (the inner
+                // store's read half) was already closed (inner store
+                // errored or the join's other future dropped). Mark
+                // committed so Drop doesn't synthesize a redundant
+                // Internal on top of the underlying err. The send_error
+                // would land in a closed channel anyway.
+                return Err(tx_guard.fail(err));
+            }
         }
         Ok(())
     }
