@@ -1,11 +1,31 @@
 [build]
+# Cross-platform defaults. Cargo APPLIES these only when no matching
+# `[target.<triple>]` table is set. When a target table IS set (see Linux
+# below), cargo REPLACES (does NOT concatenate) these with the target's
+# rustflags. Per
+# https://doc.rust-lang.org/cargo/reference/config.html#buildrustflags
+#
+# **Practical consequence:** any flag here MUST be duplicated in every
+# active `[target.<triple>]` block, or it is silently dropped on that
+# target. The alternative — relying on concatenation — does not work in
+# any released cargo, despite many docs/examples implying it does.
+#
+# **Today (2026-05-04) this caught us:** `--cfg tokio_unstable` was set
+# only here; the Linux target block did not duplicate it. Linux builds
+# silently dropped it. `src/bin/nativelink.rs:264-287` runtime-metrics
+# watchdog (gated `#[cfg(tokio_unstable)]`) had been compiled out as
+# dead code in production for the entire lifetime of that block. A
+# probe added to `nativelink-util/src/spawn_rate_probe.rs` calling
+# `m.num_blocking_threads()` unconditionally then failed to compile,
+# the deploy script's `2>&1 | tail -3` swallowed the error, and a
+# stale binary was installed. See `.claude/audits/239-deep-dive-mechanism.md`.
 rustflags = ["-C", "target-cpu=native", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable"]
 
-# Linux-specific overrides. cargo concatenates [build] rustflags with the
-# matching [target.X] rustflags, so only put Linux-only flags here. Avoid
-# repeating cross-platform flags from [build] above; duplicate -C entries
-# can cause spurious cache invalidation on some cargo versions.
+# Linux build flags. MUST DUPLICATE every entry from `[build] rustflags`
+# above, or that entry is silently dropped on Linux. Linux-only
+# additions go after the duplicates.
 #
+# Linux-only additions:
 # - `-C link-arg=-fuse-ld=mold` cuts test-binary link wall-clock; mold is
 #   already a hard requirement on the deploy server.
 # - `-Z share-generics=y` collapses duplicate generic instantiations across
@@ -27,6 +47,11 @@ rustflags = ["-C", "target-cpu=native", "-C", "force-frame-pointers=yes", "--cfg
 # workspace, drop the `-Z` lines below or guard them in a separate config.
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
+  # === duplicated from [build] above (cargo replaces, doesn't concat) ===
+  "-C", "target-cpu=native",
+  "-C", "force-frame-pointers=yes",
+  "--cfg", "tokio_unstable",
+  # === Linux-only additions ===
   "-C", "link-arg=-fuse-ld=mold",
   "-Z", "share-generics=y",
   "-Z", "threads=64",
