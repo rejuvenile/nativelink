@@ -39,6 +39,7 @@
 
 #![cfg(all(feature = "chunked_fast_slow", feature = "test-utils"))]
 
+use core::pin::Pin;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -50,6 +51,7 @@ use nativelink_error::Code;
 use nativelink_macro::nativelink_test;
 use nativelink_store::filesystem_store::{DIGEST_FOLDER, FileEntryImpl, FilesystemStore};
 use nativelink_util::common::DigestInfo;
+use nativelink_util::store_trait::{StoreDriver, StoreKey};
 
 /// Test harness: build a fresh `FilesystemStore` rooted under a unique
 /// temp path. Returns the store + the (content_path, temp_path) so tests
@@ -562,6 +564,30 @@ async fn commit_chunked_zero_byte_blob_with_no_writes() {
             partial_meta.is_err(),
             "zero-byte fast-path must not leave a .partial behind; \
              found unexpected file at {partial_path}",
+        );
+
+        // #247 cross-layer index-visibility contract: kernel-view
+        // assertions above (tokio::fs::read, tokio::fs::metadata)
+        // verify the file landed on disk but NOT the in-process index
+        // production callers consult. Per CLAUDE.md "Index-visibility
+        // contract", any rename-into-canonical-path operation must be
+        // tested via has_with_results, NOT via fs::read/metadata of
+        // the final path. A future regression that bypasses the
+        // finalize_holding evicting_map insert for the zero-byte path
+        // would leave the file readable from the kernel but invisible
+        // to has() — same shape as the original #247 bug.
+        let mut results = [None];
+        Pin::new(store.as_ref())
+            .has_with_results(&[StoreKey::Digest(zero_digest)], &mut results)
+            .await
+            .expect("has_with_results must succeed");
+        assert_eq!(
+            results[0],
+            Some(0),
+            "zero-byte chunked commit must be visible to has_with_results \
+             immediately after finalize_holding (cross-layer index-visibility \
+             contract; #247). Got: {:?}",
+            results[0],
         );
     })
     .await

@@ -446,3 +446,99 @@ async fn forward_racer_aborts_racer_task_on_bind_buffered_err_244() -> Result<()
 
     Ok(())
 }
+
+/// #244 over-action positive control. Per CLAUDE.md "Asymmetric
+/// contract coverage": the under-action test above asserts that
+/// `handle.abort()` MUST FIRE when `bind_buffered` returns Err. The
+/// over-action sibling asserts the success path through
+/// `forward_racer` returns Ok with the full payload — guarding
+/// against accidental error injection on the success path.
+///
+/// **Mutation-step limitation:** the obvious over-action mutation
+/// (hoisting `handle.abort()` outside the `if let Err` arm) does
+/// NOT cause this test to red-fail. By the time `bind_buffered`
+/// returns Ok, the racer task has already dropped its tx (which is
+/// what triggered the rx EOF that ended bind_buffered) and
+/// completed; `handle.abort()` after task-completion is a documented
+/// no-op, and `handle.await` returns the task's stored Ok result.
+/// The natural ordering protects this specific over-action site.
+/// The test still has value as positive coverage of the
+/// `race_peers=true` peer-winner success path — guarding against
+/// regressions that DO change the success-path Result (e.g.
+/// `handle.await.map(|_| Err(...))` "improvements").
+///
+/// Setup: a peer that streams the FULL payload to completion with
+/// no inter-chunk delay; a consumer that drains everything via
+/// `get_part_unchunked`. Asserts the bytes returned match the
+/// payload byte-for-byte.
+#[nativelink_test]
+async fn forward_racer_does_not_abort_racer_task_on_bind_buffered_ok_244()
+-> Result<(), Error> {
+    // Small payload to keep the test quick; the contract is
+    // independent of payload size as long as bind_buffered drains
+    // to natural EOF.
+    let value = test_value(64 * 1024);
+    let digest = digest_for_size(value.len() as u64);
+
+    let inner = make_empty_filesystem_inner().await?;
+
+    // ExitGuard signals when the peer's get_part future drops; we
+    // don't strictly need this for the assertion, but it confirms
+    // the peer task completes naturally.
+    let (exit_tx, _exit_rx) = oneshot::channel::<()>();
+    let peer_inner = Store::new(Arc::new(ChunkedPeerStore {
+        payload: Bytes::from(value.clone()),
+        chunk_size: 8 * 1024,
+        // No post-burst sleep, no early sleep gate — peer streams
+        // straight through and completes naturally.
+        post_burst_sleep_ms: AtomicU64::new(0),
+        chunks_before_sleep: AtomicU64::new(u64::MAX),
+        exit_signal: StdMutex::new(Some(exit_tx)),
+    }));
+
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
+    proxy_arc.enable_race_peers();
+    let peer_endpoint = "grpc://forward-racer-244-ok-peer:50081";
+    proxy_arc.inject_worker_connection(peer_endpoint, peer_inner);
+    locality_map
+        .write()
+        .register_blobs(peer_endpoint, &[digest]);
+    let proxy = Store::new(proxy_arc.clone());
+
+    // Drain everything via get_part_unchunked — exercises the
+    // bind_buffered Ok path inside forward_racer; consumer reads
+    // all chunks; bind_buffered returns Ok; handle.await observes
+    // the peer task's natural Ok completion.
+    let key: StoreKey<'static> = digest.into();
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        proxy.get_part_unchunked(key, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — bind_buffered Ok path must complete in 10s \
+         (#244 over-action positive control)",
+    );
+
+    let bytes = result.expect(
+        "peer-winner success path through forward_racer must return Ok. \
+         If this fires with Code::Internal mentioning JoinError::cancelled, \
+         the abort was hoisted outside the bind_buffered Err if-let — restore \
+         the conditional gate at worker_proxy_store.rs:2188 (#244 over-action \
+         positive control).",
+    );
+    assert_eq!(
+        bytes.len(),
+        value.len(),
+        "peer-winner payload length must match (#244 over-action); got {}",
+        bytes.len(),
+    );
+    assert_eq!(
+        bytes.as_ref(),
+        value.as_slice(),
+        "peer-winner payload bytes must match (#244 over-action)",
+    );
+
+    Ok(())
+}

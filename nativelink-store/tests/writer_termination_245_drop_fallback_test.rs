@@ -18,9 +18,9 @@
 //!
 //! Per testing-czar review of #245 (`.claude/reviews/245-writer-termination-fix/
 //! testing-czar.md`), the new guard wraps at:
-//!   - `compression_store.rs:334` (write_fut),
-//!   - `fast_slow_store.rs:731-732` (chunked data_stream_fut, two guards),
-//!   - `fast_slow_store.rs:3102` (legacy data_stream_fut),
+//!   - `compression_store.rs CompressionStore::update write_fut WriteHalfGuard wrap` (write_fut),
+//!   - `fast_slow_store.rs FastSlowStore::update chunked data_stream_fut WriteHalfGuard wraps (fast_tx + chunk_tx)` (chunked data_stream_fut, two guards),
+//!   - `fast_slow_store.rs FastSlowStore::update legacy data_stream_fut` (legacy data_stream_fut),
 //! are defense-in-depth on `?` propagation paths. The original #245
 //! tests cover `verify_store::inner_check_update` (the production
 //! symptom site) but do NOT exercise these wraps. A future commit that
@@ -216,7 +216,7 @@ impl StoreDriver for ReaderObservingInnerStore {
 /// structured Err instead of the synthesized "Sender dropped"
 /// Internal). A future commit that removed the
 /// `let mut tx_guard = WriteHalfGuard::new(&mut tx);` line at
-/// `compression_store.rs:334` would silently regress this contract.
+/// `compression_store.rs CompressionStore::update write_fut WriteHalfGuard wrap` would silently regress this contract.
 ///
 /// Mechanism: producer sends nothing then injects a structured
 /// `send_error` on the OUTER reader. CompressionStore's `write_fut`
@@ -271,7 +271,7 @@ async fn compression_store_write_failure_propagates_via_drop_fallback() -> Resul
         "WRITER_TERMINATION_VIOLATED_245_compression_drop_fallback: \
          CompressionStore::update did not return within 5s when write_fut \
          hit a `?`-propagation Err. The WriteHalfGuard wrap at \
-         compression_store.rs:334 must terminate tx so the paired inner \
+         compression_store.rs CompressionStore::update write_fut WriteHalfGuard wrap must terminate tx so the paired inner \
          store's rx.recv() returns instead of blocking forever.",
     );
 
@@ -297,7 +297,7 @@ async fn compression_store_write_failure_propagates_via_drop_fallback() -> Resul
             .iter()
             .any(|m| m.contains(DROP_FALLBACK_IDENTIFIER)),
         "compression_store::update's `WriteHalfGuard::new(&mut tx)` wrap at \
-         compression_store.rs:334 must fire the Drop fallback on `?` exit so \
+         compression_store.rs CompressionStore::update write_fut WriteHalfGuard wrap must fire the Drop fallback on `?` exit so \
          the paired inner store's rx.recv() observes the structured \
          {DROP_FALLBACK_IDENTIFIER:?} marker. If this fragment is absent the \
          guard wrap was removed — re-add it so `?` exits terminate tx \
@@ -310,7 +310,7 @@ async fn compression_store_write_failure_propagates_via_drop_fallback() -> Resul
             .any(|m| m.contains(SENDER_DROPPED_IDENTIFIER)),
         "compression_store: inner observed the synthesized 'Sender dropped \
          before sending EOF' Internal instead of the WriteHalfGuard Drop \
-         fallback marker — the guard wrap at compression_store.rs:334 was \
+         fallback marker — the guard wrap at compression_store.rs CompressionStore::update write_fut WriteHalfGuard wrap was \
          removed. Got: {observed_err:?}",
     );
     assert!(
@@ -456,7 +456,7 @@ impl StoreDriver for RecordingFastStore {
 /// Internal. A future commit that removed the
 /// `let mut fast_guard = WriteHalfGuard::new(&mut fast_tx);` or
 /// `let mut chunk_guard = WriteHalfGuard::new(&mut chunk_tx);` line at
-/// `fast_slow_store.rs:731-732` would silently regress this contract.
+/// `fast_slow_store.rs FastSlowStore::update chunked data_stream_fut WriteHalfGuard wraps (fast_tx + chunk_tx)` would silently regress this contract.
 ///
 /// Mechanism: producer sends nothing then injects `send_error` on the
 /// outer reader. data_stream_fut's `reader.recv()` returns Err on the
@@ -557,7 +557,7 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
         "WRITER_TERMINATION_VIOLATED_245_fast_slow_chunked_drop_fallback: \
          FastSlowStore::update did not return within 5s when chunked \
          data_stream_fut hit a `?`-propagation Err. The WriteHalfGuard \
-         wraps at fast_slow_store.rs:731-732 must terminate fast_tx and \
+         wraps at fast_slow_store.rs FastSlowStore::update chunked data_stream_fut WriteHalfGuard wraps (fast_tx + chunk_tx) must terminate fast_tx and \
          chunk_tx so the paired fast-store + dispatcher rx.recv()s return \
          instead of blocking forever.",
     );
@@ -584,7 +584,7 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
             .iter()
             .any(|m| m.contains(DROP_FALLBACK_IDENTIFIER)),
         "fast_slow_store chunked data_stream_fut's `WriteHalfGuard::new(&mut \
-         fast_tx)` wrap at fast_slow_store.rs:731 must fire the Drop fallback \
+         fast_tx)` wrap at fast_slow_store.rs FastSlowStore::update fast_tx WriteHalfGuard wrap must fire the Drop fallback \
          on `?` exit so fast_store_fut's rx.recv() observes the structured \
          {DROP_FALLBACK_IDENTIFIER:?} marker. Got fast observed: {fast_err:?}",
     );
@@ -594,7 +594,7 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
             .iter()
             .any(|m| m.contains(SENDER_DROPPED_IDENTIFIER)),
         "fast tier observed the synthesized 'Sender dropped before sending EOF' \
-         Internal — fast_guard wrap at fast_slow_store.rs:731 was removed. \
+         Internal — fast_guard wrap at fast_slow_store.rs FastSlowStore::update fast_tx WriteHalfGuard wrap was removed. \
          Got: {fast_err:?}",
     );
 
@@ -614,7 +614,7 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
             .iter()
             .any(|m| m.contains(DROP_FALLBACK_IDENTIFIER)),
         "fast_slow_store chunked data_stream_fut's `WriteHalfGuard::new(&mut \
-         chunk_tx)` wrap at fast_slow_store.rs:732 must fire the Drop fallback \
+         chunk_tx)` wrap at fast_slow_store.rs FastSlowStore::update chunk_tx WriteHalfGuard wrap must fire the Drop fallback \
          on `?` exit so dispatch_fut's rx.recv() observes the structured \
          {DROP_FALLBACK_IDENTIFIER:?} marker. Got dispatcher observed: \
          {chunk_err:?}",
@@ -625,7 +625,7 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
             .iter()
             .any(|m| m.contains(SENDER_DROPPED_IDENTIFIER)),
         "dispatcher observed the synthesized 'Sender dropped before sending EOF' \
-         Internal — chunk_guard wrap at fast_slow_store.rs:732 was removed. \
+         Internal — chunk_guard wrap at fast_slow_store.rs FastSlowStore::update chunk_tx WriteHalfGuard wrap was removed. \
          Got: {chunk_err:?}",
     );
 

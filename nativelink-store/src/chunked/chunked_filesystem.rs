@@ -424,6 +424,18 @@ pub(crate) async fn write_chunk_at_offset(
         // Defensive: a zero-length chunk is a no-op. Don't open the
         // file for nothing. Phase 2.3 driver should never produce
         // zero-length chunks but the contract here is permissive.
+        //
+        // **Load-bearing for FIXME(#218) zero-byte fast-path**: this
+        // early-return means a true zero-byte blob never opens a
+        // partial, so `commit_chunked_to_holding`'s `!has_entry`
+        // predicate (the gate for the zero-byte fast-path) is
+        // satisfied by construction. If a future change makes this
+        // branch open + close an empty partial, the fast-path's
+        // `!has_entry` check would flip false and the path would
+        // fall through to the length-check branch — still correct
+        // (length 0 == expected_size 0 → rename succeeds), but
+        // changes the operational profile. Update both sites
+        // together if you alter this contract.
         return Ok(());
     }
 
