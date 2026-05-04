@@ -1542,12 +1542,14 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// inspect / log the failed partial before discarding.
     ///
     /// On success: removes the in-flight state entry. The new CAS file
-    /// is **NOT** automatically inserted into the FilesystemStore's
-    /// `evicting_map` — Phase 2.3's driver is responsible for that
-    /// (analogous to the legacy `update` path's `emplace_file` insert).
-    /// Splitting commit-from-emplace this way lets the driver atomically
-    /// validate-and-emplace under its own lock + bump metrics in one
-    /// place.
+    /// is inserted into the FilesystemStore's `evicting_map` by stage 2
+    /// (`finalize_holding`) AFTER the end-to-end SHA-256 verify on the
+    /// `.holding` file passes (#247 fix — see `finalize_holding` doc).
+    /// Stage 1 itself does not emplace because the bytes have only
+    /// passed per-chunk hash checks at this point; the canonical CAS
+    /// path is intentionally not exposed to readers until the e2e
+    /// digest verify succeeds and the `.holding` → canonical rename in
+    /// stage 2 completes.
     pub async fn commit_chunked(
         &self,
         digest: &DigestInfo,
@@ -1568,12 +1570,91 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// 0o555. Removes the in-flight tracker entry on success.
     /// Used by the Phase 2.3 `commit_and_verify` driver code AFTER
     /// the end-to-end SHA-256 verify against the holding file passes.
+    ///
+    /// #247 fix: after the rename succeeds, ALSO insert a `FileEntry`
+    /// pointing at the canonical CAS path into the `evicting_map` so
+    /// that `has_with_results` (which consults the in-memory index
+    /// only — it never stats the disk) sees the freshly-committed
+    /// blob immediately. Without this, the chunked driver returned
+    /// success but the file was invisible to `has()` until the next
+    /// `FilesystemStore::new` startup walk over `content_path/d/`.
+    /// In production this caused `FastSlowStore::run_producer` to
+    /// fall back to peer-fetch (`WorkerProxyStore`) on freshly-
+    /// committed blobs → partial-byte responses → Bazel hash
+    /// mismatch → build wedge.
+    ///
+    /// Mirrors the `add_files_to_cache` startup-walk emplace pattern
+    /// (filesystem_store.rs:550-591): the file is already at its
+    /// canonical `PathType::Content` location, so we construct the
+    /// `FileEntry` directly via `Fe::create(...)` (no I/O) and
+    /// `evicting_map.insert(...)`. The legacy `update_file` path
+    /// (filesystem_store.rs:1167) instead uses `emplace_file` because
+    /// THAT path's file is in `PathType::Temp` and the rename to
+    /// canonical happens INSIDE `emplace_file`; the chunked path
+    /// already did its own rename in `chunked_finalize_holding`, so
+    /// `emplace_file`'s rename would be a no-op + an unwanted
+    /// pre-rename lock dance.
+    ///
+    /// CAS-immutable optimization: mirror `emplace_file`'s
+    /// short-circuit at filesystem_store.rs:1217-1223 — if the key
+    /// already exists in the map for an immutable store, skip the
+    /// insert (same digest = same content; the existing entry already
+    /// points at the same on-disk path, which the rename just
+    /// overwrote with byte-identical content).
+    ///
+    /// Lock ordering with `ChunkedPartialsMap` removal: the partial-
+    /// map removal happens INSIDE `chunked_finalize_holding` (in
+    /// `chunked_filesystem.rs:694`), which runs BEFORE this insert.
+    /// That ordering matters for the chunked-pin read path: the
+    /// `try_get_chunk_from_pin` accessor reads the in-memory pin,
+    /// which is held by the per-blob `ChunkInProgress` Arc. Once the
+    /// chunked driver clears its pin (post `await_completion`), the
+    /// reader cascade falls through to `has_with_results`. By
+    /// emplacing AFTER the partial-map removal but BEFORE returning
+    /// to the driver (which then clears the pin), every reader
+    /// arriving after the driver-task pin clear will find the entry
+    /// in `evicting_map`. There is no window where the file is on
+    /// disk and indexed in NEITHER structure.
     pub async fn finalize_holding(&self, digest: &DigestInfo) -> Result<(), Error> {
         let holding_path = chunked_holding_path(&self.shared_context.content_path, digest);
         let key: StoreKey<'static> = (*digest).into();
         let final_os = to_full_path_from_key(&self.shared_context.content_path, &key);
         let final_path = std::path::PathBuf::from(final_os);
-        chunked_finalize_holding(&self.chunked_partials, digest, holding_path, final_path).await
+        chunked_finalize_holding(&self.chunked_partials, digest, holding_path, final_path).await?;
+
+        // CAS-immutable shortcut: if the key already exists, the
+        // pre-existing FileEntry already points at the same canonical
+        // path with byte-identical content (digest defines content).
+        // Skip the insert+unref cycle.
+        if self.content_is_immutable
+            && self.evicting_map.size_for_key(&key).await.is_some()
+        {
+            return Ok(());
+        }
+
+        // Construct a FileEntry pointing at the already-on-disk
+        // canonical CAS file. `data_size = digest.size_bytes()` is
+        // load-bearing: `commit_chunked` enforces that the .holding
+        // file's actual length matches `expected_size = digest.
+        // size_bytes()` (chunked_filesystem.rs length-mismatch path),
+        // so by the time this code runs, on-disk length == digest
+        // size. `block_size` is mirrored from the legacy
+        // `add_files_to_cache` emplace at filesystem_store.rs:550 so
+        // page-rounded LRU accounting matches the startup-walk path.
+        let data_size = digest.size_bytes();
+        let entry = Fe::create(
+            data_size,
+            self.block_size,
+            RwLock::new(EncodedFilePath {
+                shared_context: self.shared_context.clone(),
+                path_type: PathType::Content,
+                key: key.borrow().into_owned(),
+            }),
+        );
+        self.evicting_map
+            .insert(key.borrow().into_owned().into(), Arc::new(entry))
+            .await;
+        Ok(())
     }
 
     /// B1 fixup: best-effort unlink of the holding file. Used by the

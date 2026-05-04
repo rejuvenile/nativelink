@@ -260,6 +260,15 @@ required-features = ["chunked_fast_slow"]
 name = "fast_slow_str_key_skips_chunked_dispatch_test"
 required-features = ["chunked_fast_slow", "test-utils"]
 
+# #247: regression for `FilesystemStore::finalize_holding` MUST insert
+# the freshly-renamed canonical CAS file into `evicting_map` so
+# `has_with_results` sees the blob immediately after the chunked driver
+# reports commit success. Production-composition test (real
+# `ChunkedDriver` → real `FilesystemStore`); 5 s deadlock detector.
+[[test]]
+name = "filesystem_store_247_chunked_commit_immediately_visible_test"
+required-features = ["chunked_fast_slow"]
+
 # #218 testing-czar M2 + M3 deferred coverage from #212 Phase 2.1
 # `chunked_filesystem.rs` adapter primitives review. M2: per-blob
 # serialization + cross-blob parallelism. M3: discard/commit
