@@ -481,12 +481,21 @@ async fn commit_chunked_after_successful_commit_returns_err() {
 // then finds nothing in the map → NotFound), OR (b) the adapter would
 // need a `commit_chunked_empty` shortcut.
 //
-// This test asserts the CURRENT behavior and documents the gap as a
-// FIXME so the Phase 2.3 driver wiring can choose the right
-// resolution: create the empty file in `commit_chunked_to_holding`
-// when `expected_size=0` and the entry is absent, or short-circuit at
-// the dispatcher level. Either way, the test makes the missing
-// behavior visible.
+// **#218 Resolution B (chosen):** at commit time, if `expected_size == 0`
+// AND no in-flight partial exists in the map, `commit_chunked_to_holding`
+// fast-paths to a direct empty-file `create` at the holding path. Stage 2
+// (`finalize_holding`) then renames `.holding` → canonical and chmods
+// to 0o555. The fast-path is localized to the commit primitive (no
+// changes to `write_chunk_at_offset`, no driver-level shortcut) and only
+// triggers when both conditions are true, so the normal path (zero-byte
+// blob with an explicitly-opened partial) still flows through the
+// length-check branch unchanged.
+//
+// Mutation target: the `expected_size == 0 && !has_entry` fast-path block
+// at the top of `commit_chunked_to_holding`. Commenting out the
+// `return Ok(())` (or the whole block) causes the test to fail with the
+// bespoke message below — `commit_chunked` returns `NotFound` because
+// the map lookup beneath the fast-path runs and finds nothing.
 #[nativelink_test]
 async fn commit_chunked_zero_byte_blob_with_no_writes() {
     let (store, _content_path, _temp_path) = make_fs_store().await;
@@ -495,63 +504,66 @@ async fn commit_chunked_zero_byte_blob_with_no_writes() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let result = store.commit_chunked(&zero_digest, 0).await;
 
-        // FIXME(#218): the M3 spec'd this as "must succeed (creates
-        // empty file via rename)" but the current Phase 2.1 primitive
-        // requires a prior `open_or_create_partial` (i.e. a
-        // `write_chunk_at_offset` call). Without that call the in-flight
-        // map is empty and `commit_chunked_to_holding` returns NotFound.
-        //
-        // Two valid resolutions:
-        //   (a) `write_chunk_at_offset` with empty bytes opens the
-        //       file (today it short-circuits to Ok on empty bytes —
-        //       see chunked_filesystem.rs line ~423), so the empty-blob
-        //       path requires a sentinel write or a wrapper.
-        //   (b) `commit_chunked_to_holding` learns to create an empty
-        //       file directly when `expected_size=0` and the entry is
-        //       absent, treating zero-byte commits as an explicit case.
-        //
-        // The Phase 2.3 driver wiring can choose; this test pins the
-        // current behavior so a regression in either direction is
-        // visible.
+        assert!(
+            result.is_ok(),
+            "zero-byte commit (no prior writes) must succeed via direct \
+             empty-file rename per spec — actually returned: {result:?}",
+        );
 
-        match result {
-            Ok(()) => {
-                // The (b) path: commit creates the empty file directly.
-                // Verify the canonical CAS file exists with 0 bytes.
-                store.finalize_holding(&zero_digest).await.expect(
-                    "if commit_chunked succeeds for zero-byte blob, finalize_holding \
-                     must also succeed",
-                );
-                let final_path = format!(
-                    "{}/{DIGEST_FOLDER}/d0/{zero_digest}",
-                    store.content_path_for_chunked()
-                );
-                let bytes = tokio::fs::read(&final_path).await.expect(
-                    "zero-byte commit must produce a readable file at the \
-                     canonical CAS path",
-                );
-                assert_eq!(
-                    bytes.len(),
-                    0,
-                    "zero-byte commit produced a file with non-zero length: {} bytes",
-                    bytes.len(),
-                );
-            }
-            Err(err) => {
-                // The (a) path / current behavior: commit fast-fails
-                // because no entry in the map. Pin the behavior so
-                // the regression direction is named.
-                assert_eq!(
-                    err.code,
-                    Code::NotFound,
-                    "FIXME(#218): zero-byte commit without prior write returns \
-                     NotFound today (spec'd to succeed; deferred to Phase 2.3 \
-                     driver wiring). If this assertion fires with a different \
-                     code, the failure mode changed — investigate. Got: {err:?}",
-                );
-            }
+        // Stage 2: finalize the holding file → canonical CAS path +
+        // chmod 0o555. This is the same pattern the Phase 2.3 driver
+        // will use after the end-to-end SHA-256 verify (which is
+        // trivially satisfied for a zero-byte blob).
+        store.finalize_holding(&zero_digest).await.expect(
+            "zero-byte commit's stage-2 finalize_holding must succeed \
+             (the .holding file was just created by the fast-path)",
+        );
+
+        let final_path = format!(
+            "{}/{DIGEST_FOLDER}/d0/{zero_digest}",
+            store.content_path_for_chunked()
+        );
+        let bytes = tokio::fs::read(&final_path).await.expect(
+            "zero-byte commit must produce a readable file at the \
+             canonical CAS path",
+        );
+        assert_eq!(
+            bytes.len(),
+            0,
+            "zero-byte commit produced a file with non-zero length: {} bytes",
+            bytes.len(),
+        );
+
+        // Mode must be 0o555 to match the existing CAS file convention
+        // applied by `finalize_holding`.
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = tokio::fs::metadata(&final_path)
+                .await
+                .expect("metadata on canonical zero-byte CAS file must succeed");
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o555,
+                "zero-byte commit canonical file must be chmod'd to 0o555 \
+                 (got {:o})",
+                meta.permissions().mode() & 0o777,
+            );
         }
+
+        // No `.partial` file should remain anywhere — the fast-path
+        // never opened one.
+        let partial_path = format!(
+            "{}/{DIGEST_FOLDER}/d0/{zero_digest}.partial",
+            store.temp_path_for_chunked()
+        );
+        let partial_meta = tokio::fs::metadata(&partial_path).await;
+        assert!(
+            partial_meta.is_err(),
+            "zero-byte fast-path must not leave a .partial behind; \
+             found unexpected file at {partial_path}",
+        );
     })
     .await
-    .expect("must not deadlock — zero-byte commit must fast-fail or fast-succeed");
+    .expect("must not deadlock — zero-byte commit must fast-succeed");
 }

@@ -569,6 +569,51 @@ pub(crate) async fn commit_chunked_to_holding(
     expected_size: u64,
     holding_path: PathBuf,
 ) -> Result<(), Error> {
+    // #218 zero-byte fast-path: a zero-length blob has nothing to write,
+    // so `write_chunk_at_offset` correctly short-circuits to `Ok(())` for
+    // empty input (see line ~423) — meaning no `open_or_create_partial`
+    // ever fires and the in-flight map stays empty for a true zero-byte
+    // blob. Without this fast-path, the map-lookup below would fail with
+    // `NotFound`. Per the #212 spec ("zero-byte commit must succeed via
+    // empty-file rename"), we directly create an empty `.holding` file at
+    // `holding_path`. Stage 2 (`finalize_holding`) then renames it to the
+    // canonical CAS path and chmods to 0o555.
+    //
+    // We only take the fast-path when no in-flight entry exists. If a
+    // caller did manage to open a partial for a zero-size blob (e.g. via
+    // an explicit `open_or_create_partial`), the existing length-check
+    // path below correctly handles it: `actual_len == 0 == expected_size`
+    // → rename succeeds. So we don't disturb that case.
+    if expected_size == 0 {
+        let has_entry = map.inner.lock().contains_key(digest);
+        if !has_entry {
+            let to_path_for_blocking = holding_path.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+                // `create_new(true)` would refuse to overwrite a stale
+                // `.holding` file; we use the default `create(true)` here
+                // because `prune_holding_partials` GCs leftover holding
+                // files at startup, and a duplicate same-process commit
+                // is harmless (file is empty, atomic, idempotent).
+                std::fs::File::create(&to_path_for_blocking).map(|_| ())
+            })
+            .await
+            .map_err(|join_err| {
+                make_err!(
+                    Code::Internal,
+                    "spawn_blocking join error in commit_chunked_to_holding zero-byte fast-path: {join_err:?}"
+                )
+            })?
+            .map_err(|io_err| {
+                make_err!(
+                    Code::Internal,
+                    "failed to create empty holding file {} for zero-byte commit: {io_err:?}",
+                    holding_path.display()
+                )
+            })?;
+            return Ok(());
+        }
+    }
+
     // Get the entry but DO NOT remove it yet — if length validation
     // fails we want the entry to remain so `discard_chunked` (called
     // by the caller) can find it.
