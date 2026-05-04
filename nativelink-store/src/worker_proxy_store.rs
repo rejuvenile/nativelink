@@ -2164,10 +2164,33 @@ impl WorkerProxyStore {
     ) -> Result<(), Error> {
         // Forward all remaining chunks from the racer's channel to the
         // caller's writer. bind_buffered handles EOF propagation.
-        writer
-            .bind_buffered(rx)
-            .await
-            .err_tip(|| format!("WorkerProxyStore: {winner_name} racer bind_buffered"))?;
+        //
+        // CRITICAL (#244 — sibling of #230 M1 BLOCK fix at line 1788-1791):
+        // on `bind_buffered` Err early-return, the spawned racer task
+        // (`handle`) is leaked because `JoinHandle::drop` DETACHES rather
+        // than aborts. The racer is producing into the matching `tx` of
+        // the caller-owned `rx`; on consumer-disconnect (writer.send Err
+        // mid-stream) the caller drops `rx` only after we return, so the
+        // racer can wedge on `tx.send().await` for an unbounded window
+        // (default buf_channel cap = 1024 slots; large blobs / many
+        // chunks fill it well before the rx drops). Aborting before
+        // returning bounds recovery to one scheduler tick.
+        //
+        // Mirrors the #230 M1 idiom: abort the spawned handle on the
+        // forward-error path. Belt-and-suspenders with the natural
+        // rx-drop the caller performs after we return — either alone is
+        // sufficient, but `abort()` here cancels at the next await point
+        // even if the rx-drop is delayed (e.g. the caller's frame holds
+        // the rx in scope past additional `.await` points). Production
+        // path: worker-side `race_peers=true` parallel-race fetch on
+        // any peer-winner OR server-winner branch where the consumer
+        // disconnects after the first chunk.
+        if let Err(e) = writer.bind_buffered(rx).await {
+            handle.abort();
+            return Err(e).err_tip(|| {
+                format!("WorkerProxyStore: {winner_name} racer bind_buffered")
+            });
+        }
 
         // Wait for the spawned get_part to confirm it finished successfully.
         // If the task was already done (sent EOF), this returns immediately.
