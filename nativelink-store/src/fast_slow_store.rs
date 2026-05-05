@@ -1918,13 +1918,13 @@ impl FastSlowStore {
         .await;
         let head_elapsed_ms = producer_start.elapsed().as_millis() as u64;
         match &head_result {
-            Ok(size) => info!(
+            Ok(size) => debug!(
                 %key,
                 head_elapsed_ms,
                 ?size,
                 "populate head_result Ok",
             ),
-            Err(err) => info!(
+            Err(err) => debug!(
                 %key,
                 head_elapsed_ms,
                 code = ?err.code,
@@ -1977,7 +1977,7 @@ impl FastSlowStore {
         let key_for_fast = key.borrow().into_owned();
         let data_stream_fut = async move {
             let stream_start = Instant::now();
-            info!(
+            debug!(
                 key = %key_for_stream,
                 "populate data_stream branch entry",
             );
@@ -2036,7 +2036,7 @@ impl FastSlowStore {
             .await;
             let elapsed_ms = stream_start.elapsed().as_millis() as u64;
             match &result {
-                Ok(_) => info!(
+                Ok(_) => debug!(
                     key = %key_for_stream,
                     elapsed_ms,
                     first_chunk_ms = ?first_chunk_ms,
@@ -2044,7 +2044,7 @@ impl FastSlowStore {
                     total_bytes,
                     "populate data_stream branch Ok",
                 ),
-                Err(err) => info!(
+                Err(err) => debug!(
                     key = %key_for_stream,
                     elapsed_ms,
                     first_chunk_ms = ?first_chunk_ms,
@@ -2072,19 +2072,19 @@ impl FastSlowStore {
             let arc_for_slow = Arc::clone(&arc_self);
             async move {
                 let t0 = Instant::now();
-                info!(
+                debug!(
                     key = %key_for_slow,
                     "populate slow_store.get branch entry",
                 );
                 let res = arc_for_slow.slow_store.get(key_for_slow.borrow(), slow_tx).await;
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
                 match &res {
-                    Ok(()) => info!(
+                    Ok(()) => debug!(
                         key = %key_for_slow,
                         elapsed_ms,
                         "populate slow_store.get branch Ok",
                     ),
-                    Err(err) => info!(
+                    Err(err) => debug!(
                         key = %key_for_slow,
                         elapsed_ms,
                         code = ?err.code,
@@ -2098,7 +2098,7 @@ impl FastSlowStore {
             let arc_for_fast = Arc::clone(&arc_self);
             async move {
                 let t0 = Instant::now();
-                info!(
+                debug!(
                     key = %key_for_fast,
                     "populate fast_store.update branch entry",
                 );
@@ -2108,12 +2108,12 @@ impl FastSlowStore {
                     .await;
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
                 match &res {
-                    Ok(()) => info!(
+                    Ok(()) => debug!(
                         key = %key_for_fast,
                         elapsed_ms,
                         "populate fast_store.update branch Ok",
                     ),
-                    Err(err) => info!(
+                    Err(err) => debug!(
                         key = %key_for_fast,
                         elapsed_ms,
                         code = ?err.code,
@@ -2127,7 +2127,7 @@ impl FastSlowStore {
         let ((mut writer_back, data_stream_res), slow_res, fast_res) =
             join!(data_stream_fut, slow_store_fut, fast_store_fut);
         let join_elapsed_ms = producer_start.elapsed().as_millis() as u64;
-        info!(
+        debug!(
             %key,
             join_elapsed_ms,
             "populate join3 returned",
@@ -2172,7 +2172,7 @@ impl FastSlowStore {
         match merged {
             Ok(()) => {
                 let elapsed_ms = producer_start.elapsed().as_millis() as u64;
-                info!(
+                debug!(
                     %key,
                     elapsed_ms,
                     "populate calling streaming_writer.send_eof",
@@ -2185,7 +2185,7 @@ impl FastSlowStore {
             }
             Err(err) => {
                 let elapsed_ms = producer_start.elapsed().as_millis() as u64;
-                info!(
+                debug!(
                     %key,
                     elapsed_ms,
                     code = ?err.code,
@@ -2196,16 +2196,17 @@ impl FastSlowStore {
         }
         let total_elapsed_ms = producer_start.elapsed().as_millis() as u64;
         match &returned {
-            Ok(()) => info!(
+            Ok(()) => debug!(
                 %key,
                 total_elapsed_ms,
                 "populate run_producer exit Ok",
             ),
-            Err(err) => info!(
+            Err(err) => warn!(
                 %key,
                 total_elapsed_ms,
                 code = ?err.code,
-                "populate run_producer exit Err",
+                "populate run_producer exit failed — slow-store populate did not \
+                 deliver the blob to the fast tier",
             ),
         }
         // writer_back drops here — terminal state is already set via
@@ -3505,7 +3506,7 @@ impl StoreDriver for FastSlowStore {
         let slow_store = self.slow_store.clone();
         let key_for_bg = owned_key.clone();
         let spawn_instant = std::time::Instant::now();
-        info!(
+        debug!(
             ?key,
             data_len,
             "FastSlowStore::update_oneshot: background slow write spawned",
@@ -3587,7 +3588,7 @@ impl StoreDriver for FastSlowStore {
                         stable_digests_ref.lock().push(*digest);
                         stable_notify_ref.notify_one();
                     }
-                    info!(
+                    debug!(
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
