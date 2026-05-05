@@ -404,7 +404,7 @@ impl Stream for LoggingReadStream {
                 self.bytes_sent += response.data.len() as u64;
                 let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
                 let chunk_len = response.data.len();
-                info!(
+                debug!(
                     digest = %self.digest,
                     outcome = "ok_chunk",
                     chunk_len,

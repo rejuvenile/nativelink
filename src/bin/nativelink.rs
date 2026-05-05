@@ -84,7 +84,7 @@ use tonic::codec::CompressionEncoding;
 use tonic::service::Routes;
 #[cfg(feature = "quic")]
 use {quinn, tonic_h3};
-use tracing::{error, error_span, info, trace_span, warn};
+use tracing::{debug, error, error_span, info, trace_span, warn};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -674,7 +674,7 @@ async fn inner_main(
                 tokio::spawn(async move {
                     loop {
                         store_notify.notified().await;
-                        info!(
+                        debug!(
                             target: "nativelink::stable_notify_fire",
                             "stable_notify fired by a CAS store"
                         );
@@ -700,7 +700,7 @@ async fn inner_main(
                     if all_digests.is_empty() {
                         continue;
                     }
-                    info!(
+                    debug!(
                         target: "nativelink::stable_storage_broadcast",
                         digest_count = all_digests.len(),
                         scheduler_count = schedulers.len(),
@@ -718,7 +718,7 @@ async fn inner_main(
                         scheduler
                             .broadcast_blobs_in_stable_storage_chunked(all_digests.clone())
                             .await;
-                        info!(
+                        debug!(
                             target: "nativelink::stable_storage_broadcast",
                             scheduler_idx,
                             "BlobsInStableStorage chunked: broadcast returned for scheduler"

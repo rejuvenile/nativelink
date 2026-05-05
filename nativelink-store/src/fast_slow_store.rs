@@ -3356,7 +3356,7 @@ impl StoreDriver for FastSlowStore {
                         stable_digests_ref.lock().push(*digest);
                         stable_notify_ref.notify_one();
                     }
-                    info!(
+                    debug!(
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
