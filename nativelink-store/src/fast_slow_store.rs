@@ -4575,26 +4575,91 @@ impl StoreDriver for FastSlowStore {
                         );
                         return Ok(());
                     }
-                    // #252 P5 fix: driver registered but range not yet
-                    // covered. Falling through to slow tier returns
-                    // NotFound (file not renamed until commit) which
-                    // poisons EC's stale-positive detector, evicting
-                    // the (legitimate) cached Some and cycling: 5,549
-                    // events / 50min observed in production 2026-05-04.
+                    // #254 P5 follow-up: bounded retry-with-backoff for
+                    // partial-coverage. The #252 fix returned Code::Unavailable
+                    // immediately, which fired ~6/sec in production (2026-05-05
+                    // deploy fb5a4b41) because chunked writes are the dominant
+                    // write path with ~4 KiB chunks (hundreds per blob); any
+                    // concurrent get_part during the multi-second commit window
+                    // hits partial-miss. Bazel translates Unavailable →
+                    // FailedPrecondition and aborts builds.
                     //
-                    // Return Code::Unavailable instead. EC's
-                    // is_unrecoverable_read_error filter (existence_
-                    // cache_store.rs:567-574) explicitly excludes
-                    // Unavailable as "transient — leaves the cache
-                    // alone". Bazel's RemoteRetrier treats Unavailable
-                    // as retryable per gRPC convention; the next
-                    // attempt typically finds the chunks landed.
-                    registry.record_pin_partial_miss();
-                    return Err(make_err!(
-                        Code::Unavailable,
-                        "chunked-pin partial miss: driver in flight but range not yet covered; \
-                         retry after chunked write completes (#252)"
-                    ));
+                    // Instead: poll the pin every 10 ms for up to 500 ms. Two
+                    // happy paths and one tolerable fall-through:
+                    //   (1) The missing chunks land → re-attempt
+                    //       try_get_chunk_from_pin succeeds → serve from pin.
+                    //   (2) The driver completes (loop_exited) → file is on
+                    //       disk → break out of the chunked block, fall
+                    //       through to the slow-tier read below.
+                    //   (3) The 500 ms budget elapses → break out and fall
+                    //       through to the slow-tier read (pre-#252 behavior).
+                    //       Carries the EC-poisoning risk on a slow-tier
+                    //       NotFound, but the empirical hit rate of (3) is
+                    //       low because production chunked writes typically
+                    //       commit well within 500 ms.
+                    //
+                    // Trip-wire (CLAUDE.md async/sync sign-off):
+                    // this introduces a NEW `tokio::time::sleep().await` in
+                    // the read hot path. Acceptable here because (a) it
+                    // REPLACES an existing immediate Err return (callers were
+                    // already awaiting Result), (b) the wait is bounded at
+                    // 500 ms, (c) without it production Bazel builds fail.
+                    const PARTIAL_MISS_WAIT_BUDGET: Duration =
+                        Duration::from_millis(500);
+                    const PARTIAL_MISS_POLL_INTERVAL: Duration =
+                        Duration::from_millis(10);
+                    let deadline =
+                        tokio::time::Instant::now() + PARTIAL_MISS_WAIT_BUDGET;
+                    let mut served_from_pin = false;
+                    loop {
+                        if tokio::time::Instant::now() >= deadline {
+                            // Wait budget elapsed — record metric and
+                            // fall through to slow tier (case 3 above).
+                            registry.record_pin_partial_miss();
+                            break;
+                        }
+                        if driver.loop_exited() {
+                            // Driver finished — pin is cleared, file is
+                            // either on the canonical CAS path (commit
+                            // success) or gone (commit failure). Fall
+                            // through to slow tier (case 2 above).
+                            registry.record_pin_partial_miss();
+                            break;
+                        }
+                        tokio::time::sleep(PARTIAL_MISS_POLL_INTERVAL).await;
+                        if let Some(bytes) =
+                            driver.try_get_chunk_from_pin(offset, want_len)
+                        {
+                            // Late chunks landed — serve assembled bytes
+                            // from the pin (case 1 above).
+                            registry.record_pin_hit();
+                            let bytes_len = bytes.len();
+                            if !bytes.is_empty() {
+                                guard
+                                    .send(bytes)
+                                    .await
+                                    .err_tip(|| "Failed to send chunked-pin data after wait in fast_slow get_part")?;
+                            }
+                            guard
+                                .commit_eof()
+                                .err_tip(|| "Failed to send EOF for chunked-pin data after wait")?;
+                            debug!(
+                                ?key,
+                                offset,
+                                ?length,
+                                served_bytes = bytes_len,
+                                "Served blob from #212 chunked-driver pin after #254 partial-miss wait",
+                            );
+                            served_from_pin = true;
+                            break;
+                        }
+                    }
+                    if served_from_pin {
+                        return Ok(());
+                    }
+                    // Fall through to slow tier — break out of the
+                    // chunked-cascade block; downstream code in this
+                    // function reads from the slow store.
                 } else {
                     // Registry installed but no entry for this digest →
                     // no chunked write in flight; fall through normally.

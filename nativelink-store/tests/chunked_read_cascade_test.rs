@@ -462,40 +462,161 @@ async fn pin_consulted_before_slow_store_when_enabled() {
     registry.deregister(&digest);
 }
 
-/// Phase 2.5 partial-coverage test: registry has a driver entry, but
-/// the requested range is NOT fully pinned (one chunk is missing).
-/// The cascade MUST fall through to the next step (which here is the
-/// slow store, populated with the real blob) instead of serving a
-/// truncated range from the pin.
+/// #254 P5 follow-up regression test. The #252 fix returned
+/// `Code::Unavailable` immediately on partial-coverage. Production
+/// shipped on 2026-05-05 and the new branch fired ~6/sec because
+/// chunked writes are the dominant write path with ~4 KiB chunks
+/// (hundreds per blob); any concurrent get_part during the multi-second
+/// commit window hits partial-miss. Bazel translates Unavailable →
+/// FailedPrecondition and aborts builds.
 ///
-/// This is the explicit "all-or-nothing for the requested range"
-/// guarantee documented on `try_get_chunk_from_pin`.
-/// #252 P5 fix regression test. Before 2026-05-04, partial-coverage in
-/// the cascade-step-2 lookup fell through to the slow store, which
-/// returned NotFound during in-flight chunked writes (the canonical
-/// CAS file isn't renamed until commit). That NotFound propagated up
-/// to ExistenceCacheStore's stale-positive detector, which evicted
-/// the (legitimate) cached Some and triggered an evict-then-repoison
-/// loop: 5,549 events / 50min in production.
+/// The #254 fix replaces the immediate Err with a bounded poll-loop:
+/// up to 500 ms waiting for missing chunks to land. If they DO land,
+/// serve from the pin (cascade hit, no Unavailable). Three regression
+/// tests cover the contract:
+///   1. Chunk lands within the wait window → serve from pin (this test).
+///   2. Driver completes within the wait window → fall through to slow.
+///   3. Wait times out → fall through to slow (pre-#252 behavior).
 ///
-/// New contract: partial-coverage returns `Code::Unavailable`. EC's
-/// `is_unrecoverable_read_error` filter (`existence_cache_store.rs:567`)
-/// excludes Unavailable as transient, leaving the cache entry in
-/// place. Bazel's `RemoteRetrier` treats Unavailable as retryable per
-/// gRPC convention; the next retry typically finds the chunks landed.
-///
-/// The slow store is seeded with the real blob to demonstrate that
-/// the cascade is the AUTHORITY for in-flight digests — even if the
-/// slow tier happens to have the blob (e.g., from a prior commit
-/// that hadn't been evicted), the cascade returns Unavailable while
-/// chunks are mid-write. This rules out a sneak-fall-through
-/// regression where a future change might consult slow tier on
-/// partial-cover for "performance" reasons.
+/// Mutation step: in `fast_slow_store.rs::get_part`, comment out the
+/// `tokio::time::sleep(...)` inside the partial-miss poll loop. The
+/// loop spins without yielding control to the chunk-sending future →
+/// chunk 1 never lands → loop exits on deadline → fall-through to
+/// slow store → assertion fails.
 #[nativelink_test]
-async fn pin_partial_coverage_returns_unavailable_252() {
+async fn pin_partial_coverage_waits_then_serves_from_pin_when_chunk_lands_254() {
     const N: usize = 3;
     let (real_blob, digest, total) = make_blob(N, 0xb0);
 
+    // Slow store is EMPTY. The pin is the only source of bytes.
+    // If the wait-loop falls through (broken implementation), the
+    // assertion below fires with NotFound or empty bytes.
+    let fs_arc = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    );
+
+    let registry = ChunkedReadRegistry::new();
+    fs_arc.set_chunked_read_registry(Arc::clone(&registry));
+    fs_arc.enable_chunked_reads();
+
+    let chunked_fs = make_chunked_filesystem().await;
+    let budget = Arc::new(ChunkBudget::new());
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&chunked_fs),
+        digest,
+        total,
+        CHUNK,
+        PER_BLOB_MPSC_CAP,
+    );
+    let driver_arc = Arc::new(driver);
+    registry.register(digest, Arc::clone(&driver_arc));
+
+    // Send chunks 0 and 2 first. Chunk 1 is the gap that will land
+    // partway through the wait window.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for &i in &[0usize, 2usize] {
+            let permit = budget.try_acquire_chunk().expect("permit");
+            tx.send(ChunkWork {
+                chunk_offset: (i * CHUNK) as u64,
+                chunk_bytes: Bytes::from(real_blob[i * CHUNK..(i + 1) * CHUNK].to_vec()),
+                chunk_sha256: [0u8; 32],
+                finish: false,
+                _permit: permit,
+                _pin_permit: None,
+            })
+            .await
+            .expect("send");
+        }
+        loop {
+            if driver_arc.chunks_committed() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("must not deadlock — initial partial-coverage setup");
+
+    // Spawn a task that sends chunk 1 after a short delay. The
+    // delay must be SHORTER than the wait-loop budget (500 ms) so
+    // the pin gets covered before the loop deadline. 50 ms is well
+    // within budget and gives the read path time to enter the loop.
+    let blob_for_send = real_blob.clone();
+    let tx_for_send = tx.clone();
+    let budget_for_send = Arc::clone(&budget);
+    let late_send = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let permit = budget_for_send.try_acquire_chunk().expect("permit");
+        tx_for_send
+            .send(ChunkWork {
+                chunk_offset: CHUNK as u64,
+                chunk_bytes: Bytes::from(blob_for_send[CHUNK..2 * CHUNK].to_vec()),
+                chunk_sha256: [0u8; 32],
+                finish: false,
+                _permit: permit,
+                _pin_permit: None,
+            })
+            .await
+            .expect("late send");
+    });
+
+    let wrapped = wrap_in_verify(fs_arc);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        wrapped.get_part_unchunked(digest, 0, Some(total)),
+    )
+    .await
+    .expect("must not deadlock — partial-coverage wait-loop");
+
+    let got = result.expect(
+        "partial-cover wait-loop must serve assembled bytes from the pin \
+         once chunk 1 lands within the 500ms wait budget. If this returns \
+         Err, the wait loop is missing or the late chunk-arrival is not \
+         polled (mutation: tokio::time::sleep removed → busy-loop starves \
+         the late-send task → fall-through to empty slow store → NotFound)",
+    );
+    assert_eq!(
+        got.len(),
+        real_blob.len(),
+        "served byte length matches blob length (full pin coverage after wait)",
+    );
+    assert_eq!(
+        &got[..],
+        &real_blob[..],
+        "served bytes match real_blob (sourced from pin after wait)",
+    );
+
+    late_send.await.expect("late-send task");
+    drop(tx);
+    registry.deregister(&digest);
+}
+
+/// #254 partial-coverage timeout test: the wait budget elapses without
+/// the missing chunk landing AND without the driver completing. Per
+/// design the cascade falls through to the slow store (pre-#252
+/// behavior). The slow store IS seeded so the get_part returns Ok
+/// rather than Code::NotFound — we assert the path is fall-through,
+/// NOT the #252-era immediate Code::Unavailable.
+///
+/// Mutation step: replace the wait-loop's deadline-break with
+/// `return Err(make_err!(Code::Unavailable, ...))`. The fall-through
+/// is suppressed → result is Err(Unavailable) → assertion fails.
+#[nativelink_test]
+async fn pin_partial_coverage_falls_through_on_timeout_254() {
+    const N: usize = 3;
+    let (real_blob, digest, total) = make_blob(N, 0xc0);
+
+    // Slow store IS seeded with the real blob. After the wait-budget
+    // elapses, fall-through must serve real_blob from slow tier.
     let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     slow_store
         .update_oneshot(digest, Bytes::from(real_blob.clone()))
@@ -530,9 +651,8 @@ async fn pin_partial_coverage_returns_unavailable_252() {
     let driver_arc = Arc::new(driver);
     registry.register(digest, Arc::clone(&driver_arc));
 
-    // Send only chunks 0 and 2 — chunk 1 is the gap. Pin is
-    // partially populated; the cascade must return Code::Unavailable
-    // (NOT NotFound from a slow-tier fall-through).
+    // Send only chunks 0 and 2 — chunk 1 is the gap. NEVER send
+    // chunk 1 → wait-budget MUST elapse → fall-through.
     tokio::time::timeout(Duration::from_secs(5), async {
         for &i in &[0usize, 2usize] {
             let permit = budget.try_acquire_chunk().expect("permit");
@@ -559,31 +679,36 @@ async fn pin_partial_coverage_returns_unavailable_252() {
 
     let wrapped = wrap_in_verify(fs_arc);
 
+    // 5s timeout safely covers the 500ms wait-budget plus slow-tier
+    // serve. If wait-budget is missing entirely, this still completes
+    // quickly via fall-through.
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         wrapped.get_part_unchunked(digest, 0, Some(total)),
     )
     .await
-    .expect("must not deadlock — partial-coverage cascade");
+    .expect("must not deadlock — partial-coverage timeout cascade");
 
-    let err = result.expect_err(
-        "partial-cover cascade must return Err(Unavailable), \
-         NOT fall through to slow tier (which returns NotFound during \
-         in-flight chunked writes and poisons the EC stale-positive \
-         detector — the production bug #252 fixes)",
+    let got = result.expect(
+        "partial-cover wait-loop timeout MUST fall through to slow store \
+         (NOT return Code::Unavailable as the #252 fix did). Bazel sees \
+         Unavailable → FailedPrecondition and aborts; production cannot \
+         tolerate ~6/sec of these. The slow store is seeded so fall-through \
+         must succeed.",
     );
     assert_eq!(
-        err.code,
-        nativelink_error::Code::Unavailable,
-        "partial-cover must return Code::Unavailable so EC's \
-         is_unrecoverable_read_error filter (existence_cache_store.rs:567) \
-         leaves the cached Some in place; got {:?}",
-        err.code,
+        got.len(),
+        real_blob.len(),
+        "fall-through served byte length matches real_blob length",
+    );
+    assert_eq!(
+        &got[..],
+        &real_blob[..],
+        "fall-through served bytes match the seeded slow-store blob",
     );
 
     // Suppress unused-warning for CHUNK_SIZE import — kept for forward
-    // reference: production CHUNK_SIZE is 1 MiB; tests use 4 KiB. The
-    // accessor uses the test chunk_size passed to spawn_driver.
+    // reference: production CHUNK_SIZE is 1 MiB; tests use 4 KiB.
     let _ = CHUNK_SIZE;
 
     drop(tx);
