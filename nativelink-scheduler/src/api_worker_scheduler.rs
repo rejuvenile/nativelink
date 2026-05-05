@@ -3557,9 +3557,20 @@ fn score_and_generate_hints(
     file_digests: &[(DigestInfo, u64)],
     locality_map: &SharedBlobLocalityMap,
 ) -> (HashMap<Arc<str>, u64>, Arc<[PeerHint]>) {
+    // Wall-clock guard: this is a scheduler hot path called on every dispatch.
+    // We log warn! if it exceeds SLOW_THRESHOLD so operators can spot
+    // pathological locality-map sizes / lock contention without per-call info!
+    // noise (10,840 events in 5 min observed pre-demotion).
+    const SLOW_THRESHOLD: Duration = Duration::from_millis(50);
+    let started = Instant::now();
+
     let mut scores: HashMap<Arc<str>, u64> = HashMap::new();
     let mut hint_candidates: Vec<(DigestInfo, u64, Vec<Arc<str>>)> = Vec::new();
     let locality_blob_count;
+    // Tracks digests where the locality map had an entry but the endpoint
+    // set was empty — an invariant smell (entries should be evicted, not
+    // emptied), worth surfacing if it ever fires.
+    let mut empty_endpoint_matches: usize = 0;
 
     // ── Inside-lock pass: collect scores + hint candidates ──
     // Hold the read lock only while reading from the map. The sort,
@@ -3577,7 +3588,9 @@ fn score_and_generate_hints(
                     *scores.entry(endpoint.clone()).or_insert(0) += size;
                 }
                 // Collect hint candidate if this digest has peer locations.
-                if !endpoints.is_empty() {
+                if endpoints.is_empty() {
+                    empty_endpoint_matches += 1;
+                } else {
                     let peer_eps: Vec<Arc<str>> = endpoints.keys().cloned().collect();
                     hint_candidates.push((digest, size, peer_eps));
                 }
@@ -3602,11 +3615,40 @@ fn score_and_generate_hints(
         })
         .collect();
 
-    info!(
+    let elapsed = started.elapsed();
+
+    // Anomaly: locality map had matches with empty endpoint sets. The map's
+    // contract is that an entry implies at least one endpoint; empty lists
+    // suggest stale state from an eviction race or an upstream insertion bug.
+    if empty_endpoint_matches > 0 {
+        warn!(
+            empty_endpoint_matches,
+            file_digests = file_digests.len(),
+            locality_blob_count,
+            "locality map returned digest entries with empty endpoint sets"
+        );
+    }
+
+    // Anomaly: scheduler scoring took longer than expected. This runs on
+    // every action dispatch and competes with WorkerScheduler write-lock
+    // acquisition; operators should know if it is regularly slow.
+    if elapsed > SLOW_THRESHOLD {
+        warn!(
+            ?elapsed,
+            file_digests = file_digests.len(),
+            locality_blob_count,
+            peer_hints = peer_hints.len(),
+            endpoints = scores.len(),
+            "score_and_generate_hints exceeded slow threshold"
+        );
+    }
+
+    debug!(
         file_digests = file_digests.len(),
         locality_blob_count,
         peer_hints = peer_hints.len(),
         endpoints = scores.len(),
+        ?elapsed,
         "score_and_generate_hints"
     );
 
