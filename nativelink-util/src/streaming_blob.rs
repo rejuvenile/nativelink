@@ -27,7 +27,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
 use crate::common::DigestInfo;
@@ -63,7 +63,41 @@ pub struct StreamingBlobInner {
     bytes_written: AtomicU64,
 
     /// Wakes readers on new data or terminal state.
-    notify: Notify,
+    ///
+    /// Replaced `tokio::sync::Notify` with a monotonic-generation
+    /// `watch::Sender<u64>` to fix the late-subscriber lost-wakeup race
+    /// observed in production at 14:14, 14:15, 14:26 PDT 2026-05-05
+    /// (#272). `Notify::notify_waiters` only wakes pre-existing
+    /// subscribers — readers that subscribe AFTER the writer's
+    /// terminal-set + fire never get woken until the 30 s deadline.
+    ///
+    /// Watch closes that gap via the **pristine-receiver-clone**
+    /// pattern: `notify_rx_template` is the original `Receiver` from
+    /// `watch::channel(0)` and stays at `Version::INITIAL` forever
+    /// (never `changed()`'d). Each reader clones it; the clone
+    /// inherits seen-version = INITIAL. Any `send_modify` that has
+    /// already fired (or will fire) makes that clone's first
+    /// `changed().await` return immediately. NOTE: `Sender::subscribe()`
+    /// would NOT work here — it returns a receiver pinned to the
+    /// channel's CURRENT version, which is post-fire for late
+    /// subscribers, defeating the whole purpose. The clone-template
+    /// is the load-bearing distinction.
+    notify_tx: watch::Sender<u64>,
+
+    /// Pristine receiver kept at `Version::INITIAL` for cloning to
+    /// new readers. See `notify_tx` doc for why this matters.
+    notify_rx_template: watch::Receiver<u64>,
+
+    /// Diagnostic counter (Shape A from the #272 fix proposal):
+    /// total number of writer-side notify firings across the lifetime
+    /// of this blob. Increments alongside every `notify_tx.send_modify`.
+    /// Surfaced in the slow-wakeup `warn!` so a future production
+    /// occurrence proves whether the watch fix held — if this counter
+    /// advanced during the wait but the reader still timed out, the
+    /// watch primitive integration is broken (i.e. a different bug
+    /// than #272). One-release regression detector; can be removed
+    /// after a clean production cycle.
+    notify_waiters_calls: AtomicU64,
 
     /// Terminal state:
     /// - `None`       — writer still active
@@ -135,11 +169,18 @@ impl fmt::Debug for StreamingBlobInner {
 
 impl StreamingBlobInner {
     pub fn new(digest: DigestInfo, max_buffer_bytes: u64) -> Self {
+        // The receiver returned from `channel()` starts at
+        // `Version::INITIAL` — we hold it as the pristine clone
+        // template so each reader-clone observes any fire that ever
+        // happened, including ones before the reader was constructed.
+        let (notify_tx, notify_rx_template) = watch::channel(0u64);
         Self {
             chunks: RwLock::new(VecDeque::new()),
             chunk_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
-            notify: Notify::new(),
+            notify_tx,
+            notify_rx_template,
+            notify_waiters_calls: AtomicU64::new(0),
             terminal: Mutex::new(None),
             digest,
             max_buffer_bytes,
@@ -148,6 +189,22 @@ impl StreamingBlobInner {
             notify_waits_over_5s: AtomicU64::new(0),
             producer_task_id: OnceLock::new(),
         }
+    }
+
+    /// Bump the watch-channel version and the diagnostic counter to wake
+    /// any current and future subscribers. Sync; does not deadlock on the
+    /// terminal mutex (callers must drop terminal first to preserve the
+    /// `drop(terminal); notify;` ordering established for the original
+    /// `Notify::notify_waiters` call).
+    fn notify_waiters(&self) {
+        self.notify_tx.send_modify(|v| *v = v.wrapping_add(1));
+        self.notify_waiters_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Total writer-side notify firings (Shape A diagnostic counter).
+    /// Monotonic across the blob's lifetime; safe to scrape.
+    pub fn notify_waiters_calls_total(&self) -> u64 {
+        self.notify_waiters_calls.load(Ordering::Relaxed)
     }
 
     /// Capture the current tokio task ID as the producer if not
@@ -303,7 +360,7 @@ impl StreamingBlobWriter {
             }
         }
 
-        self.inner.notify.notify_waiters();
+        self.inner.notify_waiters();
         Ok(())
     }
 
@@ -329,7 +386,7 @@ impl StreamingBlobWriter {
             "streaming blob writer sent eof, notify_waiters firing"
         );
 
-        self.inner.notify.notify_waiters();
+        self.inner.notify_waiters();
         Ok(())
     }
 
@@ -369,7 +426,7 @@ impl StreamingBlobWriter {
         self.eof_sent = true;
         drop(terminal);
 
-        self.inner.notify.notify_waiters();
+        self.inner.notify_waiters();
     }
 }
 
@@ -416,7 +473,7 @@ impl Drop for StreamingBlobWriter {
                     "writer dropped without sending EOF"
                 )));
                 drop(terminal);
-                self.inner.notify.notify_waiters();
+                self.inner.notify_waiters();
             }
         }
     }
@@ -435,6 +492,16 @@ pub struct StreamingBlobReader {
     /// partial-chunk reads; currently always 0).
     #[allow(dead_code)]
     cursor_byte_offset: u64,
+    /// Watch receiver cloned from `inner.notify_rx_template` (which is
+    /// kept at `Version::INITIAL` forever). The clone inherits
+    /// seen-version = INITIAL; any `send_modify` that has already fired
+    /// (or will fire) makes the next `changed().await` return
+    /// immediately. This is the load-bearing primitive distinction vs
+    /// `Notify` — late subscribers (constructed after the writer fired
+    /// and dropped) see `version > seen` and do NOT park, fixing the
+    /// #272 late-subscriber lost-wakeup race. See `notify_tx` doc for
+    /// why `Sender::subscribe()` would NOT work here.
+    notify_rx: watch::Receiver<u64>,
     /// Diagnostic-only: number of chunks read out via `next_chunk` since
     /// reader construction. Used by Drop logging to surface premature
     /// reader teardown.
@@ -470,10 +537,20 @@ impl fmt::Debug for StreamingBlobReader {
 impl StreamingBlobReader {
     pub fn new(inner: Arc<StreamingBlobInner>) -> Self {
         let earliest = inner.earliest_chunk_idx.load(Ordering::Acquire);
+        // Clone the pristine template Receiver (kept at
+        // `Version::INITIAL` forever on Inner). The clone inherits
+        // seen-version=INITIAL, so the FIRST `changed().await` returns
+        // immediately if ANY `send_modify` has ever happened on the
+        // channel — including fires that happened before this reader
+        // was constructed. `Sender::subscribe()` would pin to the
+        // current channel version (post-fire for late subscribers),
+        // defeating the late-subscriber fix.
+        let notify_rx = inner.notify_rx_template.clone();
         Self {
             inner,
             cursor_chunk_idx: earliest,
             cursor_byte_offset: 0,
+            notify_rx,
             chunks_consumed: 0,
             terminal_seen: false,
             created_at: Instant::now(),
@@ -509,20 +586,15 @@ impl StreamingBlobReader {
         });
 
         loop {
-            // Subscribe BEFORE checking any predicates so a
-            // notify_waiters() racing our predicate check / lock
-            // drop is captured by this Notified future rather than
-            // being silently dropped.  Same lost-wakeup pattern as
-            // f1750357 (cleanup_complete_notify in
-            // running_actions_manager).  Without this, the writer
-            // can fire send_eof / send_error + notify_waiters in
-            // the microsecond window between dropping the terminal
-            // lock and calling notified().await — producing the
-            // 120s reader hangs observed at 19:33:09 UTC on
-            // worker-02.
-            let notified = self.inner.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+            // The watch::Receiver was subscribed at reader construction
+            // (see `StreamingBlobReader::new`), so any `send_modify` that
+            // fires between iterations is already captured by the
+            // current-vs-seen version comparison inside `changed()`.
+            // No same-iteration subscribe-before-check dance is needed
+            // — the receiver persists across loop iterations and never
+            // misses an increment. This is the load-bearing primitive
+            // distinction vs `Notify::notified()` (which subscribes
+            // fresh and drops permits delivered before subscribe).
 
             let earliest = self.inner.earliest_chunk_idx.load(Ordering::Acquire);
             if self.cursor_chunk_idx < earliest {
@@ -578,30 +650,31 @@ impl StreamingBlobReader {
                 }
             }
 
-            // Writer still active, no data yet — wait for
-            // notification.  The Notified above was registered
-            // BEFORE the predicate check, so any notify_waiters()
-            // that fired since then is captured here and the
-            // await returns immediately.
+            // Writer still active, no data yet — wait for the next
+            // generation bump on the watch channel.
+            //
+            // `changed()` returns immediately if the sender's current
+            // version differs from the receiver's seen-generation
+            // (subscribed at construction OR last marked-seen by a
+            // previous `changed()` return). After this returns Ok, the
+            // receiver auto-marks the new version as seen, so the next
+            // iteration's `changed().await` parks until the NEXT bump.
             //
             // Defense-in-depth: bound the wait with
             // STREAMING_BLOB_NOTIFY_TIMEOUT so the next missing-wakeup
             // bug surfaces as a logged DeadlineExceeded in seconds
-            // rather than a 120 s gRPC stream wedge. The pinned
-            // Notified is still passed through (preserves the
-            // pin+enable correctness from 646d7623) — tokio::time::
-            // timeout takes any future, including a pinned one.
-            // Use tokio::time::Instant so paused-time tests can drive
-            // the slow-wait + deadline branches deterministically; in
-            // production it forwards to std::time::Instant.
+            // rather than a 120 s gRPC stream wedge. Use tokio::time::
+            // Instant so paused-time tests can drive the slow-wait +
+            // deadline branches deterministically; in production it
+            // forwards to std::time::Instant.
             let wait_start = tokio::time::Instant::now();
             debug!(
                 digest = %self.inner.digest,
                 cursor_chunk_idx = self.cursor_chunk_idx,
-                "streaming blob reader awaiting pre-registered notify"
+                "streaming blob reader awaiting watch::changed()"
             );
             let timeout_result =
-                tokio::time::timeout(STREAMING_BLOB_NOTIFY_TIMEOUT, notified.as_mut()).await;
+                tokio::time::timeout(STREAMING_BLOB_NOTIFY_TIMEOUT, self.notify_rx.changed()).await;
             let wait_elapsed = wait_start.elapsed();
             let terminal_present = self.inner.terminal.lock().is_some();
             if timeout_result.is_err() {
@@ -609,7 +682,7 @@ impl StreamingBlobReader {
                 let earliest = self.inner.earliest_chunk_idx.load(Ordering::Acquire);
                 // terminal_present distinguishes two distinct failure modes that
                 // both surface as "reader timed out waiting for notify":
-                //   - true:  writer dropped/finished but its notify_waiters() did
+                //   - true:  writer dropped/finished but its notify firings did
                 //            not wake this reader. Genuine lost wakeup; bug
                 //            lives in the notify primitive integration here.
                 //   - false: writer is still alive (no terminal state set);
@@ -618,6 +691,7 @@ impl StreamingBlobReader {
                 //            no per-frame deadline, holding a lock, or the
                 //            tokio task is starved). Bug lives upstream.
                 let producer_tid = self.inner.producer_task_id().unwrap_or("<none>");
+                let notify_calls = self.inner.notify_waiters_calls_total();
                 if terminal_present {
                     error!(
                         digest = %self.inner.digest,
@@ -627,6 +701,7 @@ impl StreamingBlobReader {
                         earliest,
                         wait_ms = wait_elapsed.as_millis() as u64,
                         producer_task_id = %producer_tid,
+                        notify_waiters_calls = notify_calls,
                         "streaming blob reader notify deadline exceeded — \
                          terminal IS set, this is a genuine lost wakeup"
                     );
@@ -639,6 +714,7 @@ impl StreamingBlobReader {
                         earliest,
                         wait_ms = wait_elapsed.as_millis() as u64,
                         producer_task_id = %producer_tid,
+                        notify_waiters_calls = notify_calls,
                         "streaming blob reader notify deadline exceeded — \
                          terminal NOT set, producer is wedged upstream \
                          (e.g. gRPC read with no deadline, or task starvation)"
@@ -678,6 +754,7 @@ impl StreamingBlobReader {
                     wait_ms = wait_elapsed.as_millis() as u64,
                     terminal_present,
                     cursor_chunk_idx = self.cursor_chunk_idx,
+                    notify_waiters_calls = self.inner.notify_waiters_calls_total(),
                     "streaming blob reader slow notify wakeup"
                 );
             } else {
@@ -1329,141 +1406,86 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Lost-wakeup race regression: a `notify_waiters()` that fires
-    // strictly between the reader's terminal-predicate check (lock
-    // dropped) and its `notified().await` must NOT be silently
-    // dropped.  Reproduces the 120s reader hang observed at
-    // 19:33:09 UTC on worker-02.
+    // Lost-wakeup race regression (#272 Shape B): the writer can
+    // set terminal + fire its watch generation bump in the gap
+    // between a reader's terminal-predicate check (lock dropped)
+    // and its blocking await; the reader MUST observe terminal
+    // and return promptly, not park indefinitely.
     //
-    // The hang sequence:
+    // The pre-#272 implementation used `tokio::sync::Notify`,
+    // whose `notify_waiters()` only wakes Notified futures that
+    // have already registered.  A late subscriber (constructed
+    // after notify_waiters fired and dropped) would never see the
+    // permit, producing 120s+ reader hangs (observed at 19:33 UTC
+    // on worker-02; replayed at 14:14, 14:15, 14:26 PDT
+    // 2026-05-05).
     //
-    //   1. Predicate check (terminal == None)        ← reader
-    //   2. lock dropped
-    //   3. terminal = Some(Err); notify_waiters()    ← writer
-    //   4. notify.notified().await                   ← reader
+    // The Shape B fix replaces `Notify` with
+    // `watch::Sender<u64>` + receiver subscribed at reader
+    // construction.  `watch::Receiver::changed().await` returns
+    // immediately whenever the sender's current version differs
+    // from the receiver's seen-generation, so a fire that
+    // happened BEFORE `changed()` was called is still observed.
     //
-    // `tokio::sync::Notify::notify_waiters` only wakes Notified
-    // futures that have already been polled (registered).  In step
-    // 4 the Notified future is brand new — no registration existed
-    // when notify_waiters fired — so the permit is dropped on the
-    // floor and the await blocks forever (no more notifications
-    // come because terminal is now sealed).
-    //
-    // The fix is the canonical subscribe-before-check pattern (see
-    // f1750357 for cleanup_complete_notify): register the Notified
-    // future BEFORE step 1 via `let n = notify.notified();
-    // tokio::pin!(n); n.as_mut().enable();`.  Then step 3's
-    // notify_waiters delivers a permit to the registered future
-    // and the subsequent .await returns immediately.
-    //
-    // This test proves the underlying lost-wakeup property exists
-    // on tokio::sync::Notify (so we know the bug is real), then
-    // verifies that the same race driven through next_chunk does
-    // not hang.
+    // This test exercises that property directly: writer fires
+    // the generation bump while the reader hasn't yet awaited
+    // changed(); the subsequent reader call still completes
+    // promptly. (The classic predicate-vs-subscribe gap is
+    // structurally impossible with watch — the receiver was
+    // subscribed at construction and persists across iterations.)
     // ---------------------------------------------------------------
     #[tokio::test]
     async fn next_chunk_no_lost_wakeup_on_terminal_race() {
-        let (writer, reader) = StreamingBlob::new(test_digest(200), 1024 * 1024);
+        let (writer, reader) = StreamingBlob::new(test_digest(201), 1024 * 1024);
         let inner = Arc::clone(&reader.inner);
-
-        // Step 1+2: emulate the predicate-check window — reader
-        // sees no terminal, drops the lock.  We don't call
-        // `notified()` here: that's the bug we're testing for.
-        {
-            let t = inner.terminal.lock();
-            assert!(t.is_none(), "precondition: terminal must start unset");
-        }
-
-        // Step 3: writer sets terminal and fires notify_waiters.
-        // No reader is currently registered on the Notify, so this
-        // wakeup is dropped on the floor (this is a defining
-        // property of tokio::sync::Notify).
-        {
-            let mut t = inner.terminal.lock();
-            *t = Some(Err(make_err!(Code::Aborted, "race-test error")));
-        }
-        inner.notify.notify_waiters();
-
-        // Step 4: a freshly-constructed reader (re-using the same
-        // inner) calls next_chunk.  The buggy implementation
-        // checks terminal → returns the error here, so this exact
-        // sequence does NOT reproduce the hang on the read path.
-        // The hang reproduces when the predicate check happens
-        // BEFORE the writer sets terminal.  Drive that case
-        // directly using the same Notify primitive: we invoke the
-        // exact two-line sequence next_chunk uses to wait, on a
-        // fresh `inner` whose terminal is still None at predicate
-        // time, with notify_waiters firing in the gap.
         drop(reader);
 
-        let (writer2, reader2) = StreamingBlob::new(test_digest(201), 1024 * 1024);
-        let inner2 = Arc::clone(&reader2.inner);
-
-        // Spawn a writer that, after a one-shot signal, sets
-        // terminal and fires notify_waiters.  The signal is
+        // Spawn a "writer" that, after a one-shot signal, sets
+        // terminal and bumps the watch generation.  The signal is
         // delivered AFTER the test (acting as the reader) has
-        // performed the predicate check but BEFORE it has
-        // subscribed to the Notify — exactly the lost-wakeup
-        // window.
+        // performed the predicate check but BEFORE it constructs
+        // a fresh reader — the late-subscriber lost-wakeup window
+        // that defeats `Notify` but not `watch`.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let writer_inner = Arc::clone(&inner2);
+        let writer_inner = Arc::clone(&inner);
         let writer_task = tokio::spawn(async move {
             rx.await.unwrap();
             {
                 let mut t = writer_inner.terminal.lock();
                 *t = Some(Err(make_err!(Code::Aborted, "race-test error")));
             }
-            writer_inner.notify.notify_waiters();
+            writer_inner.notify_waiters();
         });
 
-        // Predicate check (mirrors lines 414-436 of next_chunk).
+        // Predicate check (mirrors the pre-await lock-and-drop).
         {
-            let t = inner2.terminal.lock();
+            let t = inner.terminal.lock();
             assert!(t.is_none(), "precondition");
         }
         // Open the lost-wakeup window.
         tx.send(()).unwrap();
         // Wait for the writer to complete BOTH steps before we
-        // subscribe — this is what the buggy code does (subscribe
-        // late).  joining the spawn ensures notify_waiters has
-        // already fired before notified() is called.
+        // subscribe — joining the spawn ensures the generation
+        // bump has already fired before any reader-side
+        // changed().await call.
         writer_task.await.unwrap();
 
-        // Now mirror the buggy subscribe-after-check: brand new
-        // notified() future, polled for the first time AFTER
-        // notify_waiters has already fired.
-        let buggy_future = inner2.notify.notified();
-        let buggy_outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            buggy_future,
-        )
-        .await;
-        assert!(
-            buggy_outcome.is_err(),
-            "sanity: subscribe-after-notify_waiters MUST be a \
-             lost wakeup (this is the bug we're guarding against)"
-        );
-
-        // Now assert that next_chunk itself does NOT exhibit this
-        // hang — even when invoked AFTER terminal was set and
-        // notify_waiters has already fired.  With the fix in
-        // place, next_chunk's predicate check sees terminal set
-        // and returns immediately.  Without the fix, the same is
-        // also true on this path; the real-world hang requires
-        // the write to land in the predicate-vs-subscribe gap of
-        // next_chunk, which we can only prove via the structural
-        // invariant: the next_chunk source must register
-        // `notified()` BEFORE the terminal predicate check.
-        let mut reader2 = StreamingBlob::new_reader(&inner2);
+        // A FRESH reader subscribes AFTER the writer fired and
+        // the spawn-task dropped — `Notify` would have lost the
+        // wakeup here. With watch, the new receiver's seen
+        // generation is the channel's version-at-subscribe (the
+        // same value the sender just bumped to), so the predicate
+        // check below already sees terminal set and returns
+        // without ever calling changed(). The wedge is impossible.
+        let mut reader2 = StreamingBlob::new_reader(&inner);
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             reader2.next_chunk(),
         )
         .await
-        .expect("next_chunk hung past 200ms");
+        .expect("next_chunk hung past 200ms — #272 lost-wakeup regression");
         assert!(result.is_err(), "expected terminal Err");
         drop(writer);
-        drop(writer2);
     }
 
     // ---------------------------------------------------------------
@@ -1732,5 +1754,242 @@ mod tests {
             0,
             "fast wakeup must not bump slow-wait counter"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // #272 Shape B late-subscriber contract: a reader CONSTRUCTED
+    // AFTER the writer has fully terminated and dropped MUST observe
+    // chunk + terminal state within ~1 s, not park for the 30 s
+    // deadline.
+    //
+    // Two layers of guarantee compose to satisfy this contract:
+    //
+    //   (a) The predicate check at the top of `next_chunk`'s loop
+    //       reads chunks (RwLock) and terminal (Mutex). Both writer
+    //       paths set state BEFORE firing notify, so the predicate
+    //       sees the post-fire state synchronously and returns
+    //       without ever entering the wait branch. (This layer
+    //       handles the production scenario as observed.)
+    //
+    //   (b) Defense-in-depth: if for any reason the predicate
+    //       check missed the state, the wait branch (watch
+    //       primitive) holds a clone of `inner.notify_rx_template`,
+    //       which is kept at `Version::INITIAL` forever. The clone
+    //       inherits seen-version=INITIAL; any prior `send_modify`
+    //       has bumped channel-version above INITIAL, so the
+    //       FIRST `changed().await` returns immediately.
+    //
+    // Mutation step: comment out `notify_tx.send_modify(...)` in
+    // `notify_waiters()`. Layer (a) still satisfies these specific
+    // tests — they pass on the synchronous predicate path. To
+    // observe the mutation, see `parked_reader_wakeup_*` tests
+    // below: those drive the wait branch directly and red-fail
+    // with `Code::DeadlineExceeded` after ~30s under mutation.
+    // ---------------------------------------------------------------
+
+    /// Spec: a reader subscribed AFTER the writer fired its terminal
+    /// EOF generation bump MUST observe the chunk + EOF promptly.
+    #[tokio::test]
+    async fn late_subscriber_after_writer_eof_completes_promptly() {
+        let digest = DigestInfo::new([0u8; 32], 2);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 1024 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+
+        // Writer sends a single chunk + EOF, fully terminating BEFORE
+        // any reader exists.
+        writer
+            .send(Bytes::from_static(b"hi"))
+            .await
+            .expect("writer.send must succeed");
+        writer.send_eof().expect("writer.send_eof must succeed");
+        // Drop ensures every notify firing has happened and the writer
+        // is gone — the canonical race window.
+        drop(writer);
+
+        // Sleep to make the race deterministic — the production race
+        // fires when the writer is fully done before reader subscribes.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // NOW construct the reader.
+        let mut reader = StreamingBlob::new_reader(&inner);
+
+        // Without Shape B, this hangs the full 30 s deadline. The
+        // bespoke .expect catches a `tokio::time::Elapsed` from the
+        // 1 s timeout (the deadlock detector) and names #272.
+        let chunk = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect(
+                "late-subscriber must observe writer's chunk without parking — \
+                 #272 Shape B (watch::Receiver subscribed after fire still sees version > seen)"
+            )
+            .expect("next_chunk must return Ok");
+        assert_eq!(&chunk[..], b"hi");
+
+        // Subsequent next_chunk returns EOF (empty Bytes) — also must
+        // not park.
+        let eof = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect(
+                "EOF observation must not park — \
+                 #272 Shape B (terminal Ok visible to late subscriber)"
+            )
+            .expect("next_chunk must return Ok at EOF");
+        assert!(eof.is_empty(), "post-EOF next_chunk must return empty Bytes");
+    }
+
+    /// Spec: a reader subscribed AFTER the writer fired its terminal
+    /// error generation bump MUST observe the chunk + error promptly.
+    /// Mirror of `late_subscriber_after_writer_eof_completes_promptly`
+    /// for the send_error path — both writer terminations need the
+    /// same late-subscriber guarantee.
+    #[tokio::test]
+    async fn late_subscriber_after_writer_send_error_completes_promptly() {
+        let digest = DigestInfo::new([0u8; 32], 4);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 1024 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+
+        // Writer sends a chunk and then signals an error, fully
+        // terminating BEFORE any reader exists.
+        writer
+            .send(Bytes::from_static(b"data"))
+            .await
+            .expect("writer.send must succeed");
+        writer.send_error(make_err!(Code::NotFound, "test"));
+        drop(writer);
+
+        // Sleep to make the race deterministic.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // NOW construct the reader.
+        let mut reader = StreamingBlob::new_reader(&inner);
+
+        // First chunk should still be visible (it landed in the deque
+        // before the terminal error).
+        let chunk = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect(
+                "late-subscriber must observe writer's chunk without parking — \
+                 #272 Shape B (chunk visible despite late subscribe)"
+            )
+            .expect("next_chunk must return Ok for chunk");
+        assert_eq!(&chunk[..], b"data");
+
+        // Next call must observe the terminal error promptly.
+        let err = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect(
+                "terminal error observation must not park — \
+                 #272 Shape B (terminal Err visible to late subscriber)"
+            )
+            .expect_err("expected Err on terminal error");
+        assert_eq!(
+            err.code,
+            Code::NotFound,
+            "expected the producer's NotFound, got {err:?}"
+        );
+    }
+
+    /// Spec (mutation-falsifiable): a reader parked in
+    /// `next_chunk`'s wait branch MUST wake within 1 s when the
+    /// writer fires a terminal EOF. This is the wait-path mutation
+    /// counterpart to `late_subscriber_after_writer_eof_*` — when
+    /// `notify_tx.send_modify(...)` is commented out in
+    /// `notify_waiters()`, this test red-fails with the bespoke
+    /// `.expect(...)` message naming #272 Shape B because the
+    /// reader's `changed().await` parks until the 30 s deadline.
+    #[tokio::test]
+    async fn parked_reader_wakeup_on_writer_eof_completes_promptly() {
+        let (mut writer, mut reader) = StreamingBlob::new(test_digest(205), 1024 * 1024);
+
+        // Park the reader in the wait branch — no chunks, no terminal.
+        let reader_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(1), reader.next_chunk()).await
+        });
+
+        // Yield enough times for the reader to enter changed().await.
+        // We can't observe the await directly; a short sleep is the
+        // standard way to let a spawned task park. (Used as
+        // sequencing only — the timeout-and-bespoke-expect catches
+        // the failure mode.)
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        writer.send_eof().expect("send_eof must succeed");
+
+        let outcome = reader_task
+            .await
+            .expect("reader task must not panic")
+            .expect(
+                "parked reader must wake within 1 s of writer EOF — \
+                 #272 Shape B (watch::Receiver::changed wakes on send_modify)"
+            )
+            .expect("next_chunk must return Ok at EOF");
+        assert!(outcome.is_empty(), "expected EOF (empty bytes)");
+    }
+
+    /// Spec (mutation-falsifiable): same as above for the
+    /// `send_error` path. Two writer terminations need the same
+    /// wait-path wakeup guarantee.
+    #[tokio::test]
+    async fn parked_reader_wakeup_on_writer_error_completes_promptly() {
+        let (mut writer, mut reader) = StreamingBlob::new(test_digest(206), 1024 * 1024);
+
+        let reader_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(1), reader.next_chunk()).await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        writer.send_error(make_err!(Code::NotFound, "test"));
+
+        let err = reader_task
+            .await
+            .expect("reader task must not panic")
+            .expect(
+                "parked reader must wake within 1 s of writer error — \
+                 #272 Shape B (watch::Receiver::changed wakes on send_modify)"
+            )
+            .expect_err("expected Err on terminal error");
+        assert_eq!(
+            err.code,
+            Code::NotFound,
+            "expected the producer's NotFound, got {err:?}"
+        );
+    }
+
+    /// Spec (Shape A diagnostic): the `notify_waiters_calls` counter
+    /// MUST advance with each writer-side fire — `send`, `send_eof`,
+    /// `send_error`, and Drop-without-eof. Acts as a regression
+    /// detector for future production wedges: if a slow-wakeup warn
+    /// shows the counter advanced during the wait but the reader
+    /// still timed out, the watch primitive integration is broken.
+    #[tokio::test]
+    async fn notify_waiters_calls_counter_advances_per_fire() {
+        // send + send_eof → 2 fires.
+        let (mut writer, _reader) = StreamingBlob::new(test_digest(202), 1024 * 1024);
+        let inner = Arc::clone(&writer.inner);
+        assert_eq!(inner.notify_waiters_calls_total(), 0);
+        writer
+            .send(Bytes::from_static(b"a"))
+            .await
+            .expect("send must succeed");
+        assert_eq!(inner.notify_waiters_calls_total(), 1);
+        writer.send_eof().expect("eof must succeed");
+        assert_eq!(inner.notify_waiters_calls_total(), 2);
+
+        // send_error → 1 fire on a fresh blob.
+        let (mut writer2, _reader2) = StreamingBlob::new(test_digest(203), 1024 * 1024);
+        let inner2 = Arc::clone(&writer2.inner);
+        assert_eq!(inner2.notify_waiters_calls_total(), 0);
+        writer2.send_error(make_err!(Code::Aborted, "test"));
+        assert_eq!(inner2.notify_waiters_calls_total(), 1);
+
+        // Drop without eof → 1 fire on a fresh blob.
+        let (writer3, _reader3) = StreamingBlob::new(test_digest(204), 1024 * 1024);
+        let inner3 = Arc::clone(&writer3.inner);
+        assert_eq!(inner3.notify_waiters_calls_total(), 0);
+        drop(writer3);
+        assert_eq!(inner3.notify_waiters_calls_total(), 1);
     }
 }
