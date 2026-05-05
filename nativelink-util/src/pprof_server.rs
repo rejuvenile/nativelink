@@ -408,6 +408,44 @@ async fn spawn_rate_probe_handler(
     }
 }
 
+/// Handler for `GET /` and `GET /debug/pprof/` — list the available
+/// endpoints. Helps the next operator reach for the right path
+/// instead of guessing Go-style `/debug/pprof/heap` (which doesn't
+/// exist here — the `pprof` Rust crate is CPU-only, no heap
+/// profiling).
+async fn index_handler() -> Response {
+    let body = "\
+nativelink pprof HTTP server
+
+Available endpoints (all under GET):
+
+  /debug/pprof/profile?seconds=N&format=pb|svg
+      CPU profile, default 10s, default SVG flamegraph.
+      `?format=pb` returns pprof protobuf for `go tool pprof`.
+
+  /debug/pprof/flamegraph?seconds=N
+      Same as profile but always SVG.
+
+  /debug/pprof/auto
+      List of auto-captured profiles in /tmp/nativelink-pprof
+      (triggered when CPU usage exceeds the threshold for ~10s).
+
+  /debug/pprof/auto/<filename>
+      Serve a captured SVG flamegraph by name.
+
+  /debug/spawn_rate_probe?last_n=N
+      JSON snapshot of the spawn-rate ring (per-site counts +
+      inter-arrival p50/p95/p99 in microseconds).
+
+Note: this server does NOT expose Go-style `/debug/pprof/heap` or
+`/debug/pprof/allocs` — the `pprof` Rust crate (0.15) only does CPU
+sampling. For RSS/heap analysis, attach a separate allocator profiler
+or read /proc/self/{statm,smaps} via `/metrics` on the main HTTP
+admin port.
+";
+    (StatusCode::OK, body).into_response()
+}
+
 /// Start the pprof HTTP server on the given port.
 /// Returns a drop guard that keeps the server alive.
 pub fn start_pprof_server(port: u16) -> Result<JoinHandleDropGuard<Result<(), Error>>, Error> {
@@ -419,6 +457,8 @@ pub fn start_pprof_server(port: u16) -> Result<JoinHandleDropGuard<Result<(), Er
     );
 
     let app = Router::new()
+        .route("/", get(index_handler))
+        .route("/debug/pprof/", get(index_handler))
         .route("/debug/pprof/profile", get(profile_handler))
         .route("/debug/pprof/flamegraph", get(flamegraph_handler))
         .route("/debug/pprof/auto", get(auto_list_handler))
@@ -445,4 +485,43 @@ pub fn start_pprof_server(port: u16) -> Result<JoinHandleDropGuard<Result<(), Er
     });
 
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    /// Smoke test: the `/` index endpoint returns 200 with the
+    /// endpoint catalog. This is the route the previous operator
+    /// hit while debugging the 2026-05-05 RSS plateau and saw a
+    /// bare 404 — adding it converted "is the server even up?"
+    /// into "here are the paths it serves."
+    #[tokio::test]
+    async fn index_handler_returns_endpoint_catalog() {
+        let response = index_handler().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body bytes");
+        let body_str = std::str::from_utf8(&body).expect("utf8 body");
+        assert!(
+            body_str.contains("nativelink pprof HTTP server"),
+            "missing server banner; body = {body_str}",
+        );
+        // Each registered route must be listed so the catalog is
+        // discoverable. If a route is added or renamed without a
+        // matching catalog update, this guard fires.
+        for path in [
+            "/debug/pprof/profile",
+            "/debug/pprof/flamegraph",
+            "/debug/pprof/auto",
+            "/debug/spawn_rate_probe",
+        ] {
+            assert!(
+                body_str.contains(path),
+                "catalog missing {path}; body = {body_str}",
+            );
+        }
+    }
 }
