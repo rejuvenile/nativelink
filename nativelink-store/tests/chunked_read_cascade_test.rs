@@ -470,8 +470,29 @@ async fn pin_consulted_before_slow_store_when_enabled() {
 ///
 /// This is the explicit "all-or-nothing for the requested range"
 /// guarantee documented on `try_get_chunk_from_pin`.
+/// #252 P5 fix regression test. Before 2026-05-04, partial-coverage in
+/// the cascade-step-2 lookup fell through to the slow store, which
+/// returned NotFound during in-flight chunked writes (the canonical
+/// CAS file isn't renamed until commit). That NotFound propagated up
+/// to ExistenceCacheStore's stale-positive detector, which evicted
+/// the (legitimate) cached Some and triggered an evict-then-repoison
+/// loop: 5,549 events / 50min in production.
+///
+/// New contract: partial-coverage returns `Code::Unavailable`. EC's
+/// `is_unrecoverable_read_error` filter (`existence_cache_store.rs:567`)
+/// excludes Unavailable as transient, leaving the cache entry in
+/// place. Bazel's `RemoteRetrier` treats Unavailable as retryable per
+/// gRPC convention; the next retry typically finds the chunks landed.
+///
+/// The slow store is seeded with the real blob to demonstrate that
+/// the cascade is the AUTHORITY for in-flight digests — even if the
+/// slow tier happens to have the blob (e.g., from a prior commit
+/// that hadn't been evicted), the cascade returns Unavailable while
+/// chunks are mid-write. This rules out a sneak-fall-through
+/// regression where a future change might consult slow tier on
+/// partial-cover for "performance" reasons.
 #[nativelink_test]
-async fn pin_partial_coverage_falls_through_to_slow_store() {
+async fn pin_partial_coverage_returns_unavailable_252() {
     const N: usize = 3;
     let (real_blob, digest, total) = make_blob(N, 0xb0);
 
@@ -510,8 +531,8 @@ async fn pin_partial_coverage_falls_through_to_slow_store() {
     registry.register(digest, Arc::clone(&driver_arc));
 
     // Send only chunks 0 and 2 — chunk 1 is the gap. Pin is
-    // partially populated; the cascade must reject the partial cover
-    // and fall through to slow store (which has the real blob).
+    // partially populated; the cascade must return Code::Unavailable
+    // (NOT NotFound from a slow-tier fall-through).
     tokio::time::timeout(Duration::from_secs(5), async {
         for &i in &[0usize, 2usize] {
             let permit = budget.try_acquire_chunk().expect("permit");
@@ -538,17 +559,26 @@ async fn pin_partial_coverage_falls_through_to_slow_store() {
 
     let wrapped = wrap_in_verify(fs_arc);
 
-    let got = tokio::time::timeout(
+    let result = tokio::time::timeout(
         Duration::from_secs(5),
         wrapped.get_part_unchunked(digest, 0, Some(total)),
     )
     .await
-    .expect("must not deadlock — partial-coverage cascade")
-    .expect("partial-cover cascade must fall through to slow store and serve the real blob");
+    .expect("must not deadlock — partial-coverage cascade");
+
+    let err = result.expect_err(
+        "partial-cover cascade must return Err(Unavailable), \
+         NOT fall through to slow tier (which returns NotFound during \
+         in-flight chunked writes and poisons the EC stale-positive \
+         detector — the production bug #252 fixes)",
+    );
     assert_eq!(
-        &got[..],
-        &real_blob[..],
-        "fall-through from partial-pin must yield the real blob from the slow store",
+        err.code,
+        nativelink_error::Code::Unavailable,
+        "partial-cover must return Code::Unavailable so EC's \
+         is_unrecoverable_read_error filter (existence_cache_store.rs:567) \
+         leaves the cached Some in place; got {:?}",
+        err.code,
     );
 
     // Suppress unused-warning for CHUNK_SIZE import — kept for forward

@@ -4125,15 +4125,26 @@ impl StoreDriver for FastSlowStore {
                         );
                         return Ok(());
                     }
-                    // Driver registered but range not covered (chunk
-                    // hasn't landed yet) → partial-miss; fall through.
+                    // #252 P5 fix: driver registered but range not yet
+                    // covered. Falling through to slow tier returns
+                    // NotFound (file not renamed until commit) which
+                    // poisons EC's stale-positive detector, evicting
+                    // the (legitimate) cached Some and cycling: 5,549
+                    // events / 50min observed in production 2026-05-04.
+                    //
+                    // Return Code::Unavailable instead. EC's
+                    // is_unrecoverable_read_error filter (existence_
+                    // cache_store.rs:567-574) explicitly excludes
+                    // Unavailable as "transient — leaves the cache
+                    // alone". Bazel's RemoteRetrier treats Unavailable
+                    // as retryable per gRPC convention; the next
+                    // attempt typically finds the chunks landed.
                     registry.record_pin_partial_miss();
-                    trace!(
-                        ?key,
-                        offset,
-                        ?length,
-                        "chunked-pin partial miss: driver in flight but range not yet covered; falling through to slow store"
-                    );
+                    return Err(make_err!(
+                        Code::Unavailable,
+                        "chunked-pin partial miss: driver in flight but range not yet covered; \
+                         retry after chunked write completes (#252)"
+                    ));
                 } else {
                     // Registry installed but no entry for this digest →
                     // no chunked write in flight; fall through normally.
