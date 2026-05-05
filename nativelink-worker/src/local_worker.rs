@@ -477,10 +477,11 @@ fn start_worker_quic_server(
     let socket_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
     let udp_socket = std::net::UdpSocket::bind(socket_addr)
         .map_err(|e| make_err!(Code::Internal, "Worker QUIC UDP bind on {socket_addr}: {e:?}"))?;
-    nativelink_util::tls_utils::tune_quic_udp_buffers(
+    let bufs = nativelink_util::tls_utils::tune_quic_udp_buffers(
         socket2::SockRef::from(&udp_socket),
         "worker_peer",
     );
+    nativelink_util::tls_utils::warn_if_quic_udp_buffer_capped(bufs, "worker_peer");
 
     let quinn_endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),

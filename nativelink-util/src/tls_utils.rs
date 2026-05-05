@@ -238,26 +238,49 @@ pub const QUIC_UDP_BUF_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(feature = "quic")]
 pub const QUIC_UDP_BUF_WARN_THRESHOLD: usize = 2 * 1024 * 1024;
 
-/// Set SO_SNDBUF and SO_RCVBUF on a QUIC UDP socket and log the actual
-/// values the kernel applied.
+/// Effective UDP socket buffer sizes after kernel accounting.
+///
+/// "Effective" here means the value usable by the application:
+/// - On Linux, `getsockopt(SO_{RCV,SND}BUF)` returns 2× the value passed
+///   to `setsockopt` (kernel doubles internally for bookkeeping), so
+///   we halve before exposing.
+/// - On macOS / BSD, no doubling — the raw value IS the effective value.
+#[cfg(feature = "quic")]
+#[derive(Debug, Clone, Copy)]
+pub struct QuicUdpBuffers {
+    pub effective_sndbuf: usize,
+    pub effective_rcvbuf: usize,
+}
+
+#[cfg(feature = "quic")]
+impl QuicUdpBuffers {
+    pub fn below_threshold(self) -> bool {
+        self.effective_rcvbuf < QUIC_UDP_BUF_WARN_THRESHOLD
+            || self.effective_sndbuf < QUIC_UDP_BUF_WARN_THRESHOLD
+    }
+}
+
+/// Set SO_SNDBUF and SO_RCVBUF on a QUIC UDP socket, log the actual
+/// values the kernel applied, and return the effective buffer sizes.
 ///
 /// Linux silently caps `setsockopt(SO_{RCV,SND}BUF, n)` at
 /// `net.core.{rmem,wmem}_max` without returning an error. This helper
 /// reads the values back via `getsockopt` and `info!`-logs them so
 /// production deployments can verify their kernel is configured to
-/// honor the request. If the actual buffer falls below
-/// [`QUIC_UDP_BUF_WARN_THRESHOLD`], a `warn!` is emitted with the exact
-/// sysctl command the operator must run.
+/// honor the request.
+///
+/// Callers receive the effective sizes (doubling-corrected on Linux,
+/// raw on macOS / BSD) and should use [`warn_if_quic_udp_buffer_capped`]
+/// to emit a sysctl-recommendation warn when below threshold. Loop
+/// callers (e.g. connection pools) typically warn ONCE after the loop
+/// — all sockets in the same process see the same `rmem_max`, so per-
+/// socket warns are pure log spam (and at high pool counts can drive
+/// memory pressure via mimalloc retention; see #255 / #197).
 ///
 /// `label` distinguishes call sites in logs (e.g. `"server"`,
-/// `"client[2]"`, `"worker_peer"`).
-///
-/// Note: Linux returns `2 * requested` from `getsockopt` — the kernel
-/// doubles internally to account for bookkeeping overhead — so a
-/// successful 8 MiB request reads back as 16 MiB. We compare against
-/// the doubled value when checking for kernel capping.
+/// `"client"`, `"worker_peer"`).
 #[cfg(feature = "quic")]
-pub fn tune_quic_udp_buffers(sock: socket2::SockRef<'_>, label: &str) {
+pub fn tune_quic_udp_buffers(sock: socket2::SockRef<'_>, label: &str) -> QuicUdpBuffers {
     if let Err(err) = sock.set_send_buffer_size(QUIC_UDP_BUF_BYTES) {
         warn!(?err, label, "failed to set QUIC SO_SNDBUF");
     }
@@ -276,30 +299,42 @@ pub fn tune_quic_udp_buffers(sock: socket2::SockRef<'_>, label: &str) {
         "QUIC UDP socket buffers configured",
     );
 
-    // Kernel doubles getsockopt return on Linux; compare half against the
-    // warn threshold so a 2 MiB-clipped request (reads back as 4 MiB)
-    // does NOT trip the warning, but a 200 KiB-clipped request (reads
-    // back as ~400 KiB) DOES.
-    let effective_rcvbuf = actual_rcvbuf / 2;
-    let effective_sndbuf = actual_sndbuf / 2;
-    if effective_rcvbuf < QUIC_UDP_BUF_WARN_THRESHOLD
-        || effective_sndbuf < QUIC_UDP_BUF_WARN_THRESHOLD
-    {
-        warn!(
-            label,
-            actual_rcvbuf,
-            actual_sndbuf,
-            requested = QUIC_UDP_BUF_BYTES,
-            warn_threshold = QUIC_UDP_BUF_WARN_THRESHOLD,
-            "QUIC UDP buffer below {} MiB after setsockopt — kernel is capping; \
-             raise net.core.rmem_max and net.core.wmem_max (e.g. \
-             `sudo sysctl -w net.core.rmem_max={} net.core.wmem_max={}`) \
-             to avoid UDP packet drops and QUIC tail-latency spikes under load",
-            QUIC_UDP_BUF_WARN_THRESHOLD / (1024 * 1024),
-            QUIC_UDP_BUF_BYTES,
-            QUIC_UDP_BUF_BYTES,
-        );
+    // Linux: `getsockopt(SO_{RCV,SND}BUF)` returns 2× what `setsockopt`
+    // accepted (the kernel doubles internally for bookkeeping overhead).
+    // macOS / BSD: no doubling.
+    #[cfg(target_os = "linux")]
+    let (effective_sndbuf, effective_rcvbuf) = (actual_sndbuf / 2, actual_rcvbuf / 2);
+    #[cfg(not(target_os = "linux"))]
+    let (effective_sndbuf, effective_rcvbuf) = (actual_sndbuf, actual_rcvbuf);
+
+    QuicUdpBuffers {
+        effective_sndbuf,
+        effective_rcvbuf,
     }
+}
+
+/// Emit a `warn!` with the operator-actionable sysctl recommendation if
+/// the effective buffer sizes fall below [`QUIC_UDP_BUF_WARN_THRESHOLD`].
+/// No-op otherwise.
+#[cfg(feature = "quic")]
+pub fn warn_if_quic_udp_buffer_capped(buffers: QuicUdpBuffers, label: &str) {
+    if !buffers.below_threshold() {
+        return;
+    }
+    warn!(
+        label,
+        effective_rcvbuf = buffers.effective_rcvbuf,
+        effective_sndbuf = buffers.effective_sndbuf,
+        requested = QUIC_UDP_BUF_BYTES,
+        warn_threshold = QUIC_UDP_BUF_WARN_THRESHOLD,
+        "QUIC UDP buffer below {} MiB after setsockopt — kernel is capping; \
+         raise net.core.rmem_max and net.core.wmem_max (e.g. \
+         `sudo sysctl -w net.core.rmem_max={} net.core.wmem_max={}`) \
+         to avoid UDP packet drops and QUIC tail-latency spikes under load",
+        QUIC_UDP_BUF_WARN_THRESHOLD / (1024 * 1024),
+        QUIC_UDP_BUF_BYTES,
+        QUIC_UDP_BUF_BYTES,
+    );
 }
 
 /// Clone-able QUIC/HTTP3 channel for gRPC clients.
@@ -530,12 +565,18 @@ pub fn h3_channel(endpoint_config: &GrpcEndpoint, connections: usize) -> Result<
 
     let connections = connections.max(1);
     let mut channels = Vec::with_capacity(connections);
+    // Warn once per pool if the kernel is capping UDP buffers — every
+    // socket sees the same rmem_max, so per-socket warns are pure spam.
+    let mut pool_buffers: Option<QuicUdpBuffers> = None;
 
     for i in 0..connections {
         let udp_socket = std::net::UdpSocket::bind("[::]:0")
             .map_err(|e| make_err!(Code::Internal, "QUIC client UDP bind [{i}]: {e:?}"))?;
         let label = format!("client[{i}]");
-        tune_quic_udp_buffers(socket2::SockRef::from(&udp_socket), &label);
+        let bufs = tune_quic_udp_buffers(socket2::SockRef::from(&udp_socket), &label);
+        if pool_buffers.is_none() {
+            pool_buffers = Some(bufs);
+        }
 
         let mut client_endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
@@ -559,6 +600,10 @@ pub fn h3_channel(endpoint_config: &GrpcEndpoint, connections: usize) -> Result<
         // while providing backpressure under transport degradation.
         let buffered = tower::buffer::Buffer::new(h3_channel, 1024);
         channels.push(buffered);
+    }
+
+    if let Some(bufs) = pool_buffers {
+        warn_if_quic_udp_buffer_capped(bufs, "client_pool");
     }
 
     info!(

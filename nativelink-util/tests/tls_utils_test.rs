@@ -226,25 +226,21 @@ async fn quic_udp_buffer_tuning_applies_minimum_2_mib() -> Result<(), Error> {
             .expect("bind 127.0.0.1:0 for UDP buffer test");
         let sock_ref = socket2::SockRef::from(&udp_socket);
 
-        tune_quic_udp_buffers(sock_ref, "test");
-
-        // Re-borrow to read back; SockRef does not retain ownership.
-        let sock_ref = socket2::SockRef::from(&udp_socket);
-        let actual_rcvbuf = sock_ref
-            .recv_buffer_size()
-            .expect("getsockopt SO_RCVBUF must succeed");
-        let actual_sndbuf = sock_ref
-            .send_buffer_size()
-            .expect("getsockopt SO_SNDBUF must succeed");
-
-        // Linux doubles the value internally; compare half.
-        let effective_rcvbuf = actual_rcvbuf / 2;
-        let effective_sndbuf = actual_sndbuf / 2;
+        // Use the helper's return value rather than doing the
+        // doubling-correction math manually — that way the test
+        // exercises the actual public API contract (including the
+        // platform-specific cfg-gated halving on Linux vs no-op
+        // elsewhere).
+        let buffers = tune_quic_udp_buffers(sock_ref, "test");
+        let effective_rcvbuf = buffers.effective_rcvbuf;
+        let effective_sndbuf = buffers.effective_sndbuf;
 
         // Read kernel caps so the assertion holds on machines that
         // can't honor the full 8 MiB request — we still want to
         // guarantee the helper raised the buffer to AT LEAST what
-        // the kernel allows.
+        // the kernel allows. Only meaningful on Linux; on macOS /
+        // BSD the read returns None and floor falls back to the
+        // warn threshold.
         let rmem_max = read_sysctl("/proc/sys/net/core/rmem_max").unwrap_or(usize::MAX);
         let wmem_max = read_sysctl("/proc/sys/net/core/wmem_max").unwrap_or(usize::MAX);
 
@@ -253,8 +249,7 @@ async fn quic_udp_buffer_tuning_applies_minimum_2_mib() -> Result<(), Error> {
 
         assert!(
             effective_rcvbuf >= expected_rcvbuf_floor,
-            "QUIC SO_RCVBUF not raised: effective={effective_rcvbuf} bytes \
-             (raw getsockopt returned {actual_rcvbuf}); \
+            "QUIC SO_RCVBUF not raised: effective={effective_rcvbuf} bytes; \
              expected at least {expected_rcvbuf_floor} bytes \
              (min of warn-threshold {QUIC_UDP_BUF_WARN_THRESHOLD} and \
              rmem_max {rmem_max}); requested {QUIC_UDP_BUF_BYTES} bytes — \
@@ -262,8 +257,7 @@ async fn quic_udp_buffer_tuning_applies_minimum_2_mib() -> Result<(), Error> {
         );
         assert!(
             effective_sndbuf >= expected_sndbuf_floor,
-            "QUIC SO_SNDBUF not raised: effective={effective_sndbuf} bytes \
-             (raw getsockopt returned {actual_sndbuf}); \
+            "QUIC SO_SNDBUF not raised: effective={effective_sndbuf} bytes; \
              expected at least {expected_sndbuf_floor} bytes \
              (min of warn-threshold {QUIC_UDP_BUF_WARN_THRESHOLD} and \
              wmem_max {wmem_max}); requested {QUIC_UDP_BUF_BYTES} bytes — \
@@ -271,8 +265,7 @@ async fn quic_udp_buffer_tuning_applies_minimum_2_mib() -> Result<(), Error> {
         );
 
         eprintln!(
-            "tune_quic_udp_buffers observed: rcvbuf={actual_rcvbuf} \
-             sndbuf={actual_sndbuf} (kernel-doubled), \
+            "tune_quic_udp_buffers observed: \
              effective rcv={effective_rcvbuf} snd={effective_sndbuf}, \
              rmem_max={rmem_max} wmem_max={wmem_max}",
         );
