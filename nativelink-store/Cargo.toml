@@ -277,3 +277,12 @@ required-features = ["chunked_fast_slow"]
 [[test]]
 name = "chunked_filesystem_serialization_test"
 required-features = ["chunked_fast_slow", "test-utils"]
+
+# #256: regression for the duplicate-chunked-commit insert+unref bug
+# where `finalize_holding`'s second `evicting_map.insert(key, ...)`
+# triggers `unref()` on the OLD Arc, which renames the canonical CAS
+# file to a temp path, leaving the new entry pointing at a missing
+# file -> production PHANTOM BLOB warns at `FastSlowStore::run_producer`.
+[[test]]
+name = "filesystem_store_256_duplicate_chunked_commit_test"
+required-features = ["chunked_fast_slow"]

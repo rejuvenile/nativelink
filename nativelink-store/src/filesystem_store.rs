@@ -1626,11 +1626,94 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// re-introduction of #247. Mirrors the `emplace_file`
     /// `background_spawn!` pattern (filesystem_store.rs:1208) which
     /// was added for the same reason against nativelink#495.
+    ///
+    /// **#256 duplicate-commit guard.** Two parallel chunked writers
+    /// for the SAME digest (the chunked path is always digest-keyed —
+    /// `commit_chunked` takes `&DigestInfo`) racing through
+    /// `finalize_holding` would, pre-#256-fix, both rename their
+    /// `.holding` file → canonical CAS path (the second rename
+    /// overwrites the first; OK because byte-identical) AND both
+    /// invoke `evicting_map.insert(key, new_arc)`. The SECOND
+    /// `insert` captures the FIRST commit's `Arc<FileEntry>` as the
+    /// "old" value and calls `old.unref().await`, which renames the
+    /// canonical CAS file → `temp_path-cas/d/XX/<temp-key>` (an
+    /// orphan path) and immediately `Drop`s the temp via a
+    /// `background_spawn!`-ed `remove_file`. The new `evicting_map`
+    /// entry now claims `path_type: Content` at the canonical path,
+    /// but the file is gone. Subsequent `has_with_results(key)`
+    /// returns `Some(size)`; subsequent `get_part(key)` opens the
+    /// canonical path and gets ENOENT → "Stale filesystem cache
+    /// entry" → `FastSlowStore::run_producer` PHANTOM BLOB warn →
+    /// fallback to `WorkerProxyStore` peer-fetch → partial-byte
+    /// response → Bazel `OutputDigestMismatchException` → build wedge.
+    ///
+    /// Production trace (PID 570543, 2026-05-05): 575 PHANTOM BLOB
+    /// events between 06:23 and 08:59 PDT. 89% (483/543) of unique
+    /// phantom digests had ≥2 chunked-commit log lines preceding the
+    /// phantom; modal commit count was 3 (320/543 cases).
+    ///
+    /// Fix: detect the duplicate at the START of `finalize_holding`.
+    /// If `evicting_map.size_for_key(key)` is `Some`, the canonical
+    /// CAS file already exists at the right path AND the index
+    /// already points at it. Per CAS immutability (digest = content),
+    /// the in-flight `.holding` file is byte-identical to what the
+    /// existing entry points at. Just unlink the `.holding` file +
+    /// remove our entry from the in-flight partials map + return Ok
+    /// — without touching the canonical CAS file or the
+    /// `evicting_map` entry. Critically: this gate runs BEFORE the
+    /// rename, so the existing entry's `Arc<FileEntry>` is never
+    /// captured by an `evicting_map.insert(...)` call and never
+    /// `unref`-ed.
+    ///
+    /// Why the prior `content_is_immutable` gate (lines 1657-1660 in
+    /// the pre-#256 version) didn't fire: production deploys run
+    /// `FilesystemStore` as the slow tier of `FastSlowStore` without
+    /// setting `content_is_immutable: true` (default at
+    /// `nativelink-config/src/stores.rs:717` is `false`). The chunked
+    /// path is INTRINSICALLY content-addressable (digest-keyed only),
+    /// so the `content_is_immutable` flag — meaningful only for the
+    /// `String`-keyed AC-store usage of `FilesystemStore` — is not
+    /// the right gate for THIS path. The fix uses the chunked-path
+    /// invariant (digest = content) directly.
     pub async fn finalize_holding(&self, digest: &DigestInfo) -> Result<(), Error> {
         let holding_path = chunked_holding_path(&self.shared_context.content_path, digest);
         let key: StoreKey<'static> = (*digest).into();
         let final_os = to_full_path_from_key(&self.shared_context.content_path, &key);
         let final_path = std::path::PathBuf::from(final_os);
+
+        // #256 duplicate-commit guard: if the digest is already in the
+        // evicting_map, the canonical CAS file is already on disk and
+        // already indexed; the in-flight .holding file is byte-identical
+        // (CAS invariant). Doing the rename + insert anyway would have
+        // the second insert's old-Arc unref steal the canonical file. So:
+        // unlink the .holding file + remove the in-flight partial entry
+        // + return Ok WITHOUT renaming or inserting.
+        // #256 duplicate-commit guard: if the digest is already in the
+        // evicting_map, the canonical CAS file is already on disk and
+        // already indexed; the in-flight .holding file is byte-identical
+        // (CAS invariant). Doing the rename + insert anyway would have
+        // the second insert's old-Arc unref steal the canonical file. So:
+        // unlink the .holding file + remove the in-flight partial entry
+        // + return Ok WITHOUT renaming or inserting.
+        if self.evicting_map.size_for_key(&key).await.is_some() {
+            // Best-effort unlink the holding file (NotFound is OK —
+            // covers the case where a sibling concurrent caller already
+            // unlinked it; `chunked_unlink_holding` itself treats
+            // NotFound as Ok).
+            chunked_unlink_holding(holding_path).await?;
+            // Drop our in-flight partial entry. Stage 1
+            // (`commit_chunked` / `chunked_commit_to_holding`) leaves
+            // the entry in the partials map (chunked_filesystem.rs:696
+            // "DO NOT remove from the in-flight map here") expecting
+            // `chunked_finalize_holding` to remove it after the SHA-256
+            // verify + rename. We're skipping that rename for the
+            // duplicate case, so we own the cleanup. `discard_chunked`
+            // is idempotent: returns Ok via the "no in-flight state"
+            // branch if the entry is already absent.
+            chunked_discard(&self.chunked_partials, digest).await?;
+            return Ok(());
+        }
+
         chunked_finalize_holding(&self.chunked_partials, digest, holding_path, final_path).await?;
 
         // Move the post-rename index-update onto a background task so
@@ -1640,7 +1723,6 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // the spawn point — so the rename → insert pair is atomic w.r.t.
         // caller-cancellation.
         let evicting_map = self.evicting_map.clone();
-        let content_is_immutable = self.content_is_immutable;
         let block_size = self.block_size;
         let shared_context = self.shared_context.clone();
         let key_for_task: StoreKey<'static> = key.borrow().into_owned();
@@ -1650,13 +1732,19 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         // parent future is dropped. Mirror of `emplace_file`'s pattern;
         // see https://github.com/TraceMachina/nativelink/issues/495.
         background_spawn!("filesystem_store_finalize_holding_insert", async move {
-            // CAS-immutable shortcut: if the key already exists, the
-            // pre-existing FileEntry already points at the same
-            // canonical path with byte-identical content (digest
-            // defines content). Skip the insert+unref cycle.
-            if content_is_immutable
-                && evicting_map.size_for_key(&key_for_task).await.is_some()
-            {
+            // #256 duplicate-commit guard, race-window second check:
+            // even though the pre-rename guard above runs SYNCHRONOUSLY
+            // before the rename, two callers can race past it (both see
+            // `None` from `size_for_key` simultaneously, both proceed
+            // to rename, both proceed to spawn this task). Re-check
+            // INSIDE the spawned task: if the key is already in the
+            // map, another caller's spawn-task got here first and
+            // inserted; skip our insert to avoid the insert+unref-the-
+            // old-Arc trap. The chunked invariant (digest = content)
+            // means whichever Arc wins the race indexes a canonical
+            // file with byte-identical content — readers see the same
+            // bytes either way.
+            if evicting_map.size_for_key(&key_for_task).await.is_some() {
                 return;
             }
 
