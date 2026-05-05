@@ -378,17 +378,19 @@ impl LoggingReadStream {
         }
     }
 
-    fn log_completion(&mut self, status: &str) {
+    fn log_completion(&mut self, status: &'static str, err: Option<&Status>) {
         let elapsed = self.start_time.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
 
-        debug!(
+        info!(
             digest = %self.digest,
             expected_size = self.expected_size,
             bytes_sent = self.bytes_sent,
             elapsed_ms,
             throughput_mbps = %throughput_mbps(self.bytes_sent, elapsed),
             status,
+            code = ?err.map(tonic::Status::code),
+            msg = err.map(tonic::Status::message).unwrap_or(""),
             "ByteStream::read: CAS read completed",
         );
     }
@@ -414,27 +416,11 @@ impl Stream for LoggingReadStream {
             }
             Poll::Ready(None) => {
                 self.completed = true;
-                let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
-                info!(
-                    digest = %self.digest,
-                    outcome = "stream_end",
-                    elapsed_ms,
-                    "logging_read_stream poll yielded end",
-                );
-                self.log_completion("ok");
+                self.log_completion("ok", None);
             }
             Poll::Ready(Some(Err(status))) => {
                 self.completed = true;
-                let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
-                info!(
-                    digest = %self.digest,
-                    outcome = "err",
-                    code = ?status.code(),
-                    msg = %status.message(),
-                    elapsed_ms,
-                    "logging_read_stream poll yielded error",
-                );
-                self.log_completion("error");
+                self.log_completion("error", Some(status));
             }
             Poll::Pending => {}
         }
@@ -445,7 +431,7 @@ impl Stream for LoggingReadStream {
 impl Drop for LoggingReadStream {
     fn drop(&mut self) {
         if !self.completed {
-            self.log_completion("dropped");
+            self.log_completion("dropped", None);
         }
     }
 }
