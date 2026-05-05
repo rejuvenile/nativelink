@@ -340,12 +340,31 @@ impl StreamingBlobWriter {
         if terminal.is_some() {
             return;
         }
-        warn!(
-            digest = %self.inner.digest,
-            age_ms = self.inner.age_ms(),
-            ?err,
-            "streaming blob writer error, notify_waiters firing"
-        );
+        // #186: NotFound is the dominant upstream-caused producer-side
+        // failure (slow_store NotFound + existence-cache stale-positive
+        // cleanup; #247-class FilesystemStore disk/index divergence).
+        // 7,372 events / 8h41m observed in production with 13K-event
+        // bursts during phantom-blob clusters — drowns the actual
+        // PHANTOM BLOB signal. Demote the NotFound case to debug; keep
+        // warn for genuine producer wedges (Internal, Aborted,
+        // Unavailable, etc.) where the streaming buffer itself is the
+        // suspect. Folds into the same benign-vs-suspect split as the
+        // Drop arm at lines 378-394.
+        if err.code == Code::NotFound {
+            debug!(
+                digest = %self.inner.digest,
+                age_ms = self.inner.age_ms(),
+                ?err,
+                "streaming blob writer error (NotFound — upstream-caused), notify_waiters firing"
+            );
+        } else {
+            warn!(
+                digest = %self.inner.digest,
+                age_ms = self.inner.age_ms(),
+                ?err,
+                "streaming blob writer error, notify_waiters firing"
+            );
+        }
         *terminal = Some(Err(err));
         self.eof_sent = true;
         drop(terminal);

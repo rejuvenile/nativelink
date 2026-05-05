@@ -25,7 +25,7 @@ use futures::{Future, Stream, TryFutureExt};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tracing::{error, warn};
+use tracing::{debug, warn};
 
 const ZERO_DATA: Bytes = Bytes::new();
 
@@ -494,9 +494,22 @@ impl Drop for WriteHalfGuard<'_> {
         // propagation; signaling EOF would lie about completeness.
         //
         // Two-channel error reporting (security-reviewer #148):
-        //   - Operator-side: `tracing::error!` with the verbose
+        //   - Operator-side: `tracing::debug!` with the verbose
         //     diagnostic naming the missing commit verbs. Greppable in
-        //     the journal so the on-call can find the bug fast.
+        //     the journal when debug-level is enabled so on-call can
+        //     find the bug fast. Demoted from `error!` per #186 (audit
+        //     `.claude/audits/186-verifystore-noise-investigation.md`):
+        //     in production this fired ~80.8/min steady-state and bursts
+        //     of 6,235 events / 8h41m during phantom-blob clusters with
+        //     a 1:1 ratio against the streaming_blob writer-error noise
+        //     — both reports of the SAME upstream NotFound from
+        //     different layers. The composability harness
+        //     (`writer_termination_245_drop_fallback_test.rs`,
+        //     `waiter_explicit_termination_test.rs`,
+        //     `fast_slow_store_test.rs::write_half_guard_drop_fallback_*`)
+        //     is now the load-bearing detector for genuine
+        //     contract-violation regressions; production logs are not.
+        //     Tail-risk OOM contribution per #197 also retired.
         //   - Wire-side: short `"buf_channel: writer dropped without
         //     commit"` carried in the `Error` struct itself, which
         //     flows verbatim into `tonic::Status::message` for remote
@@ -505,7 +518,7 @@ impl Drop for WriteHalfGuard<'_> {
         //     "commit_delegated_if_ok", "fail") from external clients
         //     while preserving a unique, greppable identifier so tests
         //     can assert the Drop body fired.
-        error!(
+        debug!(
             target: "buf_channel::write_half_guard_drop",
             "WriteHalfGuard fired Drop fallback: function exited without explicit \
              commit_eof / commit_delegated_if_ok / fail. This is a bug — the owning \
