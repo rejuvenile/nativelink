@@ -1849,7 +1849,7 @@ impl FastSlowStore {
         // waiters to find this populate in the map and join in.
         let key = loader_guard.key.borrow();
         let producer_start = Instant::now();
-        info!(
+        debug!(
             %key,
             slow_store = %arc_self.slow_store.inner_store(Some(key.borrow())).get_name(),
             "populate run_producer entry",
@@ -3231,7 +3231,7 @@ impl StoreDriver for FastSlowStore {
         let slow_store = self.slow_store.clone();
         let key_for_bg = owned_key.clone();
         let spawn_instant = std::time::Instant::now();
-        info!(
+        debug!(
             ?key,
             bytes_sent,
             "FastSlowStore::update: background slow write spawned",

@@ -1881,7 +1881,7 @@ impl WorkerProxyStore {
         let bytes_before_inner = writer.get_bytes_written();
         let inner_await_start = std::time::Instant::now();
         let _digest_for_log = key.borrow().into_digest();
-        info!(
+        debug!(
             digest = ?_digest_for_log,
             offset,
             length = ?length,
@@ -1903,7 +1903,7 @@ impl WorkerProxyStore {
             )
             .await;
         let inner_elapsed_ms = inner_await_start.elapsed().as_millis() as u64;
-        info!(
+        debug!(
             digest = ?_digest_for_log,
             inner_elapsed_ms,
             ok = inner_result.is_ok(),

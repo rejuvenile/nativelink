@@ -2913,7 +2913,7 @@ impl ApiWorkerScheduler {
         };
         let worker_count = senders.len();
 
-        info!(
+        debug!(
             target: "nativelink::bis_chunked_dispatch",
             worker_count,
             digest_count = total,

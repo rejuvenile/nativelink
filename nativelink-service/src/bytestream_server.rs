@@ -1287,7 +1287,7 @@ impl ByteStreamServer {
             {
                 let consume_fut = state.rx.consume(Some(state.max_bytes_per_stream));
                 tokio::pin!(consume_fut);
-                info!(
+                debug!(
                     %digest,
                     branch = "consume_await_start",
                     elapsed_ms = entry_time.elapsed().as_millis() as u64,
@@ -1300,7 +1300,7 @@ impl ByteStreamServer {
                                 Ok(bytes) => {
                                     if bytes.is_empty() {
                                         // EOF.
-                                        info!(
+                                        debug!(
                                             %digest,
                                             branch = "consume_ok_eof",
                                             elapsed_ms = entry_time.elapsed().as_millis() as u64,
@@ -1315,7 +1315,7 @@ impl ByteStreamServer {
                                     let bytes_len = bytes.len();
                                     response.data = bytes;
                                     trace!(response.data = format!("<redacted len({})>", response.data.len()));
-                                    info!(
+                                    debug!(
                                         %digest,
                                         branch = "consume_ok",
                                         bytes_len,
