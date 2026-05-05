@@ -28,7 +28,7 @@ use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::common::DigestInfo;
 
@@ -322,7 +322,7 @@ impl StreamingBlobWriter {
         self.eof_sent = true;
         drop(terminal);
 
-        info!(
+        debug!(
             digest = %self.inner.digest,
             bytes_written = %self.inner.bytes_written.load(Ordering::Relaxed),
             age_ms = self.inner.age_ms(),

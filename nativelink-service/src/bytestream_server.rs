@@ -382,7 +382,7 @@ impl LoggingReadStream {
         let elapsed = self.start_time.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
 
-        info!(
+        debug!(
             digest = %self.digest,
             expected_size = self.expected_size,
             bytes_sent = self.bytes_sent,
@@ -1004,7 +1004,7 @@ impl ByteStreamServer {
         read_request: ReadRequest,
         is_worker: bool,
     ) -> Result<ReadStream, Error> {
-        info!(
+        debug!(
             %digest,
             read_offset = read_request.read_offset,
             read_limit = read_request.read_limit,
@@ -1366,7 +1366,7 @@ impl ByteStreamServer {
                             }
                         },
                         result = &mut state.get_part_fut => {
-                            info!(
+                            debug!(
                                 %digest,
                                 branch = "get_part_done",
                                 is_err = result.is_err(),
@@ -2007,7 +2007,7 @@ impl ByteStreamServer {
 
         // Fast path: skip the write if the blob already exists.
         if store.has(digest).await.unwrap_or(None).is_some() {
-            info!(
+            debug!(
                 %digest,
                 size_bytes = expected_size,
                 "ByteStream::write: skipped, blob already exists",

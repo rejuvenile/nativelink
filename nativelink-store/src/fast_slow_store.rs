@@ -1936,7 +1936,7 @@ impl FastSlowStore {
             Err(err) => {
                 let returned = err.clone();
                 let elapsed_ms = producer_start.elapsed().as_millis() as u64;
-                info!(
+                debug!(
                     %key,
                     elapsed_ms,
                     code = ?returned.code,
