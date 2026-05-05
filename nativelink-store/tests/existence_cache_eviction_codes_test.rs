@@ -77,7 +77,7 @@ struct ErrCodeOnGetStore {
     /// both have the digest), then flip this flag so the next
     /// update / update_oneshot / batch read sees the cache claiming
     /// "yes" while the inner store reports "no" — exactly the
-    /// invariant the `error!` log is meant to surface.
+    /// invariant the `debug!` log is meant to surface.
     has_returns_none: AtomicBool,
 }
 
@@ -110,7 +110,7 @@ impl StoreDriver for ErrCodeOnGetStore {
             // digest (eviction race / data loss / cache populated by an
             // unverified path). Caller's existence cache may still
             // believe the digest is present — that mismatch is exactly
-            // what the stale-positive `error!` logs guard.
+            // what the stale-positive `debug!` logs guard.
             for r in results.iter_mut() {
                 *r = None;
             }
@@ -360,18 +360,20 @@ async fn batch_get_part_data_loss_evicts_cache() -> Result<(), Error> {
 }
 
 // -------------------------------------------------------------------
-// 7. Stale-positive removal MUST surface as error!-level log.
+// 7. Stale-positive removal MUST surface as a log entry.
 //
-// Per CLAUDE.md "be NOISY when impossible state happens": a
-// stale-positive in the existence cache (`has` says yes, `get_part`
-// returns NotFound on the same blob) is a contract violation — the
-// inner store lost data after we cached its existence, OR the cache
-// was populated by something other than a verified write, OR the
-// inner store's `has()` returned a stale positive itself. None of
-// these should happen in normal operation. Production saw 14,776
-// "not found in inner store or any worker" errors in ~24h — many
-// of which are these stale positives. They MUST be visible to
-// operators at error level so the systemic issue surfaces.
+// On 2026-05-05 the stale-positive logs were demoted from error! to
+// debug! because under the worker-mirror durability protocol the
+// cache=Some + inner=NotFound state is the EXPECTED outcome when the
+// blob lives only on peer workers (caller recovers via NL_REDIRECT
+// + peer-fetch in 1-31 ms). Real durability gaps surface via the
+// upstream caller's NotFound chain, NL_REDIRECT exhaustion, or
+// Bazel's own retry-exhaustion errors — not at this site. This test
+// (and its siblings below) still guards that the log fires + names
+// the digest so operators investigating a real gap can drill down,
+// but no longer asserts error level. tracing_test's default
+// `<crate_name>=trace` env filter captures debug! events too, so
+// `logs_contain` continues to fire on the same substring.
 //
 // This test:
 //   1. Primes the cache via update_oneshot (cache becomes positive)
@@ -379,16 +381,17 @@ async fn batch_get_part_data_loss_evicts_cache() -> Result<(), Error> {
 //   3. Calls get_part with the inner store wired to return NotFound
 //   4. Asserts the get_part returns NotFound
 //   5. Asserts the cache entry was removed
-//   6. Asserts an error!-level log fired with "stale positive" wording
-//      and the actual digest (so operators can correlate)
+//   6. Asserts a log fired with "stale positive" wording AND the
+//      actual digest (so operators can correlate)
 //
 // `nativelink_test` macro applies `#[traced_test]`; `logs_contain`
 // returns true if any captured event contains the given substring
-// across ALL levels — but the message MUST mention "stale positive"
-// so we know the error! call (not some debug! line) fired.
+// across ALL captured levels — the message MUST mention "stale
+// positive" so we know the dedicated debug! call (not some unrelated
+// log line) fired.
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn get_part_not_found_logs_error_for_stale_positive() -> Result<(), Error> {
+async fn get_part_not_found_logs_stale_positive() -> Result<(), Error> {
     let (store, _err_store, digest) = make_primed_cache_store(Code::NotFound).await?;
 
     // Sanity: cache MUST be primed before we can claim a stale positive.
@@ -407,11 +410,12 @@ async fn get_part_not_found_logs_error_for_stale_positive() -> Result<(), Error>
         "NotFound must remove the stale cache entry (regression guard)"
     );
 
-    // The error log MUST fire. Without this, 14k+ stale positives per
-    // day stay invisible to operators.
+    // The log MUST fire so operators investigating a real durability
+    // gap (worker-mirror exhaustion, NL_REDIRECT retries failing) can
+    // drill down by grepping for the digest.
     assert!(
         logs_contain("existence cache stale positive"),
-        "expected error!-level log with 'existence cache stale positive' \
+        "expected debug!-level log with 'existence cache stale positive' \
          when ExistenceCacheStore::get_part removes a stale entry — without \
          it operators have no way to see the cache invariant being violated \
          in production (14,776 events / 24h on buildcache 2026-04-26)"
@@ -426,24 +430,24 @@ async fn get_part_not_found_logs_error_for_stale_positive() -> Result<(), Error>
     assert!(
         logs_contain(VALID_HASH),
         "expected the offending digest hash {VALID_HASH} in the stale-positive \
-         error log so operators can grep for it"
+         log so operators can grep for it"
     );
 
     Ok(())
 }
 
 // -------------------------------------------------------------------
-// 8. Stale positive on update() path MUST surface as error!-level log.
+// 8. Stale positive on update() path MUST surface as a log entry.
 //
 // This is a sibling of test #7. The update() path has its OWN
-// `error!` site (`existence_cache_store.rs` ~line 327) that fires
+// `debug!` site (`existence_cache_store.rs` ~line 386) that fires
 // when a write arrives for a digest the cache claims to have but the
 // inner store's `has()` reports as missing. Without this test the
-// error! at that site can be silently regressed (testing-czar
+// log at that site can be silently regressed (testing-czar
 // HOLD-MAJOR mutation finding: 3 of 4 sites shipped UNPROTECTED).
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn update_logs_error_for_stale_positive() -> Result<(), Error> {
+async fn update_logs_stale_positive() -> Result<(), Error> {
     // Prime cache + inner via the standard helper (err_code is unused
     // here because we only call update, not get_part).
     let (store, err_store, digest) = make_primed_cache_store(Code::NotFound).await?;
@@ -481,12 +485,12 @@ async fn update_logs_error_for_stale_positive() -> Result<(), Error> {
     };
     tokio::try_join!(send_fut, update_fut)?;
 
-    // The error! log MUST fire — assert by message + hash. Without
+    // The debug! log MUST fire — assert by message + hash. Without
     // both, a regression that changes the message text but keeps
     // the digest, or vice versa, would slip through.
     assert!(
         logs_contain("existence cache stale positive"),
-        "expected error!-level 'existence cache stale positive' log on \
+        "expected debug!-level 'existence cache stale positive' log on \
          the update() path when inner.has() returns None for a digest \
          the cache claims to have"
     );
@@ -499,18 +503,18 @@ async fn update_logs_error_for_stale_positive() -> Result<(), Error> {
     assert!(
         logs_contain(VALID_HASH),
         "expected the offending digest hash {VALID_HASH} in the stale-positive \
-         error log on the update() path"
+         log on the update() path"
     );
 
     Ok(())
 }
 
 // -------------------------------------------------------------------
-// 9. Stale positive on update_oneshot() path MUST surface as
-//    error!-level log. Sibling of tests #7 / #8.
+// 9. Stale positive on update_oneshot() path MUST surface as a log
+//    entry. Sibling of tests #7 / #8.
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn update_oneshot_logs_error_for_stale_positive() -> Result<(), Error> {
+async fn update_oneshot_logs_stale_positive() -> Result<(), Error> {
     let (store, err_store, digest) = make_primed_cache_store(Code::NotFound).await?;
     assert!(
         store.exists_in_cache(&digest).await,
@@ -529,7 +533,7 @@ async fn update_oneshot_logs_error_for_stale_positive() -> Result<(), Error> {
 
     assert!(
         logs_contain("existence cache stale positive"),
-        "expected error!-level 'existence cache stale positive' log on \
+        "expected debug!-level 'existence cache stale positive' log on \
          the update_oneshot() path"
     );
     assert!(
@@ -540,7 +544,7 @@ async fn update_oneshot_logs_error_for_stale_positive() -> Result<(), Error> {
     assert!(
         logs_contain(VALID_HASH),
         "expected the offending digest hash {VALID_HASH} in the stale-positive \
-         error log on the update_oneshot() path"
+         log on the update_oneshot() path"
     );
 
     Ok(())
@@ -548,17 +552,17 @@ async fn update_oneshot_logs_error_for_stale_positive() -> Result<(), Error> {
 
 // -------------------------------------------------------------------
 // 10. Stale positive on batch_get_part_unchunked() path MUST surface
-//     as error!-level log — AND must fire ONLY for the cached digest,
+//     as a log entry — AND must fire ONLY for the cached digest,
 //     not for sibling digests in the same batch that were never
 //     cached.
 //
 // This composite assertion guards two invariants:
-//   - The error! site fires when a stale entry is removed.
+//   - The debug! site fires when a stale entry is removed.
 //   - It does NOT fire for honest NotFounds on never-cached digests
 //     (which would create false-positive operator alarm storms).
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn batch_get_part_logs_error_for_stale_positive() -> Result<(), Error> {
+async fn batch_get_part_logs_stale_positive() -> Result<(), Error> {
     // Prime cache + inner with digest A via the standard helper. B
     // and C are NEVER cached; they go straight into the batch and
     // should hit the inner-store NotFound path without producing a
@@ -582,10 +586,10 @@ async fn batch_get_part_logs_error_for_stale_positive() -> Result<(), Error> {
     // The cache entry for A must be gone (it was the stale positive).
     assert!(!store.exists_in_cache(&digest_a).await);
 
-    // The error! log fired with the canonical wording + the hash of A.
+    // The debug! log fired with the canonical wording + the hash of A.
     assert!(
         logs_contain("existence cache stale positive"),
-        "expected error!-level 'existence cache stale positive' log on \
+        "expected debug!-level 'existence cache stale positive' log on \
          the batch_get_part path for the cached digest"
     );
     assert!(
@@ -619,15 +623,15 @@ async fn batch_get_part_logs_error_for_stale_positive() -> Result<(), Error> {
 // -------------------------------------------------------------------
 // 11. Honest NotFound on a never-cached digest MUST stay silent.
 //
-// Negative-case guard for the `if removed { error!(...) }` gate at
+// Negative-case guard for the `if removed { debug!(...) }` gate at
 // every stale-positive site. If the gate were dropped, every
 // FindMissingBlobs-style read on a never-seen digest would produce
-// an error!-level log — drowning operators in noise and rendering
-// the alarm useless. This test asserts the GATE, not just the
-// presence of the log on a real stale-positive case.
+// a stale-positive log — drowning operator drill-down with noise
+// and rendering the signal useless. This test asserts the GATE,
+// not just the presence of the log on a real stale-positive case.
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn get_part_not_found_does_not_log_error_for_never_cached_digest()
+async fn get_part_not_found_does_not_log_for_never_cached_digest()
 -> Result<(), Error> {
     // Build the cache store WITHOUT priming anything. The inner is
     // wired to return NotFound on get_part — this is the inner-store
@@ -653,19 +657,19 @@ async fn get_part_not_found_does_not_log_error_for_never_cached_digest()
 
     // The log MUST NOT fire for a digest that was never in the cache.
     // A NotFound on a never-cached digest is honest, expected behavior
-    // (the cache simply didn't know about it). Logging error! here
-    // would produce 1000s of false alarms per minute on cold-cache
-    // reads.
+    // (the cache simply didn't know about it). Logging here would
+    // produce 1000s of false drill-down candidates per minute on
+    // cold-cache reads.
     assert!(
         !logs_contain("existence cache stale positive"),
         "honest NotFound on a never-cached digest must NOT produce a \
-         stale-positive error log — the `if removed {{ error!(...) }}` \
+         stale-positive log — the `if removed {{ debug!(...) }}` \
          gate at every stale-positive site is what keeps this silent. \
          If this assertion fails, that gate has been dropped."
     );
     assert!(
         !logs_contain(VALID_HASH),
-        "the digest hash must NOT appear in any error log for an \
+        "the digest hash must NOT appear in any log for an \
          honest NotFound on a never-cached digest"
     );
 

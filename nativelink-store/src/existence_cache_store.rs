@@ -72,10 +72,14 @@ fn is_unrecoverable_read_error(code: Code) -> bool {
 
 /// Possible causes of a stale positive observed on a WRITE path
 /// (`update` / `update_oneshot`). Emitted as a structured `causes`
-/// field on the `error!` log so the prose lives in one place instead
+/// field on the `debug!` log so the prose lives in one place instead
 /// of being duplicated per call site (and silently drifting). Three
 /// distinct mechanisms; an operator who sees this log walks through
-/// them to figure out which one fired:
+/// them to figure out which one fired (note that under the
+/// worker-mirror durability protocol the cache=Some + inner=NotFound
+/// state is EXPECTED for blobs that live only on peer workers — most
+/// production occurrences are healthy mirror-tier consultations, not
+/// contract violations):
 ///   (a) the inner store lost the blob after the cache observed it
 ///       (eviction, OOM kill mid-write, on-disk corruption),
 ///   (b) the cache was populated by a code path that did not verify
@@ -373,7 +377,16 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         let prior_size = self.existence_cache.size_for_key(&digest).await;
         let removed = self.existence_cache.remove(&digest).await;
         if removed {
-            error!(
+            // Demoted from error: under the worker-mirror durability
+            // protocol, EC.cache=Some + inner=NotFound is the EXPECTED
+            // state when the blob lives only on peer workers (caller is
+            // re-uploading harmlessly because the server's local inner
+            // tier doesn't have it). Real durability gaps surface via
+            // the upstream caller's NotFound chain ("not found in either
+            // fast or slow store"), NL_REDIRECT exhaustion, or Bazel's
+            // own retry-exhaustion errors — not here. Kept at debug for
+            // operator drill-down.
+            debug!(
                 %digest,
                 ?prior_size,
                 causes = STALE_POSITIVE_CAUSES_WRITE,
@@ -476,7 +489,11 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         let prior_size = self.existence_cache.size_for_key(&digest).await;
         let removed = self.existence_cache.remove(&digest).await;
         if removed {
-            error!(
+            // Demoted from error: see canonical rationale above the
+            // sibling `update` path log site (~line 376). Same
+            // worker-mirror durability semantics — the blob may live
+            // only on peer workers; caller will re-upload harmlessly.
+            debug!(
                 %digest,
                 ?prior_size,
                 causes = STALE_POSITIVE_CAUSES_WRITE,
@@ -588,15 +605,20 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 let prior_size = self.existence_cache.size_for_key(&digest).await;
                 let removed = self.existence_cache.remove(&digest).await;
                 if removed {
-                    // Surface stale positives loudly. Per CLAUDE.md "be
-                    // NOISY when impossible state happens": the cache
-                    // claimed this blob existed and then the inner store
-                    // failed to deliver it. None of the four root causes
-                    // listed below should happen in normal operation —
-                    // each indicates a real bug that operators need to
-                    // see. 14,776 such events / 24h on buildcache
-                    // (2026-04-26) were invisible at debug-only logging.
-                    error!(
+                    // Demoted from error: under the worker-mirror
+                    // durability protocol, EC.cache=Some + inner=NotFound
+                    // is the EXPECTED state when the blob lives only on
+                    // peer workers — the bytestream caller responds with
+                    // NL_REDIRECT and the client retries via peer-fetch
+                    // (typically delivered in 1-31 ms). Real durability
+                    // gaps surface via the upstream caller's NotFound
+                    // chain ("not found in either fast or slow store"),
+                    // NL_REDIRECT exhaustion, or Bazel's own
+                    // retry-exhaustion errors — not here. The 14,776 /
+                    // 24h events seen on buildcache 2026-04-26 were almost
+                    // entirely healthy mirror-tier consultations. Kept
+                    // at debug for operator drill-down.
+                    debug!(
                         %digest,
                         ?prior_size,
                         inner_code = ?err.code,
@@ -669,7 +691,12 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             let prior_size = self.existence_cache.size_for_key(&digest).await;
             let removed = self.existence_cache.remove(&digest).await;
             if removed {
-                error!(
+                // Demoted from error: see canonical rationale above the
+                // sibling `get_part` path log site (~line 599). Same
+                // worker-mirror durability semantics apply to the batch
+                // read path — most events are healthy mirror-tier
+                // consultations, not contract violations.
+                debug!(
                     %digest,
                     ?prior_size,
                     ?inner_code,
