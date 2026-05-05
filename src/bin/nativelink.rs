@@ -242,49 +242,20 @@ async fn inner_main(
             })
         });
 
-    let mut action_schedulers = HashMap::new();
-    let mut worker_schedulers = HashMap::new();
-    for SchedulerConfig { name, spec } in cfg.schedulers.iter().flatten() {
-        let (maybe_action_scheduler, maybe_worker_scheduler) =
-            scheduler_factory(spec, &store_manager, maybe_origin_event_tx.as_ref(), Some(locality_map.clone()), worker_proxy_tls.clone())
-                .await
-                .err_tip(|| format!("Failed to create scheduler '{name}'"))?;
-        if let Some(action_scheduler) = maybe_action_scheduler {
-            action_schedulers.insert(name.clone(), action_scheduler.clone());
-        }
-        if let Some(worker_scheduler) = maybe_worker_scheduler {
-            worker_schedulers.insert(name.clone(), worker_scheduler.clone());
-        }
-    }
-
+    // #261 fix: the WorkerProxyStore wrap MUST happen BEFORE
+    // `scheduler_factory` runs so that the scheduler captures a clone of
+    // the WRAPPED `cas_store` (with peer-fetch fallback) rather than the
+    // raw `unwrapped_cas_stores` entry. Otherwise tree-resolution in
+    // `ApiWorkerScheduler::resolve_directory_for_input_root` walks
+    // `SizePartitioning → Memory → Filesystem` only and surfaces NotFound
+    // for tiny Directory blobs that live on a peer worker (because
+    // `bytestream_server`'s fast-path skipped the server-side persist on
+    // the strength of `WorkerProxyStore::has() = Some`).
+    //
+    // The wrap REPLACES the entry in `store_manager` (HashMap insert),
+    // so the next `store_manager.get_store(name)` call inside
+    // `scheduler_factory` resolves to the wrapped Arc.
     let server_cfgs: Vec<ServerConfig> = cfg.servers.into_iter().collect();
-
-    // Periodically log tokio runtime metrics to detect thread pool exhaustion.
-    // Requires tokio_unstable cfg for blocking thread metrics.
-    #[cfg(tokio_unstable)]
-    {
-        let metrics_handle = tokio::runtime::Handle::current();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-                let metrics = metrics_handle.metrics();
-                let workers = metrics.num_workers();
-                let blocking_threads = metrics.num_blocking_threads();
-                let idle_blocking = metrics.num_idle_blocking_threads();
-                let blocking_depth = metrics.blocking_queue_depth();
-                if blocking_depth > 0 || (blocking_threads > 0 && idle_blocking == 0) {
-                    warn!(
-                        workers,
-                        blocking_threads,
-                        idle_blocking,
-                        blocking_queue_depth = blocking_depth,
-                        "tokio thread pool pressure detected"
-                    );
-                }
-            }
-        });
-    }
 
     // Wrap CAS stores with WorkerProxyStore so the server can proxy reads
     // to workers that have the blob (discovered via BlobsAvailable reports).
@@ -361,12 +332,54 @@ async fn inner_main(
                 info!(
                     store_name,
                     worker_proxy_tls = worker_proxy_tls.is_some(),
-                    "Wrapped CAS store with WorkerProxyStore for peer blob sharing"
+                    "wrapped CAS store with WorkerProxyStore for peer blob sharing"
                 );
             }
         }
         names
     };
+
+    let mut action_schedulers = HashMap::new();
+    let mut worker_schedulers = HashMap::new();
+    for SchedulerConfig { name, spec } in cfg.schedulers.iter().flatten() {
+        let (maybe_action_scheduler, maybe_worker_scheduler) =
+            scheduler_factory(spec, &store_manager, maybe_origin_event_tx.as_ref(), Some(locality_map.clone()), worker_proxy_tls.clone())
+                .await
+                .err_tip(|| format!("Failed to create scheduler '{name}'"))?;
+        if let Some(action_scheduler) = maybe_action_scheduler {
+            action_schedulers.insert(name.clone(), action_scheduler.clone());
+        }
+        if let Some(worker_scheduler) = maybe_worker_scheduler {
+            worker_schedulers.insert(name.clone(), worker_scheduler.clone());
+        }
+    }
+
+    // Periodically log tokio runtime metrics to detect thread pool exhaustion.
+    // Requires tokio_unstable cfg for blocking thread metrics.
+    #[cfg(tokio_unstable)]
+    {
+        let metrics_handle = tokio::runtime::Handle::current();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let metrics = metrics_handle.metrics();
+                let workers = metrics.num_workers();
+                let blocking_threads = metrics.num_blocking_threads();
+                let idle_blocking = metrics.num_idle_blocking_threads();
+                let blocking_depth = metrics.blocking_queue_depth();
+                if blocking_depth > 0 || (blocking_threads > 0 && idle_blocking == 0) {
+                    warn!(
+                        workers,
+                        blocking_threads,
+                        idle_blocking,
+                        blocking_queue_depth = blocking_depth,
+                        "tokio thread pool pressure detected"
+                    );
+                }
+            }
+        });
+    }
 
     // task #168 item 8: build the SmallBlobDispatcher singleton for
     // Bug A small-CAS peer-mirror push. The dispatcher is plumbed into
