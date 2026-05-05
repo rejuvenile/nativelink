@@ -628,7 +628,9 @@ impl SmallBlobDispatcher {
     /// - When `small_blob_mirror_enabled = false`: return `Ok(())` no-op.
     /// - `data.len() <= SMALL_BLOB_THRESHOLD` (per C9). Larger blobs MUST
     ///   take the existing streaming path.
-    /// - `store_id` non-empty + matches `[a-z][a-z0-9_]*` (per C11).
+    /// - `store_id` non-empty + matches `[a-zA-Z_][a-zA-Z0-9_]*` (Rust
+    ///   ident rules; per C11 as relaxed to accommodate production store
+    ///   names like `cas_STORE` that mix case).
     ///
     /// On precondition failure: returns `Err(InvalidArgument)`. Caller
     /// MUST NOT propagate this back to Bazel (the dispatcher path is
@@ -666,7 +668,7 @@ impl SmallBlobDispatcher {
         if !is_valid_store_id(store_id) {
             return Err(make_input_err!(
                 "SmallBlobDispatcher::enqueue: invalid store_id {store_id:?} \
-                 (must be non-empty + match `[a-z][a-z0-9_]*` per plan C11)"
+                 (must be non-empty + match `[a-zA-Z_][a-zA-Z0-9_]*` per plan C11)"
             ));
         }
         let endpoint_key: Arc<str> = Arc::from(endpoint);
@@ -876,16 +878,19 @@ async fn drainer_task(
     );
 }
 
-/// Validate `store_id` per plan C11. Format `[a-z][a-z0-9_]*`.
-fn is_valid_store_id(s: &str) -> bool {
+/// Validate `store_id` per plan C11 (relaxed to Rust-ident rules).
+/// Format `[a-zA-Z_][a-zA-Z0-9_]*`. Originally lowercase-only; relaxed to
+/// accept production store names that mix case (e.g. `cas_STORE`,
+/// `WORKER_FAST_SLOW_STORE`) without forcing a config rename.
+pub fn is_valid_store_id(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
         return false;
     };
-    if !first.is_ascii_lowercase() {
+    if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -902,12 +907,26 @@ mod tests {
     }
 
     #[test]
+    fn is_valid_store_id_accepts_production_store_names() {
+        // Regression for #168: production configs use mixed-case names
+        // like `cas_STORE`. The pre-relaxation regex `[a-z][a-z0-9_]*`
+        // silently disabled the dispatcher in production. The relaxed
+        // form `[a-zA-Z_][a-zA-Z0-9_]*` accepts these.
+        assert!(is_valid_store_id("cas_STORE"));
+        assert!(is_valid_store_id("cas_INNER"));
+        assert!(is_valid_store_id("WORKER_FAST_SLOW_STORE"));
+        assert!(is_valid_store_id("AC_BACKEND_CACHED"));
+        assert!(is_valid_store_id("Cas"));
+        assert!(is_valid_store_id("_underscore_start"));
+    }
+
+    #[test]
     fn is_valid_store_id_rejects_documented_invalids() {
         assert!(!is_valid_store_id(""));
-        assert!(!is_valid_store_id("Cas"));
         assert!(!is_valid_store_id("1cas"));
         assert!(!is_valid_store_id("cas-small"));
         assert!(!is_valid_store_id("cas.small"));
         assert!(!is_valid_store_id("cas/small"));
+        assert!(!is_valid_store_id("cas store"));
     }
 }

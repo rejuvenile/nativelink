@@ -486,21 +486,13 @@ async fn inner_main(
                     continue;
                 };
                 // Skip stores whose names don't match the dispatcher
-                // store_id format (`[a-z][a-z0-9_]*`); pin sets won't
-                // match and we'd just waste a registration.
-                if store_name.is_empty()
-                    || !store_name
-                        .chars()
-                        .next()
-                        .map_or(false, |c| c.is_ascii_lowercase())
-                    || !store_name
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-                {
+                // store_id format (Rust-ident-like `[a-zA-Z_][a-zA-Z0-9_]*`);
+                // pin sets won't match and we'd just waste a registration.
+                if !nativelink_store::small_blob_dispatcher::is_valid_store_id(store_name) {
                     info!(
                         store_name,
                         "small_blob_dispatcher: skipping pin-set registration; \
-                         store_name does not match `[a-z][a-z0-9_]*` (per plan C11)"
+                         store_name does not match `[a-zA-Z_][a-zA-Z0-9_]*` (per plan C11)"
                     );
                     continue;
                 }

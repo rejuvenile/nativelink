@@ -243,7 +243,9 @@ pub struct MirrorPinEntry {
     /// / The source FastSlowStore identifier (matches the per-store config
     /// / `store_id`). Used by `observe_pinned_mirror_ack` to scope the
     /// / unpin to the SOURCE store. Validated server-side as non-empty +
-    /// / `[a-z][a-z0-9_]*`.
+    /// / `[a-zA-Z_][a-zA-Z0-9_]*` (Rust-ident rules; relaxed from the
+    /// / original lowercase-only spec to accept production names like
+    /// / `cas_STORE`; see #168).
     #[prost(string, tag = "2")]
     pub store_id: ::prost::alloc::string::String,
 }

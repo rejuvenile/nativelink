@@ -252,7 +252,9 @@ async fn dispatcher_enqueue_rejects_empty_store_id() -> Result<(), Error> {
 
 // ----------------------------------------------------------------------
 // Test 7 (per plan C11): dispatcher enqueue rejects malformed store_id.
-// Format must be `[a-z][a-z0-9_]*` per C11.
+// Format must be `[a-zA-Z_][a-zA-Z0-9_]*` per C11 (relaxed from the
+// original lowercase-only spec to accept production names like
+// `cas_STORE`; see #168).
 // ----------------------------------------------------------------------
 #[nativelink_test]
 async fn dispatcher_enqueue_rejects_malformed_store_id() -> Result<(), Error> {
@@ -265,7 +267,11 @@ async fn dispatcher_enqueue_rejects_malformed_store_id() -> Result<(), Error> {
     let dispatcher = SmallBlobDispatcher::new(cfg);
     let d = make_digest(1, 100);
 
-    for bad in ["1cas", "C", "a-b", "ac.cas", "ac/cas"] {
+    // Note: under the relaxed `[a-zA-Z_][a-zA-Z0-9_]*` regex, `"C"` and
+    // `"Cas"` are now valid (single uppercase ASCII letter is fine);
+    // we exercise the still-rejected classes: digit-start, embedded
+    // hyphen/dot/slash, embedded whitespace, leading dollar.
+    for bad in ["1cas", "a-b", "ac.cas", "ac/cas", "cas store", "$cas"] {
         let res = tokio::time::timeout(
             DEADLOCK_DETECTOR,
             dispatcher.enqueue(
