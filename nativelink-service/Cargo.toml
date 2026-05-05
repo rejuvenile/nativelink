@@ -90,6 +90,10 @@ chunked_fast_slow = ["nativelink-store/chunked_fast_slow", "dep:sha2", "dep:asyn
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
 fail = { version = "0.5", features = ["failpoints"] }
+# Brings in `test-util` so `#[nativelink_test(start_paused = true)]`
+# can drive virtual time in dedup-gate timeout tests without waiting
+# 15 s wall-clock per case.
+tokio = { version = "1.44.1", features = ["test-util"], default-features = false }
 
 async-lock = { version = "3.4.0", features = ["std"], default-features = false }
 blake3 = { version = "1.8.0", default-features = false }

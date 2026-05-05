@@ -48,7 +48,8 @@ use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreS
 use nativelink_macro::nativelink_test;
 use nativelink_service::chunked_write_handler::{
     BazelChunkedDispatcherImpl, ChunkedWriteHandlerMetrics, ChunkedWriteInFlight, CommitMode,
-    DispatchOutcome, PreparedChunk, dispatch_chunks_to_driver, wait_for_no_in_flight,
+    DispatchOutcome, PreparedChunk, dispatch_bazel_facing_internal_chunking,
+    dispatch_chunks_to_driver, wait_for_no_in_flight,
 };
 use nativelink_store::chunked::chunk_budget::{ChunkBudget, TOTAL_CHUNK_PERMITS};
 use nativelink_store::chunked::pin_budget::PinBudget;
@@ -950,5 +951,418 @@ async fn async_commit_digest_mismatch_blocks_canonical_cas_landing() {
          the commit before atomic-rename. If this assertion fires with \
          appeared=true, the chunked driver's commit-time hash check is \
          broken and lying bytes can durably land on disk (#212 fixup S5).",
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Early-dedup gate: when the digest is already in the FilesystemStore's
+// in-process index (`evicting_map`), the chunked dispatcher MUST short-
+// circuit — drain the producer to EOF and return Ok WITHOUT spawning a
+// per-blob driver, opening a `.holding` file, or running per-chunk
+// SHA-256 / pwrite work.
+//
+// This is the EARLY sibling of the `finalize_holding` duplicate-commit
+// guard at filesystem_store.rs:1698 (#256 fix), which fires AFTER all
+// chunks have been pwrite'd to a `.holding` file. The early gate elides
+// the per-chunk cost on byte-identical re-uploads (Bazel re-uploads of
+// canonical CAS blobs are common during retries / cross-action sharing).
+// -----------------------------------------------------------------------------
+
+/// Helper: build a `(tx, rx)` buf-channel pair, send `data` + EOF on the
+/// tx half from a separately-spawned task, return the `rx` half. The
+/// producer task is intentionally `spawn`'d so the rx-half consumer can
+/// run concurrently — modelling the production path where
+/// `FastSlowStore::update`'s `data_stream_fut` runs concurrently with
+/// the dispatcher's reader-drain.
+fn spawn_producer(data: Bytes) -> nativelink_util::buf_channel::DropCloserReadHalf {
+    let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+    tokio::spawn(async move {
+        if !data.is_empty() {
+            let _ = tx.send(data).await;
+        }
+        let _ = tx.send_eof();
+    });
+    rx
+}
+
+/// EARLY-DEDUP gate, hit case: the digest is already in `evicting_map`
+/// before dispatch starts. The dispatcher MUST return Ok promptly and
+/// MUST NOT create a `.holding` file under `content_path/d/XX/`.
+///
+/// Mutation step: comment out the `has_indexed_digest` short-circuit at
+/// the top of `dispatch_bazel_facing_internal_chunking` — this test then
+/// red-fails with the bespoke message because the chunked driver opens
+/// the `.holding` file as part of normal per-chunk processing.
+#[nativelink_test]
+async fn dispatch_bazel_facing_skips_chunked_path_when_digest_already_indexed() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 3;
+    const SIZE: usize = N * CHUNK;
+
+    let mut blob = Vec::with_capacity(SIZE);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0x55u8 ^ (i as u8)).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let (fs_store, content_path) = make_filesystem_store().await;
+
+    // Pre-populate the FilesystemStore so the digest is in `evicting_map`.
+    // Use `update_oneshot` via the StoreLike blanket so the canonical
+    // CAS file lands at `content_path/d/XX/<digest>` AND the in-process
+    // index is updated — modelling the steady-state production case
+    // where Bazel is re-uploading a blob the server already has.
+    let pop_key: nativelink_util::store_trait::StoreKey<'static> =
+        nativelink_util::store_trait::StoreKey::Digest(digest);
+    fs_store
+        .as_pin()
+        .update_oneshot(pop_key, Bytes::copy_from_slice(&blob))
+        .await
+        .expect("pre-populate update_oneshot must succeed");
+
+    // Sanity: the `has_indexed_digest` probe sees the entry. If this
+    // assertion ever fails the test setup is broken — proceed only if
+    // the precondition (which the dispatcher's gate consults) holds.
+    assert_eq!(
+        fs_store.has_indexed_digest(&digest).await,
+        Some(SIZE as u64),
+        "test precondition: pre-populate must register the digest in \
+         evicting_map so the early-dedup gate has something to short-\
+         circuit on",
+    );
+
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+
+    // Run the dispatcher with a fresh producer pushing the same bytes.
+    // The early-dedup gate should drain the reader and return Ok
+    // without ever spawning the per-blob driver / opening a .holding
+    // file. The full byte stream is sent so the test still works in
+    // the (intentionally regression-failing) mutation case where the
+    // gate is removed — the dispatcher will then go through normal
+    // per-chunk processing.
+    let producer_rx = spawn_producer(Bytes::copy_from_slice(&blob));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatch_bazel_facing_internal_chunking(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            budget,
+            None, // pin_budget
+            None, // chunked_read_registry
+            metrics,
+            CHUNK,
+            digest,
+            producer_rx,
+        ),
+    )
+    .await
+    .expect(
+        "must not deadlock — early-dedup short-circuit must drain the \
+         producer and return Ok within seconds",
+    )
+    .expect(
+        "early-dedup short-circuit must return Ok when the digest is \
+         already in evicting_map (CAS immutability: byte-identical \
+         re-upload)",
+    );
+    assert_eq!(
+        outcome.committed_size, SIZE as u64,
+        "early-dedup outcome.committed_size MUST equal the declared blob \
+         size (the size the producer would otherwise have written)",
+    );
+
+    // Load-bearing assertion: NO `.holding` file MUST be created. The
+    // chunked driver opens `<content_path>/d/XX/<digest>.holding` as
+    // soon as the first chunk is admitted. If the early-dedup gate is
+    // missing or wrong, this file appears and the assertion red-fails
+    // with the bespoke message.
+    let holding_path = format!(
+        "{}/d/{:02x}/{}.holding",
+        content_path,
+        digest.packed_hash()[0],
+        digest
+    );
+    let exists = tokio::fs::metadata(&holding_path).await.is_ok();
+    assert!(
+        !exists,
+        "early-dedup gate violated — a .holding file appeared at {} \
+         when the digest was already in evicting_map. The chunked \
+         dispatcher MUST short-circuit before opening any holding \
+         file (CAS immutability + #256 sibling early-dedup gate).",
+        holding_path,
+    );
+
+    // Per-blob in-flight tracker MUST NOT have observed any entry —
+    // the early-dedup path never spawns a ChunkedDriver.
+    assert_eq!(
+        in_flight.in_flight_count(),
+        0,
+        "early-dedup gate violated — the per-blob in-flight tracker \
+         saw an entry, meaning a ChunkedDriver was spawned. The gate \
+         must short-circuit BEFORE driver spawn.",
+    );
+
+    // The original CAS file MUST still be intact (the early dedup
+    // path must not touch the canonical file in any way).
+    let canonical = canonical_cas_path(&content_path, &digest);
+    let on_disk_size = tokio::fs::metadata(&canonical)
+        .await
+        .expect("canonical CAS file from pre-populate must still exist after early-dedup")
+        .len();
+    assert_eq!(
+        on_disk_size, SIZE as u64,
+        "pre-populated canonical CAS file MUST be byte-length unchanged \
+         after the early-dedup short-circuit (the gate must not unlink \
+         or replace the canonical file)",
+    );
+}
+
+/// EARLY-DEDUP gate, miss case: the digest is NOT in `evicting_map`
+/// before dispatch starts. The dispatcher MUST proceed through the
+/// normal chunked path — spawn a driver, open a `.holding` file, and
+/// commit the blob to disk. This is the over-action sibling of the
+/// hit case (CLAUDE.md asymmetric-contract-coverage rule).
+///
+/// Mutation step: change the gate to fire on every call (always-Some)
+/// — this test then red-fails with "canonical CAS file did not appear
+/// after dispatch", proving the gate doesn't over-fire on miss.
+#[nativelink_test]
+async fn dispatch_bazel_facing_runs_chunked_path_when_digest_not_indexed() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 3;
+    const SIZE: usize = N * CHUNK;
+
+    let mut blob = Vec::with_capacity(SIZE);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xa3u8 ^ (i as u8)).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let (fs_store, content_path) = make_filesystem_store().await;
+
+    // Sanity precondition: digest is NOT yet indexed.
+    assert!(
+        fs_store.has_indexed_digest(&digest).await.is_none(),
+        "test precondition: fresh FilesystemStore must not contain the \
+         digest before dispatch",
+    );
+
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+
+    let producer_rx = spawn_producer(Bytes::copy_from_slice(&blob));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        dispatch_bazel_facing_internal_chunking(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            budget,
+            None,
+            None,
+            metrics,
+            CHUNK,
+            digest,
+            producer_rx,
+        ),
+    )
+    .await
+    .expect("must not deadlock — chunked dispatch with normal path")
+    .expect("chunked dispatch must succeed for hash-matching blob");
+    assert_eq!(outcome.committed_size, SIZE as u64);
+
+    // Wait for the async-commit driver to land the blob on disk.
+    let on_disk_size = wait_for_cas_file(&content_path, &digest, Duration::from_secs(10))
+        .await
+        .expect(
+            "canonical CAS file did not appear after dispatch — when the \
+             digest is NOT pre-populated, the chunked driver MUST run \
+             and commit the blob (over-action gate sibling: gate must \
+             not over-fire on miss)",
+        );
+    assert_eq!(on_disk_size, SIZE as u64);
+
+    // The driver MUST drain post-commit.
+    wait_for_no_in_flight(&in_flight, Duration::from_secs(10))
+        .await
+        .expect("in-flight tracker must drain after async commit completes");
+}
+
+/// Bounded-drain (red-team #1, follow-up to f4567ea1): producer claims
+/// a small declared digest then streams more bytes than declared. The
+/// gate's bounded drain MUST surface this as `Code::InvalidArgument`
+/// (size-cap fired) instead of accepting unbounded bytes into
+/// MemoryStore via the upstream tee's sibling `fast_store_fut` (the
+/// #203 OOM-cascade shape).
+///
+/// Mutation step: remove the `consumed > cap` branch in
+/// `bounded_drain_reader` — this test then red-fails because the drain
+/// would silently accept all 32 KiB.
+#[nativelink_test]
+async fn dispatch_bazel_facing_dedup_drain_size_cap_fires_on_oversized_producer() {
+    const CHUNK: usize = 4 * 1024;
+    // Declared blob is 4 KiB; producer streams 32 KiB. With the
+    // 4 MiB slack constant, 32 KiB does not trip the cap on its own
+    // for a 4 KiB declared size (4 KiB + 4 MiB ≈ 4.004 MiB > 32 KiB).
+    // So we use a larger over-stream to actually trip the cap, while
+    // keeping the declared size small to model "1 KiB-claim,
+    // huge-payload" attack shape that the cap is designed to catch.
+    const DECLARED: usize = 1024;
+    const OVERSTREAM: usize = 8 * 1024 * 1024; // 8 MiB > 4 MiB slack
+
+    let mut declared_blob = vec![0xa5u8; DECLARED];
+    // The digest is over the SMALL declared bytes — gate triggers on
+    // this hash. The producer then streams an inflated payload that
+    // does NOT match the declared bytes, but the gate has already
+    // decided to short-circuit so it never verifies the bytes; the
+    // size-cap is the only defence.
+    let digest = DigestInfo::new(sha256(&declared_blob), DECLARED as u64);
+    let _ = &mut declared_blob; // suppress unused-mut
+
+    let (fs_store, _content_path) = make_filesystem_store().await;
+
+    // Pre-populate so the gate fires.
+    let pop_key: nativelink_util::store_trait::StoreKey<'static> =
+        nativelink_util::store_trait::StoreKey::Digest(digest);
+    fs_store
+        .as_pin()
+        .update_oneshot(pop_key, Bytes::copy_from_slice(&declared_blob))
+        .await
+        .expect("pre-populate must succeed");
+
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+
+    // Producer streams the OVERSIZED payload (mismatched bytes; the
+    // size-cap should fire before any byte-content check would matter).
+    let oversized = vec![0xc3u8; OVERSTREAM];
+    let producer_rx = spawn_producer(Bytes::from(oversized));
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatch_bazel_facing_internal_chunking(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            budget,
+            None,
+            None,
+            metrics,
+            CHUNK,
+            digest,
+            producer_rx,
+        ),
+    )
+    .await
+    .expect(
+        "must not deadlock — bounded drain must surface size-cap \
+         failure within seconds, NOT consume unbounded bytes",
+    );
+
+    let err = result.expect_err(
+        "early-dedup bounded drain MUST reject a producer that streams \
+         more bytes than declared (size-cap = declared + 4 MiB slack); \
+         silently accepting bytes is the #203 OOM-cascade shape",
+    );
+    assert_eq!(
+        err.code,
+        nativelink_error::Code::InvalidArgument,
+        "size-cap excess MUST surface as Code::InvalidArgument, got {:?} (msg={})",
+        err.code,
+        err.messages.first().map(String::as_str).unwrap_or(""),
+    );
+}
+
+/// Bounded-drain (red-team #1, follow-up to f4567ea1): producer stalls
+/// — sends nothing AND does not EOF. The per-recv timeout MUST fire
+/// and surface `Code::DeadlineExceeded` instead of the gate holding
+/// the dispatch task forever (which would also keep the upstream
+/// MemoryStore::update via the sibling tee ingesting forever — the
+/// stalled-producer DoS shape red-team identified).
+///
+/// Uses `tokio::time::pause()` so the test does not actually wait the
+/// full per-recv timeout (15 s); virtual time advances past the
+/// deadline instantly.
+///
+/// Mutation step: replace the `tokio::time::timeout(...).await` in
+/// `bounded_drain_reader` with a bare `recv_fut.await` — this test
+/// then hangs (caught by the outer 30s wall-clock guard) instead of
+/// surfacing DeadlineExceeded.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn dispatch_bazel_facing_dedup_drain_per_recv_timeout_fires_on_stalled_producer() {
+    const CHUNK: usize = 4 * 1024;
+    const SIZE: usize = 4 * 1024;
+
+    let blob = vec![0x77u8; SIZE];
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let (fs_store, _content_path) = make_filesystem_store().await;
+    let pop_key: nativelink_util::store_trait::StoreKey<'static> =
+        nativelink_util::store_trait::StoreKey::Digest(digest);
+    fs_store
+        .as_pin()
+        .update_oneshot(pop_key, Bytes::copy_from_slice(&blob))
+        .await
+        .expect("pre-populate must succeed");
+
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+
+    // Stalled producer: hold the tx alive, send nothing, never EOF.
+    let (tx, producer_rx) = make_buf_channel_pair_with_size(128);
+    // Move tx into a long-lived Box so it isn't dropped (which would
+    // close the channel and cause `recv()` to return EOF, masking the
+    // timeout we want to test). We deliberately leak it for the test
+    // duration; the helper drops on test-completion via the spawn
+    // handle below.
+    let tx_holder = tokio::spawn(async move {
+        // Hold tx alive for a virtual eternity. With `start_paused`,
+        // the runtime advances virtual time only when polled.
+        let _hold = tx;
+        // Sleep on virtual time effectively forever.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    });
+
+    let dispatch_fut = dispatch_bazel_facing_internal_chunking(
+        Arc::clone(&fs_store),
+        Arc::clone(&in_flight),
+        budget,
+        None,
+        None,
+        metrics,
+        CHUNK,
+        digest,
+        producer_rx,
+    );
+
+    // Outer guard: 30 virtual seconds. The per-recv timeout is 15 s,
+    // so the gate MUST surface DeadlineExceeded inside this window.
+    // Without the timeout in `bounded_drain_reader`, this test hangs
+    // and the timeout's `.expect` panics.
+    let result = tokio::time::timeout(Duration::from_secs(30), dispatch_fut)
+        .await
+        .expect(
+            "bounded drain hung — the per-recv 15s timeout MUST fire \
+             when the producer stalls; without it, the dispatch task \
+             holds forever and the upstream tee's MemoryStore::update \
+             keeps consuming bytes (the #203 OOM-cascade shape)",
+        );
+
+    tx_holder.abort();
+
+    let err = result.expect_err(
+        "stalled producer MUST surface a Result::Err — the gate \
+         cannot return Ok without observing the producer's bytes \
+         (or its EOF)",
+    );
+    assert_eq!(
+        err.code,
+        nativelink_error::Code::DeadlineExceeded,
+        "stalled-producer drain MUST surface as Code::DeadlineExceeded, got {:?} (msg={})",
+        err.code,
+        err.messages.first().map(String::as_str).unwrap_or(""),
     );
 }

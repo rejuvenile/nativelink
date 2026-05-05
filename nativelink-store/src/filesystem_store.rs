@@ -1813,6 +1813,25 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     pub async fn discard_chunked(&self, digest: &DigestInfo) -> Result<(), Error> {
         chunked_discard(&self.chunked_partials, digest).await
     }
+
+    /// Cheap in-process index probe: returns `Some(size)` if the digest
+    /// is already present in `evicting_map` (a canonical CAS file is on
+    /// disk and indexed), `None` otherwise. Mirrors the visibility
+    /// surface used by `finalize_holding`'s pre-rename guard
+    /// (filesystem_store.rs:1698).
+    ///
+    /// Distinct from `StoreDriver::has_with_results` in that it (a)
+    /// does NOT auto-create zero-length files, (b) does NOT trip the
+    /// `Str`-key vs `Digest`-key size-fixup pass, and (c) takes a
+    /// `&DigestInfo` directly so callers in the chunked path don't need
+    /// `StoreLike` in scope. Intended for chunked-write entry points
+    /// that want to short-circuit the per-chunk pwrite cost when an
+    /// identical-digest blob is already canonical (CAS immutability:
+    /// digest = content).
+    pub async fn has_indexed_digest(&self, digest: &DigestInfo) -> Option<u64> {
+        let key: StoreKey<'static> = (*digest).into();
+        self.evicting_map.size_for_key(&key).await
+    }
 }
 
 #[async_trait]

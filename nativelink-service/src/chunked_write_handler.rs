@@ -113,6 +113,29 @@ const CONCURRENT_SAME_DIGEST_RETRY_AFTER_MS: u64 = 250;
 /// lower bound.
 const PIN_BUDGET_RETRY_AFTER_MS: u64 = 100;
 
+/// Per-recv timeout on the early-dedup gate's drain loop (`bounded_drain_*`).
+/// Mirrors the legacy chunked driver's `per_chunk_timeout` philosophy
+/// (`feedback_per_chunk_timeout_design_intent`): no whole-RPC deadline,
+/// only a no-progress timer per chunk. Production sets the per-chunk
+/// timer to 15 s and relies on `chunked_driver`'s timeout for stuck-
+/// transport detection. Without this bound on the dedup-skip path a
+/// stalled producer can hold the dispatch task forever AND keep the
+/// sibling fast-tier `MemoryStore::update` ingesting bytes via the
+/// upstream tee — exactly the #203 (2026-04-28) memory-pressure
+/// cascade shape.
+const EARLY_DEDUP_DRAIN_PER_RECV_TIMEOUT: core::time::Duration =
+    core::time::Duration::from_secs(15);
+
+/// Hard cap on bytes consumed by the early-dedup drain. The producer
+/// declared `digest.size_bytes()`; a well-behaved producer sends
+/// exactly that. We allow a small slack for protocol framing overhead
+/// (per-chunk WriteChunk wrappers, end-of-stream sentinels). Anything
+/// beyond declared + slack is treated as a malicious or buggy producer
+/// claiming a small digest while streaming a large payload — abort with
+/// `Code::InvalidArgument` rather than let the bytes accumulate in the
+/// upstream MemoryStore via the sibling `fast_store_fut`.
+const EARLY_DEDUP_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
+
 /// In-flight map: `DigestInfo` → live driver + sender. The sender is
 /// held here (not by the spawned driver) so multiple concurrent stream
 /// admissions for the SAME digest can re-use the same driver task and
@@ -384,6 +407,55 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             return self
                 .handle_empty_blob(stream, first_chunk, stream_digest)
                 .await;
+        }
+
+        // EARLY-DEDUP gate (sibling of dispatch_bazel_facing_internal_chunking's
+        // gate above; also a sibling of #256 finalize_holding pre-rename
+        // guard at filesystem_store.rs:1698). Same CAS-immutability
+        // rationale: when the digest is already in evicting_map, drain
+        // the stream and return WriteChunkedResponse without spawning
+        // a per-blob driver, opening a .holding file, computing per-
+        // chunk SHA-256, or doing any pwrite.
+        //
+        // Worker-side scope: this is the WriteChunked RPC handler used
+        // by worker-to-server uploads (CasExtensions on port 50071).
+        // The legacy worker upload path's `finalize_holding` post-rename
+        // guard at filesystem_store.rs:1698 (the #256 fix) deduplicates
+        // AFTER all chunks land — but only after the driver has paid the
+        // per-chunk pwrite + SHA-256 cost on every chunk. This early
+        // gate elides that work for the indexed-digest case.
+        //
+        // Drain bounds: per-message timeout + size cap (see
+        // `bounded_drain_grpc_stream` for rationale, mirroring the
+        // Bazel-facing gate).
+        if self
+            .filesystem_store
+            .has_indexed_digest(&stream_digest)
+            .await
+            .is_some()
+        {
+            if let Err(err) =
+                bounded_drain_grpc_stream(&mut stream, first_chunk, stream_digest.size_bytes())
+                    .await
+            {
+                return Err(err.append(
+                    "WriteChunked early-dedup: bounded-drain failed after short-circuit \
+                     (digest already indexed; producer stalled, errored, or exceeded \
+                     declared size)",
+                ));
+            }
+            debug!(
+                ?stream_digest,
+                committed_size = stream_digest.size_bytes(),
+                "WriteChunked early-dedup short-circuit (digest already in evicting_map; \
+                 per-chunk pwrite + sha-verify elided)"
+            );
+            let committed_digest_proto =
+                nativelink_proto::build::bazel::remote::execution::v2::Digest::from(stream_digest);
+            return Ok(WriteChunkedResponse {
+                committed_digest: Some(committed_digest_proto),
+                committed_size: stream_digest.size_bytes(),
+            });
         }
 
         // Look up or create the per-blob driver. Today: one driver per
@@ -1979,6 +2051,136 @@ pub fn wire_bazel_chunked_dispatcher<Fe: FileEntry>(
 /// violating durability. (FastSlowStore::update's existing
 /// `tokio::join!(data_stream_fut, fast_store_fut)` provides this
 /// ordering.)
+/// Drain a `DropCloserReadHalf` to EOF with bounded resource use.
+///
+/// Used by the early-dedup gate to consume the producer's bytes
+/// without spawning the chunked driver. Two protections against the
+/// stalled-producer / oversized-claim DoS shapes that the unbounded
+/// `reader.drain()` would not catch:
+///
+/// 1. **Per-recv timeout** of [`EARLY_DEDUP_DRAIN_PER_RECV_TIMEOUT`]:
+///    no whole-drain deadline (per
+///    `feedback_per_chunk_timeout_design_intent`), only a no-progress
+///    timer per chunk. A stalled producer surfaces as `Code::DeadlineExceeded`
+///    instead of holding the dispatch task forever.
+/// 2. **Size cap** of `declared + EARLY_DEDUP_DRAIN_SIZE_SLACK`: a
+///    well-behaved producer sends exactly `declared` bytes; anything
+///    beyond declared + slack is treated as malicious / buggy and
+///    surfaces as `Code::InvalidArgument`. Without this, a producer
+///    claiming a 1 KiB digest could stream 100 GiB into the upstream
+///    `FastSlowStore::update`'s MemoryStore via the sibling
+///    `fast_store_fut` (the #203 OOM-cascade shape).
+///
+/// Returns Ok(()) when the reader hits EOF; Err otherwise.
+async fn bounded_drain_reader(
+    reader: &mut DropCloserReadHalf,
+    declared_size: u64,
+) -> Result<(), Error> {
+    let cap = declared_size.saturating_add(EARLY_DEDUP_DRAIN_SIZE_SLACK);
+    let mut consumed: u64 = 0;
+    loop {
+        let recv_fut = reader.recv();
+        let chunk = match tokio::time::timeout(EARLY_DEDUP_DRAIN_PER_RECV_TIMEOUT, recv_fut).await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(make_err!(
+                    Code::DeadlineExceeded,
+                    "early-dedup drain: no progress for {:?} (consumed={consumed} declared={declared_size})",
+                    EARLY_DEDUP_DRAIN_PER_RECV_TIMEOUT,
+                ));
+            }
+        };
+        if chunk.is_empty() {
+            // EOF.
+            return Ok(());
+        }
+        consumed = consumed.saturating_add(chunk.len() as u64);
+        if consumed > cap {
+            return Err(make_err!(
+                Code::InvalidArgument,
+                "early-dedup drain: producer exceeded declared size (consumed={consumed} declared={declared_size} cap={cap})"
+            ));
+        }
+    }
+}
+
+/// Drain a `Streaming<WriteChunk>` to end-of-stream with bounded
+/// resource use. Worker-facing analogue of [`bounded_drain_reader`]:
+/// same per-message timeout + size-cap rationale, but operates on the
+/// raw gRPC `Streaming<WriteChunk>` rather than a `DropCloserReadHalf`
+/// channel.
+///
+/// Honors the WriteChunked protocol: the drain terminates either when
+/// the stream closes (`Ok(None)`) OR when a chunk arrives with
+/// `finish_chunk = true`. After `finish_chunk`, drains any further
+/// stragglers but does NOT count them toward the size cap (the protocol
+/// is already complete).
+///
+/// `first_chunk` is the chunk the caller already received off the
+/// stream while learning the digest; we count it toward `consumed`
+/// before draining further messages.
+///
+/// Returns Ok(()) on clean EOF / finish_chunk; Err otherwise.
+async fn bounded_drain_grpc_stream(
+    stream: &mut Streaming<WriteChunk>,
+    first_chunk: WriteChunk,
+    declared_size: u64,
+) -> Result<(), Error> {
+    let cap = declared_size.saturating_add(EARLY_DEDUP_DRAIN_SIZE_SLACK);
+    let mut consumed: u64 = first_chunk.chunk_bytes.len() as u64;
+    let mut saw_finish = first_chunk.finish_chunk;
+    if consumed > cap {
+        return Err(make_err!(
+            Code::InvalidArgument,
+            "early-dedup drain (worker WriteChunked): first chunk exceeded declared size \
+             (consumed={consumed} declared={declared_size} cap={cap})"
+        ));
+    }
+    while !saw_finish {
+        let msg_fut = stream.message();
+        let next = match tokio::time::timeout(EARLY_DEDUP_DRAIN_PER_RECV_TIMEOUT, msg_fut).await {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(make_err!(
+                    Code::DeadlineExceeded,
+                    "early-dedup drain (worker WriteChunked): no progress for {:?} \
+                     (consumed={consumed} declared={declared_size})",
+                    EARLY_DEDUP_DRAIN_PER_RECV_TIMEOUT,
+                ));
+            }
+        };
+        match next {
+            Ok(Some(c)) => {
+                consumed = consumed.saturating_add(c.chunk_bytes.len() as u64);
+                if consumed > cap {
+                    return Err(make_err!(
+                        Code::InvalidArgument,
+                        "early-dedup drain (worker WriteChunked): producer exceeded \
+                         declared size (consumed={consumed} declared={declared_size} cap={cap})"
+                    ));
+                }
+                if c.finish_chunk {
+                    saw_finish = true;
+                }
+            }
+            Ok(None) => {
+                // Stream closed before finish_chunk. Tolerate — the
+                // dedup gate has already determined the digest is
+                // committed; the producer giving up early is benign.
+                return Ok(());
+            }
+            Err(status) => {
+                let err: Error = status.into();
+                return Err(err.append(
+                    "early-dedup drain (worker WriteChunked): stream errored mid-drain",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
     filesystem_store: Arc<FilesystemStore<Fe>>,
     in_flight: Arc<ChunkedWriteInFlight>,
@@ -1990,7 +2192,7 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
     metrics: Arc<ChunkedWriteHandlerMetrics>,
     chunk_size: usize,
     digest: DigestInfo,
-    reader: DropCloserReadHalf,
+    mut reader: DropCloserReadHalf,
 ) -> Result<DispatchOutcome, Error> {
     debug!(
         ?digest,
@@ -1998,6 +2200,69 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
         size = digest.size_bytes(),
         "bazel-facing internal chunking dispatch: start"
     );
+
+    // EARLY-DEDUP gate (sibling of the #256 finalize_holding pre-rename
+    // guard at filesystem_store.rs:1698). The chunked path is purely
+    // digest-keyed; CAS immutability (digest = content) means a
+    // re-upload of an already-indexed digest cannot change the
+    // canonical bytes. So when `evicting_map` already has the digest,
+    // skip the entire chunked path:
+    //
+    //   - drain the producer's reader (with per-recv timeout + size
+    //     cap; see `bounded_drain_reader` for the bounding rationale),
+    //     and
+    //   - return Ok(declared_size) without spawning a per-blob
+    //     `ChunkedDriver`, opening a `.holding` file, computing
+    //     per-chunk SHA-256, or doing any pwrite.
+    //
+    // Scope of the savings (per distributed-systems review):
+    //   - elided on the chunked-driver side: per-chunk pwrite +
+    //     per-chunk SHA-256 spawn_blocking + 1 KiB-per-chunk SHA
+    //     tracking + .holding file open/close + finalize_holding
+    //     rename + finalize evicting_map insert.
+    //   - NOT elided: the upstream `FastSlowStore::update`'s tee into
+    //     `fast_tx` continues to feed MemoryStore::update with the
+    //     full payload via the sibling `fast_store_fut`. Network
+    //     ingress also runs at full cost. So the gate is "skip slow-
+    //     tier disk + per-chunk hash work", not "skip the upload".
+    //
+    // The fast-tier (MemoryStore) write happens regardless via the
+    // independent `fast_tx` channel — the ≥2-replica invariant is
+    // satisfied by (fast-tier write that ALWAYS runs) + (slow-tier
+    // file that ALREADY exists and is indexed). The BIS / mirror_blobs
+    // / `failed_slow_writes` machinery that the legacy chunked path
+    // normally would NOT engage on early-dedup is semantically correct
+    // to skip — those mechanisms exist to recover bytes that have NOT
+    // yet landed on the slow tier. By definition an indexed digest IS
+    // on the slow tier.
+    if filesystem_store
+        .has_indexed_digest(&digest)
+        .await
+        .is_some()
+    {
+        if let Err(err) = bounded_drain_reader(&mut reader, digest.size_bytes()).await {
+            // Drain failure: producer errored mid-stream, OR the
+            // per-recv timeout fired (stalled producer), OR the
+            // size-cap fired (producer streamed more bytes than
+            // declared — malicious / buggy claim). Surface the error
+            // rather than swallow it — the upstream gRPC stream needs
+            // to see Err to terminate cleanly.
+            return Err(err.append(
+                "bazel-facing internal-chunking early-dedup: bounded-drain failed after \
+                 short-circuit (digest already indexed; producer stalled, errored, or \
+                 exceeded declared size)",
+            ));
+        }
+        debug!(
+            ?digest,
+            size = digest.size_bytes(),
+            "bazel-facing internal chunking dispatch: early-dedup short-circuit \
+             (digest already in evicting_map; per-chunk pwrite + sha-verify elided)"
+        );
+        return Ok(DispatchOutcome {
+            committed_size: digest.size_bytes(),
+        });
+    }
 
     let chunks_stream = build_bazel_chunk_stream(reader, chunk_size, digest);
     dispatch_chunks_to_driver(
