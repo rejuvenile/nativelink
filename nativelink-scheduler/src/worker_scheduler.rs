@@ -21,6 +21,7 @@ use nativelink_util::action_messages::{OperationId, WorkerId};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::operation_state_manager::UpdateOperationType;
 use nativelink_util::shutdown_guard::ShutdownGuard;
+use nativelink_util::store_trait::Store;
 
 use crate::platform_property_manager::PlatformPropertyManager;
 use crate::worker::{Worker, WorkerTimestamp};
@@ -132,4 +133,17 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     /// has fresh pin state — doesn't get bombarded with replays for
     /// digests that no longer exist in its CAS. Default impl is a no-op.
     async fn clear_bis_resend_buffer_for_endpoint(&self, _cas_endpoint: &str) {}
+
+    /// Returns the captured `cas_store` Arc the scheduler uses for tree
+    /// resolution (see `resolve_tree_from_cas`). Default impl returns
+    /// `None`. The production `ApiWorkerScheduler` overrides this to
+    /// expose its internal handle so wiring tests can verify that the
+    /// scheduler holds the `WorkerProxyStore`-WRAPPED chain (with
+    /// peer-fetch fallback) rather than the raw chain. See #261 for
+    /// the bug where `scheduler_factory` ran BEFORE the wrap and the
+    /// scheduler captured the unwrapped clone, surfacing NotFound for
+    /// tiny Directory blobs that lived only on a peer worker.
+    fn cas_store(&self) -> Option<&Store> {
+        None
+    }
 }

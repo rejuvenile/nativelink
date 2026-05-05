@@ -4069,6 +4069,14 @@ impl WorkerScheduler for ApiWorkerScheduler {
     async fn clear_bis_resend_buffer_for_endpoint(&self, cas_endpoint: &str) {
         self.clear_bis_resend_buffer_for_endpoint(cas_endpoint).await;
     }
+
+    fn cas_store(&self) -> Option<&Store> {
+        // #261: tests + inner_main wiring assertions consult this to
+        // verify the scheduler holds the WorkerProxyStore-WRAPPED chain
+        // (with peer-fetch fallback) rather than the raw chain. See the
+        // trait doc-comment for the full bug description.
+        self.cas_store.as_ref()
+    }
 }
 
 impl RootMetricsComponent for ApiWorkerScheduler {}
