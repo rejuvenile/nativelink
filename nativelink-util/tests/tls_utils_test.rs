@@ -18,6 +18,13 @@ use nativelink_macro::nativelink_test;
 use nativelink_util::tls_utils::{endpoint_from, load_client_config};
 use tempfile::NamedTempFile;
 
+#[cfg(feature = "quic")]
+use core::time::Duration;
+#[cfg(feature = "quic")]
+use nativelink_util::tls_utils::{
+    QUIC_UDP_BUF_BYTES, QUIC_UDP_BUF_WARN_THRESHOLD, tune_quic_udp_buffers,
+};
+
 #[nativelink_test]
 async fn test_load_client_config_none() -> Result<(), Error> {
     let config = load_client_config(&None)?;
@@ -184,4 +191,105 @@ async fn test_endpoint_from_missing_authority() -> Result<(), Error> {
         Err(e) if e.to_string().contains("Unable to determine authority of endpoint")
     ));
     Ok(())
+}
+
+/// Production-composition regression test for the QUIC UDP buffer-tuning
+/// helper used by the server, the client connection pool, and the worker
+/// peer-CAS endpoint.
+///
+/// Quinn does NOT raise `SO_RCVBUF`/`SO_SNDBUF` on its UDP socket on its
+/// own — it inherits whatever the kernel default is (often ~208 KiB on
+/// stock Linux), which causes UDP packet drops and QUIC tail-latency
+/// spikes under load. This test pins the contract that the helper:
+///   1. Issues setsockopt for both directions on a freshly-bound UDP
+///      socket (the same one Quinn will own).
+///   2. Achieves an effective post-set buffer >= 2 MiB on a kernel
+///      configured to honor the request, OR matches `net.core.{rmem,
+///      wmem}_max` if the kernel is capping below that.
+///
+/// Note: Linux returns `2 * requested` from `getsockopt(SO_RCVBUF)`
+/// because the kernel doubles internally for bookkeeping overhead, so a
+/// successful 8 MiB request reads back as 16 MiB. We compare half of
+/// the observed value against the threshold.
+///
+/// Wrapped in `tokio::time::timeout` purely as a deadlock detector with
+/// a bespoke message — the helper itself is sync and should return
+/// promptly; if it ever blocks, a generic `is_ok()` would mask the bug.
+#[cfg(feature = "quic")]
+#[nativelink_test]
+async fn quic_udp_buffer_tuning_applies_minimum_2_mib() -> Result<(), Error> {
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        // Bind a real UDP socket the same way `h3_channel` does so we
+        // exercise the production code path end-to-end (real socket,
+        // real setsockopt syscall, real read-back).
+        let udp_socket = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("bind 127.0.0.1:0 for UDP buffer test");
+        let sock_ref = socket2::SockRef::from(&udp_socket);
+
+        tune_quic_udp_buffers(sock_ref, "test");
+
+        // Re-borrow to read back; SockRef does not retain ownership.
+        let sock_ref = socket2::SockRef::from(&udp_socket);
+        let actual_rcvbuf = sock_ref
+            .recv_buffer_size()
+            .expect("getsockopt SO_RCVBUF must succeed");
+        let actual_sndbuf = sock_ref
+            .send_buffer_size()
+            .expect("getsockopt SO_SNDBUF must succeed");
+
+        // Linux doubles the value internally; compare half.
+        let effective_rcvbuf = actual_rcvbuf / 2;
+        let effective_sndbuf = actual_sndbuf / 2;
+
+        // Read kernel caps so the assertion holds on machines that
+        // can't honor the full 8 MiB request — we still want to
+        // guarantee the helper raised the buffer to AT LEAST what
+        // the kernel allows.
+        let rmem_max = read_sysctl("/proc/sys/net/core/rmem_max").unwrap_or(usize::MAX);
+        let wmem_max = read_sysctl("/proc/sys/net/core/wmem_max").unwrap_or(usize::MAX);
+
+        let expected_rcvbuf_floor = QUIC_UDP_BUF_WARN_THRESHOLD.min(rmem_max);
+        let expected_sndbuf_floor = QUIC_UDP_BUF_WARN_THRESHOLD.min(wmem_max);
+
+        assert!(
+            effective_rcvbuf >= expected_rcvbuf_floor,
+            "QUIC SO_RCVBUF not raised: effective={effective_rcvbuf} bytes \
+             (raw getsockopt returned {actual_rcvbuf}); \
+             expected at least {expected_rcvbuf_floor} bytes \
+             (min of warn-threshold {QUIC_UDP_BUF_WARN_THRESHOLD} and \
+             rmem_max {rmem_max}); requested {QUIC_UDP_BUF_BYTES} bytes — \
+             tune_quic_udp_buffers did not raise the recv buffer",
+        );
+        assert!(
+            effective_sndbuf >= expected_sndbuf_floor,
+            "QUIC SO_SNDBUF not raised: effective={effective_sndbuf} bytes \
+             (raw getsockopt returned {actual_sndbuf}); \
+             expected at least {expected_sndbuf_floor} bytes \
+             (min of warn-threshold {QUIC_UDP_BUF_WARN_THRESHOLD} and \
+             wmem_max {wmem_max}); requested {QUIC_UDP_BUF_BYTES} bytes — \
+             tune_quic_udp_buffers did not raise the send buffer",
+        );
+
+        eprintln!(
+            "tune_quic_udp_buffers observed: rcvbuf={actual_rcvbuf} \
+             sndbuf={actual_sndbuf} (kernel-doubled), \
+             effective rcv={effective_rcvbuf} snd={effective_sndbuf}, \
+             rmem_max={rmem_max} wmem_max={wmem_max}",
+        );
+    })
+    .await;
+
+    outcome.expect(
+        "tune_quic_udp_buffers must complete promptly — \
+         QUIC UDP buffer-tuning contract violated (helper hung)",
+    );
+    Ok(())
+}
+
+/// Minimal helper to read a single integer from a /proc/sys file.
+/// Returns None if reading or parsing fails (e.g. non-Linux).
+#[cfg(feature = "quic")]
+fn read_sysctl(path: &str) -> Option<usize> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    raw.trim().parse::<usize>().ok()
 }

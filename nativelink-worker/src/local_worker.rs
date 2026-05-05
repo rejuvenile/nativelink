@@ -477,16 +477,10 @@ fn start_worker_quic_server(
     let socket_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
     let udp_socket = std::net::UdpSocket::bind(socket_addr)
         .map_err(|e| make_err!(Code::Internal, "Worker QUIC UDP bind on {socket_addr}: {e:?}"))?;
-    {
-        const QUIC_UDP_BUF: usize = 8 * 1024 * 1024;
-        let sock_ref = socket2::SockRef::from(&udp_socket);
-        if let Err(err) = sock_ref.set_send_buffer_size(QUIC_UDP_BUF) {
-            info!(?err, "Failed to set worker QUIC SO_SNDBUF");
-        }
-        if let Err(err) = sock_ref.set_recv_buffer_size(QUIC_UDP_BUF) {
-            info!(?err, "Failed to set worker QUIC SO_RCVBUF");
-        }
-    }
+    nativelink_util::tls_utils::tune_quic_udp_buffers(
+        socket2::SockRef::from(&udp_socket),
+        "worker_peer",
+    );
 
     let quinn_endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),

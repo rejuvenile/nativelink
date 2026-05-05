@@ -1523,7 +1523,6 @@ async fn inner_main(
             // SO_REUSEPORT allows multiple sockets on the same port so the
             // kernel distributes incoming packets across them in parallel.
             let udp_socket = {
-                const QUIC_UDP_BUF: usize = 8 * 1024 * 1024;
                 let sock = socket2::Socket::new(
                     match socket_addr {
                         std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
@@ -1537,12 +1536,10 @@ async fn inner_main(
                     .map_err(|e| make_err!(Code::Internal, "QUIC SO_REUSEPORT: {e:?}"))?;
                 sock.set_nonblocking(true)
                     .map_err(|e| make_err!(Code::Internal, "QUIC nonblocking: {e:?}"))?;
-                if let Err(err) = sock.set_send_buffer_size(QUIC_UDP_BUF) {
-                    warn!(?err, "Failed to set QUIC SO_SNDBUF");
-                }
-                if let Err(err) = sock.set_recv_buffer_size(QUIC_UDP_BUF) {
-                    warn!(?err, "Failed to set QUIC SO_RCVBUF");
-                }
+                nativelink_util::tls_utils::tune_quic_udp_buffers(
+                    socket2::SockRef::from(&sock),
+                    "server",
+                );
                 sock.bind(&socket_addr.into())
                     .map_err(|e| make_err!(Code::Internal, "QUIC UDP bind on {socket_addr}: {e:?}"))?;
                 std::net::UdpSocket::from(sock)

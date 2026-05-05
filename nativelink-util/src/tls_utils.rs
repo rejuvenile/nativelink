@@ -214,6 +214,94 @@ pub fn endpoint(endpoint_config: &GrpcEndpoint) -> Result<tonic::transport::Endp
     Ok(endpoint)
 }
 
+/// Target QUIC UDP socket buffer size: 8 MiB.
+///
+/// Quinn does NOT raise the kernel default UDP buffer (typically 208 KiB on
+/// stock Linux) on its own — the underlying tokio/quinn `UdpSocket` inherits
+/// `net.core.{rmem,wmem}_default`. Without tuning, sustained QUIC ingress
+/// drops packets and tail latency spikes under load.
+///
+/// 8 MiB is well above the 2 MiB minimum needed for a single 10 GbE BDP burst
+/// at LAN RTT and matches what every Quinn endpoint in this repo (server,
+/// client pool, worker peer-CAS) requests. The kernel may silently cap
+/// requests above `net.core.{rmem,wmem}_max` — see `tune_quic_udp_buffers`
+/// for read-back logging that surfaces the cap in production logs.
+#[cfg(feature = "quic")]
+pub const QUIC_UDP_BUF_BYTES: usize = 8 * 1024 * 1024;
+
+/// Minimum acceptable post-set UDP buffer size before we warn the operator.
+///
+/// Below 2 MiB, QUIC tail latency degrades sharply under burst load and
+/// `net.core.rmem_max` almost certainly needs raising. Stock Linux ships
+/// `rmem_max = 212992` (~208 KiB), which clips every `set_recv_buffer_size`
+/// request silently — the syscall returns `Ok(())` regardless.
+#[cfg(feature = "quic")]
+pub const QUIC_UDP_BUF_WARN_THRESHOLD: usize = 2 * 1024 * 1024;
+
+/// Set SO_SNDBUF and SO_RCVBUF on a QUIC UDP socket and log the actual
+/// values the kernel applied.
+///
+/// Linux silently caps `setsockopt(SO_{RCV,SND}BUF, n)` at
+/// `net.core.{rmem,wmem}_max` without returning an error. This helper
+/// reads the values back via `getsockopt` and `info!`-logs them so
+/// production deployments can verify their kernel is configured to
+/// honor the request. If the actual buffer falls below
+/// [`QUIC_UDP_BUF_WARN_THRESHOLD`], a `warn!` is emitted with the exact
+/// sysctl command the operator must run.
+///
+/// `label` distinguishes call sites in logs (e.g. `"server"`,
+/// `"client[2]"`, `"worker_peer"`).
+///
+/// Note: Linux returns `2 * requested` from `getsockopt` — the kernel
+/// doubles internally to account for bookkeeping overhead — so a
+/// successful 8 MiB request reads back as 16 MiB. We compare against
+/// the doubled value when checking for kernel capping.
+#[cfg(feature = "quic")]
+pub fn tune_quic_udp_buffers(sock: socket2::SockRef<'_>, label: &str) {
+    if let Err(err) = sock.set_send_buffer_size(QUIC_UDP_BUF_BYTES) {
+        warn!(?err, label, "failed to set QUIC SO_SNDBUF");
+    }
+    if let Err(err) = sock.set_recv_buffer_size(QUIC_UDP_BUF_BYTES) {
+        warn!(?err, label, "failed to set QUIC SO_RCVBUF");
+    }
+
+    let actual_sndbuf = sock.send_buffer_size().unwrap_or(0);
+    let actual_rcvbuf = sock.recv_buffer_size().unwrap_or(0);
+
+    info!(
+        label,
+        requested = QUIC_UDP_BUF_BYTES,
+        actual_sndbuf,
+        actual_rcvbuf,
+        "QUIC UDP socket buffers configured",
+    );
+
+    // Kernel doubles getsockopt return on Linux; compare half against the
+    // warn threshold so a 2 MiB-clipped request (reads back as 4 MiB)
+    // does NOT trip the warning, but a 200 KiB-clipped request (reads
+    // back as ~400 KiB) DOES.
+    let effective_rcvbuf = actual_rcvbuf / 2;
+    let effective_sndbuf = actual_sndbuf / 2;
+    if effective_rcvbuf < QUIC_UDP_BUF_WARN_THRESHOLD
+        || effective_sndbuf < QUIC_UDP_BUF_WARN_THRESHOLD
+    {
+        warn!(
+            label,
+            actual_rcvbuf,
+            actual_sndbuf,
+            requested = QUIC_UDP_BUF_BYTES,
+            warn_threshold = QUIC_UDP_BUF_WARN_THRESHOLD,
+            "QUIC UDP buffer below {} MiB after setsockopt — kernel is capping; \
+             raise net.core.rmem_max and net.core.wmem_max (e.g. \
+             `sudo sysctl -w net.core.rmem_max={} net.core.wmem_max={}`) \
+             to avoid UDP packet drops and QUIC tail-latency spikes under load",
+            QUIC_UDP_BUF_WARN_THRESHOLD / (1024 * 1024),
+            QUIC_UDP_BUF_BYTES,
+            QUIC_UDP_BUF_BYTES,
+        );
+    }
+}
+
 /// Clone-able QUIC/HTTP3 channel for gRPC clients.
 ///
 /// `tonic_h3::H3Channel` wraps a `BoxService` internally and doesn't
@@ -446,16 +534,8 @@ pub fn h3_channel(endpoint_config: &GrpcEndpoint, connections: usize) -> Result<
     for i in 0..connections {
         let udp_socket = std::net::UdpSocket::bind("[::]:0")
             .map_err(|e| make_err!(Code::Internal, "QUIC client UDP bind [{i}]: {e:?}"))?;
-        {
-            const QUIC_UDP_BUF: usize = 8 * 1024 * 1024;
-            let sock_ref = socket2::SockRef::from(&udp_socket);
-            if let Err(err) = sock_ref.set_send_buffer_size(QUIC_UDP_BUF) {
-                info!(?err, i, "Failed to set QUIC client SO_SNDBUF");
-            }
-            if let Err(err) = sock_ref.set_recv_buffer_size(QUIC_UDP_BUF) {
-                info!(?err, i, "Failed to set QUIC client SO_RCVBUF");
-            }
-        }
+        let label = format!("client[{i}]");
+        tune_quic_udp_buffers(socket2::SockRef::from(&udp_socket), &label);
 
         let mut client_endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
