@@ -326,6 +326,13 @@ async fn inner_main(
                 // construction. Default-OFF — only active when
                 // `enable_batch_small_blob_reads` is called.
                 proxy_arc.init_batch_read_coalescer();
+                // #88: enable opportunistic BatchReadBlobs coalescing for
+                // small-blob server→worker proxy reads. Concurrent
+                // same-target small-blob fetches collapse into one
+                // BatchReadBlobs RPC per coalesce window per endpoint
+                // instead of N individual ByteStream Read RPCs. User
+                // sign-off 2026-05-05 (operator authorization).
+                proxy_arc.enable_batch_small_blob_reads();
                 worker_proxy_stores.insert(store_name.clone(), proxy_arc.clone());
                 let proxy_store = nativelink_util::store_trait::Store::new(proxy_arc);
                 store_manager.add_store(store_name, proxy_store);
@@ -452,7 +459,16 @@ async fn inner_main(
                 find_fast_slow_for_pin(inner)
             }
 
-            let cfg = SmallBlobDispatcherConfig::default();
+            // #168: enable Bug A small-CAS peer-mirror push. Operator
+            // authorization 2026-05-05 — promotes the dispatcher's
+            // `enqueue` from inert no-op to live mirror-push. The
+            // dispatcher remains gated on per-store pin-set
+            // registration below, so stores without a FastSlowStore
+            // backing are still skipped.
+            let cfg = SmallBlobDispatcherConfig {
+                small_blob_mirror_enabled: true,
+                ..Default::default()
+            };
             let pin_max_bytes = cfg.pin_max_bytes;
             let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
 
