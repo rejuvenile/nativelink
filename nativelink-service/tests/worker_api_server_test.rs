@@ -2071,6 +2071,7 @@ async fn setup_api_server_with_dispatcher(
         None, // no cas_store
         None, // no worker_proxy
         Some(dispatcher.clone()),
+        None, // no ac_pin_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -2270,6 +2271,7 @@ async fn setup_dispatcher_with_mirror_enabled(
         None, // no cas_store
         None, // no worker_proxy
         Some(dispatcher.clone()),
+        None, // no ac_pin_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -2624,6 +2626,7 @@ async fn setup_api_server_with_locality_and_dispatcher(
         None, // no cas_store
         None, // no worker_proxy
         Some(dispatcher.clone()),
+        None, // no ac_pin_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -2732,6 +2735,7 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
                     store_id: "cas".to_string(),
                 },
             ],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
