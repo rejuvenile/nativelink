@@ -286,10 +286,13 @@ async fn unknown_store_id_chunk_is_noop_with_ac_target_present() {
     .await
     .expect("must not deadlock — unknown store_id handling violated");
 
-    // Decode succeeds (proto is valid) — the no-op is the routing
-    // step, not the digest decode. So `unpinned` counts decoded
-    // digests; the index mutations are the asymmetric assertions.
-    assert_eq!(outcome.unpinned, 1, "valid proto digest must decode");
+    // Decode succeeds (proto is valid) but routing is a no-op, so
+    // `unpinned` MUST be zero — it reflects side-effect counts, not
+    // decode counts. `failed` is also zero (decode succeeded).
+    assert_eq!(
+        outcome.unpinned, 0,
+        "no-op routing must not report any pin removed"
+    );
     assert_eq!(outcome.failed, 0);
     assert_eq!(
         cas_fss.mirror_blob_count(),
@@ -341,7 +344,10 @@ async fn ac_store_id_chunk_with_no_ac_target_is_noop() {
     .await
     .expect("must not deadlock — no-AC-target routing contract violated");
 
-    assert_eq!(outcome.unpinned, 1);
+    assert_eq!(
+        outcome.unpinned, 0,
+        "no-AC-target route is a no-op; unpinned must be zero"
+    );
     // CAS state must remain (no-op routing) — AC chunk should not
     // fall through to the CAS path even on workers without an AC FSS.
     assert_eq!(

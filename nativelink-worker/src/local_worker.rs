@@ -926,13 +926,13 @@ pub fn handle_blobs_in_stable_storage_for_store(
     proto_digests: &[nativelink_proto::build::bazel::remote::execution::v2::Digest],
 ) -> BisUnpinOutcome {
     let digest_count = proto_digests.len();
-    let mut unpinned = 0usize;
+    let mut decoded = 0usize;
     let mut failed = 0usize;
     let mut acked_digests: Vec<DigestInfo> = Vec::with_capacity(digest_count);
     for proto_digest in proto_digests {
         if let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) {
             acked_digests.push(digest);
-            unpinned += 1;
+            decoded += 1;
         } else {
             failed += 1;
             warn!(
@@ -948,8 +948,15 @@ pub fn handle_blobs_in_stable_storage_for_store(
     // (a) walk the wrong byte map (zero overlap with AC entries), and
     // (b) walk `dispatched_mirror_pins` removing matches keyed by
     // digest only — collateral damage to CAS pins for the same digest.
-    if store_id.is_empty() {
-        // CAS path — historic shape.
+    //
+    // `unpinned` is set ONLY in the branches that actually mutate pin
+    // state. The unknown-store_id and no-AC-target branches return
+    // `unpinned = 0` so observability accurately reflects "did we do
+    // anything" — the `warn!` is the only signal that the chunk was
+    // received but unrouted, and the metric must not contradict it.
+    let unpinned = if store_id.is_empty() {
+        // CAS path — historic shape. Every decoded digest is unpinned
+        // and acked; `unpinned` equals `decoded` here by construction.
         let fs_store = &state.fs_store;
         for digest in &acked_digests {
             fs_store.unpin_digest(digest);
@@ -970,22 +977,24 @@ pub fn handle_blobs_in_stable_storage_for_store(
             }
         }
         info!(
-            unpinned,
+            unpinned = decoded,
             failed,
             digest_count,
             store_id = "",
             "BlobsInStableStorage CAS: unpinned digests from local CAS"
         );
+        decoded
     } else if let Some(target) = state.ac_mirror_target.as_ref() {
         if target.store_id.as_ref() == store_id {
             target.fss.remove_local_ac_pins(&acked_digests);
             info!(
-                unpinned,
+                unpinned = decoded,
                 failed,
                 digest_count,
                 store_id,
                 "BlobsInStableStorage AC: dropped local AC pins"
             );
+            decoded
         } else {
             warn!(
                 store_id,
@@ -995,6 +1004,7 @@ pub fn handle_blobs_in_stable_storage_for_store(
                  configured AC store; treating as no-op (chunk will still be \
                  acked so server resend buffer drains)"
             );
+            0
         }
     } else {
         warn!(
@@ -1003,7 +1013,8 @@ pub fn handle_blobs_in_stable_storage_for_store(
             "BlobsInStableStorage: chunk carries non-empty store_id but this \
              worker has no AC mirror target; treating as no-op"
         );
-    }
+        0
+    };
 
     BisUnpinOutcome { unpinned, failed }
 }
