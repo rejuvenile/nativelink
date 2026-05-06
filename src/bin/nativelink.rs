@@ -228,6 +228,16 @@ async fn inner_main(
     // BlobsAvailable updates from workers).
     let locality_map = blob_locality_map::new_shared_blob_locality_map();
 
+    // Server-side AC pin registry — completely separate from the
+    // CAS-shared `BlobLocalityMap` so AC pin advertisements (proto
+    // field 17 `pinned_ac_mirror_entries`) cannot weaponize the CAS
+    // upload short-circuits in `bytestream_server::write` /
+    // `cas_server::batch_update_blobs` even on action_digest
+    // collisions. No read-side consumer in this commit (advertisement
+    // channel only).
+    let ac_pin_registry =
+        nativelink_util::ac_pin_registry::new_shared_ac_pin_registry();
+
     // Build TLS config for server-to-worker connections (used by both the
     // scheduler's prefetch path and WorkerProxyStore).
     let worker_proxy_tls: Option<nativelink_config::stores::ClientTlsConfig> =
@@ -341,6 +351,32 @@ async fn inner_main(
                     worker_proxy_tls = worker_proxy_tls.is_some(),
                     "wrapped CAS store with WorkerProxyStore for peer blob sharing"
                 );
+            }
+        }
+        names
+    };
+
+    // Collect AC store names from `services.ac` configs so we can
+    // include them in the BIS broadcast loop's drain (Option A2 drain
+    // channel for the AC pin lifecycle). When the AC store is itself a
+    // `FastSlowStore` (production: `AC_STORE → CompletenessChecking →
+    // FastSlow{ fast: Memory, slow: RefStore→Redis }`), its slow-tier
+    // write completion produces a `stable_digest` push, the BIS loop
+    // drains it, and the broadcast triggers `remove_local_ac_pins` on
+    // matching workers via `handle_blobs_in_stable_storage`.
+    //
+    // We harvest the `services.ac` set rather than re-scanning the
+    // whole `store_manager` so we only iterate stores the operator
+    // explicitly exposed as AC services.
+    let ac_store_names: HashSet<String> = {
+        let mut names: HashSet<String> = HashSet::new();
+        for server_cfg in &server_cfgs {
+            if let Some(ref services) = server_cfg.services {
+                if let Some(ref ac_cfgs) = services.ac {
+                    for c in ac_cfgs {
+                        names.insert(c.config.ac_store.clone());
+                    }
+                }
             }
         }
         names
@@ -675,25 +711,35 @@ async fn inner_main(
     }
 
     // Spawn the BlobsInStableStorage drain-then-fire loop. When any CAS
-    // FastSlowStore completes a background slow write it pushes the digest
-    // and notifies us. We drain all queued digests and broadcast immediately,
-    // so workers can unpin blobs with minimal latency.
+    // (or AC) FastSlowStore completes a background slow write it pushes
+    // the digest and notifies us. We drain all queued digests and
+    // broadcast immediately, so workers can unpin blobs with minimal
+    // latency. AC stores are included so AC pin entries (proto field
+    // 17) get drained on slow-write completion via the worker-side
+    // `remove_local_ac_pins` call in `handle_blobs_in_stable_storage`
+    // — this is the AC pin lifecycle drain channel chosen as Option
+    // A2 for the AC mirroring follow-up.
     if !worker_schedulers.is_empty() {
-        let cas_stores: Vec<nativelink_util::store_trait::Store> = cas_store_names
+        let bis_stores: Vec<nativelink_util::store_trait::Store> = cas_store_names
             .iter()
+            .chain(ac_store_names.iter())
+            .collect::<HashSet<_>>()  // dedupe in case a store is in both sets
+            .into_iter()
             .filter_map(|name| store_manager.get_store(name))
             .collect();
+        let cas_store_count = cas_store_names.len();
+        let ac_store_count = ac_store_names.len();
         let schedulers: Vec<Arc<dyn nativelink_scheduler::worker_scheduler::WorkerScheduler>> =
             worker_schedulers.values().cloned().collect();
 
-        if !cas_stores.is_empty() {
-            let cas_store_count = cas_stores.len();
+        if !bis_stores.is_empty() {
+            let bis_store_count = bis_stores.len();
             let scheduler_count = schedulers.len();
 
             // Merge per-store notifies into a single wakeup signal so the
             // broadcast loop wakes when *any* store has new stable digests.
             let merged_notify = Arc::new(Notify::new());
-            for store in &cas_stores {
+            for store in &bis_stores {
                 let store_notify = store.stable_notify();
                 let merged = merged_notify.clone();
                 tokio::spawn(async move {
@@ -701,12 +747,21 @@ async fn inner_main(
                         store_notify.notified().await;
                         debug!(
                             target: "nativelink::stable_notify_fire",
-                            "stable_notify fired by a CAS store"
+                            "stable_notify fired by a BIS-tracked store (CAS or AC)"
                         );
                         merged.notify_one();
                     }
                 });
             }
+
+            // Capture an AC pin registry handle so the broadcast loop
+            // can also drop server-side AC pin entries for the
+            // newly-stable digests. The drain is symmetric with the
+            // worker-side `remove_local_ac_pins`: both fire on the same
+            // BIS broadcast event, so by the time the next
+            // `BlobsAvailable` tick arrives the registry and the
+            // worker's pin map agree.
+            let registry_for_loop = ac_pin_registry.clone();
 
             background_spawn!("blobs_in_stable_storage_loop", async move {
                 loop {
@@ -716,7 +771,7 @@ async fn inner_main(
                     }
                     // Drain everything currently queued across all stores.
                     let mut all_digests = Vec::new();
-                    for store in &cas_stores {
+                    for store in &bis_stores {
                         let mut drained = store.drain_stable_digests();
                         if !drained.is_empty() {
                             all_digests.append(&mut drained);
@@ -731,6 +786,17 @@ async fn inner_main(
                         scheduler_count = schedulers.len(),
                         "BlobsInStableStorage: broadcasting drained digests (chunked)"
                     );
+                    // Server-side AC pin sweep: `remove_digests_for_endpoint`
+                    // acts per-endpoint; we don't know which workers the
+                    // digests are pinned on, so iterate all known
+                    // endpoints. Cheap (RwLock + HashSet retain) and only
+                    // runs once per BIS event.
+                    let endpoints: Vec<String> =
+                        registry_for_loop.endpoint_counts().keys().cloned().collect();
+                    for endpoint in &endpoints {
+                        registry_for_loop
+                            .remove_digests_for_endpoint(endpoint, &all_digests);
+                    }
                     for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
                         // (#97) Chunked dispatch: splits the digest list
                         // into ~4096-digest chunks, dispatches each via
@@ -752,9 +818,11 @@ async fn inner_main(
                 }
             });
             info!(
+                bis_store_count,
                 cas_store_count,
+                ac_store_count,
                 scheduler_count,
-                "started BlobsInStableStorage drain-then-fire loop"
+                "started BlobsInStableStorage drain-then-fire loop (CAS + AC)"
             );
         }
     }
@@ -1003,6 +1071,7 @@ async fn inner_main(
                             backfill_cas,
                             worker_proxy,
                             small_blob_dispatcher.clone(),
+                            Some(ac_pin_registry.clone()),
                         )
                         .map(|v| Some(svc_setup!(v)))
                     })
@@ -1636,8 +1705,9 @@ async fn inner_main(
                             )
                         })?;
 
-                    let maybe_ac_store = if let Some(ac_store_ref) =
-                        &local_worker_cfg.upload_action_result.ac_store
+                    let maybe_ac_store_ref =
+                        local_worker_cfg.upload_action_result.ac_store.clone();
+                    let maybe_ac_store = if let Some(ac_store_ref) = &maybe_ac_store_ref
                     {
                         Some(store_manager.get_store(ac_store_ref).err_tip(|| {
                             format!("Failed to find store for ac_store in worker config : {ac_store_ref}")
@@ -1663,6 +1733,7 @@ async fn inner_main(
                         Arc::new(local_worker_cfg),
                         fast_slow_store,
                         maybe_ac_store,
+                        maybe_ac_store_ref,
                         historical_store,
                     )
                     .await

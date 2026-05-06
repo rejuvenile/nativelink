@@ -973,6 +973,7 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1100,6 +1101,7 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1229,6 +1231,7 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1414,6 +1417,7 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1600,6 +1604,7 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1812,6 +1817,7 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1951,6 +1957,7 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2158,6 +2165,7 @@ exit 0
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2338,6 +2346,7 @@ exit 0
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2512,6 +2521,7 @@ exit 1
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2600,6 +2610,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2676,6 +2687,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2751,6 +2763,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2858,6 +2871,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2901,6 +2915,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2975,6 +2990,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3367,6 +3383,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3525,6 +3542,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3807,6 +3825,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3925,6 +3944,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -4109,6 +4129,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -4233,6 +4254,7 @@ exit 1
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -4378,6 +4400,7 @@ exit 1
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -5277,6 +5300,7 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {

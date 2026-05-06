@@ -4095,6 +4095,14 @@ struct UploadActionResults {
     upload_ac_results_strategy: UploadCacheResultsStrategy,
     upload_historical_results_strategy: UploadCacheResultsStrategy,
     ac_store: Option<Store>,
+    /// When Some, [`upload_ac_results`] records each successful AC
+    /// write in the AC FastSlowStore's `dispatched_mirror_pins` index
+    /// so the next `BlobsAvailable` tick advertises the digest via the
+    /// `pinned_ac_mirror_entries` field (proto field 17). See
+    /// [`crate::local_worker::AcMirrorTarget`] for the type-level
+    /// invariant that pairs the FSS handle with the configured
+    /// store name.
+    ac_mirror_target: Option<crate::local_worker::AcMirrorTarget>,
     historical_store: Store,
     success_message_template: Template,
     failure_message_template: Template,
@@ -4104,6 +4112,7 @@ impl UploadActionResults {
     fn new(
         config: &UploadActionResultConfig,
         ac_store: Option<Store>,
+        ac_mirror_target: Option<crate::local_worker::AcMirrorTarget>,
         historical_store: Store,
     ) -> Result<Self, Error> {
         let upload_historical_results_strategy = config
@@ -4122,6 +4131,7 @@ impl UploadActionResults {
             upload_ac_results_strategy: config.upload_ac_results_strategy,
             upload_historical_results_strategy,
             ac_store,
+            ac_mirror_target,
             historical_store,
             success_message_template: Template::new(&config.success_message_template).map_err(
                 |e| {
@@ -4251,6 +4261,30 @@ impl UploadActionResults {
             throughput_mbps = format!("{:.1}", throughput_mbps(size_bytes, elapsed)),
             "AC write completed",
         );
+        // Record this AC entry as a worker-local pin so the worker's
+        // BlobsAvailable loop advertises it to the server during the
+        // slow-write window, via the dedicated proto field
+        // `pinned_ac_mirror_entries` (field 17). The fast-tier write
+        // above has already returned (sync ack point); the slow-tier
+        // write is in flight via FastSlowStore's spawned background
+        // task. The server's BIS broadcast for the AC store (when its
+        // slow-tier write completes) triggers the matching
+        // `remove_local_ac_pins` via `handle_blobs_in_stable_storage`.
+        //
+        // Cancellation safety: this insert runs ONLY on the success
+        // path of `update_oneshot`. If the write returned Err above,
+        // the early `?` returns before we get here — no pin recorded
+        // for failed writes. If the future is dropped mid-update,
+        // tokio will not poll us to this point — also no pin recorded.
+        //
+        // No-op when this worker's AC store is not a FastSlowStore
+        // (e.g. direct GrpcStore — handled by the early-return
+        // shortcut at the top of this function before we reach here).
+        if let Some(target) = self.ac_mirror_target.as_ref() {
+            target
+                .fss
+                .insert_local_ac_pin(target.store_id.as_ref(), action_digest);
+        }
         Ok(())
     }
 
@@ -4375,6 +4409,16 @@ pub struct RunningActionsManagerArgs<'a> {
     pub execution_configuration: ExecutionConfiguration,
     pub cas_store: Arc<FastSlowStore>,
     pub ac_store: Option<Store>,
+    /// Optional `(FastSlowStore Arc, store_id)` pairing for AC pin
+    /// advertisement. Some only when the worker's `ac_store` resolves
+    /// to a `FastSlowStore` via the `find_fast_slow_for_pin` walker
+    /// AND the worker config provides an `ac_store_name`. Threaded
+    /// through to `UploadActionResults` so `upload_ac_results` can
+    /// register an AC pin entry on each successful write — the pin
+    /// rides the dedicated `pinned_ac_mirror_entries` proto field
+    /// (field 17), HARD-PARTITIONED from the CAS-shared
+    /// `pinned_mirror_entries` channel.
+    pub ac_mirror_target: Option<crate::local_worker::AcMirrorTarget>,
     pub historical_store: Store,
     pub upload_action_result_config: &'a UploadActionResultConfig,
     pub max_action_timeout: Duration,
@@ -4463,6 +4507,7 @@ impl RunningActionsManagerImpl {
             upload_action_results: UploadActionResults::new(
                 args.upload_action_result_config,
                 args.ac_store,
+                args.ac_mirror_target,
                 args.historical_store,
             )
             .err_tip(|| "During RunningActionsManagerImpl construction")?,

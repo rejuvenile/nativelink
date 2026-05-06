@@ -1,0 +1,300 @@
+// Copyright 2024 The NativeLink Authors. All rights reserved.
+//
+// Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    See LICENSE file for details
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Server-side registry of AC pin advertisements from workers.
+//!
+//! This is intentionally a SEPARATE data structure from
+//! [`crate::blob_locality_map::BlobLocalityMap`]. AC pins MUST NOT route
+//! into the CAS-shared locality map because `action_digest` IS by REAPI
+//! design the same digest as the Action proto in CAS — registering AC
+//! pins against the locality map would weaponize the server's CAS
+//! upload short-circuits in `bytestream_server::write` and
+//! `cas_server::batch_update_blobs` (those functions skip uploads when
+//! `WorkerProxyStore::has_with_results` returns Some via locality_map
+//! lookup), causing permanent silent data loss of Action proto bytes.
+//!
+//! This commit establishes the advertisement channel ONLY. There are
+//! no read-side consumers of the registry yet — the AC peer-fetch path
+//! is a future commit. With no consumer, the registry's purpose is
+//! purely to:
+//!   - validate the wire-channel end-to-end (worker advertisement →
+//!     server registration → boot-epoch wipe convergence),
+//!   - allow observability tooling to surface AC pin distribution per
+//!     worker without coupling AC pin advertisement into CAS reads.
+//!
+//! See `nativelink-proto/.../worker_api.proto:BlobsAvailableNotification.
+//! pinned_ac_mirror_entries (field 17)` for the wire contract.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::common::DigestInfo;
+use parking_lot::RwLock;
+use tracing::debug;
+
+/// Per-worker AC pin set. Key is `(store_id, digest)` so multiple AC
+/// stores per worker remain disambiguated server-side. The `store_id`
+/// is the worker's configured AC store name (e.g. `"AC_MAIN_STORE"`).
+type EndpointAcPins = HashSet<(Arc<str>, DigestInfo)>;
+
+/// Server-side registry mapping `worker_cas_endpoint → set of (store_id,
+/// digest)` AC pins advertised by that worker. Wrapped in
+/// [`SharedAcPinRegistry`] for sharing across the
+/// [`WorkerApiServer`](nativelink-service::worker_api_server) (which
+/// registers / wipes entries) and any future AC peer-fetch reader.
+///
+/// **Cap on per-worker AC pin set:** the registry enforces a configured
+/// cap on the number of `(store_id, digest)` tuples held per endpoint.
+/// Advertisements beyond the cap are silently dropped to bound the
+/// server's memory under a hostile or buggy worker. The cap default
+/// matches the worker fast-tier capacity ceiling (100K AC entries per
+/// worker × ~10 workers ⇒ ~1M tuples server-wide), which is also the
+/// natural drain point for the BIS-based pin lifecycle.
+#[derive(Debug)]
+pub struct AcPinRegistry {
+    /// Per-endpoint AC pin sets.
+    ///
+    /// Storing the full set per endpoint (rather than a global keyed-by-
+    /// `(endpoint, store_id, digest)` map) makes
+    /// [`Self::wipe_endpoint`] O(1) — required for the boot-epoch wipe
+    /// path which holds the `endpoint_state` mutex while wiping.
+    inner: RwLock<HashMap<String, EndpointAcPins>>,
+    /// Maximum number of `(store_id, digest)` tuples held per endpoint.
+    /// Advertisements beyond the cap are silently dropped to bound
+    /// server-side memory under a hostile or buggy worker.
+    max_entries_per_endpoint: usize,
+}
+
+/// Default cap on per-endpoint AC pin entries. Sized to the worker's
+/// AC fast-tier capacity (configured today as a 100K-entry MemoryStore
+/// in `worker.json5`) — a worker cannot legitimately advertise more
+/// pins than its fast tier can hold. With ~10 workers × 100K = ~1M
+/// tuples server-wide.
+pub const DEFAULT_MAX_AC_PINS_PER_ENDPOINT: usize = 1_000_000;
+
+impl AcPinRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            max_entries_per_endpoint: DEFAULT_MAX_AC_PINS_PER_ENDPOINT,
+        }
+    }
+
+    pub fn with_max_entries_per_endpoint(max_entries_per_endpoint: usize) -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            max_entries_per_endpoint,
+        }
+    }
+
+    /// Register one `(store_id, digest)` AC pin against `endpoint`.
+    /// Silently drops the entry if the endpoint's set is already at
+    /// the configured cap (see `max_entries_per_endpoint`).
+    pub fn register_ac_pin(&self, endpoint: &str, store_id: Arc<str>, digest: DigestInfo) {
+        let mut guard = self.inner.write();
+        let set = guard
+            .entry(endpoint.to_string())
+            .or_default();
+        if set.len() >= self.max_entries_per_endpoint
+            && !set.contains(&(store_id.clone(), digest))
+        {
+            // Cap reached and this would be a NEW entry — drop it.
+            // Re-advertisements of EXISTING entries are still accepted
+            // (HashSet::insert is idempotent on present).
+            debug!(
+                endpoint,
+                cap = self.max_entries_per_endpoint,
+                "ac_pin_registry: per-endpoint cap reached; dropping new AC pin"
+            );
+            return;
+        }
+        set.insert((store_id, digest));
+    }
+
+    /// Drop the matching `(store_id, digest)` AC pin entry (if any).
+    /// Idempotent — silently no-ops on missing endpoint or missing
+    /// entry. Today this is unused because no drain channel calls
+    /// `unregister_ac_pin` directly (drain is via
+    /// [`Self::remove_digests_for_endpoint`] from the BIS broadcast
+    /// loop's AC sweep). Kept on the API surface as the symmetric
+    /// inverse of `register_ac_pin` for future use.
+    pub fn unregister_ac_pin(
+        &self,
+        endpoint: &str,
+        store_id: &str,
+        digest: &DigestInfo,
+    ) {
+        let mut guard = self.inner.write();
+        if let Some(set) = guard.get_mut(endpoint) {
+            // Avoid building an `Arc<str>` just for the lookup key.
+            // HashSet::retain is O(N) but pin-set size is small in steady
+            // state and unregister_ac_pin is on the cold (per-pin) path.
+            set.retain(|(sid, d)| !(sid.as_ref() == store_id && d == digest));
+            if set.is_empty() {
+                guard.remove(endpoint);
+            }
+        }
+    }
+
+    /// Remove all AC pin entries for `endpoint` matching ANY of the
+    /// `digests`. Used by the BIS broadcast loop's AC sweep — when an
+    /// AC slow-write completes on the server, the digest is broadcast
+    /// to all workers AND the matching server-side AC pin entries are
+    /// dropped (the server now knows it has the AC entry stably).
+    ///
+    /// Removes across all `store_id`s for matching digests (a single
+    /// digest under multiple AC stores collapses on confirm), mirroring
+    /// the worker-side
+    /// [`fast_slow_store::FastSlowStore::remove_local_ac_pins`]
+    /// semantics. O(|set| + |digests|) using a `HashSet<DigestInfo>`
+    /// lookup index built once per call.
+    pub fn remove_digests_for_endpoint(
+        &self,
+        endpoint: &str,
+        digests: &[DigestInfo],
+    ) {
+        if digests.is_empty() {
+            return;
+        }
+        let lookup: HashSet<&DigestInfo> = digests.iter().collect();
+        let mut guard = self.inner.write();
+        if let Some(set) = guard.get_mut(endpoint) {
+            set.retain(|(_, d)| !lookup.contains(d));
+            if set.is_empty() {
+                guard.remove(endpoint);
+            }
+        }
+    }
+
+    /// Wipe every AC pin recorded for `endpoint`. Called on worker
+    /// disconnect / boot-epoch change, sibling of
+    /// [`crate::blob_locality_map::BlobLocalityMap::remove_endpoint`]
+    /// for the CAS path (#141 / #174). O(1) over the outer map.
+    pub fn wipe_endpoint(&self, endpoint: &str) {
+        self.inner.write().remove(endpoint);
+    }
+
+    /// Test/diagnostic accessor: snapshot the current per-endpoint pin
+    /// count map. Allocates one entry per known endpoint plus a
+    /// per-endpoint `usize` count.
+    pub fn endpoint_counts(&self) -> HashMap<String, usize> {
+        let guard = self.inner.read();
+        guard.iter().map(|(k, v)| (k.clone(), v.len())).collect()
+    }
+
+    /// Test/diagnostic accessor: number of distinct endpoints currently
+    /// holding any AC pin entries.
+    pub fn endpoint_count(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    /// Test/diagnostic accessor: snapshot the AC pin set for `endpoint`,
+    /// returning `None` when no entries are present. Allocates one Vec.
+    pub fn snapshot_endpoint(
+        &self,
+        endpoint: &str,
+    ) -> Option<Vec<(Arc<str>, DigestInfo)>> {
+        let guard = self.inner.read();
+        guard.get(endpoint).map(|set| {
+            let mut out: Vec<_> = set.iter().cloned().collect();
+            // Sort for deterministic test assertions; not required
+            // semantically since registrations are unordered.
+            out.sort();
+            out
+        })
+    }
+}
+
+impl Default for AcPinRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shared handle on the AC pin registry. Cloned into
+/// [`WorkerApiServer`](nativelink-service::worker_api_server) so the
+/// `BlobsAvailable` handler can call [`AcPinRegistry::register_ac_pin`]
+/// and the disconnect / boot-epoch paths can call
+/// [`AcPinRegistry::wipe_endpoint`].
+pub type SharedAcPinRegistry = Arc<AcPinRegistry>;
+
+/// Construct a fresh `SharedAcPinRegistry`.
+pub fn new_shared_ac_pin_registry() -> SharedAcPinRegistry {
+    Arc::new(AcPinRegistry::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(byte: u8) -> DigestInfo {
+        DigestInfo::new([byte; 32], 100)
+    }
+
+    #[test]
+    fn register_and_snapshot_returns_entries() {
+        let reg = AcPinRegistry::new();
+        let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(1));
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(2));
+        reg.register_ac_pin("grpc://w2:50081", store_id, d(3));
+
+        let snap1 = reg.snapshot_endpoint("grpc://w1:50081").unwrap();
+        assert_eq!(snap1.len(), 2);
+        let snap2 = reg.snapshot_endpoint("grpc://w2:50081").unwrap();
+        assert_eq!(snap2.len(), 1);
+        assert_eq!(reg.snapshot_endpoint("grpc://nope:50081"), None);
+    }
+
+    #[test]
+    fn wipe_endpoint_drops_only_target() {
+        let reg = AcPinRegistry::new();
+        let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(1));
+        reg.register_ac_pin("grpc://w2:50081", store_id, d(2));
+        reg.wipe_endpoint("grpc://w1:50081");
+        assert_eq!(reg.snapshot_endpoint("grpc://w1:50081"), None);
+        assert!(reg.snapshot_endpoint("grpc://w2:50081").is_some());
+    }
+
+    #[test]
+    fn remove_digests_for_endpoint_drops_only_matches() {
+        let reg = AcPinRegistry::new();
+        let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(1));
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(2));
+        reg.register_ac_pin("grpc://w1:50081", store_id, d(3));
+        reg.remove_digests_for_endpoint("grpc://w1:50081", &[d(2)]);
+        let snap = reg.snapshot_endpoint("grpc://w1:50081").unwrap();
+        assert_eq!(snap.len(), 2);
+        assert!(snap.iter().any(|(_, x)| *x == d(1)));
+        assert!(snap.iter().any(|(_, x)| *x == d(3)));
+    }
+
+    #[test]
+    fn cap_drops_new_entries_when_full() {
+        let reg = AcPinRegistry::with_max_entries_per_endpoint(2);
+        let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(1));
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(2));
+        // Third NEW entry is dropped.
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(3));
+        let snap = reg.snapshot_endpoint("grpc://w1:50081").unwrap();
+        assert_eq!(snap.len(), 2);
+        // Re-registering an existing entry remains a no-op (no growth).
+        reg.register_ac_pin("grpc://w1:50081", store_id, d(1));
+        let snap = reg.snapshot_endpoint("grpc://w1:50081").unwrap();
+        assert_eq!(snap.len(), 2);
+    }
+}

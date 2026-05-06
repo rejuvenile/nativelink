@@ -43,6 +43,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     UpdateForScheduler, UpdateForWorker, UploadMissingBlobsRequest,
 };
 use nativelink_store::small_blob_dispatcher::SmallBlobDispatcher;
+use nativelink_util::ac_pin_registry::SharedAcPinRegistry;
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::common::DigestInfo;
 use nativelink_scheduler::worker::Worker;
@@ -73,6 +74,22 @@ pub struct WorkerApiServer {
     now_fn: Arc<NowFn>,
     node_id: [u8; 6],
     locality_map: Option<SharedBlobLocalityMap>,
+    /// Server-side AC pin registry. INTENTIONALLY a separate data
+    /// structure from `locality_map` (which is CAS-shared) so AC pin
+    /// advertisements (proto field 17 `pinned_ac_mirror_entries`)
+    /// CANNOT route into the CAS-side locality_map and weaponize
+    /// `bytestream_server::write` / `cas_server::batch_update_blobs`
+    /// upload short-circuits via `WorkerProxyStore::has_with_results`.
+    ///
+    /// `None` for tests / standalone runs without AC pin advertisement.
+    /// Populated in production from
+    /// `nativelink_util::ac_pin_registry::new_shared_ac_pin_registry()`.
+    ///
+    /// Read-side wiring (a future commit) will land an AC peer-fetch
+    /// path that consults this registry directly. With no consumer
+    /// today, the registry's purpose is purely to validate the wire
+    /// channel end-to-end.
+    ac_pin_registry: Option<SharedAcPinRegistry>,
     /// CAS store for checking blob existence during backfill requests.
     cas_store: Option<Store>,
     /// Optional handle on the `WorkerProxyStore` so we can plumb
@@ -212,6 +229,7 @@ impl WorkerApiServer {
         cas_store: Option<Store>,
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
+        ac_pin_registry: Option<SharedAcPinRegistry>,
     ) -> Result<Self, Error> {
         let node_id = {
             let mut out = [0; 6];
@@ -258,6 +276,7 @@ impl WorkerApiServer {
             cas_store,
             worker_proxy,
             small_blob_dispatcher,
+            ac_pin_registry,
         )
     }
 
@@ -272,6 +291,7 @@ impl WorkerApiServer {
         cas_store: Option<Store>,
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
+        ac_pin_registry: Option<SharedAcPinRegistry>,
     ) -> Result<Self, Error> {
         let scheduler = schedulers
             .get(&config.scheduler)
@@ -307,6 +327,7 @@ impl WorkerApiServer {
             now_fn: Arc::new(now_fn),
             node_id,
             locality_map,
+            ac_pin_registry,
             cas_store,
             worker_proxy,
             small_blob_dispatcher,
@@ -494,6 +515,21 @@ impl WorkerApiServer {
                 if let Some(ref locality_map) = self.locality_map {
                     locality_map.write().remove_endpoint(&worker_cas_endpoint);
                 }
+                // Sibling of locality_map wipe for the AC pin path —
+                // the new boot_epoch_id means a fresh process has
+                // taken over the endpoint; its AC pin entries (if
+                // any from a recent re-advertisement on the way up)
+                // start empty so the prior process's lingering AC
+                // pins must be wiped to avoid drift between the
+                // server's registry and the new worker's empty
+                // `dispatched_mirror_pins` map. Field 17 advertises
+                // the FULL CURRENT snapshot every tick, so the new
+                // worker's first BlobsAvailable will re-populate the
+                // registry — server-side wipe + worker re-advertise
+                // is convergent.
+                if let Some(ref ac_pin_registry) = self.ac_pin_registry {
+                    ac_pin_registry.wipe_endpoint(&worker_cas_endpoint);
+                }
                 // #174: boot-epoch wipe dispatcher leak. When a worker
                 // reconnects with a new boot_epoch BEFORE OLD's
                 // disconnect-cleanup task runs, OLD's
@@ -597,6 +633,7 @@ impl WorkerApiServer {
             self.now_fn.clone(),
             worker_id.clone(),
             self.locality_map.clone(),
+            self.ac_pin_registry.clone(),
             self.cas_store.clone(),
             self.worker_proxy.clone(),
             self.small_blob_dispatcher.clone(),
@@ -681,6 +718,9 @@ struct WorkerConnection {
     now_fn: Arc<NowFn>,
     worker_id: WorkerId,
     locality_map: Option<SharedBlobLocalityMap>,
+    /// AC pin registry (separate from `locality_map`); see
+    /// `WorkerApiServer::ac_pin_registry` for design.
+    ac_pin_registry: Option<SharedAcPinRegistry>,
     /// CAS store for checking blob existence during backfill.
     cas_store: Option<Store>,
     /// WorkerProxyStore handle for plumbing per-endpoint mirror
@@ -718,11 +758,13 @@ struct WorkerConnection {
 }
 
 impl WorkerConnection {
+    #[allow(clippy::too_many_arguments)]
     fn start(
         scheduler: Arc<dyn WorkerScheduler>,
         now_fn: Arc<NowFn>,
         worker_id: WorkerId,
         locality_map: Option<SharedBlobLocalityMap>,
+        ac_pin_registry: Option<SharedAcPinRegistry>,
         cas_store: Option<Store>,
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
@@ -736,6 +778,7 @@ impl WorkerConnection {
         let instance = Self {
             scheduler,
             now_fn,
+            ac_pin_registry,
             worker_id,
             locality_map,
             cas_store,
@@ -858,6 +901,15 @@ impl WorkerConnection {
                 if current_owner.as_ref() == Some(&instance.worker_id) {
                     if let Some(ref locality_map) = instance.locality_map {
                         locality_map.write().remove_endpoint(&instance.cas_endpoint);
+                    }
+                    // AC pin sibling: drop every server-side AC pin
+                    // claim attached to this endpoint when the
+                    // disconnect cleanup runs and our connection is
+                    // still the owner. Prevents AC pin entries from
+                    // outliving the worker connection that
+                    // advertised them.
+                    if let Some(ref ac_pin_registry) = instance.ac_pin_registry {
+                        ac_pin_registry.wipe_endpoint(&instance.cas_endpoint);
                     }
                     // task #168 (item 6 + unpin_on_disconnect refactor):
                     //
@@ -1121,6 +1173,59 @@ impl WorkerConnection {
             }
             if let Some(ref dispatcher) = self.small_blob_dispatcher {
                 dispatcher.broadcast_pinned_mirror_ack(&notification.pinned_mirror_entries);
+            }
+        }
+
+        // AC pin advertisement (proto field 17, Option A) — kept in a
+        // SEPARATE branch from the CAS field above so the AC entries
+        // CANNOT be routed into the CAS-shared `BlobLocalityMap` even
+        // by accident. The dedicated `AcPinRegistry` is fed instead;
+        // it has no CAS-side reader, so there is no path by which AC
+        // pins could weaponize the upload short-circuits in
+        // `bytestream_server::write` / `cas_server::batch_update_blobs`.
+        //
+        // Registers the FULL CURRENT snapshot per worker: the worker
+        // (re-)sends the same field 17 contents every BlobsAvailable
+        // tick, so the registry naturally stays consistent without
+        // delta tracking. Explicit drain is via
+        // `AcPinRegistry::wipe_endpoint` on disconnect / boot-epoch
+        // change AND `AcPinRegistry::remove_digests_for_endpoint` from
+        // the BIS broadcast loop's AC sweep.
+        if !notification.pinned_ac_mirror_entries.is_empty() {
+            if let Some(ref ac_pin_registry) = self.ac_pin_registry {
+                let endpoint = if notification.worker_cas_endpoint.is_empty() {
+                    self.cas_endpoint.as_str()
+                } else {
+                    notification.worker_cas_endpoint.as_str()
+                };
+                if !endpoint.is_empty() {
+                    let count = notification.pinned_ac_mirror_entries.len();
+                    let mut registered: usize = 0;
+                    for entry in &notification.pinned_ac_mirror_entries {
+                        let Some(proto_digest) = entry.digest.as_ref() else {
+                            continue;
+                        };
+                        let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) else {
+                            continue;
+                        };
+                        if entry.store_id.is_empty() {
+                            continue;
+                        }
+                        ac_pin_registry.register_ac_pin(
+                            endpoint,
+                            std::sync::Arc::from(entry.store_id.as_str()),
+                            digest,
+                        );
+                        registered += 1;
+                    }
+                    debug!(
+                        worker_id=?self.worker_id,
+                        endpoint,
+                        received=count,
+                        registered,
+                        "BlobsAvailable: recorded pinned_ac_mirror_entries in AcPinRegistry"
+                    );
+                }
             }
         }
 

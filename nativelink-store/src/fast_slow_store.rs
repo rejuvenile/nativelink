@@ -1540,9 +1540,32 @@ impl FastSlowStore {
         // (multiple stores' pins for the same digest collapse on
         // confirm).
         if any_removed {
-            let mut pins = self.dispatched_mirror_pins.lock();
-            pins.retain(|(_, d), ()| !digests.contains(d));
-            drop(pins);
+            self.retain_pins_dropping(digests);
+        }
+    }
+
+    /// Drop every `dispatched_mirror_pins` entry whose `DigestInfo`
+    /// appears in `digests`, then `notify_one()` if anything was
+    /// removed. Shared between [`Self::remove_mirror_blobs`] (CAS BIS
+    /// ack) and [`Self::remove_local_ac_pins`] (worker AC BIS ack /
+    /// fast-tier eviction). Builds a `HashSet<DigestInfo>` once so
+    /// the retain is `O(|pins| + |digests|)`, not `O(|pins| × |digests|)`.
+    fn retain_pins_dropping(&self, digests: &[DigestInfo]) {
+        if digests.is_empty() {
+            return;
+        }
+        // Build the lookup set OUTSIDE the lock so a long `digests`
+        // slice cannot extend the parking_lot critical section.
+        let lookup: std::collections::HashSet<&DigestInfo> = digests.iter().collect();
+        let mut pins = self.dispatched_mirror_pins.lock();
+        if pins.is_empty() {
+            return;
+        }
+        let before = pins.len();
+        pins.retain(|(_, d), ()| !lookup.contains(d));
+        let removed = before - pins.len();
+        drop(pins);
+        if removed > 0 {
             self.mirror_changes_notify.notify_one();
         }
     }
@@ -1770,6 +1793,74 @@ impl FastSlowStore {
             return Vec::new();
         }
         pins.iter().map(|(k, ())| k.clone()).collect()
+    }
+
+    /// Register a worker-local AC entry that has just been written to
+    /// the AC FastSlowStore's fast tier (and is in flight to the slow
+    /// tier). Unlike CAS mirroring (`insert_dispatched_mirror_blob`),
+    /// AC writes originate ON the worker — the worker IS the producer
+    /// of the bytes, so we don't need to store the data in
+    /// `mirror_blobs` (no peer push will ever be served from there).
+    /// We only need to record the `(store_id, digest)` tuple in
+    /// `dispatched_mirror_pins` so the worker's next `BlobsAvailable`
+    /// tick advertises the AC entry to the server via a SEPARATE proto
+    /// field (`pinned_ac_mirror_entries: 17`).
+    ///
+    /// **Hard partition vs. CAS pins.** This entry is reported to the
+    /// server on the AC-only proto channel; the server inserts it into
+    /// the AC pin registry, NOT the CAS-shared `BlobLocalityMap`. AC
+    /// pins MUST NOT route through the locality map because
+    /// `action_digest` is by REAPI design the same digest as the
+    /// Action proto in CAS — registering AC pins against the locality
+    /// map would weaponize the upload-skip short-circuits in
+    /// `bytestream_server::write` and `cas_server::batch_update_blobs`,
+    /// silently losing Action proto bytes.
+    ///
+    /// **Read-side wiring is a future commit (#277 follow-up).** Today
+    /// this method's value is establishing the wire channel; the AC
+    /// peer-fetch path is not yet wired. With no consumer today,
+    /// MemoryStore-eviction-vs-pin divergence is harmless TODO that
+    /// becomes load-bearing the moment a reader lands — at that point
+    /// the eviction-callback drain (Option A1) MUST be added so pin
+    /// state matches fast-tier residency.
+    pub fn insert_local_ac_pin(&self, store_id: &str, digest: DigestInfo) {
+        debug!(store_id, %digest, "insert_local_ac_pin");
+        let key: Arc<str> = Arc::from(store_id);
+        self.dispatched_mirror_pins.lock().insert((key, digest), ());
+        // Wake the worker's BlobsAvailable loop so the entry advertises
+        // promptly (mirrors the wake from `insert_dispatched_mirror_blob`
+        // via `insert_mirror_blob`'s `mirror_changes_notify.notify_one()`).
+        self.mirror_changes_notify.notify_one();
+    }
+
+    /// Remove worker-local AC pin entries for the supplied digests
+    /// across all `store_id`s. Called from the `BlobsInStableStorage`
+    /// handler when the server confirms the AC entry has been
+    /// persisted. Unlike [`Self::remove_mirror_blobs`] this does NOT
+    /// touch `mirror_blobs` or `mirror_blobs_total_bytes` — AC pins
+    /// never lived there.
+    pub fn remove_local_ac_pins(&self, digests: &[DigestInfo]) {
+        self.retain_pins_dropping(digests);
+    }
+
+    /// Snapshot just the AC pin entries (those whose store_id matches
+    /// `ac_store_id`) as a sorted `Vec<DigestInfo>`. Used by
+    /// `send_periodic_blobs_available` to populate the dedicated
+    /// `pinned_ac_mirror_entries: 17` field — keeping the AC slice
+    /// cleanly partitioned from the CAS pin slice on the wire so the
+    /// server's CAS `register_blobs(...)` call can NEVER see an AC
+    /// entry by accident.
+    pub fn dispatched_ac_pin_snapshot_for_store(
+        &self,
+        ac_store_id: &str,
+    ) -> Vec<DigestInfo> {
+        let pins = self.dispatched_mirror_pins.lock();
+        if pins.is_empty() {
+            return Vec::new();
+        }
+        pins.iter()
+            .filter_map(|((sid, d), ())| (sid.as_ref() == ac_store_id).then_some(*d))
+            .collect()
     }
 
     /// Default per-blob streaming buffer: 64 MiB sliding window.

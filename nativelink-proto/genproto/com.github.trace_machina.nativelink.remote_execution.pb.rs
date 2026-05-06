@@ -227,6 +227,25 @@ pub struct BlobsAvailableNotification {
     /// / do NOT conflate.
     #[prost(message, repeated, tag = "16")]
     pub pinned_mirror_entries: ::prost::alloc::vec::Vec<MirrorPinEntry>,
+    /// / Worker-local AC entries the worker has just written to its AC
+    /// / FastSlowStore's fast tier (and that may still be in flight to
+    /// / the AC slow tier on the server). Sorted by `store_id` ASCII so
+    /// / the server-side registry insertion is deterministic. Reuses
+    /// / the `MirrorPinEntry` shape — only the field-number / semantic
+    /// / channel differs from `pinned_mirror_entries` (field 16).
+    /// /
+    /// / CRITICAL: this field is HARD-PARTITIONED from `pinned_mirror_entries`
+    /// / at every consumer. AC pins MUST NOT route into the CAS-shared
+    /// / `BlobLocalityMap` because `action_digest` IS by REAPI design
+    /// / the same digest as the Action proto in CAS — registering AC
+    /// / pins against the locality map would cause the server's CAS
+    /// / upload short-circuits (`bytestream_server::write` /
+    /// / `cas_server::batch_update_blobs`) to silently skip uploads of
+    /// / the Action proto bytes, producing permanent data loss. The
+    /// / server-side AC pin registry is intentionally a separate data
+    /// / structure with no CAS-side reader.
+    #[prost(message, repeated, tag = "17")]
+    pub pinned_ac_mirror_entries: ::prost::alloc::vec::Vec<MirrorPinEntry>,
 }
 /// / One entry of `BlobsAvailableNotification.pinned_mirror_entries`.
 /// / Identifies a server-side dispatcher-pushed mirror pin by `(store_id,
@@ -378,6 +397,19 @@ pub struct BlobsInStableStorageChunk {
     /// / (red-team finding #5 on #97).
     #[prost(uint64, tag = "5")]
     pub server_instance_token: u64,
+    /// / Which worker-side store this chunk's digests belong to. Empty
+    /// / string ("") OR omitted (proto3 default) MUST be interpreted by
+    /// / the worker as "CAS server FastSlowStore" — the historic single-
+    /// / store wire shape, preserved for forward compatibility with
+    /// / pre-AC-BIS workers / servers. Non-empty `store_id` SHOULD match
+    /// / a configured AC store name on the worker (e.g. `"AC_MAIN_STORE"`);
+    /// / the worker routes the unpin to that store's
+    /// / `dispatched_mirror_pins` index via
+    /// / `FastSlowStore::remove_local_ac_pins`. Unknown / non-matching
+    /// / `store_id` is logged at `warn!` and the chunk is acked (so the
+    /// / server's resend buffer drains).
+    #[prost(string, tag = "6")]
+    pub store_id: ::prost::alloc::string::String,
 }
 /// / A streaming-message envelope shared across the cas->worker, scheduler->
 /// / worker, and worker->scheduler chunk producers. Exactly ONE of the

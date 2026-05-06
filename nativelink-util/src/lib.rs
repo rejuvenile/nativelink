@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod ac_pin_registry;
 pub mod action_messages;
 pub mod blob_locality_map;
 pub mod build_sha;
