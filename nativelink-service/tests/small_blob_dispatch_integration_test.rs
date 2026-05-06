@@ -13,16 +13,17 @@
 // limitations under the License.
 
 //! Production-composition integration tests for the #168 producer-side
-//! `SmallBlobDispatcher` hooks.
+//! `SmallBlobDispatcher` hooks (CAS only — AC dispatch was removed in
+//! the post-canary cleanup because workers never read from `ac_store`).
 //!
 //! Spec: `.claude/plans/bug-a-small-cas-peer-mirror.md` §"Order of
 //! operations" step 6.
 //!
 //! These tests assert that on a successful upload via the production
 //! ingest paths (`bytestream_server::inner_write_oneshot`,
-//! `cas_server::inner_batch_update_blobs`, `ac_server::inner_update_action_result`)
-//! the dispatcher fans out a `BatchWriteSmallBlobs` to every connected
-//! worker, AND that the dispatcher is correctly skipped when:
+//! `cas_server::inner_batch_update_blobs`) the dispatcher fans out a
+//! `BatchWriteSmallBlobs` to every connected worker, AND that the
+//! dispatcher is correctly skipped when:
 //!   - the blob is larger than `SMALL_BLOB_THRESHOLD`,
 //!   - the upload originates from a worker (avoid recursive re-mirror),
 //!   - the upload is itself a mirror push (avoid feedback loops),
@@ -50,24 +51,21 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use nativelink_config::cas_server::{
-    AcStoreConfig, ByteStreamConfig, CasStoreConfig, WithInstanceName,
+    ByteStreamConfig, CasStoreConfig, WithInstanceName,
 };
-use nativelink_config::stores::{MemorySpec, StoreSpec};
+use nativelink_config::stores::MemorySpec;
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    ActionResult, BatchUpdateBlobsRequest, UpdateActionResultRequest,
-    batch_update_blobs_request,
+    BatchUpdateBlobsRequest, batch_update_blobs_request,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     UpdateForWorker, update_for_worker::Update as UpdateForWorkerUpdate,
 };
 use nativelink_proto::google::bytestream::WriteRequest;
 use nativelink_proto::google::bytestream::byte_stream_server::ByteStream;
-use nativelink_service::ac_server::AcServer;
 use nativelink_service::bytestream_server::ByteStreamServer;
 use nativelink_service::cas_server::CasServer;
-use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::small_blob_dispatcher::{
     SMALL_BLOB_THRESHOLD, SmallBlobDispatcher, SmallBlobDispatcherConfig,
@@ -80,7 +78,6 @@ use nativelink_util::common::{DigestInfo, encode_stream_proto};
 use nativelink_util::store_trait::Store;
 use nativelink_util::task::JoinHandleDropGuard;
 use nativelink_util::{background_spawn, spawn};
-use prost::Message;
 use tokio::sync::mpsc;
 use tonic::Request;
 use tonic::codec::{Codec, CompressionEncoding};
@@ -107,15 +104,13 @@ const INSTANCE_NAME: &str = "main";
 /// `EphemeralServerSidePin` is registered under this exact name in
 /// `nativelink.rs:499-525`.
 const CAS_STORE_NAME: &str = "cas_STORE";
-const AC_STORE_NAME: &str = "AC_STORE";
 const HASH1: &str = "0123456789abcdef000000000000000000000000000000000123456789abcdef";
 const FAKE_WORKER_ENDPOINT: &str = "grpc://fake-worker:50071";
 const FAKE_WORKER_BOOT_EPOCH: u64 = 42;
 
 /// Build a `StoreManager` whose `cas_STORE` is a `WorkerProxyStore`
 /// wrapping a `MemoryStore` (matches the production wrap order in
-/// `nativelink.rs`). The store is ALSO registered under
-/// `AC_STORE_NAME` so the same harness can drive `AcServer` tests.
+/// `nativelink.rs`).
 async fn make_proxy_store_manager() -> Result<Arc<StoreManager>, Error> {
     Ok(make_proxy_store_manager_with_proxy().await?.0)
 }
@@ -135,20 +130,13 @@ async fn make_proxy_store_manager_with_proxy()
     let cas_proxy = WorkerProxyStore::new(cas_inner, cas_locality);
     manager.add_store(CAS_STORE_NAME, Store::new(cas_proxy.clone()));
 
-    // AC backing store: a plain MemoryStore is sufficient — the AC
-    // path doesn't go through WorkerProxyStore in production either
-    // (per `prod-server.json5`'s `AC_STORE` chain).
-    manager.add_store(
-        AC_STORE_NAME,
-        store_factory(&StoreSpec::Memory(MemorySpec::default()), &manager, None).await?,
-    );
     Ok((manager, cas_proxy))
 }
 
 /// Build a `SmallBlobDispatcher` with `small_blob_mirror_enabled=true`,
 /// register a single fake worker `(endpoint, boot_epoch_id)`, register
-/// pin sets for both `cas_STORE` and `AC_STORE`. Returns the dispatcher
-/// + the `worker_rx` the test will drain to assert dispatch arrived.
+/// a pin set for `cas_STORE`. Returns the dispatcher + the `worker_rx`
+/// the test will drain to assert dispatch arrived.
 fn make_dispatcher_with_one_worker() -> (
     Arc<SmallBlobDispatcher>,
     mpsc::UnboundedReceiver<UpdateForWorker>,
@@ -158,16 +146,12 @@ fn make_dispatcher_with_one_worker() -> (
         ..Default::default()
     };
     let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
-    // Register pin sets for the two production CAS+AC store names so
+    // Register the pin set for the production CAS store name so
     // `enqueue` does not silently drop with "no pin set registered".
     use nativelink_store::small_blob_dispatcher::EphemeralServerSidePin;
     let pin_max_bytes = 256 * 1024 * 1024;
     dispatcher.register_pin_set(
         CAS_STORE_NAME,
-        Arc::new(EphemeralServerSidePin::new(pin_max_bytes)),
-    );
-    dispatcher.register_pin_set(
-        AC_STORE_NAME,
         Arc::new(EphemeralServerSidePin::new(pin_max_bytes)),
     );
 
@@ -206,20 +190,6 @@ fn make_cas_server(
         },
     }];
     Ok(Arc::new(CasServer::new(&config, manager, dispatcher)?))
-}
-
-fn make_ac_server(
-    manager: &StoreManager,
-    dispatcher: Option<Arc<SmallBlobDispatcher>>,
-) -> Result<Arc<AcServer>, Error> {
-    let config = vec![WithInstanceName {
-        instance_name: INSTANCE_NAME.to_string(),
-        config: AcStoreConfig {
-            ac_store: AC_STORE_NAME.to_string(),
-            read_only: false,
-        },
-    }];
-    Ok(Arc::new(AcServer::new(&config, manager, dispatcher)?))
 }
 
 /// Drive a single `WriteRequest` (oneshot — `finish_write=true` on the
@@ -562,86 +532,6 @@ async fn batch_update_blobs_small_entry_dispatches()
 }
 
 // =====================================================================
-// T5: ac_server::inner_update_action_result fans out the AC blob.
-// =====================================================================
-//
-// Production-composition WIRE-UP test for the #168 producer hook in
-// `ac_server::inner_update_action_result`. ActionResult protos are
-// almost always tiny (< 1 KiB), so the SMALL_BLOB_THRESHOLD gate
-// always passes. With a connected worker AND an AC pin set registered
-// (NB: today `nativelink.rs:526-532` does NOT register AC pin sets in
-// production; this test PRE-PROVES the wire-up so that registration
-// is the only follow-up gap), the dispatcher MUST fan out.
-//
-// Mutation step: comment out the `dispatch_to_all_workers` call in
-// `ac_server::inner_update_action_result`'s Ok arm; this test MUST
-// red-fail with the bespoke
-// `"#168 producer hook MUST fan out AC update_action_result to connected worker"`
-// message.
-#[nativelink_test]
-async fn update_action_result_dispatches_to_connected_worker()
--> Result<(), Box<dyn core::error::Error>> {
-    use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
-
-    let manager = make_proxy_store_manager().await?;
-    let (dispatcher, mut worker_rx) = make_dispatcher_with_one_worker();
-    let ac_server = make_ac_server(manager.as_ref(), Some(dispatcher.clone()))?;
-
-    // The action_digest names the AC entry; the DATA stored in the
-    // AC store is the encoded ActionResult proto. We use HASH1 + a
-    // reasonable size for the action_digest; the actual size is
-    // determined by the encoded ActionResult.
-    let action_digest = DigestInfo::try_new(HASH1, 64).expect("valid digest");
-    let action_result = ActionResult::default();
-
-    let request = UpdateActionResultRequest {
-        instance_name: INSTANCE_NAME.to_string(),
-        action_digest: Some(action_digest.into()),
-        action_result: Some(action_result.clone()),
-        results_cache_policy: None,
-        digest_function: 0,
-    };
-
-    let response_fut = ac_server.update_action_result(Request::new(request));
-    let _response = tokio::time::timeout(DEADLOCK_DETECTOR, response_fut)
-        .await
-        .expect("AC update must complete")
-        .err_tip(|| "AC update_action_result RPC")?;
-
-    let entries = await_batch_write_small_blobs(
-        &mut worker_rx,
-        "#168 producer hook MUST fan out AC update_action_result to connected worker",
-    )
-    .await;
-    assert_eq!(
-        entries.len(),
-        1,
-        "exactly one AC entry must be dispatched; got {entries:?}"
-    );
-    assert_eq!(
-        entries[0].store_id, AC_STORE_NAME,
-        "AC dispatch must use registered ac_store name"
-    );
-    let dispatched_digest =
-        DigestInfo::try_from(entries[0].digest.clone().expect("digest"))
-            .expect("digest decodes");
-    assert_eq!(
-        dispatched_digest, action_digest,
-        "dispatched AC entry must carry the action_digest"
-    );
-    // The dispatched bytes are the encoded ActionResult proto.
-    let mut expected_bytes = Vec::with_capacity(action_result.encoded_len());
-    action_result.encode(&mut expected_bytes).expect("encode");
-    assert_eq!(
-        entries[0].data.as_ref(),
-        expected_bytes.as_slice(),
-        "dispatched bytes must equal the encoded ActionResult"
-    );
-
-    Ok(())
-}
-
-// =====================================================================
 // T6: zero connected workers — no dispatch + no error.
 // =====================================================================
 //
@@ -934,114 +824,6 @@ async fn dispatched_small_blob_does_not_duplicate_random_mirror()
          duplicate bytes); mirror_total_attempted ticked from {attempted_before} \
          to {attempted_after}"
     );
-
-    Ok(())
-}
-
-// =====================================================================
-// T_ac_is_worker_skip — over-action coverage at AC layer (#168 testing-czar M3).
-// =====================================================================
-//
-// USER DIRECTIVE: workers occasionally upload AC entries via
-// `UpdateActionResult` (e.g. when a worker proxies an action result
-// to the server). Those uploads MUST NOT fan out via the dispatcher
-// — the originating worker would otherwise receive its own bytes
-// back (loop-prevention contract).
-//
-// Mutation step: remove the `&& !is_worker` clause in
-// `ac_server::inner_update_action_result`'s dispatcher gate → this
-// test red-fails with the bespoke
-// "AC update with x-nativelink-worker MUST NOT loop back" message.
-#[nativelink_test]
-async fn ac_update_with_x_nativelink_worker_header_does_not_dispatch()
--> Result<(), Box<dyn core::error::Error>> {
-    use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
-
-    let manager = make_proxy_store_manager().await?;
-    let (dispatcher, mut worker_rx) = make_dispatcher_with_one_worker();
-    let ac_server = make_ac_server(manager.as_ref(), Some(dispatcher.clone()))?;
-
-    let action_digest = DigestInfo::try_new(HASH1, 64).expect("valid digest");
-    let action_result = ActionResult::default();
-    let request = UpdateActionResultRequest {
-        instance_name: INSTANCE_NAME.to_string(),
-        action_digest: Some(action_digest.into()),
-        action_result: Some(action_result),
-        results_cache_policy: None,
-        digest_function: 0,
-    };
-
-    let mut req = Request::new(request);
-    req.metadata_mut().insert(
-        "x-nativelink-worker",
-        MetadataValue::try_from("1").expect("valid header"),
-    );
-
-    let response_fut = ac_server.update_action_result(req);
-    let _response = tokio::time::timeout(DEADLOCK_DETECTOR, response_fut)
-        .await
-        .expect("AC update must complete")
-        .err_tip(|| "AC update_action_result RPC")?;
-
-    assert_no_dispatch(
-        &mut worker_rx,
-        "#168 USER DIRECTIVE / testing-czar M3: AC update with x-nativelink-worker \
-         MUST NOT loop back via dispatcher — worker already holds the bytes locally; \
-         dispatching would re-send them to the originating worker (loop-prevention \
-         contract for AC layer)",
-    )
-    .await;
-
-    Ok(())
-}
-
-// =====================================================================
-// T_ac_is_mirror_skip — over-action coverage at AC layer (#168 testing-czar M3).
-// =====================================================================
-//
-// Mirror pushes that round-trip via AC (rare but possible) MUST NOT
-// be re-dispatched. Mutation step: remove the `&& !is_mirror` clause
-// in `ac_server::inner_update_action_result`'s dispatcher gate →
-// this test red-fails with the bespoke
-// "AC update with x-nativelink-mirror MUST NOT loop back" message.
-#[nativelink_test]
-async fn ac_update_with_x_nativelink_mirror_header_does_not_dispatch()
--> Result<(), Box<dyn core::error::Error>> {
-    use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
-
-    let manager = make_proxy_store_manager().await?;
-    let (dispatcher, mut worker_rx) = make_dispatcher_with_one_worker();
-    let ac_server = make_ac_server(manager.as_ref(), Some(dispatcher.clone()))?;
-
-    let action_digest = DigestInfo::try_new(HASH1, 64).expect("valid digest");
-    let action_result = ActionResult::default();
-    let request = UpdateActionResultRequest {
-        instance_name: INSTANCE_NAME.to_string(),
-        action_digest: Some(action_digest.into()),
-        action_result: Some(action_result),
-        results_cache_policy: None,
-        digest_function: 0,
-    };
-
-    let mut req = Request::new(request);
-    req.metadata_mut().insert(
-        "x-nativelink-mirror",
-        MetadataValue::try_from("1").expect("valid header"),
-    );
-
-    let response_fut = ac_server.update_action_result(req);
-    let _response = tokio::time::timeout(DEADLOCK_DETECTOR, response_fut)
-        .await
-        .expect("AC update must complete")
-        .err_tip(|| "AC update_action_result RPC")?;
-
-    assert_no_dispatch(
-        &mut worker_rx,
-        "#168 USER DIRECTIVE / testing-czar M3: AC update with x-nativelink-mirror \
-         MUST NOT loop back via dispatcher — mirror push already arrived; \
-         dispatching would re-loop the same bytes (loop-prevention contract for AC layer)",
-    )
-    .await;
 
     Ok(())
 }

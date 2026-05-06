@@ -19,10 +19,16 @@
 //! Today the small-blob short-circuit at `bytestream_server.rs:2059, 2109-2189`
 //! lies to Bazel about workers holding small blobs they do not actually hold.
 //! The `SmallBlobDispatcher` extends the existing peer-mirror infrastructure
-//! to small CAS+AC blobs (≤ `SMALL_BLOB_THRESHOLD`) by piggybacking byte-push
+//! to small CAS blobs (≤ `SMALL_BLOB_THRESHOLD`) by piggybacking byte-push
 //! on the existing `UpdateForWorker` bidi stream as a new
 //! `BatchWriteSmallBlobs` variant. The dispatcher makes the Bazel "lie"
 //! eventually-true within ~RTT.
+//!
+//! **AC scope removed (post-canary cleanup of #168).** The original v2
+//! design fanned out small AC blobs alongside CAS, but worker code never
+//! READS from `ac_store` (only writes via `upload_ac_results`). The AC
+//! producer hook + AC pin-set registration were deleted; only CAS
+//! dispatch remains.
 //!
 //! # Status
 //!
@@ -41,8 +47,7 @@
 //! - The per-`(endpoint, boot_epoch_id, store_id)` mpsc + drainer task
 //!   (steps 2-4 of the plan).
 //! - Wiring to `bytestream_server::inner_write_oneshot:1946`,
-//!   `cas_server::inner_batch_update_blobs:437`,
-//!   `ac_server::inner_update_action_result:184` (step 6).
+//!   `cas_server::inner_batch_update_blobs:437` (step 6).
 //! - `WorkerApiServer::handle_blobs_available` extension to broadcast
 //!   `pinned_mirror_entries` (step 4).
 //! - The `LOCALITY_MIN_BLOB_SIZE = 64*1024` removal at
@@ -90,7 +95,6 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::completeness_checking_store::CompletenessCheckingStore;
 use crate::existence_cache_store::ExistenceCacheStore;
 use crate::fast_slow_store::FastSlowStore;
 use crate::verify_store::VerifyStore;
@@ -115,9 +119,9 @@ const DEFAULT_MAX_PENDING_PER_WORKER: usize = 32;
 /// `SMALL_BLOB_THRESHOLD` max.
 const DEFAULT_MAX_BATCH_BYTES: usize = 256 * 1024;
 
-/// Default per-FastSlowStore pin set byte cap. Two stores (CAS + AC) →
-/// 512 MiB worst-case per server. Per-worker × num_workers × per-store =
-/// aggregate memory budget; size for production fleet.
+/// Default per-FastSlowStore pin set byte cap. With CAS as the sole
+/// dispatcher store post-#168 cleanup, the worst-case per-server budget
+/// is `pin_max_bytes` × the number of registered CAS stores (typically 1).
 const DEFAULT_PIN_MAX_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
 /// Operator-tunable knobs for the dispatcher. Mirrors the "Knobs" table in
@@ -174,8 +178,8 @@ impl Default for SmallBlobDispatcherConfig {
 /// TTL-evicted. Memory bound is `pin_max_bytes` (per-store).
 ///
 /// Each entry (`DigestInfo` -> `Bytes`) costs `data.len()` plus a small
-/// fixed overhead. Cap is per-store (`pin_max_bytes`) so two stores
-/// (CAS + AC) sum to `2 × pin_max_bytes` per server.
+/// fixed overhead. Cap is per-store (`pin_max_bytes`); only CAS stores
+/// register a pin set today (AC removed).
 ///
 /// **NOT** the v2 worker-side pin contract; **NOT** the worker-side
 /// `mirror_blobs` map. This lives on the SERVER for in-flight push tracking
@@ -747,15 +751,14 @@ impl SmallBlobDispatcher {
     ///
     /// **Size gate ownership (post-Fix 4, #168 testing-czar MAJOR-1):**
     /// the dispatcher does NOT re-check `data.len() <= SMALL_BLOB_THRESHOLD`
-    /// here. The producer hooks at `bytestream_server::inner_write_oneshot`,
-    /// `cas_server::inner_batch_update_blobs`, and
-    /// `ac_server::inner_update_action_result` are the SOLE authority for the
-    /// size gate. Duplicating it here made the producer-side mutation test
-    /// require a double mutation before red-failing, which made the test
-    /// structurally vacuous. The public `enqueue` async API (used by tests
-    /// + would-be external callers) still re-checks the size as
-    /// defense-in-depth — only this sync schedule fast-path is producer-
-    /// gated only.
+    /// here. The producer hooks at `bytestream_server::inner_write_oneshot`
+    /// and `cas_server::inner_batch_update_blobs` are the SOLE authority
+    /// for the size gate. Duplicating it here made the producer-side
+    /// mutation test require a double mutation before red-failing, which
+    /// made the test structurally vacuous. The public `enqueue` async
+    /// API (used by tests + would-be external callers) still re-checks
+    /// the size as defense-in-depth — only this sync schedule fast-path
+    /// is producer-gated only.
     ///
     /// Otherwise spawns a `tokio::task` carrying the snapshot of
     /// connected workers + their senders, and runs the per-worker
@@ -787,8 +790,7 @@ impl SmallBlobDispatcher {
         }
         // #168 testing-czar MAJOR-1: the producer hooks
         // (`bytestream_server::inner_write_oneshot`,
-        // `cas_server::inner_batch_update_blobs`,
-        // `ac_server::inner_update_action_result`) own the
+        // `cas_server::inner_batch_update_blobs`) own the
         // `size_bytes <= SMALL_BLOB_THRESHOLD` gate. The dispatcher
         // intentionally does NOT re-check size here — duplicating the
         // gate made the producer-side mutation test require a double
@@ -1247,32 +1249,28 @@ fn synthetic_small_key() -> StoreKey<'static> {
 }
 
 /// Walk the production store wrapper chain to find the underlying
-/// [`FastSlowStore`] that backs a CAS or AC instance. Used by the
+/// [`FastSlowStore`] that backs a CAS instance. Used by the
 /// `#168` startup wire-up in `src/bin/nativelink.rs` to register a
-/// per-store [`EphemeralServerSidePin`] for every CAS + AC store
-/// whose chain bottoms out at a FastSlowStore.
+/// per-store [`EphemeralServerSidePin`] for every CAS store whose
+/// chain bottoms out at a FastSlowStore.
 ///
 /// The walker recurses through every wrapper that returns `self` from
 /// the trait-default `inner_store(None)` (`ExistenceCacheStore`,
-/// `VerifyStore`, `CompletenessCheckingStore`). For each, it drills
-/// into the right inner via the wrapper's concrete accessor:
+/// `VerifyStore`). For each, it drills into the right inner via the
+/// wrapper's concrete accessor:
 ///
 /// - `ExistenceCacheStore.inner_store()` → its single backend.
 /// - `VerifyStore.inner_store()` → its single backend.
-/// - `CompletenessCheckingStore.ac_store()` → the AC chain (NOT
-///   `cas_store`, which is the secondary verification side that the
-///   completeness check uses internally; the producer-hook fan-out
-///   targets the AC entry path that owns the digest).
 ///
 /// Stops on the first wrapper that is not recognized AND does not
 /// unwrap further (`inner_store(_)` returns the same pointer as `self`).
 ///
-/// **#168 dist-systems MINOR-1 / security Q5:** the production AC
-/// chain is `Completeness{ AC_BACKEND_CACHED = FastSlow{ fast:
-/// MemoryStore, slow: RefStore→Redis } }`. Without the
-/// `CompletenessCheckingStore` branch the walker bails immediately,
-/// the AC dispatcher pin set is never registered, and the AC
-/// fan-out path is silently inert in production.
+/// **AC stores are intentionally NOT walked.** The AC value path is
+/// write-only from the worker side (`upload_ac_results` in
+/// `nativelink-worker/src/running_actions_manager.rs`); workers never
+/// READ from `ac_store`, so eager fan-out of AC blobs to workers
+/// dispatches bytes to a place where no consumer exists. The AC
+/// producer hook was removed in the post-canary cleanup of #168.
 pub fn find_fast_slow_for_pin(store: &dyn StoreDriver) -> Option<&FastSlowStore> {
     if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
         return Some(fss);
@@ -1288,11 +1286,6 @@ pub fn find_fast_slow_for_pin(store: &dyn StoreDriver) -> Option<&FastSlowStore>
     if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
         return find_fast_slow_for_pin(
             vs.inner_store().inner_store(Some(synthetic_small_key())),
-        );
-    }
-    if let Some(ccs) = store.as_any().downcast_ref::<CompletenessCheckingStore>() {
-        return find_fast_slow_for_pin(
-            ccs.ac_store().inner_store(Some(synthetic_small_key())),
         );
     }
     let inner = store.inner_store(Some(synthetic_small_key()));
@@ -1432,78 +1425,4 @@ mod tests {
         );
     }
 
-    /// #168 dist-systems MINOR-1 / security Q5 regression:
-    ///
-    /// Production AC chain shape is
-    /// `Completeness{ AC_BACKEND_CACHED = FastSlow{ fast: MemoryStore,
-    /// slow: RefStore→Redis } }`. Before the
-    /// `CompletenessCheckingStore` branch was added, the walker fell
-    /// through to `inner_store(_)` (which returns `self` for the
-    /// composite trait) and bailed without ever registering an AC pin
-    /// set — the AC dispatcher fan-out path was inert in production.
-    ///
-    /// Mutation step (per CLAUDE.md TDD step 5): comment out the
-    /// `CompletenessCheckingStore` branch in `find_fast_slow_for_pin`
-    /// → this test MUST red-fail with the bespoke
-    /// `"#168 walker MUST recurse through CompletenessCheckingStore into AC chain"`
-    /// message.
-    #[nativelink_macro::nativelink_test]
-    async fn find_fast_slow_for_pin_recurses_through_completeness_checking_store_ac_chain() {
-        use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
-        use nativelink_util::store_trait::Store;
-
-        use crate::completeness_checking_store::CompletenessCheckingStore;
-        use crate::fast_slow_store::FastSlowStore;
-        use crate::memory_store::MemoryStore;
-
-        // Build the AC backing chain: FastSlow{ fast: MemoryStore,
-        // slow: MemoryStore } (Memory stands in for the production
-        // Redis ref_store; the walker only inspects wrapper types,
-        // not the slow tier semantics).
-        let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
-        let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
-        let ac_backend_fss: Arc<FastSlowStore> = FastSlowStore::new(
-            &FastSlowSpec {
-                fast: StoreSpec::Memory(MemorySpec::default()),
-                slow: StoreSpec::Memory(MemorySpec::default()),
-                fast_direction: StoreDirection::default(),
-                slow_direction: StoreDirection::default(),
-                chunked_reads_enabled: false,
-            },
-            fast,
-            slow,
-        );
-        let ac_backend_ptr: *const FastSlowStore = Arc::as_ptr(&ac_backend_fss);
-
-        // Wrap with CompletenessCheckingStore on top, with a separate
-        // CAS-side store. The walker MUST drill into ac_store, NOT
-        // cas_store.
-        let ac_store_for_completeness = Store::new(ac_backend_fss);
-        let cas_store_unrelated = Store::new(MemoryStore::new(&MemorySpec::default()));
-        let ccs = CompletenessCheckingStore::new(
-            ac_store_for_completeness,
-            cas_store_unrelated,
-        );
-
-        // Walk via the public helper. `&*ccs` derefs the Arc to the
-        // inner CompletenessCheckingStore, which implements
-        // `StoreDriver`. `find_fast_slow_for_pin` first downcasts to
-        // CompletenessCheckingStore, then drills into `ac_store()` —
-        // exactly the production-shape walk performed by
-        // `src/bin/nativelink.rs`'s startup loop for AC stores.
-        let driver: &dyn StoreDriver = &*ccs;
-        let found = find_fast_slow_for_pin(driver).expect(
-            "#168 walker MUST recurse through CompletenessCheckingStore into AC chain \
-             (production AC shape: Completeness{ AC_BACKEND_CACHED = FastSlow{...} })",
-        );
-
-        // Verify the resolved FastSlowStore is the one we built (same
-        // pointer == same FastSlowStore instance, not a sibling
-        // returned from the cas_store branch).
-        assert!(
-            core::ptr::eq(found as *const FastSlowStore, ac_backend_ptr),
-            "walker resolved a DIFFERENT FastSlowStore than the AC-backing one — \
-             likely walked into cas_store instead of ac_store"
-        );
-    }
 }

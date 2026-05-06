@@ -287,14 +287,6 @@ async fn inner_main(
             >,
         >,
     > = HashMap::new();
-    // #168 item D: AC store names harvested from `services.ac` so the
-    // SmallBlobDispatcher can register an `EphemeralServerSidePin` per
-    // AC store at startup (matching the CAS pin registration loop
-    // below). Without this the AC producer hook would silently drop
-    // per-blob with a `debug!` (item E demoted the warn). Default
-    // `ac_store` names like `AC_STORE` match `is_valid_store_id` so the
-    // walk + register is straightforward.
-    let mut ac_store_names: HashSet<String> = HashSet::new();
     let cas_store_names: HashSet<String> = {
         let mut names: HashSet<String> = HashSet::new();
         for server_cfg in &server_cfgs {
@@ -307,11 +299,6 @@ async fn inner_main(
                 if let Some(ref bs_cfgs) = services.bytestream {
                     for c in bs_cfgs {
                         names.insert(c.config.cas_store.clone());
-                    }
-                }
-                if let Some(ref ac_cfgs) = services.ac {
-                    for c in ac_cfgs {
-                        ac_store_names.insert(c.config.ac_store.clone());
                     }
                 }
             }
@@ -519,53 +506,6 @@ async fn inner_main(
                         store_name,
                         pin_max_bytes,
                         "small_blob_dispatcher: registered EphemeralServerSidePin"
-                    );
-                }
-            }
-            // #168 item D: register `EphemeralServerSidePin` for every
-            // AC store backed by a FastSlowStore (mirrors the CAS loop
-            // above). AC stores that aren't FastSlowStore-backed (e.g.
-            // plain FilesystemStore in test configs, plain MemoryStore)
-            // are skipped — the AC producer hook will silently drop
-            // (debug!) at runtime; that's the operator-visible
-            // "register failed" surface. With both CAS + AC pin sets
-            // registered, the dispatcher's per-blob
-            // `pin_set_for(store_id) == None` branch (item E demoted to
-            // debug) will not fire under normal operation, eliminating
-            // the AC log-flood concern (#253/#255/#197 OOM shape).
-            //
-            // We look up via `store_manager.get_store(name)` (NOT
-            // `unwrapped_cas_stores`) — AC stores live outside the
-            // CAS-only WorkerProxyStore wrapping, so the manager
-            // already returns the bare AC chain.
-            for store_name in &ac_store_names {
-                let Some(store) = store_manager.get_store(store_name) else {
-                    continue;
-                };
-                if !nativelink_store::small_blob_dispatcher::is_valid_store_id(store_name) {
-                    info!(
-                        store_name,
-                        "small_blob_dispatcher: skipping AC pin-set registration; \
-                         store_name does not match `[a-zA-Z_][a-zA-Z0-9_]*` (per plan C11)"
-                    );
-                    continue;
-                }
-                let driver: &dyn StoreDriver =
-                    store.inner_store(Some(synthetic_small_key()));
-                if find_fast_slow_for_pin(driver).is_some() {
-                    let pin = Arc::new(EphemeralServerSidePin::new(pin_max_bytes));
-                    dispatcher.register_pin_set(store_name, pin);
-                    info!(
-                        store_name,
-                        pin_max_bytes,
-                        "small_blob_dispatcher: registered AC EphemeralServerSidePin"
-                    );
-                } else {
-                    debug!(
-                        store_name,
-                        "small_blob_dispatcher: AC store is not FastSlowStore-backed; \
-                         skipping pin-set registration (AC dispatcher hook will be a no-op \
-                         for this store)"
                     );
                 }
             }
@@ -930,7 +870,7 @@ async fn inner_main(
                 services
                     .ac
                     .map_or(Ok(None), |cfg| {
-                        AcServer::new(&cfg, &store_manager, small_blob_dispatcher.clone())
+                        AcServer::new(&cfg, &store_manager)
                             .map(|v| Some(svc_setup!(v)))
                     })
                     .err_tip(|| "Could not create AC service")?,
