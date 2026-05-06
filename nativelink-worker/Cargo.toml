@@ -121,3 +121,11 @@ required-features = ["test-utils"]
 [[test]]
 name = "end_to_end_mirror_reconciliation_test"
 required-features = ["test-utils"]
+
+[[test]]
+# `bis_ac_routing_test` constructs `BlobsAvailableState::new_for_test_with_ac`,
+# gated behind `cfg(any(test, feature = "test-utils"))`. Without this `[[test]]`
+# entry the default `cargo test -p nativelink-worker` invocation red-fails with
+# E0599 on the constructor. Mirror the pattern used by the other BIS tests above.
+name = "bis_ac_routing_test"
+required-features = ["test-utils"]
