@@ -1772,6 +1772,59 @@ impl FastSlowStore {
         pins.iter().map(|(k, ())| k.clone()).collect()
     }
 
+    /// Register a worker-local AC entry that has just been written to the
+    /// AC FastSlowStore's fast tier (and is in flight to the slow tier).
+    /// Unlike CAS mirroring (`insert_dispatched_mirror_blob`), AC writes
+    /// originate ON the worker — the worker IS the producer of the bytes,
+    /// so we don't need to store the data in `mirror_blobs` (no peer push
+    /// will ever be served from there). We only need to record the
+    /// `(store_id, digest)` tuple in `dispatched_mirror_pins` so the
+    /// worker's next `BlobsAvailable` tick advertises the AC entry to
+    /// the server.
+    ///
+    /// The advertisement is consumed by the server's `worker_api_server`
+    /// handler at `worker_api_server.rs:1091-1124`, which registers the
+    /// `(endpoint, digest)` in the locality_map. AC peer-fetch wiring
+    /// (a hypothetical `WorkerProxyStore`-style wrapper around AC_STORE)
+    /// is a future commit; today this method's value is locality-map
+    /// awareness during the slow-write window — read paths do not yet
+    /// consume it.
+    ///
+    /// Cleanup happens via [`Self::remove_local_ac_pins`] from the
+    /// worker's `BlobsInStableStorage` handler (the existing CAS path
+    /// in `local_worker.rs:851-902`).
+    pub fn insert_local_ac_pin(&self, store_id: &str, digest: DigestInfo) {
+        debug!(store_id, %digest, "insert_local_ac_pin");
+        let key: Arc<str> = Arc::from(store_id);
+        self.dispatched_mirror_pins.lock().insert((key, digest), ());
+        // Wake the worker's BlobsAvailable loop so the entry advertises
+        // promptly (mirrors the wake from `insert_dispatched_mirror_blob`
+        // via `insert_mirror_blob`'s `mirror_changes_notify.notify_one()`).
+        self.mirror_changes_notify.notify_one();
+    }
+
+    /// Remove worker-local AC pin entries for the supplied digests across
+    /// all store_ids. Called from the `BlobsInStableStorage` handler
+    /// when the server confirms the AC entry has been persisted. Unlike
+    /// [`Self::remove_mirror_blobs`] this does NOT touch `mirror_blobs`
+    /// or `mirror_blobs_total_bytes` — AC pins never lived there.
+    pub fn remove_local_ac_pins(&self, digests: &[DigestInfo]) {
+        if digests.is_empty() {
+            return;
+        }
+        let mut pins = self.dispatched_mirror_pins.lock();
+        if pins.is_empty() {
+            return;
+        }
+        let before = pins.len();
+        pins.retain(|(_, d), ()| !digests.contains(d));
+        let removed = before - pins.len();
+        drop(pins);
+        if removed > 0 {
+            self.mirror_changes_notify.notify_one();
+        }
+    }
+
     /// Default per-blob streaming buffer: 64 MiB sliding window.
     const POPULATE_STREAM_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
 
