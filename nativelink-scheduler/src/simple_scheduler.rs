@@ -1019,9 +1019,13 @@ impl WorkerScheduler for SimpleScheduler {
             .await;
     }
 
-    async fn broadcast_blobs_in_stable_storage_chunked(&self, digests: Vec<DigestInfo>) {
+    async fn broadcast_blobs_in_stable_storage_chunked(
+        &self,
+        digests: Vec<DigestInfo>,
+        store_id: &str,
+    ) {
         self.worker_scheduler
-            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .broadcast_blobs_in_stable_storage_chunked(digests, store_id)
             .await;
     }
 

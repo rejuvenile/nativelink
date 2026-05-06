@@ -714,32 +714,47 @@ async fn inner_main(
     // (or AC) FastSlowStore completes a background slow write it pushes
     // the digest and notifies us. We drain all queued digests and
     // broadcast immediately, so workers can unpin blobs with minimal
-    // latency. AC stores are included so AC pin entries (proto field
-    // 17) get drained on slow-write completion via the worker-side
-    // `remove_local_ac_pins` call in `handle_blobs_in_stable_storage`
-    // — this is the AC pin lifecycle drain channel chosen as Option
-    // A2 for the AC mirroring follow-up.
+    // latency.
+    //
+    // CAS vs AC chunks are HARD-PARTITIONED on the wire by the chunk's
+    // `store_id` field (proto3 field 6 of `BlobsInStableStorageChunk`):
+    // - CAS chunks carry `store_id = ""` (forward-compatible default),
+    //   routed by the worker to `cas_fss.remove_mirror_blobs`.
+    // - AC chunks carry `store_id = "<AC store name>"`, routed by the
+    //   worker to its `ac_fss.remove_local_ac_pins` for the matching
+    //   store. CAS readers (`bytestream_server::write` short-circuit,
+    //   `cas_server::batch_update_blobs` short-circuit) NEVER consume
+    //   these via `BlobLocalityMap`; the AC channel is end-to-end
+    //   isolated from CAS-side data plane.
     if !worker_schedulers.is_empty() {
-        let bis_stores: Vec<nativelink_util::store_trait::Store> = cas_store_names
+        // CAS stores: drained together → one broadcast tagged store_id="".
+        let cas_bis_stores: Vec<(String, nativelink_util::store_trait::Store)> = cas_store_names
             .iter()
-            .chain(ac_store_names.iter())
-            .collect::<HashSet<_>>()  // dedupe in case a store is in both sets
-            .into_iter()
-            .filter_map(|name| store_manager.get_store(name))
+            .filter_map(|name| store_manager.get_store(name).map(|s| (name.clone(), s)))
             .collect();
-        let cas_store_count = cas_store_names.len();
-        let ac_store_count = ac_store_names.len();
+        // AC stores: drained per-store → one broadcast PER AC store
+        // tagged with that store's name, so workers can route the
+        // unpin to the matching FSS via `store_id` lookup.
+        let ac_bis_stores: Vec<(String, nativelink_util::store_trait::Store)> = ac_store_names
+            .iter()
+            // Avoid double-broadcasting if a name appears in both sets
+            // (a store wired as both CAS and AC service is pathological,
+            // but the dedupe is cheap insurance).
+            .filter(|name| !cas_store_names.contains(name.as_str()))
+            .filter_map(|name| store_manager.get_store(name).map(|s| (name.clone(), s)))
+            .collect();
+        let cas_store_count = cas_bis_stores.len();
+        let ac_store_count = ac_bis_stores.len();
         let schedulers: Vec<Arc<dyn nativelink_scheduler::worker_scheduler::WorkerScheduler>> =
             worker_schedulers.values().cloned().collect();
 
-        if !bis_stores.is_empty() {
-            let bis_store_count = bis_stores.len();
+        if cas_store_count + ac_store_count > 0 {
             let scheduler_count = schedulers.len();
 
             // Merge per-store notifies into a single wakeup signal so the
             // broadcast loop wakes when *any* store has new stable digests.
             let merged_notify = Arc::new(Notify::new());
-            for store in &bis_stores {
+            for (_name, store) in cas_bis_stores.iter().chain(ac_bis_stores.iter()) {
                 let store_notify = store.stable_notify();
                 let merged = merged_notify.clone();
                 tokio::spawn(async move {
@@ -769,56 +784,89 @@ async fn inner_main(
                         () = merged_notify.notified() => {}
                         () = tokio::time::sleep(Duration::from_millis(500)) => {}
                     }
-                    // Drain everything currently queued across all stores.
-                    let mut all_digests = Vec::new();
-                    for store in &bis_stores {
+                    // Drain CAS digests across all CAS stores into one
+                    // bucket (CAS share locality_map; one broadcast).
+                    let mut cas_digests = Vec::new();
+                    for (_name, store) in &cas_bis_stores {
                         let mut drained = store.drain_stable_digests();
                         if !drained.is_empty() {
-                            all_digests.append(&mut drained);
+                            cas_digests.append(&mut drained);
                         }
                     }
-                    if all_digests.is_empty() {
+                    // Drain AC digests PER store so we can broadcast each
+                    // with its own `store_id`. Worker handlers route on
+                    // store_id; merging would lose that distinction.
+                    let mut per_ac_digests: Vec<(String, Vec<nativelink_util::common::DigestInfo>)> = Vec::new();
+                    for (name, store) in &ac_bis_stores {
+                        let drained = store.drain_stable_digests();
+                        if !drained.is_empty() {
+                            per_ac_digests.push((name.clone(), drained));
+                        }
+                    }
+                    if cas_digests.is_empty() && per_ac_digests.is_empty() {
                         continue;
                     }
-                    debug!(
-                        target: "nativelink::stable_storage_broadcast",
-                        digest_count = all_digests.len(),
-                        scheduler_count = schedulers.len(),
-                        "BlobsInStableStorage: broadcasting drained digests (chunked)"
-                    );
-                    // Server-side AC pin sweep: `remove_digests_for_endpoint`
-                    // acts per-endpoint; we don't know which workers the
-                    // digests are pinned on, so iterate all known
-                    // endpoints. Cheap (RwLock + HashSet retain) and only
-                    // runs once per BIS event.
-                    let endpoints: Vec<String> =
-                        registry_for_loop.endpoint_counts().keys().cloned().collect();
-                    for endpoint in &endpoints {
-                        registry_for_loop
-                            .remove_digests_for_endpoint(endpoint, &all_digests);
-                    }
-                    for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
-                        // (#97) Chunked dispatch: splits the digest list
-                        // into ~4096-digest chunks, dispatches each via
-                        // `Update::ChunkedMessage(BlobsInStableStorage)`,
-                        // and tracks per-worker unacked chunks so a worker
-                        // reconnect replays them. Closes the durability
-                        // gap from #89 where BIS notifications were lost
-                        // on h2/QUIC stream churn — without ack-tracking,
-                        // a single dropped chunk leaked pin state forever.
-                        scheduler
-                            .broadcast_blobs_in_stable_storage_chunked(all_digests.clone())
-                            .await;
+
+                    // CAS broadcast (store_id="").
+                    if !cas_digests.is_empty() {
                         debug!(
                             target: "nativelink::stable_storage_broadcast",
-                            scheduler_idx,
-                            "BlobsInStableStorage chunked: broadcast returned for scheduler"
+                            digest_count = cas_digests.len(),
+                            scheduler_count = schedulers.len(),
+                            "BlobsInStableStorage CAS: broadcasting drained digests"
                         );
+                        for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
+                            scheduler
+                                .broadcast_blobs_in_stable_storage_chunked(cas_digests.clone(), "")
+                                .await;
+                            debug!(
+                                target: "nativelink::stable_storage_broadcast",
+                                scheduler_idx,
+                                "BlobsInStableStorage CAS chunked: broadcast returned"
+                            );
+                        }
+                    }
+                    // AC broadcasts (one per AC store) — each tagged
+                    // with its store_id. Server-side AC pin registry
+                    // sweep runs once per drained AC store.
+                    for (ac_name, ac_digests) in &per_ac_digests {
+                        debug!(
+                            target: "nativelink::stable_storage_broadcast",
+                            digest_count = ac_digests.len(),
+                            ac_store = ac_name.as_str(),
+                            scheduler_count = schedulers.len(),
+                            "BlobsInStableStorage AC: broadcasting drained digests"
+                        );
+                        // Server-side AC pin sweep: walk all endpoints
+                        // and drop matching `(store_id, digest)` pairs
+                        // for this AC store.
+                        let endpoints: Vec<String> =
+                            registry_for_loop.endpoint_counts().keys().cloned().collect();
+                        for endpoint in &endpoints {
+                            registry_for_loop.remove_digests_for_endpoint_in_store(
+                                endpoint,
+                                ac_name,
+                                ac_digests,
+                            );
+                        }
+                        for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
+                            scheduler
+                                .broadcast_blobs_in_stable_storage_chunked(
+                                    ac_digests.clone(),
+                                    ac_name,
+                                )
+                                .await;
+                            debug!(
+                                target: "nativelink::stable_storage_broadcast",
+                                scheduler_idx,
+                                ac_store = ac_name.as_str(),
+                                "BlobsInStableStorage AC chunked: broadcast returned"
+                            );
+                        }
                     }
                 }
             });
             info!(
-                bis_store_count,
                 cas_store_count,
                 ac_store_count,
                 scheduler_count,

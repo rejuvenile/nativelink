@@ -177,6 +177,32 @@ impl AcPinRegistry {
         }
     }
 
+    /// Variant of [`Self::remove_digests_for_endpoint`] that ALSO
+    /// constrains removals to the matching `store_id`. Used by the
+    /// AC-BIS broadcast loop's per-store sweep — when an AC store's
+    /// slow-tier write drains, we know exactly which `store_id` is
+    /// stable, and want to scope the unregister so a digest that
+    /// happened to be advertised under multiple AC stores doesn't
+    /// have its OTHER store's pin entry collateral-damaged.
+    pub fn remove_digests_for_endpoint_in_store(
+        &self,
+        endpoint: &str,
+        store_id: &str,
+        digests: &[DigestInfo],
+    ) {
+        if digests.is_empty() {
+            return;
+        }
+        let lookup: HashSet<&DigestInfo> = digests.iter().collect();
+        let mut guard = self.inner.write();
+        if let Some(set) = guard.get_mut(endpoint) {
+            set.retain(|(sid, d)| !(sid.as_ref() == store_id && lookup.contains(d)));
+            if set.is_empty() {
+                guard.remove(endpoint);
+            }
+        }
+    }
+
     /// Wipe every AC pin recorded for `endpoint`. Called on worker
     /// disconnect / boot-epoch change, sibling of
     /// [`crate::blob_locality_map::BlobLocalityMap::remove_endpoint`]

@@ -109,7 +109,16 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     /// schedulers that don't implement chunking still work; the
     /// production `ApiWorkerScheduler` overrides this to do per-chunk
     /// dispatch + per-worker resend tracking.
-    async fn broadcast_blobs_in_stable_storage_chunked(&self, digests: Vec<DigestInfo>) {
+    ///
+    /// `store_id` tags each chunk with the source store so workers can
+    /// route AC chunks (`store_id = "AC_MAIN_STORE"` etc.) to AC pin
+    /// drains separately from CAS chunks (empty string = CAS, the
+    /// historic single-store wire shape preserved for forward compat).
+    async fn broadcast_blobs_in_stable_storage_chunked(
+        &self,
+        digests: Vec<DigestInfo>,
+        _store_id: &str,
+    ) {
         self.broadcast_blobs_in_stable_storage(digests).await;
     }
 

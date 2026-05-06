@@ -1624,6 +1624,7 @@ async fn bis_chunked_dispatch_arm_round_trips_ack() -> Result<(), Error> {
         sequence: 7,
         is_last: true,
         server_instance_token: 0xDEAD_BEEF_DEAD_BEEF,
+        store_id: String::new(),
     };
     tx_stream
         .send(Frame::data(

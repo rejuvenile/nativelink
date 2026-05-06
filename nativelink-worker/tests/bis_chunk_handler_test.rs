@@ -151,6 +151,7 @@ async fn bis_chunked_full_burst() -> Result<(), nativelink_error::Error> {
         sequence: 0,
         is_last: true,
         server_instance_token: 0xDEAD_BEEF_CAFE_F00D,
+        store_id: String::new(),
     };
 
     let mut acks: Vec<BisAck> = Vec::new();
@@ -196,6 +197,7 @@ async fn bis_chunked_empty_terminal_acks() -> Result<(), nativelink_error::Error
         sequence: 5,
         is_last: true,
         server_instance_token: 0x1234,
+        store_id: String::new(),
     };
 
     let mut acks: Vec<BisAck> = Vec::new();
@@ -233,6 +235,7 @@ async fn bis_chunked_idempotent_unpin() -> Result<(), nativelink_error::Error> {
         sequence: 2,
         is_last: false,
         server_instance_token: 0x5678,
+        store_id: String::new(),
     };
 
     let mut acks: Vec<BisAck> = Vec::new();
@@ -302,6 +305,7 @@ async fn bis_ack_not_sent_when_unpin_fails() -> Result<(), nativelink_error::Err
         sequence: 13,
         is_last: false,
         server_instance_token: 0xABCD,
+        store_id: String::new(),
     };
 
     let mut acks: Vec<BisAck> = Vec::new();

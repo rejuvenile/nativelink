@@ -899,14 +899,38 @@ pub fn handle_blobs_in_stable_storage(
     cas_store: Option<&Arc<FastSlowStore>>,
     proto_digests: &[nativelink_proto::build::bazel::remote::execution::v2::Digest],
 ) -> BisUnpinOutcome {
+    handle_blobs_in_stable_storage_for_store(state, cas_store, "", proto_digests)
+}
+
+/// Variant of [`handle_blobs_in_stable_storage`] that takes the
+/// chunk's `store_id` and dispatches to:
+///
+/// - Empty `store_id` (`""`): the historic CAS path — unpins from the
+///   FilesystemStore, calls `cas_store.ack_digests`, drops `mirror_blobs`
+///   from the CAS FSS. **Forward-compatible default for pre-AC-BIS
+///   servers.**
+/// - `store_id` matching this worker's configured AC store name: the
+///   AC pin drain path — calls `remove_local_ac_pins` ONLY. Does NOT
+///   touch the FilesystemStore (AC entries never lived there) and
+///   does NOT touch `mirror_blobs` (same — AC pins never registered
+///   there in this Option-A design).
+/// - Unknown non-empty `store_id`: `warn!` and treat as a no-op (the
+///   chunk is still acked so the server's resend buffer drains). Being
+///   asked to unpin against a store this worker doesn't know about is
+///   benign on the worker side; the registry mismatch is a server-side
+///   config drift problem and surfaces in the warn log.
+pub fn handle_blobs_in_stable_storage_for_store(
+    state: &BlobsAvailableState,
+    cas_store: Option<&Arc<FastSlowStore>>,
+    store_id: &str,
+    proto_digests: &[nativelink_proto::build::bazel::remote::execution::v2::Digest],
+) -> BisUnpinOutcome {
     let digest_count = proto_digests.len();
-    let fs_store = &state.fs_store;
     let mut unpinned = 0usize;
     let mut failed = 0usize;
     let mut acked_digests: Vec<DigestInfo> = Vec::with_capacity(digest_count);
     for proto_digest in proto_digests {
         if let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) {
-            fs_store.unpin_digest(&digest);
             acked_digests.push(digest);
             unpinned += 1;
         } else {
@@ -917,43 +941,70 @@ pub fn handle_blobs_in_stable_storage(
             );
         }
     }
-    // Clear from pending-upload set on both stores (the CAS server
-    // store and the action upload store may track different digests;
-    // they share the failed_slow_writes set under the hood).
-    if let Some(cas_store) = cas_store {
-        cas_store.ack_digests(&acked_digests);
-    }
-    // Clean up mirror blobs from the CAS server's FastSlowStore — the
-    // server has confirmed it persisted these, so the worker no longer
-    // needs to hold the in-memory copies.
-    if let Some(cas_fss) = state.cas_server_fss.as_ref() {
-        let before = cas_fss.mirror_blob_count();
-        cas_fss.remove_mirror_blobs(&acked_digests);
-        let removed = before - cas_fss.mirror_blob_count();
-        if removed > 0 {
+
+    // Dispatch on store_id. CRITICAL: AC chunks (non-empty store_id
+    // matching the configured AC store) MUST NOT walk the CAS path;
+    // routing AC digests through `cas_fss.remove_mirror_blobs` would
+    // (a) walk the wrong byte map (zero overlap with AC entries), and
+    // (b) walk `dispatched_mirror_pins` removing matches keyed by
+    // digest only — collateral damage to CAS pins for the same digest.
+    if store_id.is_empty() {
+        // CAS path — historic shape.
+        let fs_store = &state.fs_store;
+        for digest in &acked_digests {
+            fs_store.unpin_digest(digest);
+        }
+        if let Some(cas_store) = cas_store {
+            cas_store.ack_digests(&acked_digests);
+        }
+        if let Some(cas_fss) = state.cas_server_fss.as_ref() {
+            let before = cas_fss.mirror_blob_count();
+            cas_fss.remove_mirror_blobs(&acked_digests);
+            let removed = before - cas_fss.mirror_blob_count();
+            if removed > 0 {
+                info!(
+                    removed,
+                    remaining = cas_fss.mirror_blob_count(),
+                    "BlobsInStableStorage CAS: removed mirror blobs from memory"
+                );
+            }
+        }
+        info!(
+            unpinned,
+            failed,
+            digest_count,
+            store_id = "",
+            "BlobsInStableStorage CAS: unpinned digests from local CAS"
+        );
+    } else if let Some(target) = state.ac_mirror_target.as_ref() {
+        if target.store_id.as_ref() == store_id {
+            target.fss.remove_local_ac_pins(&acked_digests);
             info!(
-                removed,
-                remaining = cas_fss.mirror_blob_count(),
-                "BlobsInStableStorage: removed mirror blobs from memory"
+                unpinned,
+                failed,
+                digest_count,
+                store_id,
+                "BlobsInStableStorage AC: dropped local AC pins"
+            );
+        } else {
+            warn!(
+                store_id,
+                ac_store_id = %target.store_id,
+                digest_count,
+                "BlobsInStableStorage: store_id does not match this worker's \
+                 configured AC store; treating as no-op (chunk will still be \
+                 acked so server resend buffer drains)"
             );
         }
+    } else {
+        warn!(
+            store_id,
+            digest_count,
+            "BlobsInStableStorage: chunk carries non-empty store_id but this \
+             worker has no AC mirror target; treating as no-op"
+        );
     }
-    // Drop worker-local AC pin entries from the AC FastSlowStore. The
-    // server's BIS broadcast loop iterates AC stores too, so an AC
-    // slow-write completion produces a stable-digest broadcast that
-    // arrives here for any worker with a matching AC pin. Idempotent
-    // for workers without the digest. Note: `remove_local_ac_pins` does
-    // NOT touch `mirror_blobs` (AC pins never lived there — the bytes
-    // are in the FSS fast tier).
-    if let Some(target) = state.ac_mirror_target.as_ref() {
-        target.fss.remove_local_ac_pins(&acked_digests);
-    }
-    info!(
-        unpinned,
-        failed,
-        digest_count,
-        "BlobsInStableStorage: unpinned digests from local CAS"
-    );
+
     BisUnpinOutcome { unpinned, failed }
 }
 
@@ -997,7 +1048,12 @@ pub fn handle_bis_chunk(
     chunk: &BlobsInStableStorageChunk,
     ack_sink: impl FnOnce(BisAck),
 ) -> BisUnpinOutcome {
-    let outcome = handle_blobs_in_stable_storage(state, cas_store, &chunk.digests);
+    let outcome = handle_blobs_in_stable_storage_for_store(
+        state,
+        cas_store,
+        &chunk.store_id,
+        &chunk.digests,
+    );
     if outcome.all_succeeded() {
         // Echo the server_instance_token from the chunk into the ack
         // (red-team #5: scheduler validates the token to drop acks
@@ -2695,7 +2751,7 @@ pub async fn new_local_worker(
             // The walker borrows `&dyn StoreDriver` from the store
             // it's given; call `.inner_store(None)` to obtain a
             // borrow without requiring the store to clone its inner.
-            let driver = store.inner_store(None);
+            let driver = store.inner_store(None::<StoreKey<'_>>);
             let fss_borrow =
                 nativelink_store::small_blob_dispatcher::find_fast_slow_for_pin(driver);
             match fss_borrow.and_then(|fss| fss.get_arc()) {

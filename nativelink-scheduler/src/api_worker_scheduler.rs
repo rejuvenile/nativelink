@@ -2869,6 +2869,7 @@ impl ApiWorkerScheduler {
     pub async fn broadcast_blobs_in_stable_storage_chunked(
         &self,
         digests: Vec<DigestInfo>,
+        store_id: &str,
     ) {
         if digests.is_empty() {
             return;
@@ -2937,6 +2938,7 @@ impl ApiWorkerScheduler {
             sequence: c.sequence,
             is_last: c.is_last,
             server_instance_token,
+            store_id: store_id.to_string(),
         }))
         .collect();
 
@@ -4049,8 +4051,12 @@ impl WorkerScheduler for ApiWorkerScheduler {
         self.broadcast_blobs_in_stable_storage(digests).await;
     }
 
-    async fn broadcast_blobs_in_stable_storage_chunked(&self, digests: Vec<DigestInfo>) {
-        self.broadcast_blobs_in_stable_storage_chunked(digests).await;
+    async fn broadcast_blobs_in_stable_storage_chunked(
+        &self,
+        digests: Vec<DigestInfo>,
+        store_id: &str,
+    ) {
+        self.broadcast_blobs_in_stable_storage_chunked(digests, store_id).await;
     }
 
     async fn bis_ack_received(
@@ -4933,7 +4939,7 @@ mod tests {
         // semantics.
         let digests: Vec<DigestInfo> = (0..100_000u64).map(make_digest_info).collect();
         scheduler
-            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .broadcast_blobs_in_stable_storage_chunked(digests, "")
             .await;
 
         let chunks = drain_bis_chunks(&mut rx).await;
@@ -5008,7 +5014,7 @@ mod tests {
 
         let digests: Vec<DigestInfo> = (0..10_000u64).map(make_digest_info).collect();
         scheduler
-            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .broadcast_blobs_in_stable_storage_chunked(digests, "")
             .await;
 
         let chunks = drain_bis_chunks(&mut rx1).await;
@@ -5079,7 +5085,7 @@ mod tests {
 
         let digests: Vec<DigestInfo> = (0..5_000u64).map(make_digest_info).collect();
         scheduler
-            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .broadcast_blobs_in_stable_storage_chunked(digests, "")
             .await;
         let chunks = drain_bis_chunks(&mut rx1).await;
         assert!(!chunks.is_empty(), "must dispatch at least one chunk");
@@ -5115,7 +5121,7 @@ mod tests {
 
         let digests: Vec<DigestInfo> = (0..1000u64).map(make_digest_info).collect();
         scheduler
-            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .broadcast_blobs_in_stable_storage_chunked(digests, "")
             .await;
         let chunks = drain_bis_chunks(&mut rx).await;
 
@@ -5160,7 +5166,7 @@ mod tests {
         // current server_instance_token.
         let digests: Vec<DigestInfo> = (0..200u64).map(make_digest_info).collect();
         scheduler
-            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .broadcast_blobs_in_stable_storage_chunked(digests, "")
             .await;
         let chunks = drain_bis_chunks(&mut rx).await;
         assert!(!chunks.is_empty(), "must dispatch at least one chunk");
@@ -5258,7 +5264,7 @@ mod tests {
         // Pre-populate the buffer with N chunks for endpoint E.
         let digests: Vec<DigestInfo> = (0..400u64).map(make_digest_info).collect();
         scheduler
-            .broadcast_blobs_in_stable_storage_chunked(digests)
+            .broadcast_blobs_in_stable_storage_chunked(digests, "")
             .await;
         let chunks = drain_bis_chunks(&mut rx1).await;
         assert!(chunks.len() >= 1, "must dispatch chunks");
@@ -5386,7 +5392,7 @@ mod tests {
             for i in 0..target_chunks {
                 let digest = vec![make_digest_info(i as u64)];
                 scheduler
-                    .broadcast_blobs_in_stable_storage_chunked(digest)
+                    .broadcast_blobs_in_stable_storage_chunked(digest, "")
                     .await;
             }
         };
@@ -5473,7 +5479,7 @@ mod tests {
             for i in 0..n {
                 let digest = vec![make_digest_info(i as u64)];
                 scheduler
-                    .broadcast_blobs_in_stable_storage_chunked(digest)
+                    .broadcast_blobs_in_stable_storage_chunked(digest, "")
                     .await;
             }
         };
@@ -5536,7 +5542,7 @@ mod tests {
             for i in 0..total {
                 let digest = vec![make_digest_info(i as u64)];
                 scheduler
-                    .broadcast_blobs_in_stable_storage_chunked(digest)
+                    .broadcast_blobs_in_stable_storage_chunked(digest, "")
                     .await;
             }
         };
