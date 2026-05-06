@@ -3745,3 +3745,83 @@ async fn remove_local_ac_pins_empty_inputs_are_noops() -> Result<(), Error> {
     fss.remove_local_ac_pins(&[d(0x99)]); // no match
     Ok(())
 }
+
+/// (Test 5 — BlobsAvailable advertisement: AC slice).
+/// `dispatched_ac_pin_snapshot_for_store` MUST return only digests
+/// whose `store_id` matches the requested `ac_store_id`. This is the
+/// load-bearing partition that keeps AC pins out of the CAS-shaped
+/// `pinned_mirror_entries` (field 16) slice on the wire.
+///
+/// Asymmetric coverage:
+/// - under (matching store: digests appear in the slice);
+/// - over (different store: digests DO NOT appear in the AC slice
+///   even though they share the same `dispatched_mirror_pins` map).
+///
+/// Mutation step: replace the `(sid.as_ref() == ac_store_id)` filter
+/// with `true` → the over-action assertion ("must NOT appear under
+/// AC slice for OTHER store") red-fails.
+#[nativelink_test]
+async fn ac_pin_snapshot_filters_strictly_by_store_id() -> Result<(), Error> {
+    let fss = make_fss_for_ac_pin();
+    let d_main = d(0x10);
+    let d_other = d(0x20);
+    fss.insert_local_ac_pin("AC_MAIN_STORE", d_main);
+    fss.insert_local_ac_pin("AC_OTHER_STORE", d_other);
+    // Add a CAS-shaped pin too — must also stay out of either
+    // AC slice.
+    fss.insert_local_ac_pin("cas_STORE", d(0x30));
+
+    let main_slice = fss.dispatched_ac_pin_snapshot_for_store("AC_MAIN_STORE");
+    let other_slice = fss.dispatched_ac_pin_snapshot_for_store("AC_OTHER_STORE");
+
+    // Under-action: matching store's pin appears.
+    assert!(
+        main_slice.contains(&d_main),
+        "AC slice for AC_MAIN_STORE MUST include its own pin entry; \
+         under-action: snapshot filter dropped a matching digest"
+    );
+    assert!(
+        other_slice.contains(&d_other),
+        "AC slice for AC_OTHER_STORE MUST include its own pin entry"
+    );
+
+    // Over-action: pins from a different store_id MUST NOT appear.
+    assert!(
+        !main_slice.contains(&d_other),
+        "AC slice for AC_MAIN_STORE MUST NOT include AC_OTHER_STORE pin; \
+         over-action: snapshot filter is too permissive across store_ids"
+    );
+    assert!(
+        !other_slice.contains(&d_main),
+        "AC slice for AC_OTHER_STORE MUST NOT include AC_MAIN_STORE pin"
+    );
+    assert!(
+        !main_slice.contains(&d(0x30)),
+        "AC slice for AC_MAIN_STORE MUST NOT include cas_STORE pin; \
+         over-action: AC snapshot leaks CAS-shaped pins into the AC \
+         field-17 wire slice (would route into CAS BlobLocalityMap, \
+         the digest-collision exploit that drove the revert of \
+         merge 563c8ebb)"
+    );
+    Ok(())
+}
+
+/// (Test 5 sibling — empty AC slice when no AC pins exist).
+/// An advertisement tick fired by an unrelated CAS event MUST emit
+/// an EMPTY AC slice (no spurious entries from the shared
+/// `dispatched_mirror_pins` map). Catches "snapshot ignores
+/// store_id filter on empty input" / "snapshot returns the whole
+/// map when filter empty" bugs.
+#[nativelink_test]
+async fn ac_pin_snapshot_empty_when_no_ac_pins() -> Result<(), Error> {
+    let fss = make_fss_for_ac_pin();
+    // Only CAS-shaped pin exists.
+    fss.insert_local_ac_pin("cas_STORE", d(0x40));
+    let ac_slice = fss.dispatched_ac_pin_snapshot_for_store("AC_MAIN_STORE");
+    assert!(
+        ac_slice.is_empty(),
+        "AC slice MUST be empty when no AC pin exists; \
+         over-action: snapshot leaked CAS pins into AC slice"
+    );
+    Ok(())
+}
