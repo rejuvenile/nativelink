@@ -744,7 +744,18 @@ impl SmallBlobDispatcher {
     ///
     /// Synchronous fast-fail order (no allocation, no spawn):
     /// 1. Feature flag off → return.
-    /// 2. `data.len() > SMALL_BLOB_THRESHOLD` → return.
+    ///
+    /// **Size gate ownership (post-Fix 4, #168 testing-czar MAJOR-1):**
+    /// the dispatcher does NOT re-check `data.len() <= SMALL_BLOB_THRESHOLD`
+    /// here. The producer hooks at `bytestream_server::inner_write_oneshot`,
+    /// `cas_server::inner_batch_update_blobs`, and
+    /// `ac_server::inner_update_action_result` are the SOLE authority for the
+    /// size gate. Duplicating it here made the producer-side mutation test
+    /// require a double mutation before red-failing, which made the test
+    /// structurally vacuous. The public `enqueue` async API (used by tests
+    /// + would-be external callers) still re-checks the size as
+    /// defense-in-depth — only this sync schedule fast-path is producer-
+    /// gated only.
     ///
     /// Otherwise spawns a `tokio::task` carrying the snapshot of
     /// connected workers + their senders, and runs the per-worker
@@ -823,17 +834,14 @@ impl SmallBlobDispatcher {
             "dispatch_to_all_workers: fanning out small blob"
         );
         for (endpoint, boot_epoch_id, worker_tx) in workers {
-            if let Err(err) = self
-                .enqueue_with_sender(
-                    endpoint.clone(),
-                    boot_epoch_id,
-                    store_id.clone(),
-                    digest,
-                    data.clone(),
-                    worker_tx,
-                )
-                .await
-            {
+            if let Err(err) = self.enqueue_with_sender(
+                endpoint.clone(),
+                boot_epoch_id,
+                store_id.clone(),
+                digest,
+                data.clone(),
+                worker_tx,
+            ) {
                 warn!(
                     store_id = store_id.as_ref(),
                     %digest,
@@ -999,7 +1007,6 @@ impl SmallBlobDispatcher {
             data,
             worker_tx,
         )
-        .await
     }
 
     /// Internal enqueue variant with a pre-resolved `worker_tx`.
@@ -1029,7 +1036,7 @@ impl SmallBlobDispatcher {
     /// CONSISTENT (i.e., the same one that was registered via
     /// `register_worker(endpoint, boot_epoch_id, ...)`) so a
     /// hypothetical first-time spawn produces the right drainer.
-    async fn enqueue_with_sender(
+    fn enqueue_with_sender(
         &self,
         endpoint_key: Arc<str>,
         boot_epoch_id: u64,

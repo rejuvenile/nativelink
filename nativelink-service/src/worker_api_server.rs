@@ -1006,6 +1006,37 @@ impl WorkerConnection {
         &self,
         notification: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsAvailableNotification,
     ) -> Result<(), Error> {
+        // #168 security MEDIUM Q2 (hoisted from the field-16 block to
+        // function entry per second-pass review): a worker self-reports
+        // its own `worker_cas_endpoint` in BlobsAvailable. The notification
+        // is consumed at THREE sinks below — pinned_mirror_entries (field
+        // 16), `record_mirror_capacity`, and the consolidated
+        // `register_blobs_iter` / `evict_blobs` / `remove_endpoint` block
+        // (field 13 + full-snapshot wipe). All three trust this string;
+        // a malicious worker could spoof another peer's endpoint to
+        // pollute that peer's locality_map (sinks 1+3) or attribute
+        // capacity drift (sink 2). Sink #3's `is_full_snapshot` ×
+        // `remove_endpoint` is the load-bearing concern: it lets a
+        // malicious worker WIPE another peer's locality entries.
+        //
+        // Audit at function entry so the warn! covers ALL sinks. Detective
+        // only — we still process the report (a benign misconfig is
+        // recoverable; rejecting would prevent legit endpoint roll). The
+        // operator-visible audit trail is in the log.
+        if !notification.worker_cas_endpoint.is_empty()
+            && notification.worker_cas_endpoint != self.cas_endpoint
+        {
+            warn!(
+                worker_id=?self.worker_id,
+                reported_endpoint=%notification.worker_cas_endpoint,
+                connected_endpoint=%self.cas_endpoint,
+                "BlobsAvailable: worker self-reported worker_cas_endpoint differs \
+                 from connected endpoint — possible spoof or misconfiguration; \
+                 processing the report but logging for audit (#168 security MEDIUM Q2; \
+                 covers all 3 sinks: pinned_mirror_entries, record_mirror_capacity, \
+                 register_blobs_iter+remove_endpoint)"
+            );
+        }
         // task #168 (item 1): broadcast `pinned_mirror_entries` (proto
         // field 16) to every registered FastSlowStore via the dispatcher.
         // Each `EphemeralServerSidePin` binary-searches the entries slice
@@ -1064,29 +1095,9 @@ impl WorkerConnection {
                 } else {
                     notification.worker_cas_endpoint.as_str()
                 };
-                // #168 security MEDIUM Q2: a worker self-reports its
-                // own `worker_cas_endpoint` in BlobsAvailable. If it
-                // differs from `self.cas_endpoint` (the connect-time
-                // cas_endpoint registered for this worker), this is a
-                // potential spoof / misconfiguration: a malicious or
-                // misconfigured worker could register pinned-mirror
-                // entries against another worker's endpoint, polluting
-                // the locality map. Surface as warn! so operators can
-                // detect; we still process the report (a benign
-                // misconfiguration is recoverable) but the audit
-                // trail is in the log.
-                if !notification.worker_cas_endpoint.is_empty()
-                    && notification.worker_cas_endpoint != self.cas_endpoint
-                {
-                    warn!(
-                        worker_id=?self.worker_id,
-                        reported_endpoint=%notification.worker_cas_endpoint,
-                        connected_endpoint=%self.cas_endpoint,
-                        "BlobsAvailable: worker self-reported worker_cas_endpoint differs \
-                         from connected endpoint — possible spoof or misconfiguration; \
-                         processing the report but logging for audit (#168 security MEDIUM Q2)"
-                    );
-                }
+                // (Spoof-check audit log was hoisted to function entry;
+                // it covers ALL sinks of `worker_cas_endpoint`, not just
+                // this one.)
                 if !endpoint.is_empty() {
                     let digests: Vec<DigestInfo> = notification
                         .pinned_mirror_entries
