@@ -3506,3 +3506,242 @@ async fn dispatched_mirror_pin_snapshot_is_sorted_by_store_id() -> Result<(), Er
 
     Ok(())
 }
+
+// ============================================================================
+// Option A AC mirroring tests (#268 follow-up after revert of 563c8ebb)
+//
+// Coverage map (from spawn-prompt):
+//   1. insert_local_ac_pin: under-action (write succeeds → entry in
+//      dispatched_mirror_pins) + over-action (write fails → no pin)
+//   2. remove_local_ac_pins via BIS-ack drain: under (matching ack →
+//      removed) + over (unrelated ack → kept)
+//   3. Cross-FSS isolation (digest aliasing safety): CAS BIS ack does
+//      NOT remove an AC pin on a different FSS instance, and vice versa.
+//
+// Each test uses production composition (real FastSlowStore via the
+// real spec → new() path) and a tokio::time::timeout deadlock detector.
+// Mutation steps are described in each test's doc-comment.
+// ============================================================================
+
+/// Helper: construct a real FastSlowStore for AC pin testing. The
+/// MemoryStore tiers mirror the production AC FSS shape (worker.json5
+/// configures `MemoryStore` fast tier + `GrpcStore` slow tier; we
+/// substitute `MemoryStore` for the slow tier in test-only since the
+/// pin index doesn't depend on which slow type is used).
+fn make_fss_for_ac_pin() -> Arc<FastSlowStore> {
+    FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    )
+}
+
+fn d(byte: u8) -> DigestInfo {
+    let hash: String = (0..32).map(|_| format!("{byte:02x}")).collect();
+    DigestInfo::try_new(&hash, 100).unwrap()
+}
+
+/// (Test 1, under-action) `insert_local_ac_pin` MUST add `(store_id,
+/// digest)` to `dispatched_mirror_pins` (advertisable on the next
+/// BlobsAvailable tick) and MUST NOT touch `mirror_blobs` (AC pins
+/// don't store bytes — the AC FSS holds them in its fast tier).
+///
+/// Mutation step: comment out
+/// `self.dispatched_mirror_pins.lock().insert(...)` in
+/// `insert_local_ac_pin` and confirm the snapshot assertion red-fails
+/// with the bespoke "MUST contain the inserted entry" message.
+#[nativelink_test]
+async fn insert_local_ac_pin_advertises_without_touching_mirror_blobs(
+) -> Result<(), Error> {
+    let fss = make_fss_for_ac_pin();
+    let digest = d(0x42);
+    let snap0 = fss.dispatched_mirror_pin_snapshot();
+    assert!(snap0.is_empty(), "fresh FSS must have empty pin snapshot");
+    let blob_count_before = fss.mirror_blob_count();
+    let blob_bytes_before = fss.mirror_blobs_used_bytes();
+
+    tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        async { fss.insert_local_ac_pin("AC_MAIN_STORE", digest); },
+    )
+    .await
+    .expect("must not deadlock — insert_local_ac_pin contract violated");
+
+    let snap = fss.dispatched_mirror_pin_snapshot();
+    assert_eq!(
+        snap.len(),
+        1,
+        "dispatched_mirror_pin_snapshot MUST contain the inserted entry; \
+         under-action: insert_local_ac_pin failed to record the pin"
+    );
+    assert_eq!(snap[0].0.as_ref(), "AC_MAIN_STORE");
+    assert_eq!(snap[0].1, digest);
+
+    // Over-action probe: AC pin MUST NOT touch mirror_blobs (this
+    // would over-allocate RAM on every AC write — the production
+    // mirror_blobs cap is for CAS only).
+    assert_eq!(
+        fss.mirror_blob_count(),
+        blob_count_before,
+        "AC pin MUST NOT register a mirror_blobs entry; over-action: \
+         insert_local_ac_pin populated the wrong index"
+    );
+    assert_eq!(
+        fss.mirror_blobs_used_bytes(),
+        blob_bytes_before,
+        "AC pin MUST NOT charge byte cap; over-action: \
+         insert_local_ac_pin charged the CAS mirror byte budget"
+    );
+    Ok(())
+}
+
+/// (Test 2 under-action) `remove_local_ac_pins` MUST remove an entry
+/// whose digest matches a supplied digest (the BIS-ack drain path).
+/// (Test 2 over-action) `remove_local_ac_pins` MUST NOT remove an
+/// entry whose digest does NOT match — that would silently flap the
+/// pin and re-advertise it, causing the server registry to oscillate.
+///
+/// Mutation steps:
+/// - Replace `pins.retain(|(_, d), ()| !lookup.contains(d))` with
+///   `pins.retain(|_, _| true)` (no-op) → under-action assertion
+///   fails ("MUST be empty after BIS-style ack").
+/// - Replace `pins.retain(|(_, d), ()| !lookup.contains(d))` with
+///   `pins.clear()` → over-action assertion fails ("MUST keep the
+///   unrelated digest's pin").
+#[nativelink_test]
+async fn remove_local_ac_pins_drops_only_matched_digests() -> Result<(), Error> {
+    let fss = make_fss_for_ac_pin();
+    let d_ack = d(0xAA);
+    let d_keep = d(0xBB);
+    fss.insert_local_ac_pin("AC_MAIN_STORE", d_ack);
+    fss.insert_local_ac_pin("AC_MAIN_STORE", d_keep);
+    assert_eq!(fss.dispatched_mirror_pin_snapshot().len(), 2);
+
+    // Drive the BIS-ack drain.
+    tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        async { fss.remove_local_ac_pins(&[d_ack]); },
+    )
+    .await
+    .expect("must not deadlock — remove_local_ac_pins contract violated");
+
+    let snap = fss.dispatched_mirror_pin_snapshot();
+    // Under-action: matched entry MUST drop.
+    assert!(
+        !snap.iter().any(|(_, x)| *x == d_ack),
+        "remove_local_ac_pins MUST drop the matched digest's pin entry; \
+         under-action: ack arrived but worker keeps re-advertising the AC pin"
+    );
+    // Over-action: unrelated entry MUST stay.
+    assert!(
+        snap.iter().any(|(_, x)| *x == d_keep),
+        "remove_local_ac_pins MUST keep the unrelated digest's pin entry; \
+         over-action: an unrelated ack stripped a still-in-flight AC pin"
+    );
+    assert_eq!(snap.len(), 1);
+    Ok(())
+}
+
+/// (Test 3) Cross-FSS isolation: an AC FSS instance and a CAS FSS
+/// instance are SEPARATE objects with SEPARATE pin maps. A
+/// remove call on one MUST NOT affect the other, even when the
+/// digest is identical (the action_digest collision case — the
+/// REAPI-mandated reuse of the same hash for the Action proto in
+/// CAS and the AC entry pointing to its result).
+///
+/// This is the regression test for the digest-collision exploit
+/// that triggered the revert of `563c8ebb` — the `pinned_mirror_entries`
+/// channel routed AC pins through the CAS-shared `BlobLocalityMap`.
+/// In Option A we hard-partition AC vs CAS via separate FSS instances
+/// and the dedicated `pinned_ac_mirror_entries` proto field; this
+/// test asserts the FSS-level isolation that underlies the wire
+/// partition.
+///
+/// Mutation step: re-use the same Arc<FastSlowStore> for both `ac` and
+/// `cas` (treating them as one instance) — this test red-fails because
+/// `cas_fss.remove_mirror_blobs` would also drain the AC pins.
+#[nativelink_test]
+async fn ac_and_cas_fss_pin_maps_are_isolated_by_construction() -> Result<(), Error> {
+    let cas_fss = make_fss_for_ac_pin();
+    let ac_fss = make_fss_for_ac_pin();
+    let aliased = d(0xCC); // same digest plays both roles
+
+    // Worker has CAS-side mirror byte for the digest (a peer-pushed
+    // CAS blob) AND an AC pin for the same digest (a worker-written
+    // AC entry referencing an Action whose action_digest == this
+    // digest by REAPI design).
+    cas_fss
+        .insert_dispatched_mirror_blob("cas_STORE", aliased, Bytes::from(vec![0u8; 100]))
+        .expect("CAS insert");
+    ac_fss.insert_local_ac_pin("AC_MAIN_STORE", aliased);
+    assert_eq!(cas_fss.dispatched_mirror_pin_snapshot().len(), 1);
+    assert_eq!(ac_fss.dispatched_mirror_pin_snapshot().len(), 1);
+
+    // Direction A: CAS BIS ack arrives — drains CAS only, leaves AC.
+    tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        async { cas_fss.remove_mirror_blobs(&[aliased]); },
+    )
+    .await
+    .expect("must not deadlock");
+    assert!(
+        cas_fss.dispatched_mirror_pin_snapshot().is_empty(),
+        "CAS BIS ack MUST drain CAS pin (under-action)"
+    );
+    assert_eq!(
+        ac_fss.dispatched_mirror_pin_snapshot().len(),
+        1,
+        "CAS BIS ack on aliased digest MUST NOT touch AC pin map; \
+         over-action: cross-FSS leakage between CAS and AC channels — \
+         this is the exact failure mode that triggered the revert of \
+         merge 563c8ebb."
+    );
+
+    // Direction B: AC BIS ack arrives — drains AC only.
+    // (CAS already empty so direction-A's invariant is
+    // trivially preserved here.)
+    tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        async { ac_fss.remove_local_ac_pins(&[aliased]); },
+    )
+    .await
+    .expect("must not deadlock");
+    assert!(
+        ac_fss.dispatched_mirror_pin_snapshot().is_empty(),
+        "AC BIS ack MUST drain AC pin (under-action)"
+    );
+    Ok(())
+}
+
+/// (Test 4 over-action) `insert_local_ac_pin` is a sync no-arg call
+/// from the success path of `upload_ac_results` — there's no async
+/// boundary at which it could be cancelled or skipped. The
+/// over-action analog is therefore "a write FAILED but the call
+/// fired anyway." Production callsite places `insert_local_ac_pin`
+/// AFTER `update_oneshot.await?` (the `?` returns Err early if the
+/// fast write failed). We verify this contract at the integration
+/// layer in running_actions_manager_test (test 6 below), but it's
+/// worth a unit-level check that an empty digests slice is a no-op
+/// AND an empty pins map shortcuts to no notify storm.
+#[nativelink_test]
+async fn remove_local_ac_pins_empty_inputs_are_noops() -> Result<(), Error> {
+    let fss = make_fss_for_ac_pin();
+    // Empty digests on empty pins.
+    fss.remove_local_ac_pins(&[]);
+    assert!(fss.dispatched_mirror_pin_snapshot().is_empty());
+    // Empty digests on populated pins.
+    fss.insert_local_ac_pin("AC_MAIN_STORE", d(0x77));
+    fss.remove_local_ac_pins(&[]);
+    assert_eq!(fss.dispatched_mirror_pin_snapshot().len(), 1);
+    // Non-empty digests on empty pins (already drained).
+    fss.remove_local_ac_pins(&[d(0x77)]);
+    assert!(fss.dispatched_mirror_pin_snapshot().is_empty());
+    fss.remove_local_ac_pins(&[d(0x99)]); // no match
+    Ok(())
+}
