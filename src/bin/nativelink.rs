@@ -419,13 +419,32 @@ async fn inner_main(
             use nativelink_util::store_trait::StoreDriver;
 
             // Walk the store wrapper chain to find the underlying
-            // FastSlowStore. Mirrors `store_manager.rs:81-108` —
+            // FastSlowStore. Mirrors `store_manager.rs:81-108` and the
+            // sibling `find_fast_slow_chunked` walker below.
+            //
+            // SmallBlobDispatcher targets SMALL blobs (≤8 KiB per plan
+            // C9), so when traversing a `SizePartitioningStore` we pass a
+            // synthetic SMALL-digest key (size 0). That routes through
+            // SizePartitioning's `inner_store(Some(key))` to its
+            // `lower_store` — the side that holds small CAS blobs in
+            // production (`SMALL_CAS_CACHED = FSS { fast: MemoryStore,
+            // slow: RefStore→Redis }`). Without this, SizePartitioning's
+            // `inner_store(None)` returns `self` and the walker bails;
+            // the dispatcher's pin set never registers, and the dispatcher
+            // is silently disabled (the second silent-failure mode of
+            // #168, masked by the regex bug until it was fixed).
+            //
             // ExistenceCacheStore + VerifyStore are the two production
-            // wrappers that return `self` from `inner_store()`, so we
-            // downcast manually. Returns Some(&FastSlowStore) on hit;
-            // None for non-FSS leaves (NoopStore / pure-Memory test
-            // backends / etc.). Stops on the first wrapper that is not
-            // recognized + does not unwrap further.
+            // wrappers that return `self` from `inner_store(None)`, so we
+            // downcast and recurse manually. Stops on the first wrapper
+            // that is not recognized + does not unwrap further.
+            fn synthetic_small_key() -> nativelink_util::store_trait::StoreKey<'static> {
+                // size 0 routes to lower_store under any
+                // SizePartitioning threshold > 0.
+                nativelink_util::store_trait::StoreKey::Digest(
+                    nativelink_util::common::DigestInfo::new([0u8; 32], 0),
+                )
+            }
             fn find_fast_slow_for_pin<'a>(
                 store: &'a dyn StoreDriver,
             ) -> Option<&'a FastSlowStore> {
@@ -437,19 +456,15 @@ async fn inner_main(
                     .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
                 {
                     return find_fast_slow_for_pin(
-                        ecs.inner_store().inner_store(
-                            Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                        ),
+                        ecs.inner_store().inner_store(Some(synthetic_small_key())),
                     );
                 }
                 if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
                     return find_fast_slow_for_pin(
-                        vs.inner_store().inner_store(
-                            Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                        ),
+                        vs.inner_store().inner_store(Some(synthetic_small_key())),
                     );
                 }
-                let inner = store.inner_store(None);
+                let inner = store.inner_store(Some(synthetic_small_key()));
                 if core::ptr::eq(
                     inner as *const dyn StoreDriver,
                     store as *const dyn StoreDriver,
@@ -496,9 +511,8 @@ async fn inner_main(
                     );
                     continue;
                 }
-                let driver: &dyn StoreDriver = store.inner_store(
-                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                );
+                let driver: &dyn StoreDriver =
+                    store.inner_store(Some(synthetic_small_key()));
                 if find_fast_slow_for_pin(driver).is_some() {
                     let pin = Arc::new(EphemeralServerSidePin::new(pin_max_bytes));
                     dispatcher.register_pin_set(store_name, pin);
