@@ -973,6 +973,8 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1100,6 +1102,8 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1229,6 +1233,8 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1414,6 +1420,8 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1600,6 +1608,8 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1812,6 +1822,8 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -1951,6 +1963,8 @@ mod tests {
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2158,6 +2172,8 @@ exit 0
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2338,6 +2354,8 @@ exit 0
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2512,6 +2530,8 @@ exit 1
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2600,6 +2620,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2676,6 +2698,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2751,6 +2775,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2858,6 +2884,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2901,6 +2929,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -2975,6 +3005,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3097,6 +3129,8 @@ exit 1
                     execution_configuration: ExecutionConfiguration::default(),
                     cas_store: cas_store.clone(),
                     ac_store: Some(Store::new(ac_store.clone())),
+                    ac_store_fss: None,
+                    ac_store_name: None,
                     historical_store: Store::new(cas_store.clone()),
                     upload_action_result_config:
                         &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3188,6 +3222,8 @@ exit 1
                     execution_configuration: ExecutionConfiguration::default(),
                     cas_store: cas_store.clone(),
                     ac_store: Some(Store::new(ac_store.clone())),
+                    ac_store_fss: None,
+                    ac_store_name: None,
                     historical_store: Store::new(cas_store.clone()),
                     upload_action_result_config:
                         &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3279,6 +3315,8 @@ exit 1
                     execution_configuration: ExecutionConfiguration::default(),
                     cas_store: cas_store.clone(),
                     ac_store: Some(Store::new(ac_store.clone())),
+                    ac_store_fss: None,
+                    ac_store_name: None,
                     historical_store: Store::new(cas_store.clone()),
                     upload_action_result_config:
                         &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3367,6 +3405,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3525,6 +3565,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3705,6 +3747,8 @@ exit 1
                 root_action_directory,
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 execution_configuration: ExecutionConfiguration::default(),
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
@@ -3807,6 +3851,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -3925,6 +3971,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -4109,6 +4157,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -4233,6 +4283,8 @@ exit 1
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -4378,6 +4430,8 @@ exit 1
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -5277,6 +5331,8 @@ exit 1
                 execution_configuration: ExecutionConfiguration::default(),
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
+                ac_store_fss: None,
+                ac_store_name: None,
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
                     &nativelink_config::cas_server::UploadActionResultConfig {
@@ -5401,6 +5457,152 @@ exit 1
         );
 
         running_action.cleanup().await?;
+        Ok(())
+    }
+
+    /// Production-composition test for the worker AC mirroring path:
+    /// when the worker's AC store is wired as a `FastSlowStore` and the
+    /// `ac_store_fss` + `ac_store_name` plumbing is set, every successful
+    /// `cache_action_result` call MUST register the AC digest in the
+    /// FSS's `dispatched_mirror_pins` index so the next `BlobsAvailable`
+    /// tick advertises it to the server.
+    ///
+    /// Mutation step: comment out the `ac_fss.insert_local_ac_pin(...)`
+    /// call in `upload_ac_results`. The "AC pin entry MUST appear" assert
+    /// red-fails with the bespoke message below.
+    #[nativelink_test]
+    async fn upload_ac_results_registers_pin_in_fss() -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "ac-mirror-worker";
+        const AC_STORE_NAME: &str = "AC_MAIN_STORE";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        // Build the worker's AC store as a FastSlowStore { fast: Memory,
+        // slow: Memory } — production wiring is FastSlowStore { fast:
+        // Memory, slow: GrpcStore }; substituting Memory for the slow
+        // tier keeps the test hermetic while exercising the same FSS
+        // code path that hosts `dispatched_mirror_pins`.
+        let ac_fast_store = MemoryStore::new(&MemorySpec::default());
+        let ac_slow_store = MemoryStore::new(&MemorySpec::default());
+        let ac_fss = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Memory(MemorySpec::default()),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+            },
+            Store::new(ac_fast_store),
+            Store::new(ac_slow_store),
+        );
+        let ac_store_for_ram = Store::new(ac_fss.clone());
+
+        let (_, _slow_store, cas_store, _ac_unused) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        // Empty initially.
+        assert!(
+            ac_fss.dispatched_mirror_pin_snapshot().is_empty(),
+            "fresh AC FSS MUST start with no dispatched_mirror_pins entries"
+        );
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(ac_store_for_ram),
+                ac_store_fss: Some(ac_fss.clone()),
+                ac_store_name: Some(AC_STORE_NAME.to_string()),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Everything,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Construct an action_digest + minimal successful ActionResult so
+        // `cache_action_result` proceeds to upload through the AC FSS.
+        let action_digest =
+            DigestInfo::try_new("a".repeat(64).as_str(), 100).expect("action_digest");
+        let mut action_result = ActionResult {
+            output_files: Vec::new(),
+            output_folders: Vec::new(),
+            output_directory_symlinks: Vec::new(),
+            output_file_symlinks: Vec::new(),
+            exit_code: 0,
+            stdout_digest: DigestInfo::try_new("0".repeat(64).as_str(), 0).expect("stdout"),
+            stderr_digest: DigestInfo::try_new("0".repeat(64).as_str(), 0).expect("stderr"),
+            execution_metadata: ExecutionMetadata {
+                worker: WORKER_ID.to_string(),
+                queued_timestamp: SystemTime::UNIX_EPOCH,
+                worker_start_timestamp: SystemTime::UNIX_EPOCH,
+                worker_completed_timestamp: SystemTime::UNIX_EPOCH,
+                input_fetch_start_timestamp: SystemTime::UNIX_EPOCH,
+                input_fetch_completed_timestamp: SystemTime::UNIX_EPOCH,
+                execution_start_timestamp: SystemTime::UNIX_EPOCH,
+                execution_completed_timestamp: SystemTime::UNIX_EPOCH,
+                output_upload_start_timestamp: SystemTime::UNIX_EPOCH,
+                output_upload_completed_timestamp: SystemTime::UNIX_EPOCH,
+            },
+            server_logs: HashMap::new(),
+            error: None,
+            message: String::new(),
+        };
+        // Wrap under a deadlock-detector timeout — without this, a
+        // hanging upload would wedge the test runner indefinitely.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            running_actions_manager.cache_action_result(
+                action_digest,
+                &mut action_result,
+                DigestHasherFunc::Sha256,
+            ),
+        )
+        .await
+        .expect(
+            "cache_action_result MUST NOT hang — the AC FSS slow tier \
+             is in-process Memory, so the fast write + spawn of the slow \
+             write should both complete promptly",
+        )?;
+
+        let snap = ac_fss.dispatched_mirror_pin_snapshot();
+        assert_eq!(
+            snap.len(),
+            1,
+            "AC pin entry MUST appear in dispatched_mirror_pins after \
+             cache_action_result — `upload_ac_results` is supposed to call \
+             `ac_fss.insert_local_ac_pin(ac_store_name, action_digest)` \
+             on the success path; got snapshot {snap:?}"
+        );
+        assert_eq!(snap[0].0.as_ref(), AC_STORE_NAME);
+        assert_eq!(snap[0].1, action_digest);
+
+        // Simulate the BIS ack path: server confirms; pin must clear.
+        ac_fss.remove_local_ac_pins(&[action_digest]);
+        let snap2 = ac_fss.dispatched_mirror_pin_snapshot();
+        assert!(
+            snap2.is_empty(),
+            "remove_local_ac_pins MUST drop the entry on BIS ack — \
+             leaving stale pins makes the worker re-advertise blobs the \
+             server already persisted; got snapshot {snap2:?}"
+        );
+
         Ok(())
     }
 }

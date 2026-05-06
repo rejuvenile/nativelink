@@ -670,6 +670,12 @@ pub struct BlobsAvailableState {
     /// The FastSlowStore backing the worker's CAS server. Used to clean up
     /// mirror blobs when `BlobsInStableStorage` is received.
     cas_server_fss: Option<Arc<FastSlowStore>>,
+    /// The FastSlowStore backing the worker's AC store, when configured
+    /// as a `FastSlowStore`. Source of `pinned_mirror_entries` for AC
+    /// digests in the `BlobsAvailable` snapshot, and target of the
+    /// AC-pin removal on `BlobsInStableStorage` ack. `None` when the
+    /// worker has no AC store, or its AC store is a direct GrpcStore.
+    ac_store_fss: Option<Arc<FastSlowStore>>,
 }
 
 impl BlobsAvailableState {
@@ -681,6 +687,18 @@ impl BlobsAvailableState {
         fs_store: Arc<FilesystemStore>,
         cas_server_fss: Option<Arc<FastSlowStore>>,
     ) -> Self {
+        Self::new_for_test_with_ac(fs_store, cas_server_fss, None)
+    }
+
+    /// Test-only constructor that also accepts an AC FastSlowStore handle
+    /// for tests that exercise the AC-pin advertisement / unpin paths.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn new_for_test_with_ac(
+        fs_store: Arc<FilesystemStore>,
+        cas_server_fss: Option<Arc<FastSlowStore>>,
+        ac_store_fss: Option<Arc<FastSlowStore>>,
+    ) -> Self {
         Self {
             fs_store,
             tracker: BlobChangeTracker::new(Arc::new(Notify::new())),
@@ -688,6 +706,7 @@ impl BlobsAvailableState {
             notify: Arc::new(Notify::new()),
             max_interval: Duration::from_secs(60),
             cas_server_fss,
+            ac_store_fss,
         }
     }
 }
@@ -891,6 +910,15 @@ pub fn handle_blobs_in_stable_storage(
                 "BlobsInStableStorage: removed mirror blobs from memory"
             );
         }
+    }
+    // Clean up worker-local AC pin entries from the AC FastSlowStore.
+    // The server confirms AC entries via the same `BlobsInStableStorage`
+    // mechanism it uses for CAS — a single ack drains both stores'
+    // matching `dispatched_mirror_pins` entries for the digest. Note:
+    // `remove_local_ac_pins` does NOT touch `mirror_blobs` (AC pins
+    // never lived there — the bytes are in the FSS fast tier).
+    if let Some(ac_fss) = state.ac_store_fss.as_ref() {
+        ac_fss.remove_local_ac_pins(&acked_digests);
     }
     info!(
         unpinned,
@@ -1457,13 +1485,58 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let removed_subtree_count = removed_subtree_digests.len();
         let pinned_mirror_count = pinned_mirror_digests.len();
 
-        // Skip sending if there are truly no changes at all.
+        // Build the merged `pinned_mirror_entries` snapshot once so we
+        // can both (a) include AC pin entries in the "skip if no changes"
+        // check and (b) reuse the merged Vec when constructing the
+        // notification below — avoiding two BTreeMap snapshots per tick.
+        let pinned_mirror_entries: Vec<MirrorPinEntry> = {
+            let mut merged: Vec<MirrorPinEntry> = Vec::new();
+            if let Some(fss) = state.cas_server_fss.as_ref() {
+                merged.extend(fss.dispatched_mirror_pin_snapshot().into_iter().map(
+                    |(store_id, digest)| MirrorPinEntry {
+                        digest: Some(digest.into()),
+                        store_id: store_id.to_string(),
+                    },
+                ));
+            }
+            if let Some(ac_fss) = state.ac_store_fss.as_ref() {
+                merged.extend(ac_fss.dispatched_mirror_pin_snapshot().into_iter().map(
+                    |(store_id, digest)| MirrorPinEntry {
+                        digest: Some(digest.into()),
+                        store_id: store_id.to_string(),
+                    },
+                ));
+            }
+            if !merged.is_empty() {
+                // Re-sort merged result so the server-side binary-search
+                // self-filter in
+                // `EphemeralServerSidePin::observe_pinned_mirror_ack`
+                // sees the expected (store_id ASCII, then digest) order.
+                merged.sort_by(|a, b| {
+                    a.store_id.cmp(&b.store_id).then_with(|| {
+                        a.digest
+                            .as_ref()
+                            .map(|d| (d.hash.as_str(), d.size_bytes))
+                            .cmp(&b.digest.as_ref().map(|d| (d.hash.as_str(), d.size_bytes)))
+                    })
+                });
+            }
+            merged
+        };
+        let pinned_mirror_entries_count = pinned_mirror_entries.len();
+
+        // Skip sending if there are truly no changes at all. Note:
+        // `pinned_mirror_entries_count` covers both CAS mirror pins
+        // (server→worker push) and AC pins (worker-local writes). A
+        // non-zero count keeps the tick alive so the server's locality
+        // map gets the AC pin advertisement during the slow-write window.
         if !is_first
             && new_or_touched_count == 0
             && evicted_count == 0
             && added_subtree_count == 0
             && removed_subtree_count == 0
             && pinned_mirror_count == 0
+            && pinned_mirror_entries_count == 0
         {
             trace!("BlobsAvailable: no changes since last tick, skipping");
             return Ok(());
@@ -1500,27 +1573,9 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 .cas_server_fss
                 .as_ref()
                 .map_or(0, |fss| fss.mirror_blobs_max_bytes()),
-            // Field 16 (task #168 item 5): the dispatcher-pushed
-            // pin snapshot keyed by (store_id, digest). Iterates the
-            // FastSlowStore's `dispatched_mirror_pins` BTreeMap so the
-            // order is sorted by `store_id` ASCII (then by DigestInfo)
-            // — the precondition for the server's binary-search
-            // self-filter in `EphemeralServerSidePin::observe_pinned_mirror_ack`.
-            // Empty when the dispatcher has pushed nothing OR when
-            // there is no `cas_server_fss` on this worker.
-            pinned_mirror_entries: state
-                .cas_server_fss
-                .as_ref()
-                .map(|fss| {
-                    fss.dispatched_mirror_pin_snapshot()
-                        .into_iter()
-                        .map(|(store_id, digest)| MirrorPinEntry {
-                            digest: Some(digest.into()),
-                            store_id: store_id.to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
+            // Field 16: the merged pin snapshot built above (CAS mirror
+            // pins + AC pins, sorted by `store_id` ASCII then digest).
+            pinned_mirror_entries,
         };
 
         if let Err(err) = grpc_client.blobs_available(notification).await {
@@ -1590,6 +1645,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             // copy of a blob if the server was slow to ack stable storage.
             let mirror_notify =
                 state.cas_server_fss.as_ref().map(|f| f.mirror_changes_notify());
+            // Same idea for the AC FSS: wake on `insert_local_ac_pin` /
+            // `remove_local_ac_pins` so newly-written AC entries advertise
+            // promptly during the slow-write window. Reuses the FSS's
+            // existing `mirror_changes_notify` (one notify covers both
+            // CAS mirror events and AC pin events on a given FSS instance).
+            let ac_notify =
+                state.ac_store_fss.as_ref().map(|f| f.mirror_changes_notify());
             let ram = self.running_actions_manager.clone();
             futures.push(
                 async move {
@@ -1605,9 +1667,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     loop {
                         // Wait for any of:
                         // 1. A FilesystemStore blob insert/eviction (immediate wake)
-                        // 2. A mirror-blob insert/remove (immediate wake — only
+                        // 2. A CAS mirror-blob insert/remove (immediate wake — only
                         //    armed if a CAS server FastSlowStore exists)
-                        // 3. The backstop interval (catches subtree-only changes)
+                        // 3. An AC FSS pin insert/remove (immediate wake — only
+                        //    armed if the worker's AC store is a FastSlowStore)
+                        // 4. The backstop interval (catches subtree-only changes)
                         //
                         // Stack-pinned Notified instead of `Box::pin` per
                         // iteration — saves one heap allocation per
@@ -1620,9 +1684,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             mirror_notify.as_deref().map(Notify::notified),
                         );
                         tokio::pin!(mirror_wait);
+                        let ac_wait = OptionFuture::from(
+                            ac_notify.as_deref().map(Notify::notified),
+                        );
+                        tokio::pin!(ac_wait);
                         tokio::select! {
                             () = state.notify.notified() => {}
                             Some(()) = &mut mirror_wait => {}
+                            Some(()) = &mut ac_wait => {}
                             () = sleep(state.max_interval) => {}
                         }
                         Self::send_periodic_blobs_available(
@@ -2342,10 +2411,19 @@ impl<
 
 /// Creates a new `LocalWorker`. The `cas_store` must be an instance of
 /// `FastSlowStore` and will be checked at runtime.
+///
+/// `ac_store_name` is the configured store name (e.g. `"AC_MAIN_STORE"`)
+/// for the AC store, used as the `store_id` for the AC pin advertisement
+/// path. When the AC store is a `FastSlowStore`, the worker registers
+/// AC pin entries in its `dispatched_mirror_pins` index after each
+/// `upload_ac_results` so the next `BlobsAvailable` tick advertises
+/// them to the server (locality-map awareness during the slow-write
+/// window). `None` ⇒ no AC store configured / no name to advertise.
 pub async fn new_local_worker(
     config: Arc<LocalWorkerConfig>,
     cas_store: Store,
     ac_store: Option<Store>,
+    ac_store_name: Option<String>,
     historical_store: Store,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
     start_cpu_sampler()?;
@@ -2553,6 +2631,18 @@ pub async fn new_local_worker(
     // Keep a reference for mirror blob cleanup in BlobsInStableStorage.
     let cas_server_fss = effective_cas_store_for_cas_server.clone();
 
+    // Downcast the AC store to a FastSlowStore Arc when possible. The
+    // worker's AC store wiring uses `FastSlowStore { fast: MemoryStore,
+    // slow: GrpcStore }` — the FSS's spawned background slow write is
+    // the seam where we need to advertise the AC entry as a worker-local
+    // pin during the slow-write window. Direct GrpcStore (no FSS wrap)
+    // is also supported in config; in that case `ac_store_fss` stays
+    // None and `upload_ac_results` skips the pin-advertisement step.
+    #[allow(clippy::disallowed_methods)]
+    let ac_store_fss = ac_store
+        .as_ref()
+        .and_then(|s| s.downcast_ref::<FastSlowStore>(None).and_then(|f| f.get_arc()));
+
     let running_actions_manager =
         Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
             root_action_directory: config.work_directory.clone(),
@@ -2562,6 +2652,8 @@ pub async fn new_local_worker(
             },
             cas_store: effective_cas_store,
             ac_store,
+            ac_store_fss: ac_store_fss.clone(),
+            ac_store_name: ac_store_name.clone(),
             historical_store,
             upload_action_result_config: &config.upload_action_result,
             max_action_timeout,
@@ -2626,6 +2718,7 @@ pub async fn new_local_worker(
                 notify,
                 max_interval: Duration::from_millis(max_interval_ms),
                 cas_server_fss: Some(cas_server_fss.clone()),
+                ac_store_fss: ac_store_fss.clone(),
             })
         } else {
             warn!("FastSlowStore's fast store is not a FilesystemStore; BlobsAvailable reporting disabled");
