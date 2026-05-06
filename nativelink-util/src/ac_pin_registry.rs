@@ -39,9 +39,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::common::DigestInfo;
 use parking_lot::RwLock;
 use tracing::debug;
+
+use crate::common::DigestInfo;
 
 /// Per-worker AC pin set. Key is `(store_id, digest)` so multiple AC
 /// stores per worker remain disambiguated server-side. The `store_id`
@@ -120,31 +121,6 @@ impl AcPinRegistry {
             return;
         }
         set.insert((store_id, digest));
-    }
-
-    /// Drop the matching `(store_id, digest)` AC pin entry (if any).
-    /// Idempotent — silently no-ops on missing endpoint or missing
-    /// entry. Today this is unused because no drain channel calls
-    /// `unregister_ac_pin` directly (drain is via
-    /// [`Self::remove_digests_for_endpoint`] from the BIS broadcast
-    /// loop's AC sweep). Kept on the API surface as the symmetric
-    /// inverse of `register_ac_pin` for future use.
-    pub fn unregister_ac_pin(
-        &self,
-        endpoint: &str,
-        store_id: &str,
-        digest: &DigestInfo,
-    ) {
-        let mut guard = self.inner.write();
-        if let Some(set) = guard.get_mut(endpoint) {
-            // Avoid building an `Arc<str>` just for the lookup key.
-            // HashSet::retain is O(N) but pin-set size is small in steady
-            // state and unregister_ac_pin is on the cold (per-pin) path.
-            set.retain(|(sid, d)| !(sid.as_ref() == store_id && d == digest));
-            if set.is_empty() {
-                guard.remove(endpoint);
-            }
-        }
     }
 
     /// Remove all AC pin entries for `endpoint` matching ANY of the
