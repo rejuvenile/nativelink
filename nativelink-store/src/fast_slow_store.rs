@@ -1816,13 +1816,14 @@ impl FastSlowStore {
     /// `bytestream_server::write` and `cas_server::batch_update_blobs`,
     /// silently losing Action proto bytes.
     ///
-    /// **Read-side wiring is a future commit (#277 follow-up).** Today
-    /// this method's value is establishing the wire channel; the AC
-    /// peer-fetch path is not yet wired. With no consumer today,
-    /// MemoryStore-eviction-vs-pin divergence is harmless TODO that
-    /// becomes load-bearing the moment a reader lands — at that point
-    /// the eviction-callback drain (Option A1) MUST be added so pin
-    /// state matches fast-tier residency.
+    /// **Read-side wiring lands in a follow-up commit.** Today this
+    /// method's value is establishing the wire channel; the AC peer-
+    /// fetch path is not yet wired. With no consumer today,
+    /// MemoryStore-eviction-vs-pin divergence is dormant — it becomes
+    /// load-bearing the moment a reader lands. At that point the
+    /// eviction-callback drain MUST be added so pin state matches
+    /// fast-tier residency.
+    /// TODO: AC peer-fetch + pin-eviction interlock.
     pub fn insert_local_ac_pin(&self, store_id: &str, digest: DigestInfo) {
         debug!(store_id, %digest, "insert_local_ac_pin");
         let key: Arc<str> = Arc::from(store_id);

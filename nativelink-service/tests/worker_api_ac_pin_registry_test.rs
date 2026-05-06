@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Server-side `AcPinRegistry` integration tests for Option A AC
-//! mirroring (#268).
+//! Server-side `AcPinRegistry` integration tests for AC mirroring.
 //!
 //! Coverage:
 //!   1. **Field-17 advertisement registers in the AC registry**
@@ -366,8 +365,8 @@ async fn field_17_populates_ac_registry_only() -> Result<(), Box<dyn core::error
         map.lookup_workers(&d1).is_empty(),
         "AC pin MUST NOT register in CAS locality map; \
          over-action: cross-channel leakage on field 17 \
-         (this is the digest-collision exploit that drove the \
-         revert of merge 563c8ebb)"
+         (this is the digest-collision exploit that the hard-partition \
+         design defends against)"
     );
     assert!(
         map.lookup_workers(&d2).is_empty(),

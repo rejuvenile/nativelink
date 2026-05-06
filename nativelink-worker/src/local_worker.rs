@@ -702,12 +702,11 @@ impl BlobsAvailableState {
     /// Test-only: build a `BlobsAvailableState` from explicit components.
     /// The non-test path constructs this inline inside `new_local_worker`.
     ///
-    /// Per simplifier MAJOR-3 + N1 on #268 review: this single
-    /// constructor accepts the AC handle as a final optional arg so
-    /// future test authors don't need to remember which constructor
-    /// to call when adding a new optional field. The vast majority of
-    /// callers pass `None` for `ac_mirror_target`; use
-    /// [`Self::new_for_test_default_ac`] in those cases.
+    /// Forwards to [`Self::new_for_test_with_ac`] passing `None` for the
+    /// AC handle. This single-constructor design (with the AC handle as
+    /// a final optional arg) means test authors don't need to remember
+    /// which factory to call when a new optional state field lands —
+    /// the vast majority of callers pass `None` for `ac_mirror_target`.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn new_for_test(
@@ -1677,13 +1676,15 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
-            // Field 17 (Option A AC mirroring follow-up to revert
-            // `c9239dbf` of `563c8ebb`): the AC pin snapshot, fed from
-            // a SEPARATE `FastSlowStore` instance (the AC FSS). This
-            // field is HARD-PARTITIONED from `pinned_mirror_entries`:
-            // the server registers it in the dedicated `AcPinRegistry`
-            // — never the CAS-shared `BlobLocalityMap` — so CAS
-            // upload short-circuits cannot consume AC pin claims.
+            // AC pin snapshot, fed from a SEPARATE `FastSlowStore`
+            // instance (the AC FSS). HARD-PARTITIONED from
+            // `pinned_mirror_entries`: the server registers it in the
+            // dedicated `AcPinRegistry` — never the CAS-shared
+            // `BlobLocalityMap` — because `action_digest` IS by REAPI
+            // design the same digest as the Action proto in CAS, so
+            // routing AC pins through the locality map would cause CAS
+            // upload short-circuits to silently skip uploads of the
+            // Action proto bytes.
             pinned_ac_mirror_entries,
         };
 
@@ -2748,8 +2749,8 @@ pub async fn new_local_worker(
     // that the CAS pin path uses, NOT a single-level downcast — a bare
     // downcast silently disables AC pin advertisement the moment any
     // wrapper (ExistenceCacheStore, VerifyStore, etc.) lands above the
-    // FSS, which is the exact bit-rot footgun testing-czar B3 flagged
-    // on the reverted #268.
+    // FSS, since each wrapper presents its own Arc and a one-level
+    // downcast misses the layered chain.
     //
     // Per the type-system invariant on `AcMirrorTarget`, both `fss`
     // and `store_id` are produced together — there is no "have one,

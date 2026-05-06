@@ -3508,9 +3508,9 @@ async fn dispatched_mirror_pin_snapshot_is_sorted_by_store_id() -> Result<(), Er
 }
 
 // ============================================================================
-// Option A AC mirroring tests (#268 follow-up after revert of 563c8ebb)
+// Option A AC mirroring tests for FastSlowStore.
 //
-// Coverage map (from spawn-prompt):
+// Coverage map:
 //   1. insert_local_ac_pin: under-action (write succeeds → entry in
 //      dispatched_mirror_pins) + over-action (write fails → no pin)
 //   2. remove_local_ac_pins via BIS-ack drain: under (matching ack →
@@ -3655,11 +3655,12 @@ async fn remove_local_ac_pins_drops_only_matched_digests() -> Result<(), Error> 
 /// REAPI-mandated reuse of the same hash for the Action proto in
 /// CAS and the AC entry pointing to its result).
 ///
-/// This is the regression test for the digest-collision exploit
-/// that triggered the revert of `563c8ebb` — the `pinned_mirror_entries`
-/// channel routed AC pins through the CAS-shared `BlobLocalityMap`.
-/// In Option A we hard-partition AC vs CAS via separate FSS instances
-/// and the dedicated `pinned_ac_mirror_entries` proto field; this
+/// This is the regression test for the digest-collision exploit:
+/// previously the `pinned_mirror_entries` channel routed AC pins
+/// through the CAS-shared `BlobLocalityMap`, which would weaponize CAS
+/// upload short-circuits to silently drop Action proto bytes. The
+/// current design hard-partitions AC vs CAS via separate FSS instances
+/// and a dedicated `pinned_ac_mirror_entries` proto field; this
 /// test asserts the FSS-level isolation that underlies the wire
 /// partition.
 ///
@@ -3699,8 +3700,8 @@ async fn ac_and_cas_fss_pin_maps_are_isolated_by_construction() -> Result<(), Er
         1,
         "CAS BIS ack on aliased digest MUST NOT touch AC pin map; \
          over-action: cross-FSS leakage between CAS and AC channels — \
-         this is the exact failure mode that triggered the revert of \
-         merge 563c8ebb."
+         this is the digest-collision exploit on the AC mirroring \
+         channel that the hard-partition design defends against."
     );
 
     // Direction B: AC BIS ack arrives — drains AC only.
@@ -3799,9 +3800,9 @@ async fn ac_pin_snapshot_filters_strictly_by_store_id() -> Result<(), Error> {
         !main_slice.contains(&d(0x30)),
         "AC slice for AC_MAIN_STORE MUST NOT include cas_STORE pin; \
          over-action: AC snapshot leaks CAS-shaped pins into the AC \
-         field-17 wire slice (would route into CAS BlobLocalityMap, \
-         the digest-collision exploit that drove the revert of \
-         merge 563c8ebb)"
+         field-17 wire slice (would route into CAS BlobLocalityMap and \
+         weaponize CAS upload short-circuits — the digest-collision \
+         exploit the hard-partition design defends against)"
     );
     Ok(())
 }

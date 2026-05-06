@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Worker-side BIS handler routing tests for Option A AC mirroring
-//! (#268). These cover the "asymmetric" cases that complement the
-//! existing CAS-only `blobs_in_stable_storage_handler_test.rs`:
+//! Worker-side BIS handler routing tests for AC mirroring. These cover
+//! the "asymmetric" cases that complement the existing CAS-only
+//! `blobs_in_stable_storage_handler_test.rs`:
 //!
 //! 1. **AC chunk → AC drain only** (under-action of AC path):
 //!    a non-empty `store_id` matching this worker's configured AC
@@ -26,9 +26,10 @@
 //!    cross-channel leakage.
 //! 3. **CAS chunk does NOT touch AC state** (over-action of AC path):
 //!    an empty-store_id chunk MUST NOT call `remove_local_ac_pins` on
-//!    the AC FSS, even when the chunk's digest aliases an AC pin
-//!    (REAPI digest collision case — the exact mechanism that drove
-//!    the revert of merge `563c8ebb`).
+//!    the AC FSS, even when the chunk's digest aliases an AC pin —
+//!    REAPI mandates that an Action's hash is the same digest used in
+//!    both CAS and AC, so a CAS BIS ack carrying that digest must
+//!    still leave the AC pin map untouched.
 //! 4. **Unknown store_id → warn + ack** (no-panic, no-state-change):
 //!    a chunk whose `store_id` matches neither "" nor the configured
 //!    AC store is treated as a no-op. The chunk still acks (the BIS
@@ -198,8 +199,8 @@ async fn ac_chunk_drains_ac_only_not_cas() {
         1,
         "CAS mirror blob MUST NOT be removed by AC-tagged chunk; \
          over-action: AC routing leaked into CAS path \
-         (this is the digest-collision exploit that drove the \
-         revert of merge 563c8ebb)"
+         (this is the digest-collision exploit that the hard-partition \
+         design defends against)"
     );
 }
 
