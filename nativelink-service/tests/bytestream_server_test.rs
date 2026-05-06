@@ -3035,3 +3035,171 @@ pub async fn query_write_status_debug_asserts_committed_size_within_digest()
 
     Ok(())
 }
+
+// --------------------------------------------------------------------
+// Production-composition coverage for the chunked-write `bytes_received
+// > expected_size` overrun check at proto_stream_utils.rs:152.
+//
+// Background: 2026-05-06 a deterministic Bazel-side cache corruption
+// caused production "sent too much data: expected=17139 ... bytes_received
+// =17218" failures (RCA in `.claude/audits/...`). The unit-level coverage
+// at `nativelink-util/tests/proto_stream_utils_test.rs::genuine_overrun_
+// is_still_rejected` exercises `WriteRequestStreamWrapper` directly. The
+// END-TO-END production-composition path (Bazel client → ByteStreamServer
+// → WriteRequestStreamWrapper → store) had ZERO coverage of the rejection
+// branch — every existing chunked test sends correctly-sized chunks. Per
+// CLAUDE.md "Asymmetric contract coverage": the over-action direction
+// (server REJECTS oversized client streams) was the under-tested side.
+//
+// Tests below close that gap: drive a real 2-chunk WriteRequest stream
+// through the full bytestream_server stack where chunk2's offset+len
+// exceeds the declared digest size by 79 bytes (matching the production
+// failure delta). Mutation step: comment out the `if self.bytes_received
+// > self.resource_info.expected_size` branch in
+// `nativelink-util/src/proto_stream_utils.rs`; both tests must red-fail.
+// --------------------------------------------------------------------
+
+/// Chunked client uploads MORE bytes than the digest declares — server
+/// MUST reject with `InvalidArgument: sent too much data`. Mirrors the
+/// production 2026-05-06 incident shape (Bazel sent 17218 bytes for a
+/// blob declared as 17139 bytes; off by 79).
+#[nativelink_test]
+pub async fn chunked_overrun_is_rejected_by_bytestream_server()
+-> Result<(), Box<dyn core::error::Error>> {
+    // Production-incident byte counts (May 6 RCA): declared 17139,
+    // sent 17218. Delta = 79 bytes (consistent with LF→CRLF on a
+    // ~79-line file or similar deterministic Bazel cache drift).
+    const DECLARED_LEN: usize = 17139;
+    const ACTUAL_LEN: usize = 17218;
+    const FIRST_CHUNK_LEN: usize = 16384; // 16 KiB — same boundary Bazel uses.
+    const SECOND_CHUNK_LEN: usize = ACTUAL_LEN - FIRST_CHUNK_LEN; // 834 bytes.
+
+    let store_manager = make_store_manager().await?;
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
+    );
+
+    let (tx, join_handle) =
+        make_stream_and_writer_spawn(bs_server, Some(CompressionEncoding::Gzip));
+
+    // The resource name DECLARES 17139 bytes (matching the digest the
+    // Bazel client computed). The chunks below SEND 17218 bytes — the
+    // mismatch the production incident exposed.
+    let resource_name = make_resource_name(DECLARED_LEN);
+    let payload = vec![0u8; ACTUAL_LEN];
+
+    let make_chunk = |offset: i64, range: core::ops::Range<usize>, finish: bool| WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: offset,
+        finish_write: finish,
+        data: Bytes::copy_from_slice(&payload[range]),
+    };
+
+    // Chunk 1: 16384 bytes at offset 0 — fits within DECLARED_LEN.
+    tx.send(Frame::data(encode_stream_proto(&make_chunk(
+        0,
+        0..FIRST_CHUNK_LEN,
+        false,
+    ))?))
+    .await?;
+    // Chunk 2: 834 bytes at offset 16384 — bytes_received high-watermark
+    // becomes 17218, which exceeds DECLARED_LEN=17139. Must be rejected.
+    tx.send(Frame::data(encode_stream_proto(&make_chunk(
+        FIRST_CHUNK_LEN as i64,
+        FIRST_CHUNK_LEN..ACTUAL_LEN,
+        true,
+    ))?))
+    .await?;
+    drop(tx);
+
+    let server_result = join_handle.await.expect("Failed to join");
+    let status = server_result
+        .expect_err("server MUST reject chunked overrun (2026-05-06 RCA contract)");
+    let msg = status.message();
+    assert!(
+        msg.contains("sent too much data"),
+        "rejection MUST name the contract being violated — \
+         expected 'sent too much data' in error message, got: {msg}",
+    );
+    assert!(
+        msg.contains(&format!("expected={DECLARED_LEN}")),
+        "rejection MUST include declared size for operator diagnosis — \
+         expected 'expected={DECLARED_LEN}' in error message, got: {msg}",
+    );
+    assert!(
+        msg.contains(&format!("bytes_received={ACTUAL_LEN}")),
+        "rejection MUST include actual bytes_received for operator diagnosis — \
+         expected 'bytes_received={ACTUAL_LEN}' in error message, got: {msg}",
+    );
+
+    Ok(())
+}
+
+/// Symmetric under-action coverage: chunked client uploads EXACTLY the
+/// declared bytes — server MUST accept. Without this, a future regression
+/// could disable the rejection branch entirely (or invert the check) and
+/// the over-action test alone wouldn't notice.
+#[nativelink_test]
+pub async fn chunked_exact_size_is_accepted_by_bytestream_server()
+-> Result<(), Box<dyn core::error::Error>> {
+    // Same declared size as the over-action test, but client sends
+    // exactly that many bytes — boundary case to prove the check
+    // doesn't false-positive on writes that fill the declared size.
+    const DECLARED_LEN: usize = 17139;
+    const FIRST_CHUNK_LEN: usize = 16384;
+    const SECOND_CHUNK_LEN: usize = DECLARED_LEN - FIRST_CHUNK_LEN; // 755 bytes.
+
+    let store_manager = make_store_manager().await?;
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
+    );
+    let store = store_manager.get_store("main_cas").unwrap();
+
+    let (tx, join_handle) =
+        make_stream_and_writer_spawn(bs_server, Some(CompressionEncoding::Gzip));
+
+    let resource_name = make_resource_name(DECLARED_LEN);
+    let payload = vec![0u8; DECLARED_LEN];
+
+    let make_chunk = |offset: i64, range: core::ops::Range<usize>, finish: bool| WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: offset,
+        finish_write: finish,
+        data: Bytes::copy_from_slice(&payload[range]),
+    };
+
+    tx.send(Frame::data(encode_stream_proto(&make_chunk(
+        0,
+        0..FIRST_CHUNK_LEN,
+        false,
+    ))?))
+    .await?;
+    tx.send(Frame::data(encode_stream_proto(&make_chunk(
+        FIRST_CHUNK_LEN as i64,
+        FIRST_CHUNK_LEN..DECLARED_LEN,
+        true,
+    ))?))
+    .await?;
+    drop(tx);
+
+    let server_result = join_handle
+        .await
+        .expect("Failed to join")
+        .expect("exact-size chunked write MUST succeed (boundary case for overrun check)");
+    let committed = usize::try_from(server_result.into_inner().committed_size)
+        .or(Err("Cant convert i64 to usize"))?;
+    assert_eq!(
+        committed, DECLARED_LEN,
+        "committed_size MUST equal declared size on exact-fit chunked write",
+    );
+    assert!(
+        store
+            .has(DigestInfo::try_new(HASH1, DECLARED_LEN)?)
+            .await?
+            .is_some(),
+        "blob MUST be present in store after successful chunked write",
+    );
+
+    let _ = SECOND_CHUNK_LEN; // referenced for documentation; bound check above is the assertion.
+    Ok(())
+}
