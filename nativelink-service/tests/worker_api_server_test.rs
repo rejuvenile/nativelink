@@ -187,6 +187,7 @@ async fn setup_api_server_with_task_limit(
         None,
         None,
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -703,6 +704,7 @@ async fn setup_api_server_with_locality(
         None,
         None,
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -821,6 +823,7 @@ async fn setup_api_server_with_mirror_proxy(
         None,
         Some(worker_proxy.clone()),
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -910,6 +913,7 @@ pub async fn mirror_capacity_report_plumbed_to_picker_test()
             mirror_used_bytes: REPORTED_USED,
             mirror_max_bytes: REPORTED_MAX,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -971,6 +975,7 @@ pub async fn zero_mirror_max_does_not_record_capacity_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1025,6 +1030,7 @@ pub async fn handle_blobs_available_populates_locality_map_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
@@ -1086,6 +1092,7 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1120,6 +1127,7 @@ pub async fn full_snapshot_replaces_endpoint_view_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1177,6 +1185,7 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1202,6 +1211,7 @@ pub async fn incremental_update_preserves_existing_blobs_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1251,6 +1261,7 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1276,6 +1287,7 @@ pub async fn eviction_removes_digests_from_locality_map_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1330,6 +1342,7 @@ pub async fn worker_disconnect_cleans_up_locality_map_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1414,6 +1427,7 @@ pub async fn blobs_available_with_malformed_digests_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1467,6 +1481,7 @@ pub async fn blobs_evicted_is_noop_for_wire_compat_test()
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;
@@ -1545,6 +1560,7 @@ async fn setup_multi_connect() -> Result<MultiConnectContext, Error> {
         Box::new(static_now_fn),
         [1u8; 6],
         Some(locality_map.clone()),
+        None,
         None,
         None,
         None,
@@ -1629,6 +1645,7 @@ async fn send_blobs_and_wait(
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| make_err!(tonic::Code::Internal, "Error sending: {e}"))?;

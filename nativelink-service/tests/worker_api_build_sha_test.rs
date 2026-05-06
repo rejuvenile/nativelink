@@ -135,6 +135,7 @@ fn build_server(
         None,
         None,
         None,
+        None,
     )
     .err_tip(|| "build_server: WorkerApiServer::new_with_now_fn")?;
 

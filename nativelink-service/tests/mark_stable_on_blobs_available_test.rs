@@ -311,6 +311,7 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
         Some(cas_store.clone()),
         None,
         None,
+        None,
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -388,6 +389,7 @@ async fn send_blobs_available(
             mirror_used_bytes: 0,
             mirror_max_bytes: 0,
             pinned_mirror_entries: vec![],
+            pinned_ac_mirror_entries: Vec::new(),
         }))
         .await
         .map_err(|e| nativelink_error::make_err!(nativelink_error::Code::Internal, "send: {e}"))
