@@ -4095,13 +4095,6 @@ struct UploadActionResults {
     upload_ac_results_strategy: UploadCacheResultsStrategy,
     upload_historical_results_strategy: UploadCacheResultsStrategy,
     ac_store: Option<Store>,
-    /// See `RunningActionsManagerArgs::ac_store_fss` for full rationale.
-    /// When Some, [`upload_ac_results`] records each successful AC write
-    /// in `dispatched_mirror_pins` so it advertises in the next
-    /// `BlobsAvailable` tick.
-    ac_store_fss: Option<Arc<FastSlowStore>>,
-    /// See `RunningActionsManagerArgs::ac_store_name` for full rationale.
-    ac_store_name: Option<String>,
     historical_store: Store,
     success_message_template: Template,
     failure_message_template: Template,
@@ -4111,8 +4104,6 @@ impl UploadActionResults {
     fn new(
         config: &UploadActionResultConfig,
         ac_store: Option<Store>,
-        ac_store_fss: Option<Arc<FastSlowStore>>,
-        ac_store_name: Option<String>,
         historical_store: Store,
     ) -> Result<Self, Error> {
         let upload_historical_results_strategy = config
@@ -4131,8 +4122,6 @@ impl UploadActionResults {
             upload_ac_results_strategy: config.upload_ac_results_strategy,
             upload_historical_results_strategy,
             ac_store,
-            ac_store_fss,
-            ac_store_name,
             historical_store,
             success_message_template: Template::new(&config.success_message_template).map_err(
                 |e| {
@@ -4262,21 +4251,6 @@ impl UploadActionResults {
             throughput_mbps = format!("{:.1}", throughput_mbps(size_bytes, elapsed)),
             "AC write completed",
         );
-        // Record this AC entry as a worker-local pin so the worker's
-        // BlobsAvailable loop advertises it to the server during the
-        // slow-write window. The fast-tier write above has already
-        // returned (sync ack point); the slow-tier write is in flight
-        // via FastSlowStore's spawned background task. The server's
-        // BlobsInStableStorage broadcast (which fires on slow-write
-        // success) will trigger the matching `remove_local_ac_pins`.
-        // No-op when this worker's AC store is not a FastSlowStore (e.g.
-        // direct GrpcStore — handled by the early-return shortcut at
-        // the top of this function).
-        if let (Some(ac_fss), Some(ac_name)) =
-            (self.ac_store_fss.as_ref(), self.ac_store_name.as_deref())
-        {
-            ac_fss.insert_local_ac_pin(ac_name, action_digest);
-        }
         Ok(())
     }
 
@@ -4401,24 +4375,6 @@ pub struct RunningActionsManagerArgs<'a> {
     pub execution_configuration: ExecutionConfiguration,
     pub cas_store: Arc<FastSlowStore>,
     pub ac_store: Option<Store>,
-    /// Optional handle to the worker's AC `FastSlowStore` (when the
-    /// configured `ac_store` is a FastSlowStore). Used by
-    /// [`upload_ac_results`] to record an AC pin entry in the FSS's
-    /// `dispatched_mirror_pins` after a successful AC write so the
-    /// worker's `BlobsAvailable` loop advertises the digest to the
-    /// server during the slow-write window.
-    ///
-    /// `None` when (a) no AC store is configured, (b) the AC store is a
-    /// raw `GrpcStore` (no fast tier — there is no slow-write window to
-    /// cover), or (c) the AC store is wrapped in a non-FastSlowStore
-    /// wrapper that obscures the FSS.
-    pub ac_store_fss: Option<Arc<FastSlowStore>>,
-    /// The configured name of the AC store (e.g. "AC_MAIN_STORE").
-    /// Required as the `store_id` for `dispatched_mirror_pins` so the
-    /// server-side handler can route the ack via
-    /// `EphemeralServerSidePin`. Paired with `ac_store_fss` (Some iff
-    /// `ac_store_fss` is Some).
-    pub ac_store_name: Option<String>,
     pub historical_store: Store,
     pub upload_action_result_config: &'a UploadActionResultConfig,
     pub max_action_timeout: Duration,
@@ -4507,8 +4463,6 @@ impl RunningActionsManagerImpl {
             upload_action_results: UploadActionResults::new(
                 args.upload_action_result_config,
                 args.ac_store,
-                args.ac_store_fss,
-                args.ac_store_name,
                 args.historical_store,
             )
             .err_tip(|| "During RunningActionsManagerImpl construction")?,

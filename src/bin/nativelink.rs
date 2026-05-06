@@ -1636,9 +1636,8 @@ async fn inner_main(
                             )
                         })?;
 
-                    let maybe_ac_store_ref =
-                        local_worker_cfg.upload_action_result.ac_store.clone();
-                    let maybe_ac_store = if let Some(ac_store_ref) = &maybe_ac_store_ref
+                    let maybe_ac_store = if let Some(ac_store_ref) =
+                        &local_worker_cfg.upload_action_result.ac_store
                     {
                         Some(store_manager.get_store(ac_store_ref).err_tip(|| {
                             format!("Failed to find store for ac_store in worker config : {ac_store_ref}")
@@ -1664,7 +1663,6 @@ async fn inner_main(
                         Arc::new(local_worker_cfg),
                         fast_slow_store,
                         maybe_ac_store,
-                        maybe_ac_store_ref,
                         historical_store,
                     )
                     .await
