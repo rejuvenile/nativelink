@@ -778,18 +778,17 @@ async fn mirror_upload_does_not_dispatch_avoids_loop()
 // =====================================================================
 //
 // Spec M: "cas_server BatchUpdateBlobs with >threshold entry → assert no
-// dispatch (mutate the producer-side gate, NOT dispatcher's internal
-// gate; v1's T2 was masked by the dispatcher's internal gate)".
+// dispatch (mutate the producer-side gate; per #168 testing-czar
+// MAJOR-1 fix, the dispatcher's internal `data.len() >
+// SMALL_BLOB_THRESHOLD` early-return was REMOVED so the producer-gate
+// mutation step is single-step)".
 //
-// To prove this guards the producer-side gate (not just the
-// dispatcher's internal `data.len() > SMALL_BLOB_THRESHOLD` check), the
-// test is constructed so removing the producer's `size_bytes <=
-// SMALL_BLOB_THRESHOLD` gate would still pass through to the dispatcher
-// — and the dispatcher's internal gate would silently absorb it. The
-// mutation-step path is therefore: comment out BOTH the producer
-// `size_bytes <= SMALL_BLOB_THRESHOLD` clause AND the dispatcher's
-// `data.len() > SMALL_BLOB_THRESHOLD` early return → test must red-fail
-// (the assert_no_dispatch panics on receipt of a BatchWriteSmallBlobs).
+// Mutation step (single-mutation, post-fix): comment out the
+// `size_bytes <= SMALL_BLOB_THRESHOLD` clause in
+// `cas_server::inner_batch_update_blobs`'s dispatcher gate → this
+// test red-fails because the 32 KiB payload is dispatched (the
+// dispatcher no longer has its own size gate to absorb the over-size
+// payload).
 #[nativelink_test]
 async fn cas_batch_update_large_blob_does_not_dispatch()
 -> Result<(), Box<dyn core::error::Error>> {
@@ -832,62 +831,22 @@ async fn cas_batch_update_large_blob_does_not_dispatch()
 }
 
 // =====================================================================
-// T_loop — dispatched bytes MUST NOT loop back through the worker.
+// T_loop — REMOVED (#168 testing-czar MAJOR-2).
 // =====================================================================
 //
-// Loop-prevention end-to-end: the dispatcher pushes bytes server→worker,
-// and the worker's `local_worker::handle_batch_write_small_blobs`
-// inserts directly into `dispatched_mirror_pins` via
-// `insert_dispatched_mirror_blob` — it does NOT call back into the
-// worker's bytestream/cas server (which would loop back to THIS
-// dispatching server).
-//
-// In this test we exercise the SERVER side only (the worker is a
-// fake mpsc receiver, not a real worker process), so the loop-back
-// would manifest as: server dispatches → fake worker receives →
-// fake worker writes back to server → server's bytestream hook
-// dispatches again. Since our fake worker drains messages but does
-// NOT issue any callback writes, the absence of a SECOND dispatch
-// proves the wire-side loop-prevention contract.
-//
-// Mutation step: have the test fixture re-issue the bytes through
-// `bs_server.write` after receiving the first dispatch (intentionally
-// breaking the contract); this test must red-fail.
-#[nativelink_test]
-async fn dispatched_blob_does_not_loop_back()
--> Result<(), Box<dyn core::error::Error>> {
-    let manager = make_proxy_store_manager().await?;
-    let (dispatcher, mut worker_rx) = make_dispatcher_with_one_worker();
-    let bs_server = make_bytestream_server(manager.as_ref(), Some(dispatcher.clone()))?;
-
-    let data = Bytes::from(vec![0x99u8; 1024]);
-    let join_handle = drive_oneshot_write(bs_server, data.clone());
-    let _response = tokio::time::timeout(DEADLOCK_DETECTOR, join_handle)
-        .await
-        .expect("write must complete")
-        .expect("join handle")
-        .expect("write RPC must succeed");
-
-    // First dispatch arrives.
-    let entries = await_batch_write_small_blobs(
-        &mut worker_rx,
-        "#168 fan-out arrived for the original write",
-    )
-    .await;
-    assert_eq!(entries.len(), 1, "first dispatch is the upload bytes");
-
-    // Second dispatch MUST NOT arrive (no loop-back).
-    assert_no_dispatch(
-        &mut worker_rx,
-        "#168 USER DIRECTIVE: dispatched bytes MUST NOT loop back through the worker — \
-         worker handler inserts into dispatched_mirror_pins directly; no callback to \
-         server's bytestream/cas/ac. A second dispatch within NO_DISPATCH_WINDOW \
-         indicates loop-prevention contract violation.",
-    )
-    .await;
-
-    Ok(())
-}
+// The previous `dispatched_blob_does_not_loop_back` test was
+// structurally vacuous: the fake mpsc receiver does nothing with
+// received `UpdateForWorker { batch_write_small_blobs }` messages,
+// so a second dispatch was structurally impossible regardless of
+// whether the worker handler was correct. The two real
+// loop-prevention tests (`worker_upload_does_not_dispatch_avoids_loop`
+// + `mirror_upload_does_not_dispatch_avoids_loop`) cover the
+// server-side gates via the `x-nativelink-worker` /
+// `x-nativelink-mirror` headers; worker-side coverage already exists
+// in `nativelink-worker/tests/batch_write_small_blobs_handler_test.rs`.
+// A real LocalWorker fixture would be required to exercise the full
+// round-trip loop, which is heavy and out of scope for this
+// integration suite.
 
 // =====================================================================
 // T_no_duplicate_mirror — item F: dispatch suppresses random mirror.
@@ -948,23 +907,25 @@ async fn dispatched_small_blob_does_not_duplicate_random_mirror()
     )
     .await;
 
-    // Bounded ABSENCE-detection window: poll the counter every few
-    // milliseconds for `NO_DISPATCH_WINDOW`. If the suppression gate
-    // (item F) is broken, a `mirror_blob_to_random_worker` task
-    // spawned by `mirror_blob_to_worker` would fire WITHIN this
-    // window and tick the counter (the spawn happens synchronously
-    // via `nativelink_util::background_spawn!`; the function returns
-    // immediately and runs on the executor).
-    let deadline = tokio::time::Instant::now() + NO_DISPATCH_WINDOW;
-    let mut attempted_after = attempted_before;
-    while tokio::time::Instant::now() < deadline {
-        let cur = cas_proxy.mirror_total_attempted_for_test();
-        if cur != attempted_before {
-            attempted_after = cur;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    // Bounded ABSENCE-detection: we want to ASSERT the
+    // `mirror_blob_to_random_worker` path was NOT spawned. The gate
+    // check is synchronous in `bytestream_server::inner_write_oneshot`
+    // (the `if !is_worker && !is_mirror && !dispatched` branch). If
+    // the gate is broken, `background_spawn!` schedules immediately
+    // — the spawned task ticks `mirror_total_attempted` once it runs.
+    //
+    // Per CLAUDE.md "no thread::sleep / tokio::time::sleep as
+    // synchronization": we yield to the runtime several times to let
+    // any spawned tasks complete, then read the counter. With the
+    // suppression gate intact, no spawn happened — no task to drain;
+    // counter stays at `attempted_before`. Without the gate, the
+    // spawn fires; one of the early yields runs it and the counter
+    // ticks. 16 yields is generous (each yield walks the runtime's
+    // ready queue exhaustively for the current_thread test runtime).
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
     }
+    let attempted_after = cas_proxy.mirror_total_attempted_for_test();
 
     assert_eq!(
         attempted_before, attempted_after,
@@ -972,6 +933,194 @@ async fn dispatched_small_blob_does_not_duplicate_random_mirror()
          `mirror_blob_to_worker` path MUST be suppressed (would otherwise \
          duplicate bytes); mirror_total_attempted ticked from {attempted_before} \
          to {attempted_after}"
+    );
+
+    Ok(())
+}
+
+// =====================================================================
+// T_ac_is_worker_skip — over-action coverage at AC layer (#168 testing-czar M3).
+// =====================================================================
+//
+// USER DIRECTIVE: workers occasionally upload AC entries via
+// `UpdateActionResult` (e.g. when a worker proxies an action result
+// to the server). Those uploads MUST NOT fan out via the dispatcher
+// — the originating worker would otherwise receive its own bytes
+// back (loop-prevention contract).
+//
+// Mutation step: remove the `&& !is_worker` clause in
+// `ac_server::inner_update_action_result`'s dispatcher gate → this
+// test red-fails with the bespoke
+// "AC update with x-nativelink-worker MUST NOT loop back" message.
+#[nativelink_test]
+async fn ac_update_with_x_nativelink_worker_header_does_not_dispatch()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
+
+    let manager = make_proxy_store_manager().await?;
+    let (dispatcher, mut worker_rx) = make_dispatcher_with_one_worker();
+    let ac_server = make_ac_server(manager.as_ref(), Some(dispatcher.clone()))?;
+
+    let action_digest = DigestInfo::try_new(HASH1, 64).expect("valid digest");
+    let action_result = ActionResult::default();
+    let request = UpdateActionResultRequest {
+        instance_name: INSTANCE_NAME.to_string(),
+        action_digest: Some(action_digest.into()),
+        action_result: Some(action_result),
+        results_cache_policy: None,
+        digest_function: 0,
+    };
+
+    let mut req = Request::new(request);
+    req.metadata_mut().insert(
+        "x-nativelink-worker",
+        MetadataValue::try_from("1").expect("valid header"),
+    );
+
+    let response_fut = ac_server.update_action_result(req);
+    let _response = tokio::time::timeout(DEADLOCK_DETECTOR, response_fut)
+        .await
+        .expect("AC update must complete")
+        .err_tip(|| "AC update_action_result RPC")?;
+
+    assert_no_dispatch(
+        &mut worker_rx,
+        "#168 USER DIRECTIVE / testing-czar M3: AC update with x-nativelink-worker \
+         MUST NOT loop back via dispatcher — worker already holds the bytes locally; \
+         dispatching would re-send them to the originating worker (loop-prevention \
+         contract for AC layer)",
+    )
+    .await;
+
+    Ok(())
+}
+
+// =====================================================================
+// T_ac_is_mirror_skip — over-action coverage at AC layer (#168 testing-czar M3).
+// =====================================================================
+//
+// Mirror pushes that round-trip via AC (rare but possible) MUST NOT
+// be re-dispatched. Mutation step: remove the `&& !is_mirror` clause
+// in `ac_server::inner_update_action_result`'s dispatcher gate →
+// this test red-fails with the bespoke
+// "AC update with x-nativelink-mirror MUST NOT loop back" message.
+#[nativelink_test]
+async fn ac_update_with_x_nativelink_mirror_header_does_not_dispatch()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::ActionCache;
+
+    let manager = make_proxy_store_manager().await?;
+    let (dispatcher, mut worker_rx) = make_dispatcher_with_one_worker();
+    let ac_server = make_ac_server(manager.as_ref(), Some(dispatcher.clone()))?;
+
+    let action_digest = DigestInfo::try_new(HASH1, 64).expect("valid digest");
+    let action_result = ActionResult::default();
+    let request = UpdateActionResultRequest {
+        instance_name: INSTANCE_NAME.to_string(),
+        action_digest: Some(action_digest.into()),
+        action_result: Some(action_result),
+        results_cache_policy: None,
+        digest_function: 0,
+    };
+
+    let mut req = Request::new(request);
+    req.metadata_mut().insert(
+        "x-nativelink-mirror",
+        MetadataValue::try_from("1").expect("valid header"),
+    );
+
+    let response_fut = ac_server.update_action_result(req);
+    let _response = tokio::time::timeout(DEADLOCK_DETECTOR, response_fut)
+        .await
+        .expect("AC update must complete")
+        .err_tip(|| "AC update_action_result RPC")?;
+
+    assert_no_dispatch(
+        &mut worker_rx,
+        "#168 USER DIRECTIVE / testing-czar M3: AC update with x-nativelink-mirror \
+         MUST NOT loop back via dispatcher — mirror push already arrived; \
+         dispatching would re-loop the same bytes (loop-prevention contract for AC layer)",
+    )
+    .await;
+
+    Ok(())
+}
+
+// =====================================================================
+// T_worker_disconnect_during_dispatch — testing-czar MINOR-4.
+// =====================================================================
+//
+// `connected_workers_with_senders` snapshots the registered workers
+// then iterates with the resolved senders. If the worker disconnects
+// (calls `unregister_worker`) BETWEEN the snapshot and the per-worker
+// `enqueue_with_sender`, the now-stale `worker_tx` clone may still
+// produce send errors — but the dispatcher MUST tolerate this
+// silently with debug! (no panic, no propagation).
+//
+// We assert this by snapshotting connected workers, immediately
+// unregistering the worker (which clears `pin_sets` for it via the
+// worker, drops its `worker_tx`), then driving an enqueue with the
+// stale sender. The enqueue MUST surface as Ok(()) and NOT panic.
+#[nativelink_test]
+async fn worker_disconnect_during_dispatch_drops_silently_no_panic()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_store::small_blob_dispatcher::{
+        EphemeralServerSidePin, SmallBlobDispatcher, SmallBlobDispatcherConfig,
+    };
+
+    let cfg = SmallBlobDispatcherConfig {
+        small_blob_mirror_enabled: true,
+        ..Default::default()
+    };
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+    dispatcher.register_pin_set(
+        CAS_STORE_NAME,
+        Arc::new(EphemeralServerSidePin::new(256 * 1024 * 1024)),
+    );
+    let (worker_tx, _worker_rx) = mpsc::unbounded_channel::<UpdateForWorker>();
+    dispatcher.register_worker(FAKE_WORKER_ENDPOINT, FAKE_WORKER_BOOT_EPOCH, worker_tx);
+
+    // Snapshot connected workers (mirrors what
+    // `dispatch_to_all_workers_inner` does).
+    let snapshot = dispatcher.connected_workers_with_senders();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "snapshot must include the registered worker"
+    );
+
+    // Worker disconnects mid-dispatch. unregister_worker drops the
+    // server-side worker_tx + clears per-(worker, store) queues.
+    // The snapshotted `worker_tx` clone is now orphaned (still
+    // valid as a Sender, but no Receiver remains owned by the
+    // dispatcher; the unbounded channel's `_worker_rx` we held in
+    // the test still keeps it open).
+    dispatcher.unregister_worker(FAKE_WORKER_ENDPOINT, FAKE_WORKER_BOOT_EPOCH);
+
+    // Drive an enqueue via the public API. The dispatcher's
+    // worker_tx lookup will MISS (we just unregistered) so the
+    // enqueue MUST silently drop with `Ok(())` and a `debug!` log
+    // — NOT propagate any error or panic.
+    let digest = DigestInfo::new([0xCC; 32], 4);
+    let data = Bytes::from_static(b"data");
+    let result = dispatcher
+        .enqueue(
+            FAKE_WORKER_ENDPOINT,
+            FAKE_WORKER_BOOT_EPOCH,
+            CAS_STORE_NAME,
+            digest,
+            data,
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "#168 testing-czar MINOR-4: enqueue MUST silently tolerate \
+         worker-disconnect race — got error {result:?}"
+    );
+    assert_eq!(
+        dispatcher.dispatched_count(),
+        0,
+        "no dispatched_count tick when worker is unregistered"
     );
 
     Ok(())

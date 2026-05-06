@@ -156,3 +156,67 @@ async fn mirror_blob_handler_skips_entries_with_missing_digest() {
         "missing-digest entry MUST be skipped"
     );
 }
+
+/// #168 testing-czar MINOR-2: handler MUST reject entries whose
+/// `store_id` does not match the dispatcher's regex
+/// (`[a-zA-Z_][a-zA-Z0-9_]*`). A malformed `store_id` from a buggy or
+/// untrusted server would (a) leak unbounded keys into the worker's
+/// `dispatched_mirror_pins` BTreeMap, and (b) propagate to the wire
+/// ack (`BlobsAvailableNotification.pinned_mirror_entries`), where
+/// the server's `is_valid_store_id`-keyed pin-set lookup would
+/// silently fail — creating an unbounded server-side memory leak.
+///
+/// Mutation step: remove the `is_valid_store_id` check at
+/// `local_worker.rs:743` → this test red-fails because the handler
+/// inserts a phantom entry.
+#[nativelink_test]
+async fn handler_skips_entries_with_invalid_store_id() {
+    let fss = make_fss_for_mirror();
+    let d_bad1 = make_digest(1, 50);
+    let d_bad2 = make_digest(2, 50);
+    let d_bad3 = make_digest(3, 50);
+    let d_bad4 = make_digest(4, 50);
+    let d_good = make_digest(5, 50);
+
+    // Mix one well-formed entry between bad ones to assert
+    // partial-batch acceptance (other valid entries in the same
+    // batch MUST land).
+    let entries = vec![
+        SmallBlobEntry {
+            digest: Some(ProtoDigest::from(d_bad1)),
+            data: Bytes::from(vec![0u8; 50]),
+            store_id: String::new(),
+        },
+        SmallBlobEntry {
+            digest: Some(ProtoDigest::from(d_bad2)),
+            data: Bytes::from(vec![0u8; 50]),
+            store_id: "cas-bad".to_string(),
+        },
+        SmallBlobEntry {
+            digest: Some(ProtoDigest::from(d_good)),
+            data: Bytes::from(vec![0u8; 50]),
+            store_id: "cas".to_string(),
+        },
+        SmallBlobEntry {
+            digest: Some(ProtoDigest::from(d_bad3)),
+            data: Bytes::from(vec![0u8; 50]),
+            store_id: "cas store".to_string(),
+        },
+        SmallBlobEntry {
+            digest: Some(ProtoDigest::from(d_bad4)),
+            data: Bytes::from(vec![0u8; 50]),
+            store_id: "$cas".to_string(),
+        },
+    ];
+
+    handle_batch_write_small_blobs(Some(&fss), &entries);
+
+    assert_eq!(
+        fss.mirror_blob_count(),
+        1,
+        "#168 testing-czar MINOR-2: handler MUST reject entries with \
+         invalid store_id (per regex `[a-zA-Z_][a-zA-Z0-9_]*`); only the \
+         well-formed `cas` entry should land. Got {} mirror blobs.",
+        fss.mirror_blob_count(),
+    );
+}

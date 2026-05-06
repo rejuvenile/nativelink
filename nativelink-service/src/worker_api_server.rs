@@ -1040,6 +1040,23 @@ impl WorkerConnection {
         // releases the pin) so any concurrent reader sees locality
         // before the pin is released. Skipped when no `locality_map`
         // is configured (test contexts without WorkerProxyStore).
+        // #168 perf-optimizer MINOR: this block currently takes
+        // `locality_map.write()` SEPARATELY from the consolidated
+        // block at line ~1252 below — two write-locks per
+        // BlobsAvailable notification carrying both
+        // `pinned_mirror_entries` and `digests` / `pinned_mirror_digests`.
+        // Folding into the consolidated block would save one write-lock
+        // per tick (bounded by ~10 workers × ~10 ticks/sec = ~100
+        // acquisitions/sec saved), but requires moving the
+        // `broadcast_pinned_mirror_ack` call too while preserving the
+        // "register BEFORE pin release" ordering invariant. The
+        // intervening mirror-pull async work (lines ~1300-1339) makes
+        // a clean fold structurally awkward — deferred with this TODO
+        // because the perf cost is small and the contract is subtle.
+        // TODO(#168 follow-up): fold locality_map.write() into the
+        // consolidated block and move broadcast_pinned_mirror_ack
+        // after the consolidated write so the "register BEFORE ack"
+        // invariant is preserved.
         if !notification.pinned_mirror_entries.is_empty() {
             if let Some(ref locality_map) = self.locality_map {
                 let endpoint = if notification.worker_cas_endpoint.is_empty() {
@@ -1047,6 +1064,29 @@ impl WorkerConnection {
                 } else {
                     notification.worker_cas_endpoint.as_str()
                 };
+                // #168 security MEDIUM Q2: a worker self-reports its
+                // own `worker_cas_endpoint` in BlobsAvailable. If it
+                // differs from `self.cas_endpoint` (the connect-time
+                // cas_endpoint registered for this worker), this is a
+                // potential spoof / misconfiguration: a malicious or
+                // misconfigured worker could register pinned-mirror
+                // entries against another worker's endpoint, polluting
+                // the locality map. Surface as warn! so operators can
+                // detect; we still process the report (a benign
+                // misconfiguration is recoverable) but the audit
+                // trail is in the log.
+                if !notification.worker_cas_endpoint.is_empty()
+                    && notification.worker_cas_endpoint != self.cas_endpoint
+                {
+                    warn!(
+                        worker_id=?self.worker_id,
+                        reported_endpoint=%notification.worker_cas_endpoint,
+                        connected_endpoint=%self.cas_endpoint,
+                        "BlobsAvailable: worker self-reported worker_cas_endpoint differs \
+                         from connected endpoint — possible spoof or misconfiguration; \
+                         processing the report but logging for audit (#168 security MEDIUM Q2)"
+                    );
+                }
                 if !endpoint.is_empty() {
                     let digests: Vec<DigestInfo> = notification
                         .pinned_mirror_entries

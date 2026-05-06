@@ -1,13 +1,23 @@
 use core::time::Duration;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use nativelink_config::stores::{GrpcEndpoint, GrpcSpec, Retry, StoreType};
 use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
+use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::{
+    ActionCache, ActionCacheServer,
+};
+use nativelink_proto::build::bazel::remote::execution::v2::content_addressable_storage_server::{
+    ContentAddressableStorage, ContentAddressableStorageServer,
+};
 use nativelink_proto::build::bazel::remote::execution::v2::{
-    FindMissingBlobsRequest, digest_function,
+    ActionResult, BatchReadBlobsRequest, BatchReadBlobsResponse, BatchUpdateBlobsRequest,
+    BatchUpdateBlobsResponse, FindMissingBlobsRequest, GetActionResultRequest, GetTreeRequest,
+    GetTreeResponse, UpdateActionResultRequest, batch_update_blobs_response,
+    digest_function,
 };
 use nativelink_proto::google::bytestream::byte_stream_server::{
     ByteStream, ByteStreamServer,
@@ -20,7 +30,7 @@ use nativelink_store::grpc_store::GrpcStore;
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::proto_stream_utils::WriteRequestStreamWrapper;
-use nativelink_util::store_trait::{StoreKey, StoreLike};
+use nativelink_util::store_trait::{IS_WORKER_REQUEST, StoreKey, StoreLike};
 use tokio::time::timeout;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::Request;
@@ -749,3 +759,338 @@ async fn grpc_store_chunk_count_clamp_collapses_parallel_to_useful_chunks()
     Ok(())
 }
 
+// ===================================================================
+// #168 code-reviewer S1 regression: IS_WORKER_REQUEST → x-nativelink-worker
+// header propagation across batch_update_blobs / write / update_action_result.
+// ===================================================================
+//
+// Production CAS chain: WorkerProxyStore → ... → GrpcStore. When a
+// worker uploads to the server (e.g., action result outputs via
+// bytestream, batch CAS update, or AC update_action_result), the
+// `IS_WORKER_REQUEST` task-local is set to `true` somewhere on the
+// stack. Without propagation into the GrpcStore RPC metadata, the
+// server's CAS dispatcher hook treats the upload as a Bazel-originated
+// write and fans the bytes back out to all workers (including the
+// originator), wasting RTTs on a redundant push.
+//
+// These tests bind in-process tonic CAS / AC servers that capture the
+// inbound `x-nativelink-worker` header value, then call the GrpcStore
+// method under `IS_WORKER_REQUEST.scope(true, ...)` and assert the
+// header arrived. Mutation step: remove the header injection at
+// `nativelink-store/src/grpc_store.rs:batch_update_blobs / write /
+// update_action_result` → the assertion below MUST red-fail.
+
+/// CAS server fixture that records the `x-nativelink-worker` header
+/// value of every received `BatchUpdateBlobs` request.
+struct HeaderCapturingCasServer {
+    last_x_nativelink_worker: Arc<Mutex<Option<String>>>,
+}
+
+#[tonic::async_trait]
+impl ContentAddressableStorage for HeaderCapturingCasServer {
+    async fn find_missing_blobs(
+        &self,
+        _request: tonic::Request<FindMissingBlobsRequest>,
+    ) -> Result<
+        tonic::Response<
+            nativelink_proto::build::bazel::remote::execution::v2::FindMissingBlobsResponse,
+        >,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "find_missing_blobs not used in this header test",
+        ))
+    }
+
+    async fn batch_update_blobs(
+        &self,
+        request: tonic::Request<BatchUpdateBlobsRequest>,
+    ) -> Result<tonic::Response<BatchUpdateBlobsResponse>, tonic::Status> {
+        let header_value = request
+            .metadata()
+            .get("x-nativelink-worker")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        *self.last_x_nativelink_worker.lock().unwrap() = header_value;
+        let req = request.into_inner();
+        let responses = req
+            .requests
+            .into_iter()
+            .map(|r| batch_update_blobs_response::Response {
+                digest: r.digest,
+                status: Some(nativelink_proto::google::rpc::Status {
+                    code: 0,
+                    message: String::new(),
+                    details: vec![],
+                }),
+            })
+            .collect();
+        Ok(tonic::Response::new(BatchUpdateBlobsResponse { responses }))
+    }
+
+    async fn batch_read_blobs(
+        &self,
+        _request: tonic::Request<BatchReadBlobsRequest>,
+    ) -> Result<tonic::Response<BatchReadBlobsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("batch_read_blobs not used"))
+    }
+
+    type GetTreeStream =
+        futures::stream::Empty<Result<GetTreeResponse, tonic::Status>>;
+
+    async fn get_tree(
+        &self,
+        _request: tonic::Request<GetTreeRequest>,
+    ) -> Result<tonic::Response<Self::GetTreeStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("get_tree not used"))
+    }
+}
+
+/// AC server fixture that records the `x-nativelink-worker` header on
+/// every received `update_action_result` request.
+struct HeaderCapturingAcServer {
+    last_x_nativelink_worker: Arc<Mutex<Option<String>>>,
+}
+
+#[tonic::async_trait]
+impl ActionCache for HeaderCapturingAcServer {
+    async fn get_action_result(
+        &self,
+        _request: tonic::Request<GetActionResultRequest>,
+    ) -> Result<tonic::Response<ActionResult>, tonic::Status> {
+        Err(tonic::Status::unimplemented("get_action_result not used"))
+    }
+
+    async fn update_action_result(
+        &self,
+        request: tonic::Request<UpdateActionResultRequest>,
+    ) -> Result<tonic::Response<ActionResult>, tonic::Status> {
+        let header_value = request
+            .metadata()
+            .get("x-nativelink-worker")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        *self.last_x_nativelink_worker.lock().unwrap() = header_value;
+        Ok(tonic::Response::new(ActionResult::default()))
+    }
+}
+
+/// ByteStream server fixture that records the `x-nativelink-worker`
+/// header on every received `write` request.
+struct HeaderCapturingByteStream {
+    last_x_nativelink_worker: Arc<Mutex<Option<String>>>,
+}
+
+#[tonic::async_trait]
+impl ByteStream for HeaderCapturingByteStream {
+    type ReadStream = futures::stream::Empty<Result<ReadResponse, tonic::Status>>;
+
+    async fn read(
+        &self,
+        _request: tonic::Request<ReadRequest>,
+    ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("read not used"))
+    }
+
+    async fn write(
+        &self,
+        request: tonic::Request<tonic::Streaming<WriteRequest>>,
+    ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+        let header_value = request
+            .metadata()
+            .get("x-nativelink-worker")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        *self.last_x_nativelink_worker.lock().unwrap() = header_value;
+        // Drain the inbound stream and ack with the total bytes
+        // received so the GrpcStore retry loop sees a clean Ok.
+        let mut inbound = request.into_inner();
+        let mut committed: i64 = 0;
+        while let Ok(Some(chunk)) = inbound.message().await {
+            committed += chunk.data.len() as i64;
+            if chunk.finish_write {
+                break;
+            }
+        }
+        Ok(tonic::Response::new(WriteResponse { committed_size: committed }))
+    }
+
+    async fn query_write_status(
+        &self,
+        _request: tonic::Request<QueryWriteStatusRequest>,
+    ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("query_write_status not used"))
+    }
+}
+
+#[nativelink_test]
+async fn t_grpc_store_propagates_is_worker_header_on_batch_update_blobs()
+-> Result<(), Error> {
+    let last_header: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let server_fixture = HeaderCapturingCasServer {
+        last_x_nativelink_worker: last_header.clone(),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ContentAddressableStorageServer::new(server_fixture))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.retry = Retry { max_retries: 0, ..Default::default() };
+    let store = GrpcStore::new(&spec).await?;
+
+    let digest = DigestInfo::new([0xAA; 32], 4);
+    let req = BatchUpdateBlobsRequest {
+        instance_name: String::new(),
+        requests: vec![
+            nativelink_proto::build::bazel::remote::execution::v2::batch_update_blobs_request::Request {
+                digest: Some(digest.into()),
+                data: Bytes::from_static(b"AAAA"),
+                compressor: 0,
+            },
+        ],
+        digest_function: digest_function::Value::Sha256.into(),
+    };
+
+    // Drive the upload under IS_WORKER_REQUEST.scope(true, ...).
+    let _resp = IS_WORKER_REQUEST
+        .scope(true, async {
+            store.batch_update_blobs(Request::new(req)).await
+        })
+        .await?;
+
+    server_handle.abort();
+
+    let captured = last_header.lock().unwrap().clone();
+    assert_eq!(
+        captured.as_deref(),
+        Some("1"),
+        "#168 code-reviewer S1: GrpcStore::batch_update_blobs MUST propagate \
+         IS_WORKER_REQUEST=true into the `x-nativelink-worker` request \
+         metadata so the server's CAS dispatcher skips fan-out on \
+         worker-originated batch uploads"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn t_grpc_store_propagates_is_worker_header_on_update_action_result()
+-> Result<(), Error> {
+    let last_header: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let server_fixture = HeaderCapturingAcServer {
+        last_x_nativelink_worker: last_header.clone(),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ActionCacheServer::new(server_fixture))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.store_type = StoreType::Ac;
+    spec.retry = Retry { max_retries: 0, ..Default::default() };
+    let store = GrpcStore::new(&spec).await?;
+
+    let digest = DigestInfo::new([0xBB; 32], 8);
+    let req = UpdateActionResultRequest {
+        instance_name: String::new(),
+        action_digest: Some(digest.into()),
+        action_result: Some(ActionResult::default()),
+        results_cache_policy: None,
+        digest_function: digest_function::Value::Sha256.into(),
+    };
+
+    let _resp = IS_WORKER_REQUEST
+        .scope(true, async {
+            store.update_action_result(Request::new(req)).await
+        })
+        .await?;
+
+    server_handle.abort();
+
+    let captured = last_header.lock().unwrap().clone();
+    assert_eq!(
+        captured.as_deref(),
+        Some("1"),
+        "#168 code-reviewer S1: GrpcStore::update_action_result MUST propagate \
+         IS_WORKER_REQUEST=true into the `x-nativelink-worker` request \
+         metadata so the server's AC dispatcher skips fan-out on \
+         worker-originated AC updates"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn t_grpc_store_propagates_is_worker_header_on_write()
+-> Result<(), Error> {
+    let last_header: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let server_fixture = HeaderCapturingByteStream {
+        last_x_nativelink_worker: last_header.clone(),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ByteStreamServer::new(server_fixture))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.retry = Retry { max_retries: 0, ..Default::default() };
+    let store = GrpcStore::new(&spec).await?;
+
+    // Producer: send one chunk with finish_write=true.
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    let resource_name = format!(
+        "/uploads/test-uuid/blobs/{}/{}",
+        "0".repeat(64),
+        4,
+    );
+    tx.send(Ok(WriteRequest {
+        resource_name,
+        write_offset: 0,
+        finish_write: true,
+        data: Bytes::from_static(b"data"),
+    }))
+    .unwrap();
+    drop(tx);
+
+    let stream = WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx))
+        .await
+        .unwrap();
+
+    let _ = IS_WORKER_REQUEST
+        .scope(true, async { store.write(stream).await })
+        .await?;
+
+    server_handle.abort();
+
+    let captured = last_header.lock().unwrap().clone();
+    assert_eq!(
+        captured.as_deref(),
+        Some("1"),
+        "#168 code-reviewer S1: GrpcStore::write MUST propagate \
+         IS_WORKER_REQUEST=true into the `x-nativelink-worker` request \
+         metadata so the server's bytestream dispatcher skips fan-out \
+         on worker-originated bytestream uploads"
+    );
+    Ok(())
+}

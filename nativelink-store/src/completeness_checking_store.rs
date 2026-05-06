@@ -134,6 +134,18 @@ impl CompletenessCheckingStore {
         })
     }
 
+    /// AC-side backing store accessor. Used by the `#168` startup
+    /// pin-set walker (`find_fast_slow_for_pin` in `src/bin/nativelink.rs`)
+    /// to recurse through `CompletenessCheckingStore` into the AC chain
+    /// (`AC_BACKEND_CACHED = FastSlow{fast: MemoryStore, slow: RefStore→Redis}`)
+    /// to find the underlying `FastSlowStore`. Without this accessor
+    /// the walker bails at `inner_store(None)` (which returns `self`)
+    /// and the AC dispatcher pin-set is never registered — making the
+    /// AC fan-out path silently inert in production.
+    pub fn ac_store(&self) -> &Store {
+        &self.ac_store
+    }
+
     /// Check that all files and directories in action results
     /// exist in the CAS. Does this by decoding digests and
     /// checking their existence in two separate sets of futures that

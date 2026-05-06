@@ -85,9 +85,15 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     update_for_worker::Update as UpdateForWorkerUpdate,
 };
 use nativelink_util::common::DigestInfo;
+use nativelink_util::store_trait::{StoreDriver, StoreKey};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+use crate::completeness_checking_store::CompletenessCheckingStore;
+use crate::existence_cache_store::ExistenceCacheStore;
+use crate::fast_slow_store::FastSlowStore;
+use crate::verify_store::VerifyStore;
 
 /// The maximum blob size (bytes) that the dispatcher accepts. Larger blobs
 /// take the existing streaming path (`worker_proxy_store::mirror_blob_to_random_worker`).
@@ -763,14 +769,22 @@ impl SmallBlobDispatcher {
         digest: DigestInfo,
         data: Bytes,
     ) {
-        // Cheap synchronous gates — bail BEFORE any allocation or spawn
+        // Cheap synchronous gate — bail BEFORE any allocation or spawn
         // (perf-optimizer #168 NIT — keep the disabled-path zero-cost).
         if !self.config.small_blob_mirror_enabled {
             return;
         }
-        if data.len() > SMALL_BLOB_THRESHOLD {
-            return;
-        }
+        // #168 testing-czar MAJOR-1: the producer hooks
+        // (`bytestream_server::inner_write_oneshot`,
+        // `cas_server::inner_batch_update_blobs`,
+        // `ac_server::inner_update_action_result`) own the
+        // `size_bytes <= SMALL_BLOB_THRESHOLD` gate. The dispatcher
+        // intentionally does NOT re-check size here — duplicating the
+        // gate made the producer-side mutation test require a double
+        // mutation (comment out BOTH gates) before the test red-failed,
+        // which made the test structurally vacuous (a producer-gate
+        // regression would silently pass). The producer hooks are the
+        // sole authority for the size gate.
         // Spawn the fan-out and return. The spawn allocation + task
         // wake is the only per-call overhead when the dispatcher is on.
         let this = Arc::clone(self);
@@ -847,6 +861,9 @@ impl SmallBlobDispatcher {
         if !self.config.small_blob_mirror_enabled {
             return;
         }
+        // Test-only mirror of `schedule_dispatch_to_all_workers`: the
+        // size gate lives in the producer hooks, not here. Test
+        // callers MUST honor `data.len() <= SMALL_BLOB_THRESHOLD`.
         if data.len() > SMALL_BLOB_THRESHOLD {
             return;
         }
@@ -856,9 +873,12 @@ impl SmallBlobDispatcher {
     }
 
     /// Spawn a periodic info-logger that emits dispatcher activity
-    /// metrics on `period`. The loop exits when the returned join
-    /// handle is dropped (caller responsibility) — typically held by
-    /// the server bootstrap for the lifetime of the process.
+    /// metrics on `period`. The loop holds a `Weak<Self>` and exits
+    /// when the dispatcher `Arc` is dropped (i.e., `Weak::upgrade`
+    /// returns `None`). The returned `JoinHandle` is for caller
+    /// observability ONLY — dropping it does NOT cancel the loop.
+    /// (#168 code-reviewer S2: previous doc claimed the loop exits
+    /// when the join handle is dropped; that was incorrect.)
     ///
     /// Per #168 dist-systems MAJOR-1: operators need to detect
     /// pin-set capacity exhaustion, queue-full, and fan-out coverage
@@ -995,6 +1015,20 @@ impl SmallBlobDispatcher {
     /// must have validated `data.len()` and `store_id` shape already.
     /// However the pin-set / queue-full / cap-exceeded *runtime*
     /// gates DO run here.
+    ///
+    /// **`worker_tx_for_initial_drainer_spawn` semantics (#168
+    /// code-reviewer S3 footgun):** this parameter is consumed ONLY
+    /// when this call is the FIRST enqueue for `(endpoint_key,
+    /// boot_epoch_id, store_key)` — at that point the per-(worker,
+    /// store) queue does not exist yet and we spawn the drainer task
+    /// using this `worker_tx` as the upstream sender. On every
+    /// SUBSEQUENT enqueue for the same triple, the spawned drainer
+    /// already holds the `worker_tx` it was given on its first call,
+    /// so the parameter passed to this method is silently dropped.
+    /// Callers MUST pass a `worker_tx` clone that is REGISTRY-
+    /// CONSISTENT (i.e., the same one that was registered via
+    /// `register_worker(endpoint, boot_epoch_id, ...)`) so a
+    /// hypothetical first-time spawn produces the right drainer.
     async fn enqueue_with_sender(
         &self,
         endpoint_key: Arc<str>,
@@ -1002,7 +1036,7 @@ impl SmallBlobDispatcher {
         store_key: Arc<str>,
         digest: DigestInfo,
         data: Bytes,
-        worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
+        worker_tx_for_initial_drainer_spawn: mpsc::UnboundedSender<UpdateForWorker>,
     ) -> Result<(), Error> {
         // Resolve the pin set; required for accounting. Missing pin set
         // is a config error (FastSlowStore did not register). Per item E
@@ -1061,7 +1095,7 @@ impl SmallBlobDispatcher {
                     boot_epoch_id,
                     store_id_for_log,
                     rx,
-                    worker_tx,
+                    worker_tx_for_initial_drainer_spawn,
                     max_batch_bytes,
                     pin_set_for_drainer,
                 ));
@@ -1195,6 +1229,75 @@ async fn drainer_task(
     );
 }
 
+/// Synthetic small-key (size 0) used by [`find_fast_slow_for_pin`] to
+/// route `SizePartitioning`'s `inner_store(Some(key))` to its
+/// `lower_store` branch (the side that holds small CAS blobs in
+/// production: `SMALL_CAS_CACHED = FastSlow{ fast: MemoryStore, slow:
+/// RefStore→Redis }`). Without this, `inner_store(None)` returns `self`
+/// and the walker bails before reaching the FastSlowStore.
+fn synthetic_small_key() -> StoreKey<'static> {
+    StoreKey::Digest(DigestInfo::new([0u8; 32], 0))
+}
+
+/// Walk the production store wrapper chain to find the underlying
+/// [`FastSlowStore`] that backs a CAS or AC instance. Used by the
+/// `#168` startup wire-up in `src/bin/nativelink.rs` to register a
+/// per-store [`EphemeralServerSidePin`] for every CAS + AC store
+/// whose chain bottoms out at a FastSlowStore.
+///
+/// The walker recurses through every wrapper that returns `self` from
+/// the trait-default `inner_store(None)` (`ExistenceCacheStore`,
+/// `VerifyStore`, `CompletenessCheckingStore`). For each, it drills
+/// into the right inner via the wrapper's concrete accessor:
+///
+/// - `ExistenceCacheStore.inner_store()` → its single backend.
+/// - `VerifyStore.inner_store()` → its single backend.
+/// - `CompletenessCheckingStore.ac_store()` → the AC chain (NOT
+///   `cas_store`, which is the secondary verification side that the
+///   completeness check uses internally; the producer-hook fan-out
+///   targets the AC entry path that owns the digest).
+///
+/// Stops on the first wrapper that is not recognized AND does not
+/// unwrap further (`inner_store(_)` returns the same pointer as `self`).
+///
+/// **#168 dist-systems MINOR-1 / security Q5:** the production AC
+/// chain is `Completeness{ AC_BACKEND_CACHED = FastSlow{ fast:
+/// MemoryStore, slow: RefStore→Redis } }`. Without the
+/// `CompletenessCheckingStore` branch the walker bails immediately,
+/// the AC dispatcher pin set is never registered, and the AC
+/// fan-out path is silently inert in production.
+pub fn find_fast_slow_for_pin(store: &dyn StoreDriver) -> Option<&FastSlowStore> {
+    if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
+        return Some(fss);
+    }
+    if let Some(ecs) = store
+        .as_any()
+        .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
+    {
+        return find_fast_slow_for_pin(
+            ecs.inner_store().inner_store(Some(synthetic_small_key())),
+        );
+    }
+    if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
+        return find_fast_slow_for_pin(
+            vs.inner_store().inner_store(Some(synthetic_small_key())),
+        );
+    }
+    if let Some(ccs) = store.as_any().downcast_ref::<CompletenessCheckingStore>() {
+        return find_fast_slow_for_pin(
+            ccs.ac_store().inner_store(Some(synthetic_small_key())),
+        );
+    }
+    let inner = store.inner_store(Some(synthetic_small_key()));
+    if core::ptr::eq(
+        inner as *const dyn StoreDriver,
+        store as *const dyn StoreDriver,
+    ) {
+        return None;
+    }
+    find_fast_slow_for_pin(inner)
+}
+
 /// Validate `store_id` per plan C11 (relaxed to Rust-ident rules).
 /// Format `[a-zA-Z_][a-zA-Z0-9_]*`. Originally lowercase-only; relaxed to
 /// accept production store names that mix case (e.g. `cas_STORE`,
@@ -1245,5 +1348,155 @@ mod tests {
         assert!(!is_valid_store_id("cas.small"));
         assert!(!is_valid_store_id("cas/small"));
         assert!(!is_valid_store_id("cas store"));
+    }
+
+    /// #168 review Fix 2 (red-team Q1) regression:
+    ///
+    /// The per-(worker, store) queue is `mpsc::channel(max_pending_per_worker)`,
+    /// a BOUNDED sender, so `try_send` returns `TrySendError::Full` once
+    /// the queue is at capacity AND the drainer has not yet drained any
+    /// item. The dispatcher's `skipped_queue_full_total` counter MUST
+    /// tick AND the pin entry MUST be rolled back so accounting stays
+    /// honest under sustained burst.
+    ///
+    /// We use `tokio::test(start_paused = true)` to prevent the spawned
+    /// drainer task from running between our two synchronous enqueues.
+    /// With `max_pending_per_worker = 1` the second enqueue is
+    /// guaranteed to hit a full queue (the drainer hasn't been
+    /// scheduled yet).
+    ///
+    /// Mutation step: set `dispatcher_cfg.max_pending_per_worker = 1024`
+    /// (or remove the `try_send` Full handling) → this test red-fails.
+    #[nativelink_macro::nativelink_test(flavor = "current_thread", start_paused = true)]
+    async fn enqueue_queue_full_increments_counter_and_rolls_back_pin() {
+        let cfg = SmallBlobDispatcherConfig {
+            small_blob_mirror_enabled: true,
+            // Capacity 1: second item MUST hit queue-full because the
+            // drainer task has not been scheduled (start_paused = true).
+            max_pending_per_worker: 1,
+            ..Default::default()
+        };
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+        let pin = Arc::new(EphemeralServerSidePin::new(256 * 1024 * 1024));
+        dispatcher.register_pin_set("cas_STORE", pin.clone());
+        let (worker_tx, _worker_rx) = mpsc::unbounded_channel::<UpdateForWorker>();
+        dispatcher.register_worker("grpc://fake:1", 1, worker_tx);
+
+        let digest_a = DigestInfo::new([0xAA; 32], 4);
+        let digest_b = DigestInfo::new([0xBB; 32], 4);
+        let data_a = Bytes::from_static(b"AAAA");
+        let data_b = Bytes::from_static(b"BBBB");
+
+        // First enqueue: lazily spawns the drainer + leaves capacity 0.
+        let r1 = dispatcher
+            .enqueue("grpc://fake:1", 1, "cas_STORE", digest_a, data_a)
+            .await;
+        assert!(r1.is_ok(), "first enqueue must succeed: {r1:?}");
+
+        // Second enqueue WITHOUT yielding to the runtime — drainer is
+        // still parked because the runtime is paused, queue is at
+        // capacity. `try_send` MUST return `TrySendError::Full` and the
+        // dispatcher MUST roll the pin entry back.
+        let r2 = dispatcher
+            .enqueue("grpc://fake:1", 1, "cas_STORE", digest_b, data_b)
+            .await;
+        assert!(
+            r2.is_ok(),
+            "queue-full enqueue MUST surface as Ok(()) (drop-with-warn — fire-and-forget contract)"
+        );
+        assert_eq!(
+            dispatcher.skipped_queue_full_total(),
+            1,
+            "skipped_queue_full_total MUST tick on TrySendError::Full \
+             — without bounded mpsc::channel + try_send Full handling, \
+             this counter never advances and operators cannot detect a \
+             slow worker (red-team Q1)"
+        );
+        // Pin set MUST contain ONLY the first digest: the second
+        // enqueue's pin entry was rolled back when try_send returned
+        // Full.
+        assert!(
+            pin.contains(&digest_a),
+            "first digest's pin entry MUST be retained (queued in drainer)"
+        );
+        assert!(
+            !pin.contains(&digest_b),
+            "queue-full digest's pin entry MUST be rolled back so accounting stays honest"
+        );
+    }
+
+    /// #168 dist-systems MINOR-1 / security Q5 regression:
+    ///
+    /// Production AC chain shape is
+    /// `Completeness{ AC_BACKEND_CACHED = FastSlow{ fast: MemoryStore,
+    /// slow: RefStore→Redis } }`. Before the
+    /// `CompletenessCheckingStore` branch was added, the walker fell
+    /// through to `inner_store(_)` (which returns `self` for the
+    /// composite trait) and bailed without ever registering an AC pin
+    /// set — the AC dispatcher fan-out path was inert in production.
+    ///
+    /// Mutation step (per CLAUDE.md TDD step 5): comment out the
+    /// `CompletenessCheckingStore` branch in `find_fast_slow_for_pin`
+    /// → this test MUST red-fail with the bespoke
+    /// `"#168 walker MUST recurse through CompletenessCheckingStore into AC chain"`
+    /// message.
+    #[nativelink_macro::nativelink_test]
+    async fn find_fast_slow_for_pin_recurses_through_completeness_checking_store_ac_chain() {
+        use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
+        use nativelink_util::store_trait::Store;
+
+        use crate::completeness_checking_store::CompletenessCheckingStore;
+        use crate::fast_slow_store::FastSlowStore;
+        use crate::memory_store::MemoryStore;
+
+        // Build the AC backing chain: FastSlow{ fast: MemoryStore,
+        // slow: MemoryStore } (Memory stands in for the production
+        // Redis ref_store; the walker only inspects wrapper types,
+        // not the slow tier semantics).
+        let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let ac_backend_fss: Arc<FastSlowStore> = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Memory(MemorySpec::default()),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+            },
+            fast,
+            slow,
+        );
+        let ac_backend_ptr: *const FastSlowStore = Arc::as_ptr(&ac_backend_fss);
+
+        // Wrap with CompletenessCheckingStore on top, with a separate
+        // CAS-side store. The walker MUST drill into ac_store, NOT
+        // cas_store.
+        let ac_store_for_completeness = Store::new(ac_backend_fss);
+        let cas_store_unrelated = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let ccs = CompletenessCheckingStore::new(
+            ac_store_for_completeness,
+            cas_store_unrelated,
+        );
+
+        // Walk via the public helper. `&*ccs` derefs the Arc to the
+        // inner CompletenessCheckingStore, which implements
+        // `StoreDriver`. `find_fast_slow_for_pin` first downcasts to
+        // CompletenessCheckingStore, then drills into `ac_store()` —
+        // exactly the production-shape walk performed by
+        // `src/bin/nativelink.rs`'s startup loop for AC stores.
+        let driver: &dyn StoreDriver = &*ccs;
+        let found = find_fast_slow_for_pin(driver).expect(
+            "#168 walker MUST recurse through CompletenessCheckingStore into AC chain \
+             (production AC shape: Completeness{ AC_BACKEND_CACHED = FastSlow{...} })",
+        );
+
+        // Verify the resolved FastSlowStore is the one we built (same
+        // pointer == same FastSlowStore instance, not a sibling
+        // returned from the cas_store branch).
+        assert!(
+            core::ptr::eq(found as *const FastSlowStore, ac_backend_ptr),
+            "walker resolved a DIFFERENT FastSlowStore than the AC-backing one — \
+             likely walked into cas_store instead of ac_store"
+        );
     }
 }

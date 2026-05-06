@@ -423,12 +423,10 @@ async fn inner_main(
         if worker_schedulers.is_empty() {
             None
         } else {
-            use nativelink_store::existence_cache_store::ExistenceCacheStore;
-            use nativelink_store::fast_slow_store::FastSlowStore;
             use nativelink_store::small_blob_dispatcher::{
                 EphemeralServerSidePin, SmallBlobDispatcher, SmallBlobDispatcherConfig,
+                find_fast_slow_for_pin,
             };
-            use nativelink_store::verify_store::VerifyStore;
             use nativelink_util::store_trait::StoreDriver;
 
             // Walk the store wrapper chain to find the underlying
@@ -451,40 +449,16 @@ async fn inner_main(
             // wrappers that return `self` from `inner_store(None)`, so we
             // downcast and recurse manually. Stops on the first wrapper
             // that is not recognized + does not unwrap further.
+            // Synthetic small-key for routing through `SizePartitioning`
+            // wrappers (size 0 routes to `lower_store`). Mirrors the
+            // helper inside `find_fast_slow_for_pin`; defined locally
+            // because the registration loops below also call
+            // `inner_store(Some(synthetic_small_key()))` on the OUTER
+            // store before handing the result to the walker.
             fn synthetic_small_key() -> nativelink_util::store_trait::StoreKey<'static> {
-                // size 0 routes to lower_store under any
-                // SizePartitioning threshold > 0.
                 nativelink_util::store_trait::StoreKey::Digest(
                     nativelink_util::common::DigestInfo::new([0u8; 32], 0),
                 )
-            }
-            fn find_fast_slow_for_pin<'a>(
-                store: &'a dyn StoreDriver,
-            ) -> Option<&'a FastSlowStore> {
-                if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
-                    return Some(fss);
-                }
-                if let Some(ecs) = store
-                    .as_any()
-                    .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
-                {
-                    return find_fast_slow_for_pin(
-                        ecs.inner_store().inner_store(Some(synthetic_small_key())),
-                    );
-                }
-                if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
-                    return find_fast_slow_for_pin(
-                        vs.inner_store().inner_store(Some(synthetic_small_key())),
-                    );
-                }
-                let inner = store.inner_store(Some(synthetic_small_key()));
-                if core::ptr::eq(
-                    inner as *const dyn StoreDriver,
-                    store as *const dyn StoreDriver,
-                ) {
-                    return None;
-                }
-                find_fast_slow_for_pin(inner)
             }
 
             // #168: SmallBlobDispatcher master feature flag is sourced

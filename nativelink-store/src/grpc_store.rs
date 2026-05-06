@@ -864,11 +864,25 @@ impl GrpcStore {
         let mut request = grpc_request.into_inner();
         request.instance_name.clone_from(&self.instance_name);
         let is_mirror = IS_MIRROR_REQUEST.try_with(|v| *v).unwrap_or(false);
+        // #168 code-reviewer S1: propagate `IS_WORKER_REQUEST` task-local
+        // into the `x-nativelink-worker` request metadata. Without this
+        // header, worker uploads to the server arrive with `is_worker=false`
+        // and the server's CAS dispatcher fans the bytes back to all
+        // workers (including the originator), wasting RTTs and risking
+        // a benign-but-noisy redundant push (loop-prevention contract
+        // covers correctness; this fix avoids redundant work).
+        let is_worker = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
         self.perform_request(request, |request| async move {
             let mut grpc_request = Request::new(request);
             if is_mirror {
                 grpc_request.metadata_mut().insert(
                     "x-nativelink-mirror",
+                    tonic::metadata::MetadataValue::from_static("1"),
+                );
+            }
+            if is_worker {
+                grpc_request.metadata_mut().insert(
+                    "x-nativelink-worker",
                     tonic::metadata::MetadataValue::from_static("1"),
                 );
             }
@@ -1123,6 +1137,10 @@ impl GrpcStore {
         // retry loop. The flag is set by WorkerProxyStore's mirror functions
         // and propagates through the GrpcStore to become an RPC header.
         let is_mirror = IS_MIRROR_REQUEST.try_with(|v| *v).unwrap_or(false);
+        // #168 code-reviewer S1: capture IS_WORKER_REQUEST and propagate
+        // as `x-nativelink-worker` header so the server can skip the
+        // dispatcher fan-out on worker-originated bytestream uploads.
+        let is_worker = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
 
         // Per-chunk no-progress timeout. Configured via `rpc_timeout_s`
         // but applied per-chunk: each WriteRequest delivered from the
@@ -1173,10 +1191,14 @@ impl GrpcStore {
 
                     /// Helper: build the tonic Request for a ByteStream write,
                     /// attaching the `x-nativelink-mirror` header when the
-                    /// write originates from a server-side mirror operation.
+                    /// write originates from a server-side mirror operation,
+                    /// AND the `x-nativelink-worker` header when the write
+                    /// originates from a worker (so the server skips the
+                    /// dispatcher fan-out — #168 code-reviewer S1).
                     fn make_write_request<T, E>(
                         state: Arc<Mutex<WriteState<T, E>>>,
                         is_mirror: bool,
+                        is_worker: bool,
                     ) -> Request<WriteStateWrapper<T, E>>
                     where
                         T: Stream<Item = Result<WriteRequest, E>> + Unpin + Send + 'static,
@@ -1186,6 +1208,12 @@ impl GrpcStore {
                         if is_mirror {
                             request.metadata_mut().insert(
                                 "x-nativelink-mirror",
+                                tonic::metadata::MetadataValue::from_static("1"),
+                            );
+                        }
+                        if is_worker {
+                            request.metadata_mut().insert(
+                                "x-nativelink-worker",
                                 tonic::metadata::MetadataValue::from_static("1"),
                             );
                         }
@@ -1210,7 +1238,7 @@ impl GrpcStore {
                                 );
                                 let rpc_start = std::time::Instant::now();
                                 let res = self.bs_client(channel)
-                                    .write(make_write_request(local_state_for_rpc, is_mirror))
+                                    .write(make_write_request(local_state_for_rpc, is_mirror, is_worker))
                                     .await
                                     .err_tip(|| "in GrpcStore::write");
                                 let rpc_elapsed_ms = u64::try_from(
@@ -1229,7 +1257,7 @@ impl GrpcStore {
                             Transport::Quic(ch) => {
                                 let rpc_start = std::time::Instant::now();
                                 let res = self.bs_client(ch.clone())
-                                    .write(make_write_request(local_state_for_rpc, is_mirror))
+                                    .write(make_write_request(local_state_for_rpc, is_mirror, is_worker))
                                     .await
                                     .err_tip(|| "in GrpcStore::write (quic)");
                                 let rpc_elapsed_ms = u64::try_from(
@@ -1262,7 +1290,7 @@ impl GrpcStore {
                                 );
                                 let rpc_start = std::time::Instant::now();
                                 let res = self.bs_client(channel)
-                                    .write(make_write_request(local_state_for_rpc, is_mirror))
+                                    .write(make_write_request(local_state_for_rpc, is_mirror, is_worker))
                                     .await
                                     .err_tip(|| "in GrpcStore::write (dual/tcp)");
                                 let rpc_elapsed_ms = u64::try_from(
@@ -1446,19 +1474,38 @@ impl GrpcStore {
     ) -> Result<Response<ActionResult>, Error> {
         let mut request = grpc_request.into_inner();
         request.instance_name.clone_from(&self.instance_name);
+        // #168 code-reviewer S1: propagate IS_WORKER_REQUEST + IS_MIRROR_REQUEST
+        // task-locals into the AC update_action_result RPC metadata so the
+        // server's AC dispatcher hook can skip fan-out on worker- /
+        // mirror-originated AC writes (loop prevention).
+        let is_worker = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
+        let is_mirror = IS_MIRROR_REQUEST.try_with(|v| *v).unwrap_or(false);
         self.perform_request(request, |request| async move {
+            let mut grpc_request = Request::new(request);
+            if is_worker {
+                grpc_request.metadata_mut().insert(
+                    "x-nativelink-worker",
+                    tonic::metadata::MetadataValue::from_static("1"),
+                );
+            }
+            if is_mirror {
+                grpc_request.metadata_mut().insert(
+                    "x-nativelink-mirror",
+                    tonic::metadata::MetadataValue::from_static("1"),
+                );
+            }
             match &self.transport {
                 Transport::Tcp(cm) => {
                     let channel = cm.connection("update_action_result".into()).await.err_tip(|| "in update_action_result")?;
                     self.ac_client(channel)
-                        .update_action_result(Request::new(request))
+                        .update_action_result(grpc_request)
                         .await
                         .err_tip(|| "in GrpcStore::update_action_result")
                 }
                 #[cfg(feature = "quic")]
                 Transport::Quic(ch) => {
                     self.ac_client(ch.clone())
-                        .update_action_result(Request::new(request))
+                        .update_action_result(grpc_request)
                         .await
                         .err_tip(|| "in GrpcStore::update_action_result (quic)")
                 }
@@ -1466,7 +1513,7 @@ impl GrpcStore {
                 Transport::Dual { quic, .. } => {
                     // Small AC update: prefer QUIC
                     self.ac_client(quic.clone())
-                        .update_action_result(Request::new(request))
+                        .update_action_result(grpc_request)
                         .await
                         .err_tip(|| "in GrpcStore::update_action_result (dual/quic)")
                 }

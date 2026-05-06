@@ -1754,6 +1754,25 @@ impl ByteStreamServer {
         // Close our guard and consider the stream no longer active.
         active_stream_guard.graceful_finish();
 
+        // #168 dist-systems MINOR-2: the chunked write path
+        // (`inner_write`, this function) does NOT fan out small blobs
+        // to the SmallBlobDispatcher. The fast-path `inner_write_oneshot`
+        // does, and that path absorbs almost all small writes
+        // (≤ SMALL_BLOB_THRESHOLD = 16 KiB) because Bazel pushes small
+        // blobs in a single chunk. Wiring a hook here is structurally
+        // awkward: the chunked path streams to `tx` (no accumulated
+        // Bytes); collecting the bytes for fan-out would either buffer
+        // (defeating the streaming optimization) or re-read from the
+        // store post-write (extra round-trip). Defer.
+        //
+        // TODO(#168 follow-up): if production telemetry shows
+        // small-blob writes routinely arriving via the chunked path
+        // (>0.1% of small writes), wire a tee channel here that
+        // accumulates ≤ SMALL_BLOB_THRESHOLD bytes for the dispatcher;
+        // bail out (drop the buffer) once the size exceeds the
+        // threshold so the streaming optimization is preserved for
+        // larger blobs.
+
         Ok(Response::new(WriteResponse {
             committed_size: expected_size as i64,
         }))
