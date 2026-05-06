@@ -63,6 +63,7 @@ mod tests {
     use nativelink_util::common::{DigestInfo, fs};
     use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
     use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
+    use nativelink_worker::local_worker::AcMirrorTarget;
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
         RunningActionsManagerArgs, RunningActionsManagerImpl, download_to_directory,
@@ -5429,6 +5430,155 @@ exit 1
         );
 
         running_action.cleanup().await?;
+        Ok(())
+    }
+
+    /// Production-composition regression: when `upload_ac_results`
+    /// completes successfully on a `FastSlowStore`-backed AC store, the
+    /// `ac_mirror_target.fss.insert_local_ac_pin(...)` MUST run so the
+    /// worker's BlobsAvailable loop advertises the AC entry on proto
+    /// field 17 (`pinned_ac_mirror_entries`) during the slow-write
+    /// window. This is the under-action half of the contract.
+    ///
+    /// The test wires the SAME AC `FastSlowStore` instance as both
+    /// `ac_store` (so `update_oneshot` runs through it on the real path
+    /// `cache_action_result → upload_ac_results`) AND as
+    /// `ac_mirror_target.fss` (so the post-write pin insert mutates the
+    /// observable index). Asserting via `dispatched_mirror_pin_snapshot`
+    /// crosses the same in-process seam the production
+    /// `send_periodic_blobs_available` loop reads from
+    /// (`dispatched_ac_pin_snapshot_for_store`), satisfying production
+    /// composition in substance — not just form.
+    ///
+    /// Mutation step: comment out the `if let Some(target) =
+    /// self.ac_mirror_target.as_ref()` block in
+    /// `running_actions_manager.rs::upload_ac_results`. The test must
+    /// red-fail with the bespoke "AC pin must be registered after
+    /// upload_ac_results — production-composition contract violated"
+    /// message — not a generic `is_err()` / `assert_eq` mismatch.
+    #[nativelink_test]
+    async fn upload_ac_results_registers_pin_in_fss()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (_, _, cas_store, _) = setup_stores().await?;
+
+        // Build a REAL `FastSlowStore` for AC: memory-fast over
+        // memory-slow. This is the production shape on which
+        // `insert_local_ac_pin` is meaningful — a bare `MemoryStore` AC
+        // would not even support pin tracking.
+        let ac_fast_spec = MemorySpec::default();
+        let ac_slow_spec = MemorySpec::default();
+        let ac_fast = MemoryStore::new(&ac_fast_spec);
+        let ac_slow = MemoryStore::new(&ac_slow_spec);
+        let ac_fss = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Memory(ac_fast_spec),
+                slow: StoreSpec::Memory(ac_slow_spec),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+            },
+            Store::new(ac_fast),
+            Store::new(ac_slow),
+        );
+
+        let ac_store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                root_action_directory: String::new(),
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                // The same AC FSS that is the pin-target also serves as
+                // `ac_store` so the production update path actually runs.
+                ac_store: Some(Store::new(ac_fss.clone())),
+                ac_mirror_target: Some(AcMirrorTarget {
+                    fss: ac_fss.clone(),
+                    store_id: ac_store_id.clone(),
+                }),
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::SuccessOnly,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+            })?);
+
+        let action_digest = DigestInfo::new([0xACu8; 32], 32);
+        let mut action_result = ActionResult {
+            output_files: vec![FileInfo {
+                name_or_path: NameOrPath::Path("test.txt".to_string()),
+                digest: DigestInfo::try_new(
+                    "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3",
+                    3,
+                )?,
+                is_executable: false,
+            }],
+            stdout_digest: DigestInfo::try_new(
+                "426afaf613d8cfdd9fa8addcc030ae6c95a7950ae0301164af1d5851012081d5",
+                10,
+            )?,
+            stderr_digest: DigestInfo::try_new(
+                "7b2e400d08b8e334e3172d105be308b506c6036c62a9bde5c509d7808b28b213",
+                10,
+            )?,
+            exit_code: 0,
+            output_folders: vec![],
+            output_file_symlinks: vec![],
+            output_directory_symlinks: vec![],
+            server_logs: HashMap::new(),
+            execution_metadata: ExecutionMetadata {
+                worker: "WORKER_ID".to_string(),
+                queued_timestamp: SystemTime::UNIX_EPOCH,
+                worker_start_timestamp: make_system_time(0),
+                input_fetch_start_timestamp: make_system_time(1),
+                input_fetch_completed_timestamp: make_system_time(2),
+                execution_start_timestamp: make_system_time(3),
+                execution_completed_timestamp: make_system_time(4),
+                output_upload_start_timestamp: make_system_time(5),
+                output_upload_completed_timestamp: make_system_time(6),
+                worker_completed_timestamp: make_system_time(7),
+            },
+            error: None,
+            message: String::new(),
+        };
+
+        // 5s deadlock-detector: if any layer above the AC FSS borrows
+        // a writer that the pin insert path doesn't terminate, this
+        // timeout fires with a SPECIFIC message instead of hanging
+        // CI. Per CLAUDE.md, the timeout-message specificity is the
+        // signal that distinguishes a contract violation from a generic
+        // test-infra hang.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            running_actions_manager.cache_action_result(
+                action_digest,
+                &mut action_result,
+                DigestHasherFunc::Sha256,
+            ),
+        )
+        .await
+        .expect(
+            "must not deadlock — cache_action_result borrowed-state \
+             contract on AC FSS pin insert",
+        )?;
+
+        // Production-composition assertion: the AC FSS instance held
+        // by `ac_mirror_target` must contain a pin entry for the
+        // action_digest under the configured store_id, observable via
+        // the SAME accessor the production `send_periodic_blobs_available`
+        // loop uses.
+        let snapshot =
+            ac_fss.dispatched_ac_pin_snapshot_for_store(ac_store_id.as_ref());
+        assert!(
+            snapshot.iter().any(|d| *d == action_digest),
+            "AC pin must be registered after upload_ac_results — \
+             production-composition contract violated. \
+             Snapshot under store_id {ac_store_id:?}: {snapshot:?}",
+        );
         Ok(())
     }
 }
