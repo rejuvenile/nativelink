@@ -90,6 +90,7 @@ fn make_services(
             },
         }],
         store_manager,
+        None,
     )
     .expect("failed to create ByteStreamServer");
 
@@ -101,6 +102,7 @@ fn make_services(
             },
         }],
         store_manager,
+        None,
     )
     .expect("failed to create CasServer");
 

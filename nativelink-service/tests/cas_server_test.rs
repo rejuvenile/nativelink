@@ -70,6 +70,7 @@ fn make_cas_server(store_manager: &StoreManager) -> Result<CasServer, Error> {
             },
         }],
         store_manager,
+        None,
     )
 }
 

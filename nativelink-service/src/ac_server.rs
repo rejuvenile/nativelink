@@ -15,6 +15,7 @@
 use core::convert::Into;
 use core::fmt::Debug;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::BytesMut;
 use nativelink_config::cas_server::{AcStoreConfig, WithInstanceName};
@@ -27,12 +28,13 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 };
 use nativelink_store::ac_utils::{ESTIMATED_DIGEST_SIZE, get_and_decode_digest};
 use nativelink_store::grpc_store::GrpcStore;
+use nativelink_store::small_blob_dispatcher::{SMALL_BLOB_THRESHOLD, SmallBlobDispatcher};
 use nativelink_store::store_manager::StoreManager;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
 use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::stall_detector::StallGuard;
-use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::store_trait::{IS_MIRROR_REQUEST, IS_WORKER_REQUEST, Store, StoreLike};
 use opentelemetry::context::FutureExt;
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -42,6 +44,19 @@ use tracing::{Instrument, Level, debug, error, error_span, instrument};
 pub struct AcStoreInfo {
     store: Store,
     read_only: bool,
+    /// The configured `ac_store` name (e.g. `"AC_STORE"`). Used as the
+    /// `store_id` when fanning out small AC blobs via the dispatcher.
+    /// Pre-allocated as `Arc<str>` so the per-blob hot path only does
+    /// an O(1) refcount bump (perf-optimizer #168 NIT-1).
+    ///
+    /// Per #168 item D, AC `EphemeralServerSidePin` registration also
+    /// happens at startup in `nativelink.rs` (mirroring CAS), so the
+    /// dispatcher's pin-set lookup succeeds at runtime and the hook
+    /// fires properly.
+    ac_store_name_arc: Arc<str>,
+    /// #168 producer-side hook. `None` when no worker scheduler is
+    /// configured.
+    small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
 }
 
 pub struct AcServer {
@@ -58,6 +73,7 @@ impl AcServer {
     pub fn new(
         configs: &[WithInstanceName<AcStoreConfig>],
         store_manager: &StoreManager,
+        small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     ) -> Result<Self, Error> {
         let mut stores = HashMap::with_capacity(configs.len());
         for config in configs {
@@ -69,6 +85,8 @@ impl AcServer {
                 AcStoreInfo {
                     store,
                     read_only: config.read_only,
+                    ac_store_name_arc: Arc::from(config.ac_store.as_str()),
+                    small_blob_dispatcher: small_blob_dispatcher.clone(),
                 },
             );
         }
@@ -140,6 +158,8 @@ impl AcServer {
     async fn inner_update_action_result(
         &self,
         request: UpdateActionResultRequest,
+        is_mirror: bool,
+        is_worker: bool,
     ) -> Result<Response<ActionResult>, Error> {
         let instance_name = &request.instance_name;
         let store_info = self
@@ -178,12 +198,20 @@ impl AcServer {
             .err_tip(|| "Provided ActionResult could not be serialized")?;
 
         let size_bytes = store_data.len() as u64;
+        // Freeze once so we have a `Bytes` we can both pass to
+        // `update_oneshot` AND clone for the dispatcher fan-out below
+        // (Bytes::clone is O(1) refcount bump).
+        let frozen_data = store_data.freeze();
         let start = std::time::Instant::now();
-        let result = store_info
-            .store
-            .update_oneshot(digest, store_data.freeze())
-            .await
-            .err_tip(|| "Failed to update in action cache");
+        let result = IS_MIRROR_REQUEST
+            .scope(is_mirror, async {
+                store_info
+                    .store
+                    .update_oneshot(digest, frozen_data.clone())
+                    .await
+                    .err_tip(|| "Failed to update in action cache")
+            })
+            .await;
         let elapsed = start.elapsed();
         match &result {
             Ok(()) => {
@@ -194,6 +222,34 @@ impl AcServer {
                     throughput_mbps = format!("{:.1}", throughput_mbps(size_bytes, elapsed)),
                     "AC write completed",
                 );
+                // #168 producer-side: fan out small AC blobs to every
+                // connected worker via the dispatcher. AC blobs are
+                // typically < 1 KiB (just an ActionResult proto), so
+                // they almost always pass the SMALL_BLOB_THRESHOLD
+                // gate. AC pin sets are registered at startup in
+                // `nativelink.rs` per #168 item D.
+                //
+                // Skip for `is_mirror` AND `is_worker` (USER DIRECTIVE
+                // on loop prevention). AC writes that are themselves
+                // mirror pushes (`IS_MIRROR_REQUEST = true`) or worker-
+                // originated (`IS_WORKER_REQUEST = true`) MUST NOT
+                // re-fan-out. Same `is_mirror && is_worker` shape as
+                // the bytestream/cas hooks (#168 testing-czar M1).
+                //
+                // Fire-and-forget — do not .await; see
+                // `SmallBlobDispatcher::schedule_dispatch_to_all_workers` doc.
+                if !is_mirror
+                    && !is_worker
+                    && size_bytes <= SMALL_BLOB_THRESHOLD as u64
+                {
+                    if let Some(dispatcher) = store_info.small_blob_dispatcher.as_ref() {
+                        dispatcher.schedule_dispatch_to_all_workers(
+                            store_info.ac_store_name_arc.clone(),
+                            digest,
+                            frozen_data,
+                        );
+                    }
+                }
             }
             Err(e) => {
                 error!(
@@ -257,17 +313,35 @@ impl ActionCache for AcServer {
         &self,
         grpc_request: Request<UpdateActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
+        // #168 producer-side: extract is_mirror/is_worker so the
+        // dispatcher fan-out hook in `inner_update_action_result`
+        // skips re-fan-out (loop prevention — USER DIRECTIVE).
+        // Workers occasionally upload AC entries via UpdateActionResult,
+        // and a mirror push may also re-arrive via this endpoint.
+        let is_mirror = grpc_request
+            .metadata()
+            .contains_key("x-nativelink-mirror");
+        let is_worker = grpc_request
+            .metadata()
+            .contains_key("x-nativelink-worker");
         let request = grpc_request.into_inner();
         let digest_function = request.digest_function;
         let _stall_guard = StallGuard::new(
             nativelink_util::stall_detector::DEFAULT_STALL_THRESHOLD,
             "AC::update_action_result",
         );
-        self.inner_update_action_result(request)
-            .instrument(error_span!("ac_server_update_action_result"))
-            .with_context(
-                make_ctx_for_hash_func(digest_function)
-                    .err_tip(|| "In AcServer::update_action_result")?,
+        IS_MIRROR_REQUEST
+            .scope(
+                is_mirror,
+                IS_WORKER_REQUEST.scope(
+                    is_worker,
+                    self.inner_update_action_result(request, is_mirror, is_worker)
+                        .instrument(error_span!("ac_server_update_action_result"))
+                        .with_context(
+                            make_ctx_for_hash_func(digest_function)
+                                .err_tip(|| "In AcServer::update_action_result")?,
+                        ),
+                ),
             )
             .await
             .map_err(Into::into)

@@ -88,7 +88,7 @@ fn make_bytestream_server(
             },
         }]
     });
-    ByteStreamServer::new(&config, store_manager)
+    ByteStreamServer::new(&config, store_manager, None)
 }
 
 fn make_stream(
@@ -1213,7 +1213,7 @@ pub async fn memory_pressure_evicts_oldest_idle_streams() -> Result<(), Box<dyn 
         },
     }];
     let bs_server = Arc::new(
-        ByteStreamServer::new(&config, store_manager.as_ref()).expect("Failed to make server"),
+        ByteStreamServer::new(&config, store_manager.as_ref(), None).expect("Failed to make server"),
     );
 
     let uuid_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -1342,7 +1342,7 @@ pub async fn streaming_read_while_write_basic() -> Result<(), Box<dyn core::erro
 
     let store_manager = make_store_manager().await?;
     let bs_server = Arc::new(
-        ByteStreamServer::new(&make_streaming_config(), store_manager.as_ref())
+        ByteStreamServer::new(&make_streaming_config(), store_manager.as_ref(), None)
             .expect("Failed to make server"),
     );
 
@@ -1541,7 +1541,7 @@ pub async fn streaming_read_while_write_with_offset()
 
     let store_manager = make_store_manager().await?;
     let bs_server = Arc::new(
-        ByteStreamServer::new(&make_streaming_config(), store_manager.as_ref())
+        ByteStreamServer::new(&make_streaming_config(), store_manager.as_ref(), None)
             .expect("Failed to make server"),
     );
 
@@ -1637,7 +1637,7 @@ pub async fn memory_pressure_does_not_trigger_under_budget()
         },
     }];
     let bs_server = Arc::new(
-        ByteStreamServer::new(&config, store_manager.as_ref()).expect("Failed to make server"),
+        ByteStreamServer::new(&config, store_manager.as_ref(), None).expect("Failed to make server"),
     );
 
     // Create 5 idle streams (50 bytes total, under 100 byte budget).
@@ -1710,7 +1710,7 @@ pub async fn memory_pressure_evicts_oldest_idle_stream()
         },
     }];
     let bs_server = Arc::new(
-        ByteStreamServer::new(&config, store_manager.as_ref()).expect("Failed to make server"),
+        ByteStreamServer::new(&config, store_manager.as_ref(), None).expect("Failed to make server"),
     );
 
     // Create 3 idle streams: A (oldest), B, C (newest).
@@ -1807,7 +1807,7 @@ pub async fn streaming_read_while_write_writer_error_propagates_to_reader()
 
     let store_manager = make_store_manager().await?;
     let bs_server = Arc::new(
-        ByteStreamServer::new(&make_streaming_config(), store_manager.as_ref())
+        ByteStreamServer::new(&make_streaming_config(), store_manager.as_ref(), None)
             .expect("Failed to make server"),
     );
 
@@ -1926,7 +1926,7 @@ pub async fn resumable_write_reconnect_same_uuid()
         },
     }];
     let bs_server = Arc::new(
-        ByteStreamServer::new(&config, store_manager.as_ref()).expect("Failed to make server"),
+        ByteStreamServer::new(&config, store_manager.as_ref(), None).expect("Failed to make server"),
     );
 
     let uuid = "66666666-6666-6666-6666-666666666666";
@@ -2043,7 +2043,7 @@ pub async fn streaming_read_of_large_blob_not_truncated()
         },
     }];
     let bs_server = Arc::new(
-        ByteStreamServer::new(&config, store_manager.as_ref())
+        ByteStreamServer::new(&config, store_manager.as_ref(), None)
             .expect("Failed to make server"),
     );
 
@@ -2184,7 +2184,7 @@ pub async fn streaming_read_large_chunk_exceeds_max_bytes_per_stream()
         },
     }];
     let bs_server = Arc::new(
-        ByteStreamServer::new(&config, store_manager.as_ref())
+        ByteStreamServer::new(&config, store_manager.as_ref(), None)
             .expect("Failed to make server"),
     );
 
@@ -2311,7 +2311,7 @@ pub async fn streaming_read_with_offset_past_eviction_falls_through_to_store()
         },
     }];
     let bs_server = Arc::new(
-        ByteStreamServer::new(&config, store_manager.as_ref())
+        ByteStreamServer::new(&config, store_manager.as_ref(), None)
             .expect("Failed to make server"),
     );
 
@@ -2423,7 +2423,7 @@ pub async fn concurrent_read_during_active_upload()
         },
     }];
     let bs_server = Arc::new(
-        ByteStreamServer::new(&config, store_manager.as_ref())
+        ByteStreamServer::new(&config, store_manager.as_ref(), None)
             .expect("Failed to make server"),
     );
 
@@ -2718,7 +2718,7 @@ fn make_locality_test_server(store_manager: &StoreManager) -> Arc<ByteStreamServ
         },
     }];
     Arc::new(
-        ByteStreamServer::new(&config, store_manager).expect("Failed to make server"),
+        ByteStreamServer::new(&config, store_manager, None).expect("Failed to make server"),
     )
 }
 

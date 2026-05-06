@@ -40,6 +40,7 @@ use nativelink_proto::google::bytestream::{
     WriteResponse,
 };
 use nativelink_store::grpc_store::GrpcStore;
+use nativelink_store::small_blob_dispatcher::{SMALL_BLOB_THRESHOLD, SmallBlobDispatcher};
 use nativelink_store::store_manager::StoreManager;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::buf_channel::{
@@ -304,6 +305,20 @@ fn parse_uuid_to_key(uuid_str: &str) -> UuidKey {
 
 pub struct InstanceInfo {
     store: Store,
+    /// The configured `cas_store` name (e.g. `"cas_STORE"`). Used as the
+    /// `store_id` in `SmallBlobDispatcher::schedule_dispatch_to_all_workers` so
+    /// that the per-store `EphemeralServerSidePin` registered at startup
+    /// (under the SAME name in `nativelink.rs:499-525`) receives the pin
+    /// insert. Pre-allocated as `Arc<str>` so the per-blob hot path
+    /// only does an O(1) refcount bump (perf-optimizer #168 NIT-1 —
+    /// avoids `Arc::from(&str)` allocation per dispatch).
+    cas_store_name_arc: Arc<str>,
+    /// #168 producer-side hook: when `Some`, every successful oneshot
+    /// CAS write of a blob ≤ `SMALL_BLOB_THRESHOLD` is fanned out to
+    /// every connected worker via the dispatcher. `None` when no worker
+    /// scheduler is configured (the dispatcher is not constructed in
+    /// that case — see `nativelink.rs:409-534`).
+    small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     // Max number of bytes to send on each grpc stream chunk.
     max_bytes_per_stream: usize,
     /// Active uploads keyed by UUID as u128 for better performance.
@@ -339,6 +354,11 @@ impl Debug for InstanceInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("InstanceInfo")
             .field("store", &self.store)
+            .field("cas_store_name", &self.cas_store_name_arc)
+            .field(
+                "small_blob_dispatcher",
+                &self.small_blob_dispatcher.is_some(),
+            )
             .field("max_bytes_per_stream", &self.max_bytes_per_stream)
             .field("active_uploads", &self.active_uploads)
             .field("idle_stream_timeout", &self.idle_stream_timeout)
@@ -615,6 +635,7 @@ impl ByteStreamServer {
     pub fn new(
         configs: &[WithInstanceName<ByteStreamConfig>],
         store_manager: &StoreManager,
+        small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     ) -> Result<Self, Error> {
         let mut instance_infos: HashMap<String, InstanceInfo> = HashMap::new();
         for config in configs {
@@ -625,7 +646,12 @@ impl ByteStreamServer {
             };
             let _old_value = instance_infos.insert(
                 config.instance_name.clone(),
-                Self::new_with_timeout(config, store_manager, idle_stream_timeout)?,
+                Self::new_with_timeout(
+                    config,
+                    store_manager,
+                    idle_stream_timeout,
+                    small_blob_dispatcher.clone(),
+                )?,
             );
         }
         Ok(Self { instance_infos })
@@ -635,6 +661,7 @@ impl ByteStreamServer {
         config: &WithInstanceName<ByteStreamConfig>,
         store_manager: &StoreManager,
         idle_stream_timeout: Duration,
+        small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     ) -> Result<InstanceInfo, Error> {
         let store = store_manager
             .get_store(&config.cas_store)
@@ -815,6 +842,8 @@ impl ByteStreamServer {
 
         Ok(InstanceInfo {
             store,
+            cas_store_name_arc: Arc::from(config.cas_store.as_str()),
+            small_blob_dispatcher,
             max_bytes_per_stream,
             active_uploads,
             idle_stream_timeout,
@@ -1877,10 +1906,52 @@ impl ByteStreamServer {
             }
         }
 
+        // #168 producer-side: fan out small blobs (≤ SMALL_BLOB_THRESHOLD)
+        // to every connected worker via the SmallBlobDispatcher so future
+        // actions on any worker can serve the blob locally without a
+        // peer-fetch round-trip (proactive read-locality replication).
+        //
+        // Skip for `is_worker` (worker uploaded action results; would
+        // loop them back to the originating worker) and `is_mirror`
+        // (server-to-worker mirror push round-tripped via bytestream
+        // — would re-loop). Both gates close the over-action sibling
+        // (#168 testing-czar M1 / USER DIRECTIVE on loop prevention).
+        //
+        // Item F: track whether we dispatched so the random-single
+        // `mirror_blob_to_worker` path below can be SUPPRESSED for
+        // small blobs the dispatcher already handled (the dispatcher
+        // gives every worker the bytes; the random-single mirror is
+        // redundant for small blobs which are durable via Redis
+        // SMALL_CAS_CACHED).
+        //
+        // Fire-and-forget — do not .await; see
+        // `SmallBlobDispatcher::schedule_dispatch_to_all_workers` doc.
+        let dispatched = if !is_worker
+            && !is_mirror
+            && bytes_received <= SMALL_BLOB_THRESHOLD as u64
+        {
+            if let Some(dispatcher) = instance_info.small_blob_dispatcher.as_ref() {
+                dispatcher.schedule_dispatch_to_all_workers(
+                    instance_info.cas_store_name_arc.clone(),
+                    digest,
+                    mirror_data.clone(),
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Mirror to a random worker using the cloned data — no re-read needed.
         // Skip mirroring for worker uploads and mirror writes — workers already
         // have the blob, and mirror writes should not be re-mirrored.
-        if !is_worker && !is_mirror {
+        // Item F: also skip when the dispatcher already fanned out the
+        // same bytes to every worker (small blobs are durable via Redis;
+        // the random-single mirror would just duplicate bytes already
+        // pushed by the dispatcher).
+        if !is_worker && !is_mirror && !dispatched {
             mirror_blob_to_worker(&store, digest, Some(mirror_data));
         }
 

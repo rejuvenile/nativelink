@@ -1014,7 +1014,60 @@ impl WorkerConnection {
         // Pre-existing field 13 path (`pinned_mirror_digests`, below)
         // is UNCHANGED — fields 13 and 16 have distinct semantics per
         // the proto comment and are processed independently.
+        //
+        // task #168 item K — USER DIRECTIVE: ALSO eagerly register the
+        // dispatcher-pushed digests in the server-side `locality_map`
+        // keyed by the worker's `cas_endpoint`. Without this, the
+        // server's knowledge that worker W now holds digest D would
+        // lag the next periodic field-13 (`digests`) tick — meaning an
+        // action referencing D scheduled in the meantime would (a)
+        // trigger a redundant peer-fetch from another worker (wasted
+        // bandwidth), (b) potentially be re-dispatched by the
+        // dispatcher because the server doesn't know W has it, OR (c)
+        // be scheduled away from W, missing the locality-affinity
+        // optimization.
+        //
+        // Coupling this to the SAME tick that carries the ack closes
+        // the action-arrival window: the worker triggers this tick
+        // eagerly via `mirror_changes_notify.notify_one()` in
+        // `FastSlowStore::insert_mirror_blob` (called from
+        // `handle_batch_write_small_blobs` after each successful
+        // batch), so latency from dispatch to locality-update is
+        // bounded by ~RTT (sub-second) — well inside any reasonable
+        // action-arrival window.
+        //
+        // We register BEFORE acking the dispatcher (broadcast_pinned_mirror_ack
+        // releases the pin) so any concurrent reader sees locality
+        // before the pin is released. Skipped when no `locality_map`
+        // is configured (test contexts without WorkerProxyStore).
         if !notification.pinned_mirror_entries.is_empty() {
+            if let Some(ref locality_map) = self.locality_map {
+                let endpoint = if notification.worker_cas_endpoint.is_empty() {
+                    self.cas_endpoint.as_str()
+                } else {
+                    notification.worker_cas_endpoint.as_str()
+                };
+                if !endpoint.is_empty() {
+                    let digests: Vec<DigestInfo> = notification
+                        .pinned_mirror_entries
+                        .iter()
+                        .filter_map(|e| {
+                            e.digest
+                                .as_ref()
+                                .and_then(|d| DigestInfo::try_from(d.clone()).ok())
+                        })
+                        .collect();
+                    if !digests.is_empty() {
+                        debug!(
+                            worker_id=?self.worker_id,
+                            endpoint,
+                            count=digests.len(),
+                            "BlobsAvailable: registering dispatcher-pushed pinned_mirror_entries in locality_map (#168 item K)"
+                        );
+                        locality_map.write().register_blobs(endpoint, &digests);
+                    }
+                }
+            }
             if let Some(ref dispatcher) = self.small_blob_dispatcher {
                 dispatcher.broadcast_pinned_mirror_ack(&notification.pinned_mirror_entries);
             }

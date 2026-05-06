@@ -38,6 +38,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 use nativelink_proto::google::rpc::Status as GrpcStatus;
 use nativelink_store::ac_utils::batch_get_and_decode_digest;
 use nativelink_store::grpc_store::GrpcStore;
+use nativelink_store::small_blob_dispatcher::{SMALL_BLOB_THRESHOLD, SmallBlobDispatcher};
 use nativelink_store::store_manager::StoreManager;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::common::DigestInfo;
@@ -164,9 +165,27 @@ fn mirror_blob_to_worker_with_data(store: &Store, digest: DigestInfo, data: Byte
     });
 }
 
+/// Per-instance plumbing for the CAS service. Carries the configured
+/// `cas_store` name (e.g. `"cas_STORE"`) so we can pass the same value
+/// to `SmallBlobDispatcher::schedule_dispatch_to_all_workers` as the
+/// `store_id` the dispatcher's per-store `EphemeralServerSidePin` is
+/// registered under (see `nativelink.rs:499-525`). Pre-allocated as
+/// `Arc<str>` so the per-blob hot path only does an O(1) refcount bump
+/// (perf-optimizer #168 NIT-1 — avoids `Arc::from(&str)` allocation
+/// per dispatch).
+#[derive(Debug, Clone)]
+struct CasInstance {
+    store: Store,
+    cas_store_name_arc: Arc<str>,
+    /// #168 producer-side hook. `None` when no worker scheduler is
+    /// configured (the dispatcher is not constructed at startup —
+    /// `nativelink.rs:409-534`).
+    small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
+}
+
 #[derive(Debug)]
 pub struct CasServer {
-    stores: HashMap<String, Store>,
+    stores: HashMap<String, CasInstance>,
     /// Cache of GetTree results keyed by root digest. CAS trees are
     /// immutable (content-addressed), so a cache hit avoids re-running
     /// the full BFS traversal. Bounded by size and TTL.
@@ -206,13 +225,21 @@ impl CasServer {
     pub fn new(
         configs: &[WithInstanceName<CasStoreConfig>],
         store_manager: &StoreManager,
+        small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
     ) -> Result<Self, Error> {
         let mut stores = HashMap::with_capacity(configs.len());
         for config in configs {
             let store = store_manager.get_store(&config.cas_store).ok_or_else(|| {
                 make_input_err!("'cas_store': '{}' does not exist", config.cas_store)
             })?;
-            stores.insert(config.instance_name.to_string(), store);
+            stores.insert(
+                config.instance_name.to_string(),
+                CasInstance {
+                    store,
+                    cas_store_name_arc: Arc::from(config.cas_store.as_str()),
+                    small_blob_dispatcher: small_blob_dispatcher.clone(),
+                },
+            );
         }
         let tree_cache_policy = EvictionPolicy {
             max_bytes: TREE_CACHE_MAX_BYTES,
@@ -287,11 +314,12 @@ impl CasServer {
         request: FindMissingBlobsRequest,
     ) -> Result<Response<FindMissingBlobsResponse>, Error> {
         let instance_name = &request.instance_name;
-        let store = self
+        let instance = self
             .stores
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
             .clone();
+        let store = instance.store.clone();
 
         let mut requested_blobs = Vec::with_capacity(request.blob_digests.len());
         for digest in &request.blob_digests {
@@ -328,14 +356,16 @@ impl CasServer {
         &self,
         request: BatchUpdateBlobsRequest,
         is_mirror: bool,
+        is_worker: bool,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Error> {
         let instance_name = &request.instance_name;
 
-        let store = self
+        let instance = self
             .stores
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
             .clone();
+        let store = instance.store.clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
         // Note: We don't know the digests here, so we try perform a very shallow
@@ -347,6 +377,11 @@ impl CasServer {
         let store_ref = &store;
         let blob_count = request.requests.len();
         let batch_start = std::time::Instant::now();
+        // Pre-resolve dispatcher + store_name into local refs the
+        // FuturesUnordered closures can capture cheaply. #168
+        // producer-side hook.
+        let dispatcher_ref = instance.small_blob_dispatcher.as_ref();
+        let cas_store_name_arc = &instance.cas_store_name_arc;
 
         // Pre-parse all digests and validate sizes upfront so we can do a
         // single batch has() check instead of N individual checks inside
@@ -431,9 +466,50 @@ impl CasServer {
                             throughput_mbps = format!("{:.1}", throughput_mbps(size_bytes as u64, elapsed)),
                             "BatchUpdateBlobs: CAS write completed",
                         );
+                        // #168 producer-side: fan out small CAS blobs
+                        // to every connected worker via the dispatcher.
+                        // Sits ALONGSIDE (or — for small + dispatcher
+                        // enabled — REPLACES) the random-single-worker
+                        // mirror below (item F). Skip for `is_mirror`
+                        // AND `is_worker` to avoid feedback loops:
+                        //   - is_mirror: server-to-worker mirror push
+                        //     re-arrived via cas_server (rare).
+                        //   - is_worker: worker uploaded action results
+                        //     to the server; we'd loop them back
+                        //     uselessly to the originating worker.
+                        // Both gates close the over-action sibling
+                        // contract (#168 testing-czar M1 / USER
+                        // DIRECTIVE on loop prevention).
+                        //
+                        // Fire-and-forget — do not .await; see
+                        // `SmallBlobDispatcher::schedule_dispatch_to_all_workers` doc.
+                        let dispatched = if !is_mirror
+                            && !is_worker
+                            && size_bytes <= SMALL_BLOB_THRESHOLD
+                        {
+                            if let Some(dispatcher) = dispatcher_ref {
+                                dispatcher.schedule_dispatch_to_all_workers(
+                                    cas_store_name_arc.clone(),
+                                    digest_info,
+                                    mirror_data.clone(),
+                                );
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
                         // Mirror to a random worker for OOM redundancy.
-                        // Skip for mirror writes to avoid feedback loops.
-                        if !is_mirror {
+                        // Skip for mirror writes (avoid feedback loops)
+                        // AND skip when the dispatcher already fanned
+                        // out the same bytes to every worker (item F:
+                        // dispatcher subsumes the random-mirror for
+                        // small blobs; small blobs are durable via
+                        // Redis SMALL_CAS_CACHED, mirror exists for
+                        // read-locality which the dispatcher already
+                        // provides on every worker).
+                        if !is_mirror && !dispatched {
                             mirror_blob_to_worker_with_data(store_ref, digest_info, mirror_data);
                         }
                     }
@@ -482,6 +558,7 @@ impl CasServer {
         &self,
         request: BatchUpdateBlobsRequest,
         is_mirror: bool,
+        is_worker: bool,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
         let digest_function = request.digest_function;
 
@@ -489,11 +566,15 @@ impl CasServer {
             nativelink_util::stall_detector::DEFAULT_STALL_THRESHOLD,
             "BatchUpdateBlobs",
         );
-        self.inner_batch_update_blobs(request, is_mirror)
-            .instrument(error_span!("cas_server_batch_update_blobs"))
-            .with_context(
-                make_ctx_for_hash_func(digest_function)
-                    .err_tip(|| "In CasServer::batch_update_blobs")?,
+        IS_WORKER_REQUEST
+            .scope(
+                is_worker,
+                self.inner_batch_update_blobs(request, is_mirror, is_worker)
+                    .instrument(error_span!("cas_server_batch_update_blobs"))
+                    .with_context(
+                        make_ctx_for_hash_func(digest_function)
+                            .err_tip(|| "In CasServer::batch_update_blobs")?,
+                    ),
             )
             .await
             .err_tip(|| "Failed on batch_update_blobs() command")
@@ -506,11 +587,12 @@ impl CasServer {
     ) -> Result<Response<BatchReadBlobsResponse>, Error> {
         let instance_name = &request.instance_name;
 
-        let store = self
+        let instance = self
             .stores
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
             .clone();
+        let store = instance.store.clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
         // Note: We don't know the digests here, so we try perform a very shallow
@@ -591,11 +673,12 @@ impl CasServer {
     ) -> Result<impl Stream<Item = Result<GetTreeResponse, Status>> + Send + use<>, Error> {
         let instance_name = &request.instance_name;
 
-        let store = self
+        let instance = self
             .stores
             .get(instance_name)
             .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
             .clone();
+        let store = instance.store.clone();
 
         // If we are a GrpcStore we shortcut here, as this is a special store.
         // Note: We don't know the digests here, so we try perform a very shallow
@@ -1059,6 +1142,14 @@ impl ContentAddressableStorage for CasServer {
         let is_mirror = grpc_request
             .metadata()
             .contains_key("x-nativelink-mirror");
+        // #168 producer-side: extract `is_worker` so the dispatcher hook
+        // in `inner_batch_update_blobs` skips fan-out for worker uploads
+        // (workers already hold the blob locally; dispatching back would
+        // loop). Symmetric to the `is_worker` extraction in
+        // `batch_read_blobs` below.
+        let is_worker = grpc_request
+            .metadata()
+            .contains_key("x-nativelink-worker");
         let request = grpc_request.into_inner();
         let digest_function = request.digest_function;
 
@@ -1066,11 +1157,15 @@ impl ContentAddressableStorage for CasServer {
             nativelink_util::stall_detector::DEFAULT_STALL_THRESHOLD,
             "BatchUpdateBlobs",
         );
-        self.inner_batch_update_blobs(request, is_mirror)
-            .instrument(error_span!("cas_server_batch_update_blobs"))
-            .with_context(
-                make_ctx_for_hash_func(digest_function)
-                    .err_tip(|| "In CasServer::batch_update_blobs")?,
+        IS_WORKER_REQUEST
+            .scope(
+                is_worker,
+                self.inner_batch_update_blobs(request, is_mirror, is_worker)
+                    .instrument(error_span!("cas_server_batch_update_blobs"))
+                    .with_context(
+                        make_ctx_for_hash_func(digest_function)
+                            .err_tip(|| "In CasServer::batch_update_blobs")?,
+                    ),
             )
             .await
             .err_tip(|| "Failed on batch_update_blobs() command")
@@ -1199,6 +1294,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for ZeroCopyCasService {
             Box::pin(async move {
                 let (parts, body) = req.into_parts();
                 let is_mirror = parts.headers.contains_key("x-nativelink-mirror");
+                let is_worker = parts.headers.contains_key("x-nativelink-worker");
 
                 // Decode the unary request directly from body frames.
                 let request: BatchUpdateBlobsRequest =
@@ -1207,7 +1303,9 @@ impl tower::Service<http::Request<tonic::body::Body>> for ZeroCopyCasService {
                         Err(status) => return Ok(status.into_http()),
                     };
 
-                let result = inner.zero_copy_batch_update_blobs(request, is_mirror).await;
+                let result = inner
+                    .zero_copy_batch_update_blobs(request, is_mirror, is_worker)
+                    .await;
 
                 match result {
                     Ok(response) => {

@@ -287,6 +287,14 @@ async fn inner_main(
             >,
         >,
     > = HashMap::new();
+    // #168 item D: AC store names harvested from `services.ac` so the
+    // SmallBlobDispatcher can register an `EphemeralServerSidePin` per
+    // AC store at startup (matching the CAS pin registration loop
+    // below). Without this the AC producer hook would silently drop
+    // per-blob with a `debug!` (item E demoted the warn). Default
+    // `ac_store` names like `AC_STORE` match `is_valid_store_id` so the
+    // walk + register is straightforward.
+    let mut ac_store_names: HashSet<String> = HashSet::new();
     let cas_store_names: HashSet<String> = {
         let mut names: HashSet<String> = HashSet::new();
         for server_cfg in &server_cfgs {
@@ -299,6 +307,11 @@ async fn inner_main(
                 if let Some(ref bs_cfgs) = services.bytestream {
                     for c in bs_cfgs {
                         names.insert(c.config.cas_store.clone());
+                    }
+                }
+                if let Some(ref ac_cfgs) = services.ac {
+                    for c in ac_cfgs {
+                        ac_store_names.insert(c.config.ac_store.clone());
                     }
                 }
             }
@@ -422,7 +435,7 @@ async fn inner_main(
             // FastSlowStore. Mirrors `store_manager.rs:81-108` and the
             // sibling `find_fast_slow_chunked` walker below.
             //
-            // SmallBlobDispatcher targets SMALL blobs (≤8 KiB per plan
+            // SmallBlobDispatcher targets SMALL blobs (≤16 KiB per plan
             // C9), so when traversing a `SizePartitioningStore` we pass a
             // synthetic SMALL-digest key (size 0). That routes through
             // SizePartitioning's `inner_store(Some(key))` to its
@@ -474,18 +487,30 @@ async fn inner_main(
                 find_fast_slow_for_pin(inner)
             }
 
-            // #168: enable Bug A small-CAS peer-mirror push. Operator
-            // authorization 2026-05-05 — promotes the dispatcher's
-            // `enqueue` from inert no-op to live mirror-push. The
-            // dispatcher remains gated on per-store pin-set
-            // registration below, so stores without a FastSlowStore
-            // backing are still skipped.
-            let cfg = SmallBlobDispatcherConfig {
-                small_blob_mirror_enabled: true,
+            // #168: SmallBlobDispatcher master feature flag is sourced
+            // from `GlobalConfig.small_blob_mirror_enabled` (defaults
+            // false). Operator flips via JSON5 config — no rebuild
+            // required. The dispatcher is constructed regardless so
+            // that the WorkerApiServer wire-up + per-store pin-set
+            // registration stay consistent across reconfigs; with the
+            // flag off, `enqueue` (and the new sync
+            // `schedule_dispatch_to_all_workers`) are inert no-ops.
+            let small_blob_mirror_enabled = cfg
+                .global
+                .as_ref()
+                .map(|g| g.small_blob_mirror_enabled)
+                .unwrap_or(false);
+            let dispatcher_cfg = SmallBlobDispatcherConfig {
+                small_blob_mirror_enabled,
                 ..Default::default()
             };
-            let pin_max_bytes = cfg.pin_max_bytes;
-            let dispatcher = Arc::new(SmallBlobDispatcher::new(cfg));
+            let pin_max_bytes = dispatcher_cfg.pin_max_bytes;
+            let dispatcher = Arc::new(SmallBlobDispatcher::new(dispatcher_cfg));
+            info!(
+                small_blob_mirror_enabled,
+                pin_max_bytes,
+                "small_blob_dispatcher: constructed (#168)"
+            );
 
             // Register a per-store `EphemeralServerSidePin` for every
             // FastSlowStore backing a CAS instance. The `store_id`
@@ -523,12 +548,63 @@ async fn inner_main(
                     );
                 }
             }
-            // TODO(#168): also walk AC store names and register their
-            // FastSlowStores once AC store names are aggregated by the
-            // bootstrap (today they are local to each AcStoreConfig).
-            // The dispatcher works without AC pin registration —
-            // ac_server's enqueue site (item 3, also follow-up) will
-            // be a no-op until both AC pin set + ac_server hook land.
+            // #168 item D: register `EphemeralServerSidePin` for every
+            // AC store backed by a FastSlowStore (mirrors the CAS loop
+            // above). AC stores that aren't FastSlowStore-backed (e.g.
+            // plain FilesystemStore in test configs, plain MemoryStore)
+            // are skipped — the AC producer hook will silently drop
+            // (debug!) at runtime; that's the operator-visible
+            // "register failed" surface. With both CAS + AC pin sets
+            // registered, the dispatcher's per-blob
+            // `pin_set_for(store_id) == None` branch (item E demoted to
+            // debug) will not fire under normal operation, eliminating
+            // the AC log-flood concern (#253/#255/#197 OOM shape).
+            //
+            // We look up via `store_manager.get_store(name)` (NOT
+            // `unwrapped_cas_stores`) — AC stores live outside the
+            // CAS-only WorkerProxyStore wrapping, so the manager
+            // already returns the bare AC chain.
+            for store_name in &ac_store_names {
+                let Some(store) = store_manager.get_store(store_name) else {
+                    continue;
+                };
+                if !nativelink_store::small_blob_dispatcher::is_valid_store_id(store_name) {
+                    info!(
+                        store_name,
+                        "small_blob_dispatcher: skipping AC pin-set registration; \
+                         store_name does not match `[a-zA-Z_][a-zA-Z0-9_]*` (per plan C11)"
+                    );
+                    continue;
+                }
+                let driver: &dyn StoreDriver =
+                    store.inner_store(Some(synthetic_small_key()));
+                if find_fast_slow_for_pin(driver).is_some() {
+                    let pin = Arc::new(EphemeralServerSidePin::new(pin_max_bytes));
+                    dispatcher.register_pin_set(store_name, pin);
+                    info!(
+                        store_name,
+                        pin_max_bytes,
+                        "small_blob_dispatcher: registered AC EphemeralServerSidePin"
+                    );
+                } else {
+                    debug!(
+                        store_name,
+                        "small_blob_dispatcher: AC store is not FastSlowStore-backed; \
+                         skipping pin-set registration (AC dispatcher hook will be a no-op \
+                         for this store)"
+                    );
+                }
+            }
+            // #168 item I: spawn the periodic activity-metrics logger
+            // (1 line / minute). Provides operator visibility into
+            // pin-set capacity headroom + queue-full / pin-full counters
+            // without standing up a separate metrics endpoint. The
+            // join handle is intentionally dropped — the task observes
+            // the dispatcher via `Weak`, so it self-exits if the
+            // dispatcher Arc is ever dropped.
+            let _metrics_handle = dispatcher.spawn_periodic_metrics(
+                core::time::Duration::from_secs(60),
+            );
             Some(dispatcher)
         }
     };
@@ -880,7 +956,7 @@ async fn inner_main(
                 services
                     .ac
                     .map_or(Ok(None), |cfg| {
-                        AcServer::new(&cfg, &store_manager)
+                        AcServer::new(&cfg, &store_manager, small_blob_dispatcher.clone())
                             .map(|v| Some(svc_setup!(v)))
                     })
                     .err_tip(|| "Could not create AC service")?,
@@ -889,7 +965,7 @@ async fn inner_main(
                 services
                     .cas
                     .map_or(Ok(None), |cfg| {
-                        CasServer::new(&cfg, &store_manager)
+                        CasServer::new(&cfg, &store_manager, small_blob_dispatcher.clone())
                             .map(|v| {
                                 let mut service = v.into_zero_copy_service(max_decoding, max_encoding);
                                 if let ListenerConfig::Http(ref http_config) = server_cfg.listener {
@@ -954,7 +1030,7 @@ async fn inner_main(
                 services
                     .bytestream
                     .map_or(Ok(None), |cfg| {
-                        ByteStreamServer::new(&cfg, &store_manager)
+                        ByteStreamServer::new(&cfg, &store_manager, small_blob_dispatcher.clone())
                             .map(|v| {
                                 let mut service = v.into_zero_copy_service(max_decoding, max_encoding);
                                 if let ListenerConfig::Http(ref http_config) = server_cfg.listener {
@@ -2024,6 +2100,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             worker_proxy_tls_cert_file: None,
             worker_proxy_tls_key_file: None,
             bazel_facing_internal_chunking_enabled: false,
+            small_blob_mirror_enabled: false,
         }
     };
 

@@ -669,6 +669,16 @@ impl WorkerProxyStore {
         &self.locality_map
     }
 
+    /// Test-only: snapshot the `mirror_total_attempted` counter.
+    /// Used by `#168` integration tests to assert that the dispatcher's
+    /// `schedule_dispatch_to_all_workers` correctly suppresses the
+    /// duplicate `mirror_blob_to_random_worker` call (item F).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn mirror_total_attempted_for_test(&self) -> u64 {
+        self.mirror_total_attempted.load(Ordering::Relaxed)
+    }
+
     /// Returns all currently-connected peer stores.
     pub fn peer_stores(&self) -> HashMap<Arc<str>, Store> {
         self.worker_connections.read().clone()

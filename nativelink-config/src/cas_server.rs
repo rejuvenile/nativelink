@@ -1210,6 +1210,28 @@ pub struct GlobalConfig {
     /// Default: false (legacy single-stream path)
     #[serde(default)]
     pub bazel_facing_internal_chunking_enabled: bool,
+
+    /// #168 SmallBlobDispatcher master feature flag. When `true`, the
+    /// server's bytestream / cas / ac producer hooks fan out small
+    /// (`<= SMALL_BLOB_THRESHOLD = 16 KiB`) CAS+AC blobs to every
+    /// connected worker via the `SmallBlobDispatcher`. Workers receive
+    /// the bytes via `BatchWriteSmallBlobs` push and insert directly
+    /// into their local mirror map (no server callback). When `false`,
+    /// the dispatcher's `enqueue` (and the new sync
+    /// `schedule_dispatch_to_all_workers`) is an inert no-op even when
+    /// the per-store `EphemeralServerSidePin` sets are registered.
+    ///
+    /// Wiring lands inert (default false) in this commit; canary
+    /// requires an explicit JSON5 flag flip to `true`. Per CLAUDE.md
+    /// `feedback_async_to_sync_requires_explicit_signoff`, the dispatch
+    /// fan-out itself is fully async (`tokio::spawn`-based, see
+    /// `SmallBlobDispatcher::schedule_dispatch_to_all_workers`) so
+    /// flipping this on does NOT introduce sync coupling between Bazel
+    /// ack and the worker fan-out.
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub small_blob_mirror_enabled: bool,
 }
 
 fn default_disable_otlp() -> bool {

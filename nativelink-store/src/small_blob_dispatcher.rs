@@ -72,6 +72,7 @@
 //!   in v1 — see `SmallBlobDispatcher::unpin_on_disconnect` doc for the
 //!   correctness argument and follow-up TODO.
 
+use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -86,7 +87,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_util::common::DigestInfo;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// The maximum blob size (bytes) that the dispatcher accepts. Larger blobs
 /// take the existing streaming path (`worker_proxy_store::mirror_blob_to_random_worker`).
@@ -219,6 +220,12 @@ impl EphemeralServerSidePin {
     /// Number of entries currently held.
     pub fn len(&self) -> usize {
         self.state.lock().len()
+    }
+
+    /// Configured byte capacity. Read-only accessor for periodic
+    /// metrics emit (per #168 dist-systems MAJOR-1).
+    pub fn cap(&self) -> u64 {
+        self.cap
     }
 
     /// True if the pin set is empty.
@@ -436,6 +443,43 @@ pub struct SmallBlobDispatcher {
     /// health signal (per B6); this counter is for tests + low-frequency
     /// debug.
     dispatched_count: AtomicUsize,
+    /// Diagnostic counter: number of `schedule_dispatch_to_all_workers`
+    /// calls that fanned out to ≥1 worker. Each call counts once,
+    /// regardless of `connected_workers().len()` — pair with
+    /// `dispatched_count` (per-worker) to derive the average fan-out.
+    /// Used by the periodic metrics task to expose dispatcher activity
+    /// in operator logs (per #168 dist-systems MAJOR-1).
+    fan_out_count_total: AtomicU64,
+    /// Diagnostic counter: number of `enqueue` calls that synchronously
+    /// passed gates but were dropped because a per-store pin set hit
+    /// `pin_max_bytes`. Visible in periodic metrics; non-zero indicates
+    /// a hot store under sustained burst.
+    skipped_pin_full_total: AtomicU64,
+    /// Diagnostic counter: number of `enqueue` calls that synchronously
+    /// passed gates but were dropped because the per-(worker, store)
+    /// `try_send` returned `Full`. Non-zero indicates a slow worker
+    /// (drainer falling behind RTT × producer rate).
+    skipped_queue_full_total: AtomicU64,
+}
+
+/// Manual `Debug` impl. Producer servers (`bytestream_server.rs`,
+/// `cas_server.rs`, `ac_server.rs`) carry `Option<Arc<Self>>` in
+/// `#[derive(Debug)]` structs, which requires `Self: Debug`. The
+/// internal state is mostly `Mutex<HashMap>` and is not interesting
+/// to log verbatim; we surface the operationally-useful counters
+/// instead.
+impl core::fmt::Debug for SmallBlobDispatcher {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SmallBlobDispatcher")
+            .field("enabled", &self.config.small_blob_mirror_enabled)
+            .field("dispatched_count", &self.dispatched_count())
+            .field("fan_out_count_total", &self.fan_out_count_total())
+            .field("skipped_pin_full_total", &self.skipped_pin_full_total())
+            .field("skipped_queue_full_total", &self.skipped_queue_full_total())
+            .field("pin_set_count", &self.pin_sets.lock().len())
+            .field("worker_tx_count", &self.worker_txs.lock().len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SmallBlobDispatcher {
@@ -448,7 +492,39 @@ impl SmallBlobDispatcher {
             worker_txs: Mutex::new(HashMap::new()),
             pin_sets: Mutex::new(HashMap::new()),
             dispatched_count: AtomicUsize::new(0),
+            fan_out_count_total: AtomicU64::new(0),
+            skipped_pin_full_total: AtomicU64::new(0),
+            skipped_queue_full_total: AtomicU64::new(0),
         }
+    }
+
+    /// True if the master feature flag is on. Producers use this as a
+    /// cheap zero-cost gate at the hook site (`if !disp.is_enabled() {
+    /// return }`) so the per-blob fan-out path is fully short-circuited
+    /// when the dispatcher is canary-disabled — no `connected_workers()`
+    /// snapshot, no per-worker validation. The same flag is re-checked
+    /// inside `enqueue` (defense in depth), so this accessor is purely a
+    /// hot-path optimization.
+    pub fn is_enabled(&self) -> bool {
+        self.config.small_blob_mirror_enabled
+    }
+
+    /// Diagnostic accessor: number of `schedule_dispatch_to_all_workers`
+    /// calls that successfully spawned a fan-out task.
+    pub fn fan_out_count_total(&self) -> u64 {
+        self.fan_out_count_total.load(Ordering::Relaxed)
+    }
+
+    /// Diagnostic accessor: number of `enqueue` calls that were dropped
+    /// because the per-store pin set was at `pin_max_bytes`.
+    pub fn skipped_pin_full_total(&self) -> u64 {
+        self.skipped_pin_full_total.load(Ordering::Relaxed)
+    }
+
+    /// Diagnostic accessor: number of `enqueue` calls that were dropped
+    /// because the per-(worker, store) mpsc `try_send` returned `Full`.
+    pub fn skipped_queue_full_total(&self) -> u64 {
+        self.skipped_queue_full_total.load(Ordering::Relaxed)
     }
 
     /// Diagnostic accessor: how many calls passed all gates and landed
@@ -470,6 +546,36 @@ impl SmallBlobDispatcher {
     pub fn has_worker_tx_for_test(&self, endpoint: &str, boot_epoch_id: u64) -> bool {
         let key: Arc<str> = Arc::from(endpoint);
         self.worker_txs.lock().contains_key(&(key, boot_epoch_id))
+    }
+
+    /// Snapshot every `(endpoint, boot_epoch_id)` for which a `worker_tx`
+    /// is currently registered. Used by tests + diagnostics; producers
+    /// use [`Self::connected_workers_with_senders`] to skip the
+    /// per-worker `worker_txs.lock()` round-trip (perf-optimizer #168
+    /// NIT-1).
+    pub fn connected_workers(&self) -> Vec<(Arc<str>, u64)> {
+        self.worker_txs
+            .lock()
+            .keys()
+            .map(|(ep, epoch)| (ep.clone(), *epoch))
+            .collect()
+    }
+
+    /// Snapshot every connected worker plus its `worker_tx` `Sender`
+    /// clone. Used by `schedule_dispatch_to_all_workers` to fan-out
+    /// without re-locking `worker_txs` per worker (perf-optimizer #168
+    /// NIT-1: kill the per-iteration `worker_txs.lock()` round-trip).
+    /// O(N) under the `worker_txs` Mutex; N ≤ fleet size (~10 today,
+    /// bounded). Snapshots into an owned `Vec` so the caller does not
+    /// hold the lock across `.await`.
+    pub fn connected_workers_with_senders(
+        &self,
+    ) -> Vec<(Arc<str>, u64, mpsc::UnboundedSender<UpdateForWorker>)> {
+        self.worker_txs
+            .lock()
+            .iter()
+            .map(|((ep, epoch), tx)| (ep.clone(), *epoch, tx.clone()))
+            .collect()
     }
 
     /// Diagnostic accessor: how many per-`(endpoint, boot_epoch_id, *)`
@@ -621,6 +727,181 @@ impl SmallBlobDispatcher {
         }
     }
 
+    /// Schedule a fan-out dispatch to every connected worker. **SYNC**:
+    /// returns immediately after spawning the work, so the caller's RPC
+    /// future does NOT block on dispatch. The Bazel-facing ack remains
+    /// immediate per `feedback_no_sync_slow_write_ack` and the
+    /// `feedback_async_to_sync_requires_explicit_signoff` rule (#168
+    /// perf-optimizer MAJOR-1, BLOCKER — addresses the #203 OOM
+    /// cascade shape: any sync-coupling between Bazel ack and the
+    /// dispatcher path is a regression in waiting).
+    ///
+    /// Synchronous fast-fail order (no allocation, no spawn):
+    /// 1. Feature flag off → return.
+    /// 2. `data.len() > SMALL_BLOB_THRESHOLD` → return.
+    ///
+    /// Otherwise spawns a `tokio::task` carrying the snapshot of
+    /// connected workers + their senders, and runs the per-worker
+    /// `enqueue` calls there. Per-worker errors are logged inside the
+    /// task; nothing propagates back to the caller.
+    ///
+    /// **No `.await` is performed by this method.** The producer
+    /// hook contract is: call this, then continue immediately.
+    ///
+    /// Callers' hook-site contract:
+    /// 1. Call AFTER the slow-tier write (`update_oneshot`) returns Ok —
+    ///    durability via slow tier is the precondition for dispatch.
+    /// 2. Skip when the upload is itself a mirror (`is_mirror`) or
+    ///    originates from a worker (`is_worker`) — those paths must not
+    ///    recursively re-dispatch (USER DIRECTIVE).
+    /// 3. Pass `data.clone()` (Bytes is Arc-counted, O(1)).
+    /// 4. Pass `store_id: Arc<str>` so the producer doesn't re-allocate
+    ///    on every call (perf-optimizer #168 NIT-1).
+    pub fn schedule_dispatch_to_all_workers(
+        self: &Arc<Self>,
+        store_id: Arc<str>,
+        digest: DigestInfo,
+        data: Bytes,
+    ) {
+        // Cheap synchronous gates — bail BEFORE any allocation or spawn
+        // (perf-optimizer #168 NIT — keep the disabled-path zero-cost).
+        if !self.config.small_blob_mirror_enabled {
+            return;
+        }
+        if data.len() > SMALL_BLOB_THRESHOLD {
+            return;
+        }
+        // Spawn the fan-out and return. The spawn allocation + task
+        // wake is the only per-call overhead when the dispatcher is on.
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            this.dispatch_to_all_workers_inner(store_id, digest, data)
+                .await;
+        });
+    }
+
+    /// Inner fan-out implementation invoked from the spawned task.
+    /// Snapshots `connected_workers_with_senders` ONCE (perf-optimizer
+    /// #168 NIT-1 + NIT-2), iterates with the resolved senders so
+    /// per-worker `enqueue_with_sender` does NOT re-lock `worker_txs`.
+    async fn dispatch_to_all_workers_inner(
+        self: Arc<Self>,
+        store_id: Arc<str>,
+        digest: DigestInfo,
+        data: Bytes,
+    ) {
+        let workers = self.connected_workers_with_senders();
+        if workers.is_empty() {
+            debug!(
+                store_id = store_id.as_ref(),
+                %digest,
+                data_len = data.len(),
+                "dispatch_to_all_workers: no connected workers; skipping"
+            );
+            return;
+        }
+        self.fan_out_count_total.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            store_id = store_id.as_ref(),
+            %digest,
+            data_len = data.len(),
+            worker_count = workers.len(),
+            "dispatch_to_all_workers: fanning out small blob"
+        );
+        for (endpoint, boot_epoch_id, worker_tx) in workers {
+            if let Err(err) = self
+                .enqueue_with_sender(
+                    endpoint.clone(),
+                    boot_epoch_id,
+                    store_id.clone(),
+                    digest,
+                    data.clone(),
+                    worker_tx,
+                )
+                .await
+            {
+                warn!(
+                    store_id = store_id.as_ref(),
+                    %digest,
+                    endpoint = endpoint.as_ref(),
+                    boot_epoch_id,
+                    ?err,
+                    "dispatch_to_all_workers: per-worker enqueue failed; continuing fan-out"
+                );
+            }
+        }
+    }
+
+    /// Async fan-out wrapper around `dispatch_to_all_workers_inner`.
+    /// Test-only / non-hot path: production producers go through
+    /// `schedule_dispatch_to_all_workers` (sync) so the Bazel ack is
+    /// not delayed by the fan-out.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn dispatch_to_all_workers_for_test(
+        self: &Arc<Self>,
+        store_id: &str,
+        digest: DigestInfo,
+        data: Bytes,
+    ) {
+        if !self.config.small_blob_mirror_enabled {
+            return;
+        }
+        if data.len() > SMALL_BLOB_THRESHOLD {
+            return;
+        }
+        Arc::clone(self)
+            .dispatch_to_all_workers_inner(Arc::from(store_id), digest, data)
+            .await;
+    }
+
+    /// Spawn a periodic info-logger that emits dispatcher activity
+    /// metrics on `period`. The loop exits when the returned join
+    /// handle is dropped (caller responsibility) — typically held by
+    /// the server bootstrap for the lifetime of the process.
+    ///
+    /// Per #168 dist-systems MAJOR-1: operators need to detect
+    /// pin-set capacity exhaustion, queue-full, and fan-out coverage
+    /// without a separate metric. One log line per `period` is the
+    /// agreed visibility hook (cheap; ~64 chars + per-store fields).
+    pub fn spawn_periodic_metrics(
+        self: &Arc<Self>,
+        period: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(period);
+            // Skip the immediate first tick so we don't log a
+            // useless all-zeros line at startup.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(disp) = weak.upgrade() else {
+                    return;
+                };
+                let pin_sets = disp.all_pin_sets();
+                for (store_id, pin_set) in &pin_sets {
+                    info!(
+                        store_id = store_id.as_ref(),
+                        bytes_used = pin_set.total_bytes(),
+                        bytes_cap = pin_set.cap(),
+                        len = pin_set.len(),
+                        "small_blob_dispatcher: pin set capacity"
+                    );
+                }
+                info!(
+                    fan_out_count_total = disp.fan_out_count_total(),
+                    dispatched_count = disp.dispatched_count(),
+                    skipped_pin_full_total = disp.skipped_pin_full_total(),
+                    skipped_queue_full_total = disp.skipped_queue_full_total(),
+                    pin_set_count = pin_sets.len(),
+                    "small_blob_dispatcher: activity metrics"
+                );
+            }
+        })
+    }
+
     /// Enqueue a single small blob for push to a specific worker.
     ///
     /// Preconditions (validated synchronously, fast-fail with no allocation):
@@ -651,10 +932,10 @@ impl SmallBlobDispatcher {
         digest: DigestInfo,
         data: Bytes,
     ) -> Result<(), Error> {
+        // Preconditions: feature flag + size + store_id format.
         if !self.config.small_blob_mirror_enabled {
             return Ok(());
         }
-        // Precondition: size.
         if data.len() > SMALL_BLOB_THRESHOLD {
             return Err(make_input_err!(
                 "SmallBlobDispatcher::enqueue: data.len()={} exceeds SMALL_BLOB_THRESHOLD={} \
@@ -664,7 +945,6 @@ impl SmallBlobDispatcher {
                 SMALL_BLOB_THRESHOLD,
             ));
         }
-        // Precondition: store_id format.
         if !is_valid_store_id(store_id) {
             return Err(make_input_err!(
                 "SmallBlobDispatcher::enqueue: invalid store_id {store_id:?} \
@@ -691,17 +971,52 @@ impl SmallBlobDispatcher {
             );
             return Ok(());
         };
+        self.enqueue_with_sender(
+            endpoint_key,
+            boot_epoch_id,
+            store_key,
+            digest,
+            data,
+            worker_tx,
+        )
+        .await
+    }
+
+    /// Internal enqueue variant with a pre-resolved `worker_tx`.
+    ///
+    /// The fan-out fast-path (`schedule_dispatch_to_all_workers` →
+    /// `dispatch_to_all_workers_inner`) calls this directly so the
+    /// per-worker `worker_txs.lock()` round-trip is paid ONCE per
+    /// fan-out (perf-optimizer #168 NIT-2).
+    ///
+    /// Preconditions are NOT re-checked here — the caller (either the
+    /// public `enqueue` after its own validation OR the
+    /// `dispatch_to_all_workers_inner` after the same set of gates)
+    /// must have validated `data.len()` and `store_id` shape already.
+    /// However the pin-set / queue-full / cap-exceeded *runtime*
+    /// gates DO run here.
+    async fn enqueue_with_sender(
+        &self,
+        endpoint_key: Arc<str>,
+        boot_epoch_id: u64,
+        store_key: Arc<str>,
+        digest: DigestInfo,
+        data: Bytes,
+        worker_tx: mpsc::UnboundedSender<UpdateForWorker>,
+    ) -> Result<(), Error> {
         // Resolve the pin set; required for accounting. Missing pin set
-        // is a config error (FastSlowStore did not register) — drop with
-        // a warn but do NOT propagate (post-ack fire-and-forget).
-        let pin_set_opt = self.pin_set_for(store_id);
+        // is a config error (FastSlowStore did not register). Per item E
+        // (#168 defense-in-depth): use `debug!` so a dispatcher-enabled
+        // but partially-registered config does NOT log-flood under load.
+        // The startup registration (`nativelink.rs`) is the operator-
+        // actionable surface; per-blob noise here adds no signal.
+        let pin_set_opt = self.pin_set_for(store_key.as_ref());
         let Some(pin_set) = pin_set_opt else {
-            warn!(
-                endpoint,
-                store_id,
+            debug!(
+                endpoint = endpoint_key.as_ref(),
+                store_id = store_key.as_ref(),
                 %digest,
-                "enqueue: no EphemeralServerSidePin registered for store_id; \
-                 dropping (FastSlowStore did not register at startup — operator-actionable)"
+                "enqueue: no EphemeralServerSidePin registered for store_id; dropping"
             );
             return Ok(());
         };
@@ -709,9 +1024,10 @@ impl SmallBlobDispatcher {
         // ack can never race ahead of our pin record. If the cap is
         // exceeded, drop without queuing.
         if let Err(err) = pin_set.insert(digest, data.clone()) {
+            self.skipped_pin_full_total.fetch_add(1, Ordering::Relaxed);
             warn!(
-                endpoint,
-                store_id,
+                endpoint = endpoint_key.as_ref(),
+                store_id = store_key.as_ref(),
                 %digest,
                 ?err,
                 "enqueue: pin set cap exceeded; dropping"
@@ -759,9 +1075,10 @@ impl SmallBlobDispatcher {
             // Roll back the pin entry — bytes will never land on the
             // worker.
             pin_set.remove_one(&digest);
+            self.skipped_queue_full_total.fetch_add(1, Ordering::Relaxed);
             warn!(
-                endpoint,
-                store_id,
+                endpoint = endpoint_key.as_ref(),
+                store_id = store_key.as_ref(),
                 %digest,
                 ?err,
                 "enqueue: per-worker dispatch queue full; dropping (pin entry rolled back)"
@@ -769,8 +1086,8 @@ impl SmallBlobDispatcher {
             return Ok(());
         }
         debug!(
-            endpoint,
-            store_id,
+            endpoint = endpoint_key.as_ref(),
+            store_id = store_key.as_ref(),
             %digest,
             "SmallBlobDispatcher::enqueue dispatched"
         );

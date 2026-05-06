@@ -32,7 +32,7 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_scheduler::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     execute_result, update_for_worker, BlobsAvailableNotification, BlobsEvictedNotification,
-    ConnectWorkerRequest, ExecuteResult, KeepAliveRequest, UpdateForScheduler,
+    ConnectWorkerRequest, ExecuteResult, KeepAliveRequest, MirrorPinEntry, UpdateForScheduler,
 };
 use nativelink_proto::google::rpc::Status as ProtoStatus;
 use nativelink_scheduler::api_worker_scheduler::ApiWorkerScheduler;
@@ -2533,5 +2533,252 @@ pub async fn boot_epoch_wipe_does_not_clear_other_endpoint_state()
     // Note: B's pin entry IS expected to be cleared by A's wipe under
     // the v1 limitation (see test header comment + #168/#190). The
     // per-endpoint contract above is the load-bearing assertion.
+    Ok(())
+}
+
+// =====================================================================
+// #168 item K — eager locality_map update on dispatch ack.
+//
+// Production composition: WorkerApiServer wired with BOTH a
+// `SharedBlobLocalityMap` AND a `SmallBlobDispatcher`. When the worker
+// reports `pinned_mirror_entries` (proto field 16) on a
+// `BlobsAvailableNotification`, the server MUST register those digests
+// in the locality_map keyed by the worker's CAS endpoint.
+//
+// USER DIRECTIVE (#168): "when the server mirrors small blobs in batch
+// to workers ... add those blobs to the locality map server-side, after
+// the ack. That way there is no delay in the server's knowledge; an
+// action which references that blob could come sooner than a
+// blobsavailable broadcast."
+//
+// Without this, the server's knowledge that worker W now holds digest
+// D would lag the next periodic field-13 (`digests`) tick — meaning an
+// action referencing D scheduled in the meantime would (a) trigger a
+// redundant peer-fetch from another worker, (b) potentially be
+// re-dispatched by the dispatcher because the server doesn't know W
+// has it, OR (c) be scheduled away from W, missing locality affinity.
+//
+// Mutation step: comment out the
+// `locality_map.write().register_blobs(endpoint, &digests)` call in
+// `worker_api_server::handle_blobs_available` (next to the
+// `broadcast_pinned_mirror_ack` call). This test MUST red-fail with
+// the bespoke "locality_map MUST be updated within 2s of dispatch"
+// assertion message.
+async fn setup_api_server_with_locality_and_dispatcher(
+    cas_endpoint: &str,
+    boot_epoch_id: u64,
+) -> Result<DispatcherWithLocalityContext, Error> {
+    use nativelink_store::small_blob_dispatcher::{
+        EphemeralServerSidePin, SmallBlobDispatcher, SmallBlobDispatcherConfig,
+    };
+
+    const SCHEDULER_NAME: &str = "DUMMY_SCHEDULE_NAME";
+    const UUID_SIZE: usize = 36;
+
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager::new());
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager.clone(),
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+
+    let locality_map = new_shared_blob_locality_map();
+    let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+    let cas_pin = Arc::new(EphemeralServerSidePin::new(/* cap= */ 1024 * 1024));
+    dispatcher.register_pin_set("cas", cas_pin.clone());
+
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert(SCHEDULER_NAME.to_string(), scheduler.clone());
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
+        },
+        &schedulers,
+        Box::new(static_now_fn),
+        [1u8; 6],
+        Some(locality_map.clone()),
+        None, // no cas_store
+        None, // no worker_proxy
+        Some(dispatcher.clone()),
+    )
+    .err_tip(|| "Error creating WorkerApiServer")?;
+
+    let connect_worker_request = ConnectWorkerRequest {
+        cas_endpoint: cas_endpoint.to_string(),
+        boot_epoch_id,
+        ..Default::default()
+    };
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(Update::ConnectWorkerRequest(connect_worker_request))
+        .await
+        .unwrap();
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut connection_worker_stream = worker_api_server
+        .inner_connect_worker_for_testing(update_stream)
+        .await?
+        .into_inner();
+
+    let first = connection_worker_stream
+        .next()
+        .await
+        .err_tip(|| "expected ConnectionResult")?
+        .err_tip(|| "stream error before ConnectionResult")?
+        .update
+        .err_tip(|| "ConnectionResult update missing")?;
+    let worker_id = match first {
+        update_for_worker::Update::ConnectionResult(connection_result) => {
+            connection_result.worker_id
+        }
+        other => unreachable!("Expected ConnectionResult, got {:?}", other),
+    };
+    assert_eq!(worker_id.len(), UUID_SIZE);
+
+    Ok(DispatcherWithLocalityContext {
+        _scheduler: scheduler,
+        _worker_api_server: worker_api_server,
+        _connection_worker_stream: connection_worker_stream,
+        _worker_id: worker_id.into(),
+        worker_stream: tx,
+        _dispatcher: dispatcher,
+        _cas_pin: cas_pin,
+        locality_map,
+    })
+}
+
+#[expect(dead_code, reason = "fields kept alive for the duration of the test")]
+struct DispatcherWithLocalityContext {
+    _scheduler: Arc<ApiWorkerScheduler>,
+    _worker_api_server: WorkerApiServer,
+    _connection_worker_stream: ConnectWorkerStream,
+    _worker_id: WorkerId,
+    worker_stream: mpsc::Sender<Update>,
+    _dispatcher: Arc<nativelink_store::small_blob_dispatcher::SmallBlobDispatcher>,
+    _cas_pin: Arc<nativelink_store::small_blob_dispatcher::EphemeralServerSidePin>,
+    locality_map: SharedBlobLocalityMap,
+}
+
+#[nativelink_test]
+pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_map_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.50:50081";
+    let ctx = setup_api_server_with_locality_and_dispatcher(cas_endpoint, 4242u64).await?;
+
+    // Two distinct dispatcher-pushed digests. The worker reports them
+    // in `pinned_mirror_entries` (proto field 16, MirrorPinEntry) —
+    // this is the wire form of "the worker now holds these bytes
+    // because the server pushed them via the dispatcher."
+    let d1 = DigestInfo::new([0xC1u8; 32], 1024);
+    let d2 = DigestInfo::new([0xC2u8; 32], 2048);
+
+    ctx.worker_stream
+        .send(Update::BlobsAvailable(BlobsAvailableNotification {
+            worker_cas_endpoint: String::new(), // empty ⇒ use registered endpoint
+            digests: vec![],
+            is_full_snapshot: false,
+            evicted_digests: vec![],
+            digest_infos: vec![],
+            cpu_load_pct: 0,
+            cached_directory_digests: vec![],
+            added_subtree_digests: vec![],
+            removed_subtree_digests: vec![],
+            is_full_subtree_snapshot: false,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
+            // The load-bearing field for #168 item K. Each entry is
+            // an (store_id, digest) pair sorted by store_id ASCII —
+            // the server must extract the digests and register them
+            // in the locality_map keyed by the worker's endpoint.
+            pinned_mirror_entries: vec![
+                MirrorPinEntry {
+                    digest: Some(d1.into()),
+                    store_id: "cas".to_string(),
+                },
+                MirrorPinEntry {
+                    digest: Some(d2.into()),
+                    store_id: "cas".to_string(),
+                },
+            ],
+        }))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
+
+    // Bounded poll for the locality_map update. 2s deadline per
+    // user directive: "an action which references that blob could
+    // come sooner than a blobsavailable broadcast" — the latency
+    // window between dispatch and locality_map update must be tight
+    // enough to outpace action arrival. We poll instead of sleeping
+    // because the background BlobsAvailable handler is async and we
+    // want fail-fast on a positive observation.
+    let locality_map = ctx.locality_map.clone();
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let map = locality_map.read();
+            let workers_d1 = map.lookup_workers(&d1);
+            let workers_d2 = map.lookup_workers(&d2);
+            if !workers_d1.is_empty() && !workers_d2.is_empty() {
+                return (workers_d1, workers_d2);
+            }
+            drop(map);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "#168 item K: locality_map MUST be updated within 2s of dispatch — \
+         broadcast latency cannot exceed action arrival window. The server's \
+         handle_blobs_available MUST register pinned_mirror_entries digests in \
+         the locality_map BEFORE acking the dispatcher (broadcast_pinned_mirror_ack); \
+         without this, an action referencing the dispatched digest scheduled \
+         between dispatch and the next field-13 BlobsAvailable tick will not \
+         see worker locality and either (a) trigger a redundant peer-fetch, \
+         (b) be re-dispatched, or (c) be scheduled away from this worker.",
+    );
+
+    assert_eq!(
+        observed.0.len(),
+        1,
+        "#168 item K: d1 must be registered against exactly one endpoint \
+         (the dispatching worker); got {:?}",
+        observed.0,
+    );
+    assert_eq!(
+        &*observed.0[0],
+        cas_endpoint,
+        "#168 item K: d1 must be registered against the dispatching worker's \
+         endpoint ({cas_endpoint}); got {:?}",
+        observed.0,
+    );
+    assert_eq!(
+        observed.1.len(),
+        1,
+        "#168 item K: d2 must be registered against exactly one endpoint \
+         (the dispatching worker); got {:?}",
+        observed.1,
+    );
+    assert_eq!(
+        &*observed.1[0],
+        cas_endpoint,
+        "#168 item K: d2 must be registered against the dispatching worker's \
+         endpoint ({cas_endpoint}); got {:?}",
+        observed.1,
+    );
+
     Ok(())
 }

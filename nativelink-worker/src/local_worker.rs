@@ -729,6 +729,26 @@ pub fn handle_batch_write_small_blobs(
     let mut inserted = 0usize;
     let mut skipped = 0usize;
     for entry in blobs {
+        // Wire-side store_id validation (#168 producer wire-up review):
+        // the worker writes `dispatched_mirror_pins[(store_id, digest)]`
+        // which is later iterated to populate
+        // `BlobsAvailableNotification.pinned_mirror_entries` (proto
+        // field 16). A malformed `store_id` from a buggy or untrusted
+        // server would (a) leak unbounded keys into the BTreeMap, and
+        // (b) propagate to the wire ack, where the server's
+        // `is_valid_store_id`-keyed pin-set lookup would silently fail
+        // to unpin — creating a memory-leak path on the server. Reject
+        // here with the same regex `enqueue` enforces (Rust-ident
+        // shape per plan C11).
+        if !nativelink_store::small_blob_dispatcher::is_valid_store_id(&entry.store_id) {
+            warn!(
+                store_id = entry.store_id,
+                "BatchWriteSmallBlobs: invalid store_id (must match \
+                 `[a-zA-Z_][a-zA-Z0-9_]*` per plan C11); skipping"
+            );
+            skipped += 1;
+            continue;
+        }
         let Some(proto_digest) = entry.digest.as_ref() else {
             warn!(
                 store_id = entry.store_id,
@@ -2637,10 +2657,15 @@ pub async fn new_local_worker(
             },
         }];
 
-        let cas_server = nativelink_service::cas_server::CasServer::new(&cas_configs, &store_manager)
+        // Workers do NOT participate in the SmallBlobDispatcher producer
+        // path — workers RECEIVE dispatched bytes; they never push to
+        // other workers. Pass `None` here so the dispatcher hook is
+        // entirely inert on the worker side. Server-side wire-up lives
+        // in `src/bin/nativelink.rs:957-973`.
+        let cas_server = nativelink_service::cas_server::CasServer::new(&cas_configs, &store_manager, None)
             .err_tip(|| "Failed to create worker CAS server")?;
         let bytestream_server =
-            nativelink_service::bytestream_server::ByteStreamServer::new(&bytestream_configs, &store_manager)
+            nativelink_service::bytestream_server::ByteStreamServer::new(&bytestream_configs, &store_manager, None)
                 .err_tip(|| "Failed to create worker ByteStream server")?;
 
         let addr: std::net::SocketAddr = ([0, 0, 0, 0, 0, 0, 0, 0], cas_port).into();
