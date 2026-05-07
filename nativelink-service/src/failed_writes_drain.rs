@@ -169,9 +169,13 @@ pub fn drain_tick(
     }
 
     // Group by endpoint for one UploadMissingBlobs per worker per
-    // tick. Re-insertion is grouped by store_name so a digest from
-    // store A re-inserts into A's set.
-    let mut per_endpoint: HashMap<Arc<str>, Vec<DigestInfo>> = HashMap::new();
+    // tick. Each entry carries `(store_name, digest)` so that a
+    // dispatch failure (race-loser or `tx.send()` Err) re-inserts the
+    // digest into the SOURCE store rather than fan-in spraying every
+    // CAS store. The single-cas_store deployment masked this; the
+    // `cas_stores: &[(String, Store)]` API supports N (split-routing,
+    // #267).
+    let mut per_endpoint: HashMap<Arc<str>, Vec<(String, DigestInfo)>> = HashMap::new();
     let mut reinsert: HashMap<String, Vec<DigestInfo>> = HashMap::new();
 
     for (store_name, digests) in all_failed {
@@ -199,7 +203,10 @@ pub fn drain_tick(
                 reinsert.entry(store_name.clone()).or_default().push(digest);
                 continue;
             };
-            per_endpoint.entry(endpoint).or_default().push(digest);
+            per_endpoint
+                .entry(endpoint)
+                .or_default()
+                .push((store_name.clone(), digest));
             if inflight.len() < inflight_cap {
                 inflight.insert(digest, now);
             }
@@ -207,7 +214,7 @@ pub fn drain_tick(
         }
     }
 
-    // Re-insert digests we couldn't dispatch.
+    // Re-insert digests we couldn't dispatch (throttled / no-worker).
     for (store_name, digests) in reinsert {
         if let Some(store) = cas_stores
             .iter()
@@ -219,19 +226,20 @@ pub fn drain_tick(
     }
 
     // Dispatch one UploadMissingBlobs per endpoint per tick, batched.
-    for (endpoint, digests) in per_endpoint {
+    // Each entry retains `(store_name, digest)` so that re-insert on
+    // dispatch failure routes to the source store, not a fan-in spray
+    // across every CAS store.
+    for (endpoint, entries) in per_endpoint {
         let Some(tx) = endpoint_to_tx.get(&endpoint) else {
             // Race: tx vanished between snapshot and dispatch.
-            // Re-insert across every CAS store (per-endpoint fan-in
-            // already lost store_name).
-            for (_, store) in cas_stores {
-                store.reinsert_failed_digests(&digests);
-            }
+            // Re-insert each digest into its source store (BLOCK B1
+            // fix: do NOT spray every cas_store).
+            reinsert_by_source_store(cas_stores, &entries);
             continue;
         };
-        for chunk in digests.chunks(batch_size) {
+        for chunk in entries.chunks(batch_size) {
             let proto_digests: Vec<Digest> =
-                chunk.iter().map(|d| Digest::from(*d)).collect();
+                chunk.iter().map(|(_, d)| Digest::from(*d)).collect();
             let msg = UpdateForWorker {
                 update: Some(update_for_worker::Update::UploadMissingBlobs(
                     UploadMissingBlobsRequest {
@@ -246,9 +254,7 @@ pub fn drain_tick(
                     "failed_slow_writes_drain: worker channel closed; \
                      re-inserting batch"
                 );
-                for (_, store) in cas_stores {
-                    store.reinsert_failed_digests(chunk);
-                }
+                reinsert_by_source_store(cas_stores, chunk);
                 break;
             }
         }
@@ -264,4 +270,28 @@ pub fn drain_tick(
         );
     }
     stats
+}
+
+/// Re-insert digests into their source CAS stores, grouping by
+/// `store_name`. Used by the dispatch-failure paths (race-loser when
+/// `tx` vanished between snapshot and dispatch; `tx.send()` Err
+/// mid-batch). Per BLOCK B1 / split-routing (#267): re-insert MUST
+/// route to the source store rather than fan-in spray every CAS store.
+fn reinsert_by_source_store(cas_stores: &[(String, Store)], entries: &[(String, DigestInfo)]) {
+    let mut by_store: HashMap<&str, Vec<DigestInfo>> = HashMap::new();
+    for (store_name, digest) in entries {
+        by_store
+            .entry(store_name.as_str())
+            .or_default()
+            .push(*digest);
+    }
+    for (store_name, digests) in by_store {
+        if let Some(store) = cas_stores
+            .iter()
+            .find(|(n, _)| n == store_name)
+            .map(|(_, s)| s.clone())
+        {
+            store.reinsert_failed_digests(&digests);
+        }
+    }
 }
