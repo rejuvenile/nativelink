@@ -682,6 +682,34 @@ impl FastSlowStore {
         self.in_flight_empty_notify.clone()
     }
 
+    /// Returns a closure that, when invoked with a digest, pushes it
+    /// onto the stable-digests queue and wakes the BIS broadcast loop.
+    ///
+    /// Used by the chunked-write dispatcher (`BazelChunkedDispatcherImpl`)
+    /// to mirror the legacy `update`/`update_oneshot` background-spawn
+    /// behavior at `fast_slow_store.rs:3449-3450`. Without this push,
+    /// chunked-committed digests never appear in the BIS broadcast →
+    /// upstream worker `mirror_blobs` and server fast-tier pins
+    /// accumulate without bound until the 120 s pin TTL drains them
+    /// (the production-incident-2026-05-06 mechanism that drove the
+    /// MemoryStore to its 48 GB cap and produced ResourceExhausted).
+    ///
+    /// Lock acquisition: parking_lot::Mutex, single push + one
+    /// notify_one. Never holds across `.await` (the closure is
+    /// synchronous). Calling more than once for the same digest is
+    /// idempotent at the protocol layer (the broadcast tolerates
+    /// duplicates) but should be avoided to keep the queue bounded —
+    /// the chunked dispatcher pushes exactly once on commit success.
+    #[must_use]
+    pub fn stable_digests_pusher(&self) -> Arc<dyn Fn(DigestInfo) + Send + Sync> {
+        let stable_digests = self.stable_digests.clone();
+        let stable_notify = self.stable_notify.clone();
+        Arc::new(move |digest: DigestInfo| {
+            stable_digests.lock().push(digest);
+            stable_notify.notify_one();
+        })
+    }
+
     /// #212 Phase 2.7 helper: dispatch a Bazel-facing write through
     /// the chunked path. Tees the upstream bytes into BOTH the fast
     /// tier (MemoryStore — in-memory replica satisfying ≥2-replica
