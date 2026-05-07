@@ -39,7 +39,7 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreLike};
 use nativelink_worker::local_worker::{
-    BlobsAvailableState, handle_blobs_in_stable_storage,
+    BlobsAvailableState, BlobsAvailableTestArgs, handle_blobs_in_stable_storage,
 };
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -121,7 +121,13 @@ async fn mirror_blob_removed_when_proto_received() {
     );
 
     let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
-    let state = BlobsAvailableState::new_for_test(fs_store, Some(cas_fss.clone()));
+    let state = BlobsAvailableState::from_test_args(
+        fs_store,
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(cas_fss.clone()),
+            ..Default::default()
+        },
+    );
 
     // Construct the proto exactly the way the dispatch arm receives it.
     let proto = vec![proto_digest_for(&acked_digest)];
@@ -150,7 +156,13 @@ async fn invalid_proto_digest_does_not_crash_handler() {
     write_mirror(&cas_fss, valid_digest, Bytes::from_static(b"abcd")).await;
 
     let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
-    let state = BlobsAvailableState::new_for_test(fs_store, Some(cas_fss.clone()));
+    let state = BlobsAvailableState::from_test_args(
+        fs_store,
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(cas_fss.clone()),
+            ..Default::default()
+        },
+    );
 
     let proto = vec![
         ProtoDigest {
@@ -174,7 +186,7 @@ async fn invalid_proto_digest_does_not_crash_handler() {
 #[nativelink_test]
 async fn handler_no_op_when_cas_server_fss_absent() {
     let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
-    let state = BlobsAvailableState::new_for_test(fs_store, None);
+    let state = BlobsAvailableState::from_test_args(fs_store, BlobsAvailableTestArgs::default());
     let digest = mk_digest(4, 4);
     let proto = vec![proto_digest_for(&digest)];
     // Must complete without panic.

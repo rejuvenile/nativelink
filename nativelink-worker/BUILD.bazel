@@ -109,7 +109,7 @@ rust_test(
 )
 
 # Mirror reconciliation integration tests. Require `test-utils` so the
-# internal hooks `BlobsAvailableState::new_for_test` and
+# internal hooks `BlobsAvailableState::from_test_args` and
 # `FastSlowStore::set_mirror_blobs_max_bytes_for_test` compile.
 # See `mirror_durability_test` in nativelink-store/BUILD.bazel for the
 # Bazel-vs-cargo feature plumbing note. The cargo CI step

@@ -11,7 +11,7 @@ nix = []
 pprof = ["nativelink-util/pprof"]
 quic = ["dep:tonic-h3", "dep:quinn", "dep:h3-quinn", "dep:rcgen", "dep:rustls", "dep:socket2", "nativelink-util/quic", "nativelink-store/quic"]
 failpoints = ["dep:fail", "fail/failpoints", "nativelink-store/failpoints", "nativelink-util/failpoints"]
-# Test-only constructors (e.g. `BlobsAvailableState::new_for_test`).
+# Test-only constructors (e.g. `BlobsAvailableState::from_test_args`).
 # Production builds MUST NOT enable this feature.
 test-utils = ["nativelink-store/test-utils"]
 
@@ -107,7 +107,7 @@ required-features = ["test-utils"]
 
 [[test]]
 # (#97) `bis_chunked_dispatch_arm_round_trips_ack` constructs a
-# `BlobsAvailableState::new_for_test`, which is gated behind
+# `BlobsAvailableState::from_test_args`, which is gated behind
 # `cfg(any(test, feature = "test-utils"))`. Cfg-test alone doesn't
 # propagate from the lib into integration tests, so we need the
 # feature explicitly here.
@@ -123,9 +123,10 @@ name = "end_to_end_mirror_reconciliation_test"
 required-features = ["test-utils"]
 
 [[test]]
-# `bis_ac_routing_test` constructs `BlobsAvailableState::new_for_test_with_ac`,
-# gated behind `cfg(any(test, feature = "test-utils"))`. Without this `[[test]]`
-# entry the default `cargo test -p nativelink-worker` invocation red-fails with
-# E0599 on the constructor. Mirror the pattern used by the other BIS tests above.
+# `bis_ac_routing_test` constructs `BlobsAvailableState::from_test_args` with an
+# `ac_mirror_target`, gated behind `cfg(any(test, feature = "test-utils"))`.
+# Without this `[[test]]` entry the default `cargo test -p nativelink-worker`
+# invocation red-fails with E0599 on the constructor. Mirror the pattern used by
+# the other BIS tests above.
 name = "bis_ac_routing_test"
 required-features = ["test-utils"]

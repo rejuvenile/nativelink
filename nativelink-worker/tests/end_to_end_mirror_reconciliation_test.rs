@@ -65,7 +65,7 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreKey, StoreLike};
 use nativelink_worker::local_worker::{
-    BlobsAvailableState, handle_blobs_in_stable_storage,
+    BlobsAvailableState, BlobsAvailableTestArgs, handle_blobs_in_stable_storage,
 };
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -195,7 +195,13 @@ async fn server_restart_reconciliation_full_flow() {
     // Production code: the dispatch arm calls
     // `handle_blobs_in_stable_storage(state, cas_store, &proto)`.
     let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
-    let state = BlobsAvailableState::new_for_test(fs_store, Some(cas_fss.clone()));
+    let state = BlobsAvailableState::from_test_args(
+        fs_store,
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(cas_fss.clone()),
+            ..Default::default()
+        },
+    );
     let proto = vec![ProtoDigest::from(blob)];
     handle_blobs_in_stable_storage(&state, None, &proto);
 

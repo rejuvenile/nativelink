@@ -1565,7 +1565,7 @@ async fn bis_chunked_dispatch_arm_round_trips_ack() -> Result<(), Error> {
         BlobsInStableStorageChunk, ChunkedMessage, chunked_message,
     };
     use nativelink_store::filesystem_store::FileEntryImpl;
-    use nativelink_worker::local_worker::BlobsAvailableState;
+    use nativelink_worker::local_worker::{BlobsAvailableState, BlobsAvailableTestArgs};
     use tempfile::TempDir;
     use tokio::time::{Duration, timeout};
     use utils::local_worker_test_utils::setup_local_worker_with_blobs_state;
@@ -1589,7 +1589,8 @@ async fn bis_chunked_dispatch_arm_round_trips_ack() -> Result<(), Error> {
         ..Default::default()
     })
     .await?;
-    let blobs_state = BlobsAvailableState::new_for_test(fs_store, None);
+    let blobs_state =
+        BlobsAvailableState::from_test_args(fs_store, BlobsAvailableTestArgs::default());
 
     let mut test_context = setup_local_worker_with_blobs_state(blobs_state).await;
     let streaming_response = test_context.maybe_streaming_response.take().unwrap();

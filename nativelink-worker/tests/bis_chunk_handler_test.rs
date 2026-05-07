@@ -62,7 +62,7 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreLike};
 use nativelink_worker::local_worker::{
-    BisUnpinOutcome, BlobsAvailableState, handle_bis_chunk,
+    BisUnpinOutcome, BlobsAvailableState, BlobsAvailableTestArgs, handle_bis_chunk,
 };
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -143,7 +143,13 @@ async fn bis_chunked_full_burst() -> Result<(), nativelink_error::Error> {
     let before = fss.mirror_blob_count();
     assert_eq!(before, 32, "mirror fixture must seat 32 blobs");
 
-    let state = BlobsAvailableState::new_for_test(fs_store.clone(), Some(fss.clone()));
+    let state = BlobsAvailableState::from_test_args(
+        fs_store.clone(),
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(fss.clone()),
+            ..Default::default()
+        },
+    );
 
     let chunk = BlobsInStableStorageChunk {
         digests: proto_from(&digests),
@@ -189,7 +195,13 @@ async fn bis_chunked_full_burst() -> Result<(), nativelink_error::Error> {
 async fn bis_chunked_empty_terminal_acks() -> Result<(), nativelink_error::Error> {
     let (fs_store, _content, _temp) = make_filesystem_store().await;
     let fss = make_fss_for_mirror();
-    let state = BlobsAvailableState::new_for_test(fs_store.clone(), Some(fss.clone()));
+    let state = BlobsAvailableState::from_test_args(
+        fs_store.clone(),
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(fss.clone()),
+            ..Default::default()
+        },
+    );
 
     let chunk = BlobsInStableStorageChunk {
         digests: vec![],
@@ -227,7 +239,13 @@ async fn bis_chunked_idempotent_unpin() -> Result<(), nativelink_error::Error> {
     let (fs_store, _content, _temp) = make_filesystem_store().await;
     let fss = make_fss_for_mirror();
     let digests = populate_mirror_blobs(&fss, 8).await;
-    let state = BlobsAvailableState::new_for_test(fs_store.clone(), Some(fss.clone()));
+    let state = BlobsAvailableState::from_test_args(
+        fs_store.clone(),
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(fss.clone()),
+            ..Default::default()
+        },
+    );
 
     let chunk = BlobsInStableStorageChunk {
         digests: proto_from(&digests),
@@ -285,7 +303,13 @@ async fn bis_ack_not_sent_when_unpin_fails() -> Result<(), nativelink_error::Err
     let (fs_store, _content, _temp) = make_filesystem_store().await;
     let fss = make_fss_for_mirror();
     let valid_digests = populate_mirror_blobs(&fss, 4).await;
-    let state = BlobsAvailableState::new_for_test(fs_store.clone(), Some(fss.clone()));
+    let state = BlobsAvailableState::from_test_args(
+        fs_store.clone(),
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(fss.clone()),
+            ..Default::default()
+        },
+    );
 
     // Chunk mixes one MALFORMED proto digest (hex won't decode) with
     // four well-formed ones. The handler must report failed=1 and

@@ -63,7 +63,8 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreLike};
 use nativelink_worker::local_worker::{
-    AcMirrorTarget, BlobsAvailableState, handle_blobs_in_stable_storage_for_store,
+    AcMirrorTarget, BlobsAvailableState, BlobsAvailableTestArgs,
+    handle_blobs_in_stable_storage_for_store,
 };
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -160,10 +161,12 @@ async fn ac_chunk_drains_ac_only_not_cas() {
     );
 
     let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
-    let state = BlobsAvailableState::new_for_test_with_ac(
+    let state = BlobsAvailableState::from_test_args(
         fs_store,
-        Some(cas_fss.clone()),
-        Some(ac_target_for(ac_fss.clone())),
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(cas_fss.clone()),
+            ac_mirror_target: Some(ac_target_for(ac_fss.clone())),
+        },
     );
 
     let proto = vec![proto_digest_for(&aliased)];
@@ -217,10 +220,12 @@ async fn cas_chunk_does_not_touch_ac_pins_even_under_aliased_digest() {
     ac_fss.insert_local_ac_pin(AC_STORE_NAME, aliased);
 
     let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
-    let state = BlobsAvailableState::new_for_test_with_ac(
+    let state = BlobsAvailableState::from_test_args(
         fs_store,
-        Some(cas_fss.clone()),
-        Some(ac_target_for(ac_fss.clone())),
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(cas_fss.clone()),
+            ac_mirror_target: Some(ac_target_for(ac_fss.clone())),
+        },
     );
 
     let proto = vec![proto_digest_for(&aliased)];
@@ -265,10 +270,12 @@ async fn unknown_store_id_chunk_is_noop_with_ac_target_present() {
     ac_fss.insert_local_ac_pin(AC_STORE_NAME, digest);
 
     let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
-    let state = BlobsAvailableState::new_for_test_with_ac(
+    let state = BlobsAvailableState::from_test_args(
         fs_store,
-        Some(cas_fss.clone()),
-        Some(ac_target_for(ac_fss.clone())),
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(cas_fss.clone()),
+            ac_mirror_target: Some(ac_target_for(ac_fss.clone())),
+        },
     );
 
     let proto = vec![proto_digest_for(&digest)];
@@ -323,10 +330,12 @@ async fn ac_store_id_chunk_with_no_ac_target_is_noop() {
 
     let (fs_store, _content_dir, _temp_dir) = make_filesystem_store().await;
     // Note: ac_mirror_target = None.
-    let state = BlobsAvailableState::new_for_test_with_ac(
+    let state = BlobsAvailableState::from_test_args(
         fs_store,
-        Some(cas_fss.clone()),
-        None,
+        BlobsAvailableTestArgs {
+            cas_server_fss: Some(cas_fss.clone()),
+            ..Default::default()
+        },
     );
 
     let proto = vec![proto_digest_for(&digest)];
