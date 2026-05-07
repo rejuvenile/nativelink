@@ -710,6 +710,47 @@ impl FastSlowStore {
         })
     }
 
+    /// Returns a closure that, when invoked with a digest, performs the
+    /// chunked-commit FAILURE bookkeeping that mirrors the legacy
+    /// `update`/`update_oneshot` background-spawn Err arm at
+    /// `fast_slow_store.rs:3489-3494`. Two synchronous effects:
+    ///
+    ///   1. `failed_slow_writes.insert(digest)` — surfaces the failed
+    ///      digest to the worker's reconnect-retry path
+    ///      (`drain_failed_digests` consumes the set on reconnect; the
+    ///      mirror protocol re-uploads). Without this, a chunked-commit
+    ///      failure leaves no record that the slow tier never landed
+    ///      the bytes — the `failed_slow_writes` set is the
+    ///      single-source-of-truth that the reconnect-retry consults.
+    ///   2. `fast_store.pin_digests(&[digest])` — re-pins the in-memory
+    ///      replica so MemoryStore's eviction policy doesn't drop the
+    ///      blob before the worker reconnects. Without this, the 120 s
+    ///      pin TTL or eviction pressure could discard the blob between
+    ///      commit-failure and the next mirror-protocol retry,
+    ///      producing a NotFound on the next read attempt.
+    ///
+    /// Used by the chunked-write dispatcher's `AsyncCommit` reaper Err
+    /// arm so the chunked-commit failure path achieves contract parity
+    /// with the legacy `FastSlowStore::update` Err arm.
+    ///
+    /// Lock acquisition: parking_lot::Mutex on `failed_slow_writes`
+    /// (single insert) + whatever lock `pin_digests` takes on the fast
+    /// store. Never holds across `.await` (the closure is
+    /// synchronous). Calling more than once for the same digest is
+    /// idempotent on both effects (HashSet insert + pin re-bump).
+    #[must_use]
+    pub fn failed_writes_inserter(&self) -> Arc<dyn Fn(DigestInfo) + Send + Sync> {
+        let failed_writes = self.failed_slow_writes.clone();
+        let fast_store = self.fast_store.clone();
+        Arc::new(move |digest: DigestInfo| {
+            failed_writes.lock().insert(digest);
+            // Re-pin so the blob survives until reconnect retry. Without
+            // this, the 120s auto-expire could allow eviction before the
+            // worker reconnects.
+            fast_store.pin_digests(&[digest]);
+        })
+    }
+
     /// #212 Phase 2.7 helper: dispatch a Bazel-facing write through
     /// the chunked path. Tees the upstream bytes into BOTH the fast
     /// tier (MemoryStore — in-memory replica satisfying ≥2-replica
