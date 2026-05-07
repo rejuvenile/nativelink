@@ -650,6 +650,7 @@ async fn chunked_synchronous_commit_pushes_digest_to_stable_digests() {
             None, // pin_budget
             None, // chunked_read_registry
             Some(sink),
+            None, // failed_commit_sink — not exercised here (Synchronous + hash-matching blob)
             CHUNK,
             digest,
             stream,
@@ -795,6 +796,7 @@ async fn chunked_early_dedup_short_circuit_pushes_digest_to_stable_digests() {
             None, // pin_budget
             None, // chunked_read_registry
             Some(sink),
+            None, // failed_commit_sink — not exercised here (early-dedup short-circuit)
             metrics,
             CHUNK,
             digest,

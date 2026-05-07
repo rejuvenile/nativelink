@@ -1436,6 +1436,19 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     // `stable_digests` and pinned bytes accumulate until the 120 s pin
     // TTL drains them (the production-incident-2026-05-06 mechanism).
     stable_digests_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
+    // #283 fix: optional failed-commit sink. When `Some`, the
+    // AsyncCommit reaper invokes the closure on commit FAILURE so the
+    // chunked path achieves contract parity with the legacy
+    // `FastSlowStore::update` Err arm at
+    // `fast_slow_store.rs:3489-3494`. The closure (constructed by
+    // `FastSlowStore::failed_writes_inserter`) inserts the digest into
+    // `failed_slow_writes` (so the worker reconnect-retry path picks it
+    // up) AND re-pins the in-memory replica on the fast store (so
+    // MemoryStore eviction doesn't drop the blob before the retry).
+    // WITHOUT this, a chunked-commit failure leaves no record of the
+    // missing slow-tier write — the reconnect-retry never runs and
+    // subsequent reads NotFound on the lost blob.
+    failed_commit_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
     chunk_size: usize,
     digest: DigestInfo,
     chunks: Pin<Box<dyn Stream<Item = Result<PreparedChunk, Error>> + Send>>,
@@ -1672,6 +1685,17 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             // freshly-committed blob whose BIS notification is racing
             // the in-flight removal.
             let sink_for_reaper = stable_digests_sink.clone();
+            // #283 fix: clone the failed-commit sink into the reaper.
+            // The closure is constructed by
+            // `FastSlowStore::failed_writes_inserter()`; on commit
+            // failure the reaper invokes it BEFORE removing the
+            // in_flight entry so the failed-write bookkeeping
+            // (failed_slow_writes insert + fast-store re-pin) is
+            // observable to any reader the moment it sees in_flight as
+            // removed. This mirrors the legacy update Err arm ordering
+            // at `fast_slow_store.rs:3465-3494` where the failure
+            // recovery runs BEFORE in_flight removal.
+            let failed_sink_for_reaper = failed_commit_sink.clone();
             // Drop our local `driver` Arc — the reaper holds its own
             // strong ref and the in-flight entry holds another. The
             // explicit `drop(driver)` here documents that we transfer
@@ -1703,6 +1727,25 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
                         committed_size = r.committed_size,
                         "chunked dispatch reaper: pushed to stable_digests"
                     );
+                }
+                // #283 fix: on commit FAILURE, fire the failed-commit
+                // sink BEFORE removing the in_flight entry. Mirrors the
+                // legacy update Err arm at
+                // `fast_slow_store.rs:3489-3494`: insert into
+                // `failed_slow_writes` (so the worker reconnect-retry
+                // picks up the digest) AND re-pin the in-memory replica
+                // on the fast store (so MemoryStore eviction doesn't
+                // drop the blob before the retry). Order matters:
+                // running this BEFORE in_flight removal closes the
+                // visibility window where a reader could observe the
+                // chunked in-flight entry as removed while the
+                // failure-recovery effects haven't yet landed (the
+                // CLAUDE.md "ordering closes the race" rule the legacy
+                // arm comments call out).
+                if commit_result.is_err() {
+                    if let Some(sink) = failed_sink_for_reaper.as_ref() {
+                        sink(stream_digest);
+                    }
                 }
                 let removed_entry =
                     in_flight_for_reaper.inner.lock().remove(&stream_digest);
@@ -1816,6 +1859,16 @@ pub struct BazelChunkedDispatcherImpl<Fe: FileEntry = FileEntryImpl> {
     /// in `wire_bazel_chunked_dispatcher` always installs this.
     stable_digests_sink:
         Option<Arc<dyn Fn(nativelink_util::common::DigestInfo) + Send + Sync>>,
+    /// #283 fix: closure that performs the failed-commit bookkeeping
+    /// (`failed_slow_writes` insert + fast-store re-pin) on chunked
+    /// AsyncCommit failure. Invoked by the AsyncCommit reaper on `Err`
+    /// driver completion. Mirrors the legacy
+    /// `FastSlowStore::update`/`update_oneshot` background-spawn Err
+    /// arm at `fast_slow_store.rs:3489-3494`. `None` = no failed-write
+    /// recovery (tests that don't observe reconnect-retry); production
+    /// wiring in `wire_bazel_chunked_dispatcher` always installs this.
+    failed_commit_sink:
+        Option<Arc<dyn Fn(nativelink_util::common::DigestInfo) + Send + Sync>>,
     chunk_size: usize,
     metrics: Arc<ChunkedWriteHandlerMetrics>,
 }
@@ -1844,6 +1897,10 @@ impl<Fe: FileEntry> core::fmt::Debug for BazelChunkedDispatcherImpl<Fe> {
             .field(
                 "stable_digests_sink_installed",
                 &self.stable_digests_sink.is_some(),
+            )
+            .field(
+                "failed_commit_sink_installed",
+                &self.failed_commit_sink.is_some(),
             )
             .field("chunk_size", &self.chunk_size)
             .field("metrics", &self.metrics)
@@ -1879,6 +1936,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
             stable_digests_sink: None,
+            failed_commit_sink: None,
             chunk_size: CHUNK_SIZE,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
         }
@@ -1943,6 +2001,28 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
         self
     }
 
+    /// #283 fix: wire the dispatcher to a failed-commit closure
+    /// (typically obtained from `FastSlowStore::failed_writes_inserter`).
+    /// The dispatcher invokes this closure on chunked AsyncCommit
+    /// FAILURE so the failed-write bookkeeping (insert into
+    /// `failed_slow_writes` + re-pin on the fast store) achieves
+    /// contract parity with the legacy `FastSlowStore::update` Err arm
+    /// at `fast_slow_store.rs:3489-3494`. WITHOUT this wiring, a
+    /// chunked-commit failure leaves no record of the missing slow-tier
+    /// write — the worker reconnect-retry never runs and subsequent
+    /// reads NotFound on the lost blob.
+    ///
+    /// On commit SUCCESS the closure is NOT invoked; the
+    /// `stable_digests_sink` handles the success bookkeeping.
+    #[must_use]
+    pub fn with_failed_commit_sink(
+        mut self,
+        sink: Arc<dyn Fn(DigestInfo) + Send + Sync>,
+    ) -> Self {
+        self.failed_commit_sink = Some(sink);
+        self
+    }
+
     /// Construct a dispatcher with externally-supplied state. Used by
     /// tests so each test can have its own in-flight tracker + chunk
     /// budget + metrics + chunk size (smaller chunks make tests faster).
@@ -1964,6 +2044,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
             stable_digests_sink: None,
+            failed_commit_sink: None,
             chunk_size,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
         }
@@ -1992,6 +2073,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
             stable_digests_sink: None,
+            failed_commit_sink: None,
             chunk_size,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
         }
@@ -2041,6 +2123,7 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
             Some(self.pin_budget),
             self.chunked_read_registry.clone(),
             self.stable_digests_sink.clone(),
+            self.failed_commit_sink.clone(),
             Arc::clone(&self.metrics),
             self.chunk_size,
             digest,
@@ -2144,7 +2227,18 @@ pub fn wire_bazel_chunked_dispatcher<Fe: FileEntry>(
             // chunked commit accumulates pinned bytes that only drain
             // at the 120 s pin TTL — the production-incident-2026-05-06
             // mechanism.
-            .with_stable_digests_sink(fast_slow.stable_digests_pusher()),
+            .with_stable_digests_sink(fast_slow.stable_digests_pusher())
+            // #283 fix: wire the failed-commit closure so a chunked
+            // AsyncCommit failure inserts into `failed_slow_writes`
+            // (worker reconnect-retry consumes the set) AND re-pins the
+            // in-memory replica on the fast store (so MemoryStore
+            // eviction doesn't drop the blob before the retry).
+            // Mirrors the legacy update Err arm at
+            // `fast_slow_store.rs:3489-3494`. WITHOUT this, a chunked
+            // commit failure leaves no record that the slow tier never
+            // landed the bytes — subsequent reads NotFound on the lost
+            // blob.
+            .with_failed_commit_sink(fast_slow.failed_writes_inserter()),
     );
     let _installed = fast_slow.set_chunked_read_registry(Arc::clone(&registry));
     fast_slow
@@ -2321,6 +2415,12 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
     // doc-comment on `dispatch_chunks_to_driver` for the full
     // contract.
     stable_digests_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
+    // #283 fix: forwarded to `dispatch_chunks_to_driver` so the
+    // AsyncCommit reaper can fire failed-commit bookkeeping
+    // (failed_slow_writes insert + fast-store re-pin) on commit
+    // FAILURE. See the parameter doc-comment on
+    // `dispatch_chunks_to_driver` for the full contract.
+    failed_commit_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
     metrics: Arc<ChunkedWriteHandlerMetrics>,
     chunk_size: usize,
     digest: DigestInfo,
@@ -2417,6 +2517,7 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
         pin_budget,
         chunked_read_registry,
         stable_digests_sink,
+        failed_commit_sink,
         chunk_size,
         digest,
         chunks_stream,
