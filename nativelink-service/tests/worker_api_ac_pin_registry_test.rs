@@ -55,6 +55,15 @@
 //!      so the predicate is unambiguous regardless of how fast the
 //!      wipe lands relative to the new tick (test
 //!      `boot_epoch_wipe_does_not_block_repopulation`).
+//!   8. **Field-17 IS replace-snapshot, NOT additive** (#279
+//!      red-team disconfirming test): a second `BlobsAvailable`
+//!      with field 17 = [X1, X3] (X2 dropped) MUST cause X2 to
+//!      disappear from the registry on that tick alone, without
+//!      any explicit drain channel. Mutation: revert the field-17
+//!      handler to per-element `register_ac_pin` → red-fails with
+//!      "field-17 MUST be replace-snapshot, not additive — stale
+//!      entries leaked across ticks" (test
+//!      `field_17_replaces_endpoint_snapshot_atomically`).
 //!
 //! Production composition: real `WorkerApiServer`, real
 //! `ApiWorkerScheduler`, real `AcPinRegistry`, real
