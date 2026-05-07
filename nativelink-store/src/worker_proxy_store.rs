@@ -51,6 +51,7 @@ use nativelink_util::store_trait::{
 };
 
 use crate::batch_read_coalescer::{BatchFn, BatchReadCoalescer};
+use crate::chunked_signal::error_has_backpressure_signal;
 use crate::fast_slow_store::INNER_MISS_NO_TERMINATE;
 use crate::grpc_store::GrpcStore;
 
@@ -1930,6 +1931,32 @@ impl WorkerProxyStore {
                     // Inner wrote partial bytes before erroring; peer-fetch
                     // would corrupt the consumer stream. Surface the
                     // original error.
+                    //
+                    // #284 part 2 defensive belt-and-suspenders: detect
+                    // at-cap (`Code::ResourceExhausted` carrying a
+                    // `BackpressureSignal`) and warn loudly. The
+                    // populator-side fix
+                    // (`fast_slow_store::run_producer`'s `cache_tee_at_cap`
+                    // demotion) prevents this code path from being reached
+                    // for MemoryStore at-cap events; if this branch ever
+                    // fires WITH the at-cap discriminator, a populator
+                    // regression has reintroduced mid-stream poisoning and
+                    // the consumer stream is being aborted exactly as the
+                    // 2026-05-06 read-cascade-abort did. Scream so the
+                    // regression is visible in production logs.
+                    if e.code == Code::ResourceExhausted
+                        && error_has_backpressure_signal(&e)
+                    {
+                        warn!(
+                            key = ?key.borrow().into_digest(),
+                            bytes_written_by_inner,
+                            err = %e,
+                            "WorkerProxyStore: inner store wrote partial bytes then \
+                             returned at-cap (ResourceExhausted+BackpressureSignal) — \
+                             populator-side warn-and-continue regressed; consumer stream \
+                             will be aborted (#284 part 2 invariant violated)"
+                        );
+                    }
                     return Err(make_err!(
                         e.code,
                         "WorkerProxyStore: inner store wrote {bytes_written_by_inner} bytes \
