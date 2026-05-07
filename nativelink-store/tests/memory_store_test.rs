@@ -447,11 +447,14 @@ async fn update_accepts_correct_size_with_exact_size() -> Result<(), Error> {
 /// network, and allocation load. The early-reject saves the entire
 /// recv loop on the unhappy path.
 ///
-/// **Production composition.** We also exercise the same condition
-/// through `VerifyStore::new(... backend: memory)` — the same
-/// historical `cas_STORE` shape — to assert that the upstream wrapper
-/// surfaces the same `ResourceExhausted` without mangling the
-/// classifier-visible detail.
+/// **Production composition.** The sibling test
+/// `update_rejects_upfront_under_verify_store_does_not_deadlock`
+/// exercises the same condition through `VerifyStore::new(verify_size
+/// = true, backend: memory)` — the historical `cas_STORE` shape —
+/// to assert that the upstream wrapper surfaces the same
+/// `ResourceExhausted` without mangling the classifier-visible detail
+/// AND without deadlocking the wrapper's `tokio::join!(update_fut,
+/// check_fut)` over its borrowed channel.
 ///
 /// **Mutation step.** Comment out the `check_backpressure_gate` call
 /// in `MemoryStore::update`'s early-reject block (`memory_store.rs`,
@@ -593,6 +596,152 @@ async fn update_drains_when_declared_size_fits() -> Result<(), Error> {
         .get_part_unchunked(digest, 0, None)
         .await?;
     assert_eq!(landed.as_ref(), data.as_slice());
+
+    Ok(())
+}
+
+/// #284 part 1 — production-composition coverage of the early-reject
+/// gate. The historical `cas_STORE` chain wraps the inner store in a
+/// `VerifyStore` (`verify_size = true`); that wrapper runs
+/// `tokio::join!(update_fut, check_fut)` over an internal tx/rx pair.
+/// If the early-reject inside `MemoryStore::update` left any borrowed
+/// channel un-terminated, this composition would deadlock — the unit-
+/// boundary tests above own the rx and would never see it.
+///
+/// The asymmetric-contract sibling of `update_rejects_upfront_when_
+/// declared_size_exceeds_capacity`: the unit test guards "function
+/// returns Err"; this composition test guards "no caller above the
+/// store deadlocks because of how it returned." Both directions of the
+/// borrowed-state contract are exercised under a `tokio::time::
+/// timeout(5s)` deadlock detector with bespoke `.expect(...)` messages
+/// so an `Elapsed` cannot masquerade as a real Err.
+///
+/// We send 1 chunk on the producer side WITHOUT EOF and never close
+/// the channel. With the early-reject in place: `MemoryStore::update`
+/// returns `ResourceExhausted` immediately on the declared 1024-byte
+/// `ExactSize`, drops the inner-store rx, which causes VerifyStore's
+/// `inner_check_update` to fail its `tx.send` on the next chunk and
+/// return — the `tokio::join!` then unblocks. Without the early-
+/// reject (mutation), `MemoryStore::update` enters its recv loop and
+/// blocks forever (no EOF coming), VerifyStore's `check_fut` blocks
+/// forever, and the 5 s timeout fires with the bespoke message —
+/// proving the test guards the contract.
+///
+/// **Mutation step** (executed 2026-05-06): commenting out the
+/// `if let UploadSizeInfo::ExactSize(declared) = size_info { ... }`
+/// block in `memory_store.rs` red-fails this test with the bespoke
+/// "must not deadlock — early-reject must propagate ResourceExhausted
+/// upfront through VerifyStore" message at the 5 s timeout, confirming
+/// the production-composition contract is guarded.
+#[cfg(feature = "chunked_fast_slow")]
+#[nativelink_test]
+async fn update_rejects_upfront_under_verify_store_does_not_deadlock(
+) -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::{EvictionPolicy, StoreSpec, VerifySpec};
+    use nativelink_store::verify_store::VerifyStore;
+    use nativelink_util::store_trait::{Store, UploadSizeInfo};
+
+    // 1 KiB cap — same shape as the unit-boundary test above.
+    let inner = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 1024,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: false,
+    });
+    inner.enable_emit_backpressure();
+
+    // Fill the cap so any further write would force eviction.
+    let payload1_len: u64 = 1024;
+    let payload1 = vec![0u8; payload1_len as usize];
+    let digest1 = DigestInfo::try_new(VALID_HASH1, payload1_len)?;
+    inner
+        .update_oneshot(digest1, payload1.into())
+        .await
+        .expect("first insert should fit");
+
+    // Wrap in VerifyStore with verify_size=true — the production
+    // `cas_STORE` shape that joins `update_fut` and `check_fut` over
+    // an internal channel. The `backend` spec is metadata; the
+    // `inner_store` argument is what's actually wired in.
+    let verify = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(inner.clone()),
+    );
+
+    let digest2 = DigestInfo::try_new(VALID_HASH2, 1024)?;
+    let (mut tx, rx) = make_buf_channel_pair();
+    let verify_pin = Pin::new(verify.as_ref());
+    let update_fut = verify_pin.update(
+        StoreKey::from(digest2),
+        rx,
+        UploadSizeInfo::ExactSize(1024),
+    );
+    // Producer: send a single chunk to give VerifyStore's
+    // `inner_check_update` a chunk to forward to the inner store.
+    // With the early-reject in place, the inner store's rx is dropped
+    // before the forward completes, the forward fails, and the join
+    // unblocks. WITHOUT the early-reject, the inner MemoryStore would
+    // block in its recv loop waiting for EOF that never arrives, and
+    // VerifyStore's join would hang — the 5 s timeout below catches
+    // that mutation. We do NOT call `send_eof` so a buggy MemoryStore
+    // cannot escape via the post-drain ExactSize-mismatch path.
+    let send_fut = async {
+        // Best-effort send; if the inner store dropped its rx the
+        // send fails — we ignore it and just hold tx alive below.
+        drop(tx.send(Bytes::from_static(b"x")).await);
+        // Hold tx alive — never close. If the early-reject works, the
+        // producer side will be cancelled once the join finishes.
+        core::future::pending::<()>().await;
+        Ok::<_, Error>(())
+    };
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            r = update_fut => r,
+            _ = send_fut => unreachable!("pending future"),
+        }
+    })
+    .await
+    .expect(
+        "VerifyStore-wrapped MemoryStore must reject over-capacity \
+         uploads at first byte, not after drain — must not deadlock — \
+         early-reject must propagate ResourceExhausted upfront through \
+         VerifyStore. Timeout means the inner MemoryStore blocked on \
+         its recv loop and VerifyStore's tokio::join! never unblocked.",
+    );
+
+    let err = result.expect_err(
+        "ExactSize upload that alone exceeds capacity MUST surface as \
+         Err through VerifyStore — the wrapper preserved the inner \
+         store's rejection, not silently dropped it",
+    );
+    assert_eq!(
+        err.code,
+        nativelink_error::Code::ResourceExhausted,
+        "VerifyStore wrap MUST forward MemoryStore's \
+         ResourceExhausted code without mangling — got code={:?} \
+         messages={:?}. The classifier (looks_like_dead_channel in \
+         grpc_store.rs) sees this wire shape and decides retry vs \
+         terminal; any other code breaks the wire-level contract.",
+        err.code,
+        err.messages,
+    );
+
+    // The store must NOT have admitted the rejected upload.
+    let has2 = Pin::new(inner.as_ref())
+        .has(StoreKey::from(digest2))
+        .await?;
+    assert!(
+        has2.is_none(),
+        "rejected upload MUST NOT land in the store (even when wrapped \
+         by VerifyStore), got has2={has2:?}"
+    );
 
     Ok(())
 }
