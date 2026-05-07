@@ -369,9 +369,12 @@ mod tests {
     ///
     /// Mutation step: revert the `warn!` in
     /// [`AcPinRegistry::maybe_warn_cap_drop`] to `debug!`. This test
-    /// red-fails with the bespoke "must observe at least one warn" message
-    /// because `traced_test` only captures `INFO`-and-above by default
-    /// (`debug` is filtered out).
+    /// red-fails with the bespoke "must observe at least one WARN-level
+    /// cap-drop event" message. The assertion filters on the line's
+    /// `" WARN "` level prefix specifically: in test builds the
+    /// `release_max_level_info` compile-time gate is inactive and a
+    /// `debug!` regression would still land in the captured buffer at
+    /// `DEBUG` level — only the level filter lets us distinguish them.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn cap_exceeded_emits_rate_limited_warn() {
