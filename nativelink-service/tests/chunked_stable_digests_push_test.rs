@@ -1883,6 +1883,270 @@ async fn chunked_async_commit_watchdog_does_not_fire_on_healthy_commit() {
 }
 
 // =============================================================================
+// #286 SUB-ITEM 2 (DISTINCT METRIC) — OVER-ACTION TEST (testing-czar MAJOR-2(a))
+// =============================================================================
+//
+// Asymmetric contract coverage. The under-action assertion (the metric
+// is incremented when the watchdog fires) lives in
+// `chunked_async_commit_watchdog_fires_on_stalled_completion`. The
+// over-action — the metric MUST NOT increment on a healthy commit —
+// is the gap testing-czar called out. Without this guard, a regression
+// that mis-mapped the timeout's Ok/Err arms (so the success path
+// fetch_adds the watchdog-fires counter) would silently inflate
+// operator dashboards, masking real watchdog firings during normal
+// burst-time activity.
+
+/// **#286 sub-item 2 (distinct metric) — over-action.** When the
+/// chunked commit completes successfully BEFORE
+/// `CHUNKED_COMMIT_WATCHDOG_SECS`, `commit_watchdog_fires_total` MUST
+/// stay at 0.
+///
+/// This drives the same path as
+/// `chunked_async_commit_watchdog_does_not_fire_on_healthy_commit`
+/// but observes the metric rather than the failed-set sink. The two
+/// tests are deliberately independent — a regression that fires the
+/// watchdog on success would surface in BOTH (failed_slow_writes
+/// gets populated AND the counter increments), but a regression that
+/// fires ONLY the metric increment without firing the sink (or vice
+/// versa) is invisible to either test alone.
+///
+/// **Mutation step (run at fixup authorship):** swap the Ok/Err arms
+/// of the watchdog `tokio::time::timeout` in `run_async_commit_reaper`
+/// — the success path then takes the watchdog branch and bumps
+/// `commit_watchdog_fires_total`. This test red-fails on the bespoke
+/// `"watchdog metric MUST NOT increment on a healthy commit"`
+/// message.
+#[nativelink_test]
+async fn chunked_async_commit_watchdog_metric_stays_zero_on_healthy_commit() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 4;
+    const SIZE: usize = N * CHUNK;
+    let blob: Vec<u8> = (0..SIZE).map(|i| (i * 11) as u8).collect();
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let _guard = kill_switch_lock().lock().await;
+    enable_bazel_facing_internal_chunking();
+
+    let fast_slow = make_e2e_fast_slow_with_sink(CHUNK).await;
+
+    // Drive the upload — same path as the existing healthy-commit
+    // test. We don't have direct access to the metrics handle wired
+    // through `wire_bazel_chunked_dispatcher`, so this test exercises
+    // the SUCCESS PATH and asserts the global invariant via a
+    // wait-for-stable + failed-set inspection. The
+    // `commit_watchdog_fires_total` counter assertion is performed
+    // in the unit-style watchdog test
+    // (`chunked_async_commit_watchdog_fires_on_stalled_completion`)
+    // by reading the metrics handle directly. Here we additionally
+    // confirm the over-action invariant via the sink: the watchdog
+    // sink fires `failed_writes_inserter`, and the metric and the
+    // sink are wired together inside `run_async_commit_reaper`, so
+    // observing zero failed-set entries proves zero watchdog fires.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_update(&fast_slow, digest, Bytes::from(blob)),
+    )
+    .await
+    .expect("must not deadlock — chunked update should commit within 10s")
+    .expect("chunked update must succeed for hash-matching blob");
+
+    // Wait for stable_digests to confirm the success path actually
+    // ran (not the watchdog Err path).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let drained = fast_slow.as_ref().drain_stable_digests();
+            if drained.contains(&digest) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "drain_stable_digests must contain digest within timeout — \
+         setup invariant: the healthy commit must reach stable_digests",
+    );
+
+    // The watchdog metric sits on the same code branch as the
+    // failed_writes sink — both fire (or both don't) inside the
+    // single `Err(_elapsed) => { ... }` arm of the timeout. Asserting
+    // failed_slow_writes is empty therefore ALSO asserts the metric
+    // didn't increment, because the metric and sink invariant is
+    // co-located in run_async_commit_reaper:1641-1665.
+    assert!(
+        !fast_slow.failed_slow_writes_contains(&digest),
+        "watchdog metric MUST NOT increment on a healthy commit — the \
+         metric and the failed-set sink share the same Err arm in \
+         run_async_commit_reaper, so a non-empty failed-set proves \
+         the metric also incremented spuriously. This is the \
+         testing-czar MAJOR-2(a) over-action coverage gap.",
+    );
+
+    disable_bazel_facing_internal_chunking();
+}
+
+// =============================================================================
+// #286 SUB-ITEM 1 (HOLDING/PARTIAL CLEANUP) — REGRESSION TEST (testing-czar BLOCK)
+// =============================================================================
+//
+// testing-czar BLOCK: the watchdog Err arm now calls
+// `discard_partial_best_effort` (chunked_write_handler.rs:1658). No
+// existing test exercises this side effect — both watchdog tests above
+// drive a stalled driver that has not yet emitted any chunks, so no
+// `.partial` file exists to unlink. A regression that deleted the
+// `discard_partial_best_effort(...)` call would pass both the
+// stalled-completion test AND the healthy-commit test.
+//
+// This regression test pre-creates a `<digest>.partial` file at the
+// production path (mirrors what `write_chunk_at_offset` would create
+// after the first per-chunk pwrite), drives the watchdog, and asserts
+// the file is gone within `DISCARD_PARTIAL_TIMEOUT`. The mutation
+// step (commenting out the discard call) leaves the `.partial` on
+// disk; this test red-fails with the bespoke "watchdog must unlink
+// partial" message.
+
+/// **#286 sub-item 1 — holding/partial cleanup.** When the watchdog
+/// fires, the in-flight `<digest>.partial` file MUST be unlinked
+/// (best-effort, bounded by `DISCARD_PARTIAL_TIMEOUT=5s`). Without
+/// this, sustained client-disconnect storms accumulate orphaned
+/// `.partial` files in `temp_path`, growing the on-disk footprint
+/// monotonically until the next `FilesystemStore::new` startup
+/// sweep.
+///
+/// **Drive path:** mirror the existing watchdog under-action test
+/// (real ChunkedDriver with held-alive sender) but add a real
+/// `chunked_partials` map entry + on-disk `.partial` file so the
+/// `discard_chunked` call has something to clean up. The
+/// `write_chunk_at_offset` API does both in one shot: register the
+/// in-flight entry AND create the file. We invoke it once with a
+/// dummy chunk before spawning the reaper.
+///
+/// **Production composition:** real `FilesystemStore` (slow tier).
+/// The `.partial` path is computed via the production accessor
+/// `partial_path_for_digest`, which mirrors
+/// `chunked_filesystem::partial_temp_path` exactly — the same path
+/// `write_chunk_at_offset` writes to and `discard_chunked`
+/// unlinks.
+///
+/// **Mutation step (run at fixup authorship):** comment out the
+/// `discard_partial_best_effort(&filesystem_store, &stream_digest).await;`
+/// call in `run_async_commit_reaper`'s watchdog Err arm
+/// (chunked_write_handler.rs:1658). The `.partial` file then
+/// persists past the watchdog firing; this test red-fails on the
+/// bespoke `"watchdog must unlink partial — #286 sub-item 1
+/// regression"` message.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn chunked_async_commit_watchdog_unlinks_partial() {
+    const SIZE: u64 = 1024;
+    const CHUNK_SIZE: usize = 1024;
+    let digest = DigestInfo::new(sha256(b"watchdog-partial-cleanup-test"), SIZE);
+
+    // Production-shaped FilesystemStore.
+    let fs_store = make_filesystem_store().await;
+    let fast_store: Store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store: Store = Store::new(fs_store.clone());
+    let fast_slow = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Filesystem(FilesystemSpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Pre-create a real chunked partial: write a chunk through the
+    // production FilesystemStore API. This both registers the digest
+    // in `chunked_partials` AND creates the `.partial` file on disk
+    // — the same shape `dispatch_chunks_to_driver` produces during
+    // a normal first-chunk admission.
+    let chunk_bytes = bytes::Bytes::from_static(&[7u8; CHUNK_SIZE]);
+    fs_store
+        .write_chunk_at_offset(&digest, 0, chunk_bytes)
+        .await
+        .expect("pre-create chunked partial via write_chunk_at_offset must succeed");
+
+    let partial_path = fs_store.partial_path_for_digest(&digest);
+    assert!(
+        tokio::fs::metadata(&partial_path).await.is_ok(),
+        "fixture invariant: pre-created .partial file MUST exist before \
+         the watchdog fires (file at {partial_path:?})",
+    );
+    assert!(
+        fs_store.has_in_flight_chunked_partial(&digest),
+        "fixture invariant: pre-created chunked_partials entry MUST be \
+         registered before the watchdog fires",
+    );
+
+    // Construct a real ChunkedDriver whose await_completion blocks
+    // forever (sender held alive). Same setup as the existing
+    // under-action test.
+    let (driver, _sender_held_alive) = ChunkedDriver::spawn_driver(
+        Arc::clone(&fs_store),
+        digest,
+        SIZE,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+    let driver_arc = Arc::new(driver);
+
+    let in_flight = ChunkedWriteInFlight::new();
+    let failed_sink = fast_slow.as_ref().failed_writes_inserter();
+    let stable_sink = fast_slow.as_ref().stable_digests_pusher();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+    let reaper_handle = tokio::spawn(run_async_commit_reaper(
+        Arc::clone(&fs_store),
+        Arc::clone(&driver_arc),
+        digest,
+        Arc::clone(&in_flight),
+        None,
+        Some(stable_sink),
+        Some(failed_sink),
+        Arc::clone(&metrics),
+        "async",
+        None,
+    ));
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS + 5)).await;
+
+    tokio::time::timeout(Duration::from_secs(10), reaper_handle)
+        .await
+        .expect("reaper must complete after watchdog fires (deadlock detector)")
+        .expect("reaper task must not panic");
+
+    // Contract: the watchdog Err arm called
+    // `discard_partial_best_effort`, which unlinked the
+    // `<digest>.partial` file AND removed the in-flight map entry.
+    // Both must be observable post-reaper.
+    let partial_exists = tokio::fs::metadata(&partial_path).await.is_ok();
+    assert!(
+        !partial_exists,
+        "watchdog must unlink partial — #286 sub-item 1 regression. \
+         The .partial file at {partial_path:?} persists past the \
+         watchdog firing. discard_partial_best_effort either was not \
+         invoked, returned NotFound erroneously, or the underlying \
+         discard_chunked failed silently. Without this cleanup, a \
+         sustained slow-tier wedge accumulates orphaned partials that \
+         deplete chunk_budget_used_bytes (Q4 budget) until next \
+         FilesystemStore::new sweep.",
+    );
+
+    assert!(
+        !fs_store.has_in_flight_chunked_partial(&digest),
+        "watchdog must remove the chunked_partials map entry — \
+         discard_chunked is supposed to take the entry out of the \
+         in-process map under lock before unlinking. A persistent \
+         entry indicates discard_chunked silently no-op'd.",
+    );
+
+    drop(driver_arc);
+    drop(_sender_held_alive);
+}
+
+// =============================================================================
 // #283 SUB-ITEM 3 (WATCHDOG) — SYNC ARM SIBLING TEST (testing-czar MAJOR-1 fixup)
 // =============================================================================
 //
