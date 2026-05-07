@@ -2181,6 +2181,21 @@ impl FastSlowStore {
             let mut first_chunk_ms: Option<u64> = None;
             let mut chunks: u64 = 0;
             let mut total_bytes: u64 = 0;
+            // #284 part 2: when the cache-tee write to fast_tx fails
+            // mid-stream (e.g. MemoryStore at-cap rejection — the bug
+            // that triggered the 2026-05-06 read cascade abort), drop
+            // `fast_tx` to signal fast_store_fut, log a warn, and
+            // CONTINUE forwarding remaining slow-tier bytes to
+            // `streaming_writer`. The consumer reads bytes from the
+            // streaming buffer and gets a clean EOF; the cache-tee miss
+            // is a lost opportunity to populate fast tier — not a lost
+            // read for the caller. Tracked here so the post-join merge
+            // can demote the fast-tier Err to a clean streaming-EOF for
+            // the consumer (split from the populator-caller's `returned`,
+            // which still surfaces the at-cap Err so copy_slow_to_fast
+            // callers know the populate did not land).
+            let mut cache_tee_disabled = false;
+            let mut maybe_fast_tx = Some(fast_tx);
             // Inner block returns the data-stream result. The outer
             // unconditionally repackages the writer back so the caller
             // can terminate the buffer AFTER the join! completes.
@@ -2191,7 +2206,16 @@ impl FastSlowStore {
                         .await
                         .err_tip(|| "Failed to read data buffer from slow store")?;
                     if output_buf.is_empty() {
-                        return Ok(fast_tx.send_eof());
+                        // Slow tier EOF. If the cache-tee is still alive,
+                        // close fast_tx with EOF so fast_store_fut can
+                        // commit the populated bytes. Otherwise (cache-tee
+                        // disabled mid-stream), there is no fast_tx to
+                        // EOF — return Ok and let the merge logic surface
+                        // the prior fast-tier Err for the populator caller.
+                        if let Some(mut tx) = maybe_fast_tx.take() {
+                            return Ok(tx.send_eof());
+                        }
+                        return Ok(Ok(()));
                     }
                     if first_chunk_ms.is_none() {
                         first_chunk_ms = Some(stream_start.elapsed().as_millis() as u64);
@@ -2224,10 +2248,34 @@ impl FastSlowStore {
                     // eviction inside `StreamingBlobWriter::send`.
                     let _send_res = streaming_writer.send(output_buf.clone()).await;
 
-                    fast_tx
-                        .send(output_buf)
-                        .await
-                        .err_tip(|| "Failed to write to fast store in fast_slow store")?;
+                    // #284 part 2: cache-tee best-effort. If fast_tx.send
+                    // fails (typically MemoryStore at-cap surfacing as
+                    // ResourceExhausted on a subsequent send after
+                    // fast_store_fut errored and dropped fast_rx), DROP
+                    // fast_tx, log a warn, and continue the loop. The
+                    // remaining slow-tier bytes still flow into
+                    // `streaming_writer` so the consumer reads the full
+                    // blob — only the fast-tier population is skipped.
+                    // Without this, the consumer's stream is poisoned
+                    // mid-flight (the bug that produced 30-min "read
+                    // cascade abort" + Bazel digest-mismatch on
+                    // 2026-05-06).
+                    if let Some(tx) = maybe_fast_tx.as_mut() {
+                        if let Err(send_err) = tx.send(output_buf).await {
+                            warn!(
+                                key = %key_for_stream,
+                                err = %send_err,
+                                bytes_sent = total_bytes,
+                                "populate cache-tee write failed; continuing without fast-tier population (consumer reads from slow tier only) — typically MemoryStore at-cap"
+                            );
+                            cache_tee_disabled = true;
+                            // Drop fast_tx so fast_store_fut completes
+                            // (its fast_rx already EOF'd from the prior
+                            // update Err, but releasing the sender is
+                            // hygiene + prevents any future hold).
+                            maybe_fast_tx = None;
+                        }
+                    }
                 }
             }
             .await;
@@ -2239,6 +2287,7 @@ impl FastSlowStore {
                     first_chunk_ms = ?first_chunk_ms,
                     chunks,
                     total_bytes,
+                    cache_tee_disabled,
                     "populate data_stream branch Ok",
                 ),
                 Err(err) => debug!(
@@ -2247,6 +2296,7 @@ impl FastSlowStore {
                     first_chunk_ms = ?first_chunk_ms,
                     chunks,
                     total_bytes,
+                    cache_tee_disabled,
                     code = ?err.code,
                     "populate data_stream branch Err",
                 ),
@@ -2261,8 +2311,12 @@ impl FastSlowStore {
             // which would drop fast_tx — but only when ALL of the
             // returned tuple is consumed. By dropping inside the
             // closure, we guarantee timely release for the unhappy path.
-            drop(fast_tx);
-            (streaming_writer, result)
+            //
+            // `maybe_fast_tx` may already be None (cache-tee disabled
+            // mid-stream); the take()+drop pattern handles both cases
+            // without double-borrow.
+            drop(maybe_fast_tx.take());
+            (streaming_writer, result, cache_tee_disabled)
         };
 
         let slow_store_fut = {
@@ -2321,14 +2375,34 @@ impl FastSlowStore {
             }
         };
 
-        let ((mut writer_back, data_stream_res), slow_res, fast_res) =
+        let ((mut writer_back, data_stream_res, cache_tee_disabled), slow_res, fast_res) =
             join!(data_stream_fut, slow_store_fut, fast_store_fut);
         let join_elapsed_ms = producer_start.elapsed().as_millis() as u64;
         debug!(
             %key,
             join_elapsed_ms,
+            cache_tee_disabled,
             "populate join3 returned",
         );
+
+        // #284 part 2: detect at-capacity cache-tee miss. When the
+        // mid-stream `fast_tx.send` failed AND the fast store rejected
+        // with `Code::ResourceExhausted` carrying a `BackpressureSignal`
+        // discriminator (typically MemoryStoreAtCapacity), we treat the
+        // event as a "lost cache-tee opportunity" — the consumer still
+        // reads every byte through the streaming buffer. This is split
+        // into two terminal states below:
+        //   * `merged` (returned to populator caller): keeps the at-cap
+        //     Err so `copy_slow_to_fast` callers know the populate did
+        //     NOT land in fast tier.
+        //   * `streaming_terminal` (sent to streaming_writer / consumers):
+        //     becomes Ok so `get_part`-style consumers see clean EOF
+        //     instead of a poisoned stream + abort.
+        let cache_tee_at_cap = cache_tee_disabled
+            && fast_res.as_ref().is_err_and(|e| {
+                e.code == Code::ResourceExhausted
+                    && crate::chunked_signal::error_has_backpressure_signal(e)
+            });
 
         // Compose the producer's terminal status. NotFound from the
         // slow store wins (matches prior behavior); else any failure is
@@ -2366,12 +2440,32 @@ impl FastSlowStore {
             Ok(()) => Ok(()),
             Err(err) => Err(err.clone()),
         };
-        match merged {
+
+        // #284 part 2: streaming-writer terminal state is SPLIT from the
+        // populator-caller's `returned`. When the cache-tee was disabled
+        // mid-stream by an at-cap rejection, the consumer still got every
+        // byte from the slow tier through `streaming_writer.send` — surface
+        // EOF so they read cleanly. The fast-tier Err remains in `merged`
+        // / `returned` so `copy_slow_to_fast` callers and the populator
+        // path know the fast tier was NOT populated. Without this split,
+        // the at-cap error poisons the consumer's stream mid-flight (the
+        // 2026-05-06 read-cascade-abort root cause).
+        let streaming_terminal: Result<(), Error> = if cache_tee_at_cap {
+            Ok(())
+        } else {
+            match &merged {
+                Ok(()) => Ok(()),
+                Err(err) => Err(err.clone()),
+            }
+        };
+
+        match streaming_terminal {
             Ok(()) => {
                 let elapsed_ms = producer_start.elapsed().as_millis() as u64;
                 debug!(
                     %key,
                     elapsed_ms,
+                    cache_tee_at_cap,
                     "populate calling streaming_writer.send_eof",
                 );
                 // Ignore the Result from send_eof: it only errors if a
