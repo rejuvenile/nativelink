@@ -344,6 +344,30 @@ impl StoreDriver for MemoryStore {
     ) -> Result<(), Error> {
         let update_start = std::time::Instant::now();
         debug!(key = ?key, "MemoryStore::update: start");
+
+        let owned_key = key.into_owned();
+
+        // #284 part 1: early-reject when the declared upload size alone
+        // would exceed capacity. Before this gate, the recv loop would
+        // pull the entire stream off the gRPC wire (allocating Bytes
+        // chunks the whole way) only to throw it away at the post-drain
+        // gate below. At ~5 over-capacity rejections/sec in production,
+        // the wasted CPU + network + allocation amplify load. Reject
+        // BEFORE the first `recv()` whenever we have a tight enough size
+        // declaration to do so without false positives:
+        //   * `ExactSize(N)` — the upload is exactly N bytes; if N alone
+        //     exceeds capacity, the post-drain gate would reject it too.
+        //   * `MaxSize(N)` — the upload is AT MOST N bytes; an early
+        //     reject here would risk false positives when the actual
+        //     payload is smaller and would fit. Skip the early gate for
+        //     MaxSize and fall through to the existing post-drain check.
+        // Reuses `check_backpressure_gate` so the error format / detail
+        // matches the post-drain rejection bit-identically (callers see
+        // the same `MemoryStoreAtCapacity` reason + retry hint).
+        if let UploadSizeInfo::ExactSize(declared) = size_info {
+            self.check_backpressure_gate(&owned_key, declared)?;
+        }
+
         // Collect chunks without concatenation (scatter-gather).
         // Each chunk stays as its own Bytes allocation — no copies.
         let mut chunks = Vec::new();
@@ -358,7 +382,6 @@ impl StoreDriver for MemoryStore {
             chunks.push(chunk);
         }
 
-        let owned_key = key.into_owned();
         let total_bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
 
         // Enforce `ExactSize` upfront — a truncated upstream (e.g.
