@@ -863,6 +863,285 @@ async fn inner_main(
                 "started BlobsInStableStorage drain-then-fire loop (CAS + AC)"
             );
         }
+
+        // #287: Spawn the server-side `failed_slow_writes` drain loop.
+        //
+        // Background. The server's cas_STORE FastSlowStore tracks digests
+        // whose background slow-tier write failed in a `failed_slow_writes`
+        // set, populated by `failed_writes_inserter()` (chunked-commit Err
+        // arms), the legacy `update`/`update_oneshot` Err arms, the
+        // `PinExpireFailedWritesListener` 120 s pin auto-expire, and the
+        // streaming-write watchdog. The companion side-effect at insert
+        // time is `fast_store.pin_digests(&[digest])` — keeps the
+        // in-memory replica alive during the 120 s pin TTL so a worker
+        // can still re-upload the bytes.
+        //
+        // Pre-#287, the only consumer was the WORKER's own
+        // `LocalWorker::on_reconnect` calling `cas_store.drain_failed_digests()`
+        // — but that's the WORKER's FSS instance, not the SERVER's. The
+        // server-side set was dead-letter: filled forever, never drained,
+        // pinning blobs in MemoryStore until the 120 s TTL expired and
+        // the mirror protocol theoretically re-uploaded them on the next
+        // BlobsAvailable tick.
+        //
+        // Fix. Periodically drain the server's `failed_slow_writes` and
+        // dispatch `UploadMissingBlobs` to a worker that has the digest
+        // (per `BlobLocalityMap`). Idempotent: if the upload fails, the
+        // slow-tier write Err arm re-inserts the digest naturally.
+        //
+        // Edge cases:
+        //   - No worker in `locality_map` for a digest → log warn (via
+        //     metric counter) and re-insert with throttling (worker may
+        //     report it on the next BlobsAvailable tick).
+        //   - Multiple workers per digest → pick the first connected one.
+        //   - Recently-dispatched digests are filtered via a per-digest
+        //     cooldown so we don't re-spam the same worker.
+        //
+        // No fsync, no async/sync architectural change — purely additive
+        // periodic drain task.
+        if !worker_schedulers.is_empty() {
+            let cas_drain_stores: Vec<(String, nativelink_util::store_trait::Store)> =
+                cas_store_names
+                    .iter()
+                    .filter_map(|name| store_manager.get_store(name).map(|s| (name.clone(), s)))
+                    .collect();
+            if !cas_drain_stores.is_empty() {
+                if let Some(dispatcher_for_drain) = small_blob_dispatcher.clone() {
+                    let locality_map_for_drain = locality_map.clone();
+                    let drain_store_count = cas_drain_stores.len();
+                    background_spawn!("failed_slow_writes_drain_loop", async move {
+                        // Tunables — kept conservative; the loop's only
+                        // job is to drain whatever has accumulated since
+                        // last tick + dispatch UploadMissingBlobs to the
+                        // right worker. The cooldown protects against
+                        // repeated dispatch when a digest can't yet be
+                        // dispatched (no worker in locality_map) or when
+                        // a dispatch failed.
+                        const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
+                        const DRAIN_COOLDOWN: Duration = Duration::from_secs(60);
+                        const DRAIN_BATCH_SIZE: usize = 1000;
+                        // Cap on inflight tracking — bounds memory if
+                        // failures storm.
+                        const DRAIN_INFLIGHT_CAP: usize = 100_000;
+
+                        // Per-digest last-dispatch timestamp so we don't
+                        // hot-loop the same digest. GC'd at top of each
+                        // tick (entries past their cooldown are dropped).
+                        let mut inflight: HashMap<
+                            nativelink_util::common::DigestInfo,
+                            std::time::Instant,
+                        > = HashMap::new();
+
+                        loop {
+                            tokio::time::sleep(DRAIN_INTERVAL).await;
+
+                            // Drain failed_slow_writes per CAS store. The
+                            // drain is destructive — digests we couldn't
+                            // dispatch this tick are re-inserted via
+                            // `reinsert_failed_digests` below.
+                            let mut all_failed: Vec<(
+                                String,
+                                Vec<nativelink_util::common::DigestInfo>,
+                            )> = Vec::new();
+                            for (name, store) in &cas_drain_stores {
+                                let drained = store.drain_failed_digests();
+                                if !drained.is_empty() {
+                                    all_failed.push((name.clone(), drained));
+                                }
+                            }
+                            if all_failed.is_empty() {
+                                continue;
+                            }
+
+                            // GC inflight: drop entries whose cooldown
+                            // has expired.
+                            let now = std::time::Instant::now();
+                            inflight
+                                .retain(|_, ts| now.duration_since(*ts) < DRAIN_COOLDOWN);
+
+                            // Snapshot connected workers ONCE per tick —
+                            // O(N) under the dispatcher Mutex; N <=
+                            // fleet size. The endpoint Arc<str> is what
+                            // `BlobLocalityMap` keys on too, so we can
+                            // match directly.
+                            let connected = dispatcher_for_drain
+                                .connected_workers_with_senders();
+                            // endpoint -> first matching tx (we don't
+                            // need boot_epoch for fan-out; the
+                            // dispatcher owns liveness).
+                            let mut endpoint_to_tx: HashMap<
+                                Arc<str>,
+                                mpsc::UnboundedSender<
+                                    nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UpdateForWorker,
+                                >,
+                            > = HashMap::new();
+                            for (ep, _epoch, tx) in connected {
+                                endpoint_to_tx.entry(ep).or_insert(tx);
+                            }
+
+                            // Group by endpoint so we send one
+                            // UploadMissingBlobs per worker per tick
+                            // (then batch by DRAIN_BATCH_SIZE). Digests
+                            // we can't dispatch get re-inserted with
+                            // throttling.
+                            let mut per_endpoint: HashMap<
+                                Arc<str>,
+                                Vec<nativelink_util::common::DigestInfo>,
+                            > = HashMap::new();
+                            // Group reinsertion by store so a digest
+                            // from store A re-inserts into A's set.
+                            let mut reinsert: HashMap<
+                                String,
+                                Vec<nativelink_util::common::DigestInfo>,
+                            > = HashMap::new();
+                            let mut total_drained: usize = 0;
+                            let mut total_dispatched: usize = 0;
+                            let mut total_no_worker: usize = 0;
+                            let mut total_throttled: usize = 0;
+
+                            for (store_name, digests) in all_failed {
+                                total_drained += digests.len();
+                                for digest in digests {
+                                    // Throttle: digest dispatched within
+                                    // cooldown? re-insert + skip.
+                                    if let Some(ts) = inflight.get(&digest) {
+                                        if now.duration_since(*ts) < DRAIN_COOLDOWN {
+                                            total_throttled += 1;
+                                            reinsert
+                                                .entry(store_name.clone())
+                                                .or_default()
+                                                .push(digest);
+                                            continue;
+                                        }
+                                    }
+                                    // Look up workers that have this
+                                    // digest.
+                                    let workers = locality_map_for_drain
+                                        .read()
+                                        .lookup_workers(&digest);
+                                    // Pick the first worker that's
+                                    // currently connected (has a
+                                    // registered worker_tx). If none of
+                                    // the locality entries have a
+                                    // connected tx, treat as no-worker.
+                                    let picked = workers
+                                        .iter()
+                                        .find(|w| endpoint_to_tx.contains_key(*w))
+                                        .cloned();
+                                    let Some(endpoint) = picked else {
+                                        total_no_worker += 1;
+                                        // No worker for this digest →
+                                        // re-insert and mark
+                                        // dispatched-this-tick so we
+                                        // don't drain-re-insert in a
+                                        // hot loop. The cooldown gives
+                                        // a worker time to re-report.
+                                        if inflight.len() < DRAIN_INFLIGHT_CAP {
+                                            inflight.insert(digest, now);
+                                        }
+                                        reinsert
+                                            .entry(store_name.clone())
+                                            .or_default()
+                                            .push(digest);
+                                        continue;
+                                    };
+                                    per_endpoint
+                                        .entry(endpoint)
+                                        .or_default()
+                                        .push(digest);
+                                    if inflight.len() < DRAIN_INFLIGHT_CAP {
+                                        inflight.insert(digest, now);
+                                    }
+                                    total_dispatched += 1;
+                                }
+                            }
+
+                            // Re-insert digests we couldn't dispatch.
+                            // Goes through `reinsert_failed_digests` on
+                            // the wrapped Store, which delegates through
+                            // wrappers to the inner FastSlowStore's set.
+                            for (store_name, digests) in reinsert {
+                                if let Some(store) = cas_drain_stores
+                                    .iter()
+                                    .find(|(n, _)| n == &store_name)
+                                    .map(|(_, s)| s.clone())
+                                {
+                                    store.reinsert_failed_digests(&digests);
+                                }
+                            }
+
+                            // Dispatch one UploadMissingBlobs per
+                            // endpoint per tick, batched by
+                            // DRAIN_BATCH_SIZE. Don't block on send —
+                            // the worker_tx is unbounded; if the worker
+                            // is dead, `unregister_worker` drops the tx
+                            // and our next tick's snapshot omits it.
+                            for (endpoint, digests) in per_endpoint {
+                                let Some(tx) = endpoint_to_tx.get(&endpoint) else {
+                                    // Race: tx vanished between snapshot
+                                    // and dispatch. Re-insert across
+                                    // every CAS store (we lost
+                                    // store_name after the per-endpoint
+                                    // fan-in).
+                                    for (_, store) in &cas_drain_stores {
+                                        store.reinsert_failed_digests(&digests);
+                                    }
+                                    continue;
+                                };
+                                for chunk in digests.chunks(DRAIN_BATCH_SIZE) {
+                                    let proto_digests: Vec<
+                                        nativelink_proto::build::bazel::remote::execution::v2::Digest,
+                                    > = chunk
+                                        .iter()
+                                        .map(|d| {
+                                            nativelink_proto::build::bazel::remote::execution::v2::Digest::from(*d)
+                                        })
+                                        .collect();
+                                    let msg = nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UpdateForWorker {
+                                        update: Some(
+                                            nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_worker::Update::UploadMissingBlobs(
+                                                nativelink_proto::com::github::trace_machina::nativelink::remote_execution::UploadMissingBlobsRequest {
+                                                    digests: proto_digests,
+                                                },
+                                            ),
+                                        ),
+                                    };
+                                    if tx.send(msg).is_err() {
+                                        warn!(
+                                            endpoint = %endpoint,
+                                            count = chunk.len(),
+                                            "failed_slow_writes_drain: worker channel closed; \
+                                             re-inserting batch"
+                                        );
+                                        // Re-insert across all CAS
+                                        // stores (per-endpoint fan-in
+                                        // already lost store_name).
+                                        for (_, store) in &cas_drain_stores {
+                                            store.reinsert_failed_digests(chunk);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if total_drained > 0 {
+                                info!(
+                                    drained = total_drained,
+                                    dispatched = total_dispatched,
+                                    no_worker = total_no_worker,
+                                    throttled = total_throttled,
+                                    "failed_slow_writes_drain: tick complete"
+                                );
+                            }
+                        }
+                    });
+                    info!(
+                        drain_store_count,
+                        "started failed_slow_writes drain loop (CAS, #287)"
+                    );
+                }
+            }
+        }
     }
 
     // Graceful shutdown: accept_stop signals HTTP accept loops to stop,

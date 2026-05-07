@@ -676,6 +676,18 @@ impl Store {
     pub fn drain_failed_digests(&self) -> Vec<DigestInfo> {
         self.inner.drain_failed_digests()
     }
+
+    /// Re-insert digests into the failed-slow-writes set. Used by the
+    /// server-side drain loop (`#287`: server-side `failed_slow_writes`
+    /// drain → UploadMissingBlobs) when a digest is drained but cannot
+    /// be dispatched (no worker in `BlobLocalityMap`, dispatch channel
+    /// closed, etc.). The reinsert is the post-drain inverse so the
+    /// digest stays observable until a worker can be picked.
+    /// Delegates to the inner [`StoreDriver::reinsert_failed_digests`].
+    #[inline]
+    pub fn reinsert_failed_digests(&self, digests: &[DigestInfo]) {
+        self.inner.reinsert_failed_digests(digests);
+    }
 }
 
 impl StoreLike for Store {
@@ -1456,6 +1468,28 @@ pub trait StoreDriver:
                 .iter()
                 .flat_map(|s| s.drain_failed_digests())
                 .collect(),
+        }
+    }
+
+    /// Re-insert digests into the failed-slow-writes set. Inverse of
+    /// [`Self::drain_failed_digests`] for use by the server-side
+    /// drain-then-dispatch loop (#287: server-side `failed_slow_writes`
+    /// drain → UploadMissingBlobs). Mirrors `drain_failed_digests`'s
+    /// delegation: passes through wrappers; the FastSlowStore Leaf
+    /// owns the set and overrides this with the actual insert.
+    fn reinsert_failed_digests(&self, digests: &[DigestInfo]) {
+        match self.stable_delegation() {
+            StableDigestDelegation::Leaf => {
+                let _ = digests;
+            }
+            StableDigestDelegation::Inner(s) | StableDigestDelegation::Passthrough(s) => {
+                s.reinsert_failed_digests(digests);
+            }
+            StableDigestDelegation::Many { children, .. } => {
+                for s in children {
+                    s.reinsert_failed_digests(digests);
+                }
+            }
         }
     }
 }

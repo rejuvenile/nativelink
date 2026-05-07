@@ -4987,6 +4987,28 @@ impl StoreDriver for FastSlowStore {
         let mut guard = self.failed_slow_writes.lock();
         guard.drain().collect()
     }
+
+    /// Re-insert digests into the failed-slow-writes set. Used by the
+    /// server-side `failed_slow_writes` drain loop (#287: server-side
+    /// drain → UploadMissingBlobs) when a digest is drained but cannot
+    /// be dispatched (no worker in `BlobLocalityMap`, dispatch channel
+    /// closed, etc.). HashSet insertion is idempotent so callers may
+    /// call this with mixed new+already-present digests without further
+    /// filtering. Does NOT re-pin — the original `failed_writes_inserter()`
+    /// closure does the `pin_digests` once at the original failure site;
+    /// re-pinning here would either be a no-op (still pinned) or
+    /// pointless (the bytes are already gone). The dispatch retry will
+    /// produce a fresh failure if the bytes are gone, and the natural
+    /// failure path will re-pin.
+    fn reinsert_failed_digests(&self, digests: &[DigestInfo]) {
+        if digests.is_empty() {
+            return;
+        }
+        let mut guard = self.failed_slow_writes.lock();
+        for d in digests {
+            guard.insert(*d);
+        }
+    }
 }
 
 #[derive(Debug, Default, MetricsComponent)]
