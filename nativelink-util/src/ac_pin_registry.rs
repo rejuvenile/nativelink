@@ -451,6 +451,55 @@ impl AcPinRegistry {
         }
     }
 
+    /// Batched variant of [`Self::remove_digests_for_endpoint_in_store`]
+    /// for the BIS broadcast loop's AC sweep. Drops all matching
+    /// `(store_id, digests)` tuples for one `endpoint` under a SINGLE
+    /// `inner.write()` lock acquisition. With N AC stores per endpoint
+    /// the per-tick lock count collapses from N to 1.
+    pub fn remove_digests_for_endpoint_batch(
+        &self,
+        endpoint: &str,
+        drains: &[(Arc<str>, &[DigestInfo])],
+    ) {
+        if drains.is_empty() {
+            return;
+        }
+        let mut guard = self.inner.write();
+        let Some(set) = guard.get_mut(endpoint) else {
+            return;
+        };
+        if drains.len() == 1 {
+            // Fast path: one (store_id, digests) tuple — same shape as
+            // remove_digests_for_endpoint_in_store but reuses the
+            // already-acquired write guard.
+            let (store_id, digests) = &drains[0];
+            if !digests.is_empty() {
+                let lookup: HashSet<&DigestInfo> = digests.iter().collect();
+                let sid = store_id.as_ref();
+                set.retain(|(s, d)| !(s.as_ref() == sid && lookup.contains(d)));
+            }
+        } else {
+            // Build per-store lookup tables once, then a single pass
+            // over the set. Allocations bounded by drains.len() (today
+            // at most a handful of AC stores).
+            let lookups: Vec<(&str, HashSet<&DigestInfo>)> = drains
+                .iter()
+                .filter(|(_, d)| !d.is_empty())
+                .map(|(s, d)| (s.as_ref(), d.iter().collect()))
+                .collect();
+            if !lookups.is_empty() {
+                set.retain(|(sid, d)| {
+                    !lookups
+                        .iter()
+                        .any(|(s, lk)| sid.as_ref() == *s && lk.contains(d))
+                });
+            }
+        }
+        if set.is_empty() {
+            guard.remove(endpoint);
+        }
+    }
+
     /// Wipe every AC pin recorded for `endpoint`. Called on worker
     /// disconnect / boot-epoch change, sibling of
     /// [`crate::blob_locality_map::BlobLocalityMap::remove_endpoint`]
@@ -947,5 +996,90 @@ mod tests {
              'worker has no AC pins this tick', not 'leave the previous \
              advertisement in place'",
         );
+    }
+
+    /// (#278B under-action) `remove_digests_for_endpoint_batch` MUST
+    /// drop every matching `(store_id, digests)` tuple under one write
+    /// lock. The test asserts the endpoint becomes empty after draining
+    /// three tuples and that an OTHER endpoint's pin (also matching one
+    /// of the digests) survives — over-action across endpoints.
+    ///
+    /// Mutation step: replace the body of
+    /// `remove_digests_for_endpoint_batch` with bare `return;`. This
+    /// test red-fails with the bespoke "MUST drop all matching tuples"
+    /// message.
+    #[test]
+    fn remove_digests_for_endpoint_batch_drops_per_store_tuples() {
+        let reg = AcPinRegistry::new();
+        let endpoint = "grpc://w1:50081";
+        let other_endpoint = "grpc://w2:50081";
+        let s1: Arc<str> = Arc::from("AC_MAIN");
+        let s2: Arc<str> = Arc::from("AC_AUX");
+        let s3: Arc<str> = Arc::from("AC_THIRD");
+        // Register digests across 3 store_ids.
+        reg.register_ac_pin(endpoint, s1.clone(), d(1));
+        reg.register_ac_pin(endpoint, s1.clone(), d(2));
+        reg.register_ac_pin(endpoint, s2.clone(), d(2));
+        reg.register_ac_pin(endpoint, s2.clone(), d(3));
+        reg.register_ac_pin(endpoint, s3.clone(), d(4));
+        // Over-action precondition: a different endpoint also holds d(2)
+        // under the same store_id, must SURVIVE the batch.
+        reg.register_ac_pin(other_endpoint, s1.clone(), d(2));
+
+        let s1_d = [d(1), d(2)];
+        let s2_d = [d(2), d(3)];
+        let s3_d = [d(4)];
+        let drains: Vec<(Arc<str>, &[DigestInfo])> = vec![
+            (s1.clone(), &s1_d as &[_]),
+            (s2.clone(), &s2_d as &[_]),
+            (s3.clone(), &s3_d as &[_]),
+        ];
+        reg.remove_digests_for_endpoint_batch(endpoint, &drains);
+
+        assert_eq!(
+            reg.snapshot_endpoint(endpoint),
+            None,
+            "remove_digests_for_endpoint_batch MUST drop all matching \
+             tuples — expected endpoint to be empty after draining its \
+             three (store_id, digests) tuples",
+        );
+
+        // Over-action: other endpoint's pin survives.
+        let snap_other = reg
+            .snapshot_endpoint(other_endpoint)
+            .expect(
+                "other endpoint's pin MUST survive — over-action: batch \
+                 leaked across endpoints",
+            );
+        assert_eq!(snap_other.len(), 1);
+        assert_eq!(snap_other[0].1, d(2));
+    }
+
+    /// (#278B over-action) `remove_digests_for_endpoint_batch` MUST
+    /// scope removals to the (store_id, digest) tuple, NOT digest-only:
+    /// a pin under store_id A whose digest also appears in store_id B's
+    /// drain list must survive when only B is drained.
+    #[test]
+    fn remove_digests_for_endpoint_batch_scoped_to_store_id() {
+        let reg = AcPinRegistry::new();
+        let endpoint = "grpc://w1:50081";
+        let s1: Arc<str> = Arc::from("AC_MAIN");
+        let s2: Arc<str> = Arc::from("AC_AUX");
+        // d(7) appears under BOTH store_ids.
+        reg.register_ac_pin(endpoint, s1.clone(), d(7));
+        reg.register_ac_pin(endpoint, s2.clone(), d(7));
+
+        // Drain d(7) ONLY for s2.
+        let s2_d = [d(7)];
+        let drains: Vec<(Arc<str>, &[DigestInfo])> = vec![(s2.clone(), &s2_d as &[_])];
+        reg.remove_digests_for_endpoint_batch(endpoint, &drains);
+
+        // s1's pin for d(7) MUST survive.
+        let snap = reg
+            .snapshot_endpoint(endpoint)
+            .expect("endpoint MUST still hold s1's d(7)");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0.as_ref(), "AC_MAIN");
+        assert_eq!(snap[0].1, d(7));
     }
 }
