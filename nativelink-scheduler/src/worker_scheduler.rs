@@ -105,22 +105,28 @@ pub trait WorkerScheduler: Sync + Send + Unpin + RootMetricsComponent + 'static 
     async fn broadcast_blobs_in_stable_storage(&self, _digests: Vec<DigestInfo>) {}
 
     /// (#97) Chunked variant of `broadcast_blobs_in_stable_storage`.
-    /// Default implementation falls back to the unchunked variant so
-    /// schedulers that don't implement chunking still work; the
-    /// production `ApiWorkerScheduler` overrides this to do per-chunk
-    /// dispatch + per-worker resend tracking.
     ///
     /// `store_id` tags each chunk with the source store so workers can
     /// route AC chunks (`store_id = "AC_MAIN_STORE"` etc.) to AC pin
     /// drains separately from CAS chunks (empty string = CAS, the
     /// historic single-store wire shape preserved for forward compat).
+    ///
+    /// **No default implementation** is provided on purpose: the only
+    /// behaviorally-correct fallback would be `broadcast_blobs_in_stable_storage(digests)`,
+    /// which silently DROPS `store_id`. A future scheduler that omits
+    /// this method while having an AC store wired would route AC chunks
+    /// to the CAS handler (Option-A review distributed-systems MINOR-2).
+    /// Forcing the override surfaces the decision at compile time:
+    /// implementors must either honor `store_id` (production
+    /// `ApiWorkerScheduler`), forward to a delegate that does
+    /// (`SimpleScheduler`), or explicitly NO-OP / panic with a
+    /// bespoke message documenting that the scheduler does not support
+    /// AC broadcasts.
     async fn broadcast_blobs_in_stable_storage_chunked(
         &self,
         digests: Vec<DigestInfo>,
-        _store_id: &str,
-    ) {
-        self.broadcast_blobs_in_stable_storage(digests).await;
-    }
+        store_id: &str,
+    );
 
     /// (#97) Notify the scheduler that a worker has acked one BIS chunk.
     /// The scheduler drops the matching `(broadcast_id, sequence)` from
