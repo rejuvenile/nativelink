@@ -1436,11 +1436,11 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     // `stable_digests` and pinned bytes accumulate until the 120 s pin
     // TTL drains them (the production-incident-2026-05-06 mechanism).
     stable_digests_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
-    // #283 fix: optional failed-commit sink. When `Some`, the
-    // AsyncCommit reaper invokes the closure on commit FAILURE so the
-    // chunked path achieves contract parity with the legacy
-    // `FastSlowStore::update` Err arm at
-    // `fast_slow_store.rs:3489-3494`. The closure (constructed by
+    // #283 fix: optional failed-commit sink. When `Some`, BOTH the
+    // AsyncCommit reaper Err arm AND the Synchronous Err arm invoke
+    // the closure on commit FAILURE so the chunked path achieves
+    // contract parity with the legacy `FastSlowStore::update` Err arm
+    // at `fast_slow_store.rs:3489-3494`. The closure (constructed by
     // `FastSlowStore::failed_writes_inserter`) inserts the digest into
     // `failed_slow_writes` (so the worker reconnect-retry path picks it
     // up) AND re-pins the in-memory replica on the fast store (so
@@ -1584,6 +1584,31 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
         CommitMode::Synchronous => {
             // Wait for commit + e2e SHA-256 verify.
             let commit_result = driver.await_completion().await;
+
+            // #283 fixup MAJOR-1: on commit FAILURE, fire the
+            // failed-commit sink BEFORE removing the in_flight entry.
+            // Mirrors the AsyncCommit reaper's ordering at
+            // `:1745-1749` and the legacy update Err arm at
+            // `fast_slow_store.rs:3489-3494`: insert into
+            // `failed_slow_writes` (so the worker reconnect-retry
+            // picks up the digest) AND re-pin the in-memory replica
+            // on the fast store (so MemoryStore eviction doesn't drop
+            // the blob before the retry). Order matters: running this
+            // BEFORE in_flight removal closes the visibility window
+            // where a reader could observe the in_flight entry as
+            // removed while the failure-recovery effects haven't yet
+            // landed (the same race the Async arm guards against).
+            //
+            // This branch had previously omitted the call entirely —
+            // sibling-bug parity gap with the AsyncCommit Err arm
+            // that #283 closed. Reachable from production via the
+            // WriteChunked RPC handler (the only Synchronous-mode
+            // caller).
+            if commit_result.is_err() {
+                if let Some(sink) = failed_commit_sink.as_ref() {
+                    sink(stream_digest);
+                }
+            }
 
             // Remove the in-flight entry now that the driver has
             // signaled completion. The cleanup_guard would also do
