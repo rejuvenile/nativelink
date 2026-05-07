@@ -698,33 +698,58 @@ pub struct BlobsAvailableState {
     ac_mirror_target: Option<AcMirrorTarget>,
 }
 
-impl BlobsAvailableState {
-    /// Test-only: build a `BlobsAvailableState` from explicit components.
-    /// The non-test path constructs this inline inside `new_local_worker`.
-    ///
-    /// Forwards to [`Self::new_for_test_with_ac`] passing `None` for the
-    /// AC handle. This single-constructor design (with the AC handle as
-    /// a final optional arg) means test authors don't need to remember
-    /// which factory to call when a new optional state field lands —
-    /// the vast majority of callers pass `None` for `ac_mirror_target`.
-    #[cfg(any(test, feature = "test-utils"))]
-    #[doc(hidden)]
-    pub fn new_for_test(
-        fs_store: Arc<FilesystemStore>,
-        cas_server_fss: Option<Arc<FastSlowStore>>,
-    ) -> Self {
-        Self::new_for_test_with_ac(fs_store, cas_server_fss, None)
-    }
+/// Test-only builder for [`BlobsAvailableState`]. Lets each test set only
+/// the fields it cares about and rely on `Default` for the rest.
+///
+/// Replaces the previous `new_for_test` / `new_for_test_with_ac` factory
+/// pair (#281 simplifier MAJOR-2): adding new optional state fields no
+/// longer requires another constructor — extend this struct with a
+/// sensible `Default` and existing callers stay green via
+/// `..Default::default()`.
+///
+/// `fs_store` has no sensible default (every test needs its own
+/// tempdir-backed store) so it's a required argument to
+/// [`BlobsAvailableState::from_test_args`]; everything else defaults.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Default)]
+pub struct BlobsAvailableTestArgs {
+    /// CAS-server `FastSlowStore` for tests that exercise the
+    /// CAS-mirror cleanup path. `None` for tests that only need a
+    /// `BlobsAvailableState` to drive non-CAS code paths.
+    pub cas_server_fss: Option<Arc<FastSlowStore>>,
+    /// AC-mirror target for tests that exercise AC-pin advertisement /
+    /// unpin behavior.
+    pub ac_mirror_target: Option<AcMirrorTarget>,
+}
 
-    /// Test-only constructor that also accepts an `AcMirrorTarget` for
-    /// tests that exercise the AC-pin advertisement / unpin paths.
+impl BlobsAvailableState {
+    /// Test-only: build a `BlobsAvailableState` from a
+    /// [`BlobsAvailableTestArgs`] builder. The non-test path
+    /// constructs this inline inside `new_local_worker`.
+    ///
+    /// `fs_store` is the only required argument (no sensible default).
+    /// All other fields default via [`BlobsAvailableTestArgs::default`];
+    /// override only the ones the test cares about, e.g.
+    ///
+    /// ```ignore
+    /// BlobsAvailableState::from_test_args(
+    ///     fs_store,
+    ///     BlobsAvailableTestArgs {
+    ///         ac_mirror_target: Some(target),
+    ///         ..Default::default()
+    ///     },
+    /// )
+    /// ```
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn new_for_test_with_ac(
+    pub fn from_test_args(
         fs_store: Arc<FilesystemStore>,
-        cas_server_fss: Option<Arc<FastSlowStore>>,
-        ac_mirror_target: Option<AcMirrorTarget>,
+        args: BlobsAvailableTestArgs,
     ) -> Self {
+        let BlobsAvailableTestArgs {
+            cas_server_fss,
+            ac_mirror_target,
+        } = args;
         Self {
             fs_store,
             tracker: BlobChangeTracker::new(Arc::new(Notify::new())),
