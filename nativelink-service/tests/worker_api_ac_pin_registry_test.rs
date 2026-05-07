@@ -584,3 +584,361 @@ async fn per_store_partitioning_in_ac_registry() -> Result<(), Box<dyn core::err
 
     Ok(())
 }
+
+// ----- #279 sub-item 3: boot-epoch wipe regression for AC pin registry -----
+//
+// Sibling-of-#141 contract for the AC path. The CAS-side coverage lives
+// in `worker_api_server_test.rs::boot_epoch_*_locality_entries_test`.
+// Without these tests a regression that drops the
+// `ac_pin_registry.wipe_endpoint(...)` call at
+// `worker_api_server.rs:531` (the registration-path branch) would ship
+// silently because every other test in this file exercises the
+// disconnect path (`:912`), not the boot-epoch flip path on a worker
+// that reconnects WHILE the old stream is still alive.
+//
+// The test mechanic mirrors the CAS-side
+// `boot_epoch_different_wipes_locality_entries_test`: hold the old
+// stream alive across the reconnect so the wipe must come from the
+// REGISTRATION path, not from the disconnect cleanup task.
+
+/// Multi-connect harness: one `WorkerApiServer` with the AC pin
+/// registry wired, used to open consecutive `ConnectWorker` streams
+/// against distinct boot epochs / endpoints.
+struct AcMultiConnectContext {
+    worker_api_server: WorkerApiServer,
+    ac_pin_registry: SharedAcPinRegistry,
+}
+
+async fn setup_multi_connect_ac() -> Result<AcMultiConnectContext, Error> {
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager::new());
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager.clone(),
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+
+    let locality_map = new_shared_blob_locality_map();
+    let ac_pin_registry = new_shared_ac_pin_registry();
+
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert(SCHEDULER_NAME.to_string(), scheduler);
+    let now_fn: NowFn = Box::new(static_now_fn);
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
+        },
+        &schedulers,
+        now_fn,
+        [1u8; 6],
+        Some(locality_map),
+        None,
+        None,
+        None,
+        Some(ac_pin_registry.clone()),
+    )
+    .err_tip(|| "Error creating WorkerApiServer")?;
+
+    Ok(AcMultiConnectContext {
+        worker_api_server,
+        ac_pin_registry,
+    })
+}
+
+/// Open one `connect_worker` stream against the given endpoint and
+/// boot epoch, and consume the `ConnectionResult` so callers see
+/// post-handshake state.
+async fn open_ac_worker_connection(
+    server: &WorkerApiServer,
+    cas_endpoint: &str,
+    boot_epoch_id: u64,
+) -> Result<(mpsc::Sender<Update>, ConnectWorkerStream), Error> {
+    let connect_worker_request = ConnectWorkerRequest {
+        cas_endpoint: cas_endpoint.to_string(),
+        boot_epoch_id,
+        ..Default::default()
+    };
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(Update::ConnectWorkerRequest(connect_worker_request))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "send connect: {e}"))?;
+    let update_stream = Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|update| {
+            let update = Ok(UpdateForScheduler {
+                update: Some(update),
+            });
+            (update, rx)
+        })
+    }));
+    let mut connection_worker_stream = server
+        .inner_connect_worker_for_testing(update_stream)
+        .await?
+        .into_inner();
+    let first = connection_worker_stream
+        .next()
+        .await
+        .err_tip(|| "expected ConnectionResult before stream end")?
+        .err_tip(|| "stream error before ConnectionResult")?
+        .update
+        .err_tip(|| "ConnectionResult update missing")?;
+    assert!(
+        matches!(first, update_for_worker::Update::ConnectionResult(_)),
+        "first update must be ConnectionResult, got {first:?}"
+    );
+    Ok((tx, connection_worker_stream))
+}
+
+/// Drive a `BlobsAvailable` carrying the supplied AC entries and poll
+/// the registry until they are visible (or fail loudly via the bespoke
+/// `await_until` deadlock detector).
+async fn send_ac_blobs_and_wait(
+    worker_stream: &mpsc::Sender<Update>,
+    ac_pin_registry: &SharedAcPinRegistry,
+    cas_endpoint: &str,
+    entries: Vec<MirrorPinEntry>,
+) -> Result<(), Error> {
+    let expected = entries.len();
+    let mut notification = empty_ba(cas_endpoint);
+    notification.pinned_ac_mirror_entries = entries;
+    worker_stream
+        .send(Update::BlobsAvailable(notification))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "send blobs available: {e}"))?;
+
+    let endpoint = cas_endpoint.to_string();
+    let registry = ac_pin_registry.clone();
+    drop(
+        await_until("AC registry seeded for boot-epoch test", move || {
+            let snap = registry.snapshot_endpoint(&endpoint)?;
+            if snap.len() == expected { Some(snap) } else { None }
+        })
+        .await,
+    );
+    Ok(())
+}
+
+/// Under-action: reconnecting with a DIFFERENT boot_epoch_id (fresh
+/// process after worker crash / OOM / planned restart) MUST wipe the
+/// prior AC pin entries on registration.
+///
+/// Mechanic: hold the OLD stream open across the reconnect so the wipe
+/// can ONLY come from the registration-path call to
+/// `ac_pin_registry.wipe_endpoint(...)` at `worker_api_server.rs:531`.
+/// Without that line, the prior entries would persist; the bespoke
+/// expect message names the contract so a regression is unambiguous.
+#[nativelink_test]
+async fn boot_epoch_different_wipes_ac_registry()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.40:50081";
+    let ctx = setup_multi_connect_ac().await?;
+
+    // First boot — register 3 AC pins.
+    let (tx1, stream1) =
+        open_ac_worker_connection(&ctx.worker_api_server, cas_endpoint, 1).await?;
+    let d1 = DigestInfo::new([0xE1u8; 32], 11);
+    let d2 = DigestInfo::new([0xE2u8; 32], 22);
+    let d3 = DigestInfo::new([0xE3u8; 32], 33);
+    send_ac_blobs_and_wait(
+        &tx1,
+        &ctx.ac_pin_registry,
+        cas_endpoint,
+        vec![
+            ac_entry(d1, AC_STORE_NAME),
+            ac_entry(d2, AC_STORE_NAME),
+            ac_entry(d3, AC_STORE_NAME),
+        ],
+    )
+    .await?;
+
+    let snap_before = ctx
+        .ac_pin_registry
+        .snapshot_endpoint(cas_endpoint)
+        .expect("AC registry must hold the seeded entries before reconnect");
+    assert_eq!(snap_before.len(), 3);
+    let digests_before: Vec<_> = snap_before.iter().map(|(_, d)| *d).collect();
+    for d in [d1, d2, d3] {
+        assert!(
+            digests_before.contains(&d),
+            "expected pre-reconnect snapshot to contain seeded digest {d:?}"
+        );
+    }
+
+    // Reconnect with a DIFFERENT boot_epoch_id WHILE the old stream is
+    // still alive — wipe must come from the registration path.
+    let (_tx2, _stream2) =
+        open_ac_worker_connection(&ctx.worker_api_server, cas_endpoint, 2).await?;
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if ctx
+                .ac_pin_registry
+                .snapshot_endpoint(cas_endpoint)
+                .is_none()
+            {
+                return ();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    result.expect(
+        "boot-epoch wipe MUST clear AC pin registry — sibling-of-#141 regression",
+    );
+
+    // Tidy up old stream.
+    drop(tx1);
+    drop(stream1);
+    Ok(())
+}
+
+/// Over-action: a boot-epoch wipe of endpoint A MUST NOT clear
+/// endpoint B's AC pins. The wipe must be scoped to the reconnecting
+/// endpoint; cross-endpoint leakage would be a #141-style regression
+/// in the opposite direction (one worker's reconnect wiping another
+/// worker's pins).
+///
+/// Mechanic: connect endpoint A AND endpoint B, seed each with
+/// distinct AC pins, then reconnect ONLY A with a different
+/// boot_epoch_id while keeping the old A stream alive. After the
+/// wipe, A's pins are gone; B's pins MUST still be present.
+#[nativelink_test]
+async fn boot_epoch_wipe_of_endpoint_a_does_not_clear_endpoint_b()
+-> Result<(), Box<dyn core::error::Error>> {
+    let endpoint_a = "grpc://192.168.1.41:50081";
+    let endpoint_b = "grpc://192.168.1.42:50081";
+    let ctx = setup_multi_connect_ac().await?;
+
+    // Seed endpoint A.
+    let (tx_a1, stream_a1) =
+        open_ac_worker_connection(&ctx.worker_api_server, endpoint_a, 100).await?;
+    let da1 = DigestInfo::new([0xAAu8; 32], 1);
+    let da2 = DigestInfo::new([0xABu8; 32], 2);
+    send_ac_blobs_and_wait(
+        &tx_a1,
+        &ctx.ac_pin_registry,
+        endpoint_a,
+        vec![ac_entry(da1, AC_STORE_NAME), ac_entry(da2, AC_STORE_NAME)],
+    )
+    .await?;
+
+    // Seed endpoint B.
+    let (tx_b1, stream_b1) =
+        open_ac_worker_connection(&ctx.worker_api_server, endpoint_b, 200).await?;
+    let db1 = DigestInfo::new([0xBAu8; 32], 1);
+    send_ac_blobs_and_wait(
+        &tx_b1,
+        &ctx.ac_pin_registry,
+        endpoint_b,
+        vec![ac_entry(db1, AC_STORE_NAME)],
+    )
+    .await?;
+
+    // Sanity: both endpoints visible.
+    assert_eq!(
+        ctx.ac_pin_registry
+            .snapshot_endpoint(endpoint_a)
+            .map(|s| s.len()),
+        Some(2)
+    );
+    assert_eq!(
+        ctx.ac_pin_registry
+            .snapshot_endpoint(endpoint_b)
+            .map(|s| s.len()),
+        Some(1)
+    );
+
+    // Reconnect ONLY endpoint A with a different boot_epoch_id WHILE
+    // the old A stream is still alive — the wipe MUST come from the
+    // registration path AND MUST be scoped to endpoint A only.
+    let (_tx_a2, _stream_a2) =
+        open_ac_worker_connection(&ctx.worker_api_server, endpoint_a, 101).await?;
+
+    // A drains.
+    let registry_for_a = ctx.ac_pin_registry.clone();
+    let endpoint_a_owned = endpoint_a.to_string();
+    let drain_a = tokio::time::timeout(Duration::from_secs(5), async move {
+        loop {
+            if registry_for_a.snapshot_endpoint(&endpoint_a_owned).is_none() {
+                return ();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    drain_a.expect(
+        "boot-epoch wipe of A MUST clear A's AC pin entries — under-action half",
+    );
+
+    // B survives — over-action assertion.
+    let snap_b = ctx
+        .ac_pin_registry
+        .snapshot_endpoint(endpoint_b)
+        .expect(
+            "boot-epoch wipe of A MUST NOT clear B — over-action: cross-endpoint wipe leaked",
+        );
+    assert_eq!(
+        snap_b.len(),
+        1,
+        "boot-epoch wipe of A MUST NOT clear B — over-action: cross-endpoint wipe leaked",
+    );
+    assert_eq!(snap_b[0].1, db1);
+
+    drop(tx_a1);
+    drop(stream_a1);
+    drop(tx_b1);
+    drop(stream_b1);
+    Ok(())
+}
+
+/// Re-population: after a boot-epoch wipe, a fresh `BlobsAvailable`
+/// from the new connection MUST re-populate the registry. Confirms
+/// the wipe didn't break the registration path (e.g. by leaving a
+/// stale `endpoint_state` row that blocks future inserts).
+#[nativelink_test]
+async fn boot_epoch_wipe_does_not_block_repopulation()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.43:50081";
+    let ctx = setup_multi_connect_ac().await?;
+
+    // First boot.
+    let (tx1, stream1) =
+        open_ac_worker_connection(&ctx.worker_api_server, cas_endpoint, 1).await?;
+    let d_old = DigestInfo::new([0xF1u8; 32], 9);
+    send_ac_blobs_and_wait(
+        &tx1,
+        &ctx.ac_pin_registry,
+        cas_endpoint,
+        vec![ac_entry(d_old, AC_STORE_NAME)],
+    )
+    .await?;
+    drop(tx1);
+    drop(stream1);
+
+    // Reconnect with new boot_epoch — wipe should occur on registration.
+    let (tx2, _stream2) =
+        open_ac_worker_connection(&ctx.worker_api_server, cas_endpoint, 2).await?;
+
+    // After wipe, send fresh AC entries and assert they take.
+    let d_new = DigestInfo::new([0xF2u8; 32], 9);
+    send_ac_blobs_and_wait(
+        &tx2,
+        &ctx.ac_pin_registry,
+        cas_endpoint,
+        vec![ac_entry(d_new, AC_STORE_NAME)],
+    )
+    .await?;
+
+    let snap = ctx
+        .ac_pin_registry
+        .snapshot_endpoint(cas_endpoint)
+        .expect("post-wipe re-registration MUST repopulate the registry");
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].1, d_new, "stale (pre-wipe) digest leaked through wipe");
+    Ok(())
+}
