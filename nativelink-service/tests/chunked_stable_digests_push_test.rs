@@ -44,7 +44,7 @@ use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreS
 use nativelink_macro::nativelink_test;
 use nativelink_service::chunked_write_handler::{
     BazelChunkedDispatcherImpl, ChunkedWriteHandlerMetrics, ChunkedWriteInFlight, CommitMode,
-    PreparedChunk, dispatch_chunks_to_driver,
+    PreparedChunk, dispatch_bazel_facing_internal_chunking, dispatch_chunks_to_driver,
 };
 use nativelink_store::chunked::chunk_budget::ChunkBudget;
 use nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry;
@@ -639,5 +639,151 @@ async fn chunked_synchronous_commit_pushes_digest_to_stable_digests() {
         "synchronous chunked commit must push to stable_digests — \
          sibling-bug regression: the Synchronous arm at \
          chunked_write_handler.rs:1618 omitted the BIS push. drained={drained:?}",
+    );
+}
+
+// =============================================================================
+// EARLY-DEDUP SHORT-CIRCUIT BRANCH TEST (testing-czar item 2)
+// =============================================================================
+
+/// **Sibling-bug audit (testing-czar item 2).** Covers push site (3) at
+/// `chunked_write_handler.rs:2398-2400` — the early-dedup short-circuit
+/// branch in `dispatch_bazel_facing_internal_chunking`. This branch
+/// fires when the FilesystemStore's `evicting_map` already contains
+/// the digest (steady-state Bazel re-upload of an already-indexed
+/// blob). Without the fix the branch returned Ok without pushing, so
+/// the BIS broadcast loop never saw the digest and the worker's
+/// mirror_blobs entry would not be unpinned via the BIS path.
+///
+/// Mutating the call at `:2399` would not red-fail any test before
+/// this one landed: the existing
+/// `dispatch_bazel_facing_skips_chunked_path_when_digest_already_indexed`
+/// in `bazel_facing_internal_chunking_test.rs` passes `None` for the
+/// sink, so it cannot observe the push.
+///
+/// **Production composition:** real `FastSlowStore` provides the
+/// pusher closure; real `FilesystemStore` is pre-populated so
+/// `has_indexed_digest` returns `Some(size)`; real
+/// `dispatch_bazel_facing_internal_chunking` is invoked directly with
+/// the sink wired (matching how `wire_bazel_chunked_dispatcher` would
+/// wire it on the production server).
+///
+/// **Mutation step (verified at test authorship time):** comment out
+/// the `sink(digest)` call at `chunked_write_handler.rs:2399`. This
+/// test red-fails with the bespoke `.expect("early-dedup short-circuit
+/// must push to stable_digests — defense-in-depth regression")`.
+#[nativelink_test]
+async fn chunked_early_dedup_short_circuit_pushes_digest_to_stable_digests() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 3;
+    const SIZE: usize = N * CHUNK;
+
+    let mut blob = Vec::with_capacity(SIZE);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0x91u8 ^ (i as u8)).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    // Pre-populate the FilesystemStore so the digest is in
+    // evicting_map. This is the steady-state precondition the
+    // early-dedup gate consults.
+    let fs_store = make_filesystem_store().await;
+    let pop_key: nativelink_util::store_trait::StoreKey<'static> =
+        nativelink_util::store_trait::StoreKey::Digest(digest);
+    fs_store
+        .as_pin()
+        .update_oneshot(pop_key, Bytes::copy_from_slice(&blob))
+        .await
+        .expect("pre-populate update_oneshot must succeed");
+
+    // Sanity: the `has_indexed_digest` probe sees the entry. If this
+    // assertion ever fails, the early-dedup gate has nothing to short-
+    // circuit on and the test would NOT exercise site (3).
+    assert_eq!(
+        fs_store.has_indexed_digest(&digest).await,
+        Some(SIZE as u64),
+        "test precondition: pre-populate must register the digest in \
+         evicting_map so the early-dedup gate fires",
+    );
+
+    // Build the FastSlowStore so we can pull `stable_digests_pusher()`.
+    // The FSS's slow tier IS the same FilesystemStore — production
+    // composition substance, not just form.
+    let fast_store: Store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store: Store = Store::new(fs_store.clone());
+    let fast_slow = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Filesystem(FilesystemSpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Pre-flight: drain MUST be empty (the pre-populate update_oneshot
+    // ran on the bare FilesystemStore, NOT through FastSlowStore::update,
+    // so no stable_digests push could have fired from it).
+    assert!(
+        fast_slow.as_ref().drain_stable_digests().is_empty(),
+        "fixture invariant: stable_digests starts empty (pre-populate \
+         was on the bare FilesystemStore, not through FSS::update)",
+    );
+
+    // Spawn a producer that streams the same bytes into a
+    // DropCloserReadHalf. The early-dedup gate drains this reader
+    // (with bounded-drain) before short-circuiting Ok.
+    let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+    let blob_for_producer = blob.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(Bytes::from(blob_for_producer)).await;
+        let _ = tx.send_eof();
+    });
+
+    let in_flight = ChunkedWriteInFlight::new();
+    let chunk_budget = make_test_chunk_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+    let sink = fast_slow.as_ref().stable_digests_pusher();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        dispatch_bazel_facing_internal_chunking(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            chunk_budget,
+            None, // pin_budget
+            None, // chunked_read_registry
+            Some(sink),
+            metrics,
+            CHUNK,
+            digest,
+            rx,
+        ),
+    )
+    .await
+    .expect(
+        "must not deadlock — early-dedup short-circuit must drain the \
+         producer and return Ok within 10s",
+    )
+    .expect(
+        "early-dedup short-circuit must return Ok when the digest is \
+         already in evicting_map",
+    );
+    assert_eq!(outcome.committed_size, SIZE as u64);
+
+    // The early-dedup branch pushes BEFORE returning Ok (line 2399 in
+    // the implementation), so by the time we get here the digest MUST
+    // be observable in drain_stable_digests(). No polling needed —
+    // unlike the AsyncCommit reaper, the push is on the same task as
+    // the dispatcher.
+    let drained = fast_slow.as_ref().drain_stable_digests();
+    assert!(
+        drained.contains(&digest),
+        "early-dedup short-circuit must push to stable_digests — \
+         defense-in-depth regression: the early-dedup branch at \
+         chunked_write_handler.rs:2398-2400 omitted the BIS push. \
+         drained={drained:?}",
     );
 }
