@@ -3827,6 +3827,129 @@ async fn ac_pin_snapshot_empty_when_no_ac_pins() -> Result<(), Error> {
     Ok(())
 }
 
+/// (Test — CAS pin snapshot filter symmetry).
+/// `dispatched_mirror_pin_snapshot_for_store(store_id)` MUST mirror
+/// the AC-side filter: when called with a non-empty `store_id`, the
+/// returned slice contains ONLY entries whose stored `store_id`
+/// matches exactly. This is the defensive trip-wire for a future
+/// composition that wires both CAS and AC pins through the same
+/// `FastSlowStore`; today the unfiltered snapshot is correct by
+/// construction (CAS and AC pins live on distinct Arc'd FSS
+/// instances), but the filtered variant lets callers pin the slice
+/// they intend without depending on isolation between FSS instances.
+///
+/// Asymmetric coverage:
+/// - under (matching store_id: digests appear in the CAS slice);
+/// - over (different store_id: digests DO NOT appear, even though
+///   they share the same `dispatched_mirror_pins` map);
+/// - empty-string sentinel: returns ALL entries (preserves current
+///   no-filter semantics for CAS callers).
+///
+/// Mutation step (RUN): replace
+/// `(sid.as_ref() == store_id).then(|| (sid.clone(), *d))` with
+/// `Some((sid.clone(), *d))` in
+/// `dispatched_mirror_pin_snapshot_for_store` → the over-action
+/// assertions ("must NOT include OTHER_STORE entry") red-fail with
+/// the bespoke message below. Confirmed locally before commit.
+///
+/// Deadlock detector: the snapshot is a fully-synchronous
+/// `parking_lot::Mutex` lock + iterate; a 5-second `tokio::time::
+/// timeout` guards against any future refactor that would route the
+/// snapshot through an `.await` and accidentally introduce a
+/// lock-across-await deadlock under contention.
+#[nativelink_test]
+async fn cas_pin_snapshot_filters_strictly_by_store_id() -> Result<(), Error> {
+    let fss = make_fss_for_ac_pin();
+    let d_main = d(0x50);
+    let d_other = d(0x60);
+    let d_third = d(0x70);
+    // Populate the shared `dispatched_mirror_pins` map with three
+    // entries under three distinct store_ids. `insert_local_ac_pin`
+    // is the cheapest setup helper that touches the same map a CAS
+    // dispatch would (`insert_dispatched_mirror_blob` uses the same
+    // `dispatched_mirror_pins.insert` line); the snapshot iterator
+    // does not distinguish by source path.
+    fss.insert_local_ac_pin("cas_STORE", d_main);
+    fss.insert_local_ac_pin("OTHER_STORE", d_other);
+    fss.insert_local_ac_pin("THIRD_STORE", d_third);
+
+    let main_slice = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        async { fss.dispatched_mirror_pin_snapshot_for_store("cas_STORE") },
+    )
+    .await
+    .expect(
+        "dispatched_mirror_pin_snapshot_for_store must complete within 5s — \
+         deadlock detector: snapshot path was refactored to hold a lock \
+         across an .await",
+    );
+    let other_slice = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        async { fss.dispatched_mirror_pin_snapshot_for_store("OTHER_STORE") },
+    )
+    .await
+    .expect(
+        "dispatched_mirror_pin_snapshot_for_store must complete within 5s — \
+         deadlock detector",
+    );
+
+    // Under-action: matching store_id's pin appears in its own slice.
+    assert!(
+        main_slice.iter().any(|(sid, dg)| sid.as_ref() == "cas_STORE" && *dg == d_main),
+        "CAS slice for cas_STORE MUST include its own pin entry; \
+         under-action: snapshot filter dropped a matching digest \
+         (store_id=cas_STORE, digest_byte=0x50)"
+    );
+    assert!(
+        other_slice.iter().any(|(sid, dg)| sid.as_ref() == "OTHER_STORE" && *dg == d_other),
+        "CAS slice for OTHER_STORE MUST include its own pin entry; \
+         under-action: snapshot filter dropped a matching digest"
+    );
+
+    // Over-action: pins from other store_ids MUST NOT appear in a
+    // filtered slice. This is the defensive future-proofing the
+    // distributed-systems MINOR-1 demanded — symmetry with
+    // `dispatched_ac_pin_snapshot_for_store`.
+    assert!(
+        !main_slice.iter().any(|(_, dg)| *dg == d_other),
+        "CAS slice for cas_STORE MUST NOT include OTHER_STORE pin; \
+         over-action: snapshot filter is too permissive across store_ids \
+         (would leak slices in a future composition that wires CAS+AC pins \
+         through the same FastSlowStore)"
+    );
+    assert!(
+        !main_slice.iter().any(|(_, dg)| *dg == d_third),
+        "CAS slice for cas_STORE MUST NOT include THIRD_STORE pin; \
+         over-action: snapshot filter is too permissive across store_ids"
+    );
+    assert!(
+        !other_slice.iter().any(|(_, dg)| *dg == d_main),
+        "CAS slice for OTHER_STORE MUST NOT include cas_STORE pin; \
+         over-action: snapshot filter is too permissive across store_ids"
+    );
+
+    // Empty-string sentinel: preserves the current no-filter
+    // semantics so CAS callers passing `""` see the entire map.
+    let unfiltered = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        async { fss.dispatched_mirror_pin_snapshot_for_store("") },
+    )
+    .await
+    .expect(
+        "dispatched_mirror_pin_snapshot_for_store(\"\") must complete within 5s",
+    );
+    assert_eq!(
+        unfiltered.len(),
+        3,
+        "empty-string sentinel MUST return ALL 3 pin entries unfiltered; \
+         got {} — sentinel semantics regression: filter applied when it \
+         should be a pass-through",
+        unfiltered.len()
+    );
+
+    Ok(())
+}
+
 // =============================================================================
 // #284 part 2: warn-and-continue on cache-tee at-cap (regression tests).
 //
