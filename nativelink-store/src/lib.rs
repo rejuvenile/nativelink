@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod ac_proxy_store;
 pub mod ac_utils;
 pub mod azure_blob_store;
 pub mod batch_read_coalescer;
