@@ -234,37 +234,53 @@ fn commit_with_inner_miss_gate(
 /// because the action took longer than `PIN_TIMEOUT_SECS` (no slow-write
 /// ever existed for that digest — the blob came in via download).
 ///
-/// To distinguish, the listener consults `in_flight_slow_writes` of its
-/// owning `FastSlowStore`. Only digests that have an outstanding
-/// background slow-write spawn (populated by `update` /
-/// `update_oneshot`) are queued for retry. Download-pin expiries are
-/// silently skipped — no warn, no failed-set entry — which both
-/// eliminates the spurious "queueing digest for slow-write retry"
-/// log churn (5774 events / 10 min observed on workers from
+/// To distinguish, the listener consults the wrapper's in-flight maps:
+/// EITHER `in_flight_slow_writes` (the legacy `update`/`update_oneshot`
+/// path's per-spawn map) OR `chunked_in_flight_digests` (the chunked
+/// dispatcher's per-blob set populated by
+/// `BazelChunkedDispatcherImpl::dispatch`). Only digests with an
+/// outstanding write on EITHER path are queued for retry. Download-pin
+/// expiries are silently skipped — no warn, no failed-set entry —
+/// which both eliminates the spurious "queueing digest for slow-write
+/// retry" log churn (5774 events / 10 min observed on workers from
 /// `directory_cache.rs` pins) AND prevents `failed_slow_writes` from
 /// accumulating dead-weight entries that, on reconnect, would attempt
 /// to re-upload blobs the server already has.
+///
+/// **#283 fixup MAJOR-2** — the chunked-write path populates
+/// `chunked_in_flight_digests`, not `in_flight_slow_writes`. Without
+/// the chunked-set check, a chunked-commit that stalls past
+/// PIN_TIMEOUT_SECS (no Err returned, no Ok returned) reaches
+/// `on_pin_expired` and the listener no-ops because none of the
+/// digests are in `in_flight_slow_writes`. MemoryStore evicts the
+/// in-memory replica; on worker reconnect, `drain_failed_digests`
+/// returns empty; reads NotFound. Including the chunked set extends
+/// the silent-hang safety net (#187 family) to chunked dispatches.
 ///
 /// As a side-effect this also dedupes the multi-listener fan-out:
 /// `local_worker.rs` registers three `PinExpireFailedWritesListener`
 /// instances against the SAME underlying fast store (one per
 /// `FastSlowStore::new` / `new_with_shared_failed_writes` site). Each
-/// listener carries its OWNING wrapper's `in_flight_slow_writes` Arc
-/// (every wrapper has its own in-flight map; only `failed_slow_writes`
-/// is shared). A real silent slow-write hang shows up in the in-flight
-/// of ONLY the wrapper that owned the spawn, so exactly one of the
-/// three listeners fires the warn + insert per pin expiry — collapsing
-/// the previously observed 3× warn amplification to 1×.
+/// listener carries its OWNING wrapper's in-flight Arcs (every wrapper
+/// has its own in-flight maps; only `failed_slow_writes` is shared). A
+/// real silent slow-write hang shows up in the in-flight of ONLY the
+/// wrapper that owned the spawn / chunked dispatch, so exactly one of
+/// the three listeners fires the warn + insert per pin expiry —
+/// collapsing the previously observed 3× warn amplification to 1×.
 #[derive(Debug)]
 struct PinExpireFailedWritesListener {
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
-    /// Per-wrapper in-flight slow-write set. Used as the "is this pin
-    /// associated with a slow-write owned by *this* wrapper?" gate.
-    /// Skipping the warn + failed-set insert when the digest is absent
-    /// from this map is what makes the listener idempotent across the
-    /// 3-wrapper composition AND scopes the durability path to actual
-    /// uploads (vs `DirectoryCache` download pins).
+    /// Per-wrapper in-flight slow-write set (legacy
+    /// `update`/`update_oneshot` spawn path). Used as one half of the
+    /// "is this pin associated with a write owned by *this* wrapper?"
+    /// gate. See struct doc-comment for the rationale.
     in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
+    /// Per-wrapper chunked in-flight digest set (chunked dispatcher
+    /// path, populated by `BazelChunkedDispatcherImpl::dispatch`).
+    /// Used as the OTHER half of the gate — the chunked path doesn't
+    /// touch `in_flight_slow_writes`, so without this check the
+    /// silent-hang safety net wouldn't cover chunked-commit stalls.
+    chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>>,
 }
 
 impl ItemCallback for PinExpireFailedWritesListener {
@@ -278,23 +294,29 @@ impl ItemCallback for PinExpireFailedWritesListener {
 
     fn on_pin_expired(&self, store_key: StoreKey<'_>, _size: u64) {
         if let StoreKey::Digest(digest) = store_key {
-            // Only act when *this* wrapper has a slow-write outstanding
-            // for the digest. The two skip cases are:
-            //   1. `DirectoryCache` download pin (no slow-write ever
+            // Only act when *this* wrapper has a write outstanding for
+            // the digest on EITHER the legacy spawn path
+            // (`in_flight_slow_writes`) OR the chunked dispatcher path
+            // (`chunked_in_flight_digests`). Skip cases:
+            //   1. `DirectoryCache` download pin (no write ever
             //      created — blob came in via download).
-            //   2. Slow-write was initiated by a sibling wrapper
-            //      sharing the fast store (the sibling's listener is
-            //      the one that should fire).
-            // In either case, queueing the digest into `failed_slow_writes`
-            // would produce a dead-weight reconnect retry for a blob the
-            // server already has.
+            //   2. Write was initiated by a sibling wrapper sharing
+            //      the fast store (the sibling's listener is the one
+            //      that should fire).
+            // In either case, queueing the digest into
+            // `failed_slow_writes` would produce a dead-weight
+            // reconnect retry for a blob the server already has.
             let owned_key = StoreKey::Digest(digest);
-            if !self.in_flight_slow_writes.lock().contains_key(&owned_key) {
+            let in_legacy = self.in_flight_slow_writes.lock().contains_key(&owned_key);
+            let in_chunked = self.chunked_in_flight_digests.lock().contains(&digest);
+            if !in_legacy && !in_chunked {
                 return;
             }
             self.failed_slow_writes.lock().insert(digest);
             warn!(
                 ?digest,
+                in_legacy,
+                in_chunked,
                 "fast-store pin auto-expired with in-flight slow-write; \
                  queueing digest for slow-write retry on reconnect"
             );
@@ -310,19 +332,23 @@ impl ItemCallback for PinExpireFailedWritesListener {
 /// pin-expiry listener is the safety net for the SILENT-hang case
 /// (slow-write neither succeeds nor errors before pin TTL fires).
 ///
-/// Registers a listener that carries BOTH the `failed_slow_writes`
-/// Arc (typically shared across wrappers) AND the `in_flight_slow_writes`
-/// Arc (per-wrapper). The in-flight gate is what makes the
-/// listener safe to register multiple times against the same fast
-/// store — see the listener's doc comment for the rationale.
+/// Registers a listener that carries the `failed_slow_writes` Arc
+/// (typically shared across wrappers) plus BOTH per-wrapper in-flight
+/// maps: `in_flight_slow_writes` (legacy spawn path) AND
+/// `chunked_in_flight_digests` (chunked dispatcher path). The
+/// either-or gate is what makes the listener safe to register multiple
+/// times against the same fast store AND extends the silent-hang
+/// safety net to chunked dispatches — see the listener's doc-comment.
 fn register_pin_expire_listener(
     fast_store: &Store,
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
     in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
+    chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>>,
 ) {
     let listener: Arc<dyn ItemCallback> = Arc::new(PinExpireFailedWritesListener {
         failed_slow_writes,
         in_flight_slow_writes,
+        chunked_in_flight_digests,
     });
     if let Err(err) = fast_store.register_item_callback(listener) {
         warn!(
@@ -599,10 +625,13 @@ impl FastSlowStore {
             Arc::new(Mutex::new(HashSet::new()));
         let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>> =
+            Arc::new(Mutex::new(HashSet::new()));
         register_pin_expire_listener(
             &fast_store,
             failed_slow_writes.clone(),
             in_flight_slow_writes.clone(),
+            chunked_in_flight_digests.clone(),
         );
         let store = Arc::new_cyclic(|weak_self| Self {
             fast_store,
@@ -613,7 +642,7 @@ impl FastSlowStore {
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
             in_flight_slow_writes,
-            chunked_in_flight_digests: Arc::new(Mutex::new(HashSet::new())),
+            chunked_in_flight_digests,
             in_flight_empty_notify: Arc::new(Notify::new()),
             stable_digests: Arc::new(Mutex::new(Vec::new())),
             stable_notify: Arc::new(Notify::new()),
@@ -1448,7 +1477,14 @@ impl FastSlowStore {
         let shared = other.failed_slow_writes.clone();
         let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        register_pin_expire_listener(&fast_store, shared.clone(), in_flight_slow_writes.clone());
+        let chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        register_pin_expire_listener(
+            &fast_store,
+            shared.clone(),
+            in_flight_slow_writes.clone(),
+            chunked_in_flight_digests.clone(),
+        );
         let store = Arc::new_cyclic(|weak_self| Self {
             fast_store,
             fast_direction: spec.fast_direction,
@@ -1458,7 +1494,7 @@ impl FastSlowStore {
             metrics: FastSlowStoreMetrics::default(),
             populating_digests: Mutex::new(HashMap::new()),
             in_flight_slow_writes,
-            chunked_in_flight_digests: Arc::new(Mutex::new(HashSet::new())),
+            chunked_in_flight_digests,
             in_flight_empty_notify: Arc::new(Notify::new()),
             stable_digests: Arc::new(Mutex::new(Vec::new())),
             stable_notify: Arc::new(Notify::new()),
