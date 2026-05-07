@@ -1725,6 +1725,142 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
 }
 
 // =============================================================================
+// #283 SUB-ITEM 3 (WATCHDOG) — OVER-ACTION TEST (testing-czar MAJOR-2 fixup)
+// =============================================================================
+//
+// Asymmetric contract coverage (CLAUDE.md #171 lesson). The under-action
+// test (`chunked_async_commit_watchdog_fires_on_stalled_completion`)
+// proves the watchdog FIRES on a wedged driver. This test proves it
+// DOES NOT fire on a healthy driver that completes inside the budget.
+//
+// Without this test, a regression that swapped `timeout(WATCHDOG_SECS,
+// ...)` for `timeout(0, ...)`, that mis-mapped the `Ok(r) =>` and
+// `Err(_) =>` arms, or that fired the watchdog speculatively would
+// corrupt healthy commits into `failed_slow_writes`, retriggering the
+// 2026-05-06 cap-exhaustion class via spurious-failure inflation
+// instead of via stall.
+
+/// **#283 sub-item 3 (watchdog) — over-action.** When the chunked
+/// commit completes successfully BEFORE `CHUNKED_COMMIT_WATCHDOG_SECS`,
+/// the watchdog arm MUST NOT fire. Specifically:
+///
+///   1. `failed_commit_sink` MUST NOT be invoked (the digest MUST NOT
+///      appear in `failed_slow_writes`).
+///   2. `stable_digests_sink` MUST be invoked (the digest MUST appear
+///      in `drain_stable_digests`).
+///
+/// **Drive path:** drive a real chunked update through the production
+/// composition (`make_e2e_fast_slow_with_sink` + `run_update`) and
+/// observe both sinks within a generous 5s timeout. The chunked
+/// dispatcher spawns the AsyncCommit reaper, which awaits
+/// `await_completion()` under `tokio::time::timeout(WATCHDOG, ..)`;
+/// for a healthy slow tier the inner future resolves Ok long before
+/// the watchdog fires, the success arm runs, and the digest lands in
+/// `stable_digests`.
+///
+/// **Production composition:** identical to
+/// `chunked_commit_pushes_digest_to_stable_digests` (the under-action
+/// test for #282 BIS push) — same `make_e2e_fast_slow_with_sink`
+/// helper, same `run_update` driver, same drain-polling pattern. The
+/// only difference: this test additionally asserts the over-action
+/// invariant (failed_slow_writes EMPTY) — which the under-action test
+/// did not bother to verify.
+///
+/// **Mutation step (verified at test authorship time):** change the
+/// `CHUNKED_COMMIT_WATCHDOG_SECS` constant in `chunked_write_handler.rs`
+/// from `60` to `0`. The watchdog now fires immediately, treating the
+/// healthy commit as a Deadline-Exceeded failure: the digest lands in
+/// `failed_slow_writes` (over-action!) and NOT in `stable_digests`.
+/// This test red-fails on the `failed_slow_writes_contains == false`
+/// assertion with the bespoke `"watchdog MUST NOT fire on a healthy
+/// commit"` message. The under-action #282 push test
+/// (`chunked_commit_pushes_digest_to_stable_digests`) ALSO red-fails
+/// (the success-path push doesn't run because the reaper takes the
+/// Err arm), confirming the mutation is the right one.
+#[nativelink_test]
+async fn chunked_async_commit_watchdog_does_not_fire_on_healthy_commit() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 4;
+    const SIZE: usize = N * CHUNK;
+    let blob: Vec<u8> = (0..SIZE).map(|i| (i * 13) as u8).collect();
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let _guard = kill_switch_lock().lock().await;
+    enable_bazel_facing_internal_chunking();
+
+    let fast_slow = make_e2e_fast_slow_with_sink(CHUNK).await;
+
+    // Pre-flight: both sinks empty.
+    assert!(
+        !fast_slow.failed_slow_writes_contains(&digest),
+        "fixture invariant: failed_slow_writes starts empty",
+    );
+    assert!(
+        fast_slow.as_ref().drain_stable_digests().is_empty(),
+        "fixture invariant: stable_digests starts empty",
+    );
+
+    // Drive the upload through the dispatcher — same path as
+    // `chunked_commit_pushes_digest_to_stable_digests` (#282 under-action).
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_update(&fast_slow, digest, Bytes::from(blob)),
+    )
+    .await
+    .expect("must not deadlock — chunked update should commit within 10s")
+    .expect("chunked update must succeed for hash-matching blob");
+
+    // Wait up to 5s for the AsyncCommit reaper to push the success
+    // signal. The reaper completes on a separate spawn; we observe
+    // via drain_stable_digests as the under-action test does.
+    let pushed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let drained = fast_slow.as_ref().drain_stable_digests();
+            if drained.contains(&digest) {
+                return drained;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "drain_stable_digests must contain digest within timeout — \
+         setup invariant: the healthy commit must reach stable_digests, \
+         otherwise the test isn't actually exercising the success arm",
+    );
+
+    // Contract part 1: stable_digests fires (success path).
+    assert!(
+        pushed.contains(&digest),
+        "healthy commit MUST push to stable_digests (under-action \
+         mirror invariant — confirms the reaper actually took the Ok \
+         arm before we assert the over-action). pushed={pushed:?}",
+    );
+
+    // Contract part 2 (the over-action assertion): failed_slow_writes
+    // MUST NOT contain the digest. A regression that fires the watchdog
+    // on healthy completion would tag this digest as failed and
+    // trigger spurious worker reconnect-retry — recreating the
+    // 2026-05-06 cap-exhaustion class via spurious-failure inflation
+    // instead of via missing-push. CLAUDE.md asymmetric-coverage rule
+    // (#171 lesson): the under-action push-fires test alone does NOT
+    // catch a watchdog that ALSO over-fires on success — both
+    // directions of the contract must be tested.
+    assert!(
+        !fast_slow.failed_slow_writes_contains(&digest),
+        "watchdog MUST NOT fire on a healthy commit (over-action \
+         contract). The digest was tagged in failed_slow_writes even \
+         though the driver completed successfully — a regression that \
+         would convert healthy commits into spurious worker \
+         reconnect-retry storms. Most likely cause: \
+         CHUNKED_COMMIT_WATCHDOG_SECS reduced to 0, the timeout's \
+         Ok/Err arms swapped, or the watchdog firing speculatively.",
+    );
+
+    disable_bazel_facing_internal_chunking();
+}
+
+// =============================================================================
 // #283 SUB-ITEM 3 (WATCHDOG) — SYNC ARM SIBLING TEST (testing-czar MAJOR-1 fixup)
 // =============================================================================
 //
