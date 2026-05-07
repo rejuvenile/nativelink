@@ -32,7 +32,8 @@
 
 use nativelink_error::Error;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, backpressure_signal,
+    BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL,
+    WatchdogTimeoutSignal, backpressure_signal, watchdog_timeout_signal,
 };
 use prost::Message;
 
@@ -130,17 +131,73 @@ pub fn error_has_backpressure_reason(
     })
 }
 
+/// #286 sub-item 3 (red-team P1): build a `prost_types::Any` carrying
+/// an encoded `WatchdogTimeoutSignal`. The chunked-commit watchdog
+/// (`run_async_commit_reaper` in `chunked_write_handler.rs`) attaches
+/// this detail to the synthesised `Code::DeadlineExceeded` Err so the
+/// chunked client's `classify_retryable` predicate (in
+/// `chunked_client.rs`) can gate its `DeadlineExceeded → Retry` arm
+/// on the discriminator's presence.
+///
+/// Without the discriminator, ANY `DeadlineExceeded` (including a
+/// future per-RPC `tonic::Request::set_timeout`) would inherit the
+/// retry behavior intended only for the watchdog — the `#203`-shape
+/// OOM cascade in miniature (red-team P1). The pattern mirrors
+/// `BackpressureSignal` exactly: type_url is the load-bearing wire
+/// contract; producers MUST attach this detail when they want the
+/// retry; consumers MUST gate on its presence before retrying.
+#[must_use]
+pub fn encode_watchdog_timeout_signal_any(
+    reason: watchdog_timeout_signal::Reason,
+    watchdog_secs: u64,
+) -> prost_types::Any {
+    let signal = WatchdogTimeoutSignal {
+        reason: reason as i32,
+        watchdog_secs,
+    };
+    prost_types::Any {
+        type_url: WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL.to_string(),
+        value: signal.encode_to_vec(),
+    }
+}
+
+/// True iff `err.details` carries a `WatchdogTimeoutSignal` (matched
+/// by `type_url` only — value bytes are not re-decoded). Used by the
+/// chunked client's `classify_retryable` to identify watchdog-
+/// synthesised `DeadlineExceeded` errors so a future bare
+/// `DeadlineExceeded` (e.g. `tonic::Request::set_timeout`) is NOT
+/// silently retried.
+///
+/// We deliberately do NOT decode the value: producers may add new
+/// reasons over time, and the classifier's job is "did the watchdog
+/// say this is retryable?", not "is the reason exactly this enum
+/// value." A producer that emits the type_url with malformed bytes
+/// is still asserting "this is watchdog timeout, retryable" — the
+/// classifier should respect that even if the body is unreadable.
+#[must_use]
+pub fn error_has_watchdog_timeout_signal(err: &Error) -> bool {
+    if err.details.is_empty() {
+        return false;
+    }
+    err.details
+        .iter()
+        .any(|any| any.type_url == WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL)
+}
+
 #[cfg(test)]
 mod tests {
     use nativelink_error::{Code, Error, make_err};
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-        BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, backpressure_signal,
+        BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal,
+        WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL, WatchdogTimeoutSignal, backpressure_signal,
+        watchdog_timeout_signal,
     };
     use prost::Message;
 
     use super::{
-        encode_backpressure_signal_any, error_has_backpressure_reason,
-        error_has_backpressure_signal,
+        encode_backpressure_signal_any, encode_watchdog_timeout_signal_any,
+        error_has_backpressure_reason, error_has_backpressure_signal,
+        error_has_watchdog_timeout_signal,
     };
 
     /// Encode + decode round-trip preserves both fields. This is the
@@ -346,6 +403,76 @@ mod tests {
                 &[backpressure_signal::Reason::MemoryStoreAtCapacity],
             ),
             "malformed value MUST NOT classify as a positive discriminator match",
+        );
+    }
+
+    /// #286 sub-item 3 (red-team P1): the new `WatchdogTimeoutSignal`
+    /// pattern roundtrips and the `error_has_watchdog_timeout_signal`
+    /// classifier matches by `type_url`. Mirrors the
+    /// `BackpressureSignal` test contract exactly because the
+    /// classifier's job — "is this discriminator present?" — is the
+    /// same. Wire-stability + classifier-coverage in one test.
+    #[test]
+    fn watchdog_timeout_signal_roundtrip_and_classify() {
+        let any = encode_watchdog_timeout_signal_any(
+            watchdog_timeout_signal::Reason::ChunkedCommitWatchdog,
+            60,
+        );
+        assert_eq!(
+            any.type_url, WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL,
+            "type_url MUST match the contractual constant",
+        );
+        let decoded = WatchdogTimeoutSignal::decode(&*any.value)
+            .expect("encoded WatchdogTimeoutSignal must decode cleanly");
+        assert_eq!(
+            decoded.reason,
+            watchdog_timeout_signal::Reason::ChunkedCommitWatchdog as i32,
+            "decoded reason MUST round-trip exactly",
+        );
+        assert_eq!(decoded.watchdog_secs, 60);
+
+        let err = Error::deadline_exceeded_with_detail("watchdog fired", any);
+        assert!(
+            error_has_watchdog_timeout_signal(&err),
+            "MUST detect the watchdog discriminator on a DeadlineExceeded \
+             error — without this, the chunked client's classify_retryable \
+             cannot gate the retry arm on the discriminator (red-team P1)",
+        );
+
+        // No details at all → false.
+        let bare: Error = make_err!(Code::DeadlineExceeded, "bare timeout");
+        assert!(
+            !error_has_watchdog_timeout_signal(&bare),
+            "bare DeadlineExceeded (no detail) MUST NOT match — this is \
+             the load-bearing case for red-team P1: a future blanket \
+             tonic::Request::set_timeout MUST NOT silently inherit the \
+             watchdog retry behavior",
+        );
+
+        // Some other detail type_url → false.
+        let mut other: Error = make_err!(Code::DeadlineExceeded, "other");
+        other.details.push(prost_types::Any {
+            type_url: "type.googleapis.com/some.other.Type".into(),
+            value: vec![1, 2, 3],
+        });
+        assert!(
+            !error_has_watchdog_timeout_signal(&other),
+            "different detail type_url MUST NOT classify as watchdog",
+        );
+
+        // BackpressureSignal detail (a different discriminator
+        // sharing the same Code::ResourceExhausted retry pattern)
+        // MUST NOT cross-match. The two discriminators are
+        // independent.
+        let bp = encode_backpressure_signal_any(
+            backpressure_signal::Reason::GlobalChunkBudgetExhausted,
+            10,
+        );
+        let bp_err = Error::resource_exhausted_backpressure("bp", bp);
+        assert!(
+            !error_has_watchdog_timeout_signal(&bp_err),
+            "BackpressureSignal MUST NOT cross-match as watchdog — they \
+             are independent discriminators with independent retry shapes",
         );
     }
 }

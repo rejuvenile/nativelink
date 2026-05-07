@@ -92,7 +92,7 @@ use tonic::Response;
 use tracing::{debug, info, warn};
 
 use crate::chunked::CHUNK_SIZE;
-use crate::chunked_signal::error_has_backpressure_signal;
+use crate::chunked_signal::{error_has_backpressure_signal, error_has_watchdog_timeout_signal};
 
 /// Type alias for the boxed-and-pinned future returned by
 /// `WriteChunkedDispatcher::dispatch`. Manually-spelled rather than
@@ -254,6 +254,17 @@ pub struct ChunkedClientMetrics {
     /// Per-attempt rejections with `Code::ResourceExhausted` +
     /// `BackpressureSignal` (Q8 admission backpressure).
     pub resource_exhausted_total: AtomicU64,
+    /// #286 sub-item 3 fixup (code-reviewer MAJOR): per-attempt
+    /// retries triggered by a watchdog-tagged
+    /// `Code::DeadlineExceeded` (carrying a `WatchdogTimeoutSignal`
+    /// detail). Distinct from `resource_exhausted_total` — operators
+    /// reading these gauges separately can distinguish (a) genuine
+    /// global-budget rejections (Q8 admission backpressure) from
+    /// (b) slow-tier wedges trip the server's commit watchdog.
+    /// Conflating them under `resource_exhausted_total` would mask
+    /// a slow-tier wedge as an admission-backpressure signal — the
+    /// red-team P1 finding for #286.
+    pub watchdog_retried_total: AtomicU64,
     /// Bytes successfully delivered via chunked transport. Equals
     /// the sum of declared digest sizes for `succeeded_total`
     /// invocations.
@@ -398,6 +409,11 @@ pub async fn write_chunked_stream(
                             .resource_exhausted_total
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    RetryReason::WatchdogDeadline => {
+                        metrics
+                            .watchdog_retried_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 if attempt == options.max_attempts {
                     warn!(
@@ -437,6 +453,13 @@ pub async fn write_chunked_stream(
 enum RetryReason {
     Aborted,
     ResourceExhausted,
+    /// #286 sub-item 3 fixup (code-reviewer MAJOR): the server's
+    /// chunked-commit watchdog fired. Distinct from
+    /// `ResourceExhausted` so operators can distinguish (a) genuine
+    /// global-budget rejection from (b) slow-tier wedge — both are
+    /// transient but they imply different mitigations. Drives a
+    /// dedicated `watchdog_retried_total` metric counter.
+    WatchdogDeadline,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -457,31 +480,39 @@ enum RetryDecision {
 ///   the hint.
 /// - `Code::ResourceExhausted` carrying a `BackpressureSignal`
 ///   (global budget OR per-blob mpsc full) → retry after the hint.
-/// - `Code::DeadlineExceeded` (no detail required) → retry after a
-///   small fallback backoff. #286 sub-item 3 (red-team finding
-///   `283-watchdog-8090162d` P2 falsified): the server-side chunked
-///   commit watchdog (`chunked_write_handler::run_async_commit_reaper`,
-///   `CHUNKED_COMMIT_WATCHDOG_SECS=60`) synthesises a bare
-///   `make_err!(Code::DeadlineExceeded, ...)` with no
-///   `BackpressureSignal` detail when the slow tier wedges. Without
-///   this arm, the chunked client surfaces straight to the caller
-///   without per-attempt retry — the watchdog sees a transient
-///   slow-tier stall and the client doesn't retry it inside its own
-///   3-attempt loop the way Aborted/ResourceExhausted are. Treating
-///   DeadlineExceeded as retryable closes that gap. The retry-after
-///   hint defaults to the `decode_retry_after` fallback (50 ms; the
-///   server doesn't attach a hint here) capped at `MAX_RETRY_AFTER`.
+/// - `Code::DeadlineExceeded` carrying a `WatchdogTimeoutSignal`
+///   (#286 sub-item 3 fixup, red-team P1) → retry after a small
+///   fallback backoff. The discriminator is load-bearing: the
+///   server-side chunked commit watchdog
+///   (`chunked_write_handler::run_async_commit_reaper`,
+///   `CHUNKED_COMMIT_WATCHDOG_SECS=60`) synthesises a tagged
+///   `Code::DeadlineExceeded` carrying the
+///   `WatchdogTimeoutSignal` discriminator. The client retries
+///   the WHOLE blob from byte 0 inside the existing 3-attempt
+///   loop (the watchdog implies a transient slow-tier wedge — the
+///   right shape for a fresh full-blob attempt).
+///
+///   **A bare `Code::DeadlineExceeded` (no discriminator) maps to
+///   `Abort`.** Critical defense against red-team P1: the
+///   #286/#283 retry arm was originally written as "any
+///   `DeadlineExceeded` retries", which would silently swallow
+///   future per-RPC `tonic::Request::set_timeout` deadlines, the
+///   chunk-driver per-pwrite + e2e SHA timeouts in
+///   `chunked_driver.rs`, and any other non-watchdog
+///   `DeadlineExceeded`. Each of those is "give up", not "retry
+///   the whole blob"; conflating them with watchdog firings
+///   re-creates the #203 OOM-cascade shape (slow-tier transient
+///   → upstream stall → per-chunk timeout → retry storm →
+///   in-flight growth → SIGKILL).
 /// - Anything else → abort.
 fn classify_retryable(err: &Error) -> RetryDecision {
-    // #286 sub-item 3: DeadlineExceeded is retryable independent of
-    // BackpressureSignal — the chunked watchdog (server-side) emits
-    // it WITHOUT a detail. Check this BEFORE the has_signal early-
-    // return so a missing detail doesn't down-grade the decision to
-    // Abort.
-    if err.code == Code::DeadlineExceeded {
+    // #286 sub-item 3 (red-team P1 fixup): retry only on
+    // watchdog-tagged DeadlineExceeded errors. Bare
+    // DeadlineExceeded (no discriminator) maps to Abort below.
+    if err.code == Code::DeadlineExceeded && error_has_watchdog_timeout_signal(err) {
         let retry_after = decode_retry_after(err).min(MAX_RETRY_AFTER);
         return RetryDecision::Retry {
-            reason: RetryReason::ResourceExhausted,
+            reason: RetryReason::WatchdogDeadline,
             retry_after,
         };
     }
@@ -939,49 +970,118 @@ mod tests {
         }
     }
 
-    /// **#286 sub-item 3 (watchdog Err is retryable).** The chunked
-    /// commit watchdog at `chunked_write_handler::run_async_commit_reaper`
-    /// synthesises a bare `make_err!(Code::DeadlineExceeded, ...)` with
-    /// NO `BackpressureSignal` detail. Without the dedicated
-    /// `Code::DeadlineExceeded` arm in `classify_retryable`, the chunked
-    /// client's 3-attempt loop would `Abort` on the watchdog Err and the
-    /// transient slow-tier wedge would surface to the caller without an
-    /// in-loop retry. This test asserts the contract: the watchdog-shaped
-    /// Err MUST classify as `Retry`.
+    /// **#286 sub-item 3 fixup (red-team P1, code-reviewer MAJOR):
+    /// watchdog-tagged DeadlineExceeded retries.** A
+    /// `Code::DeadlineExceeded` carrying a `WatchdogTimeoutSignal`
+    /// detail (synthesised by `run_async_commit_reaper` in
+    /// `chunked_write_handler.rs`) MUST classify as `Retry` with the
+    /// `WatchdogDeadline` reason. The dedicated reason variant drives
+    /// the `watchdog_retried_total` metric counter, separate from
+    /// `resource_exhausted_total` so operators can distinguish
+    /// genuine global-budget rejection from slow-tier wedge.
     ///
-    /// **Mutation step (verified at test authorship time):** revert the
-    /// `if err.code == Code::DeadlineExceeded { ... }` early-return in
-    /// `classify_retryable`. The bare-DeadlineExceeded `err` then falls
-    /// through to the `has_signal` early-return (no signal attached) and
-    /// returns `Abort`; this test red-fails on the bespoke
-    /// `"watchdog-shaped DeadlineExceeded must be retryable — #286
-    /// sub-item 3 regression"` message.
+    /// **Mutation step (run at fixup authorship):** revert the
+    /// `if ... && error_has_watchdog_timeout_signal(err) { ... }`
+    /// gate in `classify_retryable` to a bare `if err.code ==
+    /// Code::DeadlineExceeded`. The discriminator-tagged Err still
+    /// classifies as Retry — but so does a bare DeadlineExceeded
+    /// (the over-action test below would red-fail). The pair of
+    /// tests guards both directions of the contract.
     #[nativelink_test]
-    async fn classify_bare_deadline_exceeded_is_retry() {
-        // Mirror the exact shape of the watchdog's synthesised Err:
-        // bare `make_err!(Code::DeadlineExceeded, ...)` with NO
-        // `BackpressureSignal` detail.
-        let err = make_err!(
-            Code::DeadlineExceeded,
-            "chunked commit await_completion exceeded 60 s watchdog deadline"
+    async fn classify_watchdog_tagged_deadline_exceeded_is_retry() {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::watchdog_timeout_signal;
+
+        use crate::chunked_signal::encode_watchdog_timeout_signal_any;
+
+        let detail = encode_watchdog_timeout_signal_any(
+            watchdog_timeout_signal::Reason::ChunkedCommitWatchdog,
+            60,
+        );
+        let err = Error::deadline_exceeded_with_detail(
+            "chunked commit await_completion exceeded 60 s watchdog deadline",
+            detail,
         );
         match classify_retryable(&err) {
             RetryDecision::Retry { reason, retry_after } => {
                 assert_eq!(
                     reason,
-                    RetryReason::ResourceExhausted,
-                    "watchdog DeadlineExceeded must map to a metrics-bucket                      reason (ResourceExhausted today; the variant only                      drives metrics + log fields)",
+                    RetryReason::WatchdogDeadline,
+                    "watchdog-tagged DeadlineExceeded MUST map to the \
+                     WatchdogDeadline reason variant — it drives the \
+                     dedicated watchdog_retried_total metric counter, \
+                     which operators read separately from \
+                     resource_exhausted_total to distinguish slow-tier \
+                     wedge from genuine global-budget rejection",
                 );
-                // Fallback retry-after is 50 ms (decode_retry_after's
-                // bare-Err default) capped at MAX_RETRY_AFTER.
                 assert!(
                     retry_after <= MAX_RETRY_AFTER,
-                    "retry-after must be bounded above by MAX_RETRY_AFTER                      even when the server attaches no hint; got={retry_after:?}",
+                    "retry-after must be bounded above by MAX_RETRY_AFTER \
+                     even when the server attaches no hint; got={retry_after:?}",
                 );
             }
             RetryDecision::Abort => panic!(
-                "watchdog-shaped DeadlineExceeded must be retryable —                  #286 sub-item 3 regression"
+                "watchdog-tagged DeadlineExceeded MUST be retryable — \
+                 #286 sub-item 3 regression: the discriminator gate \
+                 must accept the watchdog detail"
             ),
         }
+    }
+
+    /// **#286 sub-item 3 fixup over-action (red-team P1):** a BARE
+    /// `Code::DeadlineExceeded` (no `WatchdogTimeoutSignal` detail)
+    /// MUST classify as `Abort`. This is the load-bearing red-team
+    /// finding: without the discriminator gate, every
+    /// `DeadlineExceeded` looks the same to the client, and a future
+    /// blanket `tonic::Request::set_timeout` (a single-line config
+    /// change anywhere in the call graph) would silently inherit the
+    /// retry behavior intended only for the server-side watchdog —
+    /// recreating the #203 OOM-cascade shape (slow-tier transient →
+    /// upstream stall → per-chunk timeout → retry storm → in-flight
+    /// growth → SIGKILL) at fleet scale.
+    ///
+    /// **Mutation step (run at fixup authorship):** drop the
+    /// `&& error_has_watchdog_timeout_signal(err)` clause from the
+    /// gate. Bare-DeadlineExceeded then classifies as Retry; this
+    /// test red-fails with the bespoke `"bare DeadlineExceeded MUST
+    /// classify as Abort"` message.
+    #[nativelink_test]
+    async fn classify_bare_deadline_exceeded_is_abort() {
+        let err = make_err!(
+            Code::DeadlineExceeded,
+            "per-chunk pwrite timeout (chunked_driver.rs)"
+        );
+        assert!(
+            matches!(classify_retryable(&err), RetryDecision::Abort),
+            "bare DeadlineExceeded (no WatchdogTimeoutSignal detail) MUST \
+             classify as Abort — without this gate, future per-RPC \
+             tonic::Request::set_timeout deadlines and the chunked-driver \
+             per-pwrite/e2e SHA timeouts would silently inherit the \
+             watchdog retry behavior, recreating the #203 OOM-cascade \
+             shape (red-team P1 finding for #286)"
+        );
+    }
+
+    /// **#286 sub-item 3 fixup over-action (testing-czar MAJOR-2(b)):**
+    /// classify_retryable must NOT retry on
+    /// `Code::FailedPrecondition` when no detail is attached. The new
+    /// DeadlineExceeded discriminator arm sits BEFORE the `has_signal`
+    /// early-return; without this regression test, a future refactor
+    /// that promotes the wildcard could silently make all errors
+    /// retryable, hiding genuine "give up" signals.
+    #[nativelink_test]
+    async fn classify_failed_precondition_no_detail_is_abort() {
+        let err = make_err!(
+            Code::FailedPrecondition,
+            "missing input precondition (e.g. blob not found)"
+        );
+        assert!(
+            matches!(classify_retryable(&err), RetryDecision::Abort),
+            "FailedPrecondition (no detail) MUST classify as Abort — \
+             FailedPrecondition is a permanent caller error, retrying \
+             would mask the real bug. This test guards the scope of \
+             the new DeadlineExceeded arm: the discriminator gate \
+             must NOT degrade the existing default-Abort behavior \
+             for unrelated codes."
+        );
     }
 }

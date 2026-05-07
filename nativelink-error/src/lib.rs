@@ -319,6 +319,32 @@ impl Error {
             details: vec![detail],
         }
     }
+
+    /// Construct a `Code::DeadlineExceeded` error carrying an arbitrary
+    /// `prost_types::Any` detail. #286 fixup (red-team
+    /// `283-watchdog-8090162d` P1, code-reviewer MAJOR): the chunked
+    /// commit watchdog (`run_async_commit_reaper`) synthesises this
+    /// shape carrying a `WatchdogTimeoutSignal` detail (see
+    /// `nativelink-store::chunked_signal`). The chunked client's
+    /// `classify_retryable` predicate gates its `DeadlineExceeded →
+    /// Retry` arm on the presence of the discriminator detail, so a
+    /// future caller that sets a per-RPC tonic deadline (which would
+    /// surface as bare `DeadlineExceeded` with no detail) cannot
+    /// silently inherit the retry behavior intended only for the
+    /// server-side watchdog. Mirrors the `BackpressureSignal` pattern
+    /// established in #212 Phase 2 — wide-net retries without a
+    /// discriminator detail are how #203-shape OOM cascades start.
+    #[must_use]
+    pub fn deadline_exceeded_with_detail(
+        msg: impl Into<String>,
+        detail: prost_types::Any,
+    ) -> Self {
+        Self {
+            code: Code::DeadlineExceeded,
+            messages: vec![msg.into()],
+            details: vec![detail],
+        }
+    }
 }
 
 impl core::error::Error for Error {}

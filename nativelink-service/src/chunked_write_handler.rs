@@ -75,7 +75,7 @@ use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent, publish,
 };
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    WriteChunk, WriteChunkedResponse, backpressure_signal,
+    WriteChunk, WriteChunkedResponse, backpressure_signal, watchdog_timeout_signal,
 };
 use nativelink_store::chunked::CHUNK_SIZE;
 use nativelink_store::chunked::chunk_budget::ChunkBudget;
@@ -83,7 +83,9 @@ use nativelink_store::chunked::chunked_driver::{
     ChunkWork, ChunkedCommitResult, ChunkedDriver, PER_BLOB_MPSC_CAP,
 };
 use nativelink_store::chunked::pin_budget::{PinBudget, pin_budget_singleton};
-use nativelink_store::chunked_signal::encode_backpressure_signal_any;
+use nativelink_store::chunked_signal::{
+    encode_backpressure_signal_any, encode_watchdog_timeout_signal_any,
+};
 use nativelink_store::filesystem_store::{FileEntry, FileEntryImpl, FilesystemStore};
 use nativelink_util::buf_channel::DropCloserReadHalf;
 use nativelink_util::common::DigestInfo;
@@ -1202,12 +1204,28 @@ const DISCARD_PARTIAL_TIMEOUT: core::time::Duration = core::time::Duration::from
 /// failure OR admission failure) so the on-disk partial is discarded
 /// promptly instead of waiting for next-startup `prune_temp_path`.
 ///
-/// Without this, sustained client-disconnect storms (network flap,
-/// cancellation cascades) would accumulate `<digest>.partial` files
-/// on disk AND keep `chunked_partials` map entries alive (the
-/// per-blob `ChunkInProgress` entry holds the file fd until the map
-/// entry is removed). The accumulation degrades the
-/// `chunk_budget_used_bytes` Q4 budget monotonically until restart.
+/// **Scope (#286 fixup d-s-r MINOR-1):** unlinks the in-flight
+/// `<digest>.partial` file under `temp_path` IFF the driver is
+/// still pre-stage-1 (i.e. has not yet renamed `.partial` →
+/// `.holding`). `FilesystemStore::discard_chunked` checks the
+/// in-process `chunked_partials` map: if the entry is present, the
+/// `.partial` file is unlinked synchronously; if absent (the driver
+/// already advanced past stage 1), the call returns Ok without
+/// touching disk. In the second case the `.holding` file persists
+/// in `content_path` until the next `FilesystemStore::new` startup
+/// sweep (`prune_holding_partials`). The handler does NOT attempt
+/// to unlink `.holding` itself — the driver owns the rename, and a
+/// race between the driver's post-rename SHA verify and a handler
+/// unlink would surface as a spurious mid-verify ENOENT instead of
+/// a clean discard.
+///
+/// Without this best-effort GC, sustained client-disconnect storms
+/// (network flap, cancellation cascades) would accumulate
+/// `<digest>.partial` files on disk AND keep `chunked_partials` map
+/// entries alive (the per-blob `ChunkInProgress` entry holds the
+/// file fd until the map entry is removed). The accumulation
+/// degrades the `chunk_budget_used_bytes` Q4 budget monotonically
+/// until restart.
 ///
 /// Best-effort: discard errors are logged at `warn!` and ignored.
 /// The original upstream error is what surfaces to the producer.
@@ -1642,25 +1660,47 @@ pub async fn run_async_commit_reaper<Fe: FileEntry>(
             metrics
                 .commit_watchdog_fires_total
                 .fetch_add(1, Ordering::Relaxed);
-            // #286 sub-item 1 (red-team finding P3): actively unlink the
-            // abandoned `.holding` partial BEFORE the local driver Arc
-            // drops. Without this, the JoinHandleDropGuard aborts the
-            // driver mid-pwrite (cooperative-only; the in-flight
-            // syscall completes if the kernel is unwedged) but the
-            // `.holding` file persists until the next
-            // `FilesystemStore::new` startup sweep — the gap
-            // red-team finding P3 flagged for sustained-bursty-slow-
-            // tier scenarios. Bounded by `DISCARD_PARTIAL_TIMEOUT=5s`
-            // so a wedged slow tier can't hang the reaper here either;
-            // on timeout the partial defers to the startup sweep
-            // (pre-fix behavior) but the reaper still completes the
-            // bookkeeping below.
+            // #286 sub-item 1 (red-team finding P3, #286 fixup
+            // d-s-r MINOR-1 doc correction): unlink the in-flight
+            // `<digest>.partial` if the driver is still pre-stage-1
+            // (writing chunks). `discard_partial_best_effort` calls
+            // `FilesystemStore::discard_chunked`, which removes the
+            // entry from the in-flight `chunked_partials` map and
+            // unlinks the `.partial` file under `temp_path` — this
+            // is the file the driver is actively writing chunks
+            // into. If the driver has already advanced past stage
+            // 1 (renamed `.partial` → `.holding`), `discard_chunked`
+            // observes no map entry and returns Ok; the `.holding`
+            // file under `content_path` then defers to the next
+            // `FilesystemStore::new` startup sweep
+            // (`prune_holding_partials`). The handler does NOT
+            // attempt to unlink `.holding` here because the driver
+            // owns the rename and a race between the driver's
+            // post-rename SHA verify and a handler unlink would
+            // surface as a SHA-mismatch instead of a clean discard.
+            // Bounded by `DISCARD_PARTIAL_TIMEOUT=5s` so a wedged
+            // slow tier can't hang the reaper either.
             discard_partial_best_effort(&filesystem_store, &stream_digest).await;
-            Err(make_err!(
-                Code::DeadlineExceeded,
-                "chunked commit await_completion exceeded \
-                 {CHUNKED_COMMIT_WATCHDOG_SECS}s watchdog deadline; \
-                 slow tier may be wedged"
+            // #286 sub-item 3 (red-team P1): attach the
+            // `WatchdogTimeoutSignal` discriminator so the chunked
+            // client's `classify_retryable` can gate its
+            // `DeadlineExceeded → Retry` arm on the discriminator's
+            // presence. Without this, ANY `DeadlineExceeded` —
+            // including a future per-RPC `tonic::Request::set_timeout`
+            // — would inherit the retry intended only for the
+            // server-side watchdog. Mirrors the `BackpressureSignal`
+            // pattern: type_url is the load-bearing wire contract.
+            let detail = encode_watchdog_timeout_signal_any(
+                watchdog_timeout_signal::Reason::ChunkedCommitWatchdog,
+                CHUNKED_COMMIT_WATCHDOG_SECS,
+            );
+            Err(Error::deadline_exceeded_with_detail(
+                format!(
+                    "chunked commit await_completion exceeded \
+                     {CHUNKED_COMMIT_WATCHDOG_SECS}s watchdog deadline; \
+                     slow tier may be wedged"
+                ),
+                detail,
             ))
         }
     };

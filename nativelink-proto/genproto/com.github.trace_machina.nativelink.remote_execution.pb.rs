@@ -802,6 +802,71 @@ pub mod backpressure_signal {
 /// load-bearing classifier interaction.
 pub const BACKPRESSURE_SIGNAL_TYPE_URL: &str =
     "type.googleapis.com/com.github.trace_machina.nativelink.remote_execution.BackpressureSignal";
+/// #286 sub-item 3 (red-team P1): wire-stable detail attached to
+/// `Code::DeadlineExceeded` errors synthesised by the chunked-commit
+/// watchdog. Gates the chunked client's `DeadlineExceeded → Retry`
+/// arm so a future blanket `tonic::Request::set_timeout` cannot
+/// silently inherit the retry behavior intended only for the
+/// server-side watchdog.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct WatchdogTimeoutSignal {
+    #[prost(enumeration = "watchdog_timeout_signal::Reason", tag = "1")]
+    pub reason: i32,
+    /// / Watchdog deadline that fired, in seconds. Informational only.
+    #[prost(uint64, tag = "2")]
+    pub watchdog_secs: u64,
+}
+/// Nested message and enum types in `WatchdogTimeoutSignal`.
+pub mod watchdog_timeout_signal {
+    #[derive(
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration
+    )]
+    #[repr(i32)]
+    pub enum Reason {
+        Unspecified = 0,
+        /// / Server-side `run_async_commit_reaper` watchdog fired:
+        /// / `await_completion()` exceeded `CHUNKED_COMMIT_WATCHDOG_SECS`.
+        /// / Client treats as a transient slow-tier wedge and retries
+        /// / the WHOLE blob from byte 0 inside the existing 3-attempt
+        /// / loop.
+        ChunkedCommitWatchdog = 1,
+    }
+    impl Reason {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "REASON_UNSPECIFIED",
+                Self::ChunkedCommitWatchdog => "CHUNKED_COMMIT_WATCHDOG",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "REASON_UNSPECIFIED" => Some(Self::Unspecified),
+                "CHUNKED_COMMIT_WATCHDOG" => Some(Self::ChunkedCommitWatchdog),
+                _ => None,
+            }
+        }
+    }
+}
+/// `WatchdogTimeoutSignal` proto type URL for `prost_types::Any.type_url`.
+/// Centralized constant so the encoder (`nativelink-service` watchdog)
+/// and decoder (`classify_retryable` in chunked_client.rs) agree on
+/// the exact wire string. The discriminator is the load-bearing gate
+/// for the `DeadlineExceeded → Retry` arm.
+pub const WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL: &str =
+    "type.googleapis.com/com.github.trace_machina.nativelink.remote_execution.WatchdogTimeoutSignal";
 /// / #212 Phase 2.2: one chunk of a `WriteChunked` client-streaming
 /// / upload. See worker_api.proto for the full schema documentation.
 #[derive(Clone, PartialEq, ::prost::Message)]

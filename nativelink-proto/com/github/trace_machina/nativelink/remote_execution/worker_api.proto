@@ -756,6 +756,40 @@ message BackpressureSignal {
     uint64 retry_after_ms = 2;
 }
 
+/// #286 sub-item 3 (red-team finding `283-watchdog-8090162d` P1): a
+/// wire-stable detail attached to a `Code::DeadlineExceeded` error
+/// synthesised by the chunked-commit watchdog
+/// (`run_async_commit_reaper` in `chunked_write_handler.rs`) so the
+/// chunked client's `classify_retryable` predicate can distinguish
+/// the "transient slow-tier wedge" Err (retryable inside the 3-attempt
+/// loop) from a future per-RPC tonic deadline (NOT retryable as a
+/// fresh full-blob attempt).
+///
+/// Wire stability: the `type_url` is the load-bearing classifier
+/// contract; field tags AND the `Reason` enum values are CONTRACTUAL
+/// once a release emits this proto. Changes are additive only.
+///
+/// The discriminator gates a CIRCUIT-BREAKER decision (red-team P1):
+/// without it, every `DeadlineExceeded` looks the same to the client,
+/// and a future blanket `tonic::Request::set_timeout` (a single-line
+/// config change anywhere in the call graph) would silently re-purpose
+/// this retry arm into the #203-shape OOM-cascade pattern.
+message WatchdogTimeoutSignal {
+    enum Reason {
+        REASON_UNSPECIFIED = 0;
+        /// Server-side `run_async_commit_reaper` watchdog fired —
+        /// `await_completion()` exceeded `CHUNKED_COMMIT_WATCHDOG_SECS`
+        /// without resolving. Treated by the client as a transient
+        /// slow-tier wedge (retry the WHOLE blob from byte 0 inside
+        /// the existing 3-attempt loop).
+        CHUNKED_COMMIT_WATCHDOG = 1;
+    }
+    Reason reason = 1;
+    /// Watchdog deadline that fired, in seconds (informational only;
+    /// the client does NOT use this to set its own retry-after).
+    uint64 watchdog_secs = 2;
+}
+
 /// #212 Phase 2.2: one chunk of a `WriteChunked` client-streaming
 /// upload. The first message identifies the blob via `digest`; every
 /// subsequent message in the stream MUST carry the SAME `digest` (the
