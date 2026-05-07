@@ -255,15 +255,17 @@ impl AcProxyStore {
 
     /// Iterate registered endpoints, returning every worker that has
     /// advertised `digest` in its AC pin set under any `store_id`.
-    /// Per call: one read-lock-and-clone of the endpoint name list
-    /// (`endpoint_counts` retains its keys for iteration) plus one
-    /// `endpoint_holds_digest` per endpoint (single read-lock + linear
-    /// scan, zero allocation). Pre-#277-fixup this used
+    /// Per call: `endpoint_counts()` clones the endpoint-name HashMap
+    /// (one `String` clone per registered worker — ~10 entries at
+    /// production scale, ~0.5 KiB) plus one `endpoint_holds_digest`
+    /// per endpoint (single read-lock + linear scan, zero
+    /// allocation). The previous implementation called
     /// `snapshot_endpoint` per endpoint, which allocated a
-    /// `Vec<(Arc<str>, DigestInfo)>` of every pin and sorted it; that
-    /// path produced ~1M Arc bumps + sort per AC NotFound under the
-    /// production fleet (~10 workers × ~100K pins). Now: zero
-    /// allocations beyond the result Vec.
+    /// `Vec<(Arc<str>, DigestInfo)>` of every pin and sorted it —
+    /// producing ~1M Arc bumps + sort per AC NotFound at production
+    /// scale. The current path is ~3 orders of magnitude cheaper.
+    /// A future key-only `endpoint_names()` accessor would skip the
+    /// HashMap clone entirely.
     fn endpoints_holding(&self, digest: &DigestInfo) -> Vec<Arc<str>> {
         let counts = self.registry.endpoint_counts();
         let mut hits: Vec<Arc<str>> = Vec::with_capacity(counts.len());

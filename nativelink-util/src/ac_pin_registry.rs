@@ -63,13 +63,6 @@ type EndpointAcPins = HashSet<(Arc<str>, DigestInfo)>;
 /// matches the worker fast-tier capacity ceiling (100K AC entries per
 /// worker × ~10 workers ⇒ ~1M tuples server-wide), which is also the
 /// natural drain point for the BIS-based pin lifecycle.
-/// Callback fired adjacent to [`AcPinRegistry::wipe_endpoint`] so
-/// auxiliary per-endpoint state (e.g. `AcProxyStore::worker_connections`)
-/// can be cleaned up without coupling the consumer of the registry to
-/// every wipe call site. Receives the endpoint string that was just
-/// wiped. Must NOT block on locks held by the registry itself.
-pub type EndpointWipeCallback = Arc<dyn Fn(&str) + Send + Sync>;
-
 pub struct AcPinRegistry {
     /// Per-endpoint AC pin sets.
     ///
@@ -114,6 +107,19 @@ impl core::fmt::Debug for AcPinRegistry {
             .finish()
     }
 }
+
+/// Callback fired adjacent to [`AcPinRegistry::wipe_endpoint`] so
+/// auxiliary per-endpoint state (e.g. `AcProxyStore::worker_connections`)
+/// can be cleaned up without coupling the consumer of the registry to
+/// every wipe call site. Receives the endpoint string that was just
+/// wiped.
+///
+/// Re-entrance: `wipe_endpoint` snapshots and releases all of its own
+/// locks before firing callbacks, so a callback MAY call back into the
+/// registry (read or write). The constraint is only on locks the
+/// callback itself owns elsewhere — keep callback bodies short and do
+/// NOT take other contended locks.
+pub type EndpointWipeCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Minimum interval between `warn!`-level cap-exceeded messages for
 /// the SAME endpoint. Drops between warns are counted and reported in
