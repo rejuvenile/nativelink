@@ -3826,3 +3826,443 @@ async fn ac_pin_snapshot_empty_when_no_ac_pins() -> Result<(), Error> {
     );
     Ok(())
 }
+
+// =============================================================================
+// #284 part 2: warn-and-continue on cache-tee at-cap (regression tests).
+//
+// Root cause covered: when the fast tier (MemoryStore at-cap) rejects the
+// populator's `fast_store.update` mid-stream with
+// `Code::ResourceExhausted` + `BackpressureSignal::MemoryStoreAtCapacity`,
+// the producer historically poisoned the streaming buffer's terminal
+// state via `streaming_writer.send_error`, so any consumer reading from
+// the streaming buffer saw a mid-stream Err. WorkerProxyStore's
+// bytes-written-then-erred branch then aborted the consumer stream with
+// "cannot peer-fetch without corrupting consumer stream", surfacing to
+// Bazel as a digest-mismatch or RESOURCE_EXHAUSTED. This caused the
+// 2026-05-06 read cascade abort.
+//
+// The fix in `fast_slow_store::run_producer` splits the streaming-writer
+// terminal state from the populator-caller's `returned`: when the
+// cache-tee was disabled mid-stream AND the fast-tier failure carries an
+// at-cap discriminator, the streaming buffer terminates with EOF
+// (consumer reads cleanly) while the populator caller still gets the
+// Err so `copy_slow_to_fast` knows the populate did not land.
+//
+// Asymmetric coverage (CLAUDE.md mandatory practice):
+// - Under-action (positive case): on at-cap mid-stream, the consumer
+//   MUST receive ALL bytes from slow tier — the populator MUST NOT
+//   poison the streaming buffer.
+// - Over-action (negative case): on fast-tier success, the populator
+//   MUST still surface fast-tier writes correctly (no false positives
+//   that demote a real error into a silent success).
+// =============================================================================
+
+/// **Under-action (the bug fix).** Production composition: real
+/// `FastSlowStore` with a MemoryStore fast tier (capped + emit-
+/// backpressure ON, so any incoming write rejects with
+/// `MemoryStoreAtCapacity`) wrapped around a `GatedSlowStore` that
+/// delivers the bytes in two installments: chunk 0 immediately, then
+/// awaits a `release_eof` notify before sending EOF. The blob's
+/// declared size exceeds the fast tier's cap, so the producer's
+/// `fast_store.update` rejects upfront via `MemoryStore`'s `ExactSize`
+/// early-reject (`memory_store.rs:367-369`). The cache-tee
+/// `fast_tx.send` fails on the first chunk after
+/// `streaming_writer.send` already delivered chunk 0 to the
+/// streaming buffer.
+///
+/// Forcing the slow store to park between chunk 0 and EOF guarantees
+/// the consumer enters the **streaming reader path** (line 4562+ in
+/// `fast_slow_store.rs`) — NOT the terminal-Err recovery branch (line
+/// 4496-4535) which falls back to `slow_store.get_part` regardless of
+/// the populator's terminal state. The streaming reader path is where
+/// the bug actually fires: the consumer reads chunk 0 from the
+/// streaming buffer, then on the next `next_chunk()` observes the
+/// producer's terminal. Without the fix, that terminal is the at-cap
+/// Err and the consumer's `get_part_unchunked` returns Err. With the
+/// fix (the `cache_tee_at_cap` demotion in `streaming_terminal`), the
+/// terminal is Ok (EOF) and the consumer receives all bytes cleanly.
+///
+/// **Mutation step**: replace the `if cache_tee_at_cap` guard with
+/// `if false && cache_tee_at_cap` in `fast_slow_store::run_producer`'s
+/// `streaming_terminal`. The consumer's `get_part_unchunked` then
+/// returns Err mid-stream and the bespoke `.expect("populator must
+/// warn-and-continue on MemoryStore at-cap …")` red-fails. Verified
+/// 2026-05-06: with the mutation, the test fails with the bespoke
+/// message; without the mutation, it passes.
+#[cfg(feature = "chunked_fast_slow")]
+#[nativelink_test]
+async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream(
+) -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::{EvictionPolicy, FastSlowSpec, MemorySpec, StoreSpec};
+    use nativelink_util::buf_channel::DropCloserWriteHalf;
+    use nativelink_util::store_trait::Store;
+    use sha2::{Digest as _, Sha256};
+    use tokio::sync::Notify;
+
+    /// Slow store wrapper that gates between chunk 0 and EOF on a
+    /// notify. `has_with_results` defers to the inner. `get_part`
+    /// sends the first 1024 bytes then awaits `release_eof` before
+    /// sending the remaining bytes + EOF. Update is unused.
+    ///
+    /// This shape is what makes the test deterministic: the producer's
+    /// `data_stream_fut` parks on `slow_rx.recv()` after delivering
+    /// chunk 0 to the streaming buffer, giving the consumer a window
+    /// to enter the streaming-reader path AND read chunk 0 BEFORE the
+    /// producer's terminal arrives. Without the gate, the producer
+    /// could finish synchronously on a fast-enough runtime and the
+    /// consumer would hit the terminal-Err recovery branch instead of
+    /// the streaming-reader Err arm — masking the bug.
+    #[derive(MetricsComponent)]
+    struct GatedSlowStore {
+        inner: Arc<MemoryStore>,
+        chunk0_sent: Arc<Notify>,
+        release_eof: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl StoreDriver for GatedSlowStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .has_with_results(digests, results)
+                .await
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            digest: StoreKey<'_>,
+            reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .update(digest, reader, size_info)
+                .await
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            writer: &mut DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            // Pull the full payload from inner, slice off chunk 0
+            // (1 KiB), send it to the writer + signal, then await
+            // release before sending the remainder + EOF.
+            let full = Pin::new(self.inner.as_ref())
+                .get_part_unchunked(key, offset, length)
+                .await?;
+            let split_at = core::cmp::min(1024, full.len());
+            let chunk0 = full.slice(0..split_at);
+            let remainder = full.slice(split_at..);
+            writer
+                .send(chunk0)
+                .await
+                .err_tip(|| "GatedSlowStore: send chunk0 failed")?;
+            self.chunk0_sent.notify_waiters();
+            self.release_eof.notified().await;
+            if !remainder.is_empty() {
+                writer
+                    .send(remainder)
+                    .await
+                    .err_tip(|| "GatedSlowStore: send remainder failed")?;
+            }
+            writer.send_eof().err_tip(|| "GatedSlowStore: send_eof failed")?;
+            Ok(())
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+    }
+
+    default_health_status_indicator!(GatedSlowStore);
+
+    // Build a deterministic 4 KiB payload (4× the fast-tier cap so
+    // the ExactSize early-reject in MemoryStore::update fires for
+    // the cache-tee write). Using a sha2 hash matches the production
+    // VerifyStore wire format; the test uses the FSS directly without
+    // VerifyStore, but a real digest avoids any accidental special-
+    // casing on `is_zero_digest`.
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&hasher.finalize());
+    let digest = DigestInfo::new(hash_arr, payload.len() as u64);
+
+    // Inner slow tier: fresh MemoryStore with ample capacity; pre-load
+    // the payload so `GatedSlowStore` can deliver it in two
+    // installments.
+    let inner_slow = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 16 * 1024,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: false,
+    });
+    Pin::new(inner_slow.as_ref())
+        .update_oneshot(StoreKey::from(digest), Bytes::from(payload.clone()))
+        .await?;
+
+    let chunk0_sent = Arc::new(Notify::new());
+    let release_eof = Arc::new(Notify::new());
+    let gated_slow = Arc::new(GatedSlowStore {
+        inner: inner_slow,
+        chunk0_sent: Arc::clone(&chunk0_sent),
+        release_eof: Arc::clone(&release_eof),
+    });
+
+    // Fast tier: MemoryStore with 1 KiB cap + emit_backpressure ON.
+    // ExactSize(4096) > 1024 → MemoryStore::update returns
+    // ResourceExhausted+BackpressureSignal::MemoryStoreAtCapacity
+    // BEFORE pulling any chunk off `fast_rx`, which drops `fast_rx`
+    // and causes the populator's `fast_tx.send` to fail.
+    let fast_store_arc = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 1024,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: true,
+    });
+    fast_store_arc.enable_emit_backpressure();
+
+    let fss_arc = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        Store::new(fast_store_arc.clone()),
+        Store::new(gated_slow),
+    );
+    let fss_store = Store::new(fss_arc);
+
+    // Pre-register the chunk0_sent waiter so we can't miss the
+    // wake-up if the producer signals it before we await.
+    let chunk0_wait = chunk0_sent.notified();
+
+    // Spawn the consumer's get_part_unchunked. Without the spawn we
+    // cannot interleave the test's release_eof notify with the
+    // consumer's read (the consumer's future does not yield long
+    // enough for us to do anything between is_terminal=false and
+    // the streaming reader's first poll otherwise).
+    //
+    // Pass `length=None` (NOT Some(payload.len())) so the consumer's
+    // streaming reader awaits the producer's terminal state via
+    // `next_chunk()` AFTER receiving all bytes. Passing Some(N) where
+    // N == total bytes makes the consumer break the read loop on
+    // `pos >= end` BEFORE observing the terminal — masking both
+    // success (clean EOF) and the bug (Err on terminal). length=None
+    // forces the loop to keep polling next_chunk until EOF or Err,
+    // which is the path the bug fires through.
+    let consumer_handle = tokio::spawn({
+        let store = fss_store.clone();
+        async move {
+            store.get_part_unchunked(digest, 0, None).await
+        }
+    });
+
+    // Wait until the slow store has sent chunk 0 (proves the producer
+    // task has been scheduled and is now parked awaiting release_eof).
+    // The consumer task has either entered the streaming reader path
+    // already, or is about to: in either case the producer's terminal
+    // is NOT yet set, so when the consumer hits next_chunk after
+    // reading chunk 0 it MUST observe the post-release terminal state
+    // (the bug-firing path).
+    tokio::time::timeout(Duration::from_secs(5), chunk0_wait)
+        .await
+        .expect("must not deadlock — slow store should send chunk 0 promptly");
+
+    // Yield once to let the consumer's streaming reader pick up
+    // chunk 0 from the buffer before we release the producer's
+    // terminal. Without this yield the producer could race ahead and
+    // terminate before the consumer's first next_chunk runs, sending
+    // the test through the terminal-Err recovery branch instead of
+    // the streaming-reader Err arm (masking the bug).
+    tokio::task::yield_now().await;
+
+    // Release the slow store's EOF gate. The producer's data_stream_fut
+    // resumes, drains the remainder + EOF, returns Ok. The merge logic
+    // computes `cache_tee_at_cap=true` (cache_tee_disabled=true AND
+    // fast_res is ResourceExhausted+BackpressureSignal). With the fix,
+    // streaming_terminal=Ok → send_eof to consumer; without the fix,
+    // streaming_terminal=Err → send_error to consumer.
+    release_eof.notify_waiters();
+
+    // Collect the consumer's result. The 10s timeout is the deadlock
+    // detector — if any code path hangs, this surfaces with the bespoke
+    // message rather than a generic CI hang.
+    let bytes = tokio::time::timeout(Duration::from_secs(10), consumer_handle)
+        .await
+        .expect(
+            "must not deadlock — populator must warn-and-continue on MemoryStore at-cap; \
+             the streaming-writer terminal-state demotion (`cache_tee_at_cap` Ok branch) \
+             keeps the consumer's stream alive while fast-tier population is skipped",
+        )
+        .expect("consumer task must not panic")
+        .expect(
+            "populator must warn-and-continue on MemoryStore at-cap — must not abort \
+             consumer stream; consumer expects all 4096 bytes to flow through the \
+             streaming buffer with a clean EOF, not a poisoned ResourceExhausted",
+        );
+
+    assert_eq!(
+        bytes.len(),
+        payload.len(),
+        "consumer MUST receive ALL bytes via the streaming buffer (slow tier delivered \
+         every chunk); cache-tee at-cap MUST NOT truncate the consumer's read",
+    );
+    assert_eq!(
+        bytes.as_ref(),
+        payload.as_slice(),
+        "consumer bytes MUST equal the slow-tier payload byte-for-byte; the streaming \
+         buffer must forward slow-tier chunks unmodified after the cache-tee is disabled",
+    );
+
+    // Belt-and-suspenders: the fast tier MUST NOT contain the blob
+    // (cache-tee was correctly skipped). Without this check, a future
+    // regression that "magically populated" the fast tier (e.g., via
+    // a retry path that bypassed the kill-switch) would silently
+    // change the consumer-perceived correctness.
+    let fast_has = Pin::new(fast_store_arc.as_ref())
+        .has(StoreKey::from(digest))
+        .await?;
+    assert!(
+        fast_has.is_none(),
+        "fast tier MUST NOT contain the blob — cache-tee was disabled mid-stream by \
+         the at-cap rejection; got fast_has={fast_has:?}"
+    );
+
+    Ok(())
+}
+
+/// **Pre-stream / nothing-to-lose case.** When the slow tier itself
+/// returns NotFound (no bytes ever delivered to the streaming buffer),
+/// the consumer MUST receive a clean error rather than spuriously
+/// succeeding with empty bytes. This guards the over-action sibling
+/// of the warn-and-continue fix — the demotion of fast-tier Err to
+/// streaming-EOF must NOT trigger when there were never any bytes to
+/// begin with (the slow tier failed before any chunk reached the
+/// streaming buffer).
+///
+/// Setup: fast tier capped + emit-backpressure ON (so it would reject
+/// any incoming write); slow tier EMPTY (so `slow_store.has` returns
+/// None → producer's `head_result` is Err NotFound BEFORE the data
+/// stream even starts). The producer terminates with NotFound; the
+/// streaming buffer's terminal state is Err NotFound; the consumer's
+/// `get_part` enters the terminal-Err branch (line 4496-4500 in
+/// `fast_slow_store.rs`), falls through to slow_store fallback,
+/// re-issues `slow_store.get_part`, and surfaces NotFound to the
+/// caller. With the fix, this path is unchanged from legacy.
+///
+/// **Mutation step**: change `cache_tee_at_cap` to `true` (always-
+/// demote regardless of whether cache-tee was actually disabled). The
+/// streaming buffer would then EOF on a producer-NotFound, the
+/// consumer would re-read from slow tier (still empty), and the
+/// final result would be NotFound — same outcome. So this test is
+/// less mutation-sensitive; its real value is asserting that the
+/// cache-tee demotion does NOT spuriously succeed when no bytes were
+/// delivered (over-action of the demotion logic).
+#[cfg(feature = "chunked_fast_slow")]
+#[nativelink_test]
+async fn populate_at_capacity_pre_stream_returns_clean_error() -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::{EvictionPolicy, FastSlowSpec, MemorySpec, StoreSpec};
+    use nativelink_util::store_trait::Store;
+
+    // Same VALID_HASH constant defined at top of file.
+    let digest = DigestInfo::try_new(VALID_HASH, 1024)?;
+
+    // Slow tier: EMPTY MemoryStore with ample cap. `has(digest)` will
+    // return None → producer's `head_result` errors with NotFound
+    // before any byte hits the data stream.
+    let slow_store_arc = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 16 * 1024,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: false,
+    });
+
+    // Fast tier: cap-1KiB + emit_backpressure ON.
+    let fast_store_arc = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 1024,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: true,
+    });
+    fast_store_arc.enable_emit_backpressure();
+
+    let fss_arc = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        Store::new(fast_store_arc.clone()),
+        Store::new(slow_store_arc.clone()),
+    );
+    let fss_store = Store::new(fss_arc);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        fss_store.get_part_unchunked(digest, 0, Some(1024)),
+    )
+    .await
+    .expect(
+        "must not deadlock — empty slow tier must surface NotFound promptly; \
+         the cache-tee at-cap demotion MUST NOT mask a real upstream miss",
+    );
+
+    let err = result.expect_err(
+        "consumer MUST receive a clean error when slow tier has no bytes to deliver; \
+         the cache-tee demotion MUST NOT silently succeed with empty bytes (over-action \
+         of the at-cap warn-and-continue fix)",
+    );
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "expected NotFound from empty slow tier, got code={:?} messages={:?}",
+        err.code,
+        err.messages,
+    );
+
+    Ok(())
+}
