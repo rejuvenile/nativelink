@@ -31,6 +31,30 @@
 //!      the connection drops, the AC pin registry's per-endpoint
 //!      entry is cleared (sibling of the existing locality_map
 //!      wipe).
+//!   5. **Boot-epoch flip wipes AC registry on the registration path**
+//!      (under-action, sibling-of-#141): a worker that reconnects with
+//!      a different `boot_epoch_id` triggers a wipe at
+//!      `worker_api_server.rs:531` (the registration path), NOT only
+//!      at `:912` (the disconnect-cleanup path). Holds the OLD stream
+//!      alive across the reconnect to FORCE the wipe to come from
+//!      `:531` exclusively (test
+//!      `boot_epoch_different_wipes_ac_registry`).
+//!   6. **Boot-epoch flip wipe is endpoint-scoped** (over-action,
+//!      sibling-of-#141 in the opposite direction): a wipe of
+//!      endpoint A MUST NOT clear endpoint B's entries. Asserts B
+//!      survives FIRST, then A drained — so the over-action contract
+//!      is independently exercised under a "wipe ALL endpoints"
+//!      mutation, NOT masked by the under-action assertion firing
+//!      first under a "wipe missing" mutation (test
+//!      `boot_epoch_wipe_of_endpoint_a_does_not_clear_endpoint_b`).
+//!   7. **Boot-epoch wipe does not block re-population** (forward
+//!      progress): after a boot-epoch wipe, the new connection's
+//!      `BlobsAvailable` MUST repopulate the registry. Polls for the
+//!      specific post-wipe digest (NOT `len() == expected`, which
+//!      would be ambiguous when the stale entry has the same count)
+//!      so the predicate is unambiguous regardless of how fast the
+//!      wipe lands relative to the new tick (test
+//!      `boot_epoch_wipe_does_not_block_repopulation`).
 //!
 //! Production composition: real `WorkerApiServer`, real
 //! `ApiWorkerScheduler`, real `AcPinRegistry`, real
@@ -45,11 +69,20 @@
 //!     test 1 (`field_17_populates_ac_registry_only`) red-fails
 //!     with "must register AC pin".
 //!   * Replace the field-17 dispatch's `register_ac_pin(...)` with
-//!     `locality_map.register_blobs(...)` → test 3 (`field_17_does_not_touch_cas_locality_map`)
-//!     red-fails with "AC pin MUST NOT register in CAS locality map".
+//!     `locality_map.register_blobs(...)` → test 3
+//!     (`fields_16_and_17_remain_hard_partitioned`) red-fails with
+//!     "AC pin MUST NOT register in CAS locality map".
 //!   * Comment out the `ac_pin_registry.wipe_endpoint(...)` call on
 //!     disconnect → test 4 (`worker_disconnect_wipes_ac_registry`)
 //!     red-fails.
+//!   * Comment out the `ac_pin_registry.wipe_endpoint(...)` call at
+//!     the boot-epoch-flip site (`worker_api_server.rs:531`) → tests
+//!     5, 6 (under-action half), and 7 red-fail with bespoke
+//!     messages naming the contract.
+//!   * Replace the same call with a "wipe ALL endpoints" loop → only
+//!     test 6's over-action half red-fails with "MUST NOT clear B —
+//!     over-action: cross-endpoint wipe leaked", proving the over-
+//!     action contract is independently exercised.
 
 use core::time::Duration;
 use std::collections::HashMap;
@@ -859,7 +892,28 @@ async fn boot_epoch_wipe_of_endpoint_a_does_not_clear_endpoint_b()
     let (_tx_a2, _stream_a2) =
         open_ac_worker_connection(&ctx.worker_api_server, endpoint_a, 101).await?;
 
-    // A drains.
+    // Assert B SURVIVES first (over-action contract). Under the
+    // "wipe missing" mutation the under-action half also red-fails,
+    // so if we asserted A drained first the over-action half would
+    // never be reached and a future reader running only the
+    // wipe-missing mutation would incorrectly conclude this test
+    // is redundant with `boot_epoch_different_wipes_ac_registry`.
+    // Inverting the order makes BOTH halves independently exercise
+    // their respective contracts under their own mutations.
+    let snap_b = ctx
+        .ac_pin_registry
+        .snapshot_endpoint(endpoint_b)
+        .expect(
+            "boot-epoch wipe of A MUST NOT clear B — over-action: cross-endpoint wipe leaked",
+        );
+    assert_eq!(
+        snap_b.len(),
+        1,
+        "boot-epoch wipe of A MUST NOT clear B — over-action: cross-endpoint wipe leaked",
+    );
+    assert_eq!(snap_b[0].1, db1);
+
+    // Now assert A drains (under-action contract).
     let registry_for_a = ctx.ac_pin_registry.clone();
     let endpoint_a_owned = endpoint_a.to_string();
     let drain_a = tokio::time::timeout(Duration::from_secs(5), async move {
@@ -875,20 +929,6 @@ async fn boot_epoch_wipe_of_endpoint_a_does_not_clear_endpoint_b()
         "boot-epoch wipe of A MUST clear A's AC pin entries — under-action half",
     );
 
-    // B survives — over-action assertion.
-    let snap_b = ctx
-        .ac_pin_registry
-        .snapshot_endpoint(endpoint_b)
-        .expect(
-            "boot-epoch wipe of A MUST NOT clear B — over-action: cross-endpoint wipe leaked",
-        );
-    assert_eq!(
-        snap_b.len(),
-        1,
-        "boot-epoch wipe of A MUST NOT clear B — over-action: cross-endpoint wipe leaked",
-    );
-    assert_eq!(snap_b[0].1, db1);
-
     drop(tx_a1);
     drop(stream_a1);
     drop(tx_b1);
@@ -900,13 +940,34 @@ async fn boot_epoch_wipe_of_endpoint_a_does_not_clear_endpoint_b()
 /// from the new connection MUST re-populate the registry. Confirms
 /// the wipe didn't break the registration path (e.g. by leaving a
 /// stale `endpoint_state` row that blocks future inserts).
+///
+/// Mechanic: hold tx1/stream1 alive across the reconnect (mirroring
+/// tests #1 and #2) so the disconnect cleanup path at
+/// `worker_api_server.rs:912` does NOT race with the registration-path
+/// wipe at `:531`. If we dropped tx1/stream1 first, the disconnect
+/// cleanup could `state.remove(&endpoint)` before reconnect runs,
+/// leaving `prev = None` and `needs_wipe = false`, so `:531` would
+/// NOT fire — and commenting out `:531` would still leave the test
+/// green via that path. Holding the OLD stream alive forces the wipe
+/// to come from `:531`'s registration path exclusively.
+///
+/// Polling predicate: poll for the d_new digest's PRESENCE rather
+/// than `len() == 1`. With the OLD stream alive the registry holds
+/// d_old (len=1) until the wipe fires; under the wipe-missing
+/// mutation the registry would still hold d_old=1 while the new
+/// d_new tick is in flight, and a `len() == 1` predicate would
+/// silently exit with `snap = [d_old]` and pass the test on a
+/// truthy-but-stale state. Polling for `d_new` specifically keeps
+/// the predicate unambiguous.
 #[nativelink_test]
 async fn boot_epoch_wipe_does_not_block_repopulation()
 -> Result<(), Box<dyn core::error::Error>> {
     let cas_endpoint = "grpc://192.168.1.43:50081";
     let ctx = setup_multi_connect_ac().await?;
 
-    // First boot.
+    // First boot — keep tx1 / stream1 alive across the reconnect so
+    // the disconnect cleanup at :912 cannot race the registration
+    // wipe at :531.
     let (tx1, stream1) =
         open_ac_worker_connection(&ctx.worker_api_server, cas_endpoint, 1).await?;
     let d_old = DigestInfo::new([0xF1u8; 32], 9);
@@ -917,28 +978,50 @@ async fn boot_epoch_wipe_does_not_block_repopulation()
         vec![ac_entry(d_old, AC_STORE_NAME)],
     )
     .await?;
-    drop(tx1);
-    drop(stream1);
 
-    // Reconnect with new boot_epoch — wipe should occur on registration.
+    // Reconnect with new boot_epoch — wipe MUST come from the
+    // registration path because tx1 / stream1 are still alive.
     let (tx2, _stream2) =
         open_ac_worker_connection(&ctx.worker_api_server, cas_endpoint, 2).await?;
 
-    // After wipe, send fresh AC entries and assert they take.
+    // After wipe, send fresh AC entry on tx2 and assert it takes.
+    // Send directly (not via send_ac_blobs_and_wait, which polls on
+    // len()-equality and would prematurely match the stale d_old).
     let d_new = DigestInfo::new([0xF2u8; 32], 9);
-    send_ac_blobs_and_wait(
-        &tx2,
-        &ctx.ac_pin_registry,
-        cas_endpoint,
-        vec![ac_entry(d_new, AC_STORE_NAME)],
-    )
-    .await?;
+    let mut notification = empty_ba(cas_endpoint);
+    notification.pinned_ac_mirror_entries = vec![ac_entry(d_new, AC_STORE_NAME)];
+    tx2.send(Update::BlobsAvailable(notification))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "send blobs available: {e}"))?;
 
-    let snap = ctx
-        .ac_pin_registry
-        .snapshot_endpoint(cas_endpoint)
-        .expect("post-wipe re-registration MUST repopulate the registry");
-    assert_eq!(snap.len(), 1);
-    assert_eq!(snap[0].1, d_new, "stale (pre-wipe) digest leaked through wipe");
+    // Poll for d_new specifically (NOT len() == 1, which would match
+    // the stale d_old before the wipe lands).
+    let registry = ctx.ac_pin_registry.clone();
+    let endpoint = cas_endpoint.to_string();
+    let snap = await_until(
+        "post-wipe re-registration MUST repopulate the registry with d_new",
+        move || {
+            let snap = registry.snapshot_endpoint(&endpoint)?;
+            if snap.iter().any(|(_, d)| *d == d_new) {
+                Some(snap)
+            } else {
+                None
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(
+        snap.len(),
+        1,
+        "post-wipe registry MUST hold ONLY d_new — stale (pre-wipe) digest leaked through wipe",
+    );
+    assert_eq!(
+        snap[0].1, d_new,
+        "post-wipe registry MUST hold d_new — stale (pre-wipe) digest leaked through wipe",
+    );
+
+    drop(tx1);
+    drop(stream1);
     Ok(())
 }
