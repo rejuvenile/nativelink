@@ -457,8 +457,34 @@ enum RetryDecision {
 ///   the hint.
 /// - `Code::ResourceExhausted` carrying a `BackpressureSignal`
 ///   (global budget OR per-blob mpsc full) → retry after the hint.
+/// - `Code::DeadlineExceeded` (no detail required) → retry after a
+///   small fallback backoff. #286 sub-item 3 (red-team finding
+///   `283-watchdog-8090162d` P2 falsified): the server-side chunked
+///   commit watchdog (`chunked_write_handler::run_async_commit_reaper`,
+///   `CHUNKED_COMMIT_WATCHDOG_SECS=60`) synthesises a bare
+///   `make_err!(Code::DeadlineExceeded, ...)` with no
+///   `BackpressureSignal` detail when the slow tier wedges. Without
+///   this arm, the chunked client surfaces straight to the caller
+///   without per-attempt retry — the watchdog sees a transient
+///   slow-tier stall and the client doesn't retry it inside its own
+///   3-attempt loop the way Aborted/ResourceExhausted are. Treating
+///   DeadlineExceeded as retryable closes that gap. The retry-after
+///   hint defaults to the `decode_retry_after` fallback (50 ms; the
+///   server doesn't attach a hint here) capped at `MAX_RETRY_AFTER`.
 /// - Anything else → abort.
 fn classify_retryable(err: &Error) -> RetryDecision {
+    // #286 sub-item 3: DeadlineExceeded is retryable independent of
+    // BackpressureSignal — the chunked watchdog (server-side) emits
+    // it WITHOUT a detail. Check this BEFORE the has_signal early-
+    // return so a missing detail doesn't down-grade the decision to
+    // Abort.
+    if err.code == Code::DeadlineExceeded {
+        let retry_after = decode_retry_after(err).min(MAX_RETRY_AFTER);
+        return RetryDecision::Retry {
+            reason: RetryReason::ResourceExhausted,
+            retry_after,
+        };
+    }
     let has_signal = error_has_backpressure_signal(err);
     if !has_signal {
         return RetryDecision::Abort;
