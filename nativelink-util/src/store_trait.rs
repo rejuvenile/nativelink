@@ -1474,13 +1474,46 @@ pub trait StoreDriver:
     /// Re-insert digests into the failed-slow-writes set. Inverse of
     /// [`Self::drain_failed_digests`] for use by the server-side
     /// drain-then-dispatch loop (#287: server-side `failed_slow_writes`
-    /// drain → UploadMissingBlobs). Mirrors `drain_failed_digests`'s
-    /// delegation: passes through wrappers; the FastSlowStore Leaf
-    /// owns the set and overrides this with the actual insert.
+    /// drain → UploadMissingBlobs). The non-`Leaf` arms delegate
+    /// through the wrapper chain via [`Self::stable_delegation`]; the
+    /// `Leaf` arm is loud about the contract gap.
+    ///
+    /// **`Leaf` stores that own a `failed_slow_writes` set MUST
+    /// override.** Per the Charter dead-letter rule (mirror of
+    /// `19a11ee9` for `broadcast_blobs_in_stable_storage_chunked`):
+    /// silently dropping digests at the `Leaf` boundary is exactly
+    /// the regression #287 was filed to fix. The default `Leaf` arm
+    /// therefore `debug_assert!`s that input is empty — surfacing the
+    /// contract gap loudly in tests / debug builds rather than
+    /// letting the digest vanish into a dead-letter set. Production
+    /// release builds preserve the silent-drop fallback (per
+    /// CLAUDE.md "never panic in library code") so an unforeseen
+    /// edge case can't take the server down.
+    ///
+    /// `Leaf` stores that do NOT own a `failed_slow_writes` set are
+    /// safe under the default: their `drain_failed_digests` returns
+    /// `Vec::new()`, so the wrapper traversal of
+    /// `reinsert_failed_digests` never reaches them with non-empty
+    /// input. The `debug_assert!` short-circuit lets benign callers
+    /// (e.g. callers that drain → re-insert when 0 digests came out)
+    /// traverse the chain without noise.
+    ///
+    /// Today only [`FastSlowStore`](crate::fast_slow_store) declares
+    /// `Leaf` AND owns the set, and it overrides this method. Future
+    /// `Leaf` stores that grow such a set MUST add their own
+    /// override; the `debug_assert!` will fire the first time the
+    /// drain-then-dispatch path delivers digests to them in any
+    /// non-release test run, surfacing the gap before it ships.
     fn reinsert_failed_digests(&self, digests: &[DigestInfo]) {
         match self.stable_delegation() {
             StableDigestDelegation::Leaf => {
-                let _ = digests;
+                debug_assert!(
+                    digests.is_empty(),
+                    "Leaf store inheriting default reinsert_failed_digests was \
+                     called with {} digests; this Leaf must override the method \
+                     (#287 dead-letter contract — see store_trait.rs doc)",
+                    digests.len()
+                );
             }
             StableDigestDelegation::Inner(s) | StableDigestDelegation::Passthrough(s) => {
                 s.reinsert_failed_digests(digests);
