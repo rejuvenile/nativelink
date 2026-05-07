@@ -1025,3 +1025,107 @@ async fn boot_epoch_wipe_does_not_block_repopulation()
     drop(stream1);
     Ok(())
 }
+
+/// Disconfirming test for the field-17 replace-snapshot contract:
+/// the server's per-endpoint AC pin set MUST be REPLACED on every
+/// `BlobsAvailable` advertisement, not additively merged. A worker
+/// that drops an AC entry from `dispatched_mirror_pins` between
+/// ticks (the failure-prune path or any other natural drain) MUST
+/// see that entry disappear from the registry on its NEXT tick
+/// without any explicit drain channel.
+///
+/// Mechanic: send a first `BlobsAvailable` with field 17 = [X1,
+/// X2, X3]; assert the registry holds {X1, X2, X3}. Send a second
+/// `BlobsAvailable` with field 17 = [X1, X3] (X2 dropped).
+/// Within a 5s `tokio::time::timeout`, assert the registry holds
+/// EXACTLY {X1, X3} — NOT {X1, X2, X3}. Bespoke message names
+/// the contract.
+///
+/// This test red-fails today if the field-17 handler is reverted
+/// to per-element `register_ac_pin` (additive insert):
+///   * Mutation: in `worker_api_server.rs`, switch the field-17
+///     handler back to a `for entry in ... { register_ac_pin(...) }`
+///     loop. The test red-fails with the bespoke "field-17 MUST
+///     be replace-snapshot, not additive — stale entries leaked
+///     across ticks" message.
+///
+/// Red-team Q7's specific ask: "If this test were added and run,
+/// it would red-fail today, which is exactly the signal the
+/// documentation is trying to occlude." This commit adds the
+/// test AFTER landing the replace-snapshot implementation, so it
+/// passes today; reverting the implementation makes it bite.
+#[nativelink_test]
+async fn field_17_replaces_endpoint_snapshot_atomically()
+-> Result<(), Box<dyn core::error::Error>> {
+    let cas_endpoint = "grpc://192.168.1.50:50081";
+    let ctx = setup_with_ac_registry(cas_endpoint).await?;
+
+    let x1 = DigestInfo::new([0xA1u8; 32], 1);
+    let x2 = DigestInfo::new([0xA2u8; 32], 2);
+    let x3 = DigestInfo::new([0xA3u8; 32], 3);
+
+    // First advertisement: [X1, X2, X3].
+    let mut notification = empty_ba("");
+    notification.pinned_ac_mirror_entries = vec![
+        ac_entry(x1, AC_STORE_NAME),
+        ac_entry(x2, AC_STORE_NAME),
+        ac_entry(x3, AC_STORE_NAME),
+    ];
+    ctx.worker_stream
+        .send(Update::BlobsAvailable(notification))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "send: {e}"))?;
+
+    let registry = ctx.ac_pin_registry.clone();
+    let endpoint_owned = ctx.cas_endpoint.clone();
+    drop(
+        await_until("first advertisement landed", move || {
+            let snap = registry.snapshot_endpoint(&endpoint_owned)?;
+            if snap.len() == 3 { Some(snap) } else { None }
+        })
+        .await,
+    );
+
+    // Second advertisement: [X1, X3] — X2 dropped on the wire side.
+    // Under additive `register_ac_pin` semantics, X2 would survive
+    // (the registry would hold {X1, X2, X3}). Under replace-snapshot,
+    // X2 is gone immediately on this tick.
+    let mut notification = empty_ba("");
+    notification.pinned_ac_mirror_entries = vec![
+        ac_entry(x1, AC_STORE_NAME),
+        ac_entry(x3, AC_STORE_NAME),
+    ];
+    ctx.worker_stream
+        .send(Update::BlobsAvailable(notification))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "send: {e}"))?;
+
+    // Poll for the post-replace state: EXACTLY {X1, X3} — NOT
+    // {X1, X2, X3}. Polls on the full digest set so the predicate
+    // is unambiguous (we cannot rely on `len() == 2` alone — that
+    // would also match an unrelated transient state).
+    let registry = ctx.ac_pin_registry.clone();
+    let endpoint_owned = ctx.cas_endpoint.clone();
+    let result = tokio::time::timeout(Duration::from_secs(5), async move {
+        loop {
+            let snap = registry
+                .snapshot_endpoint(&endpoint_owned)
+                .unwrap_or_default();
+            let digests: std::collections::HashSet<_> =
+                snap.iter().map(|(_, d)| *d).collect();
+            let has_x1 = digests.contains(&x1);
+            let has_x2 = digests.contains(&x2);
+            let has_x3 = digests.contains(&x3);
+            if has_x1 && !has_x2 && has_x3 && snap.len() == 2 {
+                return ();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    result.expect(
+        "field-17 MUST be replace-snapshot, not additive — stale entries leaked across ticks",
+    );
+
+    Ok(())
+}
