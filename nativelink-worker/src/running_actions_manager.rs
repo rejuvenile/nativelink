@@ -4249,10 +4249,33 @@ impl UploadActionResults {
 
         let size_bytes = store_data.len() as u64;
         let start = std::time::Instant::now();
-        ac_store
+        let res = ac_store
             .update_oneshot(action_digest, store_data.split().freeze())
-            .await
-            .err_tip(|| "Caching ActionResult")?;
+            .await;
+        if let Err(err) = &res {
+            // Synchronous AC write failure (typically a fast-tier
+            // failure since slow-tier is async-spawned). Defensive
+            // failure-prune of the worker-local AC pin: in the
+            // common case the pin was NEVER inserted (insert is on
+            // the Ok path below), so this call is idempotent.
+            // Non-defensive case: a previous successful tick may
+            // have already pinned the same `(store_id, digest)`
+            // tuple, and the write here is a re-attempt that just
+            // failed — without the prune the worker would keep
+            // re-advertising a pin whose authoritative durability
+            // claim was just invalidated. Sibling of CAS's
+            // `failed_slow_writes`-on-Err arm in
+            // `fast_slow_store.rs:948` (chunked-dispatcher path).
+            if let Some(target) = self.ac_mirror_target.as_ref() {
+                target.fss.remove_local_ac_pin_on_failure(
+                    target.store_id.as_ref(),
+                    &action_digest,
+                );
+            }
+            // Continue with the original `?` propagation behavior so
+            // the err_tip context lands on the returned error.
+            return Err(err.clone()).err_tip(|| "Caching ActionResult");
+        }
         let elapsed = start.elapsed();
         info!(
             ?action_digest,
@@ -4273,9 +4296,9 @@ impl UploadActionResults {
         //
         // Cancellation safety: this insert runs ONLY on the success
         // path of `update_oneshot`. If the write returned Err above,
-        // the early `?` returns before we get here — no pin recorded
-        // for failed writes. If the future is dropped mid-update,
-        // tokio will not poll us to this point — also no pin recorded.
+        // the failure-prune fires (defense in depth) before the early
+        // return — no pin recorded for failed writes, AND any pin
+        // from a previous tick is removed.
         //
         // No-op when this worker's AC store is not a FastSlowStore
         // (e.g. direct GrpcStore — handled by the early-return

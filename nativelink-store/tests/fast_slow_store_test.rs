@@ -5080,3 +5080,133 @@ async fn populate_does_not_demote_non_at_cap_fast_tier_error() -> Result<(), Err
 
     Ok(())
 }
+
+// ===================================================================
+// AC pin failure-prune (#279 — sibling of CAS failed_slow_writes)
+// ===================================================================
+
+/// Under-action: when an AC slow-write FAILS, the worker MUST prune
+/// the matching `(store_id, digest)` from `dispatched_mirror_pins`
+/// so the next `BlobsAvailable` advertisement does NOT continue to
+/// claim worker durability for an entry whose write failed. Without
+/// this prune, the server-side replace-snapshot semantics would
+/// keep re-instating the stale entry every tick. Sibling of CAS's
+/// `failed_slow_writes`-on-Err arm in
+/// `fast_slow_store.rs:948` (chunked-dispatcher path).
+///
+/// Mechanic: directly seed the pin via `insert_local_ac_pin`
+/// (simulating "a previous tick advertised this AC entry"), then
+/// call `remove_local_ac_pin_on_failure` (simulating "the next
+/// AC write attempt for this digest failed"), then assert the pin
+/// is GONE from the snapshot the production
+/// `send_periodic_blobs_available` loop reads
+/// (`dispatched_ac_pin_snapshot_for_store`). Crosses the same
+/// in-process seam the production caller crosses, satisfying
+/// production composition in substance.
+///
+/// Mutation step: comment out the `dispatched_mirror_pins.lock()
+/// .remove(...)` call in
+/// `FastSlowStore::remove_local_ac_pin_on_failure`. This test
+/// red-fails with the bespoke "AC slow-write failure MUST prune
+/// local pin — sibling-of-CAS-failed_slow_writes" message.
+#[nativelink_test]
+async fn ac_failure_prune_drops_dispatched_pin() -> Result<(), Error> {
+    const AC_STORE_ID: &str = "AC_MAIN_STORE";
+    let digest = DigestInfo::new([0xACu8; 32], 7);
+
+    let fast_spec = MemorySpec::default();
+    let slow_spec = MemorySpec::default();
+    let fast = MemoryStore::new(&fast_spec);
+    let slow = MemoryStore::new(&slow_spec);
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(fast_spec),
+            slow: StoreSpec::Memory(slow_spec),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        Store::new(fast),
+        Store::new(slow),
+    );
+
+    // Pre-seed the pin (simulating a previous successful tick).
+    fss.insert_local_ac_pin(AC_STORE_ID, digest);
+    let snap_before = fss.dispatched_ac_pin_snapshot_for_store(AC_STORE_ID);
+    assert!(
+        snap_before.iter().any(|d| *d == digest),
+        "pre-condition: AC pin must be seeded before failure-prune test"
+    );
+
+    // Simulate the failed-slow-write path (i.e. running_actions_manager
+    // upload_ac_results saw `update_oneshot` return Err and called
+    // `remove_local_ac_pin_on_failure`).
+    fss.remove_local_ac_pin_on_failure(AC_STORE_ID, &digest);
+
+    let snap_after = fss.dispatched_ac_pin_snapshot_for_store(AC_STORE_ID);
+    assert!(
+        !snap_after.iter().any(|d| *d == digest),
+        "AC slow-write failure MUST prune local pin — \
+         sibling-of-CAS-failed_slow_writes. Snapshot after failure-prune: {snap_after:?}"
+    );
+    Ok(())
+}
+
+/// Over-action guard: `remove_local_ac_pin_on_failure` MUST scope
+/// the prune to the matching `(store_id, digest)` pair only — a
+/// failure on `AC_MAIN_STORE` MUST NOT remove the same digest
+/// pinned under `AC_OTHER_STORE`, AND MUST NOT remove an unrelated
+/// digest pinned under the same store_id. Without the scoping
+/// (e.g. if the prune dropped across all store_ids like
+/// `remove_local_ac_pins`), per-store-id partitioning would
+/// silently leak.
+#[nativelink_test]
+async fn ac_failure_prune_is_scoped_to_store_id_and_digest() -> Result<(), Error> {
+    const AC_STORE_ID: &str = "AC_MAIN_STORE";
+    const OTHER_AC_STORE_ID: &str = "AC_OTHER_STORE";
+    let d1 = DigestInfo::new([0x01u8; 32], 1);
+    let d2 = DigestInfo::new([0x02u8; 32], 2);
+
+    let fast_spec = MemorySpec::default();
+    let slow_spec = MemorySpec::default();
+    let fast = MemoryStore::new(&fast_spec);
+    let slow = MemoryStore::new(&slow_spec);
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(fast_spec),
+            slow: StoreSpec::Memory(slow_spec),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        Store::new(fast),
+        Store::new(slow),
+    );
+
+    // Seed: d1 under AC_MAIN_STORE, d1 under AC_OTHER_STORE,
+    // d2 under AC_MAIN_STORE.
+    fss.insert_local_ac_pin(AC_STORE_ID, d1);
+    fss.insert_local_ac_pin(OTHER_AC_STORE_ID, d1);
+    fss.insert_local_ac_pin(AC_STORE_ID, d2);
+
+    // Failure-prune ONLY (AC_MAIN_STORE, d1).
+    fss.remove_local_ac_pin_on_failure(AC_STORE_ID, &d1);
+
+    let snap_main = fss.dispatched_ac_pin_snapshot_for_store(AC_STORE_ID);
+    let snap_other = fss.dispatched_ac_pin_snapshot_for_store(OTHER_AC_STORE_ID);
+    assert!(
+        !snap_main.iter().any(|d| *d == d1),
+        "AC failure-prune MUST remove the matching (store_id, digest): {snap_main:?}"
+    );
+    assert!(
+        snap_main.iter().any(|d| *d == d2),
+        "AC failure-prune MUST NOT remove unrelated digest under the same store_id — \
+         over-action: per-(store_id, digest) scoping leaked. snap_main={snap_main:?}",
+    );
+    assert!(
+        snap_other.iter().any(|d| *d == d1),
+        "AC failure-prune MUST NOT remove the same digest under a different store_id — \
+         over-action: per-(store_id, digest) scoping leaked. snap_other={snap_other:?}",
+    );
+    Ok(())
+}

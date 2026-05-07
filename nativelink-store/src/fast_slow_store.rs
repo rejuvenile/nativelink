@@ -2017,6 +2017,58 @@ impl FastSlowStore {
         self.retain_pins_dropping(digests);
     }
 
+    /// Remove a single worker-local AC pin entry on a write FAILURE
+    /// path. Sibling of CAS's `failed_slow_writes` mechanism: when
+    /// the worker has lost durability for an AC `(store_id, digest)`
+    /// tuple (e.g. the AC `update_oneshot` returned Err), the pin
+    /// MUST be removed so the worker stops advertising it via
+    /// `pinned_ac_mirror_entries` (proto field 17). Without this
+    /// hook, the next `BlobsAvailable` tick continues to claim
+    /// "this worker has the AC entry" indefinitely, even though the
+    /// write failed — server-side replace-snapshot semantics would
+    /// happily re-instate the stale entry every tick.
+    ///
+    /// Scoped to a single `(store_id, digest)` pair: only the entry
+    /// for the matching `store_id` is removed (in contrast to
+    /// [`Self::remove_local_ac_pins`] which removes across all
+    /// `store_id`s on BIS-ack drain). Idempotent: if the pin is not
+    /// present (e.g. write was synchronous-fast-tier-failure where
+    /// the pin was never inserted in the first place — this is the
+    /// common case from `running_actions_manager::upload_ac_results`'s
+    /// Err branch), the call is a no-op. Cheap: O(log n) BTreeMap
+    /// remove + a `notify_one()` only when the pin was actually
+    /// present.
+    ///
+    /// **Coverage today (synchronous failure only).** This method
+    /// is wired from `running_actions_manager::upload_ac_results`'s
+    /// synchronous Err branch, where `update_oneshot` returns Err
+    /// before the matching `insert_local_ac_pin` would have run —
+    /// so the call is currently defensive (the pin is never inserted
+    /// on that path). The slow-tier asynchronous failure case is NOT
+    /// yet covered: when `update_oneshot` returns Ok on fast-tier
+    /// success but the spawned slow-tier write later fails, no
+    /// failure-prune fires today. Wiring that path requires hooking
+    /// into `FastSlowStore::update`'s spawn-detach Err arm — the
+    /// CAS analog at `:948` (`failed_slow_writes.lock().insert(*d)`).
+    /// That extension is tracked under the same #279 umbrella; this
+    /// commit lays down the primitive + the synchronous wire.
+    pub fn remove_local_ac_pin_on_failure(&self, store_id: &str, digest: &DigestInfo) {
+        let key: Arc<str> = Arc::from(store_id);
+        let removed = self
+            .dispatched_mirror_pins
+            .lock()
+            .remove(&(key, *digest))
+            .is_some();
+        if removed {
+            // Wake the BlobsAvailable loop so the failed pin is
+            // dropped from the next advertisement promptly. Skip
+            // the notify when nothing changed (idempotent no-op
+            // path, e.g. synchronous-fast-tier-failure where the
+            // pin was never inserted).
+            self.mirror_changes_notify.notify_one();
+        }
+    }
+
     /// Snapshot just the AC pin entries (those whose store_id matches
     /// `ac_store_id`) as a sorted `Vec<DigestInfo>`. Used by
     /// `send_periodic_blobs_available` to populate the dedicated
