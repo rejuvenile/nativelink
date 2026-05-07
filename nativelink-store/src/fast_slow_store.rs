@@ -1901,6 +1901,44 @@ impl FastSlowStore {
         pins.iter().map(|(k, ())| k.clone()).collect()
     }
 
+    /// Snapshot the CAS dispatcher-pushed pin set, defensively filtered
+    /// by `store_id`. Mirrors the AC-side filtering shape on
+    /// [`Self::dispatched_ac_pin_snapshot_for_store`] so a future
+    /// composition that wires CAS and AC pins through the same
+    /// `FastSlowStore` cannot leak the wrong slice across the proto
+    /// hard-partition.
+    ///
+    /// `store_id`:
+    /// - `""` (the conventional CAS sentinel): no filter — returns all
+    ///   pins. CAS callers today rely on the unfiltered set so this is
+    ///   the safe default.
+    /// - any non-empty string: returns only entries whose `store_id`
+    ///   matches exactly. Future-proofs callers that need a CAS slice
+    ///   from a multiplexed pin map without depending on by-construction
+    ///   isolation between CAS and AC `FastSlowStore` instances.
+    ///
+    /// Preserves the same sorted-order invariant as
+    /// [`Self::dispatched_mirror_pin_snapshot`] (BTreeMap iteration is
+    /// sorted by `(store_id, digest)`) — the binary-search
+    /// `self_filter` in
+    /// `EphemeralServerSidePin::observe_pinned_mirror_ack` continues to
+    /// hold for the returned slice.
+    pub fn dispatched_mirror_pin_snapshot_for_store(
+        &self,
+        store_id: &str,
+    ) -> Vec<(Arc<str>, DigestInfo)> {
+        let pins = self.dispatched_mirror_pins.lock();
+        if pins.is_empty() {
+            return Vec::new();
+        }
+        if store_id.is_empty() {
+            return pins.iter().map(|(k, ())| k.clone()).collect();
+        }
+        pins.iter()
+            .filter_map(|((sid, d), ())| (sid.as_ref() == store_id).then(|| (sid.clone(), *d)))
+            .collect()
+    }
+
     /// Register a worker-local AC entry that has just been written to
     /// the AC FastSlowStore's fast tier (and is in flight to the slow
     /// tier). Unlike CAS mirroring (`insert_dispatched_mirror_blob`),
