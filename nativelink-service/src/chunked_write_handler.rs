@@ -150,11 +150,35 @@ const EARLY_DEDUP_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
 /// **the same end-state — pins past 120 s — is reachable via
 /// stalled-completion just as readily as via missing-failed_commit_sink.**
 ///
-/// **Value:** matches [`SLOW_WRITE_WATCHDOG_SECS`] (60 s) in
+/// **Value (60 s):** matches [`SLOW_WRITE_WATCHDOG_SECS`] in
 /// `nativelink_store::fast_slow_store` so the failed-set insert lands
-/// BEFORE the 120 s `PIN_TIMEOUT_SECS` auto-unpin on either path.
+/// BEFORE the 120 s `PIN_TIMEOUT_SECS` auto-unpin on either path. The
+/// 60 s value gives roughly 2x headroom over the typical multi-MiB
+/// chunked commit p99 (~30 s observed for commit-rename + e2e SHA-256
+/// verify on multi-MiB blobs under healthy slow-tier load); legacy
+/// parity is the dominant justification — flipping the chunked path
+/// to a different value would break the operator-mental-model of
+/// "commit-watchdog = slow-write-watchdog." See red-team
+/// `283-watchdog-8090162d` finding P1 / #286 sub-item 5: the value is
+/// doc-justified rather than measurement-justified at this revision;
+/// a future production-metric-driven revisit can tune it bounded
+/// above by `(120 s PIN_TIMEOUT_SECS - commit_p99) ≈ 90 s`.
 /// **Note: same value, different semantics on timeout** — see
 /// "Divergence from legacy" below.
+///
+/// **Upstream gRPC client deadline** (red-team finding P4 / #286
+/// sub-item 4): `chunked_client.rs:209` `client.write_chunked(stream)`
+/// does NOT call `tonic::Request::set_timeout`, so the chunked path
+/// has no client-side per-RPC deadline by default. This watchdog is
+/// therefore the **server-side** deadline only. If a tonic-level
+/// deadline is ever added (channel-default or per-call), the
+/// effective timeout becomes `min(server_watchdog, client_deadline)`
+/// — whichever fires first determines whether the failed-commit
+/// sink runs (server) or the upstream future surfaces a transport
+/// error (client). Today only the server-side timer fires; the
+/// chunked client retries the resulting `Code::DeadlineExceeded`
+/// via `classify_retryable` (#286 sub-item 3) inside its own
+/// 3-attempt loop.
 ///
 /// **Behaviour on timeout:**
 ///   1. Synthesise an `Err(Code::DeadlineExceeded, ...)` commit_result
@@ -1547,7 +1571,11 @@ pub fn admit_prepared_chunk(
 /// `min(server_watchdog, client_deadline)` — whichever fires first
 /// determines whether the failed-commit sink runs (server) or the
 /// upstream future surfaces a transport error (client). Today only
-/// the server-side timer fires.
+/// the server-side timer fires; the chunked client retries via
+/// `classify_retryable`'s `Code::DeadlineExceeded` arm (#286
+/// sub-item 3) inside its own 3-attempt loop AND via the worker's
+/// FSS reconnect-retry path on the failed-set entry that the
+/// watchdog inserts here.
 ///
 /// The function is `pub` so the watchdog regression tests in
 /// `nativelink-service`'s integration test crate can construct the
