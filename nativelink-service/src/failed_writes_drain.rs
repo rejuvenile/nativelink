@@ -45,6 +45,24 @@
 //!   worker to re-upload the bytes. If the upload fails, the slow-tier
 //!   write Err arm re-inserts the digest naturally.
 //!
+//!   TODO(#289): keep the digest in `failed_slow_writes` until BIS ack
+//!   arrives for that digest — that would make BIS the single durability
+//!   oath (the same shape as the worker mirror's "bytes stay until BIS
+//!   arrives"). Today we trust the worker's re-upload to fail the slow
+//!   tier on a true durability bug. Concrete failure modes the
+//!   trust-relay misses (red-team #287 review):
+//!     * worker drops `UploadMissingBlobs` (channel full, disconnect
+//!       between tx-Ok and worker-side processing);
+//!     * worker no-ops via its own `ExistenceCacheStore` ("have it"
+//!       → no upload → no slow-tier write → no Err arm to re-insert);
+//!     * server's `MemoryStore` pin TTL (120 s) expires before the
+//!       worker reschedules — bytes gone, no Err fires.
+//!   None are common today, but the whole drain exists precisely to
+//!   close failure-class gaps; a separate `dispatched_recently` map
+//!   to throttle while the digest stays in `failed_slow_writes` is
+//!   the right shape. Deferred from #287 to keep the fix-up scope
+//!   tight.
+//!
 //! ## Production lifecycle
 //!
 //! `nativelink.rs` spawns a `tokio::spawn`'d loop that calls
