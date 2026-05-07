@@ -863,6 +863,34 @@ async fn inner_main(
                         continue;
                     }
 
+                    // Server-side AC pin sweep: previously this fanned
+                    // out per-AC-store, then per-endpoint, with ONE
+                    // `inner.write()` lock acquisition per endpoint
+                    // per AC store (#278B perf MAJOR). Refactor: group
+                    // ALL AC drains by endpoint and apply one
+                    // `remove_digests_for_endpoint_batch` per endpoint
+                    // — N endpoints × M AC stores collapses from N*M
+                    // lock cycles to N. CAS has no analogous registry.
+                    let mut drains_for_batch: Vec<(std::sync::Arc<str>, &[nativelink_util::common::DigestInfo])> =
+                        Vec::with_capacity(batches.len());
+                    for (store_id, digests) in &batches {
+                        if store_id.is_empty() {
+                            continue; // CAS batch — no AC pin sweep
+                        }
+                        drains_for_batch.push((
+                            std::sync::Arc::<str>::from(store_id.as_str()),
+                            digests.as_slice(),
+                        ));
+                    }
+                    if !drains_for_batch.is_empty() {
+                        let endpoints: Vec<String> =
+                            registry_for_loop.endpoint_counts().keys().cloned().collect();
+                        for endpoint in &endpoints {
+                            registry_for_loop
+                                .remove_digests_for_endpoint_batch(endpoint, &drains_for_batch);
+                        }
+                    }
+
                     for (store_id, digests) in &batches {
                         let is_ac = !store_id.is_empty();
                         let kind = if is_ac { "AC" } else { "CAS" };
@@ -874,18 +902,6 @@ async fn inner_main(
                             kind,
                             "BlobsInStableStorage {kind}: broadcasting drained digests"
                         );
-                        // Server-side AC pin sweep: walk all endpoints
-                        // and drop matching `(store_id, digest)` pairs
-                        // for this AC store. CAS has no analogous registry.
-                        if is_ac {
-                            let endpoints: Vec<String> =
-                                registry_for_loop.endpoint_counts().keys().cloned().collect();
-                            for endpoint in &endpoints {
-                                registry_for_loop.remove_digests_for_endpoint_in_store(
-                                    endpoint, store_id, digests,
-                                );
-                            }
-                        }
                         for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
                             scheduler
                                 .broadcast_blobs_in_stable_storage_chunked(
