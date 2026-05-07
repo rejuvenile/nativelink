@@ -13,26 +13,65 @@
 //! mechanism that drove the server MemoryStore (48 GB cap) to
 //! ResourceExhausted.
 //!
-//! Asymmetric contract coverage (CLAUDE.md):
-//!   - **Under-action** test: chunked write commits OK → digest MUST
-//!     appear in `drain_stable_digests()` within timeout.
-//!   - **Over-action** test: chunked commit FAILURE (forced e2e
-//!     SHA-256 mismatch via lying digest) → digest MUST NOT appear
-//!     in `drain_stable_digests()`. (BIS protocol requires bytes to
-//!     be durably stored before ack.)
-//!   - **Race coverage** test: while a chunked write is in flight,
-//!     the digest must be observable as either "in_flight" (chunked
-//!     in-flight set OR in_flight_slow_writes) OR "stable" — never
-//!     neither. The push happens BEFORE in_flight removal so the
-//!     visibility gap is closed.
+//! The fix touches THREE push sites in `chunked_write_handler.rs`:
 //!
-//! **Mutation step (verified at test authorship time):** comment out
-//! the `sink(stream_digest)` call in the AsyncCommit reaper at
-//! `chunked_write_handler.rs:dispatch_chunks_to_driver` AsyncCommit
-//! branch. The under-action test red-fails with the bespoke message
-//! "drain_stable_digests must contain digest within timeout —
-//!  chunked commit completion did not push (production incident
-//!  2026-05-06 mechanism)".
+//!   1. line 1618           — Synchronous commit success branch
+//!   2. lines 1697-1700     — AsyncCommit reaper's success branch
+//!   3. lines 2398-2400     — early-dedup short-circuit branch
+//!
+//! Plus a NOTIFY side: the closure returned by
+//! `FastSlowStore::stable_digests_pusher()` calls
+//! `stable_notify.notify_one()` after pushing — without which the BIS
+//! broadcast loop's `notified().await` never resolves and
+//! `stable_digests` accumulates without ever being drained.
+//!
+//! ## Tests in this file
+//!
+//! Asymmetric contract coverage (CLAUDE.md) for site 2 (AsyncCommit reaper):
+//!   - **Under-action** (`chunked_commit_pushes_digest_to_stable_digests`):
+//!     chunked write commits OK → digest MUST appear in
+//!     `drain_stable_digests()` within timeout. Mutation: comment out
+//!     `sink(stream_digest)` at the AsyncCommit reaper
+//!     (`chunked_write_handler.rs:1697-1700`); test red-fails with the
+//!     "production incident 2026-05-06 mechanism" message.
+//!   - **Over-action**
+//!     (`chunked_commit_failure_does_not_push_to_stable_digests`):
+//!     chunked commit FAILURE (forced e2e SHA-256 mismatch via lying
+//!     digest) → digest MUST NOT appear in `drain_stable_digests()`.
+//!     (BIS protocol requires bytes to be durably stored before ack.)
+//!   - **Race coverage**
+//!     (`chunked_commit_no_visibility_gap_between_in_flight_and_stable`):
+//!     while a chunked write is in flight, the digest must be
+//!     observable as either "in_flight" (chunked in-flight set OR
+//!     in_flight_slow_writes) OR "stable" — never neither. The push
+//!     happens BEFORE in_flight removal so the visibility gap is closed.
+//!
+//! Sibling-site under-action coverage:
+//!   - **Synchronous commit**
+//!     (`chunked_synchronous_commit_pushes_digest_to_stable_digests`):
+//!     calls `dispatch_chunks_to_driver(CommitMode::Synchronous)`
+//!     directly with a production-shaped sink closure. Mutation:
+//!     comment out `sink(stream_digest)` at site 1 (line 1618); test
+//!     red-fails with "synchronous chunked commit must push to
+//!     stable_digests — sibling-bug regression".
+//!   - **Early-dedup short-circuit**
+//!     (`chunked_early_dedup_short_circuit_pushes_digest_to_stable_digests`):
+//!     pre-populates the FilesystemStore so `has_indexed_digest`
+//!     returns Some, then drives a re-upload through
+//!     `dispatch_bazel_facing_internal_chunking` with the sink wired.
+//!     Mutation: comment out `sink(digest)` at site 3 (line 2399);
+//!     test red-fails with "early-dedup short-circuit must push to
+//!     stable_digests — defense-in-depth regression".
+//!
+//! Notify-side coverage:
+//!   - **stable_notify wakeup**
+//!     (`chunked_commit_notifies_stable_notify_waiters`): subscribes
+//!     to `fast_slow.stable_notify().notified()` BEFORE driving an
+//!     AsyncCommit, asserts the future resolves within
+//!     `tokio::time::timeout(5s)`. Mutation: comment out
+//!     `stable_notify.notify_one()` in the closure at
+//!     `fast_slow_store.rs:709`; test red-fails with "BIS broadcast
+//!     loop wakeup contract violated".
 
 #![cfg(feature = "chunked_fast_slow")]
 
@@ -58,7 +97,7 @@ use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::buf_channel::make_buf_channel_pair_with_size;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
+use nativelink_util::store_trait::{Store, StoreDriver, StoreLike, UploadSizeInfo};
 use sha2::{Digest as _, Sha256};
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -786,4 +825,90 @@ async fn chunked_early_dedup_short_circuit_pushes_digest_to_stable_digests() {
          chunked_write_handler.rs:2398-2400 omitted the BIS push. \
          drained={drained:?}",
     );
+}
+
+// =============================================================================
+// stable_notify WAKEUP CONTRACT TEST (testing-czar item 3)
+// =============================================================================
+
+/// **Notify-side coverage (testing-czar item 3).** The closure returned
+/// by `FastSlowStore::stable_digests_pusher()` does TWO things:
+///
+///   1. push the digest onto `stable_digests` (Vec<DigestInfo>)
+///   2. call `stable_notify.notify_one()` to wake the BIS broadcast
+///      loop's `notified().await`
+///
+/// All three earlier tests observe via `drain_stable_digests()` —
+/// which DOES NOT consult the Notify. A regression that broke the
+/// `notify_one()` call but kept the push would ship: the queue would
+/// fill, but no broadcast loop would ever wake to drain it.
+///
+/// This test subscribes to `stable_notify().notified()` BEFORE
+/// driving the commit, then drives an AsyncCommit and asserts the
+/// notified future resolves within `tokio::time::timeout(5s)`.
+///
+/// **Production composition:** real `FastSlowStore` (chunked
+/// dispatcher wired through the same `make_e2e_fast_slow_with_sink`
+/// fixture as the under-action test); the Notify subscriber mirrors
+/// the production BIS broadcast loop's wait pattern.
+///
+/// **Mutation step (verified at test authorship time):** comment out
+/// `stable_notify.notify_one()` at `fast_slow_store.rs:709` (inside
+/// the `stable_digests_pusher()` closure). This test red-fails with
+/// the bespoke `.expect("chunked commit must wake stable_notify
+/// waiters — BIS broadcast loop wakeup contract violated")` message.
+#[nativelink_test]
+async fn chunked_commit_notifies_stable_notify_waiters() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 4;
+    const SIZE: usize = N * CHUNK;
+    let blob: Vec<u8> = (0..SIZE).map(|i| (i * 19) as u8).collect();
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let _guard = kill_switch_lock().lock().await;
+    enable_bazel_facing_internal_chunking();
+
+    let fast_slow = make_e2e_fast_slow_with_sink(CHUNK).await;
+
+    // Subscribe to stable_notify().notified() BEFORE driving the
+    // commit. The Notify is permit-based: registering the future via
+    // `.notified()` ensures a notify_one() that fires while the
+    // future is being constructed CANNOT be lost (Notify stores one
+    // pending permit). We register the future BEFORE the upload
+    // starts so even if the chunked dispatcher is unrealistically
+    // fast, the wakeup is observable.
+    //
+    // This call must be inside a tokio runtime context (the
+    // forced-delegation merged-Notify path lazily spawns forwarder
+    // tasks on first call); the `#[nativelink_test]` attribute
+    // satisfies that.
+    let stable_notify = fast_slow.stable_notify();
+    let notified_fut = {
+        let n = stable_notify.clone();
+        async move { n.notified().await }
+    };
+
+    // Concurrently: drive the upload AND wait for the notify. If the
+    // notify_one() in the closure ever fires (under-action: it MUST
+    // fire on commit success), `notified_fut` resolves. If it does
+    // NOT fire, the outer timeout panics with the bespoke message.
+    let updater_fut = run_update(&fast_slow, digest, Bytes::from(blob));
+
+    let (update_res, _notify_res) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async move { tokio::join!(updater_fut, notified_fut) },
+    )
+    .await
+    .expect(
+        "chunked commit must wake stable_notify waiters — BIS broadcast \
+         loop wakeup contract violated: the closure returned by \
+         stable_digests_pusher() must call stable_notify.notify_one() \
+         after pushing onto stable_digests, otherwise the broadcast \
+         loop's notified().await never resolves and stable_digests \
+         accumulates without ever being drained",
+    );
+
+    update_res.expect("chunked update must succeed for hash-matching blob");
+
+    disable_bazel_facing_internal_chunking();
 }
