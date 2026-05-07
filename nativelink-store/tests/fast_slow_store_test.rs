@@ -3924,7 +3924,7 @@ async fn cas_pin_snapshot_filters_strictly_by_store_id() -> Result<(), Error> {
     );
     assert!(
         !other_slice.iter().any(|(_, dg)| *dg == d_main),
-        "CAS slice for OTHER_STORE MUST NOT include cas_STORE pin; \
+        "OTHER_STORE slice MUST NOT include cas_STORE pin; \
          over-action: snapshot filter is too permissive across store_ids"
     );
 

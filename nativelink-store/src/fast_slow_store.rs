@@ -450,6 +450,35 @@ pub struct FastSlowStore {
     /// `mirror_blobs` (`remove_mirror_blobs`, eviction), every
     /// matching `(_, digest)` entry is removed from this index.
     /// Lock acquisition order: this index AFTER `mirror_blobs`.
+    ///
+    /// **Namespace footgun (CAS vs AC).** This single map holds BOTH
+    /// CAS-shape pin entries (inserted by `insert_dispatched_mirror_blob`
+    /// from the worker's small-blob dispatcher path) AND AC-shape pin
+    /// entries (inserted by `insert_local_ac_pin` from the worker's
+    /// local AC write path). Today the overlap is benign because
+    /// production wires CAS and AC stores onto **distinct Arc'd
+    /// `FastSlowStore` instances** — the CAS FSS sees only CAS pins and
+    /// the AC FSS sees only AC pins, so the namespace partition is
+    /// enforced by the OUTER composition rather than this struct.
+    ///
+    /// The invariant a future refactor MUST preserve: callers that
+    /// publish or consume a slice of this map by namespace (CAS field
+    /// 16 vs AC field 17 on the wire; CAS `BlobLocalityMap` vs AC
+    /// `AcPinRegistry` on the server) MUST NOT mix the two. The
+    /// REAPI-design overlap of `action_digest` with the Action proto
+    /// digest in CAS means an AC pin routed through CAS upload short-
+    /// circuits would silently drop Action proto bytes; a CAS pin
+    /// routed through AC peer-fetch would attempt to serve CAS bytes
+    /// for an AC RPC. Both modes are silent corruption.
+    ///
+    /// Defensive future-proofing wired today:
+    /// `dispatched_ac_pin_snapshot_for_store(ac_store_id)` filters by
+    /// store_id; `dispatched_mirror_pin_snapshot_for_store(store_id)`
+    /// mirrors that filtering shape on the CAS side. If a future
+    /// composition collapses CAS+AC onto a single FSS, callers should
+    /// migrate from the unfiltered `dispatched_mirror_pin_snapshot()`
+    /// to the filtered variant — and the namespace partition becomes
+    /// load-bearing on the filter rather than on outer composition.
     dispatched_mirror_pins: Mutex<BTreeMap<(Arc<str>, DigestInfo), ()>>,
     /// Total bytes currently held in `mirror_blobs`. Tracked separately to
     /// enforce `mirror_blobs_max_bytes` without iterating the map.
