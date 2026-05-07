@@ -1443,21 +1443,20 @@ pub fn admit_prepared_chunk(
 /// `tokio::time::timeout(CHUNKED_COMMIT_WATCHDOG_SECS)` (#283 sub-item 3),
 /// then performs the post-commit bookkeeping in the order:
 ///
-///   1. (Ok)  push to `stable_digests_sink` (the BIS broadcast loop's
-///      input — without this, chunked-committed bytes are never
-///      acknowledged and worker `mirror_blobs` accumulate to OOM —
-///      #282 production-incident-2026-05-06 mechanism).
-///   2. (Err) fire `failed_commit_sink` (the
-///      `failed_writes_inserter` closure — without this, a chunked
-///      commit failure leaves no record so the worker's
-///      reconnect-retry path never picks it up — #283 sibling-bug
-///      parity with `fast_slow_store.rs:3489-3494`).
-///   3.       remove the digest from the chunked in-flight map. The
-///      stable/failed signal MUST land BEFORE the removal so a reader
-///      observing the in-flight set as empty also sees the digest in
-///      the corresponding sink target — closing the visibility gap.
-///   4.       deregister from the optional read-cascade registry.
-///   5.       update commit-success / failure metrics counters.
+/// 1. (Ok) push to `stable_digests_sink` (the BIS broadcast loop's
+///    input — without this, chunked-committed bytes are never
+///    acknowledged and worker `mirror_blobs` accumulate to OOM —
+///    #282 production-incident-2026-05-06 mechanism).
+/// 2. (Err) fire `failed_commit_sink` (the `failed_writes_inserter`
+///    closure — without this, a chunked commit failure leaves no
+///    record so the worker's reconnect-retry path never picks it
+///    up — #283 sibling-bug parity with `fast_slow_store.rs:3489-3494`).
+/// 3. Remove the digest from the chunked in-flight map. The
+///    stable/failed signal MUST land BEFORE the removal so a reader
+///    observing the in-flight set as empty also sees the digest in
+///    the corresponding sink target — closing the visibility gap.
+/// 4. Deregister from the optional read-cascade registry.
+/// 5. Update commit-success / failure metrics counters.
 ///
 /// **Watchdog (sub-item 3):** the legacy `SLOW_WRITE_WATCHDOG_SECS=60`
 /// guards the analogous `update`/`update_oneshot` background spawn at
