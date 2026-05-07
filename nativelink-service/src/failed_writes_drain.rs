@@ -104,6 +104,13 @@ pub struct DrainTickStats {
     /// Digests skipped because they were dispatched/attempted within
     /// the cooldown window. Re-inserted.
     pub throttled: usize,
+    /// Digests for which `tx.send()` returned Err (worker channel
+    /// closed mid-tick) or whose endpoint vanished between the
+    /// dispatcher snapshot and the dispatch step. Re-inserted via
+    /// the source store. M1 invariant: digests counted here are NOT
+    /// counted in `dispatched`, so
+    /// `drained == dispatched + no_worker + throttled + send_failed`.
+    pub send_failed: usize,
 }
 
 /// Run a single drain tick. Drains `failed_slow_writes` across every
@@ -210,7 +217,12 @@ pub fn drain_tick(
             if inflight.len() < inflight_cap {
                 inflight.insert(digest, now);
             }
-            stats.dispatched += 1;
+            // M1 fix: do NOT increment `dispatched` here. The send
+            // can still fail downstream (race-loser tx-vanished or
+            // `tx.send()` Err). Counter is bumped only after a
+            // successful `tx.send()` Ok arm so the invariant
+            // `drained == dispatched + no_worker + throttled +
+            // send_failed` holds.
         }
     }
 
@@ -229,15 +241,22 @@ pub fn drain_tick(
     // Each entry retains `(store_name, digest)` so that re-insert on
     // dispatch failure routes to the source store, not a fan-in spray
     // across every CAS store.
+    //
+    // M1 invariant: `dispatched` is incremented PER chunk only after
+    // `tx.send()` Ok; `send_failed` covers both the race-vanished
+    // endpoint path (entire batch) and the mid-batch send Err path
+    // (the failing chunk plus any subsequent chunks not yet sent).
     for (endpoint, entries) in per_endpoint {
         let Some(tx) = endpoint_to_tx.get(&endpoint) else {
             // Race: tx vanished between snapshot and dispatch.
             // Re-insert each digest into its source store (BLOCK B1
             // fix: do NOT spray every cas_store).
+            stats.send_failed += entries.len();
             reinsert_by_source_store(cas_stores, &entries);
             continue;
         };
-        for chunk in entries.chunks(batch_size) {
+        let mut chunks = entries.chunks(batch_size);
+        while let Some(chunk) = chunks.next() {
             let proto_digests: Vec<Digest> =
                 chunk.iter().map(|(_, d)| Digest::from(*d)).collect();
             let msg = UpdateForWorker {
@@ -254,9 +273,17 @@ pub fn drain_tick(
                     "failed_slow_writes_drain: worker channel closed; \
                      re-inserting batch"
                 );
+                stats.send_failed += chunk.len();
                 reinsert_by_source_store(cas_stores, chunk);
+                // Re-insert ALL remaining chunks too — once tx is
+                // closed, no later chunk will succeed.
+                for remaining in chunks.by_ref() {
+                    stats.send_failed += remaining.len();
+                    reinsert_by_source_store(cas_stores, remaining);
+                }
                 break;
             }
+            stats.dispatched += chunk.len();
         }
     }
 
@@ -266,6 +293,7 @@ pub fn drain_tick(
             dispatched = stats.dispatched,
             no_worker = stats.no_worker,
             throttled = stats.throttled,
+            send_failed = stats.send_failed,
             "failed_slow_writes_drain: tick complete"
         );
     }
