@@ -183,7 +183,12 @@ async fn make_e2e_fast_slow_with_sink(
             fast_slow.in_flight_empty_notify_handle(),
         )
         // #282 fix under test: install the BIS push closure.
-        .with_stable_digests_sink(fast_slow.stable_digests_pusher()),
+        .with_stable_digests_sink(fast_slow.stable_digests_pusher())
+        // #283 fix under test: install the failed-commit closure so the
+        // AsyncCommit reaper Err arm performs the legacy bookkeeping
+        // (failed_slow_writes insert + fast-store re-pin) on commit
+        // FAILURE. Mirrors `wire_bazel_chunked_dispatcher`.
+        .with_failed_commit_sink(fast_slow.failed_writes_inserter()),
     );
     fast_slow.set_chunked_read_registry(Arc::clone(&registry));
     fast_slow
@@ -911,6 +916,152 @@ async fn chunked_commit_notifies_stable_notify_waiters() {
     );
 
     update_res.expect("chunked update must succeed for hash-matching blob");
+
+    disable_bazel_facing_internal_chunking();
+}
+
+// =============================================================================
+// #283 — AsyncCommit FAILURE bookkeeping (failed_slow_writes + re-pin)
+// =============================================================================
+
+/// **#283 under-action coverage** — chunked AsyncCommit FAILURE MUST
+/// fire the `failed_commit_sink`, which:
+///
+///   1. inserts the digest into `failed_slow_writes` (the worker
+///      reconnect-retry path consumes the set on reconnect; the
+///      mirror protocol re-uploads the lost blob), AND
+///   2. re-pins the in-memory replica on the fast store (so MemoryStore
+///      eviction can't drop the blob between commit-failure and the
+///      next mirror-protocol retry).
+///
+/// Mirrors the legacy `FastSlowStore::update` Err arm at
+/// `fast_slow_store.rs:3489-3494`. WITHOUT this, a chunked-commit
+/// failure leaves no record of the missing slow-tier write — the
+/// reconnect-retry never runs and subsequent reads NotFound on the
+/// lost blob.
+///
+/// **Failure trigger** — same fixture as the over-action test
+/// `chunked_commit_failure_does_not_push_to_stable_digests`: lying
+/// digest (declared SHA-256 doesn't match actual bytes). The chunked
+/// driver's e2e SHA verify mismatches → commit Err →
+/// AsyncCommit reaper's Err branch → failed_commit_sink fires.
+///
+/// **Production composition** — real `FastSlowStore` +
+/// `BazelChunkedDispatcherImpl` wired with both
+/// `stable_digests_pusher()` AND `failed_writes_inserter()` exactly as
+/// `wire_bazel_chunked_dispatcher` does for the production server.
+///
+/// **Mutation step (verified at test authorship time):** comment out
+/// the `sink(stream_digest)` call in the new Err branch at
+/// `chunked_write_handler.rs:1731-1735` (the `if commit_result.is_err()`
+/// block). This test red-fails with the bespoke message — the chunked
+/// commit fails but the failed-write bookkeeping never lands, so the
+/// worker reconnect-retry has nothing to retry.
+#[nativelink_test]
+async fn chunked_async_commit_failure_inserts_failed_writes_and_repins() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 4;
+    const SIZE: usize = N * CHUNK;
+
+    let actual_blob: Vec<u8> = (0..SIZE).map(|i| (i * 13) as u8).collect();
+    // Lying digest: declared hash is for DIFFERENT bytes (all-zero) so
+    // the chunked driver's e2e SHA verify mismatches at commit.
+    let lying_blob: Vec<u8> = vec![0u8; SIZE];
+    let lying_digest = DigestInfo::new(sha256(&lying_blob), SIZE as u64);
+
+    let _guard = kill_switch_lock().lock().await;
+    enable_bazel_facing_internal_chunking();
+
+    let fast_slow = make_e2e_fast_slow_with_sink(CHUNK).await;
+
+    // Pre-flight: the failed-writes set MUST be empty.
+    assert!(
+        !fast_slow.failed_slow_writes_contains(&lying_digest),
+        "fixture invariant: failed_slow_writes starts without our digest",
+    );
+
+    // Drive the upload with the WRONG bytes for the declared digest.
+    // The dispatcher/driver will admit the chunks (per-chunk SHA is
+    // computed from the actual bytes), and the e2e SHA verify will
+    // fail at the driver's commit step.
+    //
+    // The async-commit return value is Ok (admission succeeded); the
+    // mismatch surfaces only when the spawned reaper observes the
+    // driver's commit Err.
+    let _admit_res = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_update(&fast_slow, lying_digest, Bytes::from(actual_blob)),
+    )
+    .await
+    .expect("must not deadlock — chunked admission should complete in 10s");
+    // We don't assert on _admit_res — async-commit returns Ok at
+    // admission even when the eventual commit will fail.
+
+    // Wait for the chunked-in-flight set to drain (ground-truth signal
+    // that the AsyncCommit reaper has run to completion: it removes the
+    // chunked driver's in_flight entry, which causes the outer FSS
+    // dispatch reaper's `while contains_digest` loop to break and
+    // remove from `chunked_in_flight_digests`).
+    let chunked_set = fast_slow.as_ref().chunked_in_flight_digests_handle();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let empty = chunked_set.lock().is_empty();
+            if empty {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "must not deadlock — chunked in-flight set must drain after \
+         reaper completes (success OR failure)",
+    );
+
+    // The failed_commit_sink runs BEFORE the chunked driver removes its
+    // in_flight entry (per the ordering in the new Err branch at
+    // `chunked_write_handler.rs:1731-1735`), so by the time the outer
+    // chunked_in_flight_digests set has drained, the bookkeeping MUST
+    // already be observable. No additional poll needed.
+
+    // (1) failed_slow_writes MUST contain the digest.
+    assert!(
+        fast_slow.failed_slow_writes_contains(&lying_digest),
+        "chunked AsyncCommit Err arm must insert failed_writes + re-pin \
+         — contract parity with legacy update at \
+         fast_slow_store.rs:3489-3494 violated. Without this insert, the \
+         worker reconnect-retry path (drain_failed_digests) has nothing \
+         to retry; the slow tier is missing the blob and no mechanism \
+         exists to re-upload it. failed_slow_writes_contains returned \
+         false for digest={lying_digest:?}",
+    );
+
+    // (2) The fast-store re-pin MUST have been attempted. The test
+    //     fast tier is a MemoryStore, which is a non-pinning Leaf and
+    //     silently no-ops `pin_digests` (StoreDriver default). The
+    //     observable consequence is that the blob remains accessible
+    //     in the fast store via `has` — which the upstream
+    //     `FastSlowStore::update`'s tee already wrote. We assert
+    //     `has_with_results` returns Some so that ANY future change to
+    //     replace MemoryStore with a pinning leaf (e.g.
+    //     FilesystemStore) preserves the contract: the blob is alive
+    //     in the fast tier when the reconnect-retry consults it.
+    let mut results = vec![None; 1];
+    fast_slow
+        .fast_store_handle()
+        .has_with_results(&[lying_digest.into()], &mut results)
+        .await
+        .expect("fast_store has_with_results must succeed");
+    assert!(
+        results[0].is_some(),
+        "fast-store replica must remain accessible after chunked-commit \
+         failure (the upstream FSS::update tee wrote the blob; the \
+         failed_commit_sink's pin_digests call protects it from \
+         eviction). Without the re-pin, MemoryStore eviction (or — in \
+         production with FilesystemStore as fast tier — the 120s pin \
+         TTL) could drop the blob before the worker reconnect-retry \
+         consumes failed_slow_writes. results={results:?}",
+    );
 
     disable_bazel_facing_internal_chunking();
 }
