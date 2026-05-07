@@ -784,8 +784,17 @@ async fn inner_main(
                         () = merged_notify.notified() => {}
                         () = tokio::time::sleep(Duration::from_millis(500)) => {}
                     }
-                    // Drain CAS digests across all CAS stores into one
-                    // bucket (CAS share locality_map; one broadcast).
+                    // Build broadcast batches in a single list:
+                    //   - CAS first: all CAS-store drains merged into one
+                    //     bucket tagged store_id="" (CAS share locality_map;
+                    //     one broadcast covers them all).
+                    //   - Then one entry per AC store with its own store_id
+                    //     so workers can route the unpin to the matching
+                    //     FSS via store_id lookup.
+                    // An empty store_id distinguishes the CAS batch from
+                    // AC batches downstream (pin-sweep + log message).
+                    let mut batches: Vec<(String, Vec<nativelink_util::common::DigestInfo>)> =
+                        Vec::new();
                     let mut cas_digests = Vec::new();
                     for (_name, store) in &cas_bis_stores {
                         let mut drained = store.drain_stable_digests();
@@ -793,74 +802,55 @@ async fn inner_main(
                             cas_digests.append(&mut drained);
                         }
                     }
-                    // Drain AC digests PER store so we can broadcast each
-                    // with its own `store_id`. Worker handlers route on
-                    // store_id; merging would lose that distinction.
-                    let mut per_ac_digests: Vec<(String, Vec<nativelink_util::common::DigestInfo>)> = Vec::new();
+                    if !cas_digests.is_empty() {
+                        batches.push((String::new(), cas_digests));
+                    }
                     for (name, store) in &ac_bis_stores {
                         let drained = store.drain_stable_digests();
                         if !drained.is_empty() {
-                            per_ac_digests.push((name.clone(), drained));
+                            batches.push((name.clone(), drained));
                         }
                     }
-                    if cas_digests.is_empty() && per_ac_digests.is_empty() {
+                    if batches.is_empty() {
                         continue;
                     }
 
-                    // CAS broadcast (store_id="").
-                    if !cas_digests.is_empty() {
+                    for (store_id, digests) in &batches {
+                        let is_ac = !store_id.is_empty();
+                        let kind = if is_ac { "AC" } else { "CAS" };
                         debug!(
                             target: "nativelink::stable_storage_broadcast",
-                            digest_count = cas_digests.len(),
+                            digest_count = digests.len(),
+                            ac_store = store_id.as_str(),
                             scheduler_count = schedulers.len(),
-                            "BlobsInStableStorage CAS: broadcasting drained digests"
-                        );
-                        for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
-                            scheduler
-                                .broadcast_blobs_in_stable_storage_chunked(cas_digests.clone(), "")
-                                .await;
-                            debug!(
-                                target: "nativelink::stable_storage_broadcast",
-                                scheduler_idx,
-                                "BlobsInStableStorage CAS chunked: broadcast returned"
-                            );
-                        }
-                    }
-                    // AC broadcasts (one per AC store) — each tagged
-                    // with its store_id. Server-side AC pin registry
-                    // sweep runs once per drained AC store.
-                    for (ac_name, ac_digests) in &per_ac_digests {
-                        debug!(
-                            target: "nativelink::stable_storage_broadcast",
-                            digest_count = ac_digests.len(),
-                            ac_store = ac_name.as_str(),
-                            scheduler_count = schedulers.len(),
-                            "BlobsInStableStorage AC: broadcasting drained digests"
+                            kind,
+                            "BlobsInStableStorage {kind}: broadcasting drained digests"
                         );
                         // Server-side AC pin sweep: walk all endpoints
                         // and drop matching `(store_id, digest)` pairs
-                        // for this AC store.
-                        let endpoints: Vec<String> =
-                            registry_for_loop.endpoint_counts().keys().cloned().collect();
-                        for endpoint in &endpoints {
-                            registry_for_loop.remove_digests_for_endpoint_in_store(
-                                endpoint,
-                                ac_name,
-                                ac_digests,
-                            );
+                        // for this AC store. CAS has no analogous registry.
+                        if is_ac {
+                            let endpoints: Vec<String> =
+                                registry_for_loop.endpoint_counts().keys().cloned().collect();
+                            for endpoint in &endpoints {
+                                registry_for_loop.remove_digests_for_endpoint_in_store(
+                                    endpoint, store_id, digests,
+                                );
+                            }
                         }
                         for (scheduler_idx, scheduler) in schedulers.iter().enumerate() {
                             scheduler
                                 .broadcast_blobs_in_stable_storage_chunked(
-                                    ac_digests.clone(),
-                                    ac_name,
+                                    digests.clone(),
+                                    store_id,
                                 )
                                 .await;
                             debug!(
                                 target: "nativelink::stable_storage_broadcast",
                                 scheduler_idx,
-                                ac_store = ac_name.as_str(),
-                                "BlobsInStableStorage AC chunked: broadcast returned"
+                                ac_store = store_id.as_str(),
+                                kind,
+                                "BlobsInStableStorage {kind} chunked: broadcast returned"
                             );
                         }
                     }
