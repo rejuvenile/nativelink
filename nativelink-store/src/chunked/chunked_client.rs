@@ -938,4 +938,50 @@ mod tests {
             RetryDecision::Abort => panic!("expected Retry; got Abort"),
         }
     }
+
+    /// **#286 sub-item 3 (watchdog Err is retryable).** The chunked
+    /// commit watchdog at `chunked_write_handler::run_async_commit_reaper`
+    /// synthesises a bare `make_err!(Code::DeadlineExceeded, ...)` with
+    /// NO `BackpressureSignal` detail. Without the dedicated
+    /// `Code::DeadlineExceeded` arm in `classify_retryable`, the chunked
+    /// client's 3-attempt loop would `Abort` on the watchdog Err and the
+    /// transient slow-tier wedge would surface to the caller without an
+    /// in-loop retry. This test asserts the contract: the watchdog-shaped
+    /// Err MUST classify as `Retry`.
+    ///
+    /// **Mutation step (verified at test authorship time):** revert the
+    /// `if err.code == Code::DeadlineExceeded { ... }` early-return in
+    /// `classify_retryable`. The bare-DeadlineExceeded `err` then falls
+    /// through to the `has_signal` early-return (no signal attached) and
+    /// returns `Abort`; this test red-fails on the bespoke
+    /// `"watchdog-shaped DeadlineExceeded must be retryable — #286
+    /// sub-item 3 regression"` message.
+    #[nativelink_test]
+    async fn classify_bare_deadline_exceeded_is_retry() {
+        // Mirror the exact shape of the watchdog's synthesised Err:
+        // bare `make_err!(Code::DeadlineExceeded, ...)` with NO
+        // `BackpressureSignal` detail.
+        let err = make_err!(
+            Code::DeadlineExceeded,
+            "chunked commit await_completion exceeded 60 s watchdog deadline"
+        );
+        match classify_retryable(&err) {
+            RetryDecision::Retry { reason, retry_after } => {
+                assert_eq!(
+                    reason,
+                    RetryReason::ResourceExhausted,
+                    "watchdog DeadlineExceeded must map to a metrics-bucket                      reason (ResourceExhausted today; the variant only                      drives metrics + log fields)",
+                );
+                // Fallback retry-after is 50 ms (decode_retry_after's
+                // bare-Err default) capped at MAX_RETRY_AFTER.
+                assert!(
+                    retry_after <= MAX_RETRY_AFTER,
+                    "retry-after must be bounded above by MAX_RETRY_AFTER                      even when the server attaches no hint; got={retry_after:?}",
+                );
+            }
+            RetryDecision::Abort => panic!(
+                "watchdog-shaped DeadlineExceeded must be retryable —                  #286 sub-item 3 regression"
+            ),
+        }
+    }
 }

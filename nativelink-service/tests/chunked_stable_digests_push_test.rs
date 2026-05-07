@@ -1713,6 +1713,27 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
          Err path parity). got={failures}",
     );
 
+    // **#286 sub-item 2 (watchdog increments distinct metric).** The
+    // operator-visibility metric `commit_watchdog_fires_total` MUST
+    // be incremented in the watchdog Err arm; without this, operators
+    // reading a `commit_failures_total` rise during a healthy-but-slow
+    // window cannot distinguish a watchdog firing (slow-tier wedge)
+    // from a natural commit Err. Mutation step (verified at test
+    // authorship time): comment out the
+    // `metrics.commit_watchdog_fires_total.fetch_add(1, ...)` line in
+    // `run_async_commit_reaper`'s watchdog Err arm. This test then
+    // red-fails with the bespoke "watchdog fires must be observable
+    // as a distinct metric" message.
+    let watchdog_fires =
+        metrics.commit_watchdog_fires_total.load(AtomicOrdering::Relaxed);
+    assert!(
+        watchdog_fires >= 1,
+        "watchdog fires must be observable as a distinct metric — \
+         operator visibility regression (#286 sub-item 2). \
+         got={watchdog_fires}, but expected >= 1 because the watchdog \
+         Err arm fired above (commit_failures_total={failures}).",
+    );
+
     // Drop the driver Arc so the JoinHandleDropGuard inside
     // ChunkedDriver aborts the still-blocked inner driver task. The
     // production reaper does this via the closure's variable scope
@@ -2100,6 +2121,23 @@ async fn chunked_synchronous_commit_watchdog_fires_on_stalled_completion() {
         failures >= 1,
         "sync-arm watchdog MUST increment commit_failures_total \
          (natural Err path parity with the Async arm). got={failures}",
+    );
+
+    // Contract part 5 (#286 sub-item 2): commit_watchdog_fires_total
+    // incremented (Sync-arm parity with the Async-arm assertion in
+    // `chunked_async_commit_watchdog_fires_on_stalled_completion`).
+    // Without this, the Sync-arm watchdog firing would be
+    // indistinguishable from a natural Err in operator dashboards —
+    // sibling-bug parity gap.
+    let watchdog_fires =
+        metrics.commit_watchdog_fires_total.load(AtomicOrdering::Relaxed);
+    assert!(
+        watchdog_fires >= 1,
+        "sync-arm watchdog fires must be observable as a distinct \
+         metric — operator visibility regression (#286 sub-item 2). \
+         got={watchdog_fires}, but expected >= 1 because the Sync-arm \
+         watchdog Err arm fired above \
+         (commit_failures_total={failures}).",
     );
 
     // Drop the driver Arc so the JoinHandleDropGuard inside
