@@ -163,6 +163,20 @@ impl AcProxyStore {
             .insert(Arc::from(endpoint), store);
     }
 
+    /// Test-and-diagnostic accessor: count of currently-cached worker
+    /// connections. Used by the wipe-callback regression test to
+    /// verify that a registry wipe propagates through the production
+    /// `on_endpoint_wipe` hook into the proxy's connection cache.
+    pub fn cached_connection_count(&self) -> usize {
+        self.worker_connections.read().len()
+    }
+
+    /// Test-and-diagnostic accessor: whether `endpoint` has a cached
+    /// worker connection.
+    pub fn has_cached_connection(&self, endpoint: &str) -> bool {
+        self.worker_connections.read().contains_key(endpoint)
+    }
+
     fn get_worker_connection(&self, endpoint: &str) -> Option<Store> {
         self.worker_connections.read().get(endpoint).cloned()
     }
@@ -241,19 +255,21 @@ impl AcProxyStore {
 
     /// Iterate registered endpoints, returning every worker that has
     /// advertised `digest` in its AC pin set under any `store_id`.
-    /// Iteration cost is O(workers × pins-per-worker) per call — for
-    /// the production fleet (~10 workers × ~100K pins) this snapshots
-    /// per worker but the snapshot is only consulted on the
-    /// inner-NotFound slow path, so the cost is paid only when the
-    /// fast path already missed.
+    /// Per call: one read-lock-and-clone of the endpoint name list
+    /// (`endpoint_counts` retains its keys for iteration) plus one
+    /// `endpoint_holds_digest` per endpoint (single read-lock + linear
+    /// scan, zero allocation). Pre-#277-fixup this used
+    /// `snapshot_endpoint` per endpoint, which allocated a
+    /// `Vec<(Arc<str>, DigestInfo)>` of every pin and sorted it; that
+    /// path produced ~1M Arc bumps + sort per AC NotFound under the
+    /// production fleet (~10 workers × ~100K pins). Now: zero
+    /// allocations beyond the result Vec.
     fn endpoints_holding(&self, digest: &DigestInfo) -> Vec<Arc<str>> {
         let counts = self.registry.endpoint_counts();
-        let mut hits: Vec<Arc<str>> = Vec::new();
+        let mut hits: Vec<Arc<str>> = Vec::with_capacity(counts.len());
         for endpoint in counts.keys() {
-            if let Some(snapshot) = self.registry.snapshot_endpoint(endpoint) {
-                if snapshot.iter().any(|(_, d)| d == digest) {
-                    hits.push(Arc::from(endpoint.as_str()));
-                }
+            if self.registry.endpoint_holds_digest(endpoint, digest) {
+                hits.push(Arc::from(endpoint.as_str()));
             }
         }
         hits

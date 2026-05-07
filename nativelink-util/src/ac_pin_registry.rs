@@ -63,7 +63,13 @@ type EndpointAcPins = HashSet<(Arc<str>, DigestInfo)>;
 /// matches the worker fast-tier capacity ceiling (100K AC entries per
 /// worker × ~10 workers ⇒ ~1M tuples server-wide), which is also the
 /// natural drain point for the BIS-based pin lifecycle.
-#[derive(Debug)]
+/// Callback fired adjacent to [`AcPinRegistry::wipe_endpoint`] so
+/// auxiliary per-endpoint state (e.g. `AcProxyStore::worker_connections`)
+/// can be cleaned up without coupling the consumer of the registry to
+/// every wipe call site. Receives the endpoint string that was just
+/// wiped. Must NOT block on locks held by the registry itself.
+pub type EndpointWipeCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct AcPinRegistry {
     /// Per-endpoint AC pin sets.
     ///
@@ -86,6 +92,27 @@ pub struct AcPinRegistry {
     /// most one `warn!` per [`CAP_DROP_WARN_INTERVAL`] per endpoint,
     /// summarising the drops observed since the last warn.
     cap_drop_warn_state: Mutex<HashMap<String, (Option<Instant>, u64)>>,
+    /// Callbacks fired (after the registry's own wipe completes) on
+    /// every [`Self::wipe_endpoint`] call. Used by `AcProxyStore` to
+    /// drop its cached worker AC connection on boot-epoch flip
+    /// (sibling-of-#194 leak). The hook is generic enough to extend
+    /// to other endpoint-keyed caches without changing every wipe
+    /// call site.
+    endpoint_wipe_callbacks: Mutex<Vec<EndpointWipeCallback>>,
+}
+
+impl core::fmt::Debug for AcPinRegistry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AcPinRegistry")
+            .field("inner", &self.inner)
+            .field("max_entries_per_endpoint", &self.max_entries_per_endpoint)
+            .field("cap_drop_warn_state", &self.cap_drop_warn_state)
+            .field(
+                "endpoint_wipe_callbacks",
+                &self.endpoint_wipe_callbacks.lock().len(),
+            )
+            .finish()
+    }
 }
 
 /// Minimum interval between `warn!`-level cap-exceeded messages for
@@ -107,6 +134,7 @@ impl AcPinRegistry {
             inner: RwLock::new(HashMap::new()),
             max_entries_per_endpoint: DEFAULT_MAX_AC_PINS_PER_ENDPOINT,
             cap_drop_warn_state: Mutex::new(HashMap::new()),
+            endpoint_wipe_callbacks: Mutex::new(Vec::new()),
         }
     }
 
@@ -115,7 +143,18 @@ impl AcPinRegistry {
             inner: RwLock::new(HashMap::new()),
             max_entries_per_endpoint,
             cap_drop_warn_state: Mutex::new(HashMap::new()),
+            endpoint_wipe_callbacks: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register a callback fired after every [`Self::wipe_endpoint`].
+    /// Used by `AcProxyStore` (constructed in the bin) to drop its
+    /// cached worker connection adjacent to the registry wipe. The
+    /// callback fires AFTER the registry's own state has been cleared,
+    /// with the registry's locks released, so it may take other locks
+    /// freely.
+    pub fn on_endpoint_wipe(&self, callback: EndpointWipeCallback) {
+        self.endpoint_wipe_callbacks.lock().push(callback);
     }
 
     /// Register one `(store_id, digest)` AC pin against `endpoint`.
@@ -241,6 +280,13 @@ impl AcPinRegistry {
     pub fn wipe_endpoint(&self, endpoint: &str) {
         self.inner.write().remove(endpoint);
         self.cap_drop_warn_state.lock().remove(endpoint);
+        // Snapshot + release the lock before firing user callbacks to
+        // avoid lock-order surprises if a callback re-enters the
+        // registry (read or write).
+        let callbacks: Vec<_> = self.endpoint_wipe_callbacks.lock().clone();
+        for cb in callbacks {
+            cb(endpoint);
+        }
     }
 
     /// Test/diagnostic accessor: snapshot the current per-endpoint pin
@@ -255,6 +301,23 @@ impl AcPinRegistry {
     /// holding any AC pin entries.
     pub fn endpoint_count(&self) -> usize {
         self.inner.read().len()
+    }
+
+    /// Hot-path accessor: does `endpoint` currently hold ANY AC pin
+    /// entry for `digest` (across all `store_id`s)? Production callers
+    /// (`AcProxyStore::endpoints_holding`) consult this on every
+    /// inner-NotFound to decide which workers to peer-fetch from. With
+    /// ~10 workers × ~100K pins each, the prior `snapshot_endpoint+sort+scan`
+    /// strategy allocated ~1M tuples + sorted them per call; this
+    /// method is a single read-lock + linear scan with zero allocation.
+    /// (A true O(1) reverse index would require a second per-endpoint
+    /// HashMap keyed by digest; deferred until the linear-scan cost
+    /// shows up in profiling.)
+    pub fn endpoint_holds_digest(&self, endpoint: &str, digest: &DigestInfo) -> bool {
+        self.inner
+            .read()
+            .get(endpoint)
+            .is_some_and(|set| set.iter().any(|(_, d)| d == digest))
     }
 
     /// Test/diagnostic accessor: snapshot the AC pin set for `endpoint`,
@@ -321,6 +384,69 @@ mod tests {
         reg.wipe_endpoint("grpc://w1:50081");
         assert_eq!(reg.snapshot_endpoint("grpc://w1:50081"), None);
         assert!(reg.snapshot_endpoint("grpc://w2:50081").is_some());
+    }
+
+    #[test]
+    fn on_endpoint_wipe_callback_fires_with_endpoint_string() {
+        use std::sync::Mutex as StdMutex;
+
+        let reg = AcPinRegistry::new();
+        let calls: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let calls_clone = Arc::clone(&calls);
+        reg.on_endpoint_wipe(Arc::new(move |ep: &str| {
+            calls_clone.lock().unwrap().push(ep.to_string());
+        }));
+
+        // Under-action: callback fires once per wipe with the endpoint.
+        reg.wipe_endpoint("grpc://w1:50081");
+        reg.wipe_endpoint("grpc://w2:50081");
+
+        let observed = calls.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![
+                "grpc://w1:50081".to_string(),
+                "grpc://w2:50081".to_string(),
+            ],
+            "endpoint-wipe callback MUST fire for every wiped endpoint \
+             with the endpoint string — sibling-of-#194 leak: \
+             AcProxyStore connection cache cannot be cleared without \
+             this hook"
+        );
+    }
+
+    #[test]
+    fn endpoint_holds_digest_returns_membership_per_endpoint() {
+        let reg = AcPinRegistry::new();
+        let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(1));
+        reg.register_ac_pin("grpc://w1:50081", store_id.clone(), d(2));
+        reg.register_ac_pin("grpc://w2:50081", store_id, d(3));
+
+        // Under-action: matching endpoint+digest pairs return true.
+        assert!(reg.endpoint_holds_digest("grpc://w1:50081", &d(1)));
+        assert!(reg.endpoint_holds_digest("grpc://w1:50081", &d(2)));
+        assert!(reg.endpoint_holds_digest("grpc://w2:50081", &d(3)));
+
+        // Over-action: cross-endpoint pairs MUST return false. This is
+        // the membership invariant `AcProxyStore::endpoints_holding`
+        // depends on — without it the proxy would peer-fetch from
+        // workers that do not hold the digest, wasting bandwidth and
+        // potentially returning corrupt bytes.
+        assert!(
+            !reg.endpoint_holds_digest("grpc://w1:50081", &d(3)),
+            "endpoint w1 MUST NOT report holding w2's digest — \
+             over-action: per-endpoint set membership leaked across \
+             endpoints"
+        );
+        assert!(
+            !reg.endpoint_holds_digest("grpc://w2:50081", &d(1)),
+            "endpoint w2 MUST NOT report holding w1's digest"
+        );
+        // Unknown endpoint returns false (does not panic / error).
+        assert!(!reg.endpoint_holds_digest("grpc://nope:50081", &d(1)));
+        // Unknown digest returns false.
+        assert!(!reg.endpoint_holds_digest("grpc://w1:50081", &d(99)));
     }
 
     #[test]

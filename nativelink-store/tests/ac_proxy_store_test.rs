@@ -531,3 +531,100 @@ async fn ac_proxy_store_has_does_not_consult_registry() -> Result<(), Error> {
     );
     Ok(())
 }
+
+// -------------------------------------------------------------------
+// Test: AcProxyStore connection cache cleared on registry wipe
+// (sibling-of-#194 leak).
+//
+// Spec: when the production wiring (in `src/bin/nativelink.rs`)
+// connects `AcPinRegistry::on_endpoint_wipe` to
+// `AcProxyStore::remove_worker_endpoint`, a registry wipe MUST also
+// drop the cached worker AC connection for that endpoint. Pre-fixup
+// production held a stale h2 channel per endpoint per boot-epoch
+// flip; over hours of reconnect churn this leaks N stale GrpcStores
+// per AC store. Fix is a callback-based hook on the registry.
+//
+// Asymmetric coverage:
+//   - Under-action (covered): wipe fires but the cached connection
+//     is NOT dropped. Direct assertion via `has_cached_connection`.
+//   - Over-action (covered): wipe fires for endpoint A but ALSO
+//     drops the connection cached against endpoint B. We assert
+//     w2's connection survives the wipe of w1.
+//
+// Mutation step (run during authoring):
+//   1. In `nativelink-util/src/ac_pin_registry.rs::wipe_endpoint`,
+//      remove the `for cb in callbacks { cb(endpoint); }` block.
+//   2. Run this test. Expected: red-fails with the bespoke
+//      "AcProxyStore connection cache MUST be cleared on boot-epoch
+//      wipe — sibling-of-#194 leak" message because
+//      `has_cached_connection("grpc://w1:50081")` still returns
+//      true.
+//   3. Restore.
+// -------------------------------------------------------------------
+#[nativelink_test]
+async fn ac_proxy_store_wipe_callback_clears_connection_cache() -> Result<(), Error> {
+    let endpoint_w1 = "grpc://w1:50081";
+    let endpoint_w2 = "grpc://w2:50081";
+
+    let result = tokio::time::timeout(ASSERT_TIMEOUT, async {
+        let (_wrapper, _inner, registry, proxy) = make_proxy();
+
+        // Wire the production callback shape (mirrors
+        // `src/bin/nativelink.rs`): weak-ref captures the proxy so
+        // the registry doesn't keep the proxy alive past its own
+        // lifetime, and on every wipe the proxy's cached worker
+        // connection for the same endpoint is dropped.
+        let proxy_weak = Arc::downgrade(&proxy);
+        registry.on_endpoint_wipe(Arc::new(move |endpoint: &str| {
+            if let Some(p) = proxy_weak.upgrade() {
+                p.remove_worker_endpoint(endpoint);
+            }
+        }));
+
+        // Inject two cached connections — one for the endpoint
+        // we'll wipe, one that must survive (over-action guard).
+        let stub_a = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let stub_b = Store::new(MemoryStore::new(&MemorySpec::default()));
+        proxy.inject_worker_connection(endpoint_w1, stub_a);
+        proxy.inject_worker_connection(endpoint_w2, stub_b);
+        assert_eq!(
+            proxy.cached_connection_count(),
+            2,
+            "test setup precondition: both connections must be cached \
+             before the wipe fires"
+        );
+
+        // Trigger the wipe for w1 only.
+        registry.wipe_endpoint(endpoint_w1);
+
+        Result::<Arc<AcProxyStore>, Error>::Ok(proxy)
+    })
+    .await;
+    let proxy = result.expect(
+        "wipe_endpoint MUST not deadlock — callback-fire contract violated",
+    )?;
+
+    // Under-action assertion: w1's cached connection is gone.
+    assert!(
+        !proxy.has_cached_connection(endpoint_w1),
+        "AcProxyStore connection cache MUST be cleared on \
+         boot-epoch wipe — sibling-of-#194 leak"
+    );
+
+    // Over-action assertion: w2's cached connection survives the
+    // wipe of w1. Cross-endpoint wipes would over-clear the cache
+    // and leave the proxy unable to fan out to surviving workers.
+    assert!(
+        proxy.has_cached_connection(endpoint_w2),
+        "wipe_endpoint(w1) MUST NOT touch w2's connection — \
+         over-action: cross-endpoint wipe leaked"
+    );
+    assert_eq!(
+        proxy.cached_connection_count(),
+        1,
+        "exactly one connection must remain cached after a single \
+         endpoint wipe — over-action: connection cache cleared too \
+         many entries"
+    );
+    Ok(())
+}

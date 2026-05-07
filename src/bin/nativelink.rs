@@ -407,6 +407,19 @@ async fn inner_main(
                     ac_pin_registry.clone(),
                 )
             };
+            // Register a wipe callback so the proxy's worker_connections
+            // cache is cleared adjacent to the registry wipe on
+            // boot-epoch flip. Captures a Weak<AcProxyStore> so the
+            // callback (held by the registry) does NOT keep the proxy
+            // alive past store_manager's lifetime.
+            let proxy_weak = std::sync::Arc::downgrade(&proxy_arc);
+            ac_pin_registry.on_endpoint_wipe(std::sync::Arc::new(
+                move |endpoint: &str| {
+                    if let Some(p) = proxy_weak.upgrade() {
+                        p.remove_worker_endpoint(endpoint);
+                    }
+                },
+            ));
             let proxy_store = nativelink_util::store_trait::Store::new(proxy_arc);
             store_manager.add_store(store_name, proxy_store);
             info!(
