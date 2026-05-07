@@ -92,8 +92,7 @@ pub struct AcPinRegistry {
 /// the SAME endpoint. Drops between warns are counted and reported in
 /// the next warn's `drops_since_last_warn` field, so no event is lost
 /// — only the per-event log line is suppressed.
-const CAP_DROP_WARN_INTERVAL: core::time::Duration =
-    core::time::Duration::from_secs(60);
+const CAP_DROP_WARN_INTERVAL: core::time::Duration = core::time::Duration::from_secs(60);
 
 /// Default cap on per-endpoint AC pin entries. Sized to the worker's
 /// AC fast-tier capacity (configured today as a 100K-entry MemoryStore
@@ -141,11 +140,7 @@ impl AcPinRegistry {
             // Drop the inner write guard before taking the warn-state
             // mutex to avoid lock-order surprises with future readers.
             drop(guard);
-            self.maybe_warn_cap_drop(
-                endpoint,
-                store_id.as_ref(),
-                cur_len,
-            );
+            self.maybe_warn_cap_drop(endpoint, store_id.as_ref(), cur_len);
             return;
         }
         guard
@@ -161,9 +156,7 @@ impl AcPinRegistry {
     fn maybe_warn_cap_drop(&self, endpoint: &str, store_id: &str, cur_len: usize) {
         let now = Instant::now();
         let mut state = self.cap_drop_warn_state.lock();
-        let entry = state
-            .entry(endpoint.to_string())
-            .or_insert((None, 0));
+        let entry = state.entry(endpoint.to_string()).or_insert((None, 0));
         entry.1 = entry.1.saturating_add(1);
         let should_warn = entry
             .0
@@ -198,11 +191,7 @@ impl AcPinRegistry {
     /// [`fast_slow_store::FastSlowStore::remove_local_ac_pins`]
     /// semantics. O(|set| + |digests|) using a `HashSet<DigestInfo>`
     /// lookup index built once per call.
-    pub fn remove_digests_for_endpoint(
-        &self,
-        endpoint: &str,
-        digests: &[DigestInfo],
-    ) {
+    pub fn remove_digests_for_endpoint(&self, endpoint: &str, digests: &[DigestInfo]) {
         if digests.is_empty() {
             return;
         }
@@ -270,10 +259,7 @@ impl AcPinRegistry {
 
     /// Test/diagnostic accessor: snapshot the AC pin set for `endpoint`,
     /// returning `None` when no entries are present. Allocates one Vec.
-    pub fn snapshot_endpoint(
-        &self,
-        endpoint: &str,
-    ) -> Option<Vec<(Arc<str>, DigestInfo)>> {
+    pub fn snapshot_endpoint(&self, endpoint: &str) -> Option<Vec<(Arc<str>, DigestInfo)>> {
         let guard = self.inner.read();
         guard.get(endpoint).map(|set| {
             let mut out: Vec<_> = set.iter().cloned().collect();
@@ -389,29 +375,22 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn cap_exceeded_emits_rate_limited_warn() {
-        let result = tokio::time::timeout(
-            core::time::Duration::from_secs(5),
-            async {
-                let reg = AcPinRegistry::with_max_entries_per_endpoint(10);
-                let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
-                let endpoint = "grpc://hostile-worker:50081";
-                // Fill to cap.
-                for i in 0..10u8 {
-                    reg.register_ac_pin(endpoint, store_id.clone(), d(i));
-                }
-                // 100 cap-exceeded NEW entries.
-                for i in 100..200u8 {
-                    reg.register_ac_pin(endpoint, store_id.clone(), d(i));
-                }
-                // Cap held: still exactly 10 entries.
-                let snap = reg.snapshot_endpoint(endpoint).unwrap();
-                assert_eq!(
-                    snap.len(),
-                    10,
-                    "cap must hold under cap-exceeded burst"
-                );
-            },
-        )
+        let result = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+            let reg = AcPinRegistry::with_max_entries_per_endpoint(10);
+            let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+            let endpoint = "grpc://hostile-worker:50081";
+            // Fill to cap.
+            for i in 0..10u8 {
+                reg.register_ac_pin(endpoint, store_id.clone(), d(i));
+            }
+            // 100 cap-exceeded NEW entries.
+            for i in 100..200u8 {
+                reg.register_ac_pin(endpoint, store_id.clone(), d(i));
+            }
+            // Cap held: still exactly 10 entries.
+            let snap = reg.snapshot_endpoint(endpoint).unwrap();
+            assert_eq!(snap.len(), 10, "cap must hold under cap-exceeded burst");
+        })
         .await;
         result.expect(
             "cap_exceeded warn path must not deadlock — \
@@ -435,18 +414,13 @@ mod tests {
             let n = lines
                 .iter()
                 .filter(|l| {
-                    l.contains(" WARN ")
-                        && l.contains(
-                            "ac_pin_registry: per-endpoint cap reached",
-                        )
+                    l.contains(" WARN ") && l.contains("ac_pin_registry: per-endpoint cap reached")
                 })
                 .count();
             if n == 0 {
-                Err(
-                    "must observe at least one WARN-level cap-drop event \
+                Err("must observe at least one WARN-level cap-drop event \
                      — promotion from debug! to warn! reverted?"
-                        .to_string(),
-                )
+                    .to_string())
             } else if n <= 2 {
                 Ok(())
             } else {
