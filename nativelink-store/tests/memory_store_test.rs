@@ -12,6 +12,71 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Tests for `MemoryStore`.
+//!
+//! # #284 part 1 — early-reject mutation log
+//!
+//! CLAUDE.md "Test-first development" mandates the mutation step be
+//! RUN — comment out the key line, observe the bespoke red-fail
+//! message, restore. Without it, you cannot claim the test guards
+//! the behavior. The four #284 part 1 tests in this file were each
+//! mutation-verified on 2026-05-06; the outcomes are recorded here
+//! so a future reviewer sees evidence rather than a bare claim.
+//!
+//! ## `update_rejects_upfront_when_declared_size_exceeds_capacity`
+//! (under-action, unit boundary)
+//!
+//!   * **Mutation:** comment out the
+//!     `if let UploadSizeInfo::ExactSize(declared) = size_info { ... }`
+//!     block in `nativelink-store/src/memory_store.rs::update`.
+//!   * **Observed:** test red-fails at line 507 with the bespoke
+//!     `"Timeout means update() blocked on reader.recv() instead of
+//!     returning ResourceExhausted upfront"` message; the 5 s
+//!     `tokio::time::timeout` fires because `MemoryStore::update`
+//!     enters its recv loop and blocks waiting for a chunk that
+//!     never arrives.
+//!
+//! ## `update_rejects_upfront_under_verify_store_does_not_deadlock`
+//! (under-action, production composition)
+//!
+//!   * **Mutation:** same block comment as above.
+//!   * **Observed:** test red-fails with the bespoke `"must not
+//!     deadlock — early-reject must propagate ResourceExhausted
+//!     upfront through VerifyStore"` message; the 5 s timeout fires
+//!     because the inner MemoryStore blocks in its recv loop and
+//!     VerifyStore's `tokio::join!(update_fut, check_fut)` never
+//!     unblocks.
+//!
+//! ## `update_accepts_exactly_capacity_size`
+//! (over-action of the boundary predicate)
+//!
+//!   * **Mutation:** flip `>` to `>=` in
+//!     `nativelink-util/src/moka_evicting_map.rs::would_exceed_capacity`
+//!     (`current_bytes.saturating_add(incoming_kb_bytes) >=
+//!     self.max_bytes`).
+//!   * **Observed:** test red-fails at the bespoke `"exactly-fits
+//!     MUST drain and land, NOT trigger ResourceExhausted"` message
+//!     with `Code::ResourceExhausted` — the boundary `current=0,
+//!     incoming=cap` flips from accept to reject.
+//!
+//! ## `update_max_size_does_not_early_reject_when_payload_fits`
+//! (over-action of the early-reject pattern)
+//!
+//!   * **Mutation:** extend the if-let pattern in
+//!     `memory_store.rs::update` to
+//!     `if let UploadSizeInfo::ExactSize(declared) |
+//!     UploadSizeInfo::MaxSize(declared) = size_info`.
+//!   * **Observed:** test red-fails with the bespoke `"MaxSize
+//!     early-reject MUST NOT fire when the actual payload fits in
+//!     cap"` message — `would_exceed_capacity(3000) = true` (3000
+//!     rounds to ≥ cap=2048) emits `MemoryStoreAtCapacity` for the
+//!     declared upper bound even though the actual 50-byte payload
+//!     would have fit.
+//!
+//! Each mutation was reverted and the test was re-confirmed green
+//! before commit. See the per-test docstrings for the production-
+//! composition rationale and the asymmetric-contract framing.
+
 use core::ops::RangeBounds;
 use core::pin::Pin;
 
