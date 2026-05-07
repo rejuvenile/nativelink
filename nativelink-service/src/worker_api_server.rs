@@ -1184,48 +1184,54 @@ impl WorkerConnection {
         // pins could weaponize the upload short-circuits in
         // `bytestream_server::write` / `cas_server::batch_update_blobs`.
         //
-        // Registers the FULL CURRENT snapshot per worker: the worker
-        // (re-)sends the same field 17 contents every BlobsAvailable
-        // tick, so the registry naturally stays consistent without
-        // delta tracking. Explicit drain is via
-        // `AcPinRegistry::wipe_endpoint` on disconnect / boot-epoch
-        // change AND `AcPinRegistry::remove_digests_for_endpoint` from
-        // the BIS broadcast loop's AC sweep.
-        if !notification.pinned_ac_mirror_entries.is_empty() {
-            if let Some(ref ac_pin_registry) = self.ac_pin_registry {
-                let endpoint = if notification.worker_cas_endpoint.is_empty() {
-                    self.cas_endpoint.as_str()
-                } else {
-                    notification.worker_cas_endpoint.as_str()
-                };
-                if !endpoint.is_empty() {
-                    let count = notification.pinned_ac_mirror_entries.len();
-                    let mut registered: usize = 0;
-                    for entry in &notification.pinned_ac_mirror_entries {
-                        let Some(proto_digest) = entry.digest.as_ref() else {
-                            continue;
-                        };
-                        let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) else {
-                            continue;
-                        };
-                        if entry.store_id.is_empty() {
-                            continue;
-                        }
-                        ac_pin_registry.register_ac_pin(
-                            endpoint,
-                            std::sync::Arc::from(entry.store_id.as_str()),
-                            digest,
-                        );
-                        registered += 1;
+        // **Replace-snapshot semantics.** Field 17 carries the worker's
+        // FULL CURRENT AC pin snapshot every `BlobsAvailable` tick.
+        // The server's per-endpoint set is REPLACED (not additively
+        // merged) with that snapshot via `replace_endpoint_ac_pins`,
+        // so stale entries from prior ticks are dropped on every
+        // tick by construction — no explicit drain channel is needed
+        // for the steady-state registration path. (Endpoint-lifecycle
+        // drains — `wipe_endpoint` on disconnect / boot-epoch flip
+        // and `remove_digests_for_endpoint_in_store` from the
+        // BIS-ack sweep — are still wired separately.)
+        //
+        // Field 17 is processed UNCONDITIONALLY (including when
+        // empty): an empty advertisement means "the worker has no
+        // AC pins this tick" and must clear the per-endpoint row.
+        if let Some(ref ac_pin_registry) = self.ac_pin_registry {
+            let endpoint = if notification.worker_cas_endpoint.is_empty() {
+                self.cas_endpoint.as_str()
+            } else {
+                notification.worker_cas_endpoint.as_str()
+            };
+            if !endpoint.is_empty() {
+                let count = notification.pinned_ac_mirror_entries.len();
+                let mut entries: Vec<(std::sync::Arc<str>, DigestInfo)> =
+                    Vec::with_capacity(count);
+                for entry in &notification.pinned_ac_mirror_entries {
+                    let Some(proto_digest) = entry.digest.as_ref() else {
+                        continue;
+                    };
+                    let Ok(digest) = DigestInfo::try_from(proto_digest.clone()) else {
+                        continue;
+                    };
+                    if entry.store_id.is_empty() {
+                        continue;
                     }
-                    debug!(
-                        worker_id=?self.worker_id,
-                        endpoint,
-                        received=count,
-                        registered,
-                        "BlobsAvailable: recorded pinned_ac_mirror_entries in AcPinRegistry"
-                    );
+                    entries.push((
+                        std::sync::Arc::from(entry.store_id.as_str()),
+                        digest,
+                    ));
                 }
+                let registered = entries.len();
+                ac_pin_registry.replace_endpoint_ac_pins(endpoint, &entries);
+                debug!(
+                    worker_id=?self.worker_id,
+                    endpoint,
+                    received=count,
+                    registered,
+                    "BlobsAvailable: replaced pinned_ac_mirror_entries snapshot in AcPinRegistry"
+                );
             }
         }
 
