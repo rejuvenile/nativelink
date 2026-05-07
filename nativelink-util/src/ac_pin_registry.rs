@@ -35,6 +35,100 @@
 //!
 //! See `nativelink-proto/.../worker_api.proto:BlobsAvailableNotification.
 //! pinned_ac_mirror_entries (field 17)` for the wire contract.
+//!
+//! # AC pin drain semantics
+//!
+//! The registry's per-endpoint AC pin sets are kept consistent with
+//! worker truth via SIX mechanisms. The first is the steady-state
+//! convergence path; the rest cover endpoint-lifecycle and
+//! eventual-consistency drift.
+//!
+//! 1. **Field-17 replace-snapshot.** Every `BlobsAvailable` tick
+//!    carries the worker's FULL CURRENT AC pin set in field 17. The
+//!    server's per-endpoint set is REPLACED atomically with that
+//!    snapshot via [`AcPinRegistry::replace_endpoint_ac_pins`] (called
+//!    from the field-17 handler at
+//!    `nativelink-service/src/worker_api_server.rs:1227`). Stale
+//!    entries from prior ticks are dropped on every tick by
+//!    construction — no explicit drain channel is needed for the
+//!    steady-state registration path. This supersedes the historical
+//!    additive [`AcPinRegistry::register_ac_pin`] shape; per
+//!    `a2cb1db2` the symmetric `unregister_ac_pin` was removed when
+//!    no production caller needed it, and replace-snapshot makes
+//!    explicit single-pin unregister unnecessary on the registration
+//!    path. `register_ac_pin` remains in the public API for tests
+//!    and diagnostics that need additive insertion.
+//!
+//! 2. **`wipe_endpoint` on connection lifecycle events.**
+//!    [`AcPinRegistry::wipe_endpoint`] is called from
+//!    `worker_api_server.rs:531` (boot-epoch-flip on reconnect: the
+//!    worker process is fresh, so its AC pin slate starts empty) and
+//!    `:912` (disconnect cleanup: the worker is gone, so its
+//!    advertised pins MUST not survive). Both paths fire
+//!    independently — the boot-epoch wipe holds the
+//!    `endpoint_state` mutex during the wipe so a racing disconnect
+//!    cleanup observes a fully-wiped state, never a partial one. The
+//!    [`AcPinRegistry::on_endpoint_wipe`] callback hook also fires
+//!    (used by `AcProxyStore` to drop its cached worker connection
+//!    adjacent to the registry wipe — sibling-of-#194).
+//!
+//! 3. **Per-endpoint cap.** [`DEFAULT_MAX_AC_PINS_PER_ENDPOINT`]
+//!    bounds the per-endpoint set size. Both
+//!    [`AcPinRegistry::register_ac_pin`] and
+//!    [`AcPinRegistry::replace_endpoint_ac_pins`] honour the cap;
+//!    over-cap entries are silently dropped with a single
+//!    rate-limited cap-drop warn (per
+//!    [`CAP_DROP_WARN_INTERVAL`], per endpoint). The cap is the
+//!    backstop against a buggy or hostile worker; under healthy
+//!    operation it should never fire.
+//!
+//! 4. **BIS-ack drain via [`AcPinRegistry::remove_digests_for_endpoint_in_store`].**
+//!    When the server's slow-tier AC write completes and the
+//!    `BlobsInStableStorage` broadcast fires, the AC sweep walks
+//!    `endpoint_counts()` keys and removes the matching
+//!    `(endpoint, store_id, digest)` entries from the registry
+//!    (`src/bin/nativelink.rs:884`). Mirrors the worker-side
+//!    `FastSlowStore::remove_local_ac_pins` drain from the same BIS
+//!    broadcast — both sides converge on the BIS ack.
+//!
+//! 5. **AcProxyStore peer-fetch lazy prune.** When an AC peer-fetch
+//!    against a worker selected via the registry returns
+//!    `Code::NotFound`, the matching `(endpoint, digest)` is
+//!    removed from the registry across all `store_id`s
+//!    (`nativelink-store/src/ac_proxy_store.rs:354`). This closes
+//!    the worker-fast-tier-eviction-vs-pin gap without a writer-side
+//!    hook — the reader discovers the staleness when it tries to
+//!    consume the pin, and the next reader skips straight to the
+//!    next holder.
+//!
+//! 6. **Worker-side failure-prune via
+//!    [`fast_slow_store::FastSlowStore::remove_local_ac_pin_on_failure`].**
+//!    When `running_actions_manager::upload_ac_results`
+//!    (`nativelink-worker/src/running_actions_manager.rs:4270`) sees
+//!    `update_oneshot` return Err on the AC store, the matching
+//!    `(store_id, digest)` is pruned from the worker's
+//!    `dispatched_mirror_pins` BEFORE the err_tip-wrapped error
+//!    propagates. The next `BlobsAvailable` tick's field-17
+//!    snapshot omits the failed entry, and mechanism 1
+//!    (replace-snapshot) drops it from the server registry on that
+//!    tick. Sibling of CAS's `failed_slow_writes`-on-Err arm in
+//!    `fast_slow_store.rs:948` (chunked-dispatcher path).
+//!
+//! # Open work — slow-tier asynchronous AC failure
+//!
+//! Mechanism 6 covers the synchronous Err path of
+//! `ac_store.update_oneshot()` (typically a fast-tier failure).
+//! The slow-tier ASYNCHRONOUS failure case is NOT yet covered:
+//! when `update_oneshot` returns Ok on fast-tier success but the
+//! spawned slow-tier write later fails, no failure-prune fires
+//! today. Wiring that requires hooking into
+//! `FastSlowStore::update`'s spawn-detach Err arm — the CAS analog
+//! at `:948`. Tracked under the same #279 umbrella; the AC story
+//! should converge on the same shape as #287's CAS-side
+//! `failed_slow_writes` consumer (`fef138fb`: "drain server-side
+//! failed_slow_writes via UploadMissingBlobs"; per its commit
+//! message, "AC + worker-AC analogs are separate" — that work
+//! lands as a follow-up).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
