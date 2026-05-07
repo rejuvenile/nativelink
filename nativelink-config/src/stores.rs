@@ -1830,3 +1830,38 @@ impl Retry {
         }
     }
 }
+
+/// Operator knobs for the process-wide AC pin registry. The registry caps
+/// per-endpoint AC pin entries to bound server memory under a misbehaving
+/// or compromised worker that advertises an unbounded pin set.
+///
+/// Why expose this: the default sizes the cap to a worker's AC fast-tier
+/// capacity (~100K-entry MemoryStore × ~10 workers = ~1M tuples
+/// server-wide), but a deployment with substantially larger or smaller
+/// AC fast tiers, or a different worker count, must be able to
+/// re-tension the cap without rebuilding. Hardcoding the cap turns a
+/// capacity-planning decision into a code change.
+///
+/// The cap defaults to [`nativelink_util::ac_pin_registry::DEFAULT_MAX_AC_PINS_PER_ENDPOINT`]
+/// (1_000_000). Unset = use the default.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct AcPinRegistryConfig {
+    /// Maximum number of `(store_id, digest)` AC pin tuples retained per
+    /// connected worker endpoint before the registry silently drops new
+    /// entries. The drop is logged at `warn!` and rate-limited; entries
+    /// are recoverable via the worker's next periodic `BlobsAvailable`
+    /// resync, so a transient spike above the cap surfaces as a
+    /// visibility delay rather than data loss.
+    ///
+    /// Set to bound server memory in the worst case
+    /// (compromised / misbehaving worker advertising an unbounded pin
+    /// set). Default: 1_000_000 — see
+    /// [`nativelink_util::ac_pin_registry::DEFAULT_MAX_AC_PINS_PER_ENDPOINT`].
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub max_entries_per_endpoint: Option<usize>,
+}
