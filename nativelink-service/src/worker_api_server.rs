@@ -1206,20 +1206,24 @@ impl WorkerConnection {
             };
             if !endpoint.is_empty() {
                 let count = notification.pinned_ac_mirror_entries.len();
-                // Clamp the pre-allocation to the per-endpoint cap to
-                // bound memory under a hostile or buggy worker. A
-                // 100M-entry advertisement would otherwise pre-allocate
-                // ~3.2 GB on a process that has shipped OOMs (red-team
-                // 2026-05-07 retro-cadre BLOCK on #278). The registry's
-                // `replace_endpoint_ac_pins` enforces the same cap on
-                // the retained set; clamping at the caller bounds the
-                // intermediate Vec at the same shape.
-                let cap_hint = count.min(
-                    nativelink_util::ac_pin_registry::DEFAULT_MAX_AC_PINS_PER_ENDPOINT,
-                );
+                // Hard-cap the intermediate `entries` Vec at the
+                // per-endpoint cap. Pre-allocating with `with_capacity`
+                // is just a hint — without an explicit length check
+                // inside the push loop, a hostile worker advertising
+                // 100M entries grows `entries` to 100M before
+                // `replace_endpoint_ac_pins` can truncate, defeating
+                // the OOM bound the doc-comment claimed. Audit
+                // 2026-05-07 retro-cadre fixup follow-up.
+                let cap = nativelink_util::ac_pin_registry::DEFAULT_MAX_AC_PINS_PER_ENDPOINT;
+                let cap_hint = count.min(cap);
                 let mut entries: Vec<(std::sync::Arc<str>, DigestInfo)> =
                     Vec::with_capacity(cap_hint);
+                let mut over_cap_dropped: usize = 0;
                 for entry in &notification.pinned_ac_mirror_entries {
+                    if entries.len() >= cap {
+                        over_cap_dropped += 1;
+                        continue;
+                    }
                     let Some(proto_digest) = entry.digest.as_ref() else {
                         continue;
                     };
@@ -1233,6 +1237,16 @@ impl WorkerConnection {
                         std::sync::Arc::from(entry.store_id.as_str()),
                         digest,
                     ));
+                }
+                if over_cap_dropped > 0 {
+                    tracing::warn!(
+                        endpoint,
+                        cap,
+                        received = count,
+                        over_cap_dropped,
+                        "BlobsAvailable: pinned_ac_mirror_entries exceeds per-endpoint cap; \
+                         truncating at caller (defense-in-depth — registry replace also caps)"
+                    );
                 }
                 let registered = entries.len();
                 ac_pin_registry.replace_endpoint_ac_pins(endpoint, &entries);
