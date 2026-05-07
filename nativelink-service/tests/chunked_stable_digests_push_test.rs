@@ -75,12 +75,17 @@
 
 #![cfg(feature = "chunked_fast_slow")]
 
+use core::pin::Pin;
 use core::time::Duration;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreSpec};
+use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
+use nativelink_metric::MetricsComponent;
 use nativelink_service::chunked_write_handler::{
     BazelChunkedDispatcherImpl, ChunkedWriteHandlerMetrics, ChunkedWriteInFlight, CommitMode,
     PreparedChunk, dispatch_bazel_facing_internal_chunking, dispatch_chunks_to_driver,
@@ -95,9 +100,13 @@ use nativelink_store::chunked::{
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
-use nativelink_util::buf_channel::make_buf_channel_pair_with_size;
+use nativelink_util::buf_channel::{DropCloserReadHalf, make_buf_channel_pair_with_size};
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::{Store, StoreDriver, StoreLike, UploadSizeInfo};
+use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+use nativelink_util::store_trait::{
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
+};
 use sha2::{Digest as _, Sha256};
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -1064,4 +1073,430 @@ async fn chunked_async_commit_failure_inserts_failed_writes_and_repins() {
     );
 
     disable_bazel_facing_internal_chunking();
+}
+
+// =============================================================================
+// #283 fixup MAJOR-3 — pin-observable fast tier
+// =============================================================================
+//
+// `PinCountingFastStore` wraps a `MemoryStore` and counts every
+// `pin_digests` invocation. The earlier `chunked_async_commit_failure_*`
+// test asserted re-pin via `has_with_results`, which is satisfied by
+// the upstream `FastSlowStore::update`'s tee into the fast tier
+// REGARDLESS of whether `failed_commit_sink` (and therefore the
+// `pin_digests` call inside `failed_writes_inserter`) ran. Commenting
+// out `fast_store.pin_digests(&[d])` in `failed_writes_inserter`
+// (`fast_slow_store.rs:750`) would NOT red-fail that test — the re-pin
+// half of the contract was unguarded. The wrapper below directly
+// observes the pin call so the mutation step actually red-fails when
+// the sink call is removed.
+//
+// MemoryStore declares `PinDelegation::Leaf`; default `pin_digests`
+// is a silent no-op. We override it to increment the counter; the
+// rest of the trait is forwarded to the inner `MemoryStore`.
+
+#[derive(MetricsComponent)]
+struct PinCountingFastStore {
+    inner: Arc<MemoryStore>,
+    pin_calls: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl StoreDriver for PinCountingFastStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        Pin::new(self.inner.as_ref())
+            .has_with_results(digests, results)
+            .await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        digest: StoreKey<'_>,
+        reader: DropCloserReadHalf,
+        size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        Pin::new(self.inner.as_ref())
+            .update(digest, reader, size_info)
+            .await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut nativelink_util::buf_channel::DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        Pin::new(self.inner.as_ref())
+            .get_part(key, writer, offset, length)
+            .await
+    }
+
+    fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+        self
+    }
+
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        // Leaf — we provide our own (counting) `pin_digests` impl
+        // below. Declaring `Leaf` matches MemoryStore's classification
+        // and routes `Store::pin_digests` straight into our override
+        // (rather than recursing into the inner store).
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+
+    /// Override of the default `pin_digests`: count every call so the
+    /// test can assert the `failed_commit_sink` actually invoked it.
+    /// Without this override, `PinDelegation::Leaf` would route to the
+    /// trait default (no-op for non-pinning leaves) and we'd be no
+    /// better than the bare MemoryStore.
+    fn pin_digests(&self, digests: &[DigestInfo]) {
+        self.pin_calls
+            .fetch_add(digests.len() as u64, AtomicOrdering::Relaxed);
+    }
+}
+
+default_health_status_indicator!(PinCountingFastStore);
+
+/// Production-composition fixture variant: identical to
+/// `make_e2e_fast_slow_with_sink` except the fast tier is a
+/// `PinCountingFastStore` instead of a bare `MemoryStore`. Returns
+/// the `(FastSlowStore, pin_calls counter)` so tests can observe pin
+/// invocations directly.
+async fn make_e2e_fast_slow_with_sink_and_pin_counter(
+    chunk_size: usize,
+) -> (Arc<FastSlowStore>, Arc<AtomicU64>) {
+    let fs_store = make_filesystem_store().await;
+    let pin_calls = Arc::new(AtomicU64::new(0));
+    let counting_fast = Arc::new(PinCountingFastStore {
+        inner: MemoryStore::new(&MemorySpec::default()),
+        pin_calls: Arc::clone(&pin_calls),
+    });
+    let fast_store: Store = Store::new(counting_fast);
+    let slow_store: Store = Store::new(fs_store.clone());
+    let fast_slow = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Filesystem(FilesystemSpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast_store,
+        slow_store,
+    );
+
+    let registry = ChunkedReadRegistry::new();
+    let in_flight = ChunkedWriteInFlight::new();
+    let chunk_budget = make_test_chunk_budget();
+    let pin_budget = make_test_pin_budget(64 * 1024 * 1024);
+    let dispatcher = Arc::new(
+        BazelChunkedDispatcherImpl::new_with_state_and_pin_budget_for_test(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            chunk_budget,
+            pin_budget,
+            chunk_size,
+        )
+        .with_registry(Arc::clone(&registry))
+        .with_in_flight_tracking(
+            fast_slow.chunked_in_flight_digests_handle(),
+            fast_slow.in_flight_empty_notify_handle(),
+        )
+        .with_stable_digests_sink(fast_slow.stable_digests_pusher())
+        .with_failed_commit_sink(fast_slow.failed_writes_inserter()),
+    );
+    fast_slow.set_chunked_read_registry(Arc::clone(&registry));
+    fast_slow
+        .set_bazel_chunked_dispatcher(Arc::clone(&dispatcher) as Arc<dyn BazelChunkedDispatcher>);
+    fast_slow.set_chunked_size_threshold_for_test(chunk_size as u64);
+
+    (fast_slow, pin_calls)
+}
+
+/// **#283 fixup MAJOR-3** — direct re-pin observation for the
+/// AsyncCommit failure path. Replaces the indirect `has_with_results`
+/// assertion that the original test used (which was satisfied by the
+/// FSS::update tee regardless of whether `pin_digests` ran).
+///
+/// **Mutation step (verified at test authorship time):** comment out
+/// the `fast_store.pin_digests(&[digest])` call in
+/// `FastSlowStore::failed_writes_inserter` (`fast_slow_store.rs:750`).
+/// This test red-fails with the bespoke `pin_calls == 0` message; the
+/// `failed_slow_writes` insert still fires (so the previous test still
+/// passes), confirming this assertion guards the re-pin half of the
+/// contract specifically.
+#[nativelink_test]
+async fn chunked_async_commit_failure_actually_calls_pin_digests() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 4;
+    const SIZE: usize = N * CHUNK;
+
+    let actual_blob: Vec<u8> = (0..SIZE).map(|i| (i * 13) as u8).collect();
+    let lying_blob: Vec<u8> = vec![0u8; SIZE];
+    let lying_digest = DigestInfo::new(sha256(&lying_blob), SIZE as u64);
+
+    let _guard = kill_switch_lock().lock().await;
+    enable_bazel_facing_internal_chunking();
+
+    let (fast_slow, pin_calls) = make_e2e_fast_slow_with_sink_and_pin_counter(CHUNK).await;
+
+    let _admit_res = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_update(&fast_slow, lying_digest, Bytes::from(actual_blob)),
+    )
+    .await
+    .expect("must not deadlock — chunked admission should complete in 10s");
+
+    // Wait for chunked in-flight set to drain (reaper completion signal).
+    let chunked_set = fast_slow.as_ref().chunked_in_flight_digests_handle();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if chunked_set.lock().is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("must not deadlock — chunked in-flight set must drain after reaper");
+
+    // failed_slow_writes insert fired → upstream `failed_writes_inserter`
+    // closure ran. The closure also calls `fast_store.pin_digests(&[d])`;
+    // PinCountingFastStore counts every such invocation.
+    assert!(
+        fast_slow.failed_slow_writes_contains(&lying_digest),
+        "precondition for the pin-call assertion: the failed_commit_sink \
+         closure must have run (insert must be observable). If THIS \
+         assertion fails, the AsyncCommit reaper Err arm regressed — \
+         see chunked_async_commit_failure_inserts_failed_writes_and_repins.",
+    );
+
+    // Expected pin_calls breakdown for AsyncCommit FAILURE path:
+    //   1. update_via_chunked_dispatcher post-admission pin
+    //      (fast_slow_store.rs:904) — fires once after admission.
+    //   2. failed_commit_sink's pin_digests inside
+    //      failed_writes_inserter (fast_slow_store.rs:750) — fires
+    //      from the reaper Err arm. THIS is the call the test guards.
+    //
+    // Total >= 2 with the fix; == 1 if the sink's pin_digests is
+    // removed (mutation step), so the assertion red-fails directly.
+    let pin_calls_after_reaper = pin_calls.load(AtomicOrdering::Relaxed);
+    assert!(
+        pin_calls_after_reaper >= 2,
+        "fast_store.pin_digests MUST be called BOTH by the post-admission \
+         path in update_via_chunked_dispatcher (fast_slow_store.rs:904) \
+         AND by the failed_commit_sink closure when the AsyncCommit \
+         reaper observes commit FAILURE (fast_slow_store.rs:750 inside \
+         failed_writes_inserter). Total expected: >= 2. Got: \
+         {pin_calls_after_reaper}. If == 1, only the post-admission pin \
+         fired — the failed_commit_sink's re-pin (which protects the \
+         in-memory replica from eviction between commit-failure and the \
+         next reconnect-retry) is missing. Without it, MemoryStore \
+         eviction (or, in production with FilesystemStore fast tier, \
+         the 120s pin TTL) could drop the blob before \
+         drain_failed_digests fires, undoing the failed_slow_writes \
+         insert's recovery purpose.",
+    );
+
+    disable_bazel_facing_internal_chunking();
+}
+
+// =============================================================================
+// #283 fixup MAJOR-1 — Synchronous-arm failure bookkeeping
+// =============================================================================
+
+/// **#283 fixup MAJOR-1** — chunked Synchronous commit FAILURE MUST
+/// fire the `failed_commit_sink`. The Synchronous arm is reachable
+/// from production via the `WriteChunked` RPC handler. Pre-fix, the
+/// Synchronous Err branch returned the error WITHOUT firing the sink
+/// — same parity gap that #283 closed for AsyncCommit, just on the
+/// sibling code path.
+///
+/// **Drive path:** `dispatch_chunks_to_driver(CommitMode::Synchronous)`
+/// directly with a lying digest (declared SHA-256 ≠ actual bytes).
+/// The driver's `await_completion()` returns `Err(InvalidArgument,
+/// "end-to-end SHA-256 mismatch")`. Per the fix, the Synchronous arm
+/// invokes `failed_commit_sink(stream_digest)` BEFORE the in_flight
+/// removal, mirroring the AsyncCommit reaper's ordering.
+///
+/// **Production composition:** real `FastSlowStore` provides the
+/// `failed_writes_inserter()` closure that captures `failed_slow_writes`
+/// AND `fast_store` (a `PinCountingFastStore` so we can count
+/// `pin_digests` invocations directly). The closure is the SAME shape
+/// that `wire_bazel_chunked_dispatcher` installs in production.
+///
+/// **Mutation step (verified at test authorship time):** comment out
+/// the `failed_commit_sink` call inside the new `if commit_result.is_err()`
+/// block in the `Synchronous` arm of `dispatch_chunks_to_driver`. This
+/// test red-fails with the `failed_slow_writes_contains` assertion AND
+/// the `pin_calls > 0` assertion — both halves of the contract are
+/// guarded.
+#[nativelink_test]
+async fn chunked_synchronous_commit_failure_inserts_failed_writes_and_repins() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 3;
+    const SIZE: usize = N * CHUNK;
+
+    // Lying digest: declared hash is for all-zero bytes; we'll feed
+    // chunks whose actual content is non-zero. Per-chunk SHA is
+    // computed from the actual bytes (so admission succeeds); the
+    // driver's e2e SHA verify mismatches at commit.
+    let actual_blob: Vec<u8> = (0..SIZE).map(|i| (i * 19) as u8).collect();
+    let lying_blob: Vec<u8> = vec![0u8; SIZE];
+    let lying_digest = DigestInfo::new(sha256(&lying_blob), SIZE as u64);
+
+    // Build a fresh FilesystemStore slow tier + FastSlowStore (with
+    // the PinCountingFastStore as the fast tier) so we can pull the
+    // production-shaped `failed_writes_inserter()` closure.
+    let fs_store = make_filesystem_store().await;
+    let pin_calls = Arc::new(AtomicU64::new(0));
+    let counting_fast = Arc::new(PinCountingFastStore {
+        inner: MemoryStore::new(&MemorySpec::default()),
+        pin_calls: Arc::clone(&pin_calls),
+    });
+    let fast_store: Store = Store::new(counting_fast);
+    let slow_store: Store = Store::new(fs_store.clone());
+    let fast_slow = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Filesystem(FilesystemSpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Pre-flight: failed-writes empty, no pin calls yet.
+    assert!(
+        !fast_slow.failed_slow_writes_contains(&lying_digest),
+        "fixture invariant: failed_slow_writes starts empty",
+    );
+    assert_eq!(
+        pin_calls.load(AtomicOrdering::Relaxed),
+        0,
+        "fixture invariant: no pin_digests calls before the commit attempt",
+    );
+
+    // Build per-chunk PreparedChunks from the ACTUAL bytes (so each
+    // chunk's per-chunk SHA matches what the driver computes and
+    // admits). Only the e2e SHA verify at commit will mismatch.
+    let chunks: Vec<Result<PreparedChunk, nativelink_error::Error>> = (0..N)
+        .map(|i| {
+            let chunk_bytes = Bytes::copy_from_slice(&actual_blob[i * CHUNK..(i + 1) * CHUNK]);
+            Ok(PreparedChunk {
+                chunk_offset: (i * CHUNK) as u64,
+                chunk_sha256: sha256(&chunk_bytes),
+                chunk_bytes,
+                finish: i == N - 1,
+            })
+        })
+        .collect();
+    let stream = Box::pin(futures::stream::iter(chunks));
+
+    let in_flight = ChunkedWriteInFlight::new();
+    let chunk_budget = make_test_chunk_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+
+    // Pull the production-shaped failed-commit closure out of the FSS.
+    // Same shape `wire_bazel_chunked_dispatcher` installs.
+    let failed_sink = fast_slow.as_ref().failed_writes_inserter();
+    let stable_sink = fast_slow.as_ref().stable_digests_pusher();
+
+    // Drive Synchronous commit. The driver's e2e verify mismatches and
+    // returns Err; the Synchronous arm's new `if commit_result.is_err()`
+    // block fires `failed_sink(lying_digest)` BEFORE the in_flight
+    // removal, then propagates the Err via `return Err(err)`.
+    let res = tokio::time::timeout(
+        Duration::from_secs(10),
+        dispatch_chunks_to_driver(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            chunk_budget,
+            None, // pin_budget
+            None, // chunked_read_registry
+            Some(stable_sink),
+            Some(failed_sink),
+            CHUNK,
+            lying_digest,
+            stream,
+            CommitMode::Synchronous,
+            metrics,
+        ),
+    )
+    .await
+    .expect(
+        "must not deadlock — Synchronous dispatch_chunks_to_driver must \
+         complete (with Err) within 10s",
+    );
+
+    assert!(
+        res.is_err(),
+        "Synchronous commit MUST return Err for a lying digest; got \
+         Ok({res:?}) — the e2e SHA-256 verify failed to fire",
+    );
+
+    // (1) failed_slow_writes MUST contain the digest (under-action of
+    //     the `failed_slow_writes.insert(...)` half of the closure).
+    assert!(
+        fast_slow.failed_slow_writes_contains(&lying_digest),
+        "Synchronous chunked-commit Err arm MUST insert into \
+         failed_slow_writes — sibling-bug parity with the AsyncCommit \
+         Err arm at chunked_write_handler.rs:1745-1749 violated. The \
+         Synchronous arm at :1604-1620 returned Err WITHOUT firing \
+         failed_commit_sink before this fix landed; the WriteChunked \
+         RPC path would lose track of failed slow-tier writes and the \
+         worker reconnect-retry (drain_failed_digests) would have \
+         nothing to retry.",
+    );
+
+    // (2) fast_store.pin_digests MUST have been called at least once
+    //     (under-action of the re-pin half of the closure).
+    let pin_calls_after = pin_calls.load(AtomicOrdering::Relaxed);
+    assert!(
+        pin_calls_after > 0,
+        "Synchronous chunked-commit Err arm MUST invoke fast_store.\
+         pin_digests via failed_writes_inserter (re-pin half of the \
+         contract). Without this, the in-memory replica can be evicted \
+         between commit-failure and the next reconnect-retry. \
+         pin_calls_after={pin_calls_after}",
+    );
+
+    // Ensure the cleanup_guard / in_flight removal happened: the entry
+    // for our digest must NOT still be present (the Sync arm removes
+    // in_flight AFTER firing the sink in the new code).
+    assert!(
+        !in_flight.contains_digest(&lying_digest),
+        "Synchronous arm MUST remove the in_flight entry after firing \
+         the failed_commit_sink (cleanup ordering bug — sink fires, \
+         then in_flight is removed, then Err is returned).",
+    );
 }
