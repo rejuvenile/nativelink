@@ -382,6 +382,41 @@ async fn inner_main(
         names
     };
 
+    // Wrap each AC store with AcProxyStore so an inner-NotFound on
+    // the AC chain transparently consults the AcPinRegistry and
+    // peer-fetches the AC entry bytes from the worker that pinned
+    // them. The wrap MUST happen here — after the CAS wrap loop and
+    // after `ac_pin_registry` is constructed — so the wrapper is in
+    // place before any service handler binds to the store via
+    // `store_manager.get_store(...)`. AcServer is opaque to the
+    // wrapper (it consumes a `Store`); no handler change is needed.
+    //
+    // The wrapper is a no-op when no AC pin registry is wired (tests
+    // / standalone). Production always supplies one.
+    for store_name in &ac_store_names {
+        if let Some(original_store) = store_manager.get_store(store_name) {
+            let proxy_arc = if let Some(ref tls) = worker_proxy_tls {
+                nativelink_store::ac_proxy_store::AcProxyStore::new_with_tls(
+                    original_store,
+                    ac_pin_registry.clone(),
+                    tls.clone(),
+                )
+            } else {
+                nativelink_store::ac_proxy_store::AcProxyStore::new(
+                    original_store,
+                    ac_pin_registry.clone(),
+                )
+            };
+            let proxy_store = nativelink_util::store_trait::Store::new(proxy_arc);
+            store_manager.add_store(store_name, proxy_store);
+            info!(
+                store_name,
+                worker_proxy_tls = worker_proxy_tls.is_some(),
+                "wrapped AC store with AcProxyStore for peer AC entry sharing"
+            );
+        }
+    }
+
     let mut action_schedulers = HashMap::new();
     let mut worker_schedulers = HashMap::new();
     for SchedulerConfig { name, spec } in cfg.schedulers.iter().flatten() {
