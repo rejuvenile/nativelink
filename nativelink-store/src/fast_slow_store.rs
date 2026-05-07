@@ -32,6 +32,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use nativelink_config::stores::{FastSlowSpec, StoreDirection};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard, make_buf_channel_pair_with_size,
 };
@@ -2385,13 +2386,34 @@ impl FastSlowStore {
             "populate join3 returned",
         );
 
-        // #284 part 2: detect at-capacity cache-tee miss. When the
-        // mid-stream `fast_tx.send` failed AND the fast store rejected
-        // with `Code::ResourceExhausted` carrying a `BackpressureSignal`
-        // discriminator (typically MemoryStoreAtCapacity), we treat the
-        // event as a "lost cache-tee opportunity" — the consumer still
-        // reads every byte through the streaming buffer. This is split
-        // into two terminal states below:
+        // #284 part 2: detect at-capacity cache-tee miss. The demotion
+        // to clean consumer EOF MUST be narrow — it fires ONLY when ALL
+        // four conditions hold:
+        //   1. `cache_tee_disabled` — `fast_tx.send` errored mid-stream
+        //      (we already saw the rejection on the producer side).
+        //   2. `data_stream_res.is_ok()` — the producer's slow→consumer
+        //      forwarding loop ran to completion (no upstream error).
+        //   3. `slow_res.is_ok()` — the slow store delivered every byte
+        //      cleanly (no mid-stream gRPC drop, no NotFound).
+        //   4. `fast_res` is `ResourceExhausted` carrying SPECIFICALLY
+        //      `BackpressureSignal::MemoryStoreAtCapacity` (NOT any
+        //      other `BackpressureSignal::Reason`, NOT a bare
+        //      `ResourceExhausted` without the discriminator).
+        //
+        // Why all four:
+        // - Without (2) or (3): the slow tier short-circuited mid-stream.
+        //   The consumer received a partial blob; demoting to clean EOF
+        //   would silently truncate (the BLOCK that distributed-systems
+        //   review caught against an earlier `cache_tee_disabled &&
+        //   fast_res-only` predicate — silent digest mismatch shipping
+        //   under cache-tee-at-cap × slow-tier-failure).
+        // - Without (4): a future fast-tier store kind (e.g. tiered
+        //   local SSD ExistenceCache) returning `ResourceExhausted` for
+        //   `disk-full` would spuriously trigger the demotion (red-team
+        //   blind-spot — over-broad `error_has_backpressure_signal`
+        //   would mask any future backpressure flavour as benign).
+        //
+        // The two terminal states below are SPLIT:
         //   * `merged` (returned to populator caller): keeps the at-cap
         //     Err so `copy_slow_to_fast` callers know the populate did
         //     NOT land in fast tier.
@@ -2399,10 +2421,27 @@ impl FastSlowStore {
         //     becomes Ok so `get_part`-style consumers see clean EOF
         //     instead of a poisoned stream + abort.
         let cache_tee_at_cap = cache_tee_disabled
+            && data_stream_res.is_ok()
+            && slow_res.is_ok()
             && fast_res.as_ref().is_err_and(|e| {
                 e.code == Code::ResourceExhausted
-                    && crate::chunked_signal::error_has_backpressure_signal(e)
+                    && crate::chunked_signal::error_has_backpressure_reason(
+                        e,
+                        &[backpressure_signal::Reason::MemoryStoreAtCapacity],
+                    )
             });
+        if cache_tee_at_cap {
+            // Operator-visible counter (red-team observability gap).
+            // A single Prometheus-style counter is the smallest signal
+            // an SRE can alert on without grepping log lines: the rate
+            // of skipped cache-tees IS the degradation indicator. The
+            // accompanying `warn!` above identifies the affected key;
+            // this counter quantifies the rate fleet-wide.
+            arc_self
+                .metrics
+                .cache_tee_disabled_at_cap_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
 
         // Compose the producer's terminal status. NotFound from the
         // slow store wins (matches prior behavior); else any failure is
@@ -4969,6 +5008,22 @@ struct FastSlowStoreMetrics {
     /// regression.
     #[metric(help = "Count of tokio::spawn issued by the populate machinery")]
     populate_spawn_count: AtomicU64,
+    /// #284 part 2: incremented every time the populator demoted a
+    /// fast-tier `MemoryStoreAtCapacity` rejection to a clean consumer
+    /// EOF (cache-tee skipped, slow-tier bytes still delivered). The
+    /// rate-of-change of this counter IS the cache-tee degradation
+    /// signal — alert on it growing > 0 to detect periods where the
+    /// fast tier is at-capacity for long enough to elevate read
+    /// latency. Without this counter, the only operator signal is the
+    /// `warn!` line per event drowned in production log volume
+    /// (red-team observability gap, 2026-05-06 #284 part 2).
+    ///
+    /// Counted strictly in the `cache_tee_at_cap` true-branch — a
+    /// fast-tier rejection that does NOT match the discriminator-narrow
+    /// predicate (slow tier ALSO failed, or backpressure reason was not
+    /// MemoryStoreAtCapacity) does NOT bump this counter.
+    #[metric(help = "Count of populates that skipped fast-tier cache-tee due to MemoryStoreAtCapacity")]
+    cache_tee_disabled_at_cap_count: AtomicU64,
 }
 
 impl Drop for FastSlowStore {

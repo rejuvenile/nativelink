@@ -88,6 +88,48 @@ pub fn error_has_backpressure_signal(err: &Error) -> bool {
         .any(|any| any.type_url == BACKPRESSURE_SIGNAL_TYPE_URL)
 }
 
+/// True iff `err.details` carries a `BackpressureSignal` whose
+/// `reason` matches one of `wanted` (decoded from the proto value
+/// bytes, not just the `type_url`). This is the precise-discriminator
+/// counterpart to `error_has_backpressure_signal` — the latter is the
+/// "is this any flavour of backpressure" check used by the dead-h2
+/// classifier (where over-matching is the safe direction); this is
+/// the "is this SPECIFICALLY $kind of backpressure" check used when
+/// over-matching would incorrectly demote an unrelated `ResourceExhausted`
+/// to a benign outcome.
+///
+/// 2026-05-06 motivation (#284 part 2 red-team): the `cache_tee_at_cap`
+/// predicate in `FastSlowStore::run_producer` MUST fire only when the
+/// fast tier rejected with `MemoryStoreAtCapacity` — a future fast-tier
+/// store kind (e.g. a tiered local SSD ExistenceCache) returning
+/// `ResourceExhausted` for `disk-full` would otherwise spuriously
+/// downgrade a real fast-tier corruption to a clean consumer EOF.
+/// Restricting on the discriminator keeps the demotion narrow.
+///
+/// A malformed value (decoded `BackpressureSignal::decode` failed) is
+/// treated as NOT-matching: callers want a positive identification of
+/// the specific reason, and a producer that ships our `type_url` with
+/// undecodable bytes has violated the wire contract — better to
+/// surface the original error than to demote it.
+#[must_use]
+pub fn error_has_backpressure_reason(
+    err: &Error,
+    wanted: &[backpressure_signal::Reason],
+) -> bool {
+    if err.details.is_empty() {
+        return false;
+    }
+    err.details.iter().any(|any| {
+        if any.type_url != BACKPRESSURE_SIGNAL_TYPE_URL {
+            return false;
+        }
+        let Ok(decoded) = BackpressureSignal::decode(&*any.value) else {
+            return false;
+        };
+        wanted.iter().any(|r| decoded.reason == *r as i32)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use nativelink_error::{Code, Error, make_err};
@@ -96,7 +138,10 @@ mod tests {
     };
     use prost::Message;
 
-    use super::{encode_backpressure_signal_any, error_has_backpressure_signal};
+    use super::{
+        encode_backpressure_signal_any, error_has_backpressure_reason,
+        error_has_backpressure_signal,
+    };
 
     /// Encode + decode round-trip preserves both fields. This is the
     /// load-bearing contract the wire-stability commitment promises:
@@ -217,5 +262,90 @@ mod tests {
                  a dead channel and evict the h2 pool — #147 regression risk)",
             );
         }
+    }
+
+    /// #284 part 2 fixup: `error_has_backpressure_reason` matches ONLY
+    /// when the encoded `BackpressureSignal::reason` is one of the
+    /// requested discriminators. Used by `FastSlowStore::run_producer`'s
+    /// `cache_tee_at_cap` predicate to demote a fast-tier rejection to
+    /// a clean consumer EOF ONLY when the reason is `MemoryStoreAtCapacity`
+    /// — a future fast-tier store returning `ResourceExhausted` for an
+    /// unrelated reason (e.g. `PinnedBytesExhausted` or a brand-new
+    /// disk-full discriminator) MUST NOT be silently demoted.
+    #[test]
+    fn error_has_backpressure_reason_discriminates() {
+        let memcap_any = encode_backpressure_signal_any(
+            backpressure_signal::Reason::MemoryStoreAtCapacity,
+            25,
+        );
+        let memcap_err =
+            Error::resource_exhausted_backpressure("memcap", memcap_any);
+        assert!(
+            error_has_backpressure_reason(
+                &memcap_err,
+                &[backpressure_signal::Reason::MemoryStoreAtCapacity],
+            ),
+            "MUST match when the wanted reason is exactly the encoded reason",
+        );
+        // Different reason → does NOT match. This is the load-bearing
+        // case for #284 part 2: a fast-tier store returning
+        // PinnedBytesExhausted MUST NOT trigger the cache-tee demotion.
+        assert!(
+            !error_has_backpressure_reason(
+                &memcap_err,
+                &[backpressure_signal::Reason::PinnedBytesExhausted],
+            ),
+            "MUST NOT match when the wanted reason differs — over-matching \
+             would silently demote unrelated fast-tier rejections to clean EOF",
+        );
+        // No details at all → false.
+        let no_details: Error = make_err!(Code::ResourceExhausted, "no signal");
+        assert!(
+            !error_has_backpressure_reason(
+                &no_details,
+                &[backpressure_signal::Reason::MemoryStoreAtCapacity],
+            ),
+            "MUST NOT match when no details are present",
+        );
+        // Other type_url → false.
+        let mut other_detail: Error = make_err!(Code::ResourceExhausted, "other");
+        other_detail.details.push(prost_types::Any {
+            type_url: "type.googleapis.com/some.other.Type".into(),
+            value: vec![1, 2, 3],
+        });
+        assert!(
+            !error_has_backpressure_reason(
+                &other_detail,
+                &[backpressure_signal::Reason::MemoryStoreAtCapacity],
+            ),
+            "MUST NOT match when type_url is not the BackpressureSignal one",
+        );
+        // Multi-want list: any one match wins.
+        assert!(
+            error_has_backpressure_reason(
+                &memcap_err,
+                &[
+                    backpressure_signal::Reason::PinnedBytesExhausted,
+                    backpressure_signal::Reason::MemoryStoreAtCapacity,
+                ],
+            ),
+            "MUST match when ANY wanted reason matches",
+        );
+        // Malformed value (right type_url, undecodable bytes): treated
+        // as not-matching. The producer violated the wire contract;
+        // surface the original error rather than guess.
+        let mut malformed: Error = make_err!(Code::ResourceExhausted, "bad");
+        malformed.details.push(prost_types::Any {
+            type_url: BACKPRESSURE_SIGNAL_TYPE_URL.to_string(),
+            // Definitely not a valid BackpressureSignal proto encoding.
+            value: vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        });
+        assert!(
+            !error_has_backpressure_reason(
+                &malformed,
+                &[backpressure_signal::Reason::MemoryStoreAtCapacity],
+            ),
+            "malformed value MUST NOT classify as a positive discriminator match",
+        );
     }
 }
