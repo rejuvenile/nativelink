@@ -194,6 +194,87 @@ impl AcPinRegistry {
             .insert((store_id, digest));
     }
 
+    /// Replace endpoint's AC pin set atomically with `entries`. Used by
+    /// the server's field-17 (`pinned_ac_mirror_entries`) handler:
+    /// every `BlobsAvailable` advertisement carries the worker's
+    /// FULL CURRENT AC pin set, so the server's per-endpoint set
+    /// should be REPLACED with that snapshot rather than additively
+    /// `register_ac_pin`'d. Stale entries from prior ticks are
+    /// implicitly dropped on every advertisement — the registry
+    /// tracks worker truth tick-by-tick without any explicit
+    /// drain channel.
+    ///
+    /// Atomicity: takes ONE `inner.write()` and mutates the
+    /// per-endpoint set in-place. A concurrent reader (e.g.
+    /// `AcProxyStore::endpoint_holds_digest`) sees either the
+    /// pre-replace state or the post-replace state, never a
+    /// half-applied mix.
+    ///
+    /// Cap behaviour: applies the same `max_entries_per_endpoint`
+    /// cap as [`Self::register_ac_pin`]. If `entries.len()` exceeds
+    /// the cap, the first `max_entries_per_endpoint` entries are
+    /// retained (`HashSet` ordering, but stable per-call) and the
+    /// remainder are dropped with a single rate-limited cap-drop
+    /// warn (NOT one per dropped entry).
+    ///
+    /// Empty `entries` clears the endpoint entirely (matching the
+    /// wire intent: "the worker has no AC pins this tick"). The
+    /// per-endpoint cap-drop warn rate-limit state is NOT cleared
+    /// here — only [`Self::wipe_endpoint`] does that. Empty-entries
+    /// is a normal advertisement, not a connection-lifecycle event.
+    ///
+    /// Supersedes [`Self::register_ac_pin`] for the field-17
+    /// production path: register-as-additive was a load-bearing
+    /// claim of correctness in earlier iterations, but the wire
+    /// intent has always been replace-snapshot. `register_ac_pin`
+    /// remains in the public API for tests / diagnostics that
+    /// genuinely need additive insertion (see e.g.
+    /// `nativelink-service/tests/ac_isolation_bazel_e2e_test.rs`,
+    /// which seeds a single AC pin to drive the AC-vs-CAS
+    /// digest-collision regression).
+    pub fn replace_endpoint_ac_pins(
+        &self,
+        endpoint: &str,
+        entries: &[(Arc<str>, DigestInfo)],
+    ) {
+        let cap = self.max_entries_per_endpoint;
+        let drops = entries.len().saturating_sub(cap);
+        // Build the new set OUTSIDE the inner write lock so a long
+        // entries slice cannot extend the parking_lot critical
+        // section. Truncation happens during set construction:
+        // `take(cap)` stops inserting once cap is reached, so the
+        // first `cap` entries (in slice order) are retained.
+        let new_set: EndpointAcPins = entries.iter().take(cap).cloned().collect();
+
+        let mut guard = self.inner.write();
+        if new_set.is_empty() {
+            // Empty advertisement → clear the endpoint entirely.
+            // Matches the wire contract: the worker has no AC pins
+            // this tick.
+            guard.remove(endpoint);
+        } else {
+            // Replace the per-endpoint set in-place. `insert` returns
+            // the prior value (Some when present, None when absent);
+            // we don't need it.
+            guard.insert(endpoint.to_string(), new_set);
+        }
+        // Drop the inner write guard before taking the warn-state
+        // mutex to keep the warn lock window short (matches the
+        // ordering used by `register_ac_pin`).
+        drop(guard);
+
+        if drops > 0 {
+            // ONE rate-limited warn per replace call when the
+            // advertisement is over-cap. We pass `cap` (not the
+            // post-replace set size) as `cur_len` so the operator
+            // sees the cap-firing event explicitly; `store_id` is
+            // empty because the cap is per-endpoint, not per-store
+            // (the prompt's intent is to surface cap-burn at the
+            // endpoint level).
+            self.maybe_warn_cap_drop(endpoint, "", cap);
+        }
+    }
+
     /// Rate-limit state update for a cap-exceeded drop. Emits one
     /// `warn!` per [`CAP_DROP_WARN_INTERVAL`] per endpoint; intervening
     /// drops are counted and reported in the next warn. The first
@@ -655,5 +736,122 @@ mod tests {
                 ))
             }
         });
+    }
+
+    /// Replace-snapshot under-action: registering X1, X2, X3 then
+    /// REPLACING with [X1, X3] MUST drop X2. The wire contract is
+    /// "field 17 carries the worker's full current pin set"; the
+    /// server's per-endpoint set must mirror that snapshot tick-
+    /// by-tick. An additive regression (e.g. swapping `replace`
+    /// with `extend`) would resurrect X2 from the prior advertisement.
+    ///
+    /// Mutation step: change the body of
+    /// `replace_endpoint_ac_pins`'s lock-block from `guard.insert(...)`
+    /// to `guard.entry(...).or_default().extend(new_set);` (additive
+    /// merge) — this test red-fails with the bespoke "MUST replace,
+    /// not extend" message.
+    #[test]
+    fn replace_endpoint_ac_pins_replaces_set_atomically() {
+        let reg = AcPinRegistry::new();
+        let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        let endpoint = "grpc://w1:50081";
+        let x1 = (store_id.clone(), d(1));
+        let x2 = (store_id.clone(), d(2));
+        let x3 = (store_id.clone(), d(3));
+
+        // Initial advertisement: X1, X2, X3.
+        reg.replace_endpoint_ac_pins(endpoint, &[x1.clone(), x2.clone(), x3.clone()]);
+        let snap = reg.snapshot_endpoint(endpoint).unwrap();
+        assert_eq!(snap.len(), 3);
+
+        // Second advertisement: X1, X3 only — X2 dropped on the
+        // wire side.
+        reg.replace_endpoint_ac_pins(endpoint, &[x1.clone(), x3.clone()]);
+
+        let snap = reg.snapshot_endpoint(endpoint).unwrap();
+        assert_eq!(
+            snap.len(),
+            2,
+            "replace_endpoint_ac_pins MUST replace, not extend — additive \
+             regression would resurrect X2 from prior advertisement"
+        );
+        assert!(snap.contains(&x1));
+        assert!(snap.contains(&x3));
+        assert!(
+            !snap.contains(&x2),
+            "replace_endpoint_ac_pins MUST replace, not extend — additive \
+             regression would resurrect X2 from prior advertisement"
+        );
+    }
+
+    /// Cap honoured under replace: pre-fill cap entries via
+    /// `register_ac_pin`, then replace with cap+10 entries. Exactly
+    /// `cap` entries are retained on the post-replace set; the
+    /// remainder are silently dropped (with a single rate-limited
+    /// warn, asserted under traced_test in
+    /// `replace_endpoint_ac_pins_emits_cap_drop_warn` if needed —
+    /// kept out-of-scope here to keep the under-action test pure).
+    ///
+    /// Mutation step: change `entries.iter().take(cap)` to
+    /// `entries.iter()` (no truncation). This test red-fails with
+    /// the bespoke "replace_endpoint_ac_pins MUST honour the
+    /// per-endpoint cap" message.
+    #[test]
+    fn replace_endpoint_ac_pins_honours_cap() {
+        let cap = 5;
+        let reg = AcPinRegistry::with_max_entries_per_endpoint(cap);
+        let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        let endpoint = "grpc://w1:50081";
+
+        // Build cap+10 = 15 entries.
+        let entries: Vec<_> = (0..(cap + 10) as u8)
+            .map(|i| (store_id.clone(), d(i)))
+            .collect();
+        reg.replace_endpoint_ac_pins(endpoint, &entries);
+
+        let snap = reg.snapshot_endpoint(endpoint).unwrap();
+        assert_eq!(
+            snap.len(),
+            cap,
+            "replace_endpoint_ac_pins MUST honour the per-endpoint cap — \
+             exactly {} entries must be retained, observed {}",
+            cap,
+            snap.len(),
+        );
+    }
+
+    /// Empty entries → endpoint is cleared entirely. Wire intent:
+    /// the worker has no AC pins this tick, so the server's per-
+    /// endpoint row should be removed. (Alternative semantics —
+    /// "leave the previous set in place" — would drift if the
+    /// worker ever advertises an empty set.)
+    ///
+    /// Mutation step: change the empty-branch in
+    /// `replace_endpoint_ac_pins` from `guard.remove(endpoint)` to
+    /// `()` (no-op). This test red-fails with the bespoke
+    /// "empty replace MUST clear the endpoint" message.
+    #[test]
+    fn replace_endpoint_ac_pins_clears_endpoint_on_empty_entries() {
+        let reg = AcPinRegistry::new();
+        let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+        let endpoint = "grpc://w1:50081";
+
+        // Seed two entries.
+        reg.replace_endpoint_ac_pins(
+            endpoint,
+            &[(store_id.clone(), d(1)), (store_id.clone(), d(2))],
+        );
+        assert_eq!(reg.snapshot_endpoint(endpoint).unwrap().len(), 2);
+
+        // Empty advertisement.
+        reg.replace_endpoint_ac_pins(endpoint, &[]);
+
+        assert_eq!(
+            reg.snapshot_endpoint(endpoint),
+            None,
+            "empty replace MUST clear the endpoint — wire contract is \
+             'worker has no AC pins this tick', not 'leave the previous \
+             advertisement in place'",
+        );
     }
 }
