@@ -163,6 +163,18 @@ async fn ac_pin_short_circuit_does_not_silently_swallow_cas_upload() -> Result<(
         // locality_map cause `cas_store.has` to report Some for
         // digests the inner CAS doesn't actually hold, swallowing
         // every Action proto upload for any pinned AC entry.
+        //
+        // The AC-pin-must-NOT-short-circuit-CAS-upload regression
+        // class spans TWO production call sites that consult
+        // `has`/`has_with_results` then skip per-element:
+        //   - `bytestream_server::write` (per-blob has-then-skip),
+        //     exercised here directly via `cas_store.has()`.
+        //   - `cas_server::BatchUpdateBlobs` (Vec
+        //     `has_with_results`-then-skip per-element). Coverage
+        //     is transitive via the `has() → has_with_results`
+        //     1-element shim in `store_trait.rs`; a refactor that
+        //     diverges the two paths would escape this test —
+        //     escalate to explicit BatchUpdate coverage if so.
         let has_result = cas_store.has(digest).await?;
         if has_result.is_none() {
             cas_store.update_oneshot(digest, payload.clone()).await?;
