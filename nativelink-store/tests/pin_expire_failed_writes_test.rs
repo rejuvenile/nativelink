@@ -640,3 +640,105 @@ async fn pin_expire_listener_registration_is_idempotent() -> Result<(), Error> {
     drop(temp);
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// Test E — #283 fixup MAJOR-2: pin-expire listener observes the
+// chunked-path in-flight set.
+//
+// Scenario: the chunked-write dispatcher populates
+// `chunked_in_flight_digests` (NOT `in_flight_slow_writes`). Pre-fix,
+// `PinExpireFailedWritesListener::on_pin_expired` only consulted
+// `in_flight_slow_writes`, so a chunked-commit STALL (driver
+// hangs past PIN_TIMEOUT_SECS without returning Ok or Err) reached
+// `on_pin_expired` and the listener no-oped because the digest was
+// absent from `in_flight_slow_writes`. MemoryStore eviction then drops
+// the in-memory replica; on worker reconnect, `drain_failed_digests`
+// returns empty; reads NotFound. This is the chunked-stall sibling of
+// the production-incident-2026-05-06 mechanism.
+//
+// Fix: extend the listener gate to OR-check `chunked_in_flight_digests`.
+// This test exercises the chunked-only branch of the new gate (no
+// legacy `in_flight_slow_writes` entry), proving the listener fires on
+// chunked-set-only digests. The legacy-only branch is already covered
+// by Test A (`pin_auto_expire_inserts_digest_into_failed_slow_writes`).
+//
+// Mutation step: comment out `let in_chunked = ...` and the
+// `|| in_chunked` portion of the gate at fast_slow_store.rs:288 (the
+// `if !in_legacy && !in_chunked { return; }` predicate). Re-run the
+// test; without the chunked check, `in_legacy` is false (no legacy
+// in-flight), `in_chunked` is unconsulted, the listener returns early,
+// the digest does NOT land in `failed_slow_writes`, and the assertion
+// red-fails with the bespoke "chunked-path in-flight not observed"
+// message.
+// ---------------------------------------------------------------------
+
+#[nativelink_test]
+async fn pin_expire_listener_observes_chunked_in_flight_digests() -> Result<(), Error> {
+    let h = make_harness().await?;
+    let digest = DigestInfo::try_new(VALID_HASH, 1024).unwrap();
+    let data = Bytes::from(vec![0xC7; 1024]);
+
+    // Stage the blob into the fast store directly (NOT via FSS::update,
+    // because that would populate the LEGACY `in_flight_slow_writes`
+    // and we want to exercise the CHUNKED-only branch of the new gate).
+    Pin::new(h.fs_store.as_ref())
+        .update_oneshot(digest.into(), data)
+        .await
+        .err_tip(|| "fs_store.update_oneshot direct seed")?;
+
+    // Pin via the FilesystemStore so `on_pin_expired` will be reached
+    // when we force the deadline past PIN_TIMEOUT_SECS.
+    Pin::new(h.fs_store.as_ref()).pin_digests(&[digest]);
+
+    // Manually populate the chunked-path in-flight set, simulating
+    // what `BazelChunkedDispatcherImpl::dispatch` does at the start
+    // of a chunked write. The pin-expiry listener gates on this set
+    // — without the chunked-set check the listener would no-op (the
+    // legacy `in_flight_slow_writes` is empty since we skipped FSS::
+    // update on purpose).
+    h.fss
+        .chunked_in_flight_digests_handle()
+        .lock()
+        .insert(digest);
+
+    // Sanity: the pin landed and is observable as expired-eligible by
+    // the test helper.
+    assert!(
+        h.fs_store.test_force_pin_expired(&digest),
+        "digest must be pinned via direct fs_store.pin_digests"
+    );
+
+    // Sanity: the legacy in-flight is empty for this digest (so the
+    // legacy-set check inside the listener returns false; only the
+    // new chunked-set check can rescue this digest).
+    assert_eq!(
+        h.fss.in_flight_slow_write_count(),
+        0,
+        "no FastSlowStore::update call was made; in_flight_slow_writes \
+         must be empty (so the test exercises the chunked-only branch \
+         of the listener gate)",
+    );
+
+    // Trigger the pin-expiry sweep. With the fix, the listener consults
+    // the chunked set, sees the digest, and inserts into
+    // `failed_slow_writes`. WITHOUT the fix (mutation step), the
+    // chunked-set check is missing, the legacy-set check returns false,
+    // the listener returns early, and the failed_slow_writes set stays
+    // empty.
+    h.fs_store.test_expire_stale_pins().await;
+
+    let failed = h.fss.drain_failed_digests();
+    assert!(
+        failed.iter().any(|d| *d == digest),
+        "chunked-path in-flight not observed: the pin-expire listener \
+         MUST insert the digest into failed_slow_writes when the digest \
+         is in chunked_in_flight_digests at pin-expiry time. Without \
+         this, a chunked-commit STALL (driver hangs past \
+         PIN_TIMEOUT_SECS without returning Ok or Err) reaches \
+         on_pin_expired and the listener no-ops; MemoryStore evicts the \
+         in-memory replica; the worker reconnect-retry has nothing to \
+         retry; reads NotFound. This is the chunked-stall sibling of \
+         the production-incident-2026-05-06 mechanism. Got: {failed:?}",
+    );
+    Ok(())
+}
