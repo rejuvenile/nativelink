@@ -36,6 +36,20 @@ use nativelink_util::store_trait::{
     UploadSizeInfo,
 };
 
+/// Hash- and size-verifying wrapper. Re-hashes incoming/outgoing streams
+/// and rejects values where `H(bytes) != key`.
+///
+/// **CAS-only.** `verify_hash` and `verify_size` only make sense on a
+/// content-addressed store (where the key IS the hash of the bytes). The
+/// AC chain is keyed by `action_digest` (the CAS digest of the *Action*
+/// proto), but the value is the serialized *ActionResult* proto —
+/// `H(value) != key` in general, so wrapping the AC chain in
+/// `VerifyStore { verify_hash = true }` would reject every write.
+/// Production wires `cas_STORE` through `VerifyStore` (intentional) and
+/// the `AC_STORE` chain without it (intentional).
+///
+/// See `docs/ac-integrity-contract.md` for the AC contract and what
+/// integrity primitives ARE applicable there.
 #[derive(Debug, MetricsComponent)]
 pub struct VerifyStore {
     #[metric(group = "inner_store")]

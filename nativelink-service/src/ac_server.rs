@@ -173,6 +173,13 @@ impl AcServer {
             .action_result
             .err_tip(|| "Action result was not set in message")?;
 
+        // AC integrity contract: `digest` is the `action_digest` (the
+        // CAS digest of the *Action* proto). `store_data` below is the
+        // serialized *ActionResult* proto — a different message under
+        // the same key. `H(store_data) != digest` in general; AC entries
+        // are NOT content-addressed by their bytes. See
+        // `docs/ac-integrity-contract.md` and the rationale on
+        // `nativelink_store::verify_store::VerifyStore`.
         let mut store_data = BytesMut::with_capacity(ESTIMATED_DIGEST_SIZE);
         action_result
             .encode(&mut store_data)

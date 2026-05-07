@@ -77,6 +77,25 @@ pub const DIGEST_FOLDER: &str = "d";
 /// to construct or verify file paths.
 ///
 /// The path layout is: `{content_path}/d/{hash[0..2]}/{hash}-{size}`
+///
+/// # Integrity contract — depends on what backs this store
+///
+/// The filename embeds whatever hash the caller passes in `digest`. The
+/// interpretation of that hash depends on which store backs this
+/// `FilesystemStore`:
+///
+/// - **CAS-backed (`cas_STORE` chain):** `hash == SHA-N(file_bytes)`. A
+///   `VerifyStore` wrapper enforces this on every write and read; an
+///   integrity scanner that re-hashes each file MUST match the filename.
+/// - **AC-backed (`ac_store` chain):** `hash == action_digest`, which is
+///   the CAS digest of the *Action* proto, NOT a hash of the
+///   `ActionResult` bytes stored under this filename. `H(file_bytes) !=
+///   hash` in general. A `VerifyStore` wrapper would reject every AC
+///   write. An integrity scanner that re-hashes AC files against their
+///   filename will fail on every entry — by design.
+///
+/// See `docs/ac-integrity-contract.md` for the full rationale and a
+/// table of CAS-vs-AC properties.
 pub fn digest_content_path(content_path: &str, digest: &DigestInfo) -> OsString {
     let key: StoreKey<'_> = (*digest).into();
     to_full_path_from_key(content_path, &key)
