@@ -43,7 +43,8 @@ use bytes::Bytes;
 use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreSpec};
 use nativelink_macro::nativelink_test;
 use nativelink_service::chunked_write_handler::{
-    BazelChunkedDispatcherImpl, ChunkedWriteInFlight,
+    BazelChunkedDispatcherImpl, ChunkedWriteHandlerMetrics, ChunkedWriteInFlight, CommitMode,
+    PreparedChunk, dispatch_chunks_to_driver,
 };
 use nativelink_store::chunked::chunk_budget::ChunkBudget;
 use nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry;
@@ -499,4 +500,144 @@ async fn chunked_commit_no_visibility_gap_between_in_flight_and_stable() {
     );
 
     disable_bazel_facing_internal_chunking();
+}
+
+// =============================================================================
+// SYNCHRONOUS COMMIT BRANCH TEST (testing-czar item 1)
+// =============================================================================
+
+/// **Sibling-bug audit (testing-czar item 1).** The #282 fix touches
+/// THREE push sites:
+///
+///   1. `chunked_write_handler.rs:1618`  — Synchronous commit success
+///   2. `chunked_write_handler.rs:1697-1700` — AsyncCommit reaper
+///   3. `chunked_write_handler.rs:2398-2400` — early-dedup short-circuit
+///
+/// The under-action test above only covers site (2). This test covers
+/// site (1): driving `dispatch_chunks_to_driver` directly with
+/// `CommitMode::Synchronous` and the `stable_digests_pusher()` closure
+/// from a real `FastSlowStore`. After the call returns Ok, the digest
+/// MUST appear in `drain_stable_digests()`.
+///
+/// **Why a separate path is needed:** the public Bazel-facing entry
+/// (`dispatch_bazel_facing_internal_chunking`) always uses
+/// `CommitMode::AsyncCommit`. The Synchronous mode is reachable only
+/// through a direct call into `dispatch_chunks_to_driver` (used by the
+/// WriteChunked RPC handler in production). Mutating the push at
+/// `:1618` would not red-fail any existing test before this one
+/// landed.
+///
+/// **Production composition:** real `FastSlowStore` (provides the
+/// pusher closure that captures `stable_digests` + `stable_notify`) +
+/// real `FilesystemStore` slow tier + real `ChunkedDriver` machinery
+/// via `dispatch_chunks_to_driver`. The closure is the SAME
+/// `Arc<dyn Fn(DigestInfo)>` that `wire_bazel_chunked_dispatcher`
+/// installs on the production dispatcher.
+///
+/// **Mutation step (verified at test authorship time):** comment out
+/// the `sink(stream_digest)` call at `chunked_write_handler.rs:1619`
+/// (inside the `Synchronous` arm). This test red-fails with the
+/// bespoke `.expect("synchronous chunked commit must push to
+/// stable_digests — sibling-bug regression")`.
+#[nativelink_test]
+async fn chunked_synchronous_commit_pushes_digest_to_stable_digests() {
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 3;
+    const SIZE: usize = N * CHUNK;
+
+    // Build a deterministic blob whose declared SHA-256 matches its
+    // actual contents (Synchronous mode runs the e2e SHA verify; a
+    // mismatched declared digest would fail commit and bypass the push
+    // we want to observe).
+    let mut blob = Vec::with_capacity(SIZE);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0x73u8 ^ (i as u8)).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    // Build a fresh FilesystemStore slow tier + FastSlowStore so we
+    // can extract the production-shaped pusher closure.
+    let fs_store = make_filesystem_store().await;
+    let fast_store: Store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store: Store = Store::new(fs_store.clone());
+    let fast_slow = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Filesystem(FilesystemSpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Pre-flight: drain MUST be empty.
+    assert!(
+        fast_slow.as_ref().drain_stable_digests().is_empty(),
+        "fixture invariant: stable_digests starts empty",
+    );
+
+    // Build the per-chunk PreparedChunk stream the dispatcher consumes.
+    let chunks: Vec<Result<PreparedChunk, nativelink_error::Error>> = (0..N)
+        .map(|i| {
+            let chunk_bytes = Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
+            Ok(PreparedChunk {
+                chunk_offset: (i * CHUNK) as u64,
+                chunk_sha256: sha256(&chunk_bytes),
+                chunk_bytes,
+                finish: i == N - 1,
+            })
+        })
+        .collect();
+    let stream = Box::pin(futures::stream::iter(chunks));
+
+    let in_flight = ChunkedWriteInFlight::new();
+    let chunk_budget = make_test_chunk_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+
+    // Pull the production-shaped sink closure out of the FSS. This
+    // captures `stable_digests` + `stable_notify`. We pass it through
+    // to `dispatch_chunks_to_driver` exactly as
+    // `wire_bazel_chunked_dispatcher` does for the production server.
+    let sink = fast_slow.as_ref().stable_digests_pusher();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        dispatch_chunks_to_driver(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            chunk_budget,
+            None, // pin_budget
+            None, // chunked_read_registry
+            Some(sink),
+            CHUNK,
+            digest,
+            stream,
+            CommitMode::Synchronous,
+            metrics,
+        ),
+    )
+    .await
+    .expect(
+        "must not deadlock — synchronous dispatch_chunks_to_driver should \
+         complete within 10s",
+    )
+    .expect(
+        "synchronous chunked commit must succeed for hash-matching blob \
+         — preconditions for the BIS push under test",
+    );
+    assert_eq!(outcome.committed_size, SIZE as u64);
+
+    // Synchronous mode pushes BEFORE returning Ok (line 1618 in the
+    // implementation), so by the time we get here the digest MUST be
+    // observable in `drain_stable_digests()`. No polling needed —
+    // unlike AsyncCommit, the push is not on a separate spawn.
+    let drained = fast_slow.as_ref().drain_stable_digests();
+    assert!(
+        drained.contains(&digest),
+        "synchronous chunked commit must push to stable_digests — \
+         sibling-bug regression: the Synchronous arm at \
+         chunked_write_handler.rs:1618 omitted the BIS push. drained={drained:?}",
+    );
 }
