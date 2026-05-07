@@ -168,6 +168,18 @@ required-features = ["chunked_fast_slow", "test-utils"]
 name = "chunked_p25_p27_e2e_test"
 required-features = ["chunked_fast_slow", "test-utils"]
 
+# #282 production-incident-2026-05-06 fix — chunked-write completion
+# MUST push committed digests to FastSlowStore::stable_digests so the
+# BIS broadcast loop can ack stable bytes. Asymmetric contract
+# coverage: under-action (push fires on success), over-action (no push
+# on commit failure), race coverage (no visibility gap between
+# in_flight and stable). Run with:
+#   `cargo test -p nativelink-service --features chunked_fast_slow,test-utils \
+#       --test chunked_stable_digests_push_test`
+[[test]]
+name = "chunked_stable_digests_push_test"
+required-features = ["chunked_fast_slow", "test-utils"]
+
 # #212 v4.5 — end-to-end wire-routing test for `WriteChunked` on the
 # `CasExtensions` service. Spins up a real `tonic::transport::Server`
 # registering ONLY `CasExtensions` (not `WorkerApi`) and a real client
