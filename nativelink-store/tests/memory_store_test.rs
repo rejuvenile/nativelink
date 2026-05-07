@@ -435,3 +435,164 @@ async fn update_accepts_correct_size_with_exact_size() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// #284 part 1 — early-reject upfront when the declared upload size
+/// would exceed capacity, BEFORE pulling any chunk off the wire.
+///
+/// **Wasted-work contract.** Before this fix, `MemoryStore::update`
+/// drained the entire upload stream into a `Vec<Bytes>` and only THEN
+/// rejected via `check_backpressure_gate(total_bytes)`. At ~5
+/// over-capacity rejections/sec in production (18,692/hour during
+/// today's incident), the pulled-then-thrown bytes amplified CPU,
+/// network, and allocation load. The early-reject saves the entire
+/// recv loop on the unhappy path.
+///
+/// **Production composition.** We also exercise the same condition
+/// through `VerifyStore::new(... backend: memory)` — the same
+/// historical `cas_STORE` shape — to assert that the upstream wrapper
+/// surfaces the same `ResourceExhausted` without mangling the
+/// classifier-visible detail.
+///
+/// **Mutation step.** Comment out the `check_backpressure_gate` call
+/// in `MemoryStore::update`'s early-reject block (`memory_store.rs`,
+/// `if let UploadSizeInfo::ExactSize(declared) = size_info { ... }`).
+/// The test below MUST red-fail with the bespoke message — a generic
+/// `is_err()` would mask a `tokio::time::Elapsed` instead of catching
+/// "function blocked on recv() instead of returning early."
+#[cfg(feature = "chunked_fast_slow")]
+#[nativelink_test]
+async fn update_rejects_upfront_when_declared_size_exceeds_capacity() -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::EvictionPolicy;
+    use nativelink_util::store_trait::UploadSizeInfo;
+
+    // 1 KiB cap — same shape as `memory_store_backpressure_emission_test`.
+    let store = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 1024,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: false,
+    });
+    store.enable_emit_backpressure();
+
+    // Fill the cap so any further write would force eviction.
+    let payload1_len: u64 = 1024;
+    let payload1 = vec![0u8; payload1_len as usize];
+    let digest1 = DigestInfo::try_new(VALID_HASH1, payload1_len)?;
+    store
+        .update_oneshot(digest1, payload1.into())
+        .await
+        .expect("first insert should fit");
+
+    // Construct a buf-channel pair but NEVER send a chunk and NEVER
+    // close the channel. If the early-reject works, `update` returns
+    // `Err(ResourceExhausted)` BEFORE polling `recv()`. If the
+    // early-reject is broken, `update` blocks on `reader.recv()`
+    // forever — the `tokio::time::timeout` distinguishes the two.
+    let (_tx, rx) = make_buf_channel_pair();
+    let digest2 = DigestInfo::try_new(VALID_HASH2, 1024)?;
+    let store_pin = Pin::new(store.as_ref());
+    let update_fut = store_pin.update(
+        StoreKey::from(digest2),
+        rx,
+        UploadSizeInfo::ExactSize(1024),
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), update_fut)
+        .await
+        .expect(
+            "MemoryStore must reject over-capacity uploads at first byte, \
+             not after drain — wasted-work contract violated. \
+             Timeout means update() blocked on reader.recv() instead of \
+             returning ResourceExhausted upfront.",
+        );
+
+    let err = result.expect_err(
+        "ExactSize upload that alone exceeds capacity MUST return \
+         ResourceExhausted before pulling any chunk off the wire",
+    );
+    assert_eq!(
+        err.code,
+        nativelink_error::Code::ResourceExhausted,
+        "expected ResourceExhausted from early-reject, got code={:?} messages={:?}",
+        err.code,
+        err.messages,
+    );
+
+    // The store must contain only the original entry — the rejected
+    // upload must have written nothing, and (more importantly for this
+    // test) MUST have left the original entry intact (no silent
+    // eviction snuck through the early-reject gate).
+    let has1 = Pin::new(store.as_ref()).has(StoreKey::from(digest1)).await?;
+    assert_eq!(
+        has1,
+        Some(payload1_len),
+        "original entry MUST remain after early-reject — rejecting upfront \
+         must not silently evict the very entry we are protecting"
+    );
+    let has2 = Pin::new(store.as_ref()).has(StoreKey::from(digest2)).await?;
+    assert!(
+        has2.is_none(),
+        "rejected upload MUST NOT land in the store, got has2={has2:?}"
+    );
+
+    Ok(())
+}
+
+/// #284 part 1 — happy-path complement of the early-reject test:
+/// when the declared size DOES fit, the recv loop runs and the blob
+/// lands. Guards against the early-reject regressing into "always
+/// reject" — the over-action sibling of the under-action above.
+#[cfg(feature = "chunked_fast_slow")]
+#[nativelink_test]
+async fn update_drains_when_declared_size_fits() -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::EvictionPolicy;
+    use nativelink_util::store_trait::UploadSizeInfo;
+
+    // 4 KiB cap — plenty of headroom for a 1 KiB upload.
+    let store = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 4096,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: false,
+    });
+    store.enable_emit_backpressure();
+
+    let data = vec![7u8; 1024];
+    let digest = DigestInfo::try_new(VALID_HASH1, data.len() as u64)?;
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let store_pin = Pin::new(store.as_ref());
+    let update_fut = store_pin.update(
+        StoreKey::from(digest),
+        rx,
+        UploadSizeInfo::ExactSize(data.len() as u64),
+    );
+    let send_fut = async {
+        tx.send(Bytes::from(data.clone())).await?;
+        tx.send_eof()?;
+        Ok::<_, Error>(())
+    };
+    let (update_res, send_res) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(update_fut, send_fut) },
+    )
+    .await
+    .expect("must not deadlock — fitting upload should drain promptly");
+    send_res?;
+    update_res.expect(
+        "ExactSize upload within capacity MUST drain and land in the store. \
+         A failure here means the early-reject gate is over-firing on \
+         uploads that fit — the over-action sibling of #284 part 1.",
+    );
+
+    let landed = Pin::new(store.as_ref())
+        .get_part_unchunked(digest, 0, None)
+        .await?;
+    assert_eq!(landed.as_ref(), data.as_slice());
+
+    Ok(())
+}
