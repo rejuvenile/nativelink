@@ -4357,3 +4357,603 @@ async fn populate_at_capacity_pre_stream_returns_clean_error() -> Result<(), Err
 
     Ok(())
 }
+
+/// **Over-action: slow-tier-error AFTER cache-tee disabled.** Closes
+/// the distributed-systems / code-review BLOCK on the part-2 predicate.
+///
+/// Setup: fake `AlwaysAtCapFastStore` (always rejects with at-cap)
+/// + fake `MidStreamErrSlowStore` that delivers chunk 0 then errors
+/// on the second `send` with `Code::Unavailable` (simulating a gRPC
+/// drop or peer disconnect mid-stream).
+///
+/// Sequence at runtime:
+/// 1. Producer's `slow_store_fut` enters; slow store sends chunk 0.
+/// 2. `data_stream_fut` forwards chunk 0 to streaming buffer + into
+///    `fast_tx`. Fast tier rejects on its update; producer's NEXT
+///    `fast_tx.send` (chunk 1) fails → `cache_tee_disabled = true`.
+/// 3. Slow store's second `send` returns `Code::Unavailable`.
+///    `data_stream_fut`'s loop reads the error, returns Err.
+///    `slow_res` from `slow_store.get(...)` returns the same Err.
+///
+/// Without the BLOCK fix (`data_stream_res.is_ok() && slow_res.is_ok()`
+/// conjuncts in `cache_tee_at_cap`):
+///   - `cache_tee_at_cap = cache_tee_disabled && fast_res is at-cap`
+///     would evaluate true (fast_res IS at-cap) regardless of slow-
+///     tier failure.
+///   - `streaming_terminal = Ok(())` → consumer reads chunk 0 + EOF
+///     = silent truncation (consumer thinks blob is 1 KiB; actual
+///     declared size is 4 KiB → digest-mismatch when re-hashed).
+///
+/// With the fix:
+///   - `slow_res.is_ok()` is FALSE.
+///   - `cache_tee_at_cap = false` → `streaming_terminal = Err(...)`.
+///   - Consumer's `get_part_unchunked` surfaces the error.
+///
+/// **Mutation step**: drop the `data_stream_res.is_ok()` AND
+/// `slow_res.is_ok()` conjuncts from `cache_tee_at_cap`. The consumer
+/// would then receive truncated bytes + clean EOF (Ok with len=1024
+/// instead of Err) — the test's `.expect_err(...)` red-fails.
+#[nativelink_test]
+async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream(
+) -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreSpec};
+    use nativelink_store::chunked_signal::encode_backpressure_signal_any;
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
+    use nativelink_util::buf_channel::DropCloserWriteHalf;
+    use nativelink_util::store_trait::Store;
+    use sha2::{Digest as _, Sha256};
+
+    /// Fast tier: always rejects with at-cap on the FIRST chunk
+    /// pulled from `fast_rx` (so `cache_tee_disabled` is set after
+    /// chunk 0 reaches the streaming buffer).
+    #[derive(MetricsComponent)]
+    struct AlwaysAtCapFastStore {
+        #[metric(help = "marker — fake fast store has no metrics")]
+        _marker: u64,
+    }
+
+    #[async_trait]
+    impl StoreDriver for AlwaysAtCapFastStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            _digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            for r in results.iter_mut() {
+                *r = None;
+            }
+            Ok(())
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            _digest: StoreKey<'_>,
+            mut reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            _size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            let _ = reader.recv().await;
+            let detail = encode_backpressure_signal_any(
+                backpressure_signal::Reason::MemoryStoreAtCapacity,
+                25,
+            );
+            Err(Error::resource_exhausted_backpressure(
+                "AlwaysAtCapFastStore: synthetic at-cap",
+                detail,
+            ))
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            _key: StoreKey<'_>,
+            _writer: &mut DropCloserWriteHalf,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> Result<(), Error> {
+            Err(make_err!(Code::NotFound, "AlwaysAtCapFastStore: empty"))
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+    }
+
+    default_health_status_indicator!(AlwaysAtCapFastStore);
+
+    /// Slow tier: `has_with_results` returns Some(declared_size); on
+    /// `get_part`, sends chunk 0 (1 KiB) then returns
+    /// `Code::Unavailable` BEFORE EOF, simulating a gRPC drop / peer
+    /// disconnect mid-stream.
+    #[derive(MetricsComponent)]
+    struct MidStreamErrSlowStore {
+        #[metric(help = "declared blob size in bytes")]
+        declared_size: u64,
+    }
+
+    #[async_trait]
+    impl StoreDriver for MidStreamErrSlowStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            for (digest, result) in digests.iter().zip(results.iter_mut()) {
+                if let StoreKey::Digest(d) = digest.borrow() {
+                    *result = Some(d.size_bytes());
+                } else {
+                    *result = Some(self.declared_size);
+                }
+            }
+            Ok(())
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            _digest: StoreKey<'_>,
+            _reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            _size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Err(make_err!(Code::Unimplemented, "MidStreamErrSlowStore::update unused"))
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            _key: StoreKey<'_>,
+            writer: &mut DropCloserWriteHalf,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> Result<(), Error> {
+            // Three-chunk sequence to deterministically trigger
+            // cache_tee_disabled BEFORE the slow-tier err lands:
+            //
+            // 1. Send chunk 0 (1 KiB). Producer pulls it from
+            //    `slow_rx` and forwards to `fast_tx`. Fast tier's
+            //    update awaits the FIRST recv, gets chunk 0, then
+            //    returns at-cap → `fast_rx` drops.
+            // 2. Yield + send chunk 1. Producer pulls chunk 1 from
+            //    `slow_rx`. Producer's `fast_tx.send(chunk1)` fails
+            //    because `fast_rx` is dropped → `cache_tee_disabled
+            //    = true`. Producer continues: forwards chunk 1 to
+            //    streaming buffer.
+            // 3. Yield + `writer.send_error(...)` to poison the
+            //    slow_rx side WITHOUT dropping `tx`. Producer's
+            //    next `slow_rx.recv()` returns the bespoke
+            //    `Code::Unavailable` Err → `data_stream_res = Err`
+            //    AND `slow_res = Err`.
+            //
+            // With the BLOCK-fix predicate (`data_stream_res.is_ok()
+            // && slow_res.is_ok()`), `cache_tee_at_cap = false`, so
+            // `streaming_terminal = Err(...)` and the consumer
+            // surfaces the err. WITHOUT the fix, `cache_tee_at_cap
+            // = true` (because `cache_tee_disabled && fast_res
+            // is at-cap`), `streaming_terminal = Ok` → consumer
+            // reads chunk 0 + chunk 1 (= 2 KiB) + clean EOF =
+            // silent truncation of the declared 4 KiB blob.
+            let chunk0 = Bytes::from(vec![0xab; 1024]);
+            writer
+                .send(chunk0)
+                .await
+                .err_tip(|| "MidStreamErrSlowStore: chunk 0 send failed")?;
+            tokio::task::yield_now().await;
+
+            let chunk1 = Bytes::from(vec![0xcd; 1024]);
+            // The send may succeed or backpressure-park briefly; we
+            // don't care which — the load-bearing event is the
+            // producer's NEXT iteration after this chunk lands.
+            writer
+                .send(chunk1)
+                .await
+                .err_tip(|| "MidStreamErrSlowStore: chunk 1 send failed")?;
+            tokio::task::yield_now().await;
+
+            // Surface a structured terminal error WITHOUT dropping
+            // `tx` (which would synthesize Code::Internal "Sender
+            // dropped before sending EOF"). The receiver sees our
+            // bespoke Code::Unavailable on its next recv.
+            writer.send_error(make_err!(
+                Code::Unavailable,
+                "MidStreamErrSlowStore: synthetic mid-stream drop"
+            ));
+            // After `send_error`, returning Ok vs Err here doesn't
+            // matter for the data-stream-side terminal — the
+            // streaming_writer is already poisoned. We return Err so
+            // the slow_store_fut also produces `slow_res = Err`,
+            // matching the production gRPC-drop sequence (transport
+            // err propagates to both halves).
+            Err(make_err!(
+                Code::Unavailable,
+                "MidStreamErrSlowStore: synthetic mid-stream drop"
+            ))
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+    }
+
+    default_health_status_indicator!(MidStreamErrSlowStore);
+
+    // Build a deterministic 4 KiB digest. The slow store will deliver
+    // only 1 KiB then error — the consumer must NOT see clean EOF.
+    let payload: Vec<u8> = vec![0xab; 4096];
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&hasher.finalize());
+    let digest = DigestInfo::new(hash_arr, payload.len() as u64);
+
+    let fast_store_arc = Arc::new(AlwaysAtCapFastStore { _marker: 0 });
+    let slow_store_arc = Arc::new(MidStreamErrSlowStore { declared_size: payload.len() as u64 });
+
+    let fss_arc = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        Store::new(fast_store_arc),
+        Store::new(slow_store_arc),
+    );
+    let fss_store = Store::new(fss_arc);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        fss_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect("must not deadlock — slow-tier drop must surface promptly");
+
+    // Consumer MUST receive an error. Without the predicate fix,
+    // `cache_tee_at_cap` would be true (slow_res ignored) and the
+    // consumer would receive Ok(1024 bytes) — silent truncation.
+    let err = result.expect_err(
+        "consumer MUST see Err when slow tier dropped mid-stream — \
+         silent truncation (clean EOF after partial bytes) is the BLOCK \
+         the part-2 predicate fix prevents",
+    );
+    // Don't assert exact code: the merge logic may surface
+    // ResourceExhausted (fast-tier at-cap) OR Unavailable (slow drop)
+    // OR an err_tip-wrapped composite. The contract is "Err, NOT silent
+    // EOF". Asserting NOT-Ok-with-truncated-bytes is the load-bearing
+    // guarantee.
+    assert_ne!(
+        err.code,
+        Code::Ok,
+        "expected non-Ok code, got code={:?} messages={:?}",
+        err.code,
+        err.messages,
+    );
+
+    Ok(())
+}
+
+/// **Over-action: non-MemoryStoreAtCapacity fast-tier error.** Closes
+/// the testing-czar / red-team MAJOR on discriminator-narrow gating.
+///
+/// Setup: fake fast tier that errors mid-stream with `Code::Internal`
+/// (NOT ResourceExhausted, NOT a BackpressureSignal). Slow tier
+/// delivers the full payload cleanly.
+///
+/// The new `cache_tee_at_cap` predicate's fast-tier conjunct is
+/// `Code == ResourceExhausted && error_has_backpressure_reason([
+/// MemoryStoreAtCapacity])`. A `Code::Internal` rejection should NOT
+/// match — the consumer MUST see the Err, NOT a clean EOF.
+///
+/// This test guards against a future regression where someone widens
+/// the predicate to "any fast-tier rejection demotes" (e.g. revert to
+/// `error_has_backpressure_signal`-without-discriminator, OR drop the
+/// `Code::ResourceExhausted` check). Both regressions would silently
+/// hide real fast-tier bugs (Internal, Aborted, etc.) under cache-tee
+/// "best effort" semantics.
+///
+/// **Mutation step**: change `e.code == Code::ResourceExhausted` in
+/// `cache_tee_at_cap` to `true` (any code triggers demotion). The
+/// consumer would then see Ok with full bytes (slow tier delivered)
+/// and the test's `.expect_err(...)` red-fails. Alternatively, swap
+/// `error_has_backpressure_reason([MemoryStoreAtCapacity])` for
+/// `error_has_backpressure_signal` — same red-fail because the test's
+/// fast tier returns a non-discriminated error (`Code::Internal`).
+#[nativelink_test]
+async fn populate_does_not_demote_non_at_cap_fast_tier_error() -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::{EvictionPolicy, FastSlowSpec, MemorySpec, StoreSpec};
+    use nativelink_util::buf_channel::DropCloserWriteHalf;
+    use nativelink_util::store_trait::Store;
+    use sha2::{Digest as _, Sha256};
+
+    /// Fast tier that errors with `Code::Internal` on `update` —
+    /// simulates a non-backpressure fast-tier corruption (NOT the
+    /// at-cap variant the predicate is allowed to demote).
+    #[derive(MetricsComponent)]
+    struct InternalErrFastStore {
+        #[metric(help = "marker")]
+        _marker: u64,
+    }
+
+    #[async_trait]
+    impl StoreDriver for InternalErrFastStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            _digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            for r in results.iter_mut() {
+                *r = None;
+            }
+            Ok(())
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            _digest: StoreKey<'_>,
+            mut reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            _size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            // Pull at least one chunk so the producer's first send
+            // round-trips, then error. The error is `Code::Internal`
+            // — NOT `ResourceExhausted`, so the predicate's
+            // `e.code == Code::ResourceExhausted` conjunct fails and
+            // the demotion does NOT fire.
+            let _ = reader.recv().await;
+            Err(make_err!(
+                Code::Internal,
+                "InternalErrFastStore: synthetic non-at-cap failure"
+            ))
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            _key: StoreKey<'_>,
+            _writer: &mut DropCloserWriteHalf,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> Result<(), Error> {
+            Err(make_err!(Code::NotFound, "InternalErrFastStore: empty"))
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+    }
+
+    default_health_status_indicator!(InternalErrFastStore);
+
+    /// Slow tier wrapper that delivers the payload in TWO chunks
+    /// (with a yield between them) instead of one. The two-chunk
+    /// shape is required to deterministically trigger
+    /// `cache_tee_disabled` BEFORE the slow stream ends — the
+    /// producer's first `fast_tx.send` succeeds (chunk 0 is queued
+    /// before the fast tier's recv-then-error completes), then the
+    /// second `fast_tx.send` fails (fast_rx now dropped) → sets
+    /// `cache_tee_disabled = true`.
+    #[derive(MetricsComponent)]
+    struct TwoChunkSlowStore {
+        inner: Arc<MemoryStore>,
+    }
+
+    #[async_trait]
+    impl StoreDriver for TwoChunkSlowStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            digests: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .has_with_results(digests, results)
+                .await
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            digest: StoreKey<'_>,
+            reader: nativelink_util::buf_channel::DropCloserReadHalf,
+            size_info: nativelink_util::store_trait::UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .update(digest, reader, size_info)
+                .await
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            writer: &mut DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            let full = Pin::new(self.inner.as_ref())
+                .get_part_unchunked(key, offset, length)
+                .await?;
+            let split_at = full.len() / 2;
+            let chunk0 = full.slice(0..split_at);
+            let chunk1 = full.slice(split_at..);
+            writer.send(chunk0).await.err_tip(|| "TwoChunk: chunk0")?;
+            tokio::task::yield_now().await;
+            if !chunk1.is_empty() {
+                writer.send(chunk1).await.err_tip(|| "TwoChunk: chunk1")?;
+            }
+            writer.send_eof().err_tip(|| "TwoChunk: eof")?;
+            Ok(())
+        }
+
+        fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+    }
+
+    default_health_status_indicator!(TwoChunkSlowStore);
+
+    // Build a deterministic 4 KiB payload + digest.
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xff) as u8).collect();
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&hasher.finalize());
+    let digest = DigestInfo::new(hash_arr, payload.len() as u64);
+
+    // Slow tier: real MemoryStore pre-loaded with the full payload,
+    // wrapped by `TwoChunkSlowStore` so it splits into 2 chunks with
+    // a yield between them.
+    let inner_slow = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 16 * 1024,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: false,
+    });
+    Pin::new(inner_slow.as_ref())
+        .update_oneshot(StoreKey::from(digest), Bytes::from(payload.clone()))
+        .await?;
+    let slow_store_arc = Arc::new(TwoChunkSlowStore { inner: inner_slow });
+
+    let fast_store_arc = Arc::new(InternalErrFastStore { _marker: 0 });
+
+    let fss_arc = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        Store::new(fast_store_arc),
+        Store::new(slow_store_arc),
+    );
+    let fss_store = Store::new(fss_arc);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        fss_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect("must not deadlock — non-at-cap fast-tier err must surface promptly");
+
+    // Consumer MUST see Err. The fast tier returned Code::Internal
+    // (not at-cap), so the cache_tee_at_cap demotion MUST NOT fire,
+    // and the producer's terminal Err propagates to the streaming
+    // buffer → consumer's get_part_unchunked.
+    let err = result.expect_err(
+        "consumer MUST see Err when fast-tier rejection is NOT \
+         MemoryStoreAtCapacity — discriminator-narrow gating must \
+         not silently demote unrelated fast-tier failures to clean EOF",
+    );
+    assert_ne!(
+        err.code,
+        Code::Ok,
+        "expected non-Ok code, got code={:?} messages={:?}",
+        err.code,
+        err.messages,
+    );
+
+    Ok(())
+}
