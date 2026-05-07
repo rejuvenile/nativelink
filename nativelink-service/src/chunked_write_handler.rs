@@ -1473,14 +1473,14 @@ pub fn admit_prepared_chunk(
 /// the `Arc<ChunkedDriver>` drops at end-of-function so the
 /// `JoinHandleDropGuard` aborts the inner driver task.
 ///
-/// The function is `pub(crate)` so that the watchdog regression test
-/// in the integration test crate can construct the production code
-/// path against a deliberately-wedged driver (sender held alive →
-/// `await_completion()` blocks forever) and assert the watchdog
-/// arm fires the failed-commit sink. The dispatcher is the only
-/// production caller; tests should avoid calling it directly outside
-/// of the watchdog-regression context.
-pub(crate) async fn run_async_commit_reaper(
+/// The function is `pub` so the watchdog regression test in
+/// `nativelink-service`'s integration test crate can construct the
+/// production code path against a deliberately-wedged driver (sender
+/// held alive → `await_completion()` blocks forever) and assert the
+/// watchdog arm fires the failed-commit sink. The dispatcher is the
+/// only production caller; tests should avoid calling it directly
+/// outside of the watchdog-regression context.
+pub async fn run_async_commit_reaper(
     driver: Arc<ChunkedDriver>,
     stream_digest: DigestInfo,
     in_flight: Arc<ChunkedWriteInFlight>,

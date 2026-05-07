@@ -87,10 +87,12 @@ use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_service::chunked_write_handler::{
-    BazelChunkedDispatcherImpl, ChunkedWriteHandlerMetrics, ChunkedWriteInFlight, CommitMode,
-    PreparedChunk, dispatch_bazel_facing_internal_chunking, dispatch_chunks_to_driver,
+    BazelChunkedDispatcherImpl, CHUNKED_COMMIT_WATCHDOG_SECS, ChunkedWriteHandlerMetrics,
+    ChunkedWriteInFlight, CommitMode, PreparedChunk, dispatch_bazel_facing_internal_chunking,
+    dispatch_chunks_to_driver, run_async_commit_reaper,
 };
 use nativelink_store::chunked::chunk_budget::ChunkBudget;
+use nativelink_store::chunked::chunked_driver::{ChunkedDriver, PER_BLOB_MPSC_CAP};
 use nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry;
 use nativelink_store::chunked::pin_budget::PinBudget;
 use nativelink_store::chunked::{
@@ -1499,4 +1501,221 @@ async fn chunked_synchronous_commit_failure_inserts_failed_writes_and_repins() {
          the failed_commit_sink (cleanup ordering bug — sink fires, \
          then in_flight is removed, then Err is returned).",
     );
+}
+
+// =============================================================================
+// #283 SUB-ITEM 3 (WATCHDOG) TEST
+// =============================================================================
+//
+// Red-team finding for the 2026-05-06 production cap-exhaustion: even
+// after #283 sub-items 1+2 close the missing-`failed_commit_sink` path
+// for natural commit-Err, a wedged slow tier (ZFS lock-up, kernel I/O
+// hang) can still reach the same end-state — pins past the 120 s
+// `chunked_in_flight_digests` TTL — by stalling
+// `ChunkedDriver::await_completion()` indefinitely. The legacy
+// `update`/`update_oneshot` background spawn at
+// `fast_slow_store.rs:3491-3510` guards against this with
+// `SLOW_WRITE_WATCHDOG_SECS=60`; sub-item 3 mirrors that guard onto
+// the chunked path via `CHUNKED_COMMIT_WATCHDOG_SECS=60`.
+//
+// The test exercises `run_async_commit_reaper` (extracted from the
+// dispatcher's AsyncCommit branch) directly, with a deliberately-
+// wedged `ChunkedDriver`: the test holds the per-blob mpsc sender
+// alive for the duration, so the driver's `rx.recv().await` blocks
+// forever and `await_completion()` never returns. Without the
+// watchdog wrapper, the reaper task would also block forever — a
+// `tokio::time::timeout` outer guard would catch the deadlock.
+//
+// We use `tokio::time::pause()` + `start_paused = true` to advance
+// virtual time past the watchdog deadline without burning real
+// wall-clock seconds.
+
+/// **#283 sub-item 3 (watchdog) — under-action.** When
+/// `await_completion()` does not return within
+/// `CHUNKED_COMMIT_WATCHDOG_SECS`, the watchdog arm of the
+/// AsyncCommit reaper MUST fire `failed_commit_sink(stream_digest)`
+/// so the digest is observable in `failed_slow_writes` and the
+/// worker's reconnect-retry path picks it up. The
+/// `Arc<ChunkedDriver>` parameter goes out of scope at the end of
+/// the reaper future, so the `JoinHandleDropGuard` aborts the
+/// stalled inner driver task.
+///
+/// **Drive path:** call `run_async_commit_reaper` directly with a
+/// real `ChunkedDriver` (constructed via `spawn_driver`) whose
+/// per-blob mpsc sender is held alive by the test, so the driver's
+/// `rx.recv().await` never returns and `await_completion()` blocks
+/// forever. The reaper's watchdog `tokio::time::timeout` is the
+/// only thing that can unblock the future.
+///
+/// **Production composition:** real `FastSlowStore` (fast =
+/// MemoryStore, slow = FilesystemStore) provides the
+/// `failed_writes_inserter()` closure that's wired in production
+/// via `wire_bazel_chunked_dispatcher`. The watchdog arm fires that
+/// EXACT closure shape; we observe via
+/// `fast_slow.failed_slow_writes_contains(&digest)`.
+///
+/// **Mutation step (verified at test authorship time):** revert the
+/// `tokio::time::timeout(watchdog, driver.await_completion())` in
+/// `run_async_commit_reaper` to a bare `driver.await_completion().await`.
+/// This test then red-fails — the outer `tokio::time::timeout` deadlock
+/// detector trips (the reaper hangs forever waiting on a blocked
+/// receiver) — with the bespoke
+/// `"chunked commit watchdog must fire on stalled await_completion —
+/// pin TTL leak class regression"` message.
+///
+/// Outer wall-clock guard: even though the test uses paused virtual
+/// time internally, a regression that causes a real-time stall
+/// (e.g., the watchdog gets compiled-out in a feature combo we
+/// didn't anticipate) would manifest as the test running forever in
+/// CI. Wrapping the whole test body in a generous wall-clock
+/// `tokio::time::timeout` is not possible because tokio's paused
+/// timers also drive `tokio::time::timeout`. We rely instead on the
+/// poll loop having a virtual-time bound (5 s of virtual time
+/// post-watchdog) and the test runner's external bound (`timeout 60`
+/// in the cargo invocation).
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
+    // Use a small declared size; the actual size doesn't matter — we
+    // never admit any chunks, the recv loop blocks on its very first
+    // iteration.
+    const SIZE: u64 = 1024;
+    let digest = DigestInfo::new(sha256(b"watchdog-test-blob"), SIZE);
+
+    // Production composition: real FilesystemStore + FastSlowStore so
+    // the `failed_writes_inserter()` closure goes into the genuine
+    // `FastSlowStore::failed_slow_writes` set + invokes pin_digests on
+    // the genuine fast store. The closure shape matches what
+    // `wire_bazel_chunked_dispatcher` wires in production.
+    let fs_store = make_filesystem_store().await;
+    let fast_store: Store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store: Store = Store::new(fs_store.clone());
+    let fast_slow = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Filesystem(FilesystemSpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Pre-flight: failed-set empty.
+    assert!(
+        !fast_slow.failed_slow_writes_contains(&digest),
+        "fixture invariant: failed_slow_writes starts empty",
+    );
+
+    // Construct a real ChunkedDriver. We deliberately KEEP the sender
+    // alive: the driver's `rx.recv().await` will block on the very
+    // first iteration because no work has been admitted, and there is
+    // still at least one Sender (us) keeping the mpsc open.
+    // Consequently `await_completion()` never returns; the reaper's
+    // watchdog wrapper is the only thing that can unblock it.
+    let (driver, _sender_held_alive) = ChunkedDriver::spawn_driver(
+        Arc::clone(&fs_store),
+        digest,
+        SIZE,
+        // CHUNK size: any reasonable value; we never admit a chunk.
+        4 * 1024,
+        PER_BLOB_MPSC_CAP,
+    );
+    let driver_arc = Arc::new(driver);
+
+    // Empty in_flight map. The reaper's `inner.lock().remove(...)`
+    // returns None on a missing entry, which is harmless. The watchdog
+    // arm is independent of in_flight entry presence — it fires on
+    // timeout regardless.
+    let in_flight = ChunkedWriteInFlight::new();
+
+    // Production-shaped failed-commit sink. Closure captures
+    // `failed_slow_writes` + the fast store's `pin_digests`; identical
+    // shape to `wire_bazel_chunked_dispatcher`.
+    let failed_sink = fast_slow.as_ref().failed_writes_inserter();
+    let stable_sink = fast_slow.as_ref().stable_digests_pusher();
+
+    // Spawn the reaper. With `start_paused = true`, virtual time is
+    // frozen until we explicitly advance it. The reaper enters its
+    // `tokio::time::timeout(WATCHDOG, await_completion())` and
+    // immediately yields awaiting the inner future + the timer.
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+    let reaper_handle = tokio::spawn(run_async_commit_reaper(
+        Arc::clone(&driver_arc),
+        digest,
+        Arc::clone(&in_flight),
+        None, // chunked_read_registry
+        Some(stable_sink),
+        Some(failed_sink),
+        Arc::clone(&metrics),
+    ));
+
+    // Yield once so the spawned reaper makes progress past the spawn
+    // boundary into the timeout future.
+    tokio::task::yield_now().await;
+
+    // Advance virtual time PAST the watchdog deadline. The +5s buffer
+    // ensures we cross the boundary cleanly (the inner timeout+driver
+    // await race resolves to the timeout side).
+    tokio::time::advance(Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS + 5)).await;
+
+    // Wait for the reaper to finish, with a generous virtual-time
+    // outer bound. The deadlock detector: if the watchdog wrapper is
+    // missing, the reaper task hangs forever and this `timeout` trips
+    // — virtual time can be advanced past it, OR (if the test runner
+    // races us to advance again) the test will simply never exit; the
+    // outer cargo `timeout 60` is the wall-clock backstop.
+    tokio::time::timeout(Duration::from_secs(10), reaper_handle)
+        .await
+        .expect(
+            "chunked commit watchdog must fire on stalled await_completion — \
+             pin TTL leak class regression",
+        )
+        .expect("reaper task must not panic");
+
+    // Contract: the watchdog arm fires `failed_commit_sink`, which
+    // inserts into `failed_slow_writes`. Without the watchdog, the
+    // reaper hangs forever and the `await` above trips the deadlock
+    // detector instead.
+    assert!(
+        fast_slow.failed_slow_writes_contains(&digest),
+        "watchdog arm MUST insert into failed_slow_writes via the \
+         failed_commit_sink closure. Without this, a stalled slow tier \
+         leaves no record of the failed commit and the worker's \
+         reconnect-retry path never picks up the digest — recreating \
+         the 2026-05-06 cap-exhaustion shape via stall instead of via \
+         missing-push.",
+    );
+
+    // The in_flight set should be empty (it was already empty pre-
+    // reaper; the assertion documents that the watchdog arm doesn't
+    // accidentally insert anything).
+    assert!(
+        !in_flight.contains_digest(&digest),
+        "watchdog arm MUST NOT leave any residual entry in the chunked \
+         in-flight set. Observed in_flight entry post-watchdog suggests \
+         the reaper inserted instead of removing.",
+    );
+
+    // The commit-failures metric should have been incremented (the
+    // watchdog Err arm goes through the same metrics increment as a
+    // natural commit-Err).
+    let failures =
+        metrics.commit_failures_total.load(AtomicOrdering::Relaxed);
+    assert!(
+        failures >= 1,
+        "watchdog arm MUST increment commit_failures_total (natural \
+         Err path parity). got={failures}",
+    );
+
+    // Drop the driver Arc so the JoinHandleDropGuard inside
+    // ChunkedDriver aborts the still-blocked inner driver task. The
+    // production reaper does this via the closure's variable scope
+    // ending; the test does it explicitly to ensure the test process
+    // doesn't leak the driver task into other tests.
+    drop(driver_arc);
+
+    // Drop the held sender so the driver's mpsc closes (in case the
+    // JoinHandleDropGuard didn't fully tear down before this point).
+    drop(_sender_held_alive);
 }
