@@ -360,8 +360,14 @@ mod tests {
     /// allowed to flood the log.
     ///
     /// This test drives 100 cap-exceeded inserts for one endpoint and
-    /// asserts (a) at least one warn was emitted and (b) at most a small
-    /// number were emitted (rate limit holds within the test wall-clock).
+    /// asserts EXACTLY one warn was emitted: the contract is "at most
+    /// one `warn!` per [`CAP_DROP_WARN_INTERVAL`] (60s) per endpoint",
+    /// the test wall-clock is bounded by the 5s deadlock-detector
+    /// timeout, and the first drop on a previously-unseen endpoint is
+    /// the unconditional baseline warn. The 60s window therefore
+    /// dominates the test wall-clock by >12x — no scheduler jitter can
+    /// flip a second warn into the window.
+    ///
     /// The whole thing is wrapped in a `tokio::time::timeout` deadlock
     /// detector even though the registry is sync — the `traced_test`
     /// runtime is async and a regression that introduces a lock-order
@@ -369,7 +375,7 @@ mod tests {
     ///
     /// Mutation step: revert the `warn!` in
     /// [`AcPinRegistry::maybe_warn_cap_drop`] to `debug!`. This test
-    /// red-fails with the bespoke "must observe at least one WARN-level
+    /// red-fails with the bespoke "must observe exactly one WARN-level
     /// cap-drop event" message. The assertion filters on the line's
     /// `" WARN "` level prefix specifically: in test builds the
     /// `release_max_level_info` compile-time gate is inactive and a
@@ -400,19 +406,20 @@ mod tests {
              rate-limit-state lock-order contract violated",
         );
 
-        // (a) AT LEAST ONE WARN-level event was emitted AND (b) the
-        // rate limit holds — `tracing-test` collects all lines into a
-        // single buffer with the level prefix (`WARN`, `DEBUG`, etc.).
-        // We MUST filter on `WARN` specifically: the bug we are
-        // guarding against is the previous `debug!` site being
-        // compiled out under `release_max_level_info`. In test builds
+        // EXACTLY one WARN-level event was emitted — `tracing-test`
+        // collects all lines into a single buffer with the level
+        // prefix (`WARN`, `DEBUG`, etc.). We MUST filter on `WARN`
+        // specifically: the bug we are guarding against is the
+        // previous `debug!` site being compiled out under
+        // `release_max_level_info`. In test builds
         // `release_max_level_info` is inactive, so a regression to
         // `debug!` would still appear in the buffer if we counted any
         // level — defeating the whole test. Filtering on " WARN " is
         // what makes the mutation step bite.
-        // We bound to <= 2 (allowing one possible race between the 60s
-        // rate-limit window and the test wall-clock, although the
-        // window is far longer than the test will run).
+        //
+        // The contract is exactly one `warn!` per 60s window per
+        // endpoint. Test wall-clock is bounded by the 5s deadlock
+        // timeout above, so a 60s-boundary race is impossible.
         logs_assert(|lines: &[&str]| {
             let n = lines
                 .iter()
@@ -421,14 +428,98 @@ mod tests {
                 })
                 .count();
             if n == 0 {
-                Err("must observe at least one WARN-level cap-drop event \
+                Err("must observe exactly one WARN-level cap-drop event \
                      — promotion from debug! to warn! reverted?"
                     .to_string())
-            } else if n <= 2 {
+            } else if n == 1 {
                 Ok(())
             } else {
                 Err(format!(
-                    "rate limit must hold — expected <= 2 cap-drop warns, observed {n}",
+                    "rate limit must hold — expected exactly 1 cap-drop warn, observed {n}",
+                ))
+            }
+        });
+    }
+
+    /// Reconnect-after-wipe contract: when a worker reconnects (boot-
+    /// epoch wipe via [`AcPinRegistry::wipe_endpoint`]), the per-
+    /// endpoint cap-drop rate-limit state MUST be cleared so the
+    /// FIRST cap-drop after reconnect emits a fresh `warn!`
+    /// immediately — operators must see the new connection's first
+    /// cap-burn, not silently inherit the previous connection's "warn
+    /// emitted within last 60s" suppression.
+    ///
+    /// Asymmetric coverage:
+    /// - Under-action: the warn fires on first cap-drop of the new
+    ///   connection (this test).
+    /// - Over-action: pre-wipe drops do NOT inflate the post-wipe
+    ///   warn-count (asserted via the `n_pre == 1 && n_total == 2`
+    ///   structure: a missing wipe-clear would suppress the second
+    ///   warn entirely under the 60s window, leaving `n_total == 1`).
+    ///
+    /// Mutation step: comment out the
+    /// `self.cap_drop_warn_state.lock().remove(endpoint);` line inside
+    /// [`AcPinRegistry::wipe_endpoint`]. This test red-fails with the
+    /// bespoke "post-wipe cap-drop must warn immediately" message
+    /// because the second batch of 5 cap-drops hits the still-suppressed
+    /// 60s window from the pre-wipe baseline warn.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn cap_exceeded_warns_immediately_after_wipe_endpoint() {
+        let result = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+            let reg = AcPinRegistry::with_max_entries_per_endpoint(2);
+            let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+            let endpoint = "grpc://reconnecting-worker:50081";
+
+            // Fill to cap.
+            reg.register_ac_pin(endpoint, store_id.clone(), d(1));
+            reg.register_ac_pin(endpoint, store_id.clone(), d(2));
+
+            // 5 cap-exceeded NEW entries — 1 baseline warn under the
+            // 60s rate-limit window.
+            for i in 100..105u8 {
+                reg.register_ac_pin(endpoint, store_id.clone(), d(i));
+            }
+
+            // Wipe the endpoint (simulates worker reconnect).
+            reg.wipe_endpoint(endpoint);
+
+            // Re-register entries up to cap on the post-wipe
+            // connection — same endpoint string, fresh state.
+            reg.register_ac_pin(endpoint, store_id.clone(), d(1));
+            reg.register_ac_pin(endpoint, store_id.clone(), d(2));
+
+            // 5 more cap-exceeded NEW entries — must produce a SECOND
+            // warn IMMEDIATELY (post-wipe state is None → first drop
+            // warns unconditionally). Without the wipe-clear, the 60s
+            // rate-limit window from the pre-wipe baseline warn would
+            // suppress this second warn entirely (test wall-clock is
+            // bounded by the 5s timeout).
+            for i in 200..205u8 {
+                reg.register_ac_pin(endpoint, store_id.clone(), d(i));
+            }
+        })
+        .await;
+        result.expect(
+            "post-wipe cap-drop must warn immediately — \
+             wipe_endpoint failed to clear cap_drop_warn_state",
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(" WARN ") && l.contains("ac_pin_registry: per-endpoint cap reached")
+                })
+                .count();
+            if n == 2 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "post-wipe cap-drop must warn immediately — \
+                     expected exactly 2 cap-drop warns (1 pre-wipe baseline + \
+                     1 post-wipe baseline), observed {n}; \
+                     wipe_endpoint failed to clear cap_drop_warn_state",
                 ))
             }
         });
