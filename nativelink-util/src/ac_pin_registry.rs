@@ -366,4 +366,94 @@ mod tests {
         let snap = reg.snapshot_endpoint("grpc://w1:50081").unwrap();
         assert_eq!(snap.len(), 2);
     }
+
+    /// Cap-exceeded drops MUST emit a `warn!` (not the previous `debug!`,
+    /// which is compiled out under `release_max_level_info`) so operators
+    /// see hostile / buggy worker cap-burn. AND they MUST be rate-limited
+    /// — a worker advertising 100s of K of pins above the cap cannot be
+    /// allowed to flood the log.
+    ///
+    /// This test drives 100 cap-exceeded inserts for one endpoint and
+    /// asserts (a) at least one warn was emitted and (b) at most a small
+    /// number were emitted (rate limit holds within the test wall-clock).
+    /// The whole thing is wrapped in a `tokio::time::timeout` deadlock
+    /// detector even though the registry is sync — the `traced_test`
+    /// runtime is async and a regression that introduces a lock-order
+    /// surprise would manifest as a hang here, not a panic.
+    ///
+    /// Mutation step: revert the `warn!` in
+    /// [`AcPinRegistry::maybe_warn_cap_drop`] to `debug!`. This test
+    /// red-fails with the bespoke "must observe at least one warn" message
+    /// because `traced_test` only captures `INFO`-and-above by default
+    /// (`debug` is filtered out).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn cap_exceeded_emits_rate_limited_warn() {
+        let result = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            async {
+                let reg = AcPinRegistry::with_max_entries_per_endpoint(10);
+                let store_id: Arc<str> = Arc::from("AC_MAIN_STORE");
+                let endpoint = "grpc://hostile-worker:50081";
+                // Fill to cap.
+                for i in 0..10u8 {
+                    reg.register_ac_pin(endpoint, store_id.clone(), d(i));
+                }
+                // 100 cap-exceeded NEW entries.
+                for i in 100..200u8 {
+                    reg.register_ac_pin(endpoint, store_id.clone(), d(i));
+                }
+                // Cap held: still exactly 10 entries.
+                let snap = reg.snapshot_endpoint(endpoint).unwrap();
+                assert_eq!(
+                    snap.len(),
+                    10,
+                    "cap must hold under cap-exceeded burst"
+                );
+            },
+        )
+        .await;
+        result.expect(
+            "cap_exceeded warn path must not deadlock — \
+             rate-limit-state lock-order contract violated",
+        );
+
+        // (a) AT LEAST ONE WARN-level event was emitted AND (b) the
+        // rate limit holds — `tracing-test` collects all lines into a
+        // single buffer with the level prefix (`WARN`, `DEBUG`, etc.).
+        // We MUST filter on `WARN` specifically: the bug we are
+        // guarding against is the previous `debug!` site being
+        // compiled out under `release_max_level_info`. In test builds
+        // `release_max_level_info` is inactive, so a regression to
+        // `debug!` would still appear in the buffer if we counted any
+        // level — defeating the whole test. Filtering on " WARN " is
+        // what makes the mutation step bite.
+        // We bound to <= 2 (allowing one possible race between the 60s
+        // rate-limit window and the test wall-clock, although the
+        // window is far longer than the test will run).
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(" WARN ")
+                        && l.contains(
+                            "ac_pin_registry: per-endpoint cap reached",
+                        )
+                })
+                .count();
+            if n == 0 {
+                Err(
+                    "must observe at least one WARN-level cap-drop event \
+                     — promotion from debug! to warn! reverted?"
+                        .to_string(),
+                )
+            } else if n <= 2 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "rate limit must hold — expected <= 2 cap-drop warns, observed {n}",
+                ))
+            }
+        });
+    }
 }
