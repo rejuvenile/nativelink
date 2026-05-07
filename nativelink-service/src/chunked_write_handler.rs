@@ -136,6 +136,44 @@ const EARLY_DEDUP_DRAIN_PER_RECV_TIMEOUT: core::time::Duration =
 /// upstream MemoryStore via the sibling `fast_store_fut`.
 const EARLY_DEDUP_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
 
+/// Watchdog deadline for `ChunkedDriver::await_completion()` in both
+/// the AsyncCommit reaper task and the Synchronous-commit handler.
+///
+/// **Why:** without an upper bound on `await_completion()`, a wedged
+/// slow tier (ZFS hang, kernel I/O lock-up, panicking driver task that
+/// somehow doesn't drop the completion sender) can keep the driver
+/// task alive past the per-blob `chunked_in_flight_digests` 120 s pin
+/// TTL. The outer `chunked_in_flight_digests` reaper polls
+/// `in_flight.contains_digest()`; an entry that never gets removed
+/// leaks the digest from the in-flight set indefinitely. #283 sub-item 3
+/// (red-team finding for the 2026-05-06 production cap-exhaustion):
+/// **the same end-state — pins past 120 s — is reachable via
+/// stalled-completion just as readily as via missing-failed_commit_sink.**
+///
+/// **Value:** mirrors [`SLOW_WRITE_WATCHDOG_SECS`] (60 s) in
+/// `nativelink_store::fast_slow_store`. Both watchdogs guard the same
+/// invariant — on commit-result delay, the digest must end up in
+/// `failed_slow_writes` so the worker reconnect-retry path picks it up
+/// — and both must fire **before** the 120 s `PIN_TIMEOUT_SECS` on the
+/// fast-store pin so the failed-set insert lands BEFORE auto-unpin.
+///
+/// **Behaviour on timeout:**
+///   1. Synthesise an `Err(Code::DeadlineExceeded, ...)` commit_result
+///      so all downstream Err handling (failed-commit sink invocation,
+///      `commit_failures_total` increment, `in_flight` removal,
+///      `chunked_read_registry` deregister) executes via the same code
+///      path as a natural commit-Err.
+///   2. Drop the local `Arc<ChunkedDriver>` after the in-flight entry
+///      removal — the `JoinHandleDropGuard` aborts the driver task
+///      when the last `Arc` drops, freeing its blocking-pool slot.
+///
+/// The outer post-watchdog contract is identical to the legacy
+/// `SLOW_WRITE_WATCHDOG_SECS` arm at `fast_slow_store.rs:3491-3510`:
+/// the digest is observable in `failed_slow_writes` BEFORE in-flight
+/// removal completes (so a reader concurrently observing the in-flight
+/// set as empty will also see the failed-set entry).
+pub const CHUNKED_COMMIT_WATCHDOG_SECS: u64 = 60;
+
 /// In-flight map: `DigestInfo` → live driver + sender. The sender is
 /// held here (not by the spawned driver) so multiple concurrent stream
 /// admissions for the SAME digest can re-use the same driver task and
@@ -1583,7 +1621,40 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     match commit_mode {
         CommitMode::Synchronous => {
             // Wait for commit + e2e SHA-256 verify.
-            let commit_result = driver.await_completion().await;
+            //
+            // #283 sub-item 3 (watchdog): bound `await_completion()`
+            // by `CHUNKED_COMMIT_WATCHDOG_SECS` for the same reasons
+            // as the AsyncCommit reaper (see comment in that branch
+            // below). The Synchronous path is reached only via the
+            // `WriteChunked` worker→server RPC; without the watchdog
+            // a wedged slow tier holds the upstream RPC future open
+            // past the worker's gRPC deadline, the worker observes
+            // a transport timeout, and on retry the same blob
+            // re-enters the in-flight map — the chunked-cap-exhaustion
+            // shape #283 closed for the AsyncCommit path.
+            let watchdog = core::time::Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
+            let commit_result =
+                match tokio::time::timeout(watchdog, driver.await_completion()).await {
+                    Ok(r) => r,
+                    Err(_elapsed) => {
+                        warn!(
+                            ?stream_digest,
+                            watchdog_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
+                            mode = "synchronous",
+                            "chunked dispatch: await_completion exceeded watchdog \
+                             deadline; treating as commit failure so failed_slow_writes \
+                             is populated and the worker reconnect-retry path picks \
+                             it up. The driver task is aborted via JoinHandleDropGuard \
+                             when the last ChunkedDriver Arc drops below."
+                        );
+                        Err(make_err!(
+                            Code::DeadlineExceeded,
+                            "chunked commit await_completion exceeded \
+                             {CHUNKED_COMMIT_WATCHDOG_SECS}s watchdog deadline; \
+                             slow tier may be wedged"
+                        ))
+                    }
+                };
 
             // #283 fixup MAJOR-1: on commit FAILURE, fire the
             // failed-commit sink BEFORE removing the in_flight entry.
@@ -1730,7 +1801,53 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             // lives inside the `Arc<ChunkedDriver>`); nothing for us to
             // do with it here.
             tokio::spawn(async move {
-                let commit_result = driver_for_reaper.await_completion().await;
+                // #283 sub-item 3 (watchdog): bound `await_completion()`
+                // by `CHUNKED_COMMIT_WATCHDOG_SECS`. Without this bound,
+                // a wedged slow tier (e.g. ZFS lock-up, kernel I/O
+                // hang) can keep the driver task alive past the
+                // 120 s `chunked_in_flight_digests` pin TTL, leaking
+                // the digest from the in-flight set indefinitely —
+                // the same end-state as the missing-failed_commit_sink
+                // path #283 sub-items 1+2 closed (red-team flagged this
+                // as the remaining failure-mode that recreates the
+                // 2026-05-06 cap-exhaustion via stall instead of via
+                // missing-push).
+                //
+                // On Elapsed: synthesise a `Code::DeadlineExceeded`
+                // commit_result so the existing Err handling below
+                // fires the failed-commit sink + increments
+                // `commit_failures_total` + removes from in-flight via
+                // the same code path as a natural commit-Err. This
+                // satisfies the contract parity invariant: post-
+                // watchdog the digest is observable in
+                // `failed_slow_writes` BEFORE in-flight removal
+                // completes (legacy parallel: `fast_slow_store.rs:3491-3510`).
+                let watchdog = core::time::Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
+                let commit_result =
+                    match tokio::time::timeout(watchdog, driver_for_reaper.await_completion())
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(_elapsed) => {
+                            warn!(
+                                ?stream_digest,
+                                watchdog_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
+                                mode = "async",
+                                "chunked dispatch reaper: await_completion exceeded \
+                                 watchdog deadline; treating as commit failure so \
+                                 failed_slow_writes is populated and the worker \
+                                 reconnect-retry path picks it up. The driver task is \
+                                 aborted via JoinHandleDropGuard when the last \
+                                 ChunkedDriver Arc drops below."
+                            );
+                            Err(make_err!(
+                                Code::DeadlineExceeded,
+                                "chunked commit await_completion exceeded \
+                                 {CHUNKED_COMMIT_WATCHDOG_SECS}s watchdog deadline; \
+                                 slow tier may be wedged"
+                            ))
+                        }
+                    };
                 // #282 fix: push to stable_digests on success BEFORE
                 // removing the chunked driver's in_flight entry. The
                 // outer FSS reaper (`BazelChunkedDispatcherImpl::dispatch`)
