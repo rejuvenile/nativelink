@@ -1206,8 +1206,19 @@ impl WorkerConnection {
             };
             if !endpoint.is_empty() {
                 let count = notification.pinned_ac_mirror_entries.len();
+                // Clamp the pre-allocation to the per-endpoint cap to
+                // bound memory under a hostile or buggy worker. A
+                // 100M-entry advertisement would otherwise pre-allocate
+                // ~3.2 GB on a process that has shipped OOMs (red-team
+                // 2026-05-07 retro-cadre BLOCK on #278). The registry's
+                // `replace_endpoint_ac_pins` enforces the same cap on
+                // the retained set; clamping at the caller bounds the
+                // intermediate Vec at the same shape.
+                let cap_hint = count.min(
+                    nativelink_util::ac_pin_registry::DEFAULT_MAX_AC_PINS_PER_ENDPOINT,
+                );
                 let mut entries: Vec<(std::sync::Arc<str>, DigestInfo)> =
-                    Vec::with_capacity(count);
+                    Vec::with_capacity(cap_hint);
                 for entry in &notification.pinned_ac_mirror_entries {
                     let Some(proto_digest) = entry.digest.as_ref() else {
                         continue;

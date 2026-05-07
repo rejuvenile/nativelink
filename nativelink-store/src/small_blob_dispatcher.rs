@@ -1265,6 +1265,18 @@ fn synthetic_small_key() -> StoreKey<'static> {
 /// Stops on the first wrapper that is not recognized AND does not
 /// unwrap further (`inner_store(_)` returns the same pointer as `self`).
 ///
+/// **Walker bail = silent disable** (#278C). When this returns
+/// `None`, the calling startup code in `src/bin/nativelink.rs` does
+/// NOT register a pin set for that CAS store, and SmallBlobDispatcher
+/// is effectively disabled for it. The startup wire-up site emits a
+/// `warn!` on miss + an `info!` summary line
+/// (`worker_ac_mirror_target_resolved=<n>`) so operators can detect
+/// the silent-disable condition without grepping the absence of an
+/// `info!` line. If a new wrapper is added that returns `self` from
+/// `inner_store(None)`, EXTEND THIS WALKER with a `downcast_ref` arm
+/// AND its concrete inner accessor — otherwise the dispatcher is
+/// silently disabled for every CAS store sitting behind that wrapper.
+///
 /// **AC stores are intentionally NOT walked.** The AC value path is
 /// write-only from the worker side (`upload_ac_results` in
 /// `nativelink-worker/src/running_actions_manager.rs`); workers never
@@ -1296,6 +1308,29 @@ pub fn find_fast_slow_for_pin(store: &dyn StoreDriver) -> Option<&FastSlowStore>
         return None;
     }
     find_fast_slow_for_pin(inner)
+}
+
+/// (#278C visibility) Emit one `warn!` naming the CAS store whose
+/// chain the walker [`find_fast_slow_for_pin`] could not drill
+/// through to a [`FastSlowStore`]. SmallBlobDispatcher is silently
+/// disabled for that store — the warn is the operator's only signal
+/// that pin-set registration was skipped (the absence of the
+/// matching `info!` registration line is invisible by inspection).
+///
+/// Centralised here so the test helper
+/// (`tests::silent_disable_logs_warn_when_walker_misses`) drives the
+/// SAME message shape the production startup wire-up emits, instead
+/// of duplicating the literal at the call site.
+pub fn emit_walker_miss_warn(store_name: &str) {
+    warn!(
+        store_name,
+        "small_blob_dispatcher: walker bailed for CAS store \
+         (FastSlowStore not reachable via known unwrappers); \
+         pin-set NOT registered — dispatcher silently disabled \
+         for this store. Add a recognised inner_store accessor \
+         in find_fast_slow_for_pin if a new wrapper was \
+         introduced."
+    );
 }
 
 /// Validate `store_id` per plan C11 (relaxed to Rust-ident rules).
@@ -1425,4 +1460,74 @@ mod tests {
         );
     }
 
+    /// (#278C visibility) When the production store chain bottoms out
+    /// at a store that is NOT a FastSlowStore (e.g. a bare MemoryStore
+    /// — exactly the chain used in tests today), `find_fast_slow_for_pin`
+    /// MUST return `None`. The corresponding startup wire-up site in
+    /// `src/bin/nativelink.rs` consumes this `None` to emit a `warn!`
+    /// + skip the pin-set registration.
+    ///
+    /// Pre-#278C, the wire-up's `None` branch silently no-op'd. This
+    /// test pairs with a `warn!`-emission test in
+    /// [`tests::silent_disable_logs_warn_when_walker_misses`] that
+    /// drives the same chain through a tiny helper extracted for
+    /// testability.
+    ///
+    /// Mutation step: change `find_fast_slow_for_pin` to
+    /// `Some(/* any FSS */)` for non-FSS chains — this test red-fails
+    /// with the bespoke "MemoryStore chain MUST return None" message.
+    #[tokio::test]
+    async fn find_fast_slow_for_pin_returns_none_for_non_fss_chain() {
+        use crate::memory_store::MemoryStore;
+        use nativelink_config::stores::MemorySpec;
+        let memory_store = MemoryStore::new(&MemorySpec::default());
+        let driver: &dyn StoreDriver = memory_store.as_ref();
+        let result = find_fast_slow_for_pin(driver);
+        assert!(
+            result.is_none(),
+            "MemoryStore chain MUST return None — find_fast_slow_for_pin \
+             is the gating check that decides whether a CAS store is \
+             eligible for SmallBlobDispatcher pin-set registration; a \
+             false-Some would register an empty pin and the dispatcher \
+             would silently no-op every enqueue"
+        );
+    }
+
+    /// (#278C visibility under-action) The startup wire-up's silent-
+    /// disable branch MUST emit a `warn!` naming the missed
+    /// `store_name` so operators can observe the condition without
+    /// grepping the absence of the `info!` registration line.
+    ///
+    /// This test exercises the same emission shape used in
+    /// `src/bin/nativelink.rs`'s wire-up loop via the helper
+    /// [`emit_walker_miss_warn`] (extracted for testability since the
+    /// bin's startup loop is awkward to unit-test in isolation).
+    ///
+    /// Mutation step: replace the warn body with a no-op (or
+    /// `debug!`) — this test red-fails with the bespoke
+    /// "walker miss MUST emit a WARN naming the store_name" message.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn silent_disable_logs_warn_when_walker_misses() {
+        emit_walker_miss_warn("MY_FUTURE_WRAPPED_STORE");
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(" WARN ")
+                        && l.contains("small_blob_dispatcher: walker bailed")
+                        && l.contains("MY_FUTURE_WRAPPED_STORE")
+                })
+                .count();
+            if n >= 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "walker miss MUST emit a WARN naming the store_name — \
+                     observed {n} matching warn lines for \
+                     `MY_FUTURE_WRAPPED_STORE`",
+                ))
+            }
+        });
+    }
 }

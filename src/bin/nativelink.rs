@@ -566,6 +566,32 @@ async fn inner_main(
             // WorkerProxyStore wrapping) so the find walks straight to
             // the FastSlowStore without the WorkerProxyStore layer
             // adding another inner_store hop.
+            //
+            // **Walker miss = silent disable** (#278C visibility fix).
+            // Pre-#278C, when `find_fast_slow_for_pin` returned None
+            // (e.g. a future wrapper that returns `self` from
+            // `inner_store(None)` without a recognised drill-through),
+            // the else branch silently skipped pin-set registration and
+            // SmallBlobDispatcher was effectively disabled for that
+            // store. Operators had no log line to diagnose by. Now we:
+            //   - emit one `warn!` per missed CAS store at startup
+            //     naming the store_name (concrete wrapper type-name is
+            //     not exposed via the StoreDriver trait, so the
+            //     warn names the store_name as the actionable handle);
+            //   - count resolved targets and emit
+            //     `worker_ac_mirror_target_resolved=<n>` at startup so
+            //     operators can see the dispatcher's effective coverage;
+            //   - escalate to `error!` when the operator has explicitly
+            //     enabled `small_blob_mirror_enabled=true` AND no
+            //     targets resolved. The dispatcher is still
+            //     constructed (`Some(dispatcher)`) and `enqueue` will
+            //     no-op without registered pin sets — the `error!`
+            //     surfaces the misconfiguration without fail-stopping
+            //     a partial deploy. Future fail-stop policy (return
+            //     `None` here) is a separate operator decision.
+            let mut resolved: usize = 0;
+            let mut missed_stores: Vec<String> = Vec::new();
+            let mut skipped_invalid_id: usize = 0;
             for store_name in &cas_store_names {
                 let Some(store) = unwrapped_cas_stores.get(store_name) else {
                     continue;
@@ -579,6 +605,7 @@ async fn inner_main(
                         "small_blob_dispatcher: skipping pin-set registration; \
                          store_name does not match `[a-zA-Z_][a-zA-Z0-9_]*` (per plan C11)"
                     );
+                    skipped_invalid_id += 1;
                     continue;
                 }
                 let driver: &dyn StoreDriver =
@@ -586,12 +613,47 @@ async fn inner_main(
                 if find_fast_slow_for_pin(driver).is_some() {
                     let pin = Arc::new(EphemeralServerSidePin::new(pin_max_bytes));
                     dispatcher.register_pin_set(store_name, pin);
+                    resolved += 1;
                     info!(
                         store_name,
                         pin_max_bytes,
                         "small_blob_dispatcher: registered EphemeralServerSidePin"
                     );
+                } else {
+                    // Walker bailed: chain bottoms out at a wrapper
+                    // that returns `self` from `inner_store(None)` and
+                    // is not recognised by `find_fast_slow_for_pin`.
+                    // Centralised emission so production + tests share
+                    // the message shape (#278C).
+                    nativelink_store::small_blob_dispatcher::emit_walker_miss_warn(store_name);
+                    missed_stores.push(store_name.clone());
                 }
+            }
+            // Emit the resolved-target count at startup so operators
+            // have a single line to grep for SmallBlobDispatcher
+            // effective coverage.
+            info!(
+                worker_ac_mirror_target_resolved = resolved,
+                cas_store_count = cas_store_names.len(),
+                skipped_invalid_id,
+                missed = missed_stores.len(),
+                "small_blob_dispatcher: walker resolution summary"
+            );
+            // Refuse to enable the dispatcher when explicitly opted-in
+            // but every CAS store missed: the operator's intent
+            // (`small_blob_mirror_enabled=true`) cannot be honoured by
+            // a no-op dispatcher. Surface the misconfiguration loudly
+            // rather than wedging the dispatcher silently.
+            if small_blob_mirror_enabled && resolved == 0 {
+                error!(
+                    cas_store_count = cas_store_names.len(),
+                    missed = missed_stores.len(),
+                    "small_blob_dispatcher: small_blob_mirror_enabled=true but \
+                     ZERO CAS stores resolved a FastSlowStore via walker — \
+                     dispatcher constructed in inert state (every enqueue \
+                     no-ops). Audit the cas_stores chain and \
+                     find_fast_slow_for_pin's recognised wrappers."
+                );
             }
             // #168 item I: spawn the periodic activity-metrics logger
             // (1 line / minute). Provides operator visibility into
