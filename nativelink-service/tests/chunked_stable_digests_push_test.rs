@@ -83,7 +83,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreSpec};
-use nativelink_error::Error;
+use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_service::chunked_write_handler::{
@@ -92,7 +92,9 @@ use nativelink_service::chunked_write_handler::{
     dispatch_chunks_to_driver, run_async_commit_reaper,
 };
 use nativelink_store::chunked::chunk_budget::ChunkBudget;
-use nativelink_store::chunked::chunked_driver::{ChunkedDriver, PER_BLOB_MPSC_CAP};
+use nativelink_store::chunked::chunked_driver::{
+    ChunkedCommitResult, ChunkedDriver, PER_BLOB_MPSC_CAP,
+};
 use nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry;
 use nativelink_store::chunked::pin_budget::PinBudget;
 use nativelink_store::chunked::{
@@ -1719,5 +1721,251 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
 
     // Drop the held sender so the driver's mpsc closes (in case the
     // JoinHandleDropGuard didn't fully tear down before this point).
+    drop(_sender_held_alive);
+}
+
+// =============================================================================
+// #283 SUB-ITEM 3 (WATCHDOG) — SYNC ARM SIBLING TEST (testing-czar MAJOR-1 fixup)
+// =============================================================================
+//
+// Sibling-bug parity coverage for the Synchronous arm of
+// `dispatch_chunks_to_driver`. After the #283-fixup MAJOR-1 detach, the
+// Synchronous arm's production code path is:
+//
+//     tokio::spawn(run_async_commit_reaper(driver, ..., "synchronous", Some(relay_tx)));
+//     match relay_rx.await { ... }
+//
+// — IDENTICAL composition to what this test exercises. This satisfies
+// CLAUDE.md "Test in production composition, not in isolation": the
+// reaper spawn + relay-await pattern IS the Sync arm's production
+// shape now that the watchdog runs on a detached task.
+//
+// Why a separate test from the Async one: the under-action contract
+// for the Sync arm has TWO halves the Async arm doesn't have:
+//   1. The relay (`oneshot::Sender<Result<ChunkedCommitResult, Error>>`)
+//      MUST forward the watchdog's `Err(DeadlineExceeded)` to the
+//      caller's RPC return path. Without this the WriteChunked RPC
+//      would hang on `relay_rx.await` forever even though the reaper
+//      fired the failed-commit sink correctly.
+//   2. The `mode_label="synchronous"` MUST be threaded to the
+//      tracing fields (operator dashboards distinguish chunked-watchdog
+//      fires by mode; conflating async + sync hides which path is
+//      degrading).
+
+/// **#283 sub-item 3 (watchdog) — Sync-arm sibling.** When the
+/// Synchronous arm of `dispatch_chunks_to_driver` is wedged on a
+/// stalled `await_completion()`, the reaper's watchdog MUST:
+///
+/// 1. Fire `failed_commit_sink(stream_digest)` so `failed_slow_writes`
+///    contains the digest (the WriteChunked RPC's reconnect-retry
+///    path requires it).
+/// 2. Relay an `Err(Code::DeadlineExceeded)` over the
+///    `result_relay` oneshot so the WriteChunked RPC future returns a
+///    deterministic Err to the worker (instead of hanging on
+///    `relay_rx.await`).
+/// 3. Remove the digest from `in_flight` (parity with the Async arm's
+///    bookkeeping).
+/// 4. Increment `commit_failures_total` (so chunked-watchdog fires
+///    are visible in the same metric the Async arm increments).
+///
+/// **Drive path:** mirror the Sync arm's exact production composition
+/// — `tokio::spawn(run_async_commit_reaper(..., "synchronous",
+/// Some(relay_tx)))` followed by `relay_rx.await`. The driver's
+/// per-blob mpsc sender is held alive by the test, so the driver's
+/// `rx.recv().await` never returns and `await_completion()` blocks
+/// forever; the reaper's watchdog is the only thing that can unblock
+/// the future.
+///
+/// **Production composition:** real `FastSlowStore` (fast =
+/// MemoryStore, slow = FilesystemStore) provides the
+/// `failed_writes_inserter()` closure that's wired in production via
+/// `wire_bazel_chunked_dispatcher`. The watchdog arm fires that EXACT
+/// closure shape; we observe via
+/// `fast_slow.failed_slow_writes_contains(&digest)`.
+///
+/// **Mutation step (verified at test authorship time):** revert the
+/// `tokio::time::timeout(watchdog, driver.await_completion())` in
+/// `run_async_commit_reaper` to a bare `driver.await_completion().await`.
+/// This test then red-fails — the outer `tokio::time::timeout` deadlock
+/// detector trips (the reaper's spawn hangs forever on a blocked
+/// receiver, the relay never sends, `relay_rx.await` hangs in turn) —
+/// with the bespoke
+/// `"sync-arm chunked commit watchdog must fire on stalled
+/// await_completion — pin TTL leak class regression"` message.
+///
+/// Additional Sync-only mutation: comment out the
+/// `tx.send(commit_result.clone())` relay-firing line in the reaper.
+/// The bookkeeping still fires (Async test stays green) but THIS test
+/// red-fails on the relay-await deadlock-detector — the relay-fire
+/// half of the contract is uniquely guarded here.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn chunked_synchronous_commit_watchdog_fires_on_stalled_completion() {
+    const SIZE: u64 = 1024;
+    let digest = DigestInfo::new(sha256(b"sync-watchdog-test-blob"), SIZE);
+
+    // Production composition: real FilesystemStore + FastSlowStore so
+    // the `failed_writes_inserter()` closure goes into the genuine
+    // `FastSlowStore::failed_slow_writes` set + invokes pin_digests on
+    // the genuine fast store. The closure shape matches what
+    // `wire_bazel_chunked_dispatcher` wires in production.
+    let fs_store = make_filesystem_store().await;
+    let fast_store: Store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store: Store = Store::new(fs_store.clone());
+    let fast_slow = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Filesystem(FilesystemSpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Pre-flight: failed-set empty.
+    assert!(
+        !fast_slow.failed_slow_writes_contains(&digest),
+        "fixture invariant: failed_slow_writes starts empty",
+    );
+
+    // Construct a real ChunkedDriver with sender held alive — the
+    // driver's `rx.recv().await` blocks forever, `await_completion()`
+    // never returns, the reaper's watchdog is the only thing that
+    // unblocks. Mirrors the Async test's wedge mechanism exactly.
+    let (driver, _sender_held_alive) = ChunkedDriver::spawn_driver(
+        Arc::clone(&fs_store),
+        digest,
+        SIZE,
+        4 * 1024,
+        PER_BLOB_MPSC_CAP,
+    );
+    let driver_arc = Arc::new(driver);
+
+    let in_flight = ChunkedWriteInFlight::new();
+
+    // Production-shaped sinks. Identical shape to
+    // `wire_bazel_chunked_dispatcher`.
+    let failed_sink = fast_slow.as_ref().failed_writes_inserter();
+    let stable_sink = fast_slow.as_ref().stable_digests_pusher();
+
+    // Build the relay channel exactly as the Sync arm's production
+    // code path does. The Sync arm spawns the reaper with
+    // `mode_label="synchronous"` and `result_relay=Some(tx)`, then
+    // awaits `rx`.
+    let (relay_tx, relay_rx) =
+        tokio::sync::oneshot::channel::<Result<ChunkedCommitResult, Error>>();
+
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+    let reaper_handle = tokio::spawn(run_async_commit_reaper(
+        Arc::clone(&driver_arc),
+        digest,
+        Arc::clone(&in_flight),
+        None, // chunked_read_registry
+        Some(stable_sink),
+        Some(failed_sink),
+        Arc::clone(&metrics),
+        // The under-test mode label: distinguishes the Sync arm's
+        // watchdog firing from the Async arm's in operator
+        // dashboards. Mutating to "async" would make this test pass
+        // (the test does not assert on log fields) — log-field
+        // coverage is left to the existing AsyncCommit test's
+        // mutation step ("async" → "synchronous" similarly silent).
+        "synchronous",
+        // The under-test relay: the Sync arm's RPC future awaits
+        // this. Mutating to `None` would make `relay_rx.await` below
+        // hang (never receive); the outer 10s virtual-time timeout
+        // would trip on the deadlock-detector.
+        Some(relay_tx),
+    ));
+
+    // Yield once so the spawned reaper makes progress past the spawn
+    // boundary into the timeout future.
+    tokio::task::yield_now().await;
+
+    // Advance virtual time PAST the watchdog deadline. Same +5s
+    // buffer as the Async test.
+    tokio::time::advance(Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS + 5)).await;
+
+    // Await the relay — this is what the Sync arm's RPC future does.
+    // The reaper's watchdog fires, synthesises an Err, sends it
+    // through the relay BEFORE bookkeeping. Without the relay-fire,
+    // this `relay_rx.await` would hang forever (the deadlock-detector
+    // catches it via the outer 10s virtual-time timeout below).
+    let relay_result = tokio::time::timeout(Duration::from_secs(10), relay_rx)
+        .await
+        .expect(
+            "sync-arm chunked commit watchdog must fire on stalled \
+             await_completion — pin TTL leak class regression",
+        )
+        .expect(
+            "reaper task must relay the commit result — without this \
+             the WriteChunked RPC future hangs on relay_rx.await even \
+             though the watchdog correctly fired the failed-commit sink",
+        );
+
+    // Contract part 1: the relayed result is `Err(DeadlineExceeded)`.
+    let relay_err = relay_result.expect_err(
+        "sync-arm watchdog MUST relay an Err — the WriteChunked RPC's \
+         caller relies on the Err to know the commit failed (and to \
+         feed the worker reconnect-retry path)",
+    );
+    assert_eq!(
+        relay_err.code,
+        Code::DeadlineExceeded,
+        "sync-arm watchdog MUST relay Code::DeadlineExceeded (not a \
+         generic Err) so the WriteChunked classifier can distinguish \
+         the watchdog-fire from a natural commit-Err. got code={:?}, \
+         msg={:?}",
+        relay_err.code,
+        relay_err.message_string(),
+    );
+
+    // Wait for the reaper to fully complete its bookkeeping (the
+    // relay fired BEFORE bookkeeping; we need to await the spawn to
+    // observe the bookkeeping post-conditions).
+    tokio::time::timeout(Duration::from_secs(10), reaper_handle)
+        .await
+        .expect(
+            "reaper task must complete bookkeeping after firing the \
+             relay — without this the failed_commit_sink + in_flight \
+             removal observability gaps remain open",
+        )
+        .expect("reaper task must not panic");
+
+    // Contract part 2: failed_commit_sink fired. Without this the
+    // WriteChunked worker reconnect-retry path never picks up the
+    // digest.
+    assert!(
+        fast_slow.failed_slow_writes_contains(&digest),
+        "sync-arm watchdog MUST insert into failed_slow_writes via \
+         the failed_commit_sink closure. Without this, a stalled slow \
+         tier on the Sync (WriteChunked RPC) path leaves no record of \
+         the failed commit and the worker reconnect-retry path never \
+         picks up the digest — sibling-bug regression of the Async \
+         arm's contract guarded by \
+         chunked_async_commit_watchdog_fires_on_stalled_completion.",
+    );
+
+    // Contract part 3: in_flight cleared.
+    assert!(
+        !in_flight.contains_digest(&digest),
+        "sync-arm watchdog MUST NOT leave any residual entry in the \
+         chunked in-flight set. Observed in_flight entry post-watchdog \
+         suggests the reaper's bookkeeping was skipped on the relay \
+         path (parity gap with Async arm).",
+    );
+
+    // Contract part 4: commit_failures_total incremented.
+    let failures = metrics.commit_failures_total.load(AtomicOrdering::Relaxed);
+    assert!(
+        failures >= 1,
+        "sync-arm watchdog MUST increment commit_failures_total \
+         (natural Err path parity with the Async arm). got={failures}",
+    );
+
+    // Drop the driver Arc so the JoinHandleDropGuard inside
+    // ChunkedDriver aborts the still-blocked inner driver task.
+    drop(driver_arc);
     drop(_sender_held_alive);
 }
