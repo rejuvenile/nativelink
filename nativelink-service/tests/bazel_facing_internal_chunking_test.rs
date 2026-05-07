@@ -497,6 +497,7 @@ async fn dispatch_chunks_to_driver_synchronous_commits_blob() {
             budget,
             None, // pin_budget
             None, // chunked_read_registry
+            None, // stable_digests_sink
             CHUNK,
             digest,
             stream,
@@ -577,6 +578,7 @@ async fn dispatch_chunks_to_driver_async_commit_returns_promptly_then_drains() {
             budget,
             None, // pin_budget
             None, // chunked_read_registry
+            None, // stable_digests_sink
             CHUNK,
             digest,
             stream,
@@ -685,6 +687,7 @@ async fn pin_budget_cap_rejects_admission_with_pinned_bytes_exhausted_signal() {
             chunk_budget,
             Some(pin_budget),
             None, // chunked_read_registry
+            None, // stable_digests_sink
             CHUNK,
             digest,
             stream,
@@ -1051,6 +1054,7 @@ async fn dispatch_bazel_facing_skips_chunked_path_when_digest_already_indexed() 
             budget,
             None, // pin_budget
             None, // chunked_read_registry
+            None, // stable_digests_sink
             metrics,
             CHUNK,
             digest,
@@ -1162,6 +1166,7 @@ async fn dispatch_bazel_facing_runs_chunked_path_when_digest_not_indexed() {
             budget,
             None,
             None,
+            None, // stable_digests_sink
             metrics,
             CHUNK,
             digest,
@@ -1249,6 +1254,7 @@ async fn dispatch_bazel_facing_dedup_drain_size_cap_fires_on_oversized_producer(
             budget,
             None,
             None,
+            None, // stable_digests_sink
             metrics,
             CHUNK,
             digest,
@@ -1332,6 +1338,7 @@ async fn dispatch_bazel_facing_dedup_drain_per_recv_timeout_fires_on_stalled_pro
         budget,
         None,
         None,
+        None, // stable_digests_sink
         metrics,
         CHUNK,
         digest,

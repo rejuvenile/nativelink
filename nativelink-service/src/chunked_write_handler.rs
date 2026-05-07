@@ -1428,6 +1428,14 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     chunked_read_registry: Option<
         Arc<nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry>,
     >,
+    // #282 fix: optional stable_digests sink. When `Some`, the
+    // dispatcher invokes the closure on commit success — both the
+    // AsyncCommit reaper AND the Synchronous commit success branch —
+    // so chunked-committed digests reach the FastSlowStore's BIS
+    // broadcast loop. WITHOUT this, chunked commits never push to
+    // `stable_digests` and pinned bytes accumulate until the 120 s pin
+    // TTL drains them (the production-incident-2026-05-06 mechanism).
+    stable_digests_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
     chunk_size: usize,
     digest: DigestInfo,
     chunks: Pin<Box<dyn Stream<Item = Result<PreparedChunk, Error>> + Send>>,
@@ -1599,6 +1607,18 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
                 }
             };
 
+            // #282 fix: BIS push must happen on commit success so the
+            // FastSlowStore's BIS broadcast loop can ack stable bytes
+            // and worker `mirror_blobs` / server fast-tier pins drain.
+            // Mirrors the legacy update/update_oneshot push at
+            // `fast_slow_store.rs:3449-3450`. Push BEFORE returning so
+            // the digest is observable in `stable_digests` by the time
+            // the upstream caller (and any concurrent reader) sees the
+            // commit Ok.
+            if let Some(sink) = stable_digests_sink.as_ref() {
+                sink(stream_digest);
+            }
+
             metrics
                 .chunks_committed_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -1641,6 +1661,17 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             // (success OR failure) so Phase 2.5's cascade step 2 stops
             // consulting a driver whose pin is already cleared.
             let reg_for_reaper = chunked_read_registry.clone();
+            // #282 fix: clone the stable_digests sink into the reaper.
+            // The closure is the same one wired by the FSS via
+            // `stable_digests_pusher()`; on commit success the reaper
+            // invokes it BEFORE removing the in_flight entry so the
+            // FSS's outer `chunked_in_flight_digests` reaper (which
+            // polls `contains_digest`) cannot observe the digest as
+            // "neither in_flight nor stable" — the gap that would
+            // otherwise let `has_with_results` return None for a
+            // freshly-committed blob whose BIS notification is racing
+            // the in-flight removal.
+            let sink_for_reaper = stable_digests_sink.clone();
             // Drop our local `driver` Arc — the reaper holds its own
             // strong ref and the in-flight entry holds another. The
             // explicit `drop(driver)` here documents that we transfer
@@ -1651,6 +1682,28 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             // do with it here.
             tokio::spawn(async move {
                 let commit_result = driver_for_reaper.await_completion().await;
+                // #282 fix: push to stable_digests on success BEFORE
+                // removing the chunked driver's in_flight entry. The
+                // outer FSS reaper (`BazelChunkedDispatcherImpl::dispatch`)
+                // polls `in_flight.contains_digest()` to decide when to
+                // remove from `chunked_in_flight_digests`. By pushing
+                // first, we guarantee that any reader observing the
+                // outer chunked_in_flight_digests entry as removed will
+                // ALSO see the digest in `stable_digests` (the BIS
+                // broadcast loop drains it within one tick). On commit
+                // FAILURE no push fires — matches legacy update's err
+                // arm which only inserts into `failed_writes` (BIS
+                // never acks bytes that aren't durably stored).
+                if let Ok(ref r) = commit_result {
+                    if let Some(sink) = sink_for_reaper.as_ref() {
+                        sink(stream_digest);
+                    }
+                    debug!(
+                        ?stream_digest,
+                        committed_size = r.committed_size,
+                        "chunked dispatch reaper: pushed to stable_digests"
+                    );
+                }
                 let removed_entry =
                     in_flight_for_reaper.inner.lock().remove(&stream_digest);
                 drop(removed_entry);
@@ -1716,7 +1769,6 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
 ///
 /// (β) async-commit mandatory; the dispatch returns Ok as soon as
 /// admission is complete, NOT after on-disk commit.
-#[derive(Debug)]
 pub struct BazelChunkedDispatcherImpl<Fe: FileEntry = FileEntryImpl> {
     filesystem_store: Arc<FilesystemStore<Fe>>,
     in_flight: Arc<ChunkedWriteInFlight>,
@@ -1754,8 +1806,49 @@ pub struct BazelChunkedDispatcherImpl<Fe: FileEntry = FileEntryImpl> {
     /// the predicate evaluation; the dispatcher drives the producer
     /// side of that contract).
     in_flight_empty_notify: Option<Arc<tokio::sync::Notify>>,
+    /// #282 fix: closure that pushes a digest onto the FastSlowStore's
+    /// `stable_digests` queue and wakes the BIS broadcast loop. Invoked
+    /// by the AsyncCommit reaper on `Ok` driver completion (and by the
+    /// Synchronous-commit success branch). Mirrors the legacy
+    /// `FastSlowStore::update`/`update_oneshot` background-spawn push at
+    /// `fast_slow_store.rs:3449-3450`. `None` = no BIS notification
+    /// (tests that don't care about BIS lifecycle); production wiring
+    /// in `wire_bazel_chunked_dispatcher` always installs this.
+    stable_digests_sink:
+        Option<Arc<dyn Fn(nativelink_util::common::DigestInfo) + Send + Sync>>,
     chunk_size: usize,
     metrics: Arc<ChunkedWriteHandlerMetrics>,
+}
+
+// Manual `Debug` impl: the struct holds a
+// `Option<Arc<dyn Fn(DigestInfo)>>` (`stable_digests_sink`, #282) which
+// is not `Debug` because dyn-Fn objects don't carry a Debug bound. We
+// summarize whether the sink is wired without trying to format the
+// closure itself.
+impl<Fe: FileEntry> core::fmt::Debug for BazelChunkedDispatcherImpl<Fe> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BazelChunkedDispatcherImpl")
+            .field("filesystem_store", &self.filesystem_store)
+            .field("in_flight", &self.in_flight)
+            .field("chunk_budget", &self.chunk_budget)
+            .field("pin_budget", &self.pin_budget)
+            .field("chunked_read_registry", &self.chunked_read_registry)
+            .field(
+                "chunked_in_flight_digests",
+                &self.chunked_in_flight_digests.is_some(),
+            )
+            .field(
+                "in_flight_empty_notify",
+                &self.in_flight_empty_notify.is_some(),
+            )
+            .field(
+                "stable_digests_sink_installed",
+                &self.stable_digests_sink.is_some(),
+            )
+            .field("chunk_size", &self.chunk_size)
+            .field("metrics", &self.metrics)
+            .finish()
+    }
 }
 
 impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
@@ -1785,6 +1878,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunked_read_registry: None,
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
+            stable_digests_sink: None,
             chunk_size: CHUNK_SIZE,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
         }
@@ -1828,6 +1922,27 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
         self
     }
 
+    /// #282 fix: wire the dispatcher to a `stable_digests` push closure
+    /// (typically obtained from `FastSlowStore::stable_digests_pusher`).
+    /// The dispatcher invokes this closure on commit-success — both in
+    /// the AsyncCommit reaper (Bazel-facing path) AND in the Synchronous
+    /// commit branch — so chunked-committed digests appear in the BIS
+    /// broadcast that drains worker `mirror_blobs` and server fast-tier
+    /// pins. WITHOUT this wiring, every chunked commit accumulates
+    /// pinned bytes that only drain at the 120 s pin TTL — the
+    /// production-incident-2026-05-06 mechanism.
+    ///
+    /// On commit FAILURE the closure is NOT invoked; the BIS protocol
+    /// only acks bytes that are durably stored.
+    #[must_use]
+    pub fn with_stable_digests_sink(
+        mut self,
+        sink: Arc<dyn Fn(DigestInfo) + Send + Sync>,
+    ) -> Self {
+        self.stable_digests_sink = Some(sink);
+        self
+    }
+
     /// Construct a dispatcher with externally-supplied state. Used by
     /// tests so each test can have its own in-flight tracker + chunk
     /// budget + metrics + chunk size (smaller chunks make tests faster).
@@ -1848,6 +1963,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunked_read_registry: None,
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
+            stable_digests_sink: None,
             chunk_size,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
         }
@@ -1875,6 +1991,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
             chunked_read_registry: None,
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
+            stable_digests_sink: None,
             chunk_size,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
         }
@@ -1923,6 +2040,7 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
             self.chunk_budget,
             Some(self.pin_budget),
             self.chunked_read_registry.clone(),
+            self.stable_digests_sink.clone(),
             Arc::clone(&self.metrics),
             self.chunk_size,
             digest,
@@ -2018,7 +2136,15 @@ pub fn wire_bazel_chunked_dispatcher<Fe: FileEntry>(
             .with_in_flight_tracking(
                 fast_slow.chunked_in_flight_digests_handle(),
                 fast_slow.in_flight_empty_notify_handle(),
-            ),
+            )
+            // #282 fix: wire the BIS push closure so chunked-committed
+            // digests reach the FastSlowStore's BIS broadcast loop.
+            // Mirrors the legacy update/update_oneshot push at
+            // `fast_slow_store.rs:3449-3450`. WITHOUT this, every
+            // chunked commit accumulates pinned bytes that only drain
+            // at the 120 s pin TTL — the production-incident-2026-05-06
+            // mechanism.
+            .with_stable_digests_sink(fast_slow.stable_digests_pusher()),
     );
     let _installed = fast_slow.set_chunked_read_registry(Arc::clone(&registry));
     fast_slow
@@ -2189,6 +2315,12 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
     chunked_read_registry: Option<
         Arc<nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry>,
     >,
+    // #282 fix: forwarded to `dispatch_chunks_to_driver` so the
+    // AsyncCommit reaper can push chunked-committed digests onto the
+    // FastSlowStore's `stable_digests` queue. See the parameter
+    // doc-comment on `dispatch_chunks_to_driver` for the full
+    // contract.
+    stable_digests_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
     metrics: Arc<ChunkedWriteHandlerMetrics>,
     chunk_size: usize,
     digest: DigestInfo,
@@ -2253,6 +2385,19 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
                  exceeded declared size)",
             ));
         }
+        // #282 fix: even on early-dedup short-circuit, push to
+        // stable_digests. The digest IS on the slow tier and the
+        // upstream caller's fast-tier write (via FSS::update tee)
+        // also lands as an in-memory replica. Re-pushing on dedup is
+        // idempotent at the BIS protocol layer (a worker that has
+        // already dropped its mirror_blobs entry for this digest sees
+        // the unpin as a no-op). Defense in depth: covers the case
+        // where the original commit's push was lost (server crash
+        // between push and broadcast) and a Bazel re-upload now
+        // re-arms the broadcast.
+        if let Some(sink) = stable_digests_sink.as_ref() {
+            sink(digest);
+        }
         debug!(
             ?digest,
             size = digest.size_bytes(),
@@ -2271,6 +2416,7 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
         chunk_budget,
         pin_budget,
         chunked_read_registry,
+        stable_digests_sink,
         chunk_size,
         digest,
         chunks_stream,
