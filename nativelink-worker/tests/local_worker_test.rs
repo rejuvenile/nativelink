@@ -129,6 +129,9 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
         "worker must populate boot_epoch_id (#141)"
     );
     connect_worker_request.boot_epoch_id = 0;
+    // build_sha is set from the running binary's actual SHA per #216;
+    // normalize like boot_epoch_id so the assertion is shape-only.
+    connect_worker_request.build_sha = String::new();
     assert_eq!(
         connect_worker_request,
         ConnectWorkerRequest {
@@ -154,6 +157,7 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
             max_inflight_tasks: 0,
             cas_endpoint: String::new(),
             boot_epoch_id: 0,
+            build_sha: String::new(),
         }
     );
 
