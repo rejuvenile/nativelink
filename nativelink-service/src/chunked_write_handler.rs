@@ -150,12 +150,11 @@ const EARLY_DEDUP_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
 /// **the same end-state — pins past 120 s — is reachable via
 /// stalled-completion just as readily as via missing-failed_commit_sink.**
 ///
-/// **Value:** mirrors [`SLOW_WRITE_WATCHDOG_SECS`] (60 s) in
-/// `nativelink_store::fast_slow_store`. Both watchdogs guard the same
-/// invariant — on commit-result delay, the digest must end up in
-/// `failed_slow_writes` so the worker reconnect-retry path picks it up
-/// — and both must fire **before** the 120 s `PIN_TIMEOUT_SECS` on the
-/// fast-store pin so the failed-set insert lands BEFORE auto-unpin.
+/// **Value:** matches [`SLOW_WRITE_WATCHDOG_SECS`] (60 s) in
+/// `nativelink_store::fast_slow_store` so the failed-set insert lands
+/// BEFORE the 120 s `PIN_TIMEOUT_SECS` auto-unpin on either path.
+/// **Note: same value, different semantics on timeout** — see
+/// "Divergence from legacy" below.
 ///
 /// **Behaviour on timeout:**
 ///   1. Synthesise an `Err(Code::DeadlineExceeded, ...)` commit_result
@@ -165,13 +164,35 @@ const EARLY_DEDUP_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
 ///      path as a natural commit-Err.
 ///   2. Drop the local `Arc<ChunkedDriver>` after the in-flight entry
 ///      removal — the `JoinHandleDropGuard` aborts the driver task
-///      when the last `Arc` drops, freeing its blocking-pool slot.
+///      when the last `Arc` drops. **Best-effort:** abort is
+///      cooperative-only for `spawn_blocking` work (a wedged kernel-
+///      side `pwrite` syscall continues to completion; abort just
+///      prevents future polling). The blocking-pool slot is freed
+///      only when the kernel unwedges; the digest's failed-set
+///      bookkeeping is restored regardless.
 ///
-/// The outer post-watchdog contract is identical to the legacy
-/// `SLOW_WRITE_WATCHDOG_SECS` arm at `fast_slow_store.rs:3491-3510`:
-/// the digest is observable in `failed_slow_writes` BEFORE in-flight
-/// removal completes (so a reader concurrently observing the in-flight
-/// set as empty will also see the failed-set entry).
+/// **Divergence from legacy** (distributed-systems review of the
+/// 8090162d watchdog patch): the legacy `SLOW_WRITE_WATCHDOG_SECS`
+/// arm at `fast_slow_store.rs:3500-3503` explicitly DOES NOT abort
+/// the in-flight write task on timeout ("write task NOT aborted —
+/// may still complete"); it logs + queues for retry and lets the
+/// spawned task continue. The chunked watchdog IS destructive — when
+/// the last `Arc<ChunkedDriver>` drops, the `JoinHandleDropGuard`
+/// aborts the inner driver task. Cost of divergence: a wedged-mid-
+/// pwrite watchdog leaves a `.holding` partial file that is reaped
+/// at next `FilesystemStore::new` startup sweep, not at watchdog
+/// time. This is an explicit trade-off — chunked uses the watchdog
+/// to recover the in-flight bookkeeping AND best-effort the
+/// blocking-pool slot, while legacy uses it only to observe-and-tag.
+/// See red-team `283-watchdog-8090162d` finding P3 + open follow-up
+/// for a future watchdog-arm `discard_chunked` to unlink abandoned
+/// holding files at watchdog time instead.
+///
+/// **Ordering invariant** (preserved across both arms): the digest
+/// is observable in `failed_slow_writes` BEFORE in-flight removal
+/// completes (so a reader concurrently observing the in-flight set
+/// as empty will also see the failed-set entry). This part IS
+/// identical to the legacy arm.
 pub const CHUNKED_COMMIT_WATCHDOG_SECS: u64 = 60;
 
 /// In-flight map: `DigestInfo` → live driver + sender. The sender is
