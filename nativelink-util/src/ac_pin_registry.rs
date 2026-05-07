@@ -38,9 +38,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
-use parking_lot::RwLock;
-use tracing::debug;
+use parking_lot::{Mutex, RwLock};
+use tracing::warn;
 
 use crate::common::DigestInfo;
 
@@ -75,7 +76,24 @@ pub struct AcPinRegistry {
     /// Advertisements beyond the cap are silently dropped to bound
     /// server-side memory under a hostile or buggy worker.
     max_entries_per_endpoint: usize,
+    /// Per-endpoint rate-limit state for cap-exceeded warnings.
+    /// Maps `endpoint → (Option<last_warn_time>, drops_since_last_warn)`.
+    /// `None` means "this endpoint has never been warned about" — the
+    /// next cap-drop will warn unconditionally so operators see the
+    /// first occurrence. A buggy or hostile worker advertising 1M+ AC
+    /// pins must NOT be silent (operators need to see cap-burn) but
+    /// must NOT flood the log either — after the first warn, emit at
+    /// most one `warn!` per [`CAP_DROP_WARN_INTERVAL`] per endpoint,
+    /// summarising the drops observed since the last warn.
+    cap_drop_warn_state: Mutex<HashMap<String, (Option<Instant>, u64)>>,
 }
+
+/// Minimum interval between `warn!`-level cap-exceeded messages for
+/// the SAME endpoint. Drops between warns are counted and reported in
+/// the next warn's `drops_since_last_warn` field, so no event is lost
+/// — only the per-event log line is suppressed.
+const CAP_DROP_WARN_INTERVAL: core::time::Duration =
+    core::time::Duration::from_secs(60);
 
 /// Default cap on per-endpoint AC pin entries. Sized to the worker's
 /// AC fast-tier capacity (configured today as a 100K-entry MemoryStore
@@ -89,6 +107,7 @@ impl AcPinRegistry {
         Self {
             inner: RwLock::new(HashMap::new()),
             max_entries_per_endpoint: DEFAULT_MAX_AC_PINS_PER_ENDPOINT,
+            cap_drop_warn_state: Mutex::new(HashMap::new()),
         }
     }
 
@@ -96,31 +115,75 @@ impl AcPinRegistry {
         Self {
             inner: RwLock::new(HashMap::new()),
             max_entries_per_endpoint,
+            cap_drop_warn_state: Mutex::new(HashMap::new()),
         }
     }
 
     /// Register one `(store_id, digest)` AC pin against `endpoint`.
     /// Silently drops the entry if the endpoint's set is already at
     /// the configured cap (see `max_entries_per_endpoint`).
+    ///
+    /// Cap-exceeded drops emit a rate-limited `warn!` (at most one
+    /// per [`CAP_DROP_WARN_INTERVAL`] per endpoint) so operators can
+    /// observe a buggy or hostile worker burning the cap without the
+    /// log being flooded. The warn includes the count of drops
+    /// observed since the previous warn for the same endpoint.
     pub fn register_ac_pin(&self, endpoint: &str, store_id: Arc<str>, digest: DigestInfo) {
         let mut guard = self.inner.write();
-        let set = guard
-            .entry(endpoint.to_string())
-            .or_default();
-        if set.len() >= self.max_entries_per_endpoint
-            && !set.contains(&(store_id.clone(), digest))
-        {
+        let cur_len = guard.get(endpoint).map_or(0, HashSet::len);
+        let already_present = guard
+            .get(endpoint)
+            .is_some_and(|s| s.contains(&(store_id.clone(), digest)));
+        if cur_len >= self.max_entries_per_endpoint && !already_present {
             // Cap reached and this would be a NEW entry — drop it.
             // Re-advertisements of EXISTING entries are still accepted
             // (HashSet::insert is idempotent on present).
-            debug!(
+            // Drop the inner write guard before taking the warn-state
+            // mutex to avoid lock-order surprises with future readers.
+            drop(guard);
+            self.maybe_warn_cap_drop(
                 endpoint,
-                cap = self.max_entries_per_endpoint,
-                "ac_pin_registry: per-endpoint cap reached; dropping new AC pin"
+                store_id.as_ref(),
+                cur_len,
             );
             return;
         }
-        set.insert((store_id, digest));
+        guard
+            .entry(endpoint.to_string())
+            .or_default()
+            .insert((store_id, digest));
+    }
+
+    /// Rate-limit state update for a cap-exceeded drop. Emits one
+    /// `warn!` per [`CAP_DROP_WARN_INTERVAL`] per endpoint; intervening
+    /// drops are counted and reported in the next warn. The first
+    /// drop for a previously-unseen endpoint always warns.
+    fn maybe_warn_cap_drop(&self, endpoint: &str, store_id: &str, cur_len: usize) {
+        let now = Instant::now();
+        let mut state = self.cap_drop_warn_state.lock();
+        let entry = state
+            .entry(endpoint.to_string())
+            .or_insert((None, 0));
+        entry.1 = entry.1.saturating_add(1);
+        let should_warn = entry
+            .0
+            .is_none_or(|last| now.duration_since(last) >= CAP_DROP_WARN_INTERVAL);
+        if should_warn {
+            let drops_since_last_warn = entry.1;
+            entry.0 = Some(now);
+            entry.1 = 0;
+            // Drop the warn-state lock before emitting the trace event
+            // to keep the lock window short under hostile-worker load.
+            drop(state);
+            warn!(
+                endpoint,
+                store_id,
+                count = cur_len,
+                cap = self.max_entries_per_endpoint,
+                drops_since_last_warn,
+                "ac_pin_registry: per-endpoint cap reached; dropping new AC pin"
+            );
+        }
     }
 
     /// Remove all AC pin entries for `endpoint` matching ANY of the
@@ -183,8 +246,12 @@ impl AcPinRegistry {
     /// disconnect / boot-epoch change, sibling of
     /// [`crate::blob_locality_map::BlobLocalityMap::remove_endpoint`]
     /// for the CAS path (#141 / #174). O(1) over the outer map.
+    ///
+    /// Also clears the per-endpoint cap-drop warn rate-limit state
+    /// so a reconnecting worker starts fresh.
     pub fn wipe_endpoint(&self, endpoint: &str) {
         self.inner.write().remove(endpoint);
+        self.cap_drop_warn_state.lock().remove(endpoint);
     }
 
     /// Test/diagnostic accessor: snapshot the current per-endpoint pin
