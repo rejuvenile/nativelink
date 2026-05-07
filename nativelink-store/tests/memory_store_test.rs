@@ -745,3 +745,86 @@ async fn update_rejects_upfront_under_verify_store_does_not_deadlock(
 
     Ok(())
 }
+
+/// #284 part 1 — boundary coverage of the early-reject predicate at
+/// the "exactly-fits" cliff edge. `would_exceed_capacity` uses `>`
+/// (strict greater-than) on the post-insert KB-rounded weight; the
+/// boundary `current=0, incoming=cap` evaluates `cap > cap = false`
+/// and is therefore an ACCEPTABLE write. An off-by-one mutation
+/// (`>` → `>=`) would silently flip that boundary into a rejection
+/// without any other test catching it: every other ExactSize test
+/// uses cap-with-room or strict over-capacity.
+///
+/// We drive cap=1024, current=0, ExactSize(1024) through the empty
+/// store with backpressure armed, expect success, and assert the
+/// blob lands. With the off-by-one mutation:
+/// `would_exceed_capacity(1024)` returns `0 + 1024 >= 1024 = true`,
+/// `check_backpressure_gate` raises `ResourceExhausted`, and this
+/// test red-fails on the bespoke `.expect(...)` message.
+///
+/// **Mutation step** (executed 2026-05-06): flipping `>` to `>=` in
+/// `MokaEvictingMap::would_exceed_capacity` red-fails this test with
+/// the "exactly-fits MUST drain and land" message; restored and
+/// re-confirmed green.
+#[cfg(feature = "chunked_fast_slow")]
+#[nativelink_test]
+async fn update_accepts_exactly_capacity_size() -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::EvictionPolicy;
+    use nativelink_util::store_trait::UploadSizeInfo;
+
+    // 1 KiB cap, empty store. ExactSize(1024) is the exact boundary.
+    let store = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 1024,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: false,
+    });
+    store.enable_emit_backpressure();
+
+    let data = vec![3u8; 1024];
+    let digest = DigestInfo::try_new(VALID_HASH1, data.len() as u64)?;
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let store_pin = Pin::new(store.as_ref());
+    let update_fut = store_pin.update(
+        StoreKey::from(digest),
+        rx,
+        UploadSizeInfo::ExactSize(data.len() as u64),
+    );
+    let send_fut = async {
+        tx.send(Bytes::from(data.clone())).await?;
+        tx.send_eof()?;
+        Ok::<_, Error>(())
+    };
+    let (update_res, _send_res) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(update_fut, send_fut) },
+    )
+    .await
+    .expect(
+        "exactly-fits upload must not deadlock — would_exceed_capacity \
+         must use strict greater-than at the boundary so a 1024-byte \
+         insert into a 1024-byte cap is accepted",
+    );
+    // Check update_res FIRST. The producer-side `send_res` may fail with
+    // "receiver disconnected" if MemoryStore early-rejects (the inner rx
+    // is dropped before our send completes); that derivative error
+    // would mask the real bespoke message below if we propagated it
+    // first via `?`.
+    update_res.expect(
+        "ExactSize upload that exactly equals capacity (current=0, \
+         incoming=cap) MUST drain and land in the store. A failure \
+         here means `would_exceed_capacity` regressed from `>` to `>=` \
+         (or some equivalent off-by-one) — exactly-fits MUST drain \
+         and land, NOT trigger ResourceExhausted.",
+    );
+
+    let landed = Pin::new(store.as_ref())
+        .get_part_unchunked(digest, 0, None)
+        .await?;
+    assert_eq!(landed.as_ref(), data.as_slice());
+
+    Ok(())
+}
