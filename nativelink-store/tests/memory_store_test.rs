@@ -828,3 +828,96 @@ async fn update_accepts_exactly_capacity_size() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// #284 part 1 — MaxSize over-action guard. `MemoryStore::update`'s
+/// early-reject `if let UploadSizeInfo::ExactSize(declared) = size_info`
+/// pattern intentionally SKIPS `MaxSize`: the actual payload may be
+/// smaller than the declared upper bound, so an upfront reject would
+/// be a false positive. Asymmetric-contract sibling of the under-
+/// action ExactSize test: this test guards the OVER-action direction
+/// — the early-reject must NOT fire on `MaxSize` even when
+/// `MaxSize.declared` exceeds capacity.
+///
+/// Setup: cap=2048 bytes (must be >= 1024 since the weigher rounds to
+/// KB granularity; otherwise even a 50-byte post-drain check would
+/// reject). Empty store. `MaxSize(3000)` declares an upper bound that
+/// exceeds the cap, but the actual payload is only 50 bytes — small
+/// enough that the post-drain check passes (50 rounds up to 1024,
+/// 1024 ≤ 2048). With the current correct code, `MaxSize` does not
+/// match the early-reject if-let, the recv loop runs, the payload
+/// drains, and the blob lands.
+///
+/// Mutation: extending the if-let pattern to also match `MaxSize`
+/// (e.g. `if let UploadSizeInfo::ExactSize(declared) |
+/// UploadSizeInfo::MaxSize(declared) = size_info`) would early-reject
+/// on declared=3000 → `would_exceed_capacity(3000) = true` →
+/// `ResourceExhausted` returned BEFORE the recv loop, even though
+/// the actual payload would have fit. This test red-fails on that
+/// mutation.
+///
+/// **Mutation step** (executed 2026-05-06): adding `| UploadSizeInfo::
+/// MaxSize(declared)` to the if-let pattern in `memory_store.rs::
+/// update` red-fails this test with the bespoke "MaxSize early-reject
+/// MUST NOT fire" message; restored and re-confirmed green.
+#[cfg(feature = "chunked_fast_slow")]
+#[nativelink_test]
+async fn update_max_size_does_not_early_reject_when_payload_fits(
+) -> Result<(), Error> {
+    use core::time::Duration;
+    use nativelink_config::stores::EvictionPolicy;
+    use nativelink_util::store_trait::UploadSizeInfo;
+
+    // 2 KiB cap. Payload is 50 bytes (rounds to 1 KiB; well within
+    // cap). Declared MaxSize is 3000 (exceeds cap, but is only an
+    // upper bound — the early-reject MUST skip it).
+    let store = MemoryStore::new(&MemorySpec {
+        eviction_policy: Some(EvictionPolicy {
+            max_bytes: 2048,
+            ..Default::default()
+        }),
+        emit_backpressure_enabled: false,
+    });
+    store.enable_emit_backpressure();
+
+    let data = vec![9u8; 50];
+    let digest = DigestInfo::try_new(VALID_HASH1, data.len() as u64)?;
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let store_pin = Pin::new(store.as_ref());
+    let update_fut = store_pin.update(
+        StoreKey::from(digest),
+        rx,
+        UploadSizeInfo::MaxSize(3000),
+    );
+    let send_fut = async {
+        tx.send(Bytes::from(data.clone())).await?;
+        tx.send_eof()?;
+        Ok::<_, Error>(())
+    };
+    let (update_res, _send_res) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(update_fut, send_fut) },
+    )
+    .await
+    .expect(
+        "MaxSize upload that fits in cap must not deadlock — the \
+         early-reject gate MUST skip MaxSize",
+    );
+    // Check update_res first (see boundary test for the rationale).
+    update_res.expect(
+        "MaxSize early-reject MUST NOT fire when the actual payload \
+         fits in cap, even if MaxSize.declared exceeds cap. A failure \
+         here means the if-let pattern in `MemoryStore::update`'s \
+         early-reject was extended to also match MaxSize — that's an \
+         over-action regression: MaxSize is an UPPER BOUND on the \
+         payload, not a declared exact size, so an upfront reject is \
+         a false positive when the actual payload would fit.",
+    );
+
+    let landed = Pin::new(store.as_ref())
+        .get_part_unchunked(digest, 0, None)
+        .await?;
+    assert_eq!(landed.as_ref(), data.as_slice());
+
+    Ok(())
+}
