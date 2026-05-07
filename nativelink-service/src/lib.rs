@@ -20,6 +20,7 @@ pub mod cas_server;
 #[cfg(feature = "chunked_fast_slow")]
 pub mod chunked_write_handler;
 pub mod execution_server;
+pub mod failed_writes_drain;
 pub mod fetch_server;
 pub mod health_server;
 pub mod push_server;
