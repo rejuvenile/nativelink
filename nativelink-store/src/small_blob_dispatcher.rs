@@ -95,7 +95,6 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::completeness_checking_store::CompletenessCheckingStore;
 use crate::existence_cache_store::ExistenceCacheStore;
 use crate::fast_slow_store::FastSlowStore;
 use crate::verify_store::VerifyStore;
@@ -1257,23 +1256,21 @@ fn synthetic_small_key() -> StoreKey<'static> {
 ///
 /// The walker recurses through every wrapper that returns `self` from
 /// the trait-default `inner_store(None)` (`ExistenceCacheStore`,
-/// `VerifyStore`, `CompletenessCheckingStore`). For each, it drills
-/// into the right inner via the wrapper's concrete accessor:
+/// `VerifyStore`). For each, it drills into the right inner via the
+/// wrapper's concrete accessor:
 ///
 /// - `ExistenceCacheStore.inner_store()` → its single backend.
 /// - `VerifyStore.inner_store()` → its single backend.
-/// - `CompletenessCheckingStore.ac_store()` → the AC backing chain.
-///   The CAS side is reachable through whatever AC-fronting wrapper
-///   wraps `CompletenessCheckingStore` itself (it does not need to be
-///   re-walked from inside CCS).
 ///
 /// Stops on the first wrapper that is not recognized AND does not
 /// unwrap further (`inner_store(_)` returns the same pointer as `self`).
 ///
-/// AC stores ARE walked: the read-side AC peer-fetch wrapper
-/// (`AcProxyStore`) consults the per-AC-FSS pin set; without walking
-/// through `CompletenessCheckingStore` the AC FSS is hidden and the
-/// pin set never registers, leaving the read-side wrapper inert.
+/// **AC stores are intentionally NOT walked.** The AC value path is
+/// write-only from the worker side (`upload_ac_results` in
+/// `nativelink-worker/src/running_actions_manager.rs`); workers never
+/// READ from `ac_store`, so eager fan-out of AC blobs to workers
+/// dispatches bytes to a place where no consumer exists. The AC
+/// producer hook was removed in the post-canary cleanup of #168.
 pub fn find_fast_slow_for_pin(store: &dyn StoreDriver) -> Option<&FastSlowStore> {
     if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
         return Some(fss);
@@ -1289,11 +1286,6 @@ pub fn find_fast_slow_for_pin(store: &dyn StoreDriver) -> Option<&FastSlowStore>
     if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
         return find_fast_slow_for_pin(
             vs.inner_store().inner_store(Some(synthetic_small_key())),
-        );
-    }
-    if let Some(ccs) = store.as_any().downcast_ref::<CompletenessCheckingStore>() {
-        return find_fast_slow_for_pin(
-            ccs.ac_store().inner_store(Some(synthetic_small_key())),
         );
     }
     let inner = store.inner_store(Some(synthetic_small_key()));
