@@ -1648,6 +1648,8 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
         Some(stable_sink),
         Some(failed_sink),
         Arc::clone(&metrics),
+        "async",
+        None, // result_relay — Async test asserts via in_flight + failed_sink
     ));
 
     // Yield once so the spawned reaper makes progress past the spawn

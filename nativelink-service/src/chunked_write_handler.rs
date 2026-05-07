@@ -66,7 +66,7 @@ use futures::Stream;
 use futures::StreamExt as _;
 use parking_lot::Mutex;
 use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
@@ -80,7 +80,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_store::chunked::CHUNK_SIZE;
 use nativelink_store::chunked::chunk_budget::ChunkBudget;
 use nativelink_store::chunked::chunked_driver::{
-    ChunkWork, ChunkedDriver, PER_BLOB_MPSC_CAP,
+    ChunkWork, ChunkedCommitResult, ChunkedDriver, PER_BLOB_MPSC_CAP,
 };
 use nativelink_store::chunked::pin_budget::{PinBudget, pin_budget_singleton};
 use nativelink_store::chunked_signal::encode_backpressure_signal_any;
@@ -1437,26 +1437,35 @@ pub fn admit_prepared_chunk(
     }
 }
 
-/// Reaper task body for the AsyncCommit branch of `dispatch_chunks_to_driver`.
+/// Reaper task body for both `dispatch_chunks_to_driver` commit modes.
 ///
 /// Awaits the driver's commit result under
 /// `tokio::time::timeout(CHUNKED_COMMIT_WATCHDOG_SECS)` (#283 sub-item 3),
 /// then performs the post-commit bookkeeping in the order:
 ///
-/// 1. (Ok) push to `stable_digests_sink` (the BIS broadcast loop's
+/// 1. Optionally relay the commit result to a `Some(result_relay)`
+///    receiver — used by the `Synchronous` arm to detach this whole
+///    bookkeeping into a `tokio::spawn` while still feeding the
+///    upstream WriteChunked RPC future the result. AsyncCommit passes
+///    `None` (no relay needed; the dispatcher returns Ok at admit
+///    time). The relay fires BEFORE bookkeeping so the WriteChunked
+///    RPC caller can return as soon as the driver settles, while the
+///    bookkeeping continues independently of whether that caller's
+///    future is cancelled.
+/// 2. (Ok) push to `stable_digests_sink` (the BIS broadcast loop's
 ///    input — without this, chunked-committed bytes are never
 ///    acknowledged and worker `mirror_blobs` accumulate to OOM —
 ///    #282 production-incident-2026-05-06 mechanism).
-/// 2. (Err) fire `failed_commit_sink` (the `failed_writes_inserter`
+/// 3. (Err) fire `failed_commit_sink` (the `failed_writes_inserter`
 ///    closure — without this, a chunked commit failure leaves no
 ///    record so the worker's reconnect-retry path never picks it
 ///    up — #283 sibling-bug parity with `fast_slow_store.rs:3489-3494`).
-/// 3. Remove the digest from the chunked in-flight map. The
+/// 4. Remove the digest from the chunked in-flight map. The
 ///    stable/failed signal MUST land BEFORE the removal so a reader
 ///    observing the in-flight set as empty also sees the digest in
 ///    the corresponding sink target — closing the visibility gap.
-/// 4. Deregister from the optional read-cascade registry.
-/// 5. Update commit-success / failure metrics counters.
+/// 5. Deregister from the optional read-cascade registry.
+/// 6. Update commit-success / failure metrics counters.
 ///
 /// **Watchdog (sub-item 3):** the legacy `SLOW_WRITE_WATCHDOG_SECS=60`
 /// guards the analogous `update`/`update_oneshot` background spawn at
@@ -1472,13 +1481,35 @@ pub fn admit_prepared_chunk(
 /// the `Arc<ChunkedDriver>` drops at end-of-function so the
 /// `JoinHandleDropGuard` aborts the inner driver task.
 ///
-/// The function is `pub` so the watchdog regression test in
+/// **Note on legacy parity:** the doc-comment originally claimed this
+/// arm is "identical to" `SLOW_WRITE_WATCHDOG_SECS`. The two diverge
+/// in one respect: the legacy arm DOES NOT abort the in-flight slow-
+/// store write task on watchdog Elapsed (`fast_slow_store.rs:3500-3503`
+/// "write task NOT aborted — may still complete"); it logs + queues
+/// for retry and lets the spawned task continue. The chunked watchdog
+/// IS destructive — when the last `Arc<ChunkedDriver>` drops at the
+/// end of this function, the `JoinHandleDropGuard` aborts the inner
+/// driver task. Abort is cooperative-only for `spawn_blocking` work
+/// (a wedged kernel-side `pwrite` syscall continues to completion;
+/// abort just prevents future polling). This keeps the watchdog
+/// recovery semantically correct (the digest's failed-set bookkeeping
+/// is restored), at the cost of best-effort partial-file leak (the
+/// `.holding` file is reaped at next `FilesystemStore::new` startup
+/// sweep). See red-team `283-watchdog-8090162d` finding P3 for the
+/// holding-file lifetime gap and the open #285 follow-up.
+///
+/// The function is `pub` so the watchdog regression tests in
 /// `nativelink-service`'s integration test crate can construct the
 /// production code path against a deliberately-wedged driver (sender
 /// held alive → `await_completion()` blocks forever) and assert the
 /// watchdog arm fires the failed-commit sink. The dispatcher is the
 /// only production caller; tests should avoid calling it directly
 /// outside of the watchdog-regression context.
+///
+/// `mode_label` is a static "async" / "synchronous" tag that goes into
+/// the warn / info / error log lines for diagnosability — the same
+/// reaper body is now used by both branches of `dispatch_chunks_to_driver`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_async_commit_reaper(
     driver: Arc<ChunkedDriver>,
     stream_digest: DigestInfo,
@@ -1489,6 +1520,8 @@ pub async fn run_async_commit_reaper(
     stable_digests_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
     failed_commit_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
     metrics: Arc<ChunkedWriteHandlerMetrics>,
+    mode_label: &'static str,
+    result_relay: Option<oneshot::Sender<Result<ChunkedCommitResult, Error>>>,
 ) {
     // #283 sub-item 3 (watchdog): bound `await_completion()` by
     // `CHUNKED_COMMIT_WATCHDOG_SECS`. Without this bound, a wedged
@@ -1514,7 +1547,7 @@ pub async fn run_async_commit_reaper(
             warn!(
                 ?stream_digest,
                 watchdog_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
-                mode = "async",
+                mode = mode_label,
                 "chunked dispatch reaper: await_completion exceeded watchdog \
                  deadline; treating as commit failure so failed_slow_writes is \
                  populated and the worker reconnect-retry path picks it up. The \
@@ -1529,6 +1562,18 @@ pub async fn run_async_commit_reaper(
             ))
         }
     };
+
+    // #283 fixup MAJOR-1 (sync-arm cancellation leak): relay the
+    // commit_result to the `Synchronous` caller's RPC future BEFORE
+    // bookkeeping so the upstream WriteChunked RPC can return promptly,
+    // and so the bookkeeping (sink-firing + in_flight removal) happens
+    // independently of whether the upstream future was cancelled
+    // (h2 RST_STREAM, transport timeout). Send-failure is harmless —
+    // it just means the upstream future was already dropped; the
+    // bookkeeping below still fires.
+    if let Some(tx) = result_relay {
+        let _ = tx.send(commit_result.clone());
+    }
     // #282 fix: push to stable_digests on success BEFORE removing the
     // chunked driver's in_flight entry. The outer FSS reaper
     // (`BazelChunkedDispatcherImpl::dispatch`) polls
@@ -1579,8 +1624,8 @@ pub async fn run_async_commit_reaper(
             info!(
                 ?stream_digest,
                 committed_size = r.committed_size,
-                mode = "async",
-                "chunked dispatch: blob committed (Bazel-facing reaper)"
+                mode = mode_label,
+                "chunked dispatch: blob committed (reaper)"
             );
         }
         Err(err) => {
@@ -1597,10 +1642,10 @@ pub async fn run_async_commit_reaper(
             warn!(
                 ?stream_digest,
                 ?err,
-                mode = "async",
-                "chunked dispatch: async-commit FAILED (Bazel-facing); blob is \
-                 NOT durable on slow tier — upstream's fast-tier write is the \
-                 only in-memory replica until mirror re-uploads"
+                mode = mode_label,
+                "chunked dispatch: commit FAILED; blob is NOT durable on slow \
+                 tier — upstream's fast-tier write is the only in-memory \
+                 replica until mirror re-uploads"
             );
         }
     }
@@ -1797,127 +1842,78 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
 
     match commit_mode {
         CommitMode::Synchronous => {
-            // Wait for commit + e2e SHA-256 verify.
+            // #283 fixup MAJOR-1 (cancellation leak): detach the
+            // post-commit bookkeeping (watchdog wait + sink-firing +
+            // in_flight removal + metrics) into a `tokio::spawn` that
+            // runs `run_async_commit_reaper` exactly as the AsyncCommit
+            // arm does. The Synchronous arm previously ran the watchdog
+            // INLINE on the WriteChunked RPC future; if the gRPC client
+            // dropped (h2 RST_STREAM, transport timeout) BEFORE the 60 s
+            // watchdog elapsed, the dispatcher future was cancelled,
+            // leaving the in_flight entry populated and the
+            // `failed_commit_sink` unfired — recreating the same
+            // chunked-cap-exhaustion shape #283 sub-items 1+2 closed
+            // for the natural-Err path on the Sync side.
             //
-            // #283 sub-item 3 (watchdog): bound `await_completion()`
-            // by `CHUNKED_COMMIT_WATCHDOG_SECS` for the same reasons
-            // as the AsyncCommit reaper (see comment in that branch
-            // below). The Synchronous path is reached only via the
-            // `WriteChunked` worker→server RPC; without the watchdog
-            // a wedged slow tier holds the upstream RPC future open
-            // past the worker's gRPC deadline, the worker observes
-            // a transport timeout, and on retry the same blob
-            // re-enters the in-flight map — the chunked-cap-exhaustion
-            // shape #283 closed for the AsyncCommit path.
-            let watchdog = core::time::Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
-            let commit_result =
-                match tokio::time::timeout(watchdog, driver.await_completion()).await {
-                    Ok(r) => r,
-                    Err(_elapsed) => {
-                        warn!(
-                            ?stream_digest,
-                            watchdog_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
-                            mode = "synchronous",
-                            "chunked dispatch: await_completion exceeded watchdog \
-                             deadline; treating as commit failure so failed_slow_writes \
-                             is populated and the worker reconnect-retry path picks \
-                             it up. The driver task is aborted via JoinHandleDropGuard \
-                             when the last ChunkedDriver Arc drops below."
-                        );
-                        Err(make_err!(
-                            Code::DeadlineExceeded,
-                            "chunked commit await_completion exceeded \
-                             {CHUNKED_COMMIT_WATCHDOG_SECS}s watchdog deadline; \
-                             slow tier may be wedged"
-                        ))
-                    }
-                };
-
-            // #283 fixup MAJOR-1: on commit FAILURE, fire the
-            // failed-commit sink BEFORE removing the in_flight entry.
-            // Mirrors the AsyncCommit reaper's ordering at
-            // `:1745-1749` and the legacy update Err arm at
-            // `fast_slow_store.rs:3489-3494`: insert into
-            // `failed_slow_writes` (so the worker reconnect-retry
-            // picks up the digest) AND re-pin the in-memory replica
-            // on the fast store (so MemoryStore eviction doesn't drop
-            // the blob before the retry). Order matters: running this
-            // BEFORE in_flight removal closes the visibility window
-            // where a reader could observe the in_flight entry as
-            // removed while the failure-recovery effects haven't yet
-            // landed (the same race the Async arm guards against).
+            // After detach: the spawn owns the watchdog + bookkeeping;
+            // a parent-future cancellation drops only the relay
+            // receiver, the spawn continues to completion. The
+            // upstream WriteChunked RPC future awaits the relay to get
+            // the result and propagates it as before.
             //
-            // This branch had previously omitted the call entirely —
-            // sibling-bug parity gap with the AsyncCommit Err arm
-            // that #283 closed. Reachable from production via the
-            // WriteChunked RPC handler (the only Synchronous-mode
-            // caller).
-            if commit_result.is_err() {
-                if let Some(sink) = failed_commit_sink.as_ref() {
-                    sink(stream_digest);
-                }
-            }
-
-            // Remove the in-flight entry now that the driver has
-            // signaled completion. The cleanup_guard would also do
-            // this; we forget it because we explicitly removed.
-            let removed_entry = in_flight.inner.lock().remove(&stream_digest);
-            drop(removed_entry);
-            // #212 fixup S1: deregister from the read-cascade registry
-            // (if wired). The driver's pin is already cleared on its
-            // own task exit, but a stale registry entry would surface
-            // as a `pin_partial_misses_total` increment on every
-            // subsequent read; deregister keeps the cascade-step-2
-            // miss/partial-miss counters honest.
-            if let Some(reg) = chunked_read_registry.as_ref() {
-                let _ = reg.deregister(&stream_digest);
-            }
+            // The spawned reaper is responsible for in_flight removal,
+            // so we forget the cleanup_guard here — same pattern as the
+            // AsyncCommit arm. (Without this, both the cleanup_guard's
+            // Drop and the reaper would race to remove the entry; the
+            // race is harmless but produces a misleading
+            // "removed in-flight entry on early exit" debug log.)
             core::mem::forget(cleanup_guard);
 
-            let commit_result = match commit_result {
-                Ok(r) => r,
-                Err(err) => {
-                    metrics
-                        .commit_failures_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    if err.code == Code::InvalidArgument
-                        && err
-                            .message_string()
-                            .contains("end-to-end SHA-256 mismatch")
-                    {
-                        metrics
-                            .sha256_e2e_mismatches_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    return Err(err);
-                }
-            };
+            let (relay_tx, relay_rx) =
+                oneshot::channel::<Result<ChunkedCommitResult, Error>>();
+            let driver_for_reaper = Arc::clone(&driver);
+            let in_flight_for_reaper = Arc::clone(&in_flight);
+            let metrics_for_reaper = Arc::clone(&metrics);
+            let reg_for_reaper = chunked_read_registry.clone();
+            let stable_sink_for_reaper = stable_digests_sink.clone();
+            let failed_sink_for_reaper = failed_commit_sink.clone();
+            // Drop the local `driver` Arc so the reaper holds the only
+            // strong ref outside the in_flight map. After the reaper
+            // removes the in_flight entry the last Arc drops and the
+            // `JoinHandleDropGuard` aborts the inner driver task —
+            // identical to the AsyncCommit arm's ownership transfer.
+            drop(driver);
+            tokio::spawn(run_async_commit_reaper(
+                driver_for_reaper,
+                stream_digest,
+                in_flight_for_reaper,
+                reg_for_reaper,
+                stable_sink_for_reaper,
+                failed_sink_for_reaper,
+                metrics_for_reaper,
+                "synchronous",
+                Some(relay_tx),
+            ));
 
-            // #282 fix: BIS push must happen on commit success so the
-            // FastSlowStore's BIS broadcast loop can ack stable bytes
-            // and worker `mirror_blobs` / server fast-tier pins drain.
-            // Mirrors the legacy update/update_oneshot push at
-            // `fast_slow_store.rs:3449-3450`. Push BEFORE returning so
-            // the digest is observable in `stable_digests` by the time
-            // the upstream caller (and any concurrent reader) sees the
-            // commit Ok.
-            if let Some(sink) = stable_digests_sink.as_ref() {
-                sink(stream_digest);
+            // Await the result the reaper relays. On RecvError (the
+            // reaper task itself was aborted/panicked — should not
+            // happen on a healthy runtime) synthesise an Internal Err
+            // so the WriteChunked RPC sees a deterministic failure
+            // instead of a hang. Importantly, if THIS future is
+            // cancelled by the upstream gRPC layer, only `relay_rx`
+            // drops — the spawned reaper continues bookkeeping
+            // independently.
+            match relay_rx.await {
+                Ok(Ok(r)) => Ok(DispatchOutcome {
+                    committed_size: r.committed_size,
+                }),
+                Ok(Err(err)) => Err(err),
+                Err(_recv_err) => Err(make_err!(
+                    Code::Internal,
+                    "chunked synchronous commit reaper task ended without \
+                     relaying the commit result (task panic or runtime shutdown)"
+                )),
             }
-
-            metrics
-                .chunks_committed_total
-                .fetch_add(1, Ordering::Relaxed);
-            info!(
-                ?stream_digest,
-                committed_size = commit_result.committed_size,
-                mode = "synchronous",
-                "chunked dispatch: blob committed"
-            );
-
-            Ok(DispatchOutcome {
-                committed_size: commit_result.committed_size,
-            })
         }
         CommitMode::AsyncCommit => {
             // Anti-#203 (β): return Ok as soon as admission is done.
@@ -1985,6 +1981,8 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
                 sink_for_reaper,
                 failed_sink_for_reaper,
                 metrics_for_reaper,
+                "async",
+                None, // result_relay — AsyncCommit returns Ok at admit time
             ));
 
             Ok(DispatchOutcome {
