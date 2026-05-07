@@ -178,15 +178,16 @@ const EARLY_DEDUP_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
 /// may still complete"); it logs + queues for retry and lets the
 /// spawned task continue. The chunked watchdog IS destructive — when
 /// the last `Arc<ChunkedDriver>` drops, the `JoinHandleDropGuard`
-/// aborts the inner driver task. Cost of divergence: a wedged-mid-
-/// pwrite watchdog leaves a `.holding` partial file that is reaped
-/// at next `FilesystemStore::new` startup sweep, not at watchdog
-/// time. This is an explicit trade-off — chunked uses the watchdog
-/// to recover the in-flight bookkeeping AND best-effort the
-/// blocking-pool slot, while legacy uses it only to observe-and-tag.
-/// See red-team `283-watchdog-8090162d` finding P3 + open follow-up
-/// for a future watchdog-arm `discard_chunked` to unlink abandoned
-/// holding files at watchdog time instead.
+/// aborts the inner driver task. Holding-file lifetime: #286 closes
+/// the gap red-team `283-watchdog-8090162d` finding P3 flagged. The
+/// watchdog Err arm now invokes `discard_partial_best_effort` (same
+/// helper used by `dispatch_chunks_to_driver`'s early-Err exits)
+/// BEFORE the local driver `Arc` drops, unlinking the abandoned
+/// `.holding` partial under a `DISCARD_PARTIAL_TIMEOUT=5s` bound.
+/// On timeout the partial persists until next `FilesystemStore::new`
+/// startup sweep (pre-fix behavior), but the watchdog still returns
+/// within bounded wall-clock — the **post-error cleanup contract**
+/// is preserved.
 ///
 /// **Ordering invariant** (preserved across both arms): the digest
 /// is observable in `failed_slow_writes` BEFORE in-flight removal
@@ -305,6 +306,22 @@ pub struct ChunkedWriteHandlerMetrics {
     pub chunks_committed_total: AtomicU64,
     #[metric(help = "WriteChunked: commit failures (commit_chunked or e2e SHA-256 returned Err)")]
     pub commit_failures_total: AtomicU64,
+    /// #286 sub-item 2 (red-team finding from 283-watchdog-8090162d
+    /// pre-mortem): without a separate counter, the
+    /// `commit_failures_total` increment fired by the watchdog Err arm
+    /// is indistinguishable in dashboards from a natural commit Err
+    /// (`commit_chunked` or `e2e SHA-256` returned Err). Operators
+    /// reading a `commit_failures_total` rise during a healthy-but-
+    /// slow window cannot tell whether the slow tier was wedged
+    /// (watchdog firing) vs. natural-Err (e.g., disk full, permission
+    /// error, holding-file rename collision). Increment in BOTH the
+    /// AsyncCommit and Synchronous watchdog Err arms; the metric is
+    /// strictly additive on top of `commit_failures_total` (every
+    /// watchdog fire is also counted as a commit failure).
+    #[metric(
+        help = "WriteChunked: commit watchdog timeouts (CHUNKED_COMMIT_WATCHDOG_SECS exceeded; subset of commit_failures_total)"
+    )]
+    pub commit_watchdog_fires_total: AtomicU64,
 }
 
 /// Server-side handler for the `WriteChunked` RPC. Holds the
@@ -1514,10 +1531,23 @@ pub fn admit_prepared_chunk(
 /// (a wedged kernel-side `pwrite` syscall continues to completion;
 /// abort just prevents future polling). This keeps the watchdog
 /// recovery semantically correct (the digest's failed-set bookkeeping
-/// is restored), at the cost of best-effort partial-file leak (the
-/// `.holding` file is reaped at next `FilesystemStore::new` startup
-/// sweep). See red-team `283-watchdog-8090162d` finding P3 for the
-/// holding-file lifetime gap and the open #285 follow-up.
+/// is restored). #286 sub-item 1 closed the holding-file lifetime
+/// gap red-team `283-watchdog-8090162d` finding P3 flagged: the
+/// watchdog Err arm now actively invokes `discard_partial_best_effort`
+/// (5 s wall-clock bound) BEFORE the driver `Arc` drops, instead of
+/// deferring cleanup to the next-startup `FilesystemStore::new`
+/// sweep.
+///
+/// **Upstream gRPC deadline note** (red-team finding P4 / #286
+/// sub-item 4): the `chunked_client.rs:209` `client.write_chunked(..)`
+/// call does NOT call `tonic::Request::set_timeout`, so the chunked
+/// path has no client-side per-RPC deadline by default. This watchdog
+/// is therefore the SERVER-side deadline. If a tonic-level deadline is
+/// ever added (channel-default or per-call), the effective timeout is
+/// `min(server_watchdog, client_deadline)` — whichever fires first
+/// determines whether the failed-commit sink runs (server) or the
+/// upstream future surfaces a transport error (client). Today only
+/// the server-side timer fires.
 ///
 /// The function is `pub` so the watchdog regression tests in
 /// `nativelink-service`'s integration test crate can construct the
@@ -1531,7 +1561,8 @@ pub fn admit_prepared_chunk(
 /// the warn / info / error log lines for diagnosability — the same
 /// reaper body is now used by both branches of `dispatch_chunks_to_driver`.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_async_commit_reaper(
+pub async fn run_async_commit_reaper<Fe: FileEntry>(
+    filesystem_store: Arc<FilesystemStore<Fe>>,
     driver: Arc<ChunkedDriver>,
     stream_digest: DigestInfo,
     in_flight: Arc<ChunkedWriteInFlight>,
@@ -1575,6 +1606,28 @@ pub async fn run_async_commit_reaper(
                  driver task is aborted via JoinHandleDropGuard when the last \
                  ChunkedDriver Arc drops below."
             );
+            // #286 sub-item 2 (red-team finding): the operator-visible
+            // counter for "watchdog fired" distinct from "natural commit
+            // Err". Strictly additive on top of `commit_failures_total`;
+            // every watchdog fire is also counted as a commit failure
+            // below in the Err arm.
+            metrics
+                .commit_watchdog_fires_total
+                .fetch_add(1, Ordering::Relaxed);
+            // #286 sub-item 1 (red-team finding P3): actively unlink the
+            // abandoned `.holding` partial BEFORE the local driver Arc
+            // drops. Without this, the JoinHandleDropGuard aborts the
+            // driver mid-pwrite (cooperative-only; the in-flight
+            // syscall completes if the kernel is unwedged) but the
+            // `.holding` file persists until the next
+            // `FilesystemStore::new` startup sweep — the gap
+            // red-team finding P3 flagged for sustained-bursty-slow-
+            // tier scenarios. Bounded by `DISCARD_PARTIAL_TIMEOUT=5s`
+            // so a wedged slow tier can't hang the reaper here either;
+            // on timeout the partial defers to the startup sweep
+            // (pre-fix behavior) but the reaper still completes the
+            // bookkeeping below.
+            discard_partial_best_effort(&filesystem_store, &stream_digest).await;
             Err(make_err!(
                 Code::DeadlineExceeded,
                 "chunked commit await_completion exceeded \
@@ -1898,6 +1951,11 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             let reg_for_reaper = chunked_read_registry.clone();
             let stable_sink_for_reaper = stable_digests_sink.clone();
             let failed_sink_for_reaper = failed_commit_sink.clone();
+            // #286 sub-item 1: clone the FilesystemStore Arc into the
+            // reaper so the watchdog Err arm can call
+            // `discard_partial_best_effort` to unlink the abandoned
+            // `.holding` file at watchdog time.
+            let filesystem_store_for_reaper = Arc::clone(&filesystem_store);
             // Drop the local `driver` Arc so the reaper holds the only
             // strong ref outside the in_flight map. After the reaper
             // removes the in_flight entry the last Arc drops and the
@@ -1905,6 +1963,7 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             // identical to the AsyncCommit arm's ownership transfer.
             drop(driver);
             tokio::spawn(run_async_commit_reaper(
+                filesystem_store_for_reaper,
                 driver_for_reaper,
                 stream_digest,
                 in_flight_for_reaper,
@@ -1986,15 +2045,20 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             // at `fast_slow_store.rs:3465-3494` where the failure
             // recovery runs BEFORE in_flight removal.
             let failed_sink_for_reaper = failed_commit_sink.clone();
+            // #286 sub-item 1: clone the FilesystemStore Arc into the
+            // reaper so the watchdog Err arm can call
+            // `discard_partial_best_effort` to unlink the abandoned
+            // `.holding` file at watchdog time. Note: `filesystem_store`
+            // is still owned at this point (only `Arc::clone` was
+            // consumed by `spawn_driver` above).
+            let filesystem_store_for_reaper = Arc::clone(&filesystem_store);
             // Drop our local `driver` Arc — the reaper holds its own
             // strong ref and the in-flight entry holds another. The
             // explicit `drop(driver)` here documents that we transfer
             // ownership to the reaper.
             drop(driver);
-            // `filesystem_store` was consumed by `spawn_driver` above (it
-            // lives inside the `Arc<ChunkedDriver>`); nothing for us to
-            // do with it here.
             tokio::spawn(run_async_commit_reaper(
+                filesystem_store_for_reaper,
                 driver_for_reaper,
                 stream_digest,
                 in_flight_for_reaper,

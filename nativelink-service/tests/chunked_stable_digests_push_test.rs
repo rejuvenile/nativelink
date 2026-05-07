@@ -1643,6 +1643,7 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
     // immediately yields awaiting the inner future + the timer.
     let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
     let reaper_handle = tokio::spawn(run_async_commit_reaper(
+        Arc::clone(&fs_store),
         Arc::clone(&driver_arc),
         digest,
         Arc::clone(&in_flight),
@@ -1994,6 +1995,7 @@ async fn chunked_synchronous_commit_watchdog_fires_on_stalled_completion() {
 
     let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
     let reaper_handle = tokio::spawn(run_async_commit_reaper(
+        Arc::clone(&fs_store),
         Arc::clone(&driver_arc),
         digest,
         Arc::clone(&in_flight),
