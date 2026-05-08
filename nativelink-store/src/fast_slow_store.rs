@@ -166,17 +166,21 @@ pub mod cascade_diag {
 
     fn record(digest_hash: &str, site: &'static str) {
         let now = now_epoch_ms();
-        // Order: store the info first, then advance the timestamp. A reader
-        // that observes the new timestamp is guaranteed to see at least the
-        // matching (or newer) info. A reader that observes a stale timestamp
-        // before info update is harmless — `recent_cascade_within` returns
-        // `None`.
+        // Order: advance the timestamp first (Release), then update the info
+        // under Mutex. The reader at `recent_cascade_within` does the inverse
+        // (timestamp Acquire-load THEN lock+clone info). With this order, a
+        // reader that observes the new timestamp may briefly find stale-but-
+        // still-recent info under the Mutex (if scheduled between our atomic
+        // store and our lock acquire) — strictly better than the alternative
+        // order, where a reader could observe an OLD timestamp + the matching
+        // OLD info → return None and MISS reporting a freshly-recorded
+        // cascade in the exact sub-ms case the #320 diagnostic targets.
+        LAST_CASCADE_AT_EPOCH_MS.store(now, Ordering::Release);
         *LAST_CASCADE_INFO.lock() = Some(RecentCascade {
             digest_hash: digest_hash.to_string(),
             site,
             at_epoch_ms: now,
         });
-        LAST_CASCADE_AT_EPOCH_MS.store(now, Ordering::Release);
     }
 
     /// Returns the most recent recorded cascade if it occurred within the
