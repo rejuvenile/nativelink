@@ -116,10 +116,18 @@ fn assert_backpressure_signal(err: &Error, expected_reason: backpressure_signal:
     );
 }
 
-/// Drive `StoreLike::update` with a single-shot payload (mirrors the
-/// Bazel server gRPC ByteStream Write path; the small-blob non-chunked
-/// branch lives in `update`, not `update_oneshot`, so we go through the
-/// streaming path explicitly).
+/// Drive `StoreLike::update` with a single-shot payload, with an
+/// initial `yield_now()` in the producer so the inner data_stream_fut
+/// suspends on `reader.recv().await` while the sibling fast_store_fut
+/// gets polled. This is the precondition for the #334 small-blob bug:
+/// fast_store_fut must early-reject (drop `fast_rx`) BEFORE
+/// data_stream_fut tries to send. Without the yield, the producer
+/// completes synchronously inside the same poll cycle and
+/// data_stream_fut's send wins the race — `data_res = Ok` and the
+/// `fast_res?` path naturally surfaces the typed signal even WITHOUT
+/// Fix A in place. (Production has the same race window, but with
+/// gRPC ByteStream chunks crossing the wire there is always
+/// inter-chunk latency that lets the consumer poll first.)
 async fn drive_update(
     store: &Store,
     key: StoreKey<'_>,
@@ -128,13 +136,20 @@ async fn drive_update(
     let (mut tx, rx) = make_buf_channel_pair();
     let payload_len = payload.len() as u64;
     let send_fut = async move {
-        tx.send(payload).await?;
-        tx.send_eof()?;
+        // Yield so the sibling future gets a poll window before any
+        // send. In production this is the natural state — gRPC
+        // ByteStream chunks arrive over the wire with non-zero
+        // inter-arrival latency.
+        tokio::task::yield_now().await;
+        // Send may legitimately fail with channel-closed if the
+        // sibling reader (fast_store_fut) early-rejected before this
+        // send; the test caller handles that case.
+        let _ = tx.send(payload).await;
+        let _ = tx.send_eof();
         Ok::<(), Error>(())
     };
     let update_fut = store.update(key, rx, UploadSizeInfo::ExactSize(payload_len));
-    let (send_res, update_res) = tokio::join!(send_fut, update_fut);
-    send_res?;
+    let (_send_res, update_res) = tokio::join!(send_fut, update_fut);
     update_res
 }
 

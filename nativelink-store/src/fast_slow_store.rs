@@ -3919,14 +3919,13 @@ impl StoreDriver for FastSlowStore {
         // does NOT match — over-matching would silently demote
         // unrelated fast-tier failures to a backpressure-shaped retry
         // path. The discriminator + Code together ARE the contract.
-        // MUTATION STEP: Fix A disabled.
         let fast_res_carries_typed_backpressure = fast_res
             .as_ref()
             .err()
             .is_some_and(|e| {
                 e.code == Code::ResourceExhausted && error_has_backpressure_signal(e)
             });
-        if false && fast_res_carries_typed_backpressure {
+        if fast_res_carries_typed_backpressure {
             let Err(err) = fast_res else {
                 unreachable!(
                     "fast_res_carries_typed_backpressure predicate gates on \
