@@ -88,6 +88,126 @@ const LOCAL_ONLY_READS_BATCH_CONCURRENCY: usize = 16;
 /// secondary safety net for hangs longer than 120s.
 const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
 
+/// Process-global "most recent chunked-cascade error" tracker for the #320
+/// production observation: a chunked cascade error can perturb shared state
+/// (tonic h2 conn pool, mirror conn, buf_channel pool) such that a subsequent
+/// upload is dropped mid-stream a few hundred milliseconds later. The
+/// bytestream side cannot ordinarily see that an unrelated upload just
+/// failed; this module exposes a single read-only snapshot it can consult
+/// from the inner_write failure path.
+///
+/// Heavyweight per-connection tracking is intentionally avoided: we only
+/// need to answer "did ANY chunked cascade fire in the last few seconds?"
+/// to support the cross-correlation question. Per-connection attribution
+/// would require plumbing peer_addr / connection_id through the StoreDriver
+/// trait; the global timestamp + last-digest is enough to answer the
+/// hypothesis "was the chunked cascade the trigger?" in the journal grep.
+///
+/// Concurrency model: AtomicU64 timestamp + parking_lot Mutex around the
+/// digest hex string (allocated once per cascade event, ~64 bytes). The
+/// hot path (chunked cascade fires) takes the Mutex briefly; the read
+/// path (inner_write failure) snapshots both atomically for a consistent
+/// view (timestamp + digest pair). Both paths are far from the steady-state
+/// hot path so the lock contention is negligible.
+pub mod cascade_diag {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+
+    use parking_lot::Mutex;
+
+    /// Unix-epoch milliseconds of the most recent recorded cascade event.
+    /// `0` means "no cascade ever recorded" — distinguishable from a real
+    /// cascade because we record `1` if t==0 ever lands at the epoch.
+    static LAST_CASCADE_AT_EPOCH_MS: AtomicU64 = AtomicU64::new(0);
+
+    /// Hex digest of the blob whose update produced the most recent cascade,
+    /// plus the variant ("chunked" vs "stream"). The Mutex is contended only
+    /// at cascade-emission time and at inner_write-failure read time — both
+    /// rare events.
+    static LAST_CASCADE_INFO: Mutex<Option<RecentCascade>> = Mutex::new(None);
+
+    /// Snapshot of the most recent recorded cascade event. Returned by
+    /// [`recent_cascade_within`] when the event lies within the caller's
+    /// observation window.
+    #[derive(Clone, Debug)]
+    pub struct RecentCascade {
+        /// Hex hash of the digest whose update produced the cascade.
+        /// Useful for grepping the journal to find the upstream cause.
+        pub digest_hash: String,
+        /// `"chunked"` when emitted from the chunked-dispatch path,
+        /// `"stream"` when emitted from the non-chunked streaming path.
+        /// Lets the cross-correlation log distinguish which sibling site
+        /// produced the cascade.
+        pub site: &'static str,
+        /// Wall-clock epoch ms at which the cascade was recorded. Provided
+        /// so the caller can compute `(now - this)` and report the gap.
+        pub at_epoch_ms: u64,
+    }
+
+    fn now_epoch_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default()
+            .max(1)
+    }
+
+    /// Record that a chunked-dispatch cascade fired for `digest_hash`.
+    /// Called from `update_via_chunked_dispatcher`'s `data_res` Err branch.
+    pub fn record_chunked_cascade(digest_hash: &str) {
+        record(digest_hash, "chunked");
+    }
+
+    /// Record that a non-chunked streaming cascade fired for `digest_hash`.
+    /// Called from `update`'s `data_res` Err branch.
+    pub fn record_stream_cascade(digest_hash: &str) {
+        record(digest_hash, "stream");
+    }
+
+    fn record(digest_hash: &str, site: &'static str) {
+        let now = now_epoch_ms();
+        // Order: store the info first, then advance the timestamp. A reader
+        // that observes the new timestamp is guaranteed to see at least the
+        // matching (or newer) info. A reader that observes a stale timestamp
+        // before info update is harmless — `recent_cascade_within` returns
+        // `None`.
+        *LAST_CASCADE_INFO.lock() = Some(RecentCascade {
+            digest_hash: digest_hash.to_string(),
+            site,
+            at_epoch_ms: now,
+        });
+        LAST_CASCADE_AT_EPOCH_MS.store(now, Ordering::Release);
+    }
+
+    /// Returns the most recent recorded cascade if it occurred within the
+    /// last `window_ms` milliseconds, else `None`. Read by
+    /// `bytestream_server::inner_write` when an upload fails to answer
+    /// "was a chunked cascade fired in the last few seconds before this
+    /// disconnect?"
+    #[must_use]
+    pub fn recent_cascade_within(window_ms: u64) -> Option<RecentCascade> {
+        let last_ms = LAST_CASCADE_AT_EPOCH_MS.load(Ordering::Acquire);
+        if last_ms == 0 {
+            return None;
+        }
+        let now = now_epoch_ms();
+        if now.saturating_sub(last_ms) > window_ms {
+            return None;
+        }
+        LAST_CASCADE_INFO.lock().clone()
+    }
+
+    /// Test-only: clear the recorded cascade so successive tests don't pollute
+    /// each other. Not behind `#[cfg(test)]` because integration tests in
+    /// `tests/` are compiled in a separate crate and would otherwise lose
+    /// visibility.
+    #[doc(hidden)]
+    pub fn reset_for_test() {
+        LAST_CASCADE_AT_EPOCH_MS.store(0, Ordering::Release);
+        *LAST_CASCADE_INFO.lock() = None;
+    }
+}
+
 tokio::task_local! {
     /// Per-call opt-in: when set on the calling task, the populate-NotFound
     /// terminal branch in [`FastSlowStore::get_part`] (the `producer_err.code
@@ -912,6 +1032,11 @@ impl FastSlowStore {
         let data_elapsed = update_start.elapsed();
 
         if let Err(err) = data_res {
+            // #320 cross-correlation marker: record this cascade so the next
+            // bytestream upload that disconnects mid-stream can grep for
+            // "recent_chunked_cascade" in its failure log and confirm
+            // whether this cascade plausibly perturbed shared state.
+            cascade_diag::record_chunked_cascade(&format!("{digest}"));
             error!(
                 ?key,
                 elapsed_ms = data_elapsed.as_millis() as u64,
@@ -3612,6 +3737,17 @@ impl StoreDriver for FastSlowStore {
         let data = match data_res {
             Ok(d) => d,
             Err(err) => {
+                // #320 cross-correlation marker: record this cascade so
+                // the next bytestream upload that disconnects mid-stream
+                // can attribute the disconnect to a recent stream-path
+                // cascade. The chunked-path sibling does the same;
+                // see `cascade_diag`'s docs for the cross-reference
+                // workflow.
+                let digest_hash = match &key {
+                    StoreKey::Digest(d) => format!("{d}"),
+                    StoreKey::Str(s) => s.to_string(),
+                };
+                cascade_diag::record_stream_cascade(&digest_hash);
                 error!(
                     ?key,
                     elapsed_ms = update_start.elapsed().as_millis() as u64,

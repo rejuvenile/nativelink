@@ -1493,6 +1493,16 @@ impl ByteStreamServer {
             metrics: &ByteStreamMetrics,
             streaming_blob_writer: &Option<StreamingBlobWriter>,
             outer_bytes_received: &Arc<AtomicU64>,
+            // #320: outward-visible flag set the moment we observe a
+            // `finish_write: true` chunk from the client, regardless of
+            // whether subsequent validation succeeds. The outer warn
+            // reports it so an operator can distinguish "client sent
+            // finish_write but we rejected the byte count" (size mismatch
+            // / extra-bytes / etc.) from "client closed the stream
+            // without ever signaling completion" (the #320 case — the
+            // gRPC stream returned None mid-upload). Without this flag,
+            // both classes look identical in the existing warn.
+            finish_write_seen: &mut bool,
             expected_size: u64,
         ) -> Result<(), Error> {
             loop {
@@ -1614,6 +1624,13 @@ impl ByteStreamServer {
                     return Err(make_input_err!("Received more bytes than expected"));
                 }
                 if write_request.finish_write {
+                    // Surface the finish_write observation upward BEFORE the
+                    // size-validation early-return below. If the byte count
+                    // doesn't match, the function returns Err but the outer
+                    // warn must still report `finish_write_seen=true` —
+                    // distinguishing "client sent finish_write with wrong
+                    // count" from "client closed mid-stream silently" (#320).
+                    *finish_write_seen = true;
                     // Validate that we received the expected number of bytes
                     // before accepting the upload. The stream wrapper only
                     // validates on a *subsequent* poll_next after finish_write,
@@ -1713,6 +1730,13 @@ impl ByteStreamServer {
         let active_stream = active_stream_guard.stream_state.as_mut().unwrap();
         let write_start = std::time::Instant::now();
         let mut mirror_dropped_any = false;
+        // #320 Diagnostic 1: track whether the client ever sent a
+        // `finish_write: true` chunk before the gRPC stream ended. The
+        // outer warn distinguishes "graceful client-side teardown after
+        // finish_write" from "stream returned None mid-upload" — the
+        // former is recoverable (size validated explicitly, fail-stop),
+        // the latter is the #320 production observation.
+        let mut finish_write_seen = false;
         let write_result = try_join!(
             process_client_stream(
                 stream,
@@ -1722,6 +1746,7 @@ impl ByteStreamServer {
                 &instance_info.metrics,
                 &streaming_blob_writer,
                 &active_stream_guard.bytes_received,
+                &mut finish_write_seen,
                 expected_size
             ),
             (&mut active_stream.store_update_fut)
@@ -1741,11 +1766,85 @@ impl ByteStreamServer {
         let bytes_received = active_stream_guard.bytes_received.load(Ordering::Relaxed);
         let elapsed_ms = write_start.elapsed().as_millis() as u64;
         if write_result.is_err() {
+            // #320 Diagnostic 1: extended failure context. We capture the
+            // fields necessary to disambiguate WHY the inner gRPC stream
+            // returned `Ok(None)` mid-upload — the production observation
+            // at 2026-05-07 20:52:18 had no surviving cause-trace.
+            //
+            // - finish_write_seen: did the client EVER send a chunk with
+            //   `finish_write: true`? If false AND bytes_received <
+            //   expected_size, the gRPC stream ended without graceful
+            //   client-side teardown (the #320 case). If true with a
+            //   size mismatch, this is the loud "Client declared X sent
+            //   Y" path (a different bug class).
+            // - is_worker / is_mirror: helps separate workload classes —
+            //   was this a Bazel client, an inter-server mirror, or a
+            //   worker upload? Each has different failure modes.
+            // - producer_task_id: the bytestream handler's own task id;
+            //   pairs with worker logs when an operator wants to grep
+            //   for what this task was doing in the surrounding window.
+            //
+            // #320 Diagnostic 2: cross-correlation marker. If a chunked
+            // cascade (FastSlowStore::update (chunked) data stream
+            // failed) fired anywhere in the process within the last 10s,
+            // log its digest + the gap so an operator can answer "is
+            // the chunked cascade plausibly the trigger?" via grep.
+            // 10s window chosen for the production observation: 720ms
+            // gap × 14× safety = 10s; chunked cascades that fired
+            // earlier than 10s before our disconnect are unlikely to
+            // be causally linked.
+            let recent_cascade =
+                nativelink_store::fast_slow_store::cascade_diag::recent_cascade_within(10_000);
+            // #320 Diagnostic 3: buf_channel write-side state at drop.
+            // The store-write tx is held inside `active_stream.tx`.
+            // Snapshot bytes-written and pipe-broken status so we can
+            // tell whether the producer side finished its work but the
+            // consumer (store driver) bailed, vs the producer aborted.
+            let store_tx_bytes_written = active_stream.tx.get_bytes_written();
+            let store_tx_pipe_broken = active_stream.tx.is_pipe_broken();
+            // Mirror-side state: how many bytes did we successfully
+            // forward to the mirror channel before the disconnect?
+            // mirror_tx_opt is None either when no mirror was set up
+            // (worker/mirror request, or no WorkerProxyStore) OR when
+            // the mirror dropped earlier (closed). Distinguish via
+            // mirror_dropped_any.
+            let (mirror_present, mirror_bytes_forwarded, mirror_pipe_broken) = match &mirror_tx_opt
+            {
+                Some(mtx) => (true, mtx.get_bytes_written(), mtx.is_pipe_broken()),
+                None => (false, 0u64, true),
+            };
+            let producer_task_id = tokio::task::try_id().map(|t| t.to_string());
             warn!(
                 %digest,
                 expected_size,
                 bytes_received,
                 elapsed_ms,
+                finish_write_seen,
+                is_worker,
+                is_mirror,
+                producer_task_id = producer_task_id.as_deref().unwrap_or("<none>"),
+                store_tx_bytes_written,
+                store_tx_pipe_broken,
+                mirror_present,
+                mirror_dropped_any,
+                mirror_bytes_forwarded,
+                mirror_pipe_broken,
+                recent_cascade_within_10s = recent_cascade.is_some(),
+                recent_cascade_digest = recent_cascade
+                    .as_ref()
+                    .map(|c| c.digest_hash.as_str())
+                    .unwrap_or("<none>"),
+                recent_cascade_site = recent_cascade
+                    .as_ref()
+                    .map(|c| c.site)
+                    .unwrap_or("<none>"),
+                recent_cascade_age_ms = recent_cascade.as_ref().map(|c| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default();
+                    now.saturating_sub(c.at_epoch_ms)
+                }),
                 err = ?write_result.as_ref().err(),
                 "inner_write failed"
             );
