@@ -272,6 +272,15 @@ impl StoreDriver for RefStore {
             store.pin_digests(digests);
         }
     }
+
+    /// #334 Fix C: forward unpin to the resolved ref target so the BIS
+    /// broadcast loop can release server-side fast-tier pins through
+    /// any RefStore-mediated chain. Mirrors `pin_digests` above.
+    fn unpin_digests(&self, digests: &[DigestInfo]) {
+        if let Ok(store) = self.get_store() {
+            store.unpin_digests(digests);
+        }
+    }
 }
 
 default_health_status_indicator!(RefStore);
