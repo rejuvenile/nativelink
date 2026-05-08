@@ -1703,6 +1703,19 @@ pub fn download_to_directory<'a>(
                             return Err(e);
                         }
 
+                        // #92: subscribe-before-predicate. Construct the
+                        // `notified()` future and arm it via `enable()`
+                        // BEFORE snapshotting `fetched_set`. Any
+                        // notification issued from this point on is
+                        // captured by the pre-armed Notified, even if it
+                        // fires between the snapshot and the await.
+                        // Same shape as the cleanup_wait_notify reference
+                        // at line ~5720-5759 (parity test documents the
+                        // contract).
+                        let notified = fetched_notify_ref.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+
                         // Partition remaining into newly ready and still pending.
                         let mut newly_ready: Vec<&FileToMaterialize> = Vec::new();
                         let mut still_pending: Vec<&FileToMaterialize> = Vec::new();
@@ -1751,7 +1764,11 @@ pub fn download_to_directory<'a>(
                         remaining = still_pending;
                         if !remaining.is_empty() {
                             // Wait until the fetcher signals new arrivals.
-                            fetched_notify_ref.notified().await;
+                            // The `notified` future was armed BEFORE the
+                            // snapshot, so any notification issued during
+                            // the snapshot/dispatch window is delivered
+                            // here.
+                            notified.as_mut().await;
                         }
                     }
                 }
@@ -5787,5 +5804,103 @@ mod cleanup_wait_notify_parity_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fetched_notify_subscribe_before_predicate_tests {
+    //! Regression test for #92: lost-wakeup window in the deferred-files
+    //! producer loop in `download_to_directory` (file-materialization
+    //! poll loop near line 1696-1755).
+    //!
+    //! The loop subscribes to `fetched_notify` AFTER snapshotting
+    //! `fetched_set`. Today the producer uses `notify_one`, which DOES
+    //! store a permit on a missed wakeup, so the immediate symptom of
+    //! the after-snapshot-then-await order is at-most-one-extra
+    //! iteration of the loop, not a hard deadlock. However:
+    //!
+    //!   1. Defense-in-depth: documenting the subscribe-before-predicate
+    //!      contract makes the ordering survive future producer
+    //!      changes (e.g., switching to `notify_waiters` for a
+    //!      broadcast-style consumer fan-out as in
+    //!      `cleanup_complete_notify`).
+    //!   2. Sibling parity: the cleanup_wait_notify_parity_tests
+    //!      reference at line ~5715-5807 documents the same contract
+    //!      for the cleanup path; this test does the same for the
+    //!      file-fetch path.
+    //!
+    //! The shape mirrors the production loop (subscribe → snapshot →
+    //! dispatch → await) and the failure mode is the
+    //! `notify_waiters`-flavored producer (no permit storage) firing
+    //! during the snapshot window. With subscribe-before-predicate
+    //! (the fix), the pre-enabled Notified observes the wakeup and the
+    //! await completes promptly. With subscribe-after-predicate (the
+    //! mutation), the Notified is constructed AFTER the wakeup
+    //! evaporates and the await falls through to the deadlock
+    //! detector.
+    //!
+    //! NOTE on test discipline (CLAUDE.md
+    //! `feedback_lost_wakeup_test_theatre`): we use paused tokio time
+    //! + a `tokio::time::timeout` deadlock detector, NOT `sleep` as a
+    //! synchronization primitive. The Barrier coordinates the
+    //! predicate window <-> notify-fire ordering deterministically.
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use tokio::sync::{Barrier, Notify};
+
+    /// Subscribe-before-predicate (the fix at #92): the Notified
+    /// future is constructed BEFORE the snapshot window, so a
+    /// `notify_waiters` issued during that window is delivered. With
+    /// the contract violated (subscribe AFTER predicate), the
+    /// `notify_waiters` evaporates because no waiter is registered,
+    /// and the await blocks forever.
+    ///
+    /// We use `notify_waiters()` (not `notify_one()`) because
+    /// `notify_waiters` has the no-permit-storage semantics that make
+    /// the lost wakeup reproducible. The production producer uses
+    /// `notify_one`, which stores one permit and so does not deadlock
+    /// today; this test is defense-in-depth for the contract: any
+    /// future producer change toward `notify_waiters` (broadcast
+    /// fan-out) inherits the safety the subscribe-before order
+    /// provides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_before_predicate_captures_wakeup() {
+        let notify = Arc::new(Notify::new());
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Producer: wait at the barrier, then fire notify_waiters()
+        // immediately. notify_waiters() does NOT store a permit — it
+        // only wakes waiters currently registered.
+        let prod_notify = notify.clone();
+        let prod_barrier = barrier.clone();
+        tokio::spawn(async move {
+            prod_barrier.wait().await;
+            prod_notify.notify_waiters();
+        });
+
+        // Consumer mirrors the production loop body shape (#92 fix):
+        // subscribe FIRST, enable, then enter the snapshot window.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Snapshot window: release the producer to fire its
+        // notify_waiters(). The barrier acts as a happens-before
+        // synchronization point: the producer's notify is emitted
+        // strictly after this point, while we are still in the
+        // snapshot window — strictly before we reach the await
+        // below.
+        barrier.wait().await;
+
+        // Award: the pre-enabled Notified must observe the wakeup
+        // issued during the snapshot window. 2s real-wall-clock is a
+        // deadlock detector, NOT synchronization.
+        tokio::time::timeout(Duration::from_secs(2), notified.as_mut())
+            .await
+            .expect(
+                "lost-wakeup race — must subscribe before predicate (#92): \
+                 notify_waiters() fired during the snapshot window was lost",
+            );
     }
 }
