@@ -2753,6 +2753,39 @@ impl WorkerProxyStore {
         self.pick_mirror_endpoint_write(endpoints, exclude, now, size_bytes)
     }
 
+    /// Filter `peers` to drop any endpoint currently quarantined
+    /// (`quarantined_until > now`). Used by the read-side peer-fetch
+    /// selector (#67) to avoid hammering a persistently-failing peer on
+    /// every same-digest read until the locality entry is reactively
+    /// evicted. The same `EndpointStateRegistry` (here: `mirror_state`)
+    /// the mirror-write picker consults is consulted here.
+    ///
+    /// If every candidate is quarantined the returned vec is empty;
+    /// callers fall through to whatever the existing fallback is (here:
+    /// `get_part_sequential`).
+    ///
+    /// Endpoints with no entry in `mirror_state` (never recorded a
+    /// failure) are kept — they are healthy by definition.
+    fn filter_quarantined_peers(
+        &self,
+        peers: Vec<Arc<str>>,
+    ) -> Vec<Arc<str>> {
+        if peers.is_empty() {
+            return peers;
+        }
+        let now = Instant::now();
+        let state = self.mirror_state.read();
+        peers
+            .into_iter()
+            .filter(|ep| match state.get(ep) {
+                Some(entry) => entry
+                    .quarantined_until
+                    .is_none_or(|t| t <= now),
+                None => true,
+            })
+            .collect()
+    }
+
     /// Read-lock fast path. Returns `None` if any endpoint we'd consider is
     /// missing from the state map or has an expired quarantine that should
     /// be cleared — both require a write lock to fix.
@@ -3394,7 +3427,14 @@ impl StoreDriver for WorkerProxyStore {
         // redirects for workers and proxies for non-worker callers.
         let digest = key.borrow().into_digest();
         let peers = if self.race_peers.load(Ordering::Relaxed) {
-            self.locality_map.read().lookup_workers(&digest)
+            // #67: read-side circuit breaker. Filter out peers currently
+            // quarantined by `mirror_state` so a persistently-failing
+            // peer is not hammered on every same-digest read until the
+            // locality entry is reactively evicted. Falls through to the
+            // sequential path (server fetch) if all candidates are
+            // quarantined.
+            let raw = self.locality_map.read().lookup_workers(&digest);
+            self.filter_quarantined_peers(raw)
         } else {
             Vec::new()
         };
@@ -5046,6 +5086,125 @@ mod tests {
              `writer.get_bytes_written() == bytes_before_proxy` guard \
              at try_read_from_endpoints to verify this assertion fires."
         );
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // #67: read-side circuit breaker for persistently-failing peers.
+    //
+    // The mirror-write picker filters quarantined endpoints (
+    // `pick_mirror_endpoint_*` paths). The read-side peer-fetch
+    // selector at `get_part` SHOULD do the same — otherwise a
+    // persistently-failing peer is hammered on every same-digest read
+    // until reactive eviction kicks in.
+    //
+    // Production composition: real `WorkerProxyStore`, `race_peers=true`,
+    // two registered peers (one quarantined, one healthy). Both peers
+    // claim the digest (locality_map). The filter MUST drop the
+    // quarantined peer so the healthy peer is the one consulted.
+    //
+    // Counting fake peer: `peer_quarantined` is a MemoryStore holding
+    // the digest with poisoned bytes. If the filter is removed, the
+    // race selector picks `peers[0]` (the quarantined one) and returns
+    // poisoned bytes; the assertion catches the mismatch. The healthy
+    // peer holds the correct bytes; with the filter applied it is
+    // consulted and returns correct bytes.
+    //
+    // Mutation guard: removing the `filter_quarantined_peers` call in
+    // `get_part` (line ~3022) must produce the bespoke message via the
+    // returned-bytes mismatch.
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_67_read_side_filters_quarantined_peer() -> Result<(), Error> {
+        // Inner empty — force the race path to consult a peer.
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let mut proxy = WorkerProxyStore::new(inner, locality_map.clone());
+        proxy.enable_race_peers();
+        let store = Store::new(proxy.clone());
+
+        let healthy_value = b"healthy-peer-bytes";
+        let poisoned_value = b"quarantined-peer-bytes-must-not-appear";
+        // Same logical key — use the healthy size to match what the
+        // healthy peer stores. The quarantined peer's value differs in
+        // length, so without the filter the race path will instead try
+        // to satisfy a 18-byte read from a peer holding a different-
+        // length blob — the bytes returned would diverge from the
+        // expected `healthy_value`.
+        let digest = DigestInfo::try_new(VALID_HASH1, healthy_value.len() as u64)?;
+
+        // Quarantined peer: fill with poisoned data of *matching* size
+        // so it WOULD return bytes if consulted.
+        let peer_quarantined =
+            Store::new(MemoryStore::new(&MemorySpec::default()));
+        let poisoned_same_size: Vec<u8> = poisoned_value
+            .iter()
+            .copied()
+            .cycle()
+            .take(healthy_value.len())
+            .collect();
+        peer_quarantined
+            .update_oneshot(digest, Bytes::from(poisoned_same_size.clone()))
+            .await?;
+        proxy.inject_worker_connection(
+            "grpc://peer-quarantined:50071",
+            peer_quarantined,
+        );
+
+        // Healthy peer: holds the correct bytes.
+        let peer_healthy = Store::new(MemoryStore::new(&MemorySpec::default()));
+        peer_healthy
+            .update_oneshot(digest, Bytes::from_static(healthy_value))
+            .await?;
+        proxy.inject_worker_connection(
+            "grpc://peer-healthy:50071",
+            peer_healthy,
+        );
+
+        // Register quarantined first (so it appears at peers[0] in
+        // insertion order); then healthy. Both claim the digest.
+        locality_map.write().register_blobs(
+            "grpc://peer-quarantined:50071",
+            &[digest],
+        );
+        locality_map.write().register_blobs(
+            "grpc://peer-healthy:50071",
+            &[digest],
+        );
+
+        // Quarantine the bad peer by driving it past the failure
+        // threshold. This populates `mirror_state` exactly as a real
+        // mirror-write would.
+        for _ in 0..MIRROR_FAILURE_THRESHOLD {
+            proxy.record_mirror_failure(
+                "grpc://peer-quarantined:50071",
+                MirrorFailureKind::Generic,
+            );
+        }
+
+        // Wrap in a deadlock-detector timeout. The race path itself is
+        // bounded, but if the filter selects an empty peer set and the
+        // sequential fallback hangs, the timeout will surface the bug
+        // with a deterministic message instead of hanging the runner.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.get_part_unchunked(digest, 0, None),
+        )
+        .await
+        .expect(
+            "must filter quarantined peers — #67 read-side circuit \
+             breaker (timeout indicates the filter routed to a dead \
+             peer or dropped both)",
+        )?;
+
+        assert_eq!(
+            result.as_ref(),
+            healthy_value,
+            "must filter quarantined peers — #67 read-side circuit \
+             breaker (got bytes from quarantined peer instead of \
+             healthy peer)"
+        );
+
         Ok(())
     }
 }
