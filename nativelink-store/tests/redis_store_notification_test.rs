@@ -709,3 +709,121 @@ async fn keyspace_and_scheduler_collision_refused_at_construction() -> Result<()
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Spec test 7 (BLOCK-1 fix-up regression): URL-vs-config db cross-check
+// works for the production URL form `redis+unix:///path?db=N`.
+//
+// Spec (derived from dsr BLOCK-1 finding):
+// - Production buildcache uses `redis+unix:///run/valkey/valkey.sock?db=1` for
+//   the small-CAS Redis store. The redis crate parses the db from the
+//   `?db=N` query-pair for unix sockets.
+// - The previous cross-check used `Url::path_segments()` only, which yields
+//   `["run", "valkey", "valkey.sock"]` for the unix form — first segment
+//   "run" is not a u8, so the check silently passed.
+// - The fix uses `redis::IntoConnectionInfo`, the same call
+//   `RedisStore::connect` performs, so the validator and runtime cannot
+//   disagree.
+//
+// Test matrix (asserts BOTH directions of the contract):
+// - `url_db_unix_query_param_mismatch_rejected`: `redis+unix:///path?db=1`
+//   with `keyspace_notifications_db: 0` → Err. This is the case that
+//   silently passed pre-fix; the regression that ships the production
+//   wedge.
+// - `url_db_tcp_path_segment_mismatch_rejected`: `redis://host/3` with
+//   `keyspace_notifications_db: 0` → Err. This worked pre-fix and must
+//   keep working.
+// - `url_db_tcp_match_accepts_construction`: `redis://host/0` with
+//   `keyspace_notifications_db: 0` → Ok (positive control).
+//
+// Mutation step: revert `set_spec_defaults` to the path_segments-only
+// version (or any narrower form). The unix-mismatch test must FAIL with
+// the bespoke "expected url_db_unix mismatch rejection" message.
+// ---------------------------------------------------------------------------
+
+/// Build a `RedisSpec` whose `addresses[0]` is set to the supplied URL,
+/// with keyspace notifications enabled and `keyspace_notifications_db`
+/// configured per the caller. Used for URL-form cross-check tests.
+fn make_spec_with_url(url: &str, keyspace_db: u8) -> RedisSpec {
+    RedisSpec {
+        addresses: vec![url.to_string()],
+        key_prefix: "cas:".to_string(),
+        command_timeout_ms: 5_000,
+        connection_timeout_ms: 5_000,
+        enable_keyspace_notifications: true,
+        keyspace_notifications_db: keyspace_db,
+        ..Default::default()
+    }
+}
+
+#[nativelink_test]
+async fn url_db_unix_query_param_mismatch_rejected() -> Result<(), Error> {
+    // Synthetic unix-socket URL with `?db=1` query — production form
+    // (`redis+unix:///run/valkey/valkey.sock?db=1`). Use a deliberately
+    // non-existent socket path so that any future mutation removing the
+    // cross-check would surface a deterministic "no such file" error
+    // post-validation, easy to distinguish from the validator's bespoke
+    // FailedPrecondition rejection.
+    let spec = make_spec_with_url(
+        "redis+unix:///nonexistent/100-fixup-test/valkey.sock?db=1",
+        0,
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        RedisStore::new_standard(spec),
+    )
+    .await
+    .expect("must not deadlock — set_spec_defaults is synchronous validation");
+    let err = result.expect_err("expected url_db_unix mismatch rejection");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("connection URL resolves to db=1")
+            && msg.contains("keyspace_notifications_db=0"),
+        "expected unix-form URL/db mismatch rejection naming both db values, got: {msg}"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn url_db_tcp_path_segment_mismatch_rejected() -> Result<(), Error> {
+    // TCP URL with `/3` path-segment db. Same flow as above — synchronous
+    // validation, no live server needed. This case worked pre-fix; the
+    // assertion guards against regressing it during the unix-form fix.
+    let spec = make_spec_with_url("redis://127.0.0.1:6379/3", 0);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        RedisStore::new_standard(spec),
+    )
+    .await
+    .expect("must not deadlock — set_spec_defaults is synchronous validation");
+    let err = result.expect_err("expected url_db_tcp mismatch rejection");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("connection URL resolves to db=3")
+            && msg.contains("keyspace_notifications_db=0"),
+        "expected tcp-form URL/db mismatch rejection naming both db values, got: {msg}"
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn url_db_tcp_match_accepts_construction() -> Result<(), Error> {
+    // Positive control: when URL db matches the configured
+    // `keyspace_notifications_db`, construction succeeds. We DO need a live
+    // server for this one because successful `set_spec_defaults` proceeds
+    // into `init_keyspace_dispatcher_eager` which CONFIG SETs + PSUBSCRIBEs
+    // against the real Valkey.
+    let (port, _guard) = spawn_server(&[]).await;
+    let spec = make_spec_with_url(&format!("redis://127.0.0.1:{port}/0"), 0);
+    let store = tokio::time::timeout(
+        Duration::from_secs(5),
+        RedisStore::new_standard(spec),
+    )
+    .await
+    .expect("must not deadlock")
+    .expect("matching url-db must construct OK");
+    // Drop the store explicitly so the dispatcher exits before
+    // `_guard` kills the server.
+    drop(store);
+    Ok(())
+}
