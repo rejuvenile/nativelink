@@ -286,3 +286,12 @@ required-features = ["chunked_fast_slow", "test-utils"]
 [[test]]
 name = "filesystem_store_256_duplicate_chunked_commit_test"
 required-features = ["chunked_fast_slow"]
+
+# #325 (option D.1): per-reader fallback to a fresh slow_store.get_part
+# on `Code::Unavailable: reader fell behind sliding window`. Uses the
+# `streaming_blob_next_chunk_fail` failpoint to deterministically trigger
+# the sliding-window path. Requires the `failpoints` feature so the
+# failpoint macros expand.
+[[test]]
+name = "fast_slow_store_325_regression_test"
+required-features = ["failpoints"]

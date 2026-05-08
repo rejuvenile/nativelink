@@ -1294,6 +1294,18 @@ impl FastSlowStore {
             .load(Ordering::Acquire)
     }
 
+    /// #325 (option D.1) diagnostic / test counter: every per-reader
+    /// fallback-to-direct-slow-store splice (triggered by `Code::Unavailable:
+    /// reader fell behind sliding window`) increments this. Used by the
+    /// regression suite (`fast_slow_store_325_*`) to assert the under- and
+    /// over-action contracts.
+    #[doc(hidden)]
+    pub fn streaming_buffer_reader_fallback_to_direct_total(&self) -> u64 {
+        self.metrics
+            .streaming_buffer_reader_fallback_to_direct_total
+            .load(Ordering::Acquire)
+    }
+
     /// Fence out new background slow writes and wait for all existing
     /// ones to complete, with a timeout. Returns the number of writes
     /// still pending when the timeout expired (0 = all flushed).
@@ -5051,9 +5063,80 @@ impl StoreDriver for FastSlowStore {
                 }
                 Err(err) => {
                     if is_populator_caller {
-                        // Pre-fix populator semantics: errors propagate
-                        // directly, no slow-store fallback. Match the
-                        // prior `loader.get_or_try_init(populate).await?`
+                        // #325 (option D.1) per-reader fallback: when the
+                        // streaming-buffer reader falls behind the sliding
+                        // window (producer fills the 64 MiB buffer faster
+                        // than this consumer can drain it — typical when
+                        // gRPC egress + VerifyStore re-hashing are the
+                        // bottleneck), splice in a fresh
+                        // `slow_store.get_part` at the cursor position.
+                        // Other readers are unaffected, the producer is
+                        // unaffected, the writer keeps streaming bytes to
+                        // its caller without a visible error.
+                        //
+                        // Safe for stateful consumers (e.g. VerifyStore
+                        // re-hashing): the hasher consumed bytes [0..N)
+                        // from the streaming buffer, the splice fetches
+                        // bytes [N..end] from slow store, hash state
+                        // advances correctly because hash([0..end]) =
+                        // hash([0..N) || [N..end]).
+                        //
+                        // Safe vs WorkerProxyStore peer-fetch refusal: WPS
+                        // refuses peer-fetch when `bytes_written_by_inner
+                        // > 0` because it cannot stitch a fresh peer copy
+                        // onto a partial inner-write without corrupting
+                        // the prefix. With this fallback in place, FSS
+                        // returns Ok with the full blob (slow-store splice
+                        // completes the byte range), so WPS never sees
+                        // Code::Unavailable and never reaches the
+                        // peer-fetch refusal.
+                        let is_sliding_window_eviction = err.code
+                            == Code::Unavailable
+                            && err
+                                .messages
+                                .iter()
+                                .any(|m| m.contains("reader fell behind"));
+                        if is_sliding_window_eviction {
+                            let bytes_already_sent = guard.get_bytes_written();
+                            let new_offset = offset + bytes_already_sent;
+                            let new_length =
+                                length.map(|l| l.saturating_sub(bytes_already_sent));
+                            self.metrics
+                                .streaming_buffer_reader_fallback_to_direct_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            // info! not warn! — this is graceful degradation
+                            // (a slow reader splicing into the slow tier),
+                            // not an anomaly. Producer behavior, sliding
+                            // window, and other readers are unaffected.
+                            info!(
+                                ?key,
+                                bytes_already_sent,
+                                new_offset,
+                                ?new_length,
+                                "streaming populate (populator-caller): reader \
+                                 fell behind sliding window, splicing in fresh \
+                                 slow-store read at cursor"
+                            );
+                            let res = self
+                                .slow_store
+                                .get_part(
+                                    key.borrow(),
+                                    &mut *guard,
+                                    new_offset,
+                                    new_length,
+                                )
+                                .await;
+                            commit_with_inner_miss_gate(
+                                &mut guard,
+                                &res,
+                                bytes_already_sent,
+                            );
+                            return res;
+                        }
+                        // Pre-#325 populator semantics for non-sliding-window
+                        // errors (NotFound, structured producer failures):
+                        // propagate directly, no slow-store fallback. Match
+                        // the prior `loader.get_or_try_init(populate).await?`
                         // behavior so existing failpoint tests and
                         // user-visible error contracts hold.
                         //
@@ -5111,13 +5194,40 @@ impl StoreDriver for FastSlowStore {
                     let bytes_already_sent = guard.get_bytes_written();
                     let new_offset = offset + bytes_already_sent;
                     let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
-                    warn!(
-                        ?key,
-                        %err,
-                        bytes_already_sent,
-                        new_offset,
-                        "streaming populate reader error, falling back to slow store"
-                    );
+                    // #325 (option D.1): increment the per-reader fallback
+                    // counter when the trigger is a sliding-window eviction
+                    // — same observability signal as the populator-caller
+                    // path. Other waiter-path triggers (genuine producer
+                    // errors) keep the existing warn! without bumping the
+                    // sliding-window-specific counter.
+                    let is_sliding_window_eviction = err.code
+                        == Code::Unavailable
+                        && err
+                            .messages
+                            .iter()
+                            .any(|m| m.contains("reader fell behind"));
+                    if is_sliding_window_eviction {
+                        self.metrics
+                            .streaming_buffer_reader_fallback_to_direct_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            ?key,
+                            bytes_already_sent,
+                            new_offset,
+                            ?new_length,
+                            "streaming populate (waiter): reader fell behind \
+                             sliding window, splicing in fresh slow-store read \
+                             at cursor"
+                        );
+                    } else {
+                        warn!(
+                            ?key,
+                            %err,
+                            bytes_already_sent,
+                            new_offset,
+                            "streaming populate reader error, falling back to slow store"
+                        );
+                    }
                     let res = self
                         .slow_store
                         .get_part(key.borrow(), &mut *guard, new_offset, new_length)
@@ -5370,6 +5480,21 @@ struct FastSlowStoreMetrics {
     /// MemoryStoreAtCapacity) does NOT bump this counter.
     #[metric(help = "Count of populates that skipped fast-tier cache-tee due to MemoryStoreAtCapacity")]
     cache_tee_disabled_at_cap_count: AtomicU64,
+    /// #325 (option D.1): per-reader fallback to a fresh
+    /// `slow_store.get_part` triggered by `Code::Unavailable: reader fell
+    /// behind sliding window`. The producer keeps sliding-window
+    /// `streaming_writer.send` semantics (never paced, never gated, buffer
+    /// keeps eviction-on-full); only the SLOW reader splices in a direct
+    /// slow-store stream at its cursor. Other readers + producer
+    /// unaffected. Operator visibility into how often the slow-reader
+    /// fallback fires — sustained nonzero rate-of-change signals a
+    /// producer-faster-than-consumer regime worth investigating
+    /// (slow gRPC egress / VerifyStore re-hashing latency / etc.).
+    /// Counted across BOTH the populator-caller and waiter paths when the
+    /// `next_chunk()` failure is the sliding-window eviction (narrow
+    /// predicate; not bumped on other producer errors).
+    #[metric(help = "Count of streaming-buffer readers that fell behind the sliding window and spliced into a fresh slow-store read")]
+    streaming_buffer_reader_fallback_to_direct_total: AtomicU64,
 }
 
 impl Drop for FastSlowStore {

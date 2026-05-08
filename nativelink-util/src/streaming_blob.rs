@@ -577,11 +577,16 @@ impl StreamingBlobReader {
         // Exercises the fallback path in FastSlowStore::get_part where a
         // streaming populate reader error triggers a slow-store resume at
         // the correct byte offset.
+        //
+        // Uses the production-shape message text "reader fell behind
+        // sliding window" so the FastSlowStore D.1 fallback predicate
+        // (which matches on this substring) trips. Tests asserting on
+        // Code::Unavailable continue to work unchanged.
         #[cfg(feature = "failpoints")]
         fail::fail_point!("streaming_blob_next_chunk_fail", |_| {
             Err(make_err!(
                 Code::Unavailable,
-                "failpoint: streaming blob chunk read failed"
+                "failpoint: reader fell behind sliding window (synthetic)"
             ))
         });
 
