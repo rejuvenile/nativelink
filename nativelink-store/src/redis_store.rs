@@ -1015,6 +1015,36 @@ where
             spec.retry.max_retries = 1;
         }
 
+        // Cluster mode does not support keyspace notifications via
+        // server-global `CONFIG SET notify-keyspace-events` (each shard
+        // has its own config; the cluster client cannot fan-out PSUBSCRIBE
+        // across shards). `new_cluster` already hard-codes
+        // `enable_keyspace_notifications=false` and `keyspace_notifications_db=0`
+        // when it constructs the inner store, so any operator-supplied
+        // values here would be silently overwritten downstream — including
+        // the URL/db cross-check and empty-key_prefix warn below.
+        //
+        // Force-disable here too, with a `warn!`, so:
+        //  - the operator sees the override loudly at startup (red-team C
+        //    + security LOW-1: today the override happens silently inside
+        //    `new_cluster`, leaving operators with no signal that their
+        //    flag was honored or not),
+        //  - the cross-check and key_prefix warn don't fire spuriously
+        //    against cluster URLs (security LOW-1: cluster startup
+        //    failing on a confusing keyspace-notification error message
+        //    when keyspace notifications are silently disabled anyway).
+        if spec.mode == RedisMode::Cluster && spec.enable_keyspace_notifications {
+            warn!(
+                "RedisSpec: cluster mode does not support keyspace notifications via \
+                 server-global CONFIG SET; forcing enable_keyspace_notifications=false. \
+                 Operators relying on cluster-mode keyspace invalidation must wire it \
+                 up out-of-band (per-shard listeners or an external invalidation \
+                 channel)."
+            );
+            spec.enable_keyspace_notifications = false;
+            spec.keyspace_notifications_db = 0;
+        }
+
         if spec.enable_keyspace_notifications {
             // BLOCKER 5: a single `subscriber_channel` slot cannot serve both
             // `SchedulerSubscriptionManager` and the keyspace dispatcher.
@@ -1486,6 +1516,18 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
     /// `experimental_pub_sub_channel`.
     pub fn connection_manager_subscriptions(&self) -> Vec<String> {
         self.connection_manager.debug_subscriptions()
+    }
+
+    /// Test-only entry point exposing the synchronous `set_spec_defaults`
+    /// validator without requiring a live Redis. Used by integration
+    /// tests that want to assert the spec-mutation/validation contract
+    /// in isolation from the connect path (e.g., cluster-mode forced
+    /// disable of `enable_keyspace_notifications`, BLOCKER 5 collision
+    /// rejection, BLOCK-1 URL/db cross-check). Not for production code
+    /// paths.
+    #[doc(hidden)]
+    pub fn set_spec_defaults_for_test(spec: &mut RedisSpec) -> Result<(), Error> {
+        Self::set_spec_defaults(spec)
     }
 }
 

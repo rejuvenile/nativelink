@@ -50,7 +50,7 @@ use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use nativelink_config::stores::{ExistenceCacheSpec, NoopSpec, RedisSpec, StoreSpec};
+use nativelink_config::stores::{ExistenceCacheSpec, NoopSpec, RedisMode, RedisSpec, StoreSpec};
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
@@ -951,7 +951,7 @@ async fn config_set_notify_keyspace_events_reissued_on_subscriber_reconnect()
             .expect("subscriber slot exists");
         slot.1
     };
-    let _ = tokio::time::timeout(
+    let (_new_conn, _new_uuid) = tokio::time::timeout(
         Duration::from_secs(5),
         manager.reconnect(subscriber_slot_uuid),
     )
@@ -1023,6 +1023,96 @@ async fn config_set_notify_keyspace_events_reissued_on_subscriber_reconnect()
          CONFIG SET notify-keyspace-events re-issue on subscriber-slot reconnect is \
          broken. Post-reconnect notify-keyspace-events={flags_after}, received={:?}",
         cb.received.lock()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Spec test 9 (red-team C / security LOW-1 — cluster-mode forced disable):
+// `set_spec_defaults` MUST force `enable_keyspace_notifications=false` and
+// `keyspace_notifications_db=0` for cluster mode, with a `warn!`.
+//
+// Spec (derived from the reviewer findings, NOT from reading the
+// implementation):
+// Cluster mode does not support keyspace notifications via server-global
+// `CONFIG SET notify-keyspace-events` (each shard has its own config; the
+// cluster client cannot fan-out PSUBSCRIBE across shards). `new_cluster`
+// already silently overrides downstream, leaving operators with no signal
+// that their `enable_keyspace_notifications=true` config was honored or
+// not. Forcing the override (with warn) at the validation seam closes the
+// silent-override class and prevents the URL/db cross-check + key_prefix
+// warn from firing spuriously against cluster URLs.
+//
+// Test approach: drive the synchronous `set_spec_defaults` validator
+// directly via the test-only `set_spec_defaults_for_test` accessor (no
+// live cluster needed). Assert (a) the call returns Ok, (b) the
+// post-call spec has `enable_keyspace_notifications=false` AND
+// `keyspace_notifications_db=0` regardless of operator input, (c) the
+// URL/db cross-check that would normally reject `redis://node:6379/3`
+// + `keyspace_notifications_db: 0` does NOT fire (because the forced
+// disable runs first).
+//
+// Mutation step: comment out the `if spec.mode == RedisMode::Cluster &&
+// spec.enable_keyspace_notifications` block. The test must FAIL because
+// the URL/db cross-check would then return Err for the mismatch
+// (`url_db=3 != configured=0`), AND the post-call spec would have
+// `enable_keyspace_notifications=true`.
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn cluster_mode_forces_keyspace_notifications_disabled() -> Result<(), Error> {
+    // Operator-supplied spec: cluster mode, keyspace notifications enabled,
+    // keyspace_notifications_db mismatching the URL-embedded /3. Without
+    // the forced-disable, this would either be accepted (URL check skipped
+    // because enable_keyspace_notifications was force-flipped downstream,
+    // but THAT override happens silently in new_cluster — NOT here) or
+    // rejected by the URL/db cross-check with a confusing error referencing
+    // keyspace notifications.
+    let mut spec = RedisSpec {
+        addresses: vec!["redis://cluster-node:6379/3".to_string()],
+        key_prefix: String::new(), // empty — would normally trigger the warn
+        enable_keyspace_notifications: true,
+        keyspace_notifications_db: 0,
+        mode: RedisMode::Cluster,
+        ..Default::default()
+    };
+
+    RedisStore::set_spec_defaults_for_test(&mut spec)
+        .expect("cluster-mode set_spec_defaults must succeed");
+
+    assert!(
+        !spec.enable_keyspace_notifications,
+        "cluster-mode set_spec_defaults must force enable_keyspace_notifications=false; \
+         silent-override-in-new_cluster is the bug we're closing"
+    );
+    assert_eq!(
+        spec.keyspace_notifications_db, 0,
+        "cluster-mode set_spec_defaults must force keyspace_notifications_db=0"
+    );
+    Ok(())
+}
+
+// Sibling assertion: standard mode with the same mismatch MUST be rejected.
+// Confirms the forced-disable path is gated on cluster mode and doesn't
+// over-mask Standard-mode validation errors.
+#[nativelink_test]
+async fn standard_mode_keyspace_db_mismatch_still_rejected_for_sibling_check()
+-> Result<(), Error> {
+    let mut spec = RedisSpec {
+        addresses: vec!["redis://127.0.0.1:6379/3".to_string()],
+        key_prefix: "cas:".to_string(),
+        enable_keyspace_notifications: true,
+        keyspace_notifications_db: 0,
+        mode: RedisMode::Standard,
+        ..Default::default()
+    };
+    let err = RedisStore::set_spec_defaults_for_test(&mut spec)
+        .expect_err("standard-mode mismatch must still be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("connection URL resolves to db=3")
+            && msg.contains("keyspace_notifications_db=0"),
+        "standard-mode URL/db mismatch must still produce the bespoke rejection \
+         even after cluster-mode forced-disable was added; got: {msg}"
     );
     Ok(())
 }
