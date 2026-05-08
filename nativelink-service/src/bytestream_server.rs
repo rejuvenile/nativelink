@@ -1428,7 +1428,16 @@ impl ByteStreamServer {
                                         // error (dropping tx) instead of streaming data. Trim
                                         // to just the redirect message for a clean response.
                                         e.messages.truncate(1);
-                                        info!(response = ?e);
+                                        // #250: demoted from info! to debug!. NL_REDIRECT
+                                        // FailedPrecondition is high-volume in production
+                                        // (every Bazel-CAS Read for a blob the server hands
+                                        // off to a worker peer) and previously contributed
+                                        // to log-rate-driven OOMs (#186 false-alarm bursts,
+                                        // #197 phantom-blob bursts, #253 / #255 backfill
+                                        // bursts). The redirect is normal protocol behavior,
+                                        // not a state transition or an anomaly — debug! is
+                                        // the right level.
+                                        debug!(response = ?e);
                                     } else if e.code == Code::NotFound {
                                         info!(response = ?e);
                                     } else {
