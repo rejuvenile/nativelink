@@ -895,7 +895,7 @@ mod wps_wireup {
         Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
     };
     use pretty_assertions::assert_eq;
-    use tokio::sync::Notify;
+    use tokio::sync::watch;
     use tokio::time::timeout;
 
     const VALID_HASH1: &str =
@@ -903,18 +903,30 @@ mod wps_wireup {
     const VALID_HASH2: &str =
         "fedcba9876543210000000000000000000020000000000000fedcba987654321";
 
-    /// Counts get_part calls and gates them on a shared Notify barrier
-    /// so the test can observe N concurrent in-flight calls before
-    /// releasing them. Wraps an inner MemoryStore for actual data.
+    /// Counts get_part calls and gates them on a shared watch
+    /// barrier so the test can observe N concurrent in-flight calls
+    /// before releasing them. Wraps an inner MemoryStore for actual
+    /// data.
+    ///
+    /// `tokio::sync::watch::channel(bool)` is the canonical
+    /// lost-wakeup-safe replacement for `Notify::notified()` here:
+    /// the receiver caches the latest value, so `borrow_and_update`
+    /// + `changed().await` is correct regardless of whether the
+    /// sender flipped before or after the receiver subscribed
+    /// (the older `Notify` pattern in this fake had the canonical
+    /// `notify_waiters` race documented in
+    /// `feedback_lost_wakeup_test_theatre`).
     #[derive(Debug, MetricsComponent)]
     struct CountingPeerStore {
         inner: Store,
         get_part_calls: Arc<AtomicU64>,
-        /// Signaled once when the first call enters; used by the test
+        /// Flipped to `true` by the fake when the first peer call
+        /// enters; the test waits on `first_call_arrived_rx.changed()`
         /// to observe in-flight cohort size before releasing.
-        first_call_arrived: Arc<Notify>,
-        /// Test sets this to true to release queued callers.
-        release: Arc<Notify>,
+        first_call_arrived_tx: watch::Sender<bool>,
+        /// Test flips this from `false` to `true` to release queued
+        /// callers; every parked caller wakes deterministically.
+        release_rx: watch::Receiver<bool>,
     }
 
     default_health_status_indicator!(CountingPeerStore);
@@ -947,12 +959,23 @@ mod wps_wireup {
         ) -> Result<(), Error> {
             let n = self.get_part_calls.fetch_add(1, AOrdering::SeqCst);
             if n == 0 {
-                self.first_call_arrived.notify_waiters();
+                // Best-effort: receivers may already have been dropped
+                // if the test exited; ignore the SendError.
+                let _ = self.first_call_arrived_tx.send(true);
             }
-            // Wait for the test's release signal. Notify::notified must
-            // be created BEFORE the count check so we don't miss a
-            // pre-await notify_waiters call.
-            self.release.notified().await;
+            // Subscribe-before-poll: clone the receiver and only
+            // continue once the released flag is `true`. Watch caches
+            // the latest value so this is lost-wakeup-safe regardless
+            // of whether the test flipped `release` before or after
+            // we got here.
+            let mut release_rx = self.release_rx.clone();
+            while !*release_rx.borrow_and_update() {
+                if release_rx.changed().await.is_err() {
+                    // Sender dropped: test cleaned up before we
+                    // released. Treat as released.
+                    break;
+                }
+            }
             self.inner
                 .get_part(key, writer, offset, length)
                 .await
@@ -985,35 +1008,67 @@ mod wps_wireup {
         }
     }
 
+    /// Test harness handle bundling the proxy + the watch handles the
+    /// test must drive (release_tx) and observe (first_call_arrived_rx).
+    struct CountingPeerHarness {
+        proxy_arc: Arc<WorkerProxyStore>,
+        get_part_calls: Arc<AtomicU64>,
+        /// Receiver-side: `changed().await` resolves once the FIRST
+        /// peer call enters the fake. Lost-wakeup-safe: the watch
+        /// remembers the flip even if `changed().await` is called
+        /// afterwards.
+        first_call_arrived_rx: watch::Receiver<bool>,
+        /// Sender-side: `release_tx.send(true)` releases every parked
+        /// peer caller. Subsequent peer calls see the flag already set
+        /// and proceed without parking.
+        release_tx: watch::Sender<bool>,
+    }
+
     fn build_proxy_with_counting_peer(
         digest: DigestInfo,
         payload: Bytes,
-    ) -> (
-        Arc<WorkerProxyStore>,
-        Arc<AtomicU64>,
-        Arc<Notify>,
-        Arc<Notify>,
-    ) {
+    ) -> CountingPeerHarness {
         let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
         let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
         // Pre-populate the peer with the blob.
         futures::executor::block_on(peer_inner.update_oneshot(digest, payload))
             .expect("seed peer with payload");
         let get_part_calls = Arc::new(AtomicU64::new(0));
-        let first_call_arrived = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let (first_call_arrived_tx, first_call_arrived_rx) = watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(false);
         let counting_peer = Store::new(Arc::new(CountingPeerStore {
             inner: peer_inner,
             get_part_calls: get_part_calls.clone(),
-            first_call_arrived: first_call_arrived.clone(),
-            release: release.clone(),
+            first_call_arrived_tx,
+            release_rx,
         }));
         let locality_map = new_shared_blob_locality_map();
         let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
         let endpoint = "grpc://sf-wps-test-peer:50081";
         proxy_arc.inject_worker_connection(endpoint, counting_peer);
         locality_map.write().register_blobs(endpoint, &[digest]);
-        (proxy_arc, get_part_calls, first_call_arrived, release)
+        CountingPeerHarness {
+            proxy_arc,
+            get_part_calls,
+            first_call_arrived_rx,
+            release_tx,
+        }
+    }
+
+    /// Helper: await `first_call_arrived_rx` flipping to true. Pairs
+    /// with `release_tx.send(true)` in tests to coordinate the
+    /// "observe then release" cohort scenario.
+    async fn wait_for_first_peer_call(
+        rx: &mut watch::Receiver<bool>,
+    ) {
+        // borrow_and_update returns the latest value AND marks it as
+        // seen, so subsequent changed().await waits for the NEXT flip.
+        // If the flag is already true (peer raced ahead), we return
+        // immediately.
+        if *rx.borrow_and_update() {
+            return;
+        }
+        let _ = rx.changed().await;
     }
 
     // =================================================================
@@ -1037,8 +1092,12 @@ mod wps_wireup {
         let payload = Bytes::from(payload_vec);
         let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
 
-        let (proxy_arc, peer_calls, first_arrived, release) =
-            build_proxy_with_counting_peer(digest, payload.clone());
+        let CountingPeerHarness {
+            proxy_arc,
+            get_part_calls: peer_calls,
+            mut first_call_arrived_rx,
+            release_tx,
+        } = build_proxy_with_counting_peer(digest, payload.clone());
         let proxy = Store::new(proxy_arc.clone());
 
         const N_CALLERS: usize = 16;
@@ -1050,26 +1109,32 @@ mod wps_wireup {
             }));
         }
 
-        // Wait for the FIRST peer call to arrive (blocked at release).
-        timeout(Duration::from_secs(5), first_arrived.notified())
-            .await
-            .expect(
-                "wps SF test: first peer call must arrive within 5s — \
-                 if N peer calls were going to fire, the first would \
-                 already be in-flight by now",
-            );
-        // At this point the leader is parked at peer.get_part
-        // awaiting `release.notified()`. The other 15 callers should
-        // be parked in SF as waiters (their fetcher closure never ran).
+        // Wait for the FIRST peer call to arrive (parked on the
+        // release watch). watch is lost-wakeup-safe: even if the peer
+        // already arrived before we got here, the flag is cached.
+        timeout(
+            Duration::from_secs(5),
+            wait_for_first_peer_call(&mut first_call_arrived_rx),
+        )
+        .await
+        .expect(
+            "wps SF test: first peer call must arrive within 5s — \
+             if N peer calls were going to fire, the first would \
+             already be in-flight by now",
+        );
+        // At this point the leader is parked at peer.get_part awaiting
+        // the release flag. The other 15 callers should be parked in
+        // SF as waiters (their fetcher closure never ran).
 
-        // Release every caller. The leader's get_part returns a
-        // chunked stream from MemoryStore; the cache task spawns and
-        // (because the inner is a fast MemoryStore) likely completes
-        // before waiters reach inner.get_part. Waiters then hit CAS
-        // and fan out the bytes. If CAS hasn't landed yet, waiters
-        // fall back to direct fetch (race window) — the peer call
-        // counter would jump to N in that case.
-        release.notify_waiters();
+        // Release every caller deterministically with a single watch
+        // flip — replaces the previous `Notify::notify_waiters()` +
+        // 1000-iter polling-loop workaround. The leader's get_part
+        // returns a chunked stream from MemoryStore; the cache task
+        // spawns and (because the inner is a fast MemoryStore) likely
+        // completes before waiters reach inner.get_part.
+        release_tx
+            .send(true)
+            .expect("release_tx must succeed — fake's receiver still alive");
 
         let results = timeout(Duration::from_secs(10), async {
             let mut out = Vec::with_capacity(N_CALLERS);
@@ -1095,25 +1160,25 @@ mod wps_wireup {
             );
         }
 
-        // Under-action contract: 16 callers ⇒ 1 peer fetch. We allow
-        // up to a small handful of fallbacks (in case the cache task
-        // didn't complete before some waiter raced ahead and hit
-        // NotFound), but the upper bound must be FAR less than 16 for
-        // this to count as dedup. With a 4 KiB MemoryStore inner and
-        // detached cache task, the cache typically completes before
-        // the leader's forward loop EOFs — observed in practice as
-        // ~1 fetch.
+        // Under-action contract: 16 callers ⇒ 1 peer fetch.
+        // With a 4 KiB MemoryStore inner and detached cache task, the
+        // cache typically completes WHILE the leader is still
+        // streaming, so by the time waiters reach inner.get_part the
+        // CAS has the blob — full SF dedup engages. Allow up to 2
+        // peer calls as graceful-degradation tolerance for the rare
+        // race-window case (the leader's forward EOF arrives before
+        // the cache task's first poll), per testing-czar MINOR-1.
         let observed = peer_calls.load(AOrdering::SeqCst);
         assert!(
-            observed < N_CALLERS as u64 / 4,
+            observed <= 2,
             "wps SF wire-up must collapse N=16 concurrent same-digest reads \
-             into ≤ N/4 peer fetches via SF dedup — got {observed} \
+             into ≤ 2 peer fetches via SF dedup — got {observed} \
              (a value of N or close to it means SF is not engaging at the \
-             WPS layer; check the `should_use_sf` gate in get_part_and_cache)",
+             WPS layer; check the `should_use_sf` gate in get_part_and_cache; \
+             a value between 2 and N/4 likely means the race window is \
+             larger than expected and the leader's cache write rate has \
+             regressed below the leader's forward EOF rate)",
         );
-        // Strict contract: in the common case (cache fast enough) we
-        // expect exactly 1. Allow up to N/4 as graceful-degradation
-        // tolerance for the race window.
 
         // SF dedup-hits counter must show ≥ 1 dedup event.
         let (dedup_hits, _bypasses_cap) = proxy_arc.singleflight_counters_snapshot();
@@ -1155,13 +1220,13 @@ mod wps_wireup {
             .await?;
 
         let get_part_calls = Arc::new(AtomicU64::new(0));
-        let first_call_arrived = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let (first_call_arrived_tx, mut first_call_arrived_rx) = watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(false);
         let counting_peer = Store::new(Arc::new(CountingPeerStore {
             inner: peer_inner,
             get_part_calls: get_part_calls.clone(),
-            first_call_arrived: first_call_arrived.clone(),
-            release: release.clone(),
+            first_call_arrived_tx,
+            release_rx,
         }));
         let locality_map = new_shared_blob_locality_map();
         let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
@@ -1183,30 +1248,28 @@ mod wps_wireup {
 
         // Wait for first call to arrive — proves both are in-flight
         // concurrently (the race condition under test).
-        timeout(Duration::from_secs(5), first_call_arrived.notified())
-            .await
-            .expect("wps over-action test: first peer call must arrive within 5s");
-        // Best-effort wait for the second peer call. We don't need
-        // strict synchronization here; release_all unblocks both.
-        for _ in 0..50 {
+        timeout(
+            Duration::from_secs(5),
+            wait_for_first_peer_call(&mut first_call_arrived_rx),
+        )
+        .await
+        .expect("wps over-action test: first peer call must arrive within 5s");
+        // Best-effort wait for the second peer call: yield until the
+        // counter shows both arrived (no wall-clock sleep). With
+        // distinct digests, both leaders enter peer.get_part in
+        // parallel, so this resolves in a handful of yields.
+        for _ in 0..1000 {
             if get_part_calls.load(AOrdering::SeqCst) >= 2 {
                 break;
             }
             tokio::task::yield_now().await;
         }
 
-        release.notify_waiters();
-        // Notify_waiters only wakes existing waiters; if a 2nd peer
-        // call arrived AFTER our first notify_waiters, it would miss
-        // the wake. Loop until both callers have arrived AND been
-        // released.
-        for _ in 0..1000 {
-            release.notify_waiters();
-            if h_a.is_finished() && h_b.is_finished() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        // Single watch flip releases EVERY parked caller, present and
+        // future. No 1000-iter sleep loop, no Notify lost-wakeup.
+        release_tx
+            .send(true)
+            .expect("release_tx must succeed — fake's receiver still alive");
 
         let (got_a, got_b) = timeout(Duration::from_secs(10), async {
             let a = h_a.await.expect("wps over-action: caller A panicked");
@@ -1263,8 +1326,12 @@ mod wps_wireup {
         let payload = Bytes::from(payload_vec.clone());
         let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
 
-        let (proxy_arc, peer_calls, _first_arrived, release) =
-            build_proxy_with_counting_peer(digest, payload.clone());
+        let CountingPeerHarness {
+            proxy_arc,
+            get_part_calls: peer_calls,
+            first_call_arrived_rx: _,
+            release_tx,
+        } = build_proxy_with_counting_peer(digest, payload.clone());
         let proxy = Store::new(proxy_arc.clone());
 
         // Spawn 4 PARTIAL reads (offset > 0). Each must peer-fetch
@@ -1279,16 +1346,13 @@ mod wps_wireup {
             }));
         }
 
-        // Release all callers (no need for synchronization; each fires
-        // its own peer call). Loop release in case more arrive after
-        // the initial notify.
-        for _ in 0..200 {
-            release.notify_waiters();
-            if handles.iter().all(tokio::task::JoinHandle::is_finished) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        // Single watch flip releases every present and future peer
+        // caller — replaces the previous 200-iter sleep-based release
+        // loop. Late-arriving callers see release_rx already true and
+        // proceed without parking.
+        release_tx
+            .send(true)
+            .expect("release_tx must succeed — fake's receiver still alive");
 
         let results = timeout(Duration::from_secs(10), async {
             let mut out = Vec::with_capacity(N_CALLERS);
@@ -1445,13 +1509,13 @@ mod wps_wireup {
             .update_oneshot(digest, payload.clone())
             .await?;
         let get_part_calls = Arc::new(AtomicU64::new(0));
-        let first_call_arrived = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let (first_call_arrived_tx, mut first_call_arrived_rx) = watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(false);
         let counting_peer = Store::new(Arc::new(CountingPeerStore {
             inner: peer_inner,
             get_part_calls: get_part_calls.clone(),
-            first_call_arrived: first_call_arrived.clone(),
-            release: release.clone(),
+            first_call_arrived_tx,
+            release_rx,
         }));
         let locality_map = new_shared_blob_locality_map();
         let proxy_arc = WorkerProxyStore::new(slow_inner, locality_map.clone());
@@ -1469,21 +1533,21 @@ mod wps_wireup {
             }));
         }
 
-        timeout(Duration::from_secs(5), first_call_arrived.notified())
-            .await
-            .expect("wps fallback test: first peer call must arrive within 5s");
-        // Release all peer-fetches. The leader's forward completes
-        // ~immediately; the cache task then sleeps 500ms; waiters
-        // wake right after the leader signals, find CAS empty, fall
-        // back to direct peer-fetch. So the peer call counter ends
-        // up at N (each waiter fires its own).
-        for _ in 0..2000 {
-            release.notify_waiters();
-            if handles.iter().all(tokio::task::JoinHandle::is_finished) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        timeout(
+            Duration::from_secs(5),
+            wait_for_first_peer_call(&mut first_call_arrived_rx),
+        )
+        .await
+        .expect("wps fallback test: first peer call must arrive within 5s");
+        // Single watch flip releases all peer-fetches present and
+        // future. The leader's forward completes ~immediately; the
+        // cache task then sleeps 500ms; waiters wake right after the
+        // leader signals, find CAS empty, fall back to direct
+        // peer-fetch. So the peer call counter ends up at N (each
+        // waiter fires its own).
+        release_tx
+            .send(true)
+            .expect("release_tx must succeed — fake's receiver still alive");
 
         let results = timeout(Duration::from_secs(15), async {
             let mut out = Vec::with_capacity(N_CALLERS);
@@ -1517,6 +1581,384 @@ mod wps_wireup {
                  the fall-back path corrupted the response",
             );
         }
+
+        // Operator-visibility counter: at least one waiter must have
+        // recorded the race-window fall-back to direct peer-fetch.
+        // Without this counter, an operator can't distinguish "SF is
+        // engaging but degrading to direct fetch" from "SF is
+        // engaging cleanly" — both look like the same dedup-hit
+        // count. Per red-team finding.
+        let fallback_count = proxy_arc
+            .singleflight_waiter_fallback_to_direct_total();
+        assert!(
+            fallback_count >= 1,
+            "wps fallback test: \
+             singleflight_waiter_fallback_to_direct_total must increment \
+             when waiters race past the leader's cache write — got \
+             {fallback_count}. The counter is the operator's only signal \
+             that SF dedup is degrading to no-op for this digest class; \
+             without it we can't distinguish cache-fast-path success from \
+             race-window degradation",
+        );
+
+        Ok(())
+    }
+
+    // =================================================================
+    // Test 5 (writer-state robustness): waiter fall-back must NOT enter
+    //   `get_part_and_cache_inner` when the borrowed writer is already
+    //   closed (pipe broken via send_error from a wrapping layer).
+    //   This is the sibling-class to #171: today no production layer
+    //   between WPS and the leaf calls send_error on NotFound, but a
+    //   future defensive WriteHalfGuard-style wrapper would silently
+    //   trip "Tried to send while stream is closed" in the fall-back
+    //   path. The `is_pipe_broken()` guard at the waiter NotFound
+    //   match arm prevents that.
+    // =================================================================
+    //
+    // We construct a wrapping store that:
+    //   * Forwards `get_part` to an inner WorkerProxyStore.
+    //   * Closes the writer with `send_error` when the inner returns
+    //     NotFound (the would-be sibling defensive wrapper behavior).
+    // We can't easily synthesize a real composition that closes the
+    // writer mid-stream without an actual production wrapper that
+    // does this. Instead we test the contract directly: when a
+    // waiter's CAS read is observed to return NotFound on a
+    // pre-closed writer, the fall-back must NOT be invoked (which
+    // would attempt to send bytes through the closed pipe).
+    //
+    // Mutation step: remove the `!writer.is_pipe_broken()` clause
+    // from the waiter NotFound match arm. Then, even with a
+    // pre-closed writer, fall-back fires and `cache_handle.await`
+    // ends up trying to send bytes via the broken pipe. With the
+    // guard in place, the waiter surfaces the original NotFound (or
+    // a derived error) without invoking fall-back. We assert the
+    // waiter completes in bounded time AND no panic / no spurious
+    // bytes-received when the writer is closed.
+    //
+    // The key invariant under test:
+    //   "is_pipe_broken() guard prevents fall-back from re-entering
+    //    a closed writer."
+    // The mutation is the one-line removal of the `&& !writer.is_pipe_broken()`
+    // clause; without the guard the waiter still completes (because
+    // the waiter operates on its OWN top-level writer which Bazel
+    // has not closed in the production composition we'd ship), but
+    // the contract still holds because the worker never actually
+    // closes the writer on NotFound today. The forward-compatibility
+    // value of the guard is what we assert: a code-shape regression
+    // that re-enters the writer post-close is structurally
+    // prevented.
+
+    #[nativelink_test]
+    async fn wps_waiter_fallback_skips_when_writer_pipe_broken_guard()
+    -> Result<(), Error> {
+        // This test exercises the choice α invariant directly via the
+        // `is_pipe_broken()` boolean: it asserts that the waiter
+        // path's NotFound match arm correctly REQUIRES a non-broken
+        // pipe to invoke fall-back. We simulate by closing the
+        // writer manually via send_error and verifying the fall-back
+        // is skipped (no peer fetch fires on the closed-writer path).
+
+        use nativelink_util::buf_channel::make_buf_channel_pair;
+
+        const PAYLOAD_LEN: usize = 4096;
+        let payload_vec: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xff) as u8).collect();
+        let payload = Bytes::from(payload_vec);
+        let digest = DigestInfo::try_new(VALID_HASH1, PAYLOAD_LEN as u64)?;
+
+        // Slow inner: the cache-task delay forces the waiter into the
+        // race-window fall-back path. Without is_pipe_broken, the
+        // waiter would re-enter get_part_and_cache_inner.
+        let actual_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let slow_inner = Store::new(Arc::new(SlowUpdateInnerStore {
+            sleep_ms: 500,
+            update_calls: AtomicU64::new(0),
+            inner: actual_inner.clone(),
+        }));
+
+        let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        peer_inner
+            .update_oneshot(digest, payload.clone())
+            .await?;
+        let get_part_calls = Arc::new(AtomicU64::new(0));
+        let (first_call_arrived_tx, mut first_call_arrived_rx) = watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(false);
+        let counting_peer = Store::new(Arc::new(CountingPeerStore {
+            inner: peer_inner,
+            get_part_calls: get_part_calls.clone(),
+            first_call_arrived_tx,
+            release_rx,
+        }));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy_arc = WorkerProxyStore::new(slow_inner, locality_map.clone());
+        let endpoint = "grpc://sf-wps-pipe-broken-test-peer:50081";
+        proxy_arc.inject_worker_connection(endpoint, counting_peer);
+        locality_map.write().register_blobs(endpoint, &[digest]);
+        let proxy = Store::new(proxy_arc.clone());
+
+        // 1) Spawn the leader via get_part_unchunked. Its writer is
+        //    owned by the unchunked harness — we don't touch it. The
+        //    leader's peer call will block on release.
+        let leader_handle = {
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                proxy.get_part_unchunked(digest, 0, None).await
+            })
+        };
+
+        timeout(
+            Duration::from_secs(5),
+            wait_for_first_peer_call(&mut first_call_arrived_rx),
+        )
+        .await
+        .expect(
+            "wps pipe-broken test: leader's first peer call must arrive \
+             within 5s before we set up the waiter",
+        );
+
+        // 2) Build the waiter's writer — pre-close it via send_error
+        //    so is_pipe_broken() returns true. This simulates a
+        //    future defensive WriteHalfGuard-style wrapper above WPS
+        //    that closes the writer on Err. drop(rx) too so the
+        //    actual send-attempt also fails.
+        let (mut tx, rx) = make_buf_channel_pair();
+        let close_err = nativelink_error::make_err!(
+            nativelink_error::Code::Internal,
+            "pipe-broken simulator: writer closed by upstream"
+        );
+        tx.send_error(close_err);
+        assert!(
+            tx.is_pipe_broken(),
+            "test setup: send_error must mark the writer as pipe-broken",
+        );
+        drop(rx);
+
+        // 3) Spawn the waiter BEFORE release fires, so it joins SF as
+        //    a true waiter (not a successor leader after the slot
+        //    drops). The waiter parks on the SF watch channel until
+        //    the leader publishes.
+        let proxy_arc2 = proxy_arc.clone();
+        let waiter_handle = tokio::spawn(async move {
+            use nativelink_util::store_trait::StoreDriver;
+            let pinned: Pin<&dyn StoreDriver> =
+                Pin::new(proxy_arc2.as_ref());
+            pinned.get_part(StoreKey::from(digest), &mut tx, 0, None).await
+        });
+
+        // Yield a few times to give the waiter task a chance to
+        // reach the singleflight() join point.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // 4) Release the leader. Leader's peer call proceeds, leader
+        //    signals SF Ok. Waiter wakes, calls inner.get_part on
+        //    slow_inner (sleeps 500ms before returning data — but
+        //    the cache hasn't even started populating, so the slow
+        //    inner returns NotFound after sleep). Waiter sees
+        //    NotFound + bytes_before == 0. With guard: also sees
+        //    pipe_broken → falls into the Err arm WITHOUT calling
+        //    fallback (so peer.get_part is NOT called from the
+        //    waiter). Without guard: falls back → calls
+        //    get_part_and_cache_inner → peer.get_part fires AGAIN.
+        release_tx
+            .send(true)
+            .expect("release_tx must succeed — fake's receiver still alive");
+
+        let waiter_result = timeout(
+            Duration::from_secs(15),
+            waiter_handle,
+        )
+        .await
+        .expect(
+            "wps pipe-broken test: waiter must NOT deadlock — the \
+             is_pipe_broken guard should short-circuit the fall-back \
+             path; a hang here means a waiter wedged trying to send \
+             bytes through a closed writer",
+        )
+        .expect("waiter task panicked");
+
+        // The waiter must Err — the writer is closed and there's no
+        // way to deliver bytes through it.
+        assert!(
+            waiter_result.is_err(),
+            "wps pipe-broken test: waiter on closed writer must Err — \
+             got Ok, which would mean the waiter succeeded in writing \
+             bytes through a pipe the test closed before the call",
+        );
+
+        // Drain leader.
+        let leader_bytes = leader_handle
+            .await
+            .expect("leader task panicked")
+            .expect("leader returned Err");
+        assert_eq!(leader_bytes.as_ref(), payload.as_ref());
+
+        // KEY ASSERTION: with the is_pipe_broken guard in place, the
+        // waiter must NOT have invoked the fall-back path (which
+        // would call get_part_and_cache_inner → peer.get_part again).
+        // The leader fires exactly 1 peer call; the waiter fires 0.
+        // Without the guard, the waiter would fall back, fire its
+        // OWN peer call, then trip "Tried to send while stream is
+        // closed" mid-write — peer count would be 2.
+        let observed = get_part_calls.load(AOrdering::SeqCst);
+        assert_eq!(
+            observed, 1,
+            "wps pipe-broken test: peer.get_part must fire exactly ONCE \
+             (the leader). Got {observed} calls. A value of 2 means the \
+             waiter's race-window fall-back fired despite the writer \
+             being closed (`is_pipe_broken()` guard violated). The \
+             fall-back would attempt to send bytes via the closed pipe, \
+             tripping `Tried to send while stream is closed` and \
+             charging an extra peer fetch we can never deliver"
+        );
+
+        // The waiter must record a SF dedup-hit (it joined the leader
+        // as a waiter; this must be observable regardless of which
+        // arm it terminated in).
+        let (dedup_hits, _bypasses_cap) =
+            proxy_arc.singleflight_counters_snapshot();
+        assert!(
+            dedup_hits >= 1,
+            "wps pipe-broken test: dedup hits must increment ≥ 1 — \
+             waiter must have joined the leader's SF slot; got \
+             {dedup_hits}",
+        );
+
+        // The waiter must NOT have recorded a fall-back attempt
+        // (the guard short-circuits BEFORE record_waiter_fallback).
+        let fallback_count = proxy_arc
+            .singleflight_waiter_fallback_to_direct_total();
+        assert_eq!(
+            fallback_count, 0,
+            "wps pipe-broken test: waiter_fallback_to_direct must be 0 \
+             — the is_pipe_broken guard blocks fall-back BEFORE the \
+             counter increments; got {fallback_count}",
+        );
+
+        Ok(())
+    }
+
+    // =================================================================
+    // Test 6 (size bypass): blobs > MAX_CACHE_BLOB_SIZE bypass SF
+    // =================================================================
+    //
+    // The dedup gate `should_use_sf` requires `digest.size_bytes() <=
+    // MAX_CACHE_BLOB_SIZE` (64 MiB at the time of writing). Oversized
+    // blobs must independently peer-fetch — no SF coordination.
+    //
+    // Mutation step: weaken the gate (`should_use_sf = should_cache &&
+    // digest.size_bytes() > 0`) without the cache-eligibility size
+    // bound. Then oversized blobs would dedup; the per-call peer
+    // count would be 1 instead of N.
+    //
+    // We can't actually allocate 64+ MiB in test, so we use a fake
+    // peer that lies about the blob size (peer holds a small blob
+    // but the digest claims a large size). The SF gate runs against
+    // the digest.size_bytes() — not the actual payload — so the
+    // bypass decision is made BEFORE the bytes flow. We assert that
+    // SF doesn't engage (no dedup hits, peer fetch fires per caller).
+
+    #[nativelink_test]
+    async fn wps_oversized_blob_bypasses_sf() -> Result<(), Error> {
+        use nativelink_store::worker_proxy_store::WorkerProxyStore as WPS;
+
+        // Digest claims 65 MiB (above MAX_CACHE_BLOB_SIZE = 64 MiB).
+        // We don't actually allocate this — we just assert the SF
+        // gate skips dedup. The peer's get_part will be invoked but
+        // we'll release immediately and let it Err out (the seeded
+        // payload won't match the digest size, so VerifyStore would
+        // catch it; but we use plain MemoryStore here so the bytes
+        // flow without verification).
+        let oversized = (WPS::MAX_CACHE_BLOB_SIZE + 1) as u64;
+        // VALID_HASH1 has the right format; the size_bytes is the
+        // gate input.
+        let digest = DigestInfo::try_new(VALID_HASH1, oversized)?;
+
+        // Seed peer with a small payload (just enough that get_part
+        // returns Ok-ish). We don't care about correctness of the
+        // bytes — we care about peer-call-count.
+        let payload = Bytes::from(vec![0u8; 4096]);
+
+        // Build harness directly so we can inject a peer that
+        // deliberately ignores the size mismatch.
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let peer_inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        // Use a different (correctly-sized) digest for the seed; we
+        // override the request's digest only at the WPS layer via
+        // the locality map. The peer's get_part with the oversized
+        // digest won't find the seed, but that's fine — we only
+        // count call entries.
+        let _ = peer_inner.update_oneshot(digest, payload.clone()).await;
+
+        let get_part_calls = Arc::new(AtomicU64::new(0));
+        let (first_call_arrived_tx, _first_call_arrived_rx) =
+            watch::channel(false);
+        let (release_tx, release_rx) = watch::channel(true); // pre-released
+        let counting_peer = Store::new(Arc::new(CountingPeerStore {
+            inner: peer_inner,
+            get_part_calls: get_part_calls.clone(),
+            first_call_arrived_tx,
+            release_rx,
+        }));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy_arc = WorkerProxyStore::new(inner, locality_map.clone());
+        let endpoint = "grpc://sf-wps-oversized-test-peer:50081";
+        proxy_arc.inject_worker_connection(endpoint, counting_peer);
+        locality_map.write().register_blobs(endpoint, &[digest]);
+        let proxy = Store::new(proxy_arc.clone());
+        // release_tx is held to keep the watch alive (rx subscribed in
+        // the fake); pre-released so peer calls proceed instantly.
+        let _release_tx = release_tx;
+
+        // Fire 4 concurrent reads. Without SF, each fires its own
+        // peer.get_part. With SF (bug), N would collapse to ~1.
+        const N_CALLERS: usize = 4;
+        let mut handles = Vec::with_capacity(N_CALLERS);
+        for _ in 0..N_CALLERS {
+            let proxy = proxy.clone();
+            handles.push(tokio::spawn(async move {
+                proxy.get_part_unchunked(digest, 0, None).await
+            }));
+        }
+
+        // Drain — we don't care about success, just call counts.
+        let _ = timeout(Duration::from_secs(15), async {
+            for h in handles {
+                let _ = h.await;
+            }
+        })
+        .await
+        .expect(
+            "wps oversized bypass test: callers must complete within 15s — \
+             a hang here would mean an unintended dedup is wedging \
+             waiters on a leader that never publishes",
+        );
+
+        // Bypass contract: 4 concurrent oversized reads ⇒ 4 peer
+        // fetches. SF must NOT collapse them.
+        let observed = get_part_calls.load(AOrdering::SeqCst);
+        assert_eq!(
+            observed, N_CALLERS as u64,
+            "wps oversized bypass test: oversized blobs MUST bypass SF — \
+             got {observed} peer fetches for {N_CALLERS} callers, \
+             expected {N_CALLERS}. A value < {N_CALLERS} means the \
+             `should_use_sf` size-bound gate failed and oversized blobs \
+             are deduping. Oversized blobs that dedup at the WPS layer \
+             would buffer 64+ MiB across N waiters via the SF cohort \
+             machinery — a memory-safety hazard that the size bound \
+             was specifically designed to prevent"
+        );
+
+        // SF dedup hits should remain 0 — no waiter joined a leader.
+        let (dedup_hits, _bypasses_cap) =
+            proxy_arc.singleflight_counters_snapshot();
+        assert_eq!(
+            dedup_hits, 0,
+            "wps oversized bypass test: total_dedup_hits must be 0 — \
+             oversized reads bypass SF and never reach the dedup gate; \
+             got {dedup_hits}",
+        );
 
         Ok(())
     }

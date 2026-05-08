@@ -64,7 +64,7 @@ use std::sync::{Arc, Weak};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{trace, warn};
 
 use nativelink_error::Error;
 use nativelink_metric::MetricsComponent;
@@ -151,6 +151,9 @@ impl Drop for InflightEntry {
 ///   because the cap would be exceeded (cumulative)
 /// * `total_bypasses_size_zero` — count of callers that bypassed dedup
 ///   because `expected_size == 0` (cumulative)
+/// * `total_waiter_fallback_to_direct` — count of waiters that fell
+///   back to a direct peer-fetch after leader-signal-Ok because CAS
+///   was empty (the WPS race-window degradation signal)
 #[derive(Debug, MetricsComponent)]
 pub struct SingleflightMap {
     #[metric(group = "inner")]
@@ -190,6 +193,25 @@ struct SingleflightMapInner {
     /// gates `expected_size > 0` upstream.
     #[metric(help = "Cumulative count of callers that bypassed dedup due to size==0")]
     total_bypasses_size_zero: AtomicU64,
+    /// Count of waiters that, after the leader signaled Ok, found CAS
+    /// empty and fell back to a direct (non-deduped) peer-fetch
+    /// (cumulative). Distinct from `total_dedup_hits`: that counts
+    /// waiters that JOINED a leader; this counts the subset of those
+    /// joins that DEGRADED to direct fetch via the WPS race-window
+    /// fall-back path.
+    ///
+    /// Operator significance: persistent non-zero values mean the cache
+    /// (slow tier) is consistently slower than the leader's forward
+    /// EOF, so SF dedup is a no-op for that portion of the traffic
+    /// (waiters still pay peer-fetch cost). If `total_waiter_fallback
+    /// _to_direct / total_dedup_hits` ≈ 1.0, SF is fully degraded —
+    /// the operator should investigate the cache-write latency or
+    /// switch to choice (β) (leader-await-cache).
+    #[metric(
+        help = "Cumulative count of waiters that fell back to direct peer-fetch after \
+                leader-signal-Ok (race window between leader EOF and cache landing)"
+    )]
+    total_waiter_fallback_to_direct: AtomicU64,
 }
 
 impl SingleflightMap {
@@ -211,6 +233,7 @@ impl SingleflightMap {
                 total_dedup_hits: AtomicU64::new(0),
                 total_bypasses_cap: AtomicU64::new(0),
                 total_bypasses_size_zero: AtomicU64::new(0),
+                total_waiter_fallback_to_direct: AtomicU64::new(0),
             }),
         })
     }
@@ -306,8 +329,17 @@ impl SingleflightMap {
             self.inner
                 .total_dedup_hits
                 .fetch_add(1, Ordering::Relaxed);
-            info!(
+            // Hot path — N waiters per leader, fires per same-digest
+            // race on every concurrent caller cohort. `info!` here at
+            // production rates (~40 ev/s typical, bursty up to several
+            // hundred during peer-fetch storms) was a deploy-blocker
+            // class log-rate hazard (#253/#255 OOMs were log-rate
+            // driven). `trace!` keeps it available under targeted
+            // capture; the cumulative `total_dedup_hits` counter on
+            // `MetricsComponent` carries the operator-visible signal.
+            trace!(
                 target: "singleflight",
+                ?owned_key,
                 "singleflight: dedup hit",
             );
             return Role::Waiter(entry);
@@ -319,8 +351,16 @@ impl SingleflightMap {
             self.inner
                 .total_bypasses_cap
                 .fetch_add(1, Ordering::Relaxed);
-            info!(
+            // Bypass on cap is a genuine performance anomaly — the
+            // operator wants to see this. Per CLAUDE.md tracing rules,
+            // `warn!` is the right level for cap-exhaustion / contention
+            // events. The cumulative `total_bypasses_cap` counter
+            // carries the rate signal; the warn! preserves a
+            // human-readable record with structured fields for capacity
+            // diagnosis.
+            warn!(
                 target: "singleflight",
+                ?owned_key,
                 current_inflight_bytes = current,
                 max_inflight_bytes = self.inner.max_inflight_bytes,
                 expected_size,
@@ -479,6 +519,31 @@ impl SingleflightMap {
     #[must_use]
     pub fn total_bypasses_cap(&self) -> u64 {
         self.inner.total_bypasses_cap.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of waiters that fell back to direct peer-fetch
+    /// after the leader signaled Ok but the CAS was empty. The WPS
+    /// wire-up calls [`Self::record_waiter_fallback`] on this race
+    /// path; the counter answers the operator question "is SF actually
+    /// engaging in production, or are all waiters degrading to
+    /// direct fetch?".
+    #[must_use]
+    pub fn total_waiter_fallback_to_direct(&self) -> u64 {
+        self.inner
+            .total_waiter_fallback_to_direct
+            .load(Ordering::Relaxed)
+    }
+
+    /// Record that a waiter (post-leader-signal-Ok) saw NotFound from
+    /// the local CAS and is falling back to a direct peer-fetch. Called
+    /// from `WorkerProxyStore::get_part_and_cache`'s waiter race-window
+    /// path — kept on the SingleflightMap because the metric is
+    /// semantically a SF-degradation signal that operators read
+    /// alongside `total_dedup_hits`.
+    pub fn record_waiter_fallback(&self) {
+        self.inner
+            .total_waiter_fallback_to_direct
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns the current number of registered slots. Test only.

@@ -317,6 +317,19 @@ impl MetricsComponent for WorkerProxyStore {
             self.inner.publish(MetricKind::Component, MetricFieldData::default())?;
         }
 
+        // #130 SingleflightMap counters and gauges. Without this group
+        // the `#[metric]` annotations on `SingleflightMap` /
+        // `SingleflightMapInner` (current_inflight_bytes,
+        // total_dedup_hits, total_bypasses_cap, max_inflight_bytes,
+        // total_waiter_fallback_to_direct) NEVER reach Prometheus
+        // because the parent's manual `MetricsComponent::publish` impl
+        // takes over from the (absent) derive.
+        {
+            let _enter = group!("singleflight").entered();
+            self.singleflight
+                .publish(MetricKind::Component, MetricFieldData::default())?;
+        }
+
         publish!(
             "mirror_total_attempted",
             &self.mirror_total_attempted,
@@ -676,6 +689,17 @@ impl WorkerProxyStore {
             self.singleflight.total_dedup_hits(),
             self.singleflight.total_bypasses_cap(),
         )
+    }
+
+    /// Test/observability: cumulative count of waiters that fell back
+    /// to direct peer-fetch after the leader signaled Ok but the CAS
+    /// was empty (the WPS race-window degradation signal). Distinct
+    /// from `total_dedup_hits` (which counts JOINS); this counts the
+    /// subset of joins that DEGRADED to direct fetch. See
+    /// `SingleflightMap::total_waiter_fallback_to_direct`.
+    #[must_use]
+    pub fn singleflight_waiter_fallback_to_direct_total(&self) -> u64 {
+        self.singleflight.total_waiter_fallback_to_direct()
     }
 
     /// Add a worker endpoint to the connection pool.
@@ -1518,7 +1542,11 @@ impl WorkerProxyStore {
     /// Maximum blob size to buffer and cache in the inner store after a
     /// successful proxy read. Blobs larger than this are streamed directly
     /// without caching, to avoid excessive memory usage.
-    const MAX_CACHE_BLOB_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
+    /// Public so integration tests (`tests/worker_proxy_singleflight_test`)
+    /// can compute oversized-blob digests against the same constant
+    /// the production code gates on. Pinning a hard-coded literal in
+    /// tests would silently desync if this size ever changed.
+    pub const MAX_CACHE_BLOB_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 
     /// Wrapper around a peer's `get_part` that tees the data to both the
     /// caller's writer and a background write to the inner store, with
@@ -1709,10 +1737,12 @@ impl WorkerProxyStore {
         let outcome_for_closure = leader_forward_outcome.clone();
         let was_leader_clone = was_leader_or_bypass.clone();
 
-        // The SF closure borrows `&mut writer`, `self`, and `peer_store`.
+        // The SF closure borrows `&mut writer` and `self`, and copies
+        // `peer_store` (`&Store` is Copy — it wraps Arc<dyn StoreDriver
+        // + Send + Sync>, and `&T` of any T is Copy).
         // Send: `&mut DropCloserWriteHalf` is Send (Bytes/sender are Send),
         //       `&Self` is Send (WorkerProxyStore is Sync), `&Store` is
-        //       Send (Store wraps Arc<dyn StoreDriver + Send + Sync>).
+        //       Copy and Send.
         // Lifetime: the closure / future is bounded by the
         // `singleflight().await` call's lifetime — the SF API does NOT
         // 'static-bound the fetcher (see `singleflight.rs:236-244`), it
@@ -1731,7 +1761,13 @@ impl WorkerProxyStore {
                 key.borrow().into_owned(),
                 digest.size_bytes(),
                 move || async move {
-                    was_leader_clone.store(true, Ordering::SeqCst);
+                    // Release: pairs with the Acquire load below to
+                    // publish "we ran the closure body" before the
+                    // outer `singleflight().await` completes. SeqCst
+                    // was overspec'd — there's no cross-flag total
+                    // order requirement; only happens-before between
+                    // this store and the post-await load.
+                    was_leader_clone.store(true, Ordering::Release);
                     let (forward_result, cache_handle) = self
                         .get_part_and_cache_inner(
                             peer_store,
@@ -1776,7 +1812,7 @@ impl WorkerProxyStore {
             )
             .await;
 
-        if was_leader_or_bypass.load(Ordering::SeqCst) {
+        if was_leader_or_bypass.load(Ordering::Acquire) {
             // Leader/Bypass path: closure ran; writer was populated by
             // the inner forward loop. Return the actual forward result
             // (NOT the SF signal — that encodes cache outcome).
@@ -1810,15 +1846,33 @@ impl WorkerProxyStore {
                     Ok(()) => Ok(()),
                     Err(e)
                         if e.code == Code::NotFound
-                            && writer.get_bytes_written() == bytes_before =>
+                            && writer.get_bytes_written() == bytes_before
+                            && !writer.is_pipe_broken() =>
                     {
                         // CAS race: leader's cache hasn't landed yet
                         // (or was abandoned via try_send Full /
                         // consumer EOF). Safe to fall back to direct
-                        // fetch — no bytes were written. The waiter
-                        // pays peer-fetch cost; SF dedup-amplification
+                        // fetch — no bytes were written AND the writer
+                        // is still usable (not closed via send_error
+                        // by some upstream layer). The waiter pays
+                        // peer-fetch cost; SF dedup-amplification
                         // protection is lost for this caller in this
                         // race window, but no waiter is wedged.
+                        //
+                        // The `!writer.is_pipe_broken()` guard is the
+                        // sibling-class to #171: today no production
+                        // layer between WPS and the leaf calls
+                        // `send_error` on NotFound (verified at
+                        // verify_store.rs ~:208-276 + memory_store.rs
+                        // ~:503), so the byte-counter alone catches
+                        // the live race. The pipe-broken check makes
+                        // the fall-back robust to a future
+                        // `WriteHalfGuard`-style defensive layer that
+                        // closes the writer on Err — without it,
+                        // `get_part_and_cache_inner` would re-enter
+                        // and trip "Tried to send while stream is
+                        // closed" on the first chunk.
+                        self.singleflight.record_waiter_fallback();
                         debug!(
                             %digest,
                             "singleflight: waiter NotFound in CAS despite leader \
@@ -1836,7 +1890,10 @@ impl WorkerProxyStore {
                     }
                     Err(e) => {
                         // Either non-NotFound error, OR partial bytes
-                        // written (stream now corrupt). Surface as-is.
+                        // written (stream now corrupt), OR the writer
+                        // is already closed (pipe broken — fall-back
+                        // would just trip "Tried to send while stream
+                        // is closed" on its first chunk). Surface as-is.
                         Err(e).err_tip(|| {
                             "singleflight waiter: inner.get_part error after \
                              leader-signal-Ok"
@@ -2153,14 +2210,18 @@ impl WorkerProxyStore {
             )),
         };
 
-        // Cache task handle is RETURNED to the caller. The caller chooses:
-        // * Bypass / SF-disabled callers: drop(cache_handle) — preserves
-        //   the pre-#130 detached-cache behavior and the #229 "Bazel
-        //   reader never blocks on cache" invariant.
-        // * SF Leader: `cache_handle.await` — needed to determine the
-        //   waiter signal (Ok if cache landed in CAS, Err otherwise).
-        //   Awaiting happens AFTER the forward loop, so bytes-in-flight
-        //   to Bazel are unaffected; only response latency is paid.
+        // Cache task handle is RETURNED to the caller. ALL callers
+        // (Bypass / SF-disabled / SF Leader / SF Waiter fall-back)
+        // currently `drop(cache_handle)` to detach the cache task —
+        // see choice (α) in `get_part_and_cache`'s fn-level docs.
+        // Awaiting `cache_handle` here would couple Bazel back-pressure
+        // to slow-cache writes, regressing the
+        // `cdn_tee_slow_cache_abandons_does_not_block_bazel` test
+        // (rejected; see #229 audit + the choice-α design doc). A
+        // future redesign that needs leader-await-cache (choice β)
+        // would change ONLY the SF-Leader closure inside
+        // `get_part_and_cache`; this inner function stays choice-α
+        // by always returning the handle for the caller to drop.
         let final_forward_result = if let Err(get_err) = get_part_result {
             // Peer's get_part errored — surface that. forward result is
             // derivative.

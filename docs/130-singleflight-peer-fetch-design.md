@@ -286,3 +286,58 @@ exception noted on test 2); the implementation PR turns them green.
 Each test is wrapped in `tokio::time::timeout(5s, ...)` with a specific
 `.expect()` message naming the contract violated, so a hang fails loudly
 rather than silently consuming CI time.
+
+## Iteration history
+
+The wire-up landed via three discarded prototypes; recording the
+discards here so future readers don't re-walk the same dead ends.
+
+### V1 — leader buffers the entire payload, fans out via `Arc<Vec<Bytes>>`
+
+The original `singleflight.rs` API broadcast `Arc<Vec<Bytes>>` to all
+waiters. The leader buffered chunks into a `Vec<Bytes>`, sent the
+shared `Arc` through `watch::channel`, and each waiter copied the
+ref into its own writer. Worked for unit tests. Failed in
+production-composition: the leader's *forward path* (Bazel writer)
+demanded chunk-by-chunk streaming, but the SF API forced the leader
+to stash bytes for the waiters until the whole blob had streamed
+through. This either (a) doubled the per-blob memory footprint in
+the WPS layer (one Vec for forward, one for SF fan-out) or
+(b) coupled the leader's forward path to a buffer-then-fan-out
+shape that broke the `cdn_tee_slow_consumer_does_not_stall_cache_completion`
+contract. Discarded with the SF API kept (it's still useful for
+small-payload dedup elsewhere) but the WPS layer never calls it
+with non-empty payloads — see Choice (α) below.
+
+### V2 — `Vec<Bytes>` carried but each waiter re-read CAS
+
+V2 kept the SF API but had the leader signal `Ok(Vec::new())` and
+relied on every waiter to read CAS. The waiter path's CAS read
+worked when cache was fast (~1ms inner); failed when cache was slow
+(>100ms inner). Without a fall-back to direct peer-fetch, slow-cache
+waiters got `NotFound` and bubbled it up — production saw 0%
+fallback success rate during ZFS hiccups (5+ s txg waits). Discarded
+in favor of Choice (α) which adds the explicit fall-back path.
+
+### V3 (current — Option C / Choice α)
+
+* SF payload is always `Vec::new()` — the SF API is used purely as
+  a barrier, NOT as a fan-out conduit for bytes.
+* The leader detaches its `cache_handle` (drops it without awaiting),
+  preserving the #229 / `cdn_tee_slow_cache_abandons_does_not_block_bazel`
+  contract.
+* Waiters wake on the SF Ok signal and read CAS. On NotFound (with
+  zero bytes written AND writer not pipe-broken), waiters fall back
+  to a direct (non-SF) `get_part_and_cache_inner` call.
+* Race-window observability: the new
+  `total_waiter_fallback_to_direct` counter records every fall-back,
+  so operators can detect SF degradation (consistent fall-back
+  ratios near 1.0 indicate cache is consistently slower than leader
+  EOF — switch to Choice β if needed).
+
+Choice (β) — leader awaits the cache handle before signaling — was
+prototyped during V3 design and rejected explicitly: it red-tripped
+`cdn_tee_slow_cache_abandons_does_not_block_bazel` and would
+require explicit user sign-off under the CLAUDE.md async↔sync
+trip-wire. The choice-α docstring in `worker_proxy_store.rs`
+explains the trade-off in detail.
