@@ -37,22 +37,32 @@
 //! synthetic message contains `"reader fell behind sliding window"` so
 //! the production D.1 predicate trips.
 
+use core::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::stores::{
     FastSlowSpec, MemorySpec, StoreDirection, StoreSpec, VerifySpec,
 };
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
+use nativelink_metric::MetricsComponent;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::verify_store::VerifyStore;
-use nativelink_util::buf_channel::make_buf_channel_pair;
+use nativelink_util::buf_channel::{
+    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
+};
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
+use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+use nativelink_util::store_trait::{
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, UploadSizeInfo,
+};
 use serial_test::serial;
+use tokio::sync::Notify;
 use tokio::try_join;
 
 const VALID_HASH: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
@@ -557,6 +567,297 @@ async fn d1_cache_tee_survives_reader_fallback() -> Result<(), Error> {
         "cache-tee must have populated the fast tier — D.1 fallback should \
          not perturb the producer-side cache-tee path; if this fails the \
          producer is being blocked or dropped by the reader's fallback"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// GatedSlowStore: a slow-store wrapper that delegates everything to an
+// inner MemoryStore but blocks `get_part` on a `Notify` until the test
+// explicitly releases it. Used by the waiter-path test below to keep the
+// producer task in `populating_digests` so a second concurrent caller
+// arrives as a WAITER instead of being a fresh populator-caller for a
+// completed digest.
+// -------------------------------------------------------------------------
+
+#[derive(Debug, MetricsComponent)]
+struct GatedSlowStore {
+    inner: Arc<MemoryStore>,
+    release_get_part: Arc<Notify>,
+    get_part_arrived: Arc<Notify>,
+}
+
+impl GatedSlowStore {
+    fn new(inner: Arc<MemoryStore>) -> Self {
+        Self {
+            inner,
+            release_get_part: Arc::new(Notify::new()),
+            get_part_arrived: Arc::new(Notify::new()),
+        }
+    }
+}
+
+default_health_status_indicator!(GatedSlowStore);
+
+#[async_trait]
+impl StoreDriver for GatedSlowStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        Pin::new(&*self.inner).has_with_results(digests, results).await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        reader: DropCloserReadHalf,
+        upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        Pin::new(&*self.inner).update(key, reader, upload_size).await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        // Signal arrival so the test driver knows the populator-caller
+        // has reached the producer entry and the entry is registered in
+        // populating_digests. Then wait for the test to explicitly
+        // release us before serving any bytes.
+        self.get_part_arrived.notify_one();
+        self.release_get_part.notified().await;
+        Pin::new(&*self.inner).get_part(key, writer, offset, length).await
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+// -------------------------------------------------------------------------
+// 6. WAITER-PATH coverage: the existing 5 tests trigger only the
+//    populator-caller path (single caller per test). The waiter-path
+//    metric, log, and splice arithmetic at `fast_slow_store.rs:5197-5230`
+//    are untested — testing-czar finding.
+//
+// Design choice (documented per task instruction): "If a single failpoint
+// can't distinguish populator vs waiter, this may require splitting the
+// metric into two atomics OR using a per-caller injection."
+//
+// We split the metric. `streaming_buffer_reader_fallback_to_direct_total`
+// now counts only the populator-caller path; the new
+// `streaming_buffer_reader_fallback_to_direct_waiter_total` counts only
+// the waiter path. This is more useful production observability AND
+// removes the need for per-caller failpoint injection.
+//
+// To force a waiter to actually exist (rather than caller B becoming
+// a fresh populator-caller for a completed digest), we use a
+// `GatedSlowStore` that blocks the producer task in `slow.get_part`
+// until the test releases it. While the producer is blocked, the
+// streaming-buffer entry is registered in `populating_digests`, so the
+// second caller deterministically arrives as a waiter.
+//
+// Mutation step: in `fast_slow_store.rs` waiter-path, comment out the
+// `.streaming_buffer_reader_fallback_to_direct_waiter_total
+// .fetch_add(1, ...)` line. This test must red-fail with the bespoke
+// "waiter must fall back" message.
+// -------------------------------------------------------------------------
+#[serial(failpoints)]
+#[nativelink_test]
+async fn d1_waiter_path_falls_back_on_sliding_window_eviction() -> Result<(), Error> {
+    // Build a FastSlowStore around a GatedSlowStore so we can hold the
+    // producer task open while caller B arrives as a waiter.
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let inner_slow = MemoryStore::new(&MemorySpec::default());
+    let gated = Arc::new(GatedSlowStore::new(inner_slow.clone()));
+    let release = gated.release_get_part.clone();
+    let arrived = gated.get_part_arrived.clone();
+    let slow_store = Store::new(gated);
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast_store.clone(),
+        slow_store.clone(),
+    );
+    let store = Store::new(fss.clone());
+
+    let data = Bytes::from(vec![0xAAu8; 4096]);
+    let digest = DigestInfo::try_new(VALID_HASH, 4096).unwrap();
+
+    // Stage data into the inner MemoryStore (NOT through the gated
+    // wrapper) so when we eventually release the gate, the inner
+    // get_part returns the bytes. The gate only blocks the wrapper's
+    // get_part call, not the staging update.
+    inner_slow
+        .clone()
+        .update_oneshot(digest, data.clone())
+        .await
+        .err_tip(|| "setup: writing to inner slow store")?;
+
+    let metric_pop_before = fss.streaming_buffer_reader_fallback_to_direct_total();
+    let metric_waiter_before = fss.streaming_buffer_reader_fallback_to_direct_waiter_total();
+
+    // Failpoint ON before either caller starts so both readers' first
+    // `next_chunk()` call trips the synthetic sliding-window-eviction
+    // error. Caller A (populator-caller) → populator-path; caller B
+    // (waiter) → waiter-path.
+    fail::cfg("streaming_blob_next_chunk_fail", "return").unwrap();
+
+    // Caller A: spawn so it owns its task. The producer task it spawns
+    // calls `slow_store.get_part`, which is gated — so the
+    // populating_digests entry stays alive until we release.
+    let store_a = store.clone();
+    let task_a = tokio::spawn(async move {
+        store_a.get_part_unchunked(digest, 0, None).await
+    });
+
+    // Wait until the producer task has reached `slow.get_part` (its
+    // entry is now registered in populating_digests AND the producer is
+    // blocked on `release_get_part.notified()`). At this point caller A
+    // is the populator-caller; any concurrent caller for the same digest
+    // arriving NOW will be a waiter.
+    tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+        .await
+        .expect(
+            "GatedSlowStore.get_part never reached — producer didn't \
+             enter the slow store within 5s; test setup wedged",
+        );
+
+    // Caller B: now arrives. spawn_populate_producer_with_role finds an
+    // existing entry → returns is_populator_caller=false → caller B is
+    // a WAITER. Both A and B's readers will call `next_chunk()` on the
+    // streaming buffer; the failpoint trips on both.
+    let store_b = store.clone();
+    let task_b = tokio::spawn(async move {
+        store_b.get_part_unchunked(digest, 0, None).await
+    });
+
+    // Brief grace for caller B to attach its reader before we unblock
+    // the producer. Without this, caller B might still be inside
+    // `populate_and_maybe_stream` setup when the producer exits and
+    // cleans up populating_digests — producing a fresh populator-caller
+    // path instead of the waiter path. Yield-loop with explicit timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && !task_b.is_finished() {
+        tokio::task::yield_now().await;
+        // 200µs sleep is the established yield-fairness primitive for
+        // tests (see chunked_filesystem_serialization_test). Not used
+        // as synchronization — we have a deadline + finish-check.
+        // TODO(D.1) replace with Notify hook on waiter attach if a
+        // future refactor exposes one.
+        if !task_b.is_finished() {
+            // Brief yield to let task_b's spawn_populate_producer_with_role
+            // run; we don't sleep on the wall clock.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Release the producer. The gate-released slow.get_part returns the
+    // bytes; the producer pumps them into the streaming buffer; both
+    // readers' `next_chunk()` calls fire the failpoint and fall back to
+    // direct slow-store reads (which are NOT gated for caller A nor B
+    // since they call `slow_store.get_part` directly via the splice,
+    // NOT through the producer task).
+    //
+    // Note: the splice fallback also goes through `slow_store.get_part`
+    // (the GatedSlowStore wrapper), so the splice ITSELF is also gated.
+    // Release multiple times so each caller's splice + producer can
+    // proceed. The gate fires once per `notify_one` — we'll need 3
+    // notifies (1 for producer, 1 for caller A's splice, 1 for caller B's
+    // splice). Use `notify_waiters` to release ALL waiting receivers.
+    release.notify_waiters();
+    // Drain in case more arrive after notify_waiters fires.
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+        release.notify_waiters();
+    }
+
+    let res_a = tokio::time::timeout(Duration::from_secs(10), task_a)
+        .await
+        .expect("caller A must complete within 10s")
+        .expect("caller A task must not panic");
+    let res_b = tokio::time::timeout(Duration::from_secs(10), task_b)
+        .await
+        .expect("caller B must complete within 10s")
+        .expect("caller B task must not panic");
+
+    fail::cfg("streaming_blob_next_chunk_fail", "off").unwrap();
+
+    let bytes_a = res_a.expect(
+        "caller A (populator-caller) must deliver full blob via D.1 \
+         splice — populator-path D.1 contract violated",
+    );
+    let bytes_b = res_b.expect(
+        "waiter must fall back to direct slow-store on sliding-window \
+         eviction — D.1 contract violated for waiter path",
+    );
+
+    assert_eq!(bytes_a.len(), 4096, "caller A bytes length mismatch");
+    assert_eq!(bytes_b.len(), 4096, "caller B bytes length mismatch");
+    assert_eq!(bytes_a, data, "caller A bytes mismatch original");
+    assert_eq!(bytes_b, data, "caller B bytes mismatch original");
+
+    let metric_pop_after = fss.streaming_buffer_reader_fallback_to_direct_total();
+    let metric_waiter_after = fss.streaming_buffer_reader_fallback_to_direct_waiter_total();
+
+    // Populator-path metric must increment exactly once for caller A.
+    assert_eq!(
+        metric_pop_after - metric_pop_before,
+        1,
+        "populator-caller metric must increment exactly once for caller A; \
+         got delta = {} (metric split is broken if this fails)",
+        metric_pop_after - metric_pop_before
+    );
+
+    // The KEY assertion: waiter-path metric must increment for caller B.
+    // Without the metric split this would be ambiguous; with the split
+    // (Fix 4 production change), the waiter-path increment is observable
+    // independently.
+    assert_eq!(
+        metric_waiter_after - metric_waiter_before,
+        1,
+        "waiter must fall back to direct slow-store on sliding-window \
+         eviction — D.1 contract violated for waiter path; got waiter \
+         metric delta = {} (expected 1)",
+        metric_waiter_after - metric_waiter_before,
     );
 
     Ok(())

@@ -1296,15 +1296,29 @@ impl FastSlowStore {
             .load(Ordering::Acquire)
     }
 
-    /// #325 (option D.1) diagnostic / test counter: every per-reader
-    /// fallback-to-direct-slow-store splice (triggered by `Code::Unavailable:
-    /// reader fell behind sliding window`) increments this. Used by the
-    /// regression suite (`fast_slow_store_325_*`) to assert the under- and
-    /// over-action contracts.
+    /// #325 (option D.1) diagnostic / test counter: every populator-caller
+    /// per-reader fallback-to-direct-slow-store splice (triggered by
+    /// `Code::Unavailable: reader fell behind sliding window`) increments
+    /// this. Used by the regression suite (`fast_slow_store_325_*`) to
+    /// assert the populator-caller path fired (NOT the waiter path —
+    /// see `streaming_buffer_reader_fallback_to_direct_waiter_total`).
     #[doc(hidden)]
     pub fn streaming_buffer_reader_fallback_to_direct_total(&self) -> u64 {
         self.metrics
             .streaming_buffer_reader_fallback_to_direct_total
+            .load(Ordering::Acquire)
+    }
+
+    /// #325 (option D.1) diagnostic / test counter for the WAITER path
+    /// (non-populator-caller readers). Symmetric with
+    /// `streaming_buffer_reader_fallback_to_direct_total` but only
+    /// increments when the failure occurs on a waiter's reader.
+    /// Used by the regression suite to distinguish which caller-class
+    /// path actually fired without ambiguity from a single shared metric.
+    #[doc(hidden)]
+    pub fn streaming_buffer_reader_fallback_to_direct_waiter_total(&self) -> u64 {
+        self.metrics
+            .streaming_buffer_reader_fallback_to_direct_waiter_total
             .load(Ordering::Acquire)
     }
 
@@ -5210,7 +5224,7 @@ impl StoreDriver for FastSlowStore {
                             .any(|m| m.contains(SLIDING_WINDOW_EVICTION_MARKER));
                     if is_sliding_window_eviction {
                         self.metrics
-                            .streaming_buffer_reader_fallback_to_direct_total
+                            .streaming_buffer_reader_fallback_to_direct_waiter_total
                             .fetch_add(1, Ordering::Relaxed);
                         info!(
                             ?key,
@@ -5482,9 +5496,10 @@ struct FastSlowStoreMetrics {
     /// MemoryStoreAtCapacity) does NOT bump this counter.
     #[metric(help = "Count of populates that skipped fast-tier cache-tee due to MemoryStoreAtCapacity")]
     cache_tee_disabled_at_cap_count: AtomicU64,
-    /// #325 (option D.1): per-reader fallback to a fresh
-    /// `slow_store.get_part` triggered by `Code::Unavailable: reader fell
-    /// behind sliding window`. The producer keeps sliding-window
+    /// #325 (option D.1) populator-caller path: per-reader fallback to a
+    /// fresh `slow_store.get_part` triggered by `Code::Unavailable: reader
+    /// fell behind sliding window` on the populator-caller's
+    /// `StreamingBlobReader`. The producer keeps sliding-window
     /// `streaming_writer.send` semantics (never paced, never gated, buffer
     /// keeps eviction-on-full); only the SLOW reader splices in a direct
     /// slow-store stream at its cursor. Other readers + producer
@@ -5492,11 +5507,25 @@ struct FastSlowStoreMetrics {
     /// fallback fires — sustained nonzero rate-of-change signals a
     /// producer-faster-than-consumer regime worth investigating
     /// (slow gRPC egress / VerifyStore re-hashing latency / etc.).
-    /// Counted across BOTH the populator-caller and waiter paths when the
-    /// `next_chunk()` failure is the sliding-window eviction (narrow
-    /// predicate; not bumped on other producer errors).
-    #[metric(help = "Count of streaming-buffer readers that fell behind the sliding window and spliced into a fresh slow-store read")]
+    /// Bumped only on the populator-caller's path; the symmetric waiter-
+    /// path counter is `streaming_buffer_reader_fallback_to_direct_waiter_total`.
+    /// Splitting populator vs waiter makes the per-caller-class fallback
+    /// rate independently observable AND lets the regression suite
+    /// distinguish which code-path actually fired.
+    #[metric(help = "Count of streaming-buffer populator-caller readers that fell behind the sliding window and spliced into a fresh slow-store read")]
     streaming_buffer_reader_fallback_to_direct_total: AtomicU64,
+    /// #325 (option D.1) waiter path: same semantics as
+    /// `streaming_buffer_reader_fallback_to_direct_total` but bumped only
+    /// when the failure occurs on a non-populator (waiter) reader.
+    /// Operator visibility into the asymmetric exposure of the fallback
+    /// across the two caller-class paths — a dramatic skew (e.g. waiters
+    /// fall back 10× more often than populator-callers) signals an
+    /// asymmetric producer/consumer pacing regime worth investigating.
+    /// Asserts the waiter-path fired in the regression suite without
+    /// risking a populator-caller-bump-only test passing on a regression
+    /// that breaks the waiter path.
+    #[metric(help = "Count of streaming-buffer waiter (non-populator) readers that fell behind the sliding window and spliced into a fresh slow-store read")]
+    streaming_buffer_reader_fallback_to_direct_waiter_total: AtomicU64,
 }
 
 impl Drop for FastSlowStore {
