@@ -2488,8 +2488,25 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     let actions_notify = actions_notify.clone();
                     let shutdown_future = async move {
                         // Wait for in-flight operations to be fully completed.
-                        while actions_in_flight.load(Ordering::Acquire) > 0 {
-                            actions_notify.notified().await;
+                        // #95: subscribe-before-predicate. Construct the
+                        // `notified()` future and arm it via `enable()`
+                        // BEFORE loading `actions_in_flight`. Any decrement
+                        // (and accompanying `notify_one()` from the
+                        // running-action completion sites at line ~2455
+                        // and ~2464) issued from this point on is
+                        // captured by the pre-armed Notified, even if it
+                        // fires between the load and the await. Same
+                        // shape as the cleanup_wait_notify reference in
+                        // running_actions_manager.rs (~line 5720-5759)
+                        // and #92.
+                        loop {
+                            let notified = actions_notify.notified();
+                            tokio::pin!(notified);
+                            notified.as_mut().enable();
+                            if actions_in_flight.load(Ordering::Acquire) == 0 {
+                                break;
+                            }
+                            notified.as_mut().await;
                         }
                         // Sending this message immediately evicts all jobs from
                         // this worker, of which there should be none.
@@ -3680,5 +3697,82 @@ mod tests {
             endpoint.ends_with(":40081"),
             "Expected endpoint to end with ':40081', got: {endpoint}"
         );
+    }
+}
+
+#[cfg(test)]
+mod actions_notify_subscribe_before_predicate_tests {
+    //! Regression test for #95: lost-wakeup window in the
+    //! shutdown-drain loop in the worker loop body
+    //! (`local_worker.rs` near line 2491-2493).
+    //!
+    //! The pre-fix loop loaded `actions_in_flight` and then awaited
+    //! `actions_notify.notified()`. Subscribe-after-predicate has the
+    //! standard lost-wakeup race: a producer fired between the load
+    //! and the await would be missed.
+    //!
+    //! The producer (running-action completion sites) uses
+    //! `notify_one()` which DOES store one permit, so today's
+    //! immediate symptom is at-most-one-extra loop iteration during
+    //! shutdown drain rather than a hard deadlock. This test
+    //! documents the contract — defense-in-depth for any future
+    //! producer change toward broadcast-style `notify_waiters`. Same
+    //! shape and rationale as the cleanup_wait_notify_parity_tests
+    //! reference in `running_actions_manager.rs:5715-5807` and the
+    //! `fetched_notify_subscribe_before_predicate_tests` for #92.
+    //!
+    //! NOTE on test discipline (CLAUDE.md
+    //! `feedback_lost_wakeup_test_theatre`): we use a
+    //! `tokio::sync::Barrier` for deterministic ordering and a
+    //! `tokio::time::timeout` deadlock detector — NEVER `sleep` as
+    //! synchronization.
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use tokio::sync::{Barrier, Notify};
+
+    /// Subscribe-before-predicate (the fix at #95): the Notified
+    /// future is constructed BEFORE the predicate window, so a
+    /// `notify_waiters` issued during that window is delivered. With
+    /// the contract violated (subscribe AFTER predicate), the
+    /// `notify_waiters` evaporates and the await blocks forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_before_predicate_captures_wakeup() {
+        let notify = Arc::new(Notify::new());
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Producer: wait at the barrier, then fire notify_waiters().
+        // notify_waiters() does NOT store a permit — it only wakes
+        // waiters currently registered.
+        let prod_notify = notify.clone();
+        let prod_barrier = barrier.clone();
+        tokio::spawn(async move {
+            prod_barrier.wait().await;
+            prod_notify.notify_waiters();
+        });
+
+        // Consumer mirrors the production loop body shape (#95 fix):
+        // subscribe FIRST, enable, then enter the predicate window.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // Predicate window: release the producer to fire its
+        // notify_waiters(). The barrier acts as a happens-before
+        // synchronization point: the producer's notify is emitted
+        // strictly after this point, while we are still in the
+        // predicate window — strictly before we reach the await
+        // below.
+        barrier.wait().await;
+
+        // Await: the pre-enabled Notified must observe the wakeup
+        // issued during the predicate window. 2s real-wall-clock is
+        // a deadlock detector, NOT synchronization.
+        tokio::time::timeout(Duration::from_secs(2), notified.as_mut())
+            .await
+            .expect(
+                "lost-wakeup race — must subscribe before predicate (#95): \
+                 notify_waiters() fired during the predicate window was lost",
+            );
     }
 }
