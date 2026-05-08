@@ -29,6 +29,13 @@
 //!    real `RedisStore` MUST drop its cached positive within a few seconds
 //!    when Redis evicts the key under `maxmemory` pressure. This is the
 //!    canonical #100 test — the very bug the dispatcher exists to fix.
+//! 5. (Fix-up regression for BLOCKER 3) DEL of a non-digest-shaped key
+//!    inside our prefix (e.g. an admin `DEL cas:debug-foo`) MUST NOT
+//!    propagate to any registered `ItemCallback`. The dispatcher drops
+//!    non-digest payloads in `parse_keyspace_payload`. Without the filter
+//!    we'd dispatch `StoreKey::Str(...)` whose blake3-hashed digest never
+//!    matches any cache entry — pure noise plus a cross-tenant info leak
+//!    on shared Redis.
 //!
 //! Gated behind the `redis-integration-tests` Cargo feature so the default
 //! test invocation on dev boxes without `valkey-server` still passes. CI
@@ -344,9 +351,15 @@ async fn foreign_prefix_does_not_fire_callback() -> Result<(), Error> {
     // a DEL on our prefix that the dispatcher MUST report. If the
     // foreign-prefix event were going to fire, it would arrive before
     // (or alongside) the positive control.
-    let positive = "cas:positive-control";
-    let _: () = client.set(positive, "v").await.expect("set");
-    let _: i64 = client.del(positive).await.expect("del");
+    //
+    // The positive control MUST be digest-shaped: per BLOCKER 3 fix,
+    // `parse_keyspace_payload` only forwards `StoreKey::Digest` to callbacks
+    // (non-digest payloads are dropped at the parser to avoid foreign-tenant
+    // info leaks and Str-vs-Digest hash-bucket misses).
+    let positive_digest = DigestInfo::try_new(TEST_HASH, 999).unwrap();
+    let positive = format!("cas:{positive_digest}");
+    let _: () = client.set(&positive, "v").await.expect("set");
+    let _: i64 = client.del(&positive).await.expect("del");
     // wait for the positive control to land
     let cb_ref = cb.clone();
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -355,7 +368,7 @@ async fn foreign_prefix_does_not_fire_callback() -> Result<(), Error> {
                 .received
                 .lock()
                 .iter()
-                .any(|k| matches!(k, StoreKey::Str(s) if s.as_ref() == "positive-control"))
+                .any(|k| matches!(k, StoreKey::Digest(d) if *d == positive_digest))
             {
                 return;
             }
@@ -582,6 +595,117 @@ async fn existence_cache_drops_positive_after_redis_eviction() -> Result<(), Err
     .await
     .expect(
         "must not deadlock — ExistenceCacheStore retained stale positive after Redis eviction",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Spec test 5 (BLOCKER 3 fix-up regression): non-digest-shaped key under our
+// prefix MUST NOT propagate to ItemCallbacks.
+//
+// The pre-fix `parse_keyspace_payload` returned `StoreKey::Str(...)` as a
+// fallback for any non-digest body. Downstream `ExistenceCacheStore::callback`
+// calls `into_digest()` which blake3-hashes the bytes — the resulting
+// synthetic digest never matches anything actually inserted (cache inserts go
+// through `From<DigestInfo>`), so the callback churns CPU + log spam + leaks
+// foreign-tenant key bytes into our boundary, all for a guaranteed no-op
+// remove.
+//
+// Mutation step: revert `parse_keyspace_payload` to the old fall-through-to-Str
+// behavior; this test must FAIL (CapturingCallback receives the foreign key).
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn non_digest_key_under_prefix_does_not_fire_callback() -> Result<(), Error> {
+    let (port, _guard) = spawn_server(&[]).await;
+    let store = RedisStore::new_standard(make_spec(port, "cas:"))
+        .await
+        .expect("store");
+
+    let (cb, _notify) = CapturingCallback::new();
+    store
+        .clone()
+        .register_item_callback(cb.clone())
+        .expect("register");
+    wait_until_subscribed(port, 3, Duration::from_secs(3)).await;
+
+    // Issue a DEL on a non-digest-shaped key INSIDE the prefix the dispatcher
+    // is listening for. Pre-fix: dispatcher would forward it as
+    // `StoreKey::Str("debug-foo")`. Post-fix: dropped at the parser.
+    let mut client = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+        .expect("client")
+        .get_connection_manager()
+        .await
+        .expect("conn");
+    use redis::AsyncCommands;
+    let _: () = client.set("cas:debug-foo", "v").await.expect("set");
+    let _: i64 = client.del("cas:debug-foo").await.expect("del");
+
+    // Drain any in-flight notifications by issuing a positive control —
+    // a digest-shaped DEL on our prefix that the dispatcher MUST report.
+    let digest = DigestInfo::try_new(TEST_HASH, 9).unwrap();
+    let positive = format!("cas:{digest}");
+    let _: () = client.set(&positive, "v").await.expect("set");
+    let _: i64 = client.del(&positive).await.expect("del");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if cb
+                .received
+                .lock()
+                .iter()
+                .any(|k| matches!(k, StoreKey::Digest(d) if *d == digest))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("positive control did not fire");
+
+    // Now assert the non-digest event is NOT in the captured set.
+    let captured = cb.received.lock();
+    assert!(
+        captured
+            .iter()
+            .all(|k| !matches!(k, StoreKey::Str(s) if s.as_ref() == "debug-foo")),
+        "non-digest key under prefix dispatched StoreKey::Str — \
+         parse_keyspace_payload filter regressed: {captured:?}"
+    );
+    // Belt-and-suspenders: the captured set should contain ONLY the positive
+    // control digest. No Str variants at all.
+    assert!(
+        captured.iter().all(|k| matches!(k, StoreKey::Digest(_))),
+        "non-Digest variant leaked into dispatch: {captured:?}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Spec test 6 (BLOCKER 5 fix-up regression): startup-check refuses the
+// keyspace-dispatcher + scheduler-subscription collision.
+//
+// Both consumers want the single Redis push-sender channel. Whichever wins
+// the `take()` race silently disables the other. `set_spec_defaults` rejects
+// the combination at construction so the operator sees the conflict at
+// deploy time, not as silent stale-positive caching after a race.
+//
+// Mutation step: comment out the `experimental_pub_sub_channel.is_some()`
+// branch in `set_spec_defaults`; this test must FAIL (no Err returned).
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn keyspace_and_scheduler_collision_refused_at_construction() -> Result<(), Error> {
+    let (port, _guard) = spawn_server(&[]).await;
+    let mut spec = make_spec(port, "cas:");
+    spec.experimental_pub_sub_channel = Some("scheduler-channel".to_string());
+    // Both `enable_keyspace_notifications=true` (default in make_spec) and
+    // `experimental_pub_sub_channel=Some(...)` set ⇒ collision.
+    let err = RedisStore::new_standard(spec)
+        .await
+        .expect_err("expected collision rejection");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("mutually exclusive") || msg.contains("subscriber_channel"),
+        "expected collision rejection error, got: {msg}"
     );
     Ok(())
 }

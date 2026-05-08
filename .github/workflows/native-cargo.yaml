@@ -99,5 +99,22 @@ jobs:
         # the production code path with a tiny `max_buffer_bytes`).
         # Stays under the default `cargo test --all` step above.
 
+      - name: Install valkey-server (Linux only, for redis-integration-tests)
+        # The redis-integration-tests feature spawns a real `valkey-server` /
+        # `redis-server` subprocess to exercise the keyspace-notification
+        # dispatch path end-to-end (CONFIG SET notify-keyspace-events +
+        # PSUBSCRIBE __keyevent@<db>__:* + DEL/PEXPIRE/maxmemory-LRU). Without
+        # the binary on $PATH the test bin panics with a clear message — that
+        # is intentional (silent skip = no coverage = bug ships invisibly).
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valkey-server || \
+          sudo apt-get install -y --no-install-recommends redis-server
+
+      - name: Test redis keyspace dispatch (redis-integration-tests, Linux only)
+        if: runner.os == 'Linux'
+        run: cargo test -p nativelink-store --features redis-integration-tests --test redis_store_notification_test
+
       - name: Check schema export
         run: cargo run --bin build-schema --features dev-schema --package nativelink-config

@@ -301,6 +301,14 @@ where
     /// Configure the connection to have a psubscribe on it and perform the
     /// subscription on reconnect.
     fn psubscribe(&self, pattern: &str) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Record the `notify-keyspace-events` flag set the keyspace dispatcher
+    /// requires. Implementations re-apply the set to the subscriber-slot
+    /// connection on every reconnect so a Redis/Valkey restart that reverts
+    /// the in-memory CONFIG does not silently disable the dispatcher. No-op
+    /// for cluster mode (cluster-mode keyspace notifications are documented
+    /// as undefined and the store force-disables them).
+    fn set_keyspace_events_flags(&self, flags: String);
 }
 
 #[derive(Debug)]
@@ -357,6 +365,11 @@ where
         // This is a no-op for cluster connections.
         future::ready(Ok(()))
     }
+
+    fn set_keyspace_events_flags(&self, _flags: String) {
+        // No-op: keyspace notifications are force-disabled for cluster mode
+        // (semantics undefined per Redis docs); see `RedisStore::new_cluster`.
+    }
 }
 
 type RedisConnectFuture<C> = dyn Future<Output = Result<C, Error>> + Send;
@@ -396,6 +409,15 @@ where
     /// A list of subscriptions that should be performed on reconnect of the
     /// subscriber slot.
     subscriptions: Mutex<HashSet<String>>,
+
+    /// `notify-keyspace-events` flag set required for the keyspace dispatcher
+    /// to function. When `Some`, every reconnect of the subscriber slot
+    /// re-issues `CONFIG SET notify-keyspace-events <flags>` BEFORE replaying
+    /// `PSUBSCRIBE`. This closes the silent-degradation hole where a Valkey
+    /// restart reverts the in-memory CONFIG to whatever `valkey.conf` says
+    /// (typically empty) — without this re-issue the dispatcher runs
+    /// against a server that emits no keyevent traffic.
+    keyspace_events_flags: Mutex<Option<String>>,
 }
 
 impl<C> Debug for StandardRedisManager<C>
@@ -448,6 +470,7 @@ where
             connections,
             next_slot: AtomicUsize::new(0),
             subscriptions: Mutex::new(HashSet::new()),
+            keyspace_events_flags: Mutex::new(None),
         };
         // Configure (script preload) per slot. Sequential is fine here — the
         // dials are done; this is just sending one SCRIPT LOAD per slot.
@@ -546,6 +569,15 @@ where
     /// to the supplied async callback. Same structural invariant as
     /// `psubscribe_with`: only [`SUBSCRIBER_SLOT`]'s reconnect path
     /// re-applies subscriptions; all other slots never carry pubsub.
+    ///
+    /// When `keyspace_events_flags` is `Some(flags)` (set via
+    /// [`Self::set_keyspace_events_flags`]) the subscriber slot ALSO has
+    /// `CONFIG SET notify-keyspace-events <flags>` re-issued before the
+    /// `PSUBSCRIBE` replay. This is mandatory because Redis `CONFIG SET`
+    /// mutates the LIVE in-memory config only; a Valkey restart reverts to
+    /// `valkey.conf` (typically empty), so without re-issue the dispatcher
+    /// runs against a server that emits no keyevent traffic — the very wedge
+    /// the keyspace dispatcher exists to close re-emerges silently.
     pub async fn reconnect_with<F>(
         &self,
         uuid: Uuid,
@@ -572,6 +604,20 @@ where
             // Only the subscriber slot needs subscriptions re-applied. Other
             // slots never carry pubsub traffic.
             if slot_idx == SUBSCRIBER_SLOT {
+                let flags = self.keyspace_events_flags.lock().clone();
+                if let Some(flags) = flags {
+                    let _: () = redis::cmd("CONFIG")
+                        .arg("SET")
+                        .arg("notify-keyspace-events")
+                        .arg(&flags)
+                        .query_async(&mut connection_manager)
+                        .await
+                        .err_tip(|| {
+                            "CONFIG SET notify-keyspace-events on subscriber-slot reconnect \
+                             failed; the operator should persist the flags in valkey.conf so \
+                             reconnects do not depend on runtime ACL grants"
+                        })?;
+                }
                 let subscriptions = {
                     let guard = self.subscriptions.lock();
                     guard.iter().cloned().collect::<Vec<_>>()
@@ -586,6 +632,21 @@ where
         // Uuid no longer matches any slot — caller's connection was already
         // rotated by a prior reconnect. Hand back a fresh one via round-robin.
         self.get_connection_generic().await
+    }
+
+    /// Record the `notify-keyspace-events` flag set the keyspace dispatcher
+    /// requires. The set is re-applied to the subscriber slot on every
+    /// reconnect so a Valkey restart that reverts the in-memory CONFIG does
+    /// not silently disable the dispatcher.
+    ///
+    /// Set BEFORE the dispatcher psubscribes — once a reconnect interleaves
+    /// with the initial CONFIG SET, the racing reconnect could subscribe
+    /// before this flag is recorded, leaving us subscribed to a server with
+    /// no notifications enabled. Production callers
+    /// (`init_keyspace_dispatcher_eager`) call this immediately after the
+    /// initial CONFIG SET succeeds.
+    pub fn set_keyspace_events_flags(&self, flags: String) {
+        *self.keyspace_events_flags.lock() = Some(flags);
     }
 }
 
@@ -618,6 +679,13 @@ impl RedisManager<ConnectionManager> for StandardRedisManager<ConnectionManager>
             })
         })
         .await
+    }
+
+    fn set_keyspace_events_flags(&self, flags: String) {
+        // Delegate to the inherent method on `StandardRedisManager` so the
+        // trait method has the same effect regardless of how the caller
+        // holds the manager.
+        Self::set_keyspace_events_flags(self, flags);
     }
 }
 
@@ -671,7 +739,25 @@ where
     /// A manager for subscriptions to keys in Redis.
     subscription_manager: tokio::sync::OnceCell<Arc<RedisSubscriptionManager>>,
 
-    /// Channel for getting subscription messages
+    /// Channel for getting subscription messages.
+    ///
+    // UNBOUNDED-OK: Redis push events (`__keyevent@<db>__:{del,expired,evicted}`)
+    // arrive on the redis crate's `ConnectionManager` push channel and feed
+    // straight into `subscriber_channel`. Producer rate ceiling is the Valkey
+    // server's `notify-keyspace-events` emit rate; under sustained eviction
+    // storm a single Valkey instance dispatches O(10^4) events/sec at the
+    // upper bound. The consumer side — `run_keyspace_dispatcher` — drains
+    // this receiver in a tight `select!` loop and fan-outs to registered
+    // `ItemCallback`s in a `JoinSet` capped by the per-callback work
+    // (production CAS-side ECS callback `tokio::spawn`s a single `remove`
+    // per event, drained at >1M events/sec across the 16 EvictingMap shards
+    // per `feedback_blob_missing_investigation.md`). Worst-case queue depth =
+    // emit_rate × callback_latency × 1/drain_concurrency ≈ 10^4/s × 10ms /
+    // 16 = 6.25 entries steady-state; 1000× burst still ~ 6KB at one
+    // pointer-sized PushInfo per slot. Cannot be attacker-controlled: keys
+    // are NativeLink-prefixed under operator-supplied `key_prefix`, payload
+    // size capped at `KEYSPACE_PAYLOAD_MAX_LEN`. (See perf-optimizer M1
+    // analysis 2026-05-09 + DSR M2 + code-reviewer S1.)
     subscriber_channel: Mutex<Option<UnboundedReceiver<PushInfo>>>,
 
     /// Permits to limit inflight Redis requests. Technically only
@@ -695,13 +781,23 @@ where
 
     /// See [`RedisSpec::keyspace_notifications_db`]. Set at construction;
     /// determines the `__keyevent@<db>__:*` channel pattern.
-    keyspace_notifications_db: i64,
+    keyspace_notifications_db: u8,
 
     /// Sender into the keyspace dispatcher task. Initialized lazily on the
     /// first successful `register_item_callback`. The dispatcher task owns
     /// the `subscriber_channel`, the corresponding receiver, and the
     /// `Vec<Arc<dyn ItemCallback>>` of registered listeners; it exits when
     /// this sender (and any clones) drop.
+    ///
+    // UNBOUNDED-OK: producer side is `register_item_callback`, called once
+    // per wrapper at construction time (current production: a single
+    // `ExistenceCacheStore::new_with_time` per `RedisStore`). Cannot be
+    // attacker-controlled: the only callers in the workspace are
+    // wrapper-store constructors invoked from server bootstrap; an external
+    // RPC has no path to `register_item_callback`. Steady-state queue depth
+    // is 0–1 (one push at construction, drained immediately into
+    // `callbacks: Vec<...>` in `run_keyspace_dispatcher`'s select loop).
+    // (See code-reviewer S1 + DSR M2.)
     keyspace_dispatcher_tx: tokio::sync::OnceCell<UnboundedSender<Arc<dyn ItemCallback>>>,
 
     /// Counter: total keyevent payloads dispatched to the callback list.
@@ -713,6 +809,15 @@ where
     /// [`KEYSPACE_PAYLOAD_MAX_LEN`]. Observable via metrics.
     #[metric(help = "Redis keyevent payloads dropped for exceeding the size cap")]
     keyspace_payload_too_long_dropped: AtomicU64,
+
+    /// Counter: total `register_item_callback` successes. Used by the
+    /// inert-dispatcher 60s startup warn (see `init_keyspace_dispatcher_eager`):
+    /// when `enable_keyspace_notifications=true` but this counter is still 0
+    /// at +60s, the dispatcher is firing notifications into a void and the
+    /// operator gets a `warn!` so they can either disable keyspace
+    /// notifications or wire up the wrapper that forgot to register.
+    #[metric(help = "Total successful register_item_callback calls")]
+    callbacks_registered_total: AtomicU64,
 }
 
 impl<C, M> Debug for RedisStore<C, M>
@@ -790,7 +895,7 @@ where
         subscriber_channel: UnboundedReceiver<PushInfo>,
         connection_manager: M,
         enable_keyspace_notifications: bool,
-        keyspace_notifications_db: i64,
+        keyspace_notifications_db: u8,
     ) -> Result<Self, Error> {
         info!("Redis index fingerprint: {FINGERPRINT_CREATE_INDEX_HEX}");
 
@@ -813,6 +918,7 @@ where
             keyspace_dispatcher_tx: tokio::sync::OnceCell::new(),
             keyspace_events_dispatched: AtomicU64::new(0),
             keyspace_payload_too_long_dropped: AtomicU64::new(0),
+            callbacks_registered_total: AtomicU64::new(0),
         })
     }
 
@@ -908,6 +1014,72 @@ where
         if spec.retry.max_retries == 0 {
             spec.retry.max_retries = 1;
         }
+
+        if spec.enable_keyspace_notifications {
+            // BLOCKER 5: a single `subscriber_channel` slot cannot serve both
+            // `SchedulerSubscriptionManager` and the keyspace dispatcher.
+            // Refuse the combination at construction time so the operator
+            // sees the conflict at deploy, not as silent stale-positive
+            // caching after a race lands the wrong consumer first.
+            if spec.experimental_pub_sub_channel.is_some() {
+                return Err(make_err!(
+                    Code::FailedPrecondition,
+                    "RedisSpec: enable_keyspace_notifications=true and \
+                     experimental_pub_sub_channel are mutually exclusive — both consumers want \
+                     the single Redis push-sender channel and only one can win. Split into two \
+                     RedisSpec entries (one for the scheduler, one for the keyspace-callback \
+                     RedisStore) or set enable_keyspace_notifications=false on the scheduler \
+                     RedisStore."
+                ));
+            }
+
+            // Hardening: validate the configured `keyspace_notifications_db`
+            // against the database embedded in the connection URL. A typo
+            // (`redis://server/3` vs `keyspace_notifications_db: 0`) would
+            // otherwise leave the dispatcher subscribed to the wrong db with
+            // no observable signal — silent stale-positive cache returns.
+            // We only check the first address; multi-address standard mode is
+            // rejected separately by `new_standard`.
+            let url_str = &spec.addresses[0];
+            let trimmed = url_str
+                .replace("redis+sentinel://", "redis://");
+            // Use Url::parse for robust URL parsing rather than substring
+            // hacks; avoids false positives on usernames/passwords with `/`.
+            if let Ok(parsed) = Url::parse(&trimmed) {
+                let url_db: Option<u8> = parsed
+                    .path_segments()
+                    .and_then(|mut segs| segs.next())
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| s.parse::<u8>().ok());
+                if let Some(url_db) = url_db
+                    && url_db != spec.keyspace_notifications_db
+                {
+                    return Err(make_err!(
+                        Code::FailedPrecondition,
+                        "RedisSpec: connection URL specifies db={url_db} but \
+                         keyspace_notifications_db={configured}. Either match them or omit \
+                         the db from the URL. Mismatch silently subscribes to the wrong db \
+                         and disables stale-positive invalidation.",
+                        configured = spec.keyspace_notifications_db
+                    ));
+                }
+            }
+
+            // Hardening: empty `key_prefix` means `strip_prefix("")` matches
+            // every Redis key — the dispatcher would dispatch foreign-tenant
+            // DELs into our callback chain. Acceptable when the Redis is
+            // dedicated to NativeLink (single-tenant), but worth a startup
+            // warn so the operator sees the assumption explicitly.
+            if spec.key_prefix.is_empty() {
+                warn!(
+                    "RedisSpec: enable_keyspace_notifications=true with empty key_prefix; \
+                     foreign-tenant DEL/EXPIRE/EVICT events will be dispatched into \
+                     ItemCallback consumers. Set a non-empty key_prefix unless this Redis \
+                     instance is dedicated to NativeLink."
+                );
+            }
+        }
+
         trace!(?spec, "redis spec is after setting defaults");
         Ok(())
     }
@@ -950,11 +1122,21 @@ const REQUIRED_NOTIFY_FLAGS: &[char] = &['E', 'g', 'e', 'x'];
 /// Reverse of [`RedisStore::encode_key`] for keyspace-notification payloads.
 ///
 /// Strips `key_prefix`, then attempts to parse the remainder as
-/// `<hex>-<size_bytes>` into a [`StoreKey::Digest`]. Falls back to
-/// [`StoreKey::Str`] if the remainder is not digest-shaped (no hyphen,
-/// non-hex hash, or unparseable size).
+/// `<hex>-<size_bytes>` into a [`StoreKey::Digest`]. Returns `None` when the
+/// remainder is not digest-shaped — those payloads are dropped before reaching
+/// any registered `ItemCallback`.
 ///
-/// **Why this matters.** Wrapping caches like `ExistenceCacheStore` insert
+/// **Why digest-only.** The only `ItemCallback` consumer in this codebase is
+/// `ExistenceCacheStore`, whose `callback` calls `StoreKey::into_digest()` on
+/// whatever it receives. For a `StoreKey::Str` arrival the digest derived via
+/// blake3-of-bytes will never match anything actually inserted into the cache
+/// (cache inserts go through `From<DigestInfo>`), so the `remove` is a
+/// no-op. Worse, an admin tool issuing `DEL cas:debug-foo` (or any non-digest
+/// scheduler/index key under the same prefix) would dispatch a foreign string
+/// key into `info!`/`debug!` logs at our boundary — pure noise and a
+/// cross-tenant info-leak risk on shared Redis. Drop them at the parser.
+///
+/// **Why variant matters.** Wrapping caches like `ExistenceCacheStore` insert
 /// keys as `StoreKey::Digest` (because all CAS operations go through the
 /// `From<DigestInfo>` conversion). `StoreKey`'s `Hash` implementation salts
 /// by variant tag, so a `StoreKey::Str("abcd-0")` hashes to a different
@@ -969,15 +1151,10 @@ const REQUIRED_NOTIFY_FLAGS: &[char] = &['E', 'g', 'e', 'x'];
 /// the payload is enforced by the caller (see `KEYSPACE_PAYLOAD_MAX_LEN`).
 fn parse_keyspace_payload(payload: &str, key_prefix: &str) -> Option<StoreKey<'static>> {
     let stripped = payload.strip_prefix(key_prefix)?;
-    if let Some((hash, size)) = stripped.rsplit_once('-')
-        && let Ok(size_bytes) = size.parse::<u64>()
-        && let Ok(digest) = DigestInfo::try_new(hash, size_bytes)
-    {
-        return Some(StoreKey::Digest(digest));
-    }
-    // Non-digest keys (scheduler index entries, version markers, ...) are
-    // surfaced as `StoreKey::Str` so non-CAS subscribers can also invalidate.
-    Some(StoreKey::Str(Cow::Owned(stripped.to_string())))
+    let (hash, size) = stripped.rsplit_once('-')?;
+    let size_bytes = size.parse::<u64>().ok()?;
+    let digest = DigestInfo::try_new(hash, size_bytes).ok()?;
+    Some(StoreKey::Digest(digest))
 }
 
 impl<C, M> RedisStore<C, M>
@@ -985,47 +1162,41 @@ where
     C: ConnectionLike + Clone + Send + Sync + Unpin + 'static,
     M: RedisManager<C> + Unpin + Send + Sync + 'static,
 {
-    /// Initializes the keyspace-notification dispatcher exactly once.
+    /// Eagerly initializes the keyspace-notification dispatcher.
     ///
-    /// Returns:
-    /// - `Ok(sender)` containing the channel into the dispatcher task.
-    /// - `Err(_)` only when:
-    ///   - `enable_keyspace_notifications == false` and the caller would
-    ///     have expected callbacks to fire (so the operator notices that
-    ///     stale-positive invalidation is OFF), or
-    ///   - the underlying `CONFIG GET`/`CONFIG SET`/`PSUBSCRIBE` fails
-    ///     (e.g., ACL deny, command renamed).
+    /// **Must be called by `RedisStore::new_standard` immediately after
+    /// `Arc::new(self)`** so the dispatcher task can hold a `Weak<Self>`
+    /// for clean drop on store-drop. The result populates the
+    /// `keyspace_dispatcher_tx` `OnceCell` so subsequent
+    /// `register_item_callback` calls can dispatch synchronously.
     ///
-    /// On the latter the OnceCell is left empty so a later registration can
-    /// retry after the operator fixes the ACL.
-    async fn init_keyspace_dispatcher(
-        self: &Arc<Self>,
-    ) -> Result<&UnboundedSender<Arc<dyn ItemCallback>>, Error> {
+    /// This is the BLOCKER 1 fix from the 681ae250 reviewers: the previous
+    /// design ran CONFIG GET/SET + PSUBSCRIBE inside an async task spawned
+    /// from a synchronous `register_item_callback`, swallowing all failures
+    /// into a `warn!` that ECS could not observe. Eager init surfaces
+    /// ACL/RENAME-COMMAND/PSUBSCRIBE failures as `Err` from
+    /// `RedisStore::new_standard`, so the server fails to start instead of
+    /// silently running with stale-positive caching.
+    ///
+    /// Order of operations matters (BLOCKER 2): every fallible step runs
+    /// BEFORE the irrecoverable `subscriber_channel.take()`. Failure of
+    /// CONFIG SET or PSUBSCRIBE leaves the channel still in the slot so a
+    /// retry would not hit the misleading "already consumed by
+    /// SchedulerSubscriptionManager" error. With eager init at construction
+    /// the retry path is unreachable in practice (we never construct a half-
+    /// initialized store), but the order is preserved for defence in depth.
+    ///
+    /// On reconnect, `set_keyspace_events_flags` arms the manager so that
+    /// `CONFIG SET notify-keyspace-events <flags>` is re-issued before each
+    /// PSUBSCRIBE replay (BLOCKER 4) — without this a Valkey restart silently
+    /// disables the dispatcher.
+    async fn init_keyspace_dispatcher_eager(self: &Arc<Self>) -> Result<(), Error> {
         if !self.enable_keyspace_notifications {
-            return Err(make_err!(
-                Code::FailedPrecondition,
-                "RedisStore: enable_keyspace_notifications=false; ItemCallbacks will never \
-                 fire and wrapper caches such as ExistenceCacheStore will return stale-positive \
-                 results when keys are silently evicted. Set enable_keyspace_notifications=true \
-                 or remove the wrapper."
-            ));
+            // Nothing to do — `register_item_callback` will return Err and
+            // ECS construction will panic loudly. This is the desired
+            // BLOCKER 1 fail-fast shape for the disabled path.
+            return Ok(());
         }
-        self.keyspace_dispatcher_tx
-            .get_or_try_init(|| async { self.try_start_keyspace_dispatcher().await })
-            .await
-    }
-
-    async fn try_start_keyspace_dispatcher(
-        self: &Arc<Self>,
-    ) -> Result<UnboundedSender<Arc<dyn ItemCallback>>, Error> {
-        let subscriber_channel = self.subscriber_channel.lock().take().ok_or_else(|| {
-            make_err!(
-                Code::FailedPrecondition,
-                "RedisStore subscriber_channel already consumed by SchedulerSubscriptionManager; \
-                 keyspace dispatch and scheduler subscription cannot share a single RedisStore \
-                 instance — use separate stores."
-            )
-        })?;
 
         let mut client = self.get_client().await?;
         // CONFIG GET on RESP3 returns a map; on RESP2 a flat 2-element
@@ -1056,7 +1227,7 @@ where
             warn!(
                 previous = %existing,
                 new = %merged,
-                "RedisStore: mutating server notify-keyspace-events to enable ItemCallback dispatch"
+                "mutating server notify-keyspace-events to enable ItemCallback dispatch"
             );
             let _: () = redis::cmd("CONFIG")
                 .arg("SET")
@@ -1071,6 +1242,12 @@ where
         }
         drop(client);
 
+        // Arm the manager BEFORE the first PSUBSCRIBE so a reconnect that
+        // fires concurrently with this init still has the flags to apply.
+        // No-op on cluster mode (notifications force-disabled there).
+        self.connection_manager
+            .set_keyspace_events_flags(merged.clone());
+
         let db = self.keyspace_notifications_db;
         for event in ["del", "expired", "evicted"] {
             let pattern = format!("__keyevent@{db}__:{event}");
@@ -1079,6 +1256,22 @@ where
                 .await
                 .err_tip(|| format!("psubscribe {pattern} failed"))?;
         }
+
+        // BLOCKER 2 fix: take the subscriber channel ONLY after every fallible
+        // step has succeeded. If anything above failed we returned `Err` and
+        // the channel is still in `Mutex<Option<>>`. With eager init at
+        // construction this matters mainly as defence-in-depth — `set_spec_defaults`
+        // rejects the (keyspace + scheduler) sharing combo upstream.
+        let subscriber_channel = self.subscriber_channel.lock().take().ok_or_else(|| {
+            make_err!(
+                Code::FailedPrecondition,
+                "RedisStore subscriber_channel already consumed by SchedulerSubscriptionManager; \
+                 keyspace dispatch and scheduler subscription cannot share a single RedisStore \
+                 instance — use separate stores. (`set_spec_defaults` rejects this \
+                 configuration at construction; reaching this branch means a caller \
+                 bypassed `new_standard`.)"
+            )
+        })?;
 
         let (callback_tx, callback_rx) = unbounded_channel::<Arc<dyn ItemCallback>>();
         let weak_self = Arc::downgrade(self);
@@ -1097,7 +1290,57 @@ where
                 callback_rx,
             )
         );
-        Ok(callback_tx)
+
+        // Populate the OnceCell. `set` returns Err if it was already
+        // initialized — impossible here (we run exactly once at construction
+        // and have an exclusive Arc handle), but treat it as Internal if
+        // someone re-wires the call.
+        self.keyspace_dispatcher_tx
+            .set(callback_tx)
+            .map_err(|_| {
+                make_err!(
+                    Code::Internal,
+                    "init_keyspace_dispatcher_eager called twice; OnceCell already initialized"
+                )
+            })?;
+
+        // Inert-dispatcher 60s startup warn (red-team #3 from #100 cadre review).
+        // The dispatcher is now running and will fan-out PMessage events into
+        // a `Vec<Arc<dyn ItemCallback>>` that starts empty and grows only when
+        // wrapping stores call `register_item_callback` at THEIR construction.
+        // Production AC chain (FastSlowStore { fast: MemoryStore, slow:
+        // REDIS_AC_STORE }) currently has no `ExistenceCacheStore` caller, so
+        // this dispatcher would fire into the void with no operator signal.
+        // Wait one minute, then if the registration counter is still 0 emit a
+        // single `warn!` so the operator sees what is happening. Single-shot.
+        // Gated on `enable_keyspace_notifications=true` because the
+        // disabled-on-purpose path returned early at the top of this function
+        // and never started the dispatcher in the first place — but we keep
+        // the inner check as defence-in-depth in case the early-return is
+        // refactored.
+        if self.enable_keyspace_notifications {
+            let weak_for_warn = Arc::downgrade(self);
+            background_spawn!("redis_keyspace_inert_dispatcher_warn", async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let Some(store) = weak_for_warn.upgrade() else {
+                    // Store dropped within 60s of construction — nothing to
+                    // warn about; the dispatcher is on its way down anyway.
+                    return;
+                };
+                if store.callbacks_registered_total.load(Ordering::Relaxed) == 0 {
+                    warn!(
+                        target: "nativelink::redis_keyspace",
+                        "RedisStore keyspace dispatcher running but no ItemCallbacks registered \
+                         after 60s — keyspace notifications will be silently dropped. This is \
+                         correct for non-ECS-wrapped uses (e.g. AC-only stores not yet wrapped \
+                         in ExistenceCacheStore); verify intent. Set \
+                         enable_keyspace_notifications=false to disable, or wrap this RedisStore \
+                         in ExistenceCacheStore to register a callback."
+                    );
+                }
+            });
+        }
+        Ok(())
     }
 
     async fn run_keyspace_dispatcher(
@@ -1437,23 +1680,31 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
                 .err_tip(|| format!("connect-time psubscribe for pub_sub_channel {channel}"))?;
         }
 
-        Self::new_from_builder_and_parts(
-            pub_sub_channel,
-            || Uuid::new_v4().to_string(),
-            key_prefix,
-            read_chunk_size,
-            max_chunk_uploads_per_update,
-            scan_count,
-            max_client_permits,
-            max_count_per_cursor,
-            command_timeout * 2,
-            subscriber_channel,
-            manager,
-            enable_keyspace_notifications,
-            keyspace_notifications_db,
-        )
-        .await
-        .map(Arc::new)
+        let store = Arc::new(
+            Self::new_from_builder_and_parts(
+                pub_sub_channel,
+                || Uuid::new_v4().to_string(),
+                key_prefix,
+                read_chunk_size,
+                max_chunk_uploads_per_update,
+                scan_count,
+                max_client_permits,
+                max_count_per_cursor,
+                command_timeout * 2,
+                subscriber_channel,
+                manager,
+                enable_keyspace_notifications,
+                keyspace_notifications_db,
+            )
+            .await?,
+        );
+        // BLOCKER 1 fix: eager keyspace-dispatcher init at construction.
+        // Failure of CONFIG GET / CONFIG SET / PSUBSCRIBE here propagates as
+        // `Err` from `new_standard`, so the server fails to start with a
+        // clear error rather than silently running with stale-positive
+        // caching. No-op when `enable_keyspace_notifications=false`.
+        store.init_keyspace_dispatcher_eager().await?;
+        Ok(store)
     }
 }
 
@@ -2422,44 +2673,37 @@ where
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
-        // Fast path: dispatcher already running.
-        if let Some(tx) = self.keyspace_dispatcher_tx.get() {
-            return tx.send(callback).map_err(|_| {
-                make_err!(
-                    Code::Internal,
-                    "RedisStore keyspace dispatcher task has exited; ItemCallbacks cannot be registered"
-                )
-            });
-        }
-        // Slow path: dispatcher initialization is async (CONFIG SET +
-        // PSUBSCRIBE), but the trait method is sync. Capture the in-flight
-        // registration in a background task so the caller doesn't block.
-        // The OnceCell guarantees single-init even with concurrent callers.
-        //
-        // Why background_spawn (not spawn): wrapping caches like
-        // `ExistenceCacheStore` register their callback at startup and then
-        // drop the returned `JoinHandleDropGuard` immediately — `spawn!`
-        // would abort the init task before it ran.
-        let store = Arc::clone(&self);
-        background_spawn!("redis_keyspace_dispatch_init", async move {
-            match store.init_keyspace_dispatcher().await {
-                Ok(tx) => {
-                    if tx.send(callback).is_err() {
-                        warn!(
-                            "redis keyspace dispatcher exited before registration could complete"
-                        );
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "RedisStore: keyspace-notification dispatcher could not start; \
-                         ItemCallbacks will not fire. In production this disables \
-                         stale-cache invalidation for evicted keys"
-                    );
-                }
-            }
-        });
+        // The dispatcher is initialized eagerly during `RedisStore::new_standard`
+        // (BLOCKER 1 fix). Either it succeeded — and the OnceCell holds a
+        // sender ready to forward registrations — or `new_standard` itself
+        // returned `Err` and the server failed to start. Reaching this code
+        // with an empty OnceCell means `enable_keyspace_notifications=false`
+        // (the disabled-on-purpose path) and the caller is asking for
+        // invalidation that will never fire — surface that as an Err so
+        // wrappers like `ExistenceCacheStore::new_with_time` panic at
+        // construction rather than silently retain stale-positive entries.
+        let Some(tx) = self.keyspace_dispatcher_tx.get() else {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "RedisStore: enable_keyspace_notifications=false; ItemCallbacks will never fire \
+                 and wrapper caches such as ExistenceCacheStore would silently retain \
+                 stale-positive entries when keys are evicted. Set \
+                 enable_keyspace_notifications=true (and grant CONFIG ACLs) to use \
+                 invalidation, or remove the wrapper to acknowledge the trade-off."
+            ));
+        };
+        tx.send(callback).map_err(|_| {
+            make_err!(
+                Code::Internal,
+                "RedisStore keyspace dispatcher task has exited; ItemCallbacks cannot be \
+                 registered"
+            )
+        })?;
+        // Observable counter for the inert-dispatcher 60s startup warn (see
+        // `init_keyspace_dispatcher_eager`). Bump only on successful send so
+        // the warn correctly fires when every registration attempt failed.
+        self.callbacks_registered_total
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 

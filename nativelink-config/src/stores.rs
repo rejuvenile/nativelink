@@ -1731,19 +1731,27 @@ pub struct RedisSpec {
     /// (`__keyevent@<db>__:{del,expired,evicted}`) and dispatch them to
     /// every `ItemCallback` registered via `register_item_callback`.
     ///
-    /// When `true`, on the first `register_item_callback` call the store
-    /// issues `CONFIG SET notify-keyspace-events <merged>` (merged with any
+    /// When `true`, `RedisStore::new_standard` eagerly issues `CONFIG GET`
+    /// + `CONFIG SET notify-keyspace-events <merged>` (merged with any
     /// operator-set flags so we never trample) and `PSUBSCRIBE
-    /// __keyevent@<db>__:{del,expired,evicted}`. When `false`, those
-    /// operations are skipped and registered callbacks will never fire —
-    /// wrapper caches such as `ExistenceCacheStore` will keep stale-positive
-    /// entries when keys are silently evicted under
-    /// `maxmemory-policy=allkeys-lru`.
+    /// __keyevent@<db>__:{del,expired,evicted}` at construction. When
+    /// `false`, those operations are skipped and `register_item_callback`
+    /// returns `Err` — wrappers such as `ExistenceCacheStore` panic at
+    /// construction rather than silently retain stale-positive entries
+    /// when keys are evicted under `maxmemory-policy=allkeys-lru`.
     ///
-    /// Set to `false` if the configured Redis user lacks `CONFIG` ACLs, the
-    /// `CONFIG` command has been renamed/disabled, or notifications are
-    /// configured out-of-band and you want NativeLink to skip the runtime
-    /// mutation.
+    /// Set to `false` ONLY if the configured Redis/Valkey user lacks the
+    /// `+config` ACL (a hardened-cluster default), the `CONFIG` command
+    /// has been renamed/disabled, or notifications are configured
+    /// out-of-band and you want NativeLink to skip the runtime mutation.
+    /// In that case the operator MUST also remove any `ExistenceCacheStore`
+    /// wrapping this `RedisStore` from the config; otherwise
+    /// `ExistenceCacheStore::new_with_time` panics at construction
+    /// because `register_item_callback` returns
+    /// `Code::FailedPrecondition` (and the panic propagates up the
+    /// production CAS chain `cas_INNER → SizePartitioning → FastSlow →
+    /// REDIS_CAS_SMALL_STORE`, putting the server into a systemd restart
+    /// loop).
     ///
     /// Default: `true`
     #[serde(default = "default_enable_keyspace_notifications")]
@@ -1754,9 +1762,15 @@ pub struct RedisSpec {
     /// pattern. Has no effect in cluster mode (cluster mode keyspace
     /// notification semantics are documented as undefined in Redis).
     ///
+    /// Must agree with the database embedded in the connection URL (the path
+    /// segment of `redis://host[/db]`). NativeLink rejects mismatches at
+    /// startup so an operator who sets `redis://server/3` but leaves this at
+    /// the default `0` cannot end up listening for keyevent notifications on
+    /// the wrong database (silent stale-positive cache).
+    ///
     /// Default: 0 (the standard Redis default db).
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
-    pub keyspace_notifications_db: i64,
+    pub keyspace_notifications_db: u8,
 }
 
 const fn default_enable_keyspace_notifications() -> bool {
