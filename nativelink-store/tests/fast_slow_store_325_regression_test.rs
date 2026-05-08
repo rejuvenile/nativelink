@@ -49,9 +49,11 @@ use nativelink_macro::nativelink_test;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::verify_store::VerifyStore;
+use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::store_trait::{Store, StoreLike, UploadSizeInfo};
 use serial_test::serial;
+use tokio::try_join;
 
 const VALID_HASH: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 
@@ -62,6 +64,35 @@ const VALID_HASH: &str = "0123456789abcdef00000000000000000001000000000000012345
 /// `digest_hasher.rs:53`.
 const SHA256_HASH_4096_42S: &str =
     "725bcd6c66d02acf6ebeab9c92410e010ea22e336876256aaf05a211f4ce1902";
+
+/// Insert `chunks` into `store` as separate `Bytes` sends so the slow
+/// tier (MemoryStore) preserves the chunk boundary on read. `update_oneshot`
+/// always sends a single chunk; this helper bypasses it so we can stage
+/// multi-chunk blobs needed by the splice-arithmetic test below (the
+/// failpoint must fire AFTER at least one chunk has been forwarded so
+/// `bytes_already_sent > 0` actually exercises the splice arithmetic).
+async fn update_multi_chunk(
+    store: &Store,
+    digest: DigestInfo,
+    chunks: &[Bytes],
+) -> Result<(), Error> {
+    let (mut tx, rx) = make_buf_channel_pair();
+    let total_size: u64 = chunks.iter().map(|b| b.len() as u64).sum();
+    let chunks_owned: Vec<Bytes> = chunks.to_vec();
+    let send_fut = async move {
+        for chunk in chunks_owned {
+            tx.send(chunk)
+                .await
+                .err_tip(|| "update_multi_chunk: send chunk")?;
+        }
+        tx.send_eof()
+            .err_tip(|| "update_multi_chunk: send_eof")?;
+        Ok::<(), Error>(())
+    };
+    let update_fut = store.update(digest, rx, UploadSizeInfo::ExactSize(total_size));
+    try_join!(send_fut, update_fut)?;
+    Ok(())
+}
 
 /// Build a FastSlowStore wrapping a MemoryStore fast tier and a separate
 /// MemoryStore slow tier, returning the FastSlowStore Arc so we can read
@@ -253,6 +284,106 @@ async fn d1_populator_caller_partial_read_after_fallback() -> Result<(), Error> 
         data.slice(1024..3072),
         "partial read bytes must match the original byte range [1024..3072) \
          — splice offset arithmetic is wrong if this fails"
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// 3b. SPLICE ARITHMETIC: the `1*off->return` failpoint action lets the
+//     FIRST `next_chunk()` succeed (so the producer-loop forwards bytes to
+//     the outer writer), then trips on the SECOND call. By that point
+//     `bytes_already_sent > 0`, so the splice computes
+//     `new_offset = offset + bytes_already_sent` (NOT `new_offset =
+//     offset` — the testing-czar T1 mutation finding). The earlier
+//     "return" failpoint fires immediately on the first call when
+//     `bytes_already_sent == 0`, so mutation 2 (drop the
+//     `+ bytes_already_sent` term) silently passes that test family.
+//     This test pins the splice arithmetic for the non-zero case.
+//
+//     Mutation step (run manually): in `fast_slow_store.rs` populator-
+//     caller branch, change `let new_offset = offset + bytes_already_sent;`
+//     to `let new_offset = offset;`. This test must red-fail with the
+//     bespoke `splice offset MUST equal caller_offset + bytes_already_sent`
+//     message because the slow-store splice would replay the prefix bytes
+//     the streaming buffer already delivered, and the assembled blob
+//     would NOT match the original.
+// -------------------------------------------------------------------------
+#[serial(failpoints)]
+#[nativelink_test]
+async fn d1_populator_caller_splice_after_partial_consumption() -> Result<(), Error> {
+    let (fss, _fast_store, slow_store) = make_fast_slow_arc();
+    let store = Store::new(fss.clone());
+
+    // Two distinct chunks so the slow tier emits >1 streaming-buffer
+    // chunk; that lets us trip the failpoint AFTER one chunk has been
+    // forwarded by the populator-caller's read loop, so the splice
+    // arithmetic test runs against a non-zero `bytes_already_sent`.
+    let chunk0 = Bytes::from(vec![0xAAu8; 1024]);
+    let chunk1 = Bytes::from(vec![0xBBu8; 1024]);
+    let mut combined = Vec::with_capacity(2048);
+    combined.extend_from_slice(&chunk0);
+    combined.extend_from_slice(&chunk1);
+    let combined = Bytes::from(combined);
+    let digest = DigestInfo::try_new(VALID_HASH, 2048).unwrap();
+
+    update_multi_chunk(&slow_store, digest, &[chunk0.clone(), chunk1.clone()])
+        .await
+        .err_tip(|| "setup: writing multi-chunk to slow store")?;
+
+    let metric_before = fss.streaming_buffer_reader_fallback_to_direct_total();
+
+    // `1*off->return`: first invocation = no-op (the read-loop reads
+    // chunk0 normally), second invocation = synthetic
+    // sliding-window-eviction error. By the time the failpoint fires,
+    // chunk0's bytes are already in the outer writer
+    // (bytes_already_sent = 1024 > 0).
+    fail::cfg("streaming_blob_next_chunk_fail", "1*off->return").unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — D.1 splice contract violated; full blob \
+         must be delivered via mid-stream slow-store splice within 10s",
+    );
+
+    fail::cfg("streaming_blob_next_chunk_fail", "off").unwrap();
+
+    let bytes = result.expect(
+        "splice offset MUST equal caller_offset + bytes_already_sent — \
+         D.1 byte-range arithmetic broken",
+    );
+
+    // Reconstructed blob must equal the original concatenated bytes.
+    // If the splice used `new_offset = offset` (mutation 2), the
+    // slow-store get_part(offset=0) would replay chunk0's bytes, the
+    // outer writer would receive `chunk0 || chunk0 || chunk1` =
+    // 3072 bytes, NOT 2048 — the assertion below would red-fail with
+    // the bespoke message.
+    assert_eq!(
+        bytes.len(),
+        2048,
+        "splice offset MUST equal caller_offset + bytes_already_sent \
+         — D.1 byte-range arithmetic broken; got {} bytes (expected 2048)",
+        bytes.len()
+    );
+    assert_eq!(
+        bytes, combined,
+        "splice offset MUST equal caller_offset + bytes_already_sent \
+         — D.1 byte-range arithmetic broken; reassembled blob bytes \
+         do not match original"
+    );
+
+    let metric_after = fss.streaming_buffer_reader_fallback_to_direct_total();
+    assert_eq!(
+        metric_after - metric_before,
+        1,
+        "D.1 fallback metric must increment exactly once when failpoint \
+         fires AFTER one chunk has been consumed; got delta = {}",
+        metric_after - metric_before
     );
 
     Ok(())
