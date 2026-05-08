@@ -54,7 +54,7 @@ use nativelink_config::stores::{ExistenceCacheSpec, NoopSpec, RedisSpec, StoreSp
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
-use nativelink_store::redis_store::RedisStore;
+use nativelink_store::redis_store::{RedisManager, RedisStore};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{ItemCallback, Store, StoreDriver, StoreKey, StoreLike};
 use parking_lot::Mutex;
@@ -263,6 +263,53 @@ async fn raw_del(port: u16, key: &str) {
         .expect("conn");
     use redis::AsyncCommands;
     let _: i64 = client.del(key).await.expect("del");
+}
+
+/// `SET key value` on a separate connection. Used to seed a key before
+/// DEL so the DEL fires a `__keyevent@0__:del` (Valkey emits no
+/// keyevent for DEL of a non-existent key).
+async fn raw_set(port: u16, key: &str, value: &str) {
+    let mut conn = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+        .expect("client")
+        .get_connection_manager()
+        .await
+        .expect("conn");
+    use redis::AsyncCommands;
+    let _: () = conn.set(key, value).await.expect("set");
+}
+
+/// `CONFIG SET notify-keyspace-events <flags>` on a separate connection.
+/// Used by the BLOCKER 4 reconnect test to simulate a Valkey restart's
+/// effect of wiping the in-memory `notify-keyspace-events` config.
+async fn raw_config_set_notify_keyspace_events(port: u16, flags: &str) {
+    let mut conn = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+        .expect("client")
+        .get_connection_manager()
+        .await
+        .expect("conn");
+    let _: () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("notify-keyspace-events")
+        .arg(flags)
+        .query_async(&mut conn)
+        .await
+        .expect("CONFIG SET notify-keyspace-events");
+}
+
+/// Read back `notify-keyspace-events` to confirm the post-reconnect state.
+async fn raw_config_get_notify_keyspace_events(port: u16) -> String {
+    let mut conn = redis::Client::open(format!("redis://127.0.0.1:{port}/"))
+        .expect("client")
+        .get_connection_manager()
+        .await
+        .expect("conn");
+    let map: std::collections::HashMap<String, String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("notify-keyspace-events")
+        .query_async(&mut conn)
+        .await
+        .expect("CONFIG GET notify-keyspace-events");
+    map.get("notify-keyspace-events").cloned().unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -825,5 +872,157 @@ async fn url_db_tcp_match_accepts_construction() -> Result<(), Error> {
     // Drop the store explicitly so the dispatcher exits before
     // `_guard` kills the server.
     drop(store);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Spec test 8 (BLOCKER 4 regression — testing-czar F3 / red-team B):
+// `StandardRedisManager::reconnect_with` MUST re-issue
+// `CONFIG SET notify-keyspace-events <flags>` on every subscriber-slot
+// reconnect BEFORE replaying PSUBSCRIBE.
+//
+// Spec (derived from the bug report, NOT from reading the implementation):
+// Redis `CONFIG SET` mutates the in-memory config only. A Valkey
+// restart reverts to whatever is in `valkey.conf` (typically empty for
+// notify-keyspace-events). Per Q2=NO, operators do NOT persist
+// notify-keyspace-events in `valkey.conf` — so without runtime re-issue
+// on every reconnect the dispatcher silently sees zero events post-
+// restart, re-emerging the wedge the dispatcher exists to close.
+//
+// Test approach: simulate the restart effect (wipe in-memory config)
+// then trigger a reconnect on the subscriber slot directly via
+// `manager.reconnect(uuid)`. Without the BLOCKER 4 fix, the wipe
+// persists; the post-reconnect `CONFIG GET` returns "" and DELs do not
+// fire the callback. With the fix, the post-reconnect `CONFIG GET`
+// returns the original flags ("Egex" or whatever was merged at
+// init_keyspace_dispatcher_eager) and DELs continue to fire callbacks.
+//
+// Mutation step: comment out the `let flags = ...; if let Some(flags) =
+// flags { CONFIG SET ... }` block in `reconnect_with`
+// (`redis_store.rs:606-620`). The test must FAIL with the bespoke
+// "BLOCKER 4 regression — DEL after reconnect did not fire callback"
+// message because the wiped notify-keyspace-events flags were never
+// restored after the simulated restart.
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn config_set_notify_keyspace_events_reissued_on_subscriber_reconnect()
+-> Result<(), Error> {
+    let (port, _guard) = spawn_server(&[]).await;
+    let store = RedisStore::new_standard(make_spec(port, "cas:"))
+        .await
+        .expect("store");
+
+    let (cb, notify) = CapturingCallback::new();
+    store
+        .clone()
+        .register_item_callback(cb.clone())
+        .expect("register");
+    wait_until_subscribed(port, 3, Duration::from_secs(3)).await;
+
+    // Sanity: at this point notify-keyspace-events is non-empty (init
+    // ran CONFIG SET). Capture the live flags so we can assert they're
+    // restored post-reconnect.
+    let flags_before = raw_config_get_notify_keyspace_events(port).await;
+    assert!(
+        !flags_before.is_empty(),
+        "init_keyspace_dispatcher_eager should have CONFIG SET non-empty flags"
+    );
+
+    // Simulate the Valkey-restart effect: wipe the in-memory
+    // notify-keyspace-events config. Operators per Q2=NO do not persist
+    // this in valkey.conf, so the next reconnect MUST re-issue the
+    // CONFIG SET or the dispatcher goes silently dormant.
+    raw_config_set_notify_keyspace_events(port, "").await;
+    assert_eq!(
+        raw_config_get_notify_keyspace_events(port).await,
+        "",
+        "wipe must take effect"
+    );
+
+    // Trigger a reconnect on the subscriber slot directly. This is the
+    // SAME path that `ClientWithPermit::reconnect` invokes when a store
+    // operation hits a transport error post-restart, so the test
+    // exercises the production code path (not a test-only shortcut).
+    let manager = store.connection_manager();
+    let subscriber_slot_uuid = {
+        let slot = manager
+            .debug_read_slot(0)
+            .await
+            .expect("subscriber slot exists");
+        slot.1
+    };
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        manager.reconnect(subscriber_slot_uuid),
+    )
+    .await
+    .expect("must not deadlock — reconnect")
+    .expect("reconnect must succeed");
+
+    // Post-reconnect, BLOCKER 4's `CONFIG SET` re-issue should have
+    // restored the wiped flags. If the test assertion below fails,
+    // either the re-issue path is broken OR the reissued flags differ
+    // from the originally-merged ones.
+    let flags_after = raw_config_get_notify_keyspace_events(port).await;
+    assert_eq!(
+        flags_after, flags_before,
+        "BLOCKER 4 regression — post-reconnect notify-keyspace-events differs from \
+         pre-wipe value; CONFIG SET re-issue path is broken (live flags lost across \
+         reconnect)"
+    );
+
+    // End-to-end behavior check: a DEL on the post-reconnect server
+    // must fire the dispatcher callback. If `notify-keyspace-events`
+    // were still wiped (BLOCKER 4 fix broken), Valkey would emit no
+    // keyevent. With the fix, flags were restored above and DEL fires
+    // a `__keyevent@0__:del` push that the post-reconnect subscriber
+    // slot receives.
+    //
+    // We poll-DEL inside a deadline because the server may take a
+    // brief moment to process the OLD connection's disconnect after
+    // `manager.reconnect` replaces it; during that window the OLD
+    // conn's PSUBSCRIBE may still match keyevent publishes that go to
+    // the dropped sender. Re-issuing DEL until the NEW conn observes
+    // it is the right resilience pattern for this race.
+    let digest = DigestInfo::try_new(TEST_HASH, 99).unwrap();
+    let key_to_del = format!("cas:{digest}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let predicate = |keys: &[StoreKey<'static>]| {
+        keys.iter()
+            .any(|k| matches!(k, StoreKey::Digest(d) if *d == digest))
+    };
+    let mut fired = false;
+    // Loop SET+DEL until either the callback observes the keyevent or
+    // the deadline expires. Each iteration seeds the key before DEL
+    // because Valkey does not emit `__keyevent@0__:del` for a DEL of a
+    // non-existent key. Looping handles the OLD-conn server-side
+    // disconnect race: the OLD CM's PSUBSCRIBE may still match the
+    // first publish (sent to the dropped tx), but subsequent
+    // publishes hit the NEW conn after server processes the
+    // disconnect.
+    while tokio::time::Instant::now() < deadline {
+        raw_set(port, &key_to_del, "v").await;
+        raw_del(port, &key_to_del).await;
+        let recv_check_until = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < recv_check_until {
+            if predicate(&cb.received.lock()) {
+                fired = true;
+                break;
+            }
+            let remaining =
+                recv_check_until.saturating_duration_since(tokio::time::Instant::now());
+            let _ = tokio::time::timeout(remaining, notify.notified()).await;
+        }
+        if fired {
+            break;
+        }
+    }
+    assert!(
+        fired,
+        "BLOCKER 4 regression — DEL after reconnect did not fire callback within 10s; \
+         CONFIG SET notify-keyspace-events re-issue on subscriber-slot reconnect is \
+         broken. Post-reconnect notify-keyspace-events={flags_after}, received={:?}",
+        cb.received.lock()
+    );
     Ok(())
 }
