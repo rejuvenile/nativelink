@@ -46,6 +46,26 @@ const STREAMING_BLOB_NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 /// production whether the lost-wakeup wedge actually went away.
 const SLOW_NOTIFY_THRESHOLD: Duration = Duration::from_secs(5);
 
+/// Substring marker emitted into the `Code::Unavailable` error message
+/// produced by `StreamingBlobReader::next_chunk` when the reader's cursor
+/// has fallen behind the sliding window.
+///
+/// This is a forward-compatibility CONTRACT: the FastSlowStore D.1 fallback
+/// (#325) recognizes the sliding-window-eviction error class by substring-
+/// matching this marker against `Error::messages`. Renaming the production
+/// message without keeping the marker substring would silently break the
+/// fallback predicate — readers that fell behind would propagate
+/// `Code::Unavailable` to the outer caller (the bug-shape #325 fixes)
+/// instead of splicing in a fresh slow-store read.
+///
+/// The substring is referenced both from the production error construction
+/// in `next_chunk` AND from the `streaming_blob_next_chunk_fail` failpoint's
+/// synthetic message so test predicates and production predicates trip on
+/// the same byte sequence. The production unit test
+/// `production_sliding_window_message_contains_marker` asserts the
+/// substring is preserved on every change to that error message.
+pub const SLIDING_WINDOW_EVICTION_MARKER: &str = "reader fell behind sliding window";
+
 /// Inner shared state for a streaming blob.
 ///
 /// The writer appends `Bytes` chunks to the deque and notifies
@@ -578,15 +598,17 @@ impl StreamingBlobReader {
         // streaming populate reader error triggers a slow-store resume at
         // the correct byte offset.
         //
-        // Uses the production-shape message text "reader fell behind
-        // sliding window" so the FastSlowStore D.1 fallback predicate
-        // (which matches on this substring) trips. Tests asserting on
-        // Code::Unavailable continue to work unchanged.
+        // Uses the SLIDING_WINDOW_EVICTION_MARKER substring (shared with
+        // the production error path below) so the FastSlowStore D.1
+        // fallback predicate trips on the same byte sequence in both real
+        // and synthetic failures. Tests asserting on Code::Unavailable
+        // continue to work unchanged.
         #[cfg(feature = "failpoints")]
         fail::fail_point!("streaming_blob_next_chunk_fail", |_| {
             Err(make_err!(
                 Code::Unavailable,
-                "failpoint: reader fell behind sliding window (synthetic)"
+                "failpoint: {} (synthetic)",
+                SLIDING_WINDOW_EVICTION_MARKER
             ))
         });
 
@@ -605,7 +627,8 @@ impl StreamingBlobReader {
             if self.cursor_chunk_idx < earliest {
                 return Err(make_err!(
                     Code::Unavailable,
-                    "reader fell behind sliding window (cursor={}, earliest={})",
+                    "{} (cursor={}, earliest={})",
+                    SLIDING_WINDOW_EVICTION_MARKER,
                     self.cursor_chunk_idx,
                     earliest
                 ));

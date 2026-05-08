@@ -44,7 +44,9 @@ use nativelink_util::store_trait::{
     StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
     UploadSizeInfo, slow_update_store_with_file,
 };
-use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
+use nativelink_util::streaming_blob::{
+    SLIDING_WINDOW_EVICTION_MARKER, StreamingBlobInner, StreamingBlobWriter,
+};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
@@ -5095,7 +5097,7 @@ impl StoreDriver for FastSlowStore {
                             && err
                                 .messages
                                 .iter()
-                                .any(|m| m.contains("reader fell behind"));
+                                .any(|m| m.contains(SLIDING_WINDOW_EVICTION_MARKER));
                         if is_sliding_window_eviction {
                             let bytes_already_sent = guard.get_bytes_written();
                             let new_offset = offset + bytes_already_sent;
@@ -5205,7 +5207,7 @@ impl StoreDriver for FastSlowStore {
                         && err
                             .messages
                             .iter()
-                            .any(|m| m.contains("reader fell behind"));
+                            .any(|m| m.contains(SLIDING_WINDOW_EVICTION_MARKER));
                     if is_sliding_window_eviction {
                         self.metrics
                             .streaming_buffer_reader_fallback_to_direct_total
