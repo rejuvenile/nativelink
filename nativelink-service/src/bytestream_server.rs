@@ -1246,9 +1246,53 @@ impl ByteStreamServer {
             } // if let Some(streaming_reader)
         }
 
+        // mark expected_drop: the unfold's `state` holds `rx` between
+        // poll cycles. When the gRPC client cancels mid-stream (Bazel
+        // build interrupt, retry, peer reset, etc.) the unfold's state
+        // is dropped externally without observing EOF; the producer
+        // (`get_part_fut` below, owning `tx`) is still alive and will
+        // see the next `tx.send().await` fail with "receiver
+        // disconnected". That sender-side error is already loud and
+        // accurate — the receiver-side `buf_channel::receiver_dropped_mid_stream`
+        // warn would be redundant noise (~495 events/10min on buildcache
+        // 2026-05-07 review M1/S4). The `ExpectedDropRx` wrapper marks
+        // `rx` on every Drop path so the centralized one-line wrapper
+        // covers every exit uniformly:
+        //   - normal EOF return at the `consume_ok_eof` branch (warn
+        //     already suppressed by `eof_sent`; mark is a no-op duplicate)
+        //   - server-detected size-too-large (state dropped at end of
+        //     closure; producer error already surfaces via the
+        //     `Err((... into()))` tuple item)
+        //   - `consume_err` propagation (`last_err` already set inside
+        //     rx, warn already suppressed; mark is a no-op duplicate)
+        //   - external client cancellation (the load-bearing case)
+        //
+        // We can't put Drop on `ReaderState` itself because the closure
+        // moves `state.maybe_get_part_result` and `state.get_part_fut`
+        // out of the struct — Rust's E0509 forbids moves out of a Drop
+        // type. Wrapping just `rx` keeps the rest of `ReaderState`
+        // movable while preserving the mark-on-drop guarantee.
+        struct ExpectedDropRx(DropCloserReadHalf);
+        impl Drop for ExpectedDropRx {
+            fn drop(&mut self) {
+                self.0.mark_expected_drop();
+            }
+        }
+        impl core::ops::Deref for ExpectedDropRx {
+            type Target = DropCloserReadHalf;
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+        impl core::ops::DerefMut for ExpectedDropRx {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
+
         struct ReaderState {
             max_bytes_per_stream: usize,
-            rx: DropCloserReadHalf,
+            rx: ExpectedDropRx,
             maybe_get_part_result: Option<Result<(), Error>>,
             get_part_fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
         }
@@ -1269,7 +1313,7 @@ impl ByteStreamServer {
         // This allows us to call a destructor when the the object is dropped.
         let store = instance.store.clone();
         let state = Some(ReaderState {
-            rx,
+            rx: ExpectedDropRx(rx),
             max_bytes_per_stream: instance.max_bytes_per_stream,
             maybe_get_part_result: None,
             get_part_fut: Box::pin(async move {

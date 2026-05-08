@@ -145,6 +145,7 @@ pub fn make_buf_channel_pair_with_size(
             max_recent_data_size: 0,
             diag,
             terminal_error,
+            expected_drop: false,
         },
     )
 }
@@ -566,12 +567,39 @@ pub struct DropCloserReadHalf {
     /// populated, returns the producer's structured error rather than the
     /// generic "Sender dropped before sending EOF" Internal fallback.
     terminal_error: Arc<OnceLock<Error>>,
+    /// When `true`, the [`Drop`] impl suppresses the
+    /// `buf_channel::receiver_dropped_mid_stream` warn even though the
+    /// receiver was dropped without observing EOF or a sender error.
+    /// Set via [`Self::mark_expected_drop`] by callers whose drop is a
+    /// known-legitimate cancellation path (e.g. the bytestream read
+    /// `unfold` state holding `rx` when a gRPC client cancels).
+    /// Per-receiver — only this receiver's Drop is silenced; sibling
+    /// receivers in the same process still warn on mid-stream drop.
+    expected_drop: bool,
 }
 
 impl DropCloserReadHalf {
     /// Returns if the stream has data ready.
     pub fn is_empty(&self) -> bool {
         self.rx.is_empty()
+    }
+
+    /// Marks this receiver as being dropped via a legitimate, expected
+    /// cancellation path (e.g. gRPC client disconnect, parent future
+    /// cancelled by `tokio::join!` sibling abort, server-side stream
+    /// teardown after returning a structured error to the client). The
+    /// [`Drop`] impl will NOT emit the `buf_channel::receiver_dropped_mid_stream`
+    /// warn after this is called.
+    ///
+    /// Use this whenever a caller is about to drop the receiver as part
+    /// of normal teardown but cannot drain the channel to EOF first
+    /// (because the producer is still alive and has more to send, but
+    /// the consumer no longer wants the bytes).
+    ///
+    /// Per-receiver: only this receiver's drop is silenced. Sibling
+    /// receivers in the same process still warn on mid-stream drop.
+    pub fn mark_expected_drop(&mut self) {
+        self.expected_drop = true;
     }
 
     fn recv_inner(&mut self, chunk: Bytes) -> Result<Bytes, Error> {
@@ -865,11 +893,29 @@ impl Stream for DropCloserReadHalf {
 /// section assigns to non-fatal-but-suspicious events.
 impl Drop for DropCloserReadHalf {
     fn drop(&mut self) {
-        // Skip if the writer already signaled completion (clean EOF or
-        // structured error via `send_error` — both set `eof_sent`). Skip
-        // if the receiver already consumed a stream-error (`last_err`):
-        // the disconnect was already observed and surfaced upstream.
+        // Guard order:
+        //   1. `eof_sent`           — writer signaled clean completion
+        //                             (or structured error via `send_error`,
+        //                             which also sets `eof_sent`).
+        //   2. `terminal_error`     — defensive duplicate of (1) so a
+        //                             future change to `send_error` that
+        //                             stops setting `eof_sent` still
+        //                             suppresses the warn correctly.
+        //   3. `expected_drop`      — caller-attested expected cancellation
+        //                             (e.g. bytestream `unfold` state drop
+        //                             on gRPC client cancel). See
+        //                             `mark_expected_drop` for the contract.
+        //   4. `last_err`           — receiver already consumed a
+        //                             stream-error; the disconnect was
+        //                             observed and surfaced upstream.
+        //   5. in-flight check      — distinguishes mid-stream from idle.
         if self.eof_sent.load(Ordering::Acquire) {
+            return;
+        }
+        if self.terminal_error.get().is_some() {
+            return;
+        }
+        if self.expected_drop {
             return;
         }
         if self.last_err.is_some() {

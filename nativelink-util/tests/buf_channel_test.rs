@@ -677,3 +677,99 @@ async fn receiver_drop_before_any_send_does_not_log() {
          no bytes have been produced AND no completion signal exists",
     );
 }
+
+/// Spec (under-action): when a caller calls
+/// `rx.mark_expected_drop()` BEFORE dropping the receiver, the Drop
+/// impl MUST suppress the `buf_channel::receiver_dropped_mid_stream`
+/// warn even though a chunk is in flight. This is the API the
+/// bytestream_server `unfold` state uses to silence
+/// known-legitimate gRPC client cancellations (review M1/S4
+/// 2026-05-07): legitimate cancels would otherwise flood ~495
+/// events/10min as the cause sat silent.
+///
+/// Wrapped under `tokio::time::timeout(Duration::from_secs(5))` per
+/// CLAUDE.md — without it, a regression that deadlocks on Drop
+/// would hang the CI runner instead of failing fast.
+///
+/// Mutation step: comment out the `expected_drop` early-return in
+/// the `Drop for DropCloserReadHalf` impl; this test red-fails with
+/// the bespoke message below.
+#[nativelink_test]
+async fn mark_expected_drop_suppresses_mid_stream_warn() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut tx, mut rx) = make_buf_channel_pair();
+        // Producer sends a chunk so the channel is non-empty when
+        // the receiver drops — same in-flight precondition as the
+        // baseline mid-stream-warn test.
+        tx.send(Bytes::from_static(b"in-flight"))
+            .await
+            .expect("send must succeed before mark_expected_drop");
+        rx.mark_expected_drop();
+        drop(rx);
+    })
+    .await
+    .expect("must not deadlock — mark_expected_drop should not block");
+
+    let saw_warn = logs_contain("buf_channel::receiver_dropped_mid_stream")
+        || logs_contain("Receiver dropped mid-stream");
+    assert!(
+        !saw_warn,
+        "mark_expected_drop did NOT suppress the warn — Drop impl \
+         missing the expected_drop guard; legitimate gRPC client \
+         cancellation will flood the warn channel as in 2026-05-07 \
+         review M1/S4",
+    );
+}
+
+/// Spec (over-action sibling): `mark_expected_drop` MUST be
+/// per-receiver. Marking rx1 must not silence rx2 — the field is
+/// owned by the specific `DropCloserReadHalf` instance, not a
+/// process-global flag.
+///
+/// Test composition: TWO independent channel pairs. rx1 has a chunk
+/// in flight + `mark_expected_drop` then drops (silent). rx2 has a
+/// chunk in flight + drops without marking (must warn). Independent
+/// channel pairs in sequence prove the per-receiver guarantee under
+/// `logs_contain` (which scans the whole test's log buffer, so a
+/// regression on rx1's mark leaking to rx2 would show up as silence
+/// at the assertion).
+///
+/// Wrapped under `tokio::time::timeout(Duration::from_secs(5))`.
+///
+/// Mutation step: change `expected_drop` from a per-instance field
+/// to a process-global static (e.g. `AtomicBool`) and have
+/// `mark_expected_drop` set it; this test red-fails with the
+/// bespoke message below because rx2's drop would also be silenced.
+#[nativelink_test]
+async fn mark_expected_drop_does_not_silence_other_drops() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // rx1: marked + dropped — should NOT warn.
+        {
+            let (mut tx1, mut rx1) = make_buf_channel_pair();
+            tx1.send(Bytes::from_static(b"rx1-chunk"))
+                .await
+                .expect("rx1 send must succeed");
+            rx1.mark_expected_drop();
+            drop(rx1);
+        }
+
+        // rx2: NOT marked, dropped mid-stream — MUST warn.
+        {
+            let (mut tx2, rx2) = make_buf_channel_pair();
+            tx2.send(Bytes::from_static(b"rx2-chunk"))
+                .await
+                .expect("rx2 send must succeed");
+            drop(rx2);
+        }
+    })
+    .await
+    .expect("must not deadlock — independent rx drops must not block");
+
+    let saw_warn = logs_contain("buf_channel::receiver_dropped_mid_stream")
+        || logs_contain("Receiver dropped mid-stream");
+    assert!(
+        saw_warn,
+        "mark_expected_drop on rx1 silenced rx2's warn — global \
+         state leak; expected_drop must be per-receiver",
+    );
+}
