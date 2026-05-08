@@ -61,5 +61,27 @@ jobs:
         # otherwise be silently skipped from CI.
         run: cargo test -p nativelink-store -p nativelink-worker -p nativelink-service --features nativelink-store/test-utils --features nativelink-worker/test-utils --features nativelink-service/test-utils --tests
 
+      - name: Test failpoints (failpoints feature)
+        # The `failpoint_tests` suite (#268) and the `fast_slow_store_325_regression_test`
+        # suite (#325) gate on the `failpoints` feature: the `fail_point!`
+        # macro is a no-op stub without it, so failpoints registered via
+        # `fail::cfg` never fire and the tests panic at their `expect()`
+        # calls. Both bins are marked `required-features = ["failpoints"]`
+        # in `nativelink-store/Cargo.toml` so the default `cargo test --all`
+        # silently skips them; this step opts in.
+        #
+        # Run under `--test-threads=1` so each test's process-wide
+        # `fail::cfg` registry mutation is fully serialized — even with
+        # `serial_test::serial(failpoints)` annotations on every test,
+        # multi-threaded runners exhibited a flake (#325 D.1 reviewer
+        # finding) under load.
+        run: |
+          cargo test -p nativelink-store --features failpoints --test failpoint_tests -- --test-threads=1
+          cargo test -p nativelink-store --features failpoints --test fast_slow_store_325_regression_test -- --test-threads=1
+        # Also unit-test the cross-crate `SLIDING_WINDOW_EVICTION_MARKER`
+        # contract (failpoints not required for this one — it exercises
+        # the production code path with a tiny `max_buffer_bytes`).
+        # Stays under the default `cargo test --all` step above.
+
       - name: Check schema export
         run: cargo run --bin build-schema --features dev-schema --package nativelink-config
