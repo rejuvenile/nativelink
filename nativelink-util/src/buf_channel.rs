@@ -835,6 +835,74 @@ impl Stream for DropCloserReadHalf {
     }
 }
 
+/// Visibility for mid-stream receiver drops.
+///
+/// **Why this exists:** the `mpsc::Sender::send` call inside
+/// `DropCloserWriteHalf::send` only learns "the receiver disconnected" the
+/// next time the producer tries to push a chunk — and that surfaces as the
+/// generic `Code::Internal "Failed to write to data, receiver disconnected"`
+/// error at `send_get_bytes_on_error` (above). The producer-side error is
+/// loud, but it does not name **where** or **why** the receiver dropped.
+/// Production today (2026-05-07): buildcache emitted ~495 of those errors in
+/// 10 minutes, cascading up to Bazel as `INTERNAL: Tried to send while
+/// stream is closed`, with no log on the receiver side — the cause sat
+/// silent.
+///
+/// This Drop impl closes that gap by emitting one `warn!` whenever the
+/// receiver is dropped while the stream is still mid-flight. "Mid-stream"
+/// means: the writer has not signaled completion (`eof_sent == false` AND
+/// no terminal error stored), the receiver has not previously observed an
+/// upstream error (`last_err.is_none()`), and there is evidence of an
+/// in-flight transfer (already received some bytes, has data queued
+/// locally, OR the underlying mpsc channel still has buffered chunks).
+///
+/// **`warn!` not `error!`** — the bytestream read path
+/// (`bytestream_server.rs:1271-1310`) holds the `rx` inside an `unfold`
+/// stream's state; when a gRPC client disconnects mid-stream, the unfold
+/// state (and thus `rx`) is dropped before EOF is observed. This is
+/// legitimate client-cancellation behavior, not a bug. `warn!` matches the
+/// "perf anomaly worth investigating" semantics the CLAUDE.md logging
+/// section assigns to non-fatal-but-suspicious events.
+impl Drop for DropCloserReadHalf {
+    fn drop(&mut self) {
+        // Skip if the writer already signaled completion (clean EOF or
+        // structured error via `send_error` — both set `eof_sent`). Skip
+        // if the receiver already consumed a stream-error (`last_err`):
+        // the disconnect was already observed and surfaced upstream.
+        if self.eof_sent.load(Ordering::Acquire) {
+            return;
+        }
+        if self.last_err.is_some() {
+            return;
+        }
+        // No completion signal AND no observed error. Was anything in
+        // flight? If we never saw a single byte AND nothing is buffered
+        // locally AND the mpsc channel is empty, the receiver was dropped
+        // before the producer started — an idle close, not a mid-stream
+        // abort.
+        let bytes_in_underlying_channel = !self.rx.is_empty();
+        let bytes_queued_locally = !self.queued_data.is_empty();
+        let bytes_consumed = self.bytes_received > 0;
+        if !bytes_consumed && !bytes_queued_locally && !bytes_in_underlying_channel {
+            return;
+        }
+
+        // Mid-stream drop. Snapshot diag state so the operator can
+        // attribute the failure to a specific producer task.
+        let snap = self.diag.snapshot();
+        warn!(
+            target: "buf_channel::receiver_dropped_mid_stream",
+            bytes_received = self.bytes_received,
+            bytes_queued_locally = self.queued_data.len(),
+            channel_has_pending = bytes_in_underlying_channel,
+            sends_total = snap.sends_total,
+            producer_task_id = %snap.producer_task_id.as_deref().unwrap_or("<none>"),
+            "buf_channel: Receiver dropped mid-stream — no EOF, sender did not error; \
+             sender will see 'receiver disconnected' on next send",
+        );
+    }
+}
+
 /// Inline `#[cfg(test)]` tests for the operator-facing slow-recv warn
 /// diagnostics. These tests probe the **private** `diag` field on
 /// `DropCloserReadHalf` and the **private** `ChannelDiagSnapshot` type, so

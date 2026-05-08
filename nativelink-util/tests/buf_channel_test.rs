@@ -591,3 +591,89 @@ async fn drop_during_active_send_does_not_corrupt_stream() {
         "post-Drop err MUST carry the wire-side identifier, got: {err:?}",
     );
 }
+
+/// Spec: when the Receiver is dropped mid-stream (sender has produced a
+/// chunk, receiver has neither observed EOF nor a sender-side error),
+/// the Drop impl MUST emit a `WARN` with the
+/// `buf_channel::receiver_dropped_mid_stream` target. This visibility
+/// closes the production gap where the Sender's "Failed to write to
+/// data, receiver disconnected" error fired hundreds of times in
+/// 10 minutes (buildcache 2026-05-07) with no log on the receiver side
+/// naming the cause.
+///
+/// Mutation step: comment out the `warn!` body in `Drop for
+/// DropCloserReadHalf`; this test must red-fail with the explicit
+/// "missing mid-stream-drop warn" message.
+#[nativelink_test]
+async fn receiver_drop_mid_stream_emits_warn() {
+    let (mut tx, rx) = make_buf_channel_pair();
+    // Producer sends a chunk so the channel is non-empty when the
+    // receiver drops — the most common "mid-stream" case.
+    tx.send(Bytes::from_static(b"in-flight"))
+        .await
+        .expect("send must succeed before receiver drop");
+    // Drop the receiver without consuming the chunk and without
+    // observing EOF. This is the "mid-stream drop" case.
+    drop(rx);
+
+    // Allow tasks to settle; the warn fires synchronously inside the
+    // Drop impl on the test's own thread, so no sleep is needed.
+    let saw_mid_stream_warn = logs_contain("buf_channel::receiver_dropped_mid_stream")
+        || logs_contain("Receiver dropped mid-stream");
+    assert!(
+        saw_mid_stream_warn,
+        "missing mid-stream-drop warn — Drop impl MUST emit \
+         a WARN naming the target `buf_channel::receiver_dropped_mid_stream`",
+    );
+}
+
+/// Over-action sibling test (asymmetric-coverage rule, CLAUDE.md):
+/// a clean drop after EOF MUST NOT log. A regression that fires the
+/// warn unconditionally would surface as N spurious WARN events per
+/// completed transfer in production — exactly the noise pattern #186
+/// retired for the Drop fallback at the writer side.
+///
+/// Mutation step: weaken the `eof_sent` guard in `Drop for
+/// DropCloserReadHalf` (e.g. delete the early-return); this test must
+/// red-fail with the explicit "spurious clean-drop warn" message.
+#[nativelink_test]
+async fn receiver_drop_after_eof_does_not_log() {
+    let (mut tx, mut rx) = make_buf_channel_pair();
+    tx.send(Bytes::from_static(b"only-chunk"))
+        .await
+        .expect("first send must succeed");
+    tx.send_eof().expect("send_eof must succeed");
+    let chunk = rx.recv().await.expect("first recv must yield the chunk");
+    assert_eq!(&chunk[..], b"only-chunk");
+    let eof = rx.recv().await.expect("second recv must yield EOF");
+    assert!(eof.is_empty(), "expected EOF marker, got {} bytes", eof.len());
+    drop(rx);
+
+    let saw_spurious_warn = logs_contain("buf_channel::receiver_dropped_mid_stream")
+        || logs_contain("Receiver dropped mid-stream");
+    assert!(
+        !saw_spurious_warn,
+        "spurious clean-drop warn — Drop impl MUST stay silent when \
+         the writer has signaled EOF and the receiver has consumed it",
+    );
+}
+
+/// Over-action sibling test #2: dropping a Receiver before any send
+/// happens MUST NOT log. This is a common pattern when a caller
+/// constructs a channel pair and then bails out before the producer
+/// task is even spawned.
+///
+/// Mutation step: weaken the "anything in flight" guard in `Drop for
+/// DropCloserReadHalf`; this test must red-fail.
+#[nativelink_test]
+async fn receiver_drop_before_any_send_does_not_log() {
+    let (_tx, rx) = make_buf_channel_pair();
+    drop(rx);
+    let saw_spurious_warn = logs_contain("buf_channel::receiver_dropped_mid_stream")
+        || logs_contain("Receiver dropped mid-stream");
+    assert!(
+        !saw_spurious_warn,
+        "spurious idle-close warn — Drop impl MUST stay silent when \
+         no bytes have been produced AND no completion signal exists",
+    );
+}
