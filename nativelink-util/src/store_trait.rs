@@ -670,6 +670,16 @@ impl Store {
         self.inner.pin_digests_with_results(digests)
     }
 
+    /// Release pins acquired via [`Self::pin_digests`]. Used by the
+    /// server-side BlobsInStableStorage broadcast loop after notifying
+    /// workers that a digest is durably mirrored — see
+    /// [`StoreDriver::unpin_digests`] for the contract.
+    /// Delegates to the inner [`StoreDriver::unpin_digests`].
+    #[inline]
+    pub fn unpin_digests(&self, digests: &[DigestInfo]) {
+        self.inner.unpin_digests(digests);
+    }
+
     /// Drain digests whose background slow-store write failed.
     /// Delegates to the inner [`StoreDriver::drain_failed_digests`].
     #[inline]
@@ -1447,6 +1457,44 @@ pub trait StoreDriver:
                     }
                 }
                 combined
+            }
+        }
+    }
+
+    /// Unpin digests previously pinned by [`Self::pin_digests`] /
+    /// [`Self::pin_digests_with_results`]. Inverse of pin: returns the
+    /// pinned entries to LRU-eviction eligibility. The server's
+    /// BlobsInStableStorage broadcast loop calls this AFTER notifying
+    /// workers that a digest is durably mirrored — at that point the
+    /// fast-tier pin (held to bridge the BIS-ack window) is no longer
+    /// load-bearing and must be released so the pin budget doesn't fill.
+    ///
+    /// The default body dispatches via [`Self::pin_delegation`] —
+    /// symmetric to `pin_digests`. Stores that actually pin (e.g.
+    /// [`MemoryStore`], [`FilesystemStore`]) declare `Leaf` and override
+    /// this to call `MokaEvictingMap::unpin_key()`. Wrapper stores
+    /// (`Inner` / `Many`) get correct fan-out for free via the same
+    /// `pin_delegation` they use for the pin call.
+    ///
+    /// Idempotent: unpinning a digest that is not currently pinned is a
+    /// no-op (delegated to `MokaEvictingMap::unpin_key`'s remove-if-
+    /// present semantics). The `Leaf` arm is silent — `Leaf` stores that
+    /// don't pin (Noop, Memory pre-fix, S3, GCS, Azure, Mongo, Redis)
+    /// have nothing to release.
+    fn unpin_digests(&self, digests: &[DigestInfo]) {
+        match self.pin_delegation() {
+            PinDelegation::Leaf => {
+                // Leaves that don't pin (Noop, S3, GCS, Azure, Mongo,
+                // Redis) silently no-op. Pinning leaves (MemoryStore,
+                // FilesystemStore) override this method to release.
+            }
+            PinDelegation::Inner(s) | PinDelegation::Passthrough(s) => {
+                s.unpin_digests(digests);
+            }
+            PinDelegation::Many(children) => {
+                for child in children {
+                    child.unpin_digests(digests);
+                }
             }
         }
     }

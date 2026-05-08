@@ -31,6 +31,7 @@ use nativelink_metric::MetricsComponent;
 #[cfg(feature = "chunked_fast_slow")]
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::common::DigestInfo;
 use nativelink_util::evicting_map::LenEntry;
 use nativelink_util::moka_evicting_map::MokaEvictingMap;
 use nativelink_util::health_utils::{
@@ -652,10 +653,72 @@ impl StoreDriver for MemoryStore {
         StableDigestDelegation::Leaf
     }
 
-    /// MemoryStore is a leaf — pinning here is a no-op. Pin protection is
-    /// useful only against eviction (the FilesystemStore case); a memory
-    /// store either has the blob or has lost it via cap eviction, in which
-    /// case the upper layer should re-fetch.
+    /// #334 Fix C: pin keys in the in-memory eviction map so a write
+    /// at-or-near cap doesn't lose its only fast-tier replica during
+    /// the BlobsInStableStorage ack window. Mirrors
+    /// `FilesystemStore::pin_digests` (`filesystem_store.rs:2321-2327`)
+    /// — both delegate to `MokaEvictingMap::pin_keys`. Pre-fix
+    /// `cas_FAST_SLOW_STORE.fast = MemoryStore` lost the pin entirely
+    /// because the trait default's `Leaf` arm is no-op; that broke the
+    /// ≥2-replica durability invariant whenever an eviction landed
+    /// before the worker-mirror BIS ack arrived.
+    fn pin_digests(&self, digests: &[DigestInfo]) {
+        let keys: Vec<StoreKeyBorrow> = digests
+            .iter()
+            .map(|d| StoreKeyBorrow::from(StoreKey::from(*d)))
+            .collect();
+        self.evicting_map.pin_keys(&keys);
+    }
+
+    /// #334 Fix C, per-key variant. Mirrors
+    /// `FilesystemStore::pin_digests_with_results`
+    /// (`filesystem_store.rs:2329-2341`): the batched `pin_keys` path
+    /// breaks early on cap exhaustion and collapses
+    /// `run_pending_tasks()` across the batch, neither of which
+    /// gives the per-digest visibility callers need to detect
+    /// eviction races. Per-key pin so the result vec matches input
+    /// length exactly.
+    fn pin_digests_with_results(&self, digests: &[DigestInfo]) -> Vec<bool> {
+        digests
+            .iter()
+            .map(|d| {
+                let key: StoreKey<'static> = (*d).into();
+                self.evicting_map.pin_key(StoreKeyBorrow::from(key))
+            })
+            .collect()
+    }
+
+    /// #334 Fix C: release pins acquired by [`Self::pin_digests`] /
+    /// [`Self::pin_digests_with_results`]. Server BIS broadcast loop
+    /// calls this after telling workers a digest is durably mirrored;
+    /// the fast-tier pin is no longer load-bearing past that point.
+    /// Idempotent — `MokaEvictingMap::unpin_key` is a remove-if-present.
+    fn unpin_digests(&self, digests: &[DigestInfo]) {
+        for d in digests {
+            let key: StoreKey<'static> = (*d).into();
+            self.evicting_map.unpin_key(&key);
+        }
+    }
+
+    /// MemoryStore is a pinning leaf — the overrides above (`pin_digests`,
+    /// `pin_digests_with_results`, `unpin_digests`) route directly to
+    /// `MokaEvictingMap::pin_keys` / `unpin_key`. `Leaf` declares "no
+    /// inner-store delegation needed" (no children to fan out to); it
+    /// does NOT mean "no-op" — that semantics belongs to non-pinning
+    /// leaves (Noop, S3, GCS, Azure, Mongo, Redis), which inherit the
+    /// trait default's `Leaf` arm.
+    ///
+    /// **#334 Fix C — load-bearing for cas_FAST_SLOW_STORE durability.**
+    /// Production server's `cas_FAST_SLOW_STORE.fast = MemoryStore (48
+    /// GB)`. Every CAS write calls `pin_digests` on the fast tier to
+    /// hold the blob across the BlobsInStableStorage (BIS) ack window
+    /// (the time between server-side write and worker-side mirror's
+    /// "I have a second replica" ack). Pre-fix the trait default's
+    /// `Leaf` arm was no-op and the pin evaporated; an LRU eviction
+    /// during the ack window broke the ≥2-replica invariant. The
+    /// overrides below close that gap. The BIS broadcast loop calls
+    /// `unpin_digests` AFTER ack so the pin doesn't leak past its
+    /// purpose.
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Leaf
     }

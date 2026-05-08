@@ -2340,6 +2340,21 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
             .collect()
     }
 
+    /// #334 Fix C: trait-method form of the existing public
+    /// [`Self::unpin_digest`] (singular). Routed through the
+    /// `pin_delegation` chain so the server-side BIS broadcast loop
+    /// can call `cas_store.unpin_digests(&...)` and have it reach
+    /// FilesystemStore via the wrapping chain (FastSlowStore declares
+    /// `Many(fast, slow)`, so an unpin on the FSS fans out to BOTH
+    /// the MemoryStore fast tier AND this FilesystemStore slow tier).
+    /// Per-digest delegation to `unpin_key` mirrors `unpin_digest`.
+    fn unpin_digests(&self, digests: &[DigestInfo]) {
+        for d in digests {
+            let key: StoreKey<'static> = (*d).into();
+            self.evicting_map.unpin_key(&key);
+        }
+    }
+
     /// FilesystemStore is a leaf — its `drain_stable_digests` is wired
     /// from `FastSlowStore::populate_fast_store` via `register_pin_expire_listener`.
     /// FilesystemStore itself does not expose a stable-digest stream;
