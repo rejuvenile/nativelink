@@ -17,12 +17,13 @@ use core::fmt::{self, Debug};
 use core::marker::PhantomData;
 use core::ops::{Bound, RangeBounds};
 use core::pin::Pin;
+use core::str;
 use core::str::FromStr;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -36,8 +37,9 @@ use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_redis_tester::SubscriptionManagerNotify;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthRegistryBuilder, HealthStatus, HealthStatusIndicator};
-use nativelink_util::spawn;
+use nativelink_util::{background_spawn, spawn};
 use nativelink_util::store_trait::{
     BoolValue, ItemCallback, MarkStableDelegation, PinDelegation, SchedulerCurrentVersionProvider,
     SchedulerIndexProvider, SchedulerStore, SchedulerStoreDataProvider, SchedulerStoreDecodeTo,
@@ -58,6 +60,7 @@ use redis::{
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, info, trace, warn};
@@ -685,6 +688,31 @@ where
     /// instead of an error.
     #[metric(help = "Per-command timeout safety net in milliseconds")]
     command_timeout: Duration,
+
+    /// See [`RedisSpec::enable_keyspace_notifications`]. Set at construction;
+    /// gates the keyspace-notification dispatcher in `register_item_callback`.
+    enable_keyspace_notifications: bool,
+
+    /// See [`RedisSpec::keyspace_notifications_db`]. Set at construction;
+    /// determines the `__keyevent@<db>__:*` channel pattern.
+    keyspace_notifications_db: i64,
+
+    /// Sender into the keyspace dispatcher task. Initialized lazily on the
+    /// first successful `register_item_callback`. The dispatcher task owns
+    /// the `subscriber_channel`, the corresponding receiver, and the
+    /// `Vec<Arc<dyn ItemCallback>>` of registered listeners; it exits when
+    /// this sender (and any clones) drop.
+    keyspace_dispatcher_tx: tokio::sync::OnceCell<UnboundedSender<Arc<dyn ItemCallback>>>,
+
+    /// Counter: total keyevent payloads dispatched to the callback list.
+    /// Incremented after the payload-validation gate; observable via metrics.
+    #[metric(help = "Total Redis keyevent payloads dispatched to ItemCallbacks")]
+    keyspace_events_dispatched: AtomicU64,
+
+    /// Counter: payloads dropped because they exceeded
+    /// [`KEYSPACE_PAYLOAD_MAX_LEN`]. Observable via metrics.
+    #[metric(help = "Redis keyevent payloads dropped for exceeding the size cap")]
+    keyspace_payload_too_long_dropped: AtomicU64,
 }
 
 impl<C, M> Debug for RedisStore<C, M>
@@ -704,6 +732,14 @@ where
             .field("scan_count", &self.scan_count)
             .field("subscription_manager", &self.subscription_manager)
             .field("subscriber_channel", &self.subscriber_channel)
+            .field(
+                "enable_keyspace_notifications",
+                &self.enable_keyspace_notifications,
+            )
+            .field(
+                "keyspace_notifications_db",
+                &self.keyspace_notifications_db,
+            )
             .field("client_permits", &self.client_permits)
             .finish()
     }
@@ -753,6 +789,8 @@ where
         command_timeout: Duration,
         subscriber_channel: UnboundedReceiver<PushInfo>,
         connection_manager: M,
+        enable_keyspace_notifications: bool,
+        keyspace_notifications_db: i64,
     ) -> Result<Self, Error> {
         info!("Redis index fingerprint: {FINGERPRINT_CREATE_INDEX_HEX}");
 
@@ -770,6 +808,11 @@ where
             client_permits: Arc::new(Semaphore::new(max_client_permits)),
             max_count_per_cursor,
             command_timeout,
+            enable_keyspace_notifications,
+            keyspace_notifications_db,
+            keyspace_dispatcher_tx: tokio::sync::OnceCell::new(),
+            keyspace_events_dispatched: AtomicU64::new(0),
+            keyspace_payload_too_long_dropped: AtomicU64::new(0),
         })
     }
 
@@ -885,6 +928,290 @@ where
     }
 }
 
+/// Maximum byte length of a keyspace-notification payload we are willing to
+/// process. Production keys look like `<prefix><blake3-hex>-<u64>` ≈ 80 bytes;
+/// anything past 1 KiB is either misconfiguration or a hostile/cross-tenant
+/// key — drop it rather than allocate or hash it. Counted in
+/// `keyspace_payload_too_long_dropped`.
+const KEYSPACE_PAYLOAD_MAX_LEN: usize = 1024;
+
+/// Maximum number of in-flight `ItemCallback::callback` futures the
+/// dispatcher will run concurrently. A slow callback shouldn't head-of-line
+/// block other keyevents, but unbounded concurrency on a Redis-eviction
+/// storm would let the dispatcher OOM. 16 matches the rough order of
+/// magnitude of registered callbacks (typically 1-2) with headroom.
+const KEYSPACE_DISPATCH_CONCURRENCY: usize = 16;
+
+/// Required `notify-keyspace-events` flags. `E` enables keyevent channels,
+/// `g` enables generic commands (`DEL`), `e` enables eviction, `x` enables
+/// expiration. We merge with operator-set flags so we never trample.
+const REQUIRED_NOTIFY_FLAGS: &[char] = &['E', 'g', 'e', 'x'];
+
+/// Reverse of [`RedisStore::encode_key`] for keyspace-notification payloads.
+///
+/// Strips `key_prefix`, then attempts to parse the remainder as
+/// `<hex>-<size_bytes>` into a [`StoreKey::Digest`]. Falls back to
+/// [`StoreKey::Str`] if the remainder is not digest-shaped (no hyphen,
+/// non-hex hash, or unparseable size).
+///
+/// **Why this matters.** Wrapping caches like `ExistenceCacheStore` insert
+/// keys as `StoreKey::Digest` (because all CAS operations go through the
+/// `From<DigestInfo>` conversion). `StoreKey`'s `Hash` implementation salts
+/// by variant tag, so a `StoreKey::Str("abcd-0")` hashes to a different
+/// bucket than `StoreKey::Digest(...)` of the same value. Constructing the
+/// wrong variant means the callback fires against an empty bucket and the
+/// cache is never invalidated.
+///
+/// **Security.** Callers control `key_prefix`, but the Redis instance may be
+/// shared with foreign tenants whose keys also start with `key_prefix`
+/// (prefix-collision). This dispatch is best-effort invalidation — never
+/// trust the resulting `StoreKey` for authorization decisions. Length-cap on
+/// the payload is enforced by the caller (see `KEYSPACE_PAYLOAD_MAX_LEN`).
+fn parse_keyspace_payload(payload: &str, key_prefix: &str) -> Option<StoreKey<'static>> {
+    let stripped = payload.strip_prefix(key_prefix)?;
+    if let Some((hash, size)) = stripped.rsplit_once('-')
+        && let Ok(size_bytes) = size.parse::<u64>()
+        && let Ok(digest) = DigestInfo::try_new(hash, size_bytes)
+    {
+        return Some(StoreKey::Digest(digest));
+    }
+    // Non-digest keys (scheduler index entries, version markers, ...) are
+    // surfaced as `StoreKey::Str` so non-CAS subscribers can also invalidate.
+    Some(StoreKey::Str(Cow::Owned(stripped.to_string())))
+}
+
+impl<C, M> RedisStore<C, M>
+where
+    C: ConnectionLike + Clone + Send + Sync + Unpin + 'static,
+    M: RedisManager<C> + Unpin + Send + Sync + 'static,
+{
+    /// Initializes the keyspace-notification dispatcher exactly once.
+    ///
+    /// Returns:
+    /// - `Ok(sender)` containing the channel into the dispatcher task.
+    /// - `Err(_)` only when:
+    ///   - `enable_keyspace_notifications == false` and the caller would
+    ///     have expected callbacks to fire (so the operator notices that
+    ///     stale-positive invalidation is OFF), or
+    ///   - the underlying `CONFIG GET`/`CONFIG SET`/`PSUBSCRIBE` fails
+    ///     (e.g., ACL deny, command renamed).
+    ///
+    /// On the latter the OnceCell is left empty so a later registration can
+    /// retry after the operator fixes the ACL.
+    async fn init_keyspace_dispatcher(
+        self: &Arc<Self>,
+    ) -> Result<&UnboundedSender<Arc<dyn ItemCallback>>, Error> {
+        if !self.enable_keyspace_notifications {
+            return Err(make_err!(
+                Code::FailedPrecondition,
+                "RedisStore: enable_keyspace_notifications=false; ItemCallbacks will never \
+                 fire and wrapper caches such as ExistenceCacheStore will return stale-positive \
+                 results when keys are silently evicted. Set enable_keyspace_notifications=true \
+                 or remove the wrapper."
+            ));
+        }
+        self.keyspace_dispatcher_tx
+            .get_or_try_init(|| async { self.try_start_keyspace_dispatcher().await })
+            .await
+    }
+
+    async fn try_start_keyspace_dispatcher(
+        self: &Arc<Self>,
+    ) -> Result<UnboundedSender<Arc<dyn ItemCallback>>, Error> {
+        let subscriber_channel = self.subscriber_channel.lock().take().ok_or_else(|| {
+            make_err!(
+                Code::FailedPrecondition,
+                "RedisStore subscriber_channel already consumed by SchedulerSubscriptionManager; \
+                 keyspace dispatch and scheduler subscription cannot share a single RedisStore \
+                 instance — use separate stores."
+            )
+        })?;
+
+        let mut client = self.get_client().await?;
+        // CONFIG GET on RESP3 returns a map; on RESP2 a flat 2-element
+        // array. The redis crate's HashMap decoder accepts either.
+        let current: HashMap<String, String> = redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("notify-keyspace-events")
+            .query_async(&mut client.connection_manager)
+            .await
+            .err_tip(|| {
+                "CONFIG GET notify-keyspace-events failed; the configured Redis user likely \
+                 lacks the CONFIG ACL. Set enable_keyspace_notifications=false or grant the \
+                 ACL"
+            })?;
+        let existing = current
+            .get("notify-keyspace-events")
+            .cloned()
+            .unwrap_or_default();
+        let mut merged = existing.clone();
+        for ch in REQUIRED_NOTIFY_FLAGS {
+            if !merged.contains(*ch) {
+                merged.push(*ch);
+            }
+        }
+        if merged != existing {
+            // First-time mutation of operator-managed config — surface in
+            // audit log so unexpected changes are noticed.
+            warn!(
+                previous = %existing,
+                new = %merged,
+                "RedisStore: mutating server notify-keyspace-events to enable ItemCallback dispatch"
+            );
+            let _: () = redis::cmd("CONFIG")
+                .arg("SET")
+                .arg("notify-keyspace-events")
+                .arg(&merged)
+                .query_async(&mut client.connection_manager)
+                .await
+                .err_tip(|| {
+                    "CONFIG SET notify-keyspace-events failed; ACL or RENAME-COMMAND likely. \
+                     Set enable_keyspace_notifications=false or grant the ACL"
+                })?;
+        }
+        drop(client);
+
+        let db = self.keyspace_notifications_db;
+        for event in ["del", "expired", "evicted"] {
+            let pattern = format!("__keyevent@{db}__:{event}");
+            self.connection_manager
+                .psubscribe(&pattern)
+                .await
+                .err_tip(|| format!("psubscribe {pattern} failed"))?;
+        }
+
+        let (callback_tx, callback_rx) = unbounded_channel::<Arc<dyn ItemCallback>>();
+        let weak_self = Arc::downgrade(self);
+        let key_prefix = self.key_prefix.clone();
+        // Spawn freestanding task. We use `background_spawn!` (NOT `spawn!`)
+        // because the latter returns a `JoinHandleDropGuard` that aborts the
+        // task on drop. This task is supposed to outlive its caller — it
+        // owns the push channel, the receiver, and the callback list, and
+        // exits naturally when `callback_tx` drops (when `RedisStore` drops).
+        background_spawn!(
+            "redis_keyspace_dispatcher",
+            Self::run_keyspace_dispatcher(
+                weak_self,
+                key_prefix,
+                subscriber_channel,
+                callback_rx,
+            )
+        );
+        Ok(callback_tx)
+    }
+
+    async fn run_keyspace_dispatcher(
+        weak_self: Weak<Self>,
+        key_prefix: String,
+        subscriber_channel: UnboundedReceiver<PushInfo>,
+        mut callback_rx: UnboundedReceiver<Arc<dyn ItemCallback>>,
+    ) {
+        let mut subscriber_stream = UnboundedReceiverStream::new(subscriber_channel);
+        let mut callbacks: Vec<Arc<dyn ItemCallback>> = Vec::new();
+        let mut inflight: JoinSet<()> = JoinSet::new();
+
+        loop {
+            select! {
+                maybe_cb = callback_rx.recv() => {
+                    match maybe_cb {
+                        Some(cb) => callbacks.push(cb),
+                        None => {
+                            debug!("RedisStore dropped; keyspace dispatcher exiting");
+                            return;
+                        }
+                    }
+                }
+                maybe_push = subscriber_stream.next() => {
+                    let Some(push_info) = maybe_push else {
+                        debug!("redis push channel closed; keyspace dispatcher exiting");
+                        return;
+                    };
+                    if push_info.kind != redis::PushKind::PMessage {
+                        trace!(?push_info.kind, "redis push, not PMessage");
+                        continue;
+                    }
+                    if push_info.data.len() < 3 {
+                        trace!(?push_info, "redis PMessage missing fields");
+                        continue;
+                    }
+                    let payload_bytes = match push_info.data.last().expect("len>=3") {
+                        Value::SimpleString(s) => s.as_bytes(),
+                        Value::BulkString(b) => b.as_slice(),
+                        _ => continue,
+                    };
+                    if payload_bytes.len() > KEYSPACE_PAYLOAD_MAX_LEN {
+                        if let Some(store) = weak_self.upgrade() {
+                            store
+                                .keyspace_payload_too_long_dropped
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        warn!(
+                            len = payload_bytes.len(),
+                            cap = KEYSPACE_PAYLOAD_MAX_LEN,
+                            "redis keyevent payload too long; dropped"
+                        );
+                        continue;
+                    }
+                    if payload_bytes.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+                        // Reject control chars and NUL — these never appear
+                        // in legitimate StoreKeys we generate.
+                        trace!("redis keyevent payload has control chars; dropped");
+                        continue;
+                    }
+                    let Ok(payload) = str::from_utf8(payload_bytes) else {
+                        trace!("redis keyevent payload not utf8; dropped");
+                        continue;
+                    };
+                    let Some(store_key) = parse_keyspace_payload(payload, &key_prefix) else {
+                        // Foreign tenant or different prefix.
+                        continue;
+                    };
+
+                    let Some(store) = weak_self.upgrade() else {
+                        return;
+                    };
+                    store.keyspace_events_dispatched.fetch_add(1, Ordering::Relaxed);
+                    drop(store);
+
+                    debug!(key = %store_key, "redis keyevent for tracked key");
+
+                    // Backpressure: if the per-callback work is piling up,
+                    // wait for one to finish before queuing the next batch.
+                    while inflight.len() >= KEYSPACE_DISPATCH_CONCURRENCY {
+                        match inflight.join_next().await {
+                            None => break,
+                            Some(Err(join_err)) if join_err.is_panic() => {
+                                error!(
+                                    ?join_err,
+                                    "redis keyspace ItemCallback panicked; continuing dispatch"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    for cb in &callbacks {
+                        let cb = Arc::clone(cb);
+                        let key_for_cb = store_key.borrow().into_owned();
+                        inflight.spawn(async move {
+                            cb.callback(key_for_cb).await;
+                        });
+                    }
+                }
+                Some(finished) = inflight.join_next(), if !inflight.is_empty() => {
+                    if let Err(join_err) = finished
+                        && join_err.is_panic()
+                    {
+                        error!(
+                            ?join_err,
+                            "redis keyspace ItemCallback panicked; continuing dispatch"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
     /// Test/observability helper: returns the size of the underlying
     /// connection pool. The store exposes this so callers can verify
@@ -955,6 +1282,12 @@ impl RedisStore<ClusterConnection, ClusterRedisManager<ClusterConnection>> {
             command_timeout * 2,
             subscriber_channel,
             ClusterRedisManager::new(client.get_async_connection().await?).await?,
+            // Keyspace notification semantics in cluster mode are documented
+            // as undefined; force-disable so we never CONFIG SET against a
+            // cluster node. Operators relying on cluster-mode keyspace
+            // notifications must wire that up out-of-band.
+            false,
+            0,
         )
         .await
         .map(Arc::new)
@@ -1080,6 +1413,8 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
         let scan_count = spec.scan_count;
         let max_client_permits = spec.max_client_permits;
         let max_count_per_cursor = spec.max_count_per_cursor;
+        let enable_keyspace_notifications = spec.enable_keyspace_notifications;
+        let keyspace_notifications_db = spec.keyspace_notifications_db;
 
         let manager = StandardRedisManager::new_with_pool_size(
             Box::new(move || Box::pin(Self::connect(spec.clone(), tx.clone()))),
@@ -1114,6 +1449,8 @@ impl RedisStore<ConnectionManager, StandardRedisManager<ConnectionManager>> {
             command_timeout * 2,
             subscriber_channel,
             manager,
+            enable_keyspace_notifications,
+            keyspace_notifications_db,
         )
         .await
         .map(Arc::new)
@@ -2083,9 +2420,46 @@ where
 
     fn register_item_callback(
         self: Arc<Self>,
-        _callback: Arc<dyn ItemCallback>,
+        callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error> {
-        // As redis doesn't drop stuff, we can just ignore this
+        // Fast path: dispatcher already running.
+        if let Some(tx) = self.keyspace_dispatcher_tx.get() {
+            return tx.send(callback).map_err(|_| {
+                make_err!(
+                    Code::Internal,
+                    "RedisStore keyspace dispatcher task has exited; ItemCallbacks cannot be registered"
+                )
+            });
+        }
+        // Slow path: dispatcher initialization is async (CONFIG SET +
+        // PSUBSCRIBE), but the trait method is sync. Capture the in-flight
+        // registration in a background task so the caller doesn't block.
+        // The OnceCell guarantees single-init even with concurrent callers.
+        //
+        // Why background_spawn (not spawn): wrapping caches like
+        // `ExistenceCacheStore` register their callback at startup and then
+        // drop the returned `JoinHandleDropGuard` immediately — `spawn!`
+        // would abort the init task before it ran.
+        let store = Arc::clone(&self);
+        background_spawn!("redis_keyspace_dispatch_init", async move {
+            match store.init_keyspace_dispatcher().await {
+                Ok(tx) => {
+                    if tx.send(callback).is_err() {
+                        warn!(
+                            "redis keyspace dispatcher exited before registration could complete"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "RedisStore: keyspace-notification dispatcher could not start; \
+                         ItemCallbacks will not fire. In production this disables \
+                         stale-cache invalidation for evicted keys"
+                    );
+                }
+            }
+        });
         Ok(())
     }
 

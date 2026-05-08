@@ -1,6 +1,6 @@
 # Design v2: Redis ↔ ExistenceCache Consistency
 
-**Status**: design under revision; **NOT yet implementation-ready** per multiple reviewer BLOCKERs (see §0.2). Tracked under tasks #100 (AC store eviction callbacks) and #102 (existence-cache phantom-positive consistency hole).
+**Status (2026-05-08)**: Phase 1 (push-based invalidation) IMPLEMENTED on `redis-eviction-notify` for #100 (AC store eviction callbacks). Closes the stale-positive hole when keys are evicted from Redis under `maxmemory-policy=allkeys-lru`. Phase 2 (SCAN reconciler on reconnect) and Phase 3 (overflow-triggers-reconcile) remain DEFERRED — Phase 1 ships without Phase 3 because the chosen unbounded mpsc for callback registration carries no event payload (registrations are extremely rare; it's the `subscriber_channel` that carries events, and that's already unbounded by the redis crate). On overflow of the inflight `JoinSet`, the dispatcher applies cooperative backpressure via `join_next().await` rather than dropping events.
 
 **Authored** 2026-04-25 by sub-agent + iterated with 7 reviewer reports (code-reviewer, perf-optimizer, security-reviewer, code-simplifier, testing-czar, rust-crate-reviewer, red-team). Original v1 was an inline reply; this v2 folds the reviewer feedback into a single durable doc and reframes the premise per red-team's challenge.
 

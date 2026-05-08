@@ -111,6 +111,12 @@ async fn make_mock_store_with_prefix(
         Duration::from_secs(20),
         rx,
         manager,
+        // Mock-backed tests don't run the keyspace dispatcher (no real
+        // Redis to PSUBSCRIBE / CONFIG SET against). Force-disable; the
+        // keyspace path is exercised end-to-end by the
+        // `redis-integration-tests`-gated integration suite.
+        false,
+        0,
     )
     .await
     .unwrap()

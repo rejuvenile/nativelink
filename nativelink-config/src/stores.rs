@@ -1726,6 +1726,41 @@ pub struct RedisSpec {
     /// Default: 1500
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub max_count_per_cursor: u64,
+
+    /// Whether the store should subscribe to Redis keyspace notifications
+    /// (`__keyevent@<db>__:{del,expired,evicted}`) and dispatch them to
+    /// every `ItemCallback` registered via `register_item_callback`.
+    ///
+    /// When `true`, on the first `register_item_callback` call the store
+    /// issues `CONFIG SET notify-keyspace-events <merged>` (merged with any
+    /// operator-set flags so we never trample) and `PSUBSCRIBE
+    /// __keyevent@<db>__:{del,expired,evicted}`. When `false`, those
+    /// operations are skipped and registered callbacks will never fire —
+    /// wrapper caches such as `ExistenceCacheStore` will keep stale-positive
+    /// entries when keys are silently evicted under
+    /// `maxmemory-policy=allkeys-lru`.
+    ///
+    /// Set to `false` if the configured Redis user lacks `CONFIG` ACLs, the
+    /// `CONFIG` command has been renamed/disabled, or notifications are
+    /// configured out-of-band and you want NativeLink to skip the runtime
+    /// mutation.
+    ///
+    /// Default: `true`
+    #[serde(default = "default_enable_keyspace_notifications")]
+    pub enable_keyspace_notifications: bool,
+
+    /// Logical Redis database index to subscribe to for keyspace
+    /// notifications. Used to construct the `__keyevent@<db>__:*` channel
+    /// pattern. Has no effect in cluster mode (cluster mode keyspace
+    /// notification semantics are documented as undefined in Redis).
+    ///
+    /// Default: 0 (the standard Redis default db).
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub keyspace_notifications_db: i64,
+}
+
+const fn default_enable_keyspace_notifications() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
