@@ -366,6 +366,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_get_part_err()
         fast_direction: StoreDirection::Both,
         slow_direction: StoreDirection::Both,
         chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
     };
     let fast_slow = FastSlowStore::new(&spec, fast, slow).with_local_only_reads();
     let fast_slow_store = Store::new(fast_slow);

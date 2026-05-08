@@ -193,6 +193,7 @@ async fn non_wps_slow_store_fallback_err_terminates_writer_with_structured_error
         fast_direction: StoreDirection::Both,
         slow_direction: StoreDirection::Both,
         chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
     };
     let fast_slow = FastSlowStore::new(&spec, fast, slow);
 

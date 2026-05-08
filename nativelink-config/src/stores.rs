@@ -809,6 +809,40 @@ pub struct FastSlowSpec {
     /// Default: false
     #[serde(default)]
     pub chunked_reads_enabled: bool,
+
+    /// #334 Fix B: aggregate byte cap on the per-`FastSlowStore`
+    /// `in_flight_slow_writes` map. The map pins every blob whose
+    /// background slow-store write has not terminated; under slow-tier
+    /// wedge (e.g. transient gRPC unreachability, ZFS txg pause) the
+    /// map grows at upload rate × wedge duration with no bound, which
+    /// produced the production OOM cascade observed 2026-05-08 (67 GB
+    /// RSS at 1h15m uptime, climbing).
+    ///
+    /// When the next insert would push aggregate bytes past this cap,
+    /// `update` / `update_oneshot` return
+    /// `Code::ResourceExhausted` carrying the typed
+    /// `BackpressureSignal::SlowWritesAtCapacity` discriminator (see
+    /// `nativelink-proto/.../worker_api.proto`). The discriminator
+    /// keeps `looks_like_dead_channel` from misclassifying the
+    /// rejection as a dead h2 channel (#147 regression risk).
+    ///
+    /// Default: 8 GiB. Conservative — big enough to absorb a multi-
+    /// second slow-tier hiccup at line-rate writes, small enough that
+    /// a multi-minute wedge cannot drag the process into OOM territory
+    /// at typical 64 GB worker / 256 GB server RAM footprints.
+    ///
+    /// Zero is treated as "no cap" — preserves the historic unbounded
+    /// behavior bit-identically for callers that explicitly opt out
+    /// (e.g. for tests that want to drive the bug repro path).
+    #[serde(default = "default_slow_writes_in_flight_max_bytes")]
+    #[serde(deserialize_with = "convert_data_size_with_shellexpand")]
+    pub slow_writes_in_flight_max_bytes: u64,
+}
+
+/// Default cap for `FastSlowSpec::slow_writes_in_flight_max_bytes`.
+/// 8 GiB — see field doc-comment for the rationale.
+fn default_slow_writes_in_flight_max_bytes() -> u64 {
+    8 * 1024 * 1024 * 1024
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]

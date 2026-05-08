@@ -119,6 +119,7 @@ async fn make_e2e_fast_slow(
             // chunked_fast_slow,test-utils. Default-false matches
             // production until the kill-switch is flipped.
             chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         },
         fast_store,
         slow_store,

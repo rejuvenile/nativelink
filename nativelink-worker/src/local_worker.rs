@@ -2671,6 +2671,7 @@ pub async fn new_local_worker(
             // Worker-side wrapper FSS; the chunked-read cascade lives
             // on the server, never on the worker, so leave OFF.
             chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         };
         let new_fss = FastSlowStore::new(&fss_spec, fast_store, proxy_store);
         info!(
@@ -2774,6 +2775,7 @@ pub async fn new_local_worker(
             // Worker-side wrapper FSS; the chunked-read cascade lives
             // on the server, never on the worker, so leave OFF.
             chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         };
         FastSlowStore::new_with_shared_failed_writes(
             &fss_spec,

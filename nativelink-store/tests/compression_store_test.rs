@@ -664,6 +664,7 @@ async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(MemoryStore::new(&MemorySpec::default())),

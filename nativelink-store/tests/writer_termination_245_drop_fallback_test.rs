@@ -500,6 +500,7 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
             fast_direction: nativelink_config::stores::StoreDirection::default(),
             slow_direction: nativelink_config::stores::StoreDirection::default(),
             chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         },
         fast_store_typed,
         slow,

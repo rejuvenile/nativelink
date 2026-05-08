@@ -142,6 +142,7 @@ async fn make_fast_slow_with_dispatcher(
             // (config wire-up). Default-false preserves prior
             // semantics; this test does not depend on the read-cascade.
             chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         },
         fast_store,
         slow_store,
@@ -798,6 +799,7 @@ async fn fast_tier_ok_dispatch_err_records_failed_slow_write() {
             // (config wire-up). Default-false preserves prior
             // semantics; this test does not depend on the read-cascade.
             chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         },
         fast_store,
         slow_store,

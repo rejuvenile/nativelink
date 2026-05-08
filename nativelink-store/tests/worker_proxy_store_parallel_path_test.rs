@@ -309,6 +309,7 @@ async fn waiter_path_inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_d
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         },
         Store::new(MemoryStore::new(&MemorySpec::default())),
         Store::new(Arc::new(SlowNotFoundStore {

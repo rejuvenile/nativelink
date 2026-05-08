@@ -767,6 +767,18 @@ pub mod backpressure_signal {
         /// / should retry after `retry_after_ms` once existing chunked
         /// / commits drain.
         PinnedBytesExhausted = 4,
+        /// / #334 Fix B: the per-`FastSlowStore` aggregate
+        /// / `in_flight_slow_writes` byte cap is exhausted. Each background
+        /// / slow-store write pins its full chunk Vec until the slow-tier
+        /// / write terminates; under slow-tier wedge (e.g. ZFS txg pause,
+        /// / transient gRPC unreachability) the in-flight pin grows at
+        /// / upload rate × wedge duration. The cap is the per-FSS
+        /// / counterpart to `PinnedBytesExhausted`'s global chunked-pin
+        /// / budget — without it, the legacy spawn-task path can OOM the
+        /// / process during a slow-tier wedge (production cascade
+        /// / 2026-05-08 at 67 GB RSS / 1h15m). Caller should retry after
+        /// / `retry_after_ms` once existing slow writes drain.
+        SlowWritesAtCapacity = 5,
     }
     impl Reason {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -780,6 +792,7 @@ pub mod backpressure_signal {
                 Self::PerBlobMpscFull => "PER_BLOB_MPSC_FULL",
                 Self::MemoryStoreAtCapacity => "MEMORY_STORE_AT_CAPACITY",
                 Self::PinnedBytesExhausted => "PINNED_BYTES_EXHAUSTED",
+                Self::SlowWritesAtCapacity => "SLOW_WRITES_AT_CAPACITY",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -790,6 +803,7 @@ pub mod backpressure_signal {
                 "PER_BLOB_MPSC_FULL" => Some(Self::PerBlobMpscFull),
                 "MEMORY_STORE_AT_CAPACITY" => Some(Self::MemoryStoreAtCapacity),
                 "PINNED_BYTES_EXHAUSTED" => Some(Self::PinnedBytesExhausted),
+                "SLOW_WRITES_AT_CAPACITY" => Some(Self::SlowWritesAtCapacity),
                 _ => None,
             }
         }
