@@ -1038,25 +1038,39 @@ where
             // (`redis://server/3` vs `keyspace_notifications_db: 0`) would
             // otherwise leave the dispatcher subscribed to the wrong db with
             // no observable signal — silent stale-positive cache returns.
+            //
+            // Use `redis::IntoConnectionInfo` directly so the cross-check
+            // mirrors the actual db resolution the connection performs. This
+            // matters because the redis crate uses different rules per scheme:
+            //  - TCP `redis://host[:port][/N]` → db from path-segment
+            //    (`url.path().trim_matches('/')`).
+            //  - Unix `redis+unix:///path?db=N` → db from query-pair
+            //    (`query.get("db")`).
+            //  - Sentinel `redis+sentinel://...` is reduced to `redis://...`
+            //    in `RedisStore::connect` before parsing, so we apply the
+            //    same substitution here.
+            // A path-only check (e.g. `Url::path_segments`) silently passes
+            // for the production URL form `redis+unix:///run/valkey/valkey.sock?db=N`,
+            // making the cross-check a footgun against the deployment shape it
+            // exists to defend. `IntoConnectionInfo` is the same path
+            // `RedisStore::connect` calls, so the validator and the runtime
+            // cannot disagree by construction.
             // We only check the first address; multi-address standard mode is
             // rejected separately by `new_standard`.
-            let url_str = &spec.addresses[0];
-            let trimmed = url_str
+            let url_str = spec.addresses[0]
                 .replace("redis+sentinel://", "redis://");
-            // Use Url::parse for robust URL parsing rather than substring
-            // hacks; avoids false positives on usernames/passwords with `/`.
-            if let Ok(parsed) = Url::parse(&trimmed) {
-                let url_db: Option<u8> = parsed
-                    .path_segments()
-                    .and_then(|mut segs| segs.next())
-                    .filter(|s| !s.is_empty())
-                    .and_then(|s| s.parse::<u8>().ok());
-                if let Some(url_db) = url_db
-                    && url_db != spec.keyspace_notifications_db
-                {
+            if let Ok(connection_info) = url_str.into_connection_info() {
+                // `RedisConnectionInfo::db()` returns `i64`; the redis crate
+                // does not bound it to `0..=255`, but Redis itself
+                // conventionally supports 0..15 (`databases 16` default), so
+                // the explicit config field is `u8`. A negative or > 255
+                // value is a config-level error the redis crate will catch
+                // on connect; we treat any mismatch as a fail-fast signal.
+                let url_db = connection_info.redis_settings().db();
+                if url_db != i64::from(spec.keyspace_notifications_db) {
                     return Err(make_err!(
                         Code::FailedPrecondition,
-                        "RedisSpec: connection URL specifies db={url_db} but \
+                        "RedisSpec: connection URL resolves to db={url_db} but \
                          keyspace_notifications_db={configured}. Either match them or omit \
                          the db from the URL. Mismatch silently subscribes to the wrong db \
                          and disables stale-positive invalidation.",
