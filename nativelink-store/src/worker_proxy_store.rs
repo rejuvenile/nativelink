@@ -54,6 +54,7 @@ use crate::batch_read_coalescer::{BatchFn, BatchReadCoalescer};
 use crate::chunked_signal::error_has_backpressure_signal;
 use crate::fast_slow_store::INNER_MISS_NO_TERMINATE;
 use crate::grpc_store::GrpcStore;
+use crate::singleflight::SingleflightMap;
 
 /// A store wrapper that transparently proxies CAS reads from workers when
 /// the inner store returns NotFound. This enables worker-to-worker blob sharing.
@@ -148,6 +149,18 @@ pub struct WorkerProxyStore {
     /// (forward `Err`), causing the forward loop to drop `cache_tx`
     /// and abandon the cache-tee.
     cdn_tee_cache_abandoned_consumer_eof_total: Arc<AtomicU64>,
+    /// #130 — singleflight/dedup map for concurrent same-digest peer
+    /// fetches. Collapses the "N callers, same digest, ms apart" cohort
+    /// pattern into 1 leader peer-fetch + N-1 waiters that re-read from
+    /// local CAS once the leader's cache task completes. Bypassed for
+    /// partial-range reads, oversized blobs, and when the cap is
+    /// exceeded — same gating predicate as the CDN-tee. The signal
+    /// payload is empty (`Vec::new()`); waiters use it as a
+    /// "cache-now-populated" barrier and stream from `inner.get_part`,
+    /// preserving the `streaming_required` design from
+    /// `project_sf_wireup_design_streaming_required` (no `Vec<Bytes>`
+    /// buffering anywhere).
+    singleflight: Arc<SingleflightMap>,
 }
 
 /// Per-endpoint mirror state: in-flight permits and consecutive-failure tracking.
@@ -550,6 +563,7 @@ impl WorkerProxyStore {
             cdn_tee_cache_completed_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_full_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
+            singleflight: SingleflightMap::new(),
         })
     }
 
@@ -579,6 +593,7 @@ impl WorkerProxyStore {
             cdn_tee_cache_completed_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_full_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
+            singleflight: SingleflightMap::new(),
         })
     }
 
@@ -649,6 +664,17 @@ impl WorkerProxyStore {
             self.cdn_tee_cache_abandoned_full_total.load(Ordering::Relaxed),
             self.cdn_tee_cache_abandoned_consumer_eof_total
                 .load(Ordering::Relaxed),
+        )
+    }
+
+    /// Test/observability: snapshot the #130 SingleflightMap counters
+    /// `(total_dedup_hits, total_bypasses_cap)`. Useful for asserting
+    /// dedup engaged in concurrent-fetch tests.
+    #[must_use]
+    pub fn singleflight_counters_snapshot(&self) -> (u64, u64) {
+        (
+            self.singleflight.total_dedup_hits(),
+            self.singleflight.total_bypasses_cap(),
         )
     }
 
@@ -1495,13 +1521,84 @@ impl WorkerProxyStore {
     const MAX_CACHE_BLOB_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 
     /// Wrapper around a peer's `get_part` that tees the data to both the
-    /// caller's writer and a background write to the inner store.
+    /// caller's writer and a background write to the inner store, with
+    /// #130 singleflight dedup of concurrent same-digest peer-fetches
+    /// layered on top.
     ///
     /// For full-blob reads (`offset == 0 && length.is_none()`) of blobs
     /// within `MAX_CACHE_BLOB_SIZE`, the bytes are forwarded chunk-by-chunk
     /// to the caller AND fanned out to a spawned cache task that writes
     /// the blob to `self.inner`. For partial reads or oversized blobs,
-    /// streams directly without caching.
+    /// streams directly without caching AND without singleflight.
+    ///
+    /// # #130 SingleflightMap wire-up (Option C, 2026-05-07)
+    ///
+    /// When SF dedup is eligible (full-blob read ≤ MAX_CACHE_BLOB_SIZE,
+    /// digest size > 0), the peer-fetch routes through
+    /// `self.singleflight.singleflight(...)`. Three roles emerge:
+    ///
+    /// * **Leader / Bypass** (the role's `fetcher` closure runs): does
+    ///   the existing #230 detached-cache flow via
+    ///   `get_part_and_cache_inner`, IMMEDIATELY detaches the cache
+    ///   `JoinHandle` (preserving the #230 contract), and signals SF
+    ///   based on the FORWARD outcome alone (Ok if bytes reached
+    ///   Bazel, Err if the peer fetch failed). The leader's CALLER
+    ///   receives the same forward outcome via a side-channel
+    ///   `Arc<parking_lot::Mutex<Option<...>>>` — kept identical to
+    ///   the SF signal here for symmetry, but routed via the side-
+    ///   channel because the SF API ties leader return = waiter
+    ///   broadcast.
+    /// * **Waiter** (the closure does NOT run): waits for the leader's
+    ///   SF signal. On `Ok`: tries `self.inner.get_part(...)` — the
+    ///   leader's spawned cache task is detached and may or may not
+    ///   have completed by now. On hit: cheap CAS read (no peer
+    ///   round-trip). On `NotFound` with zero bytes written: falls
+    ///   back to a direct (non-SF) `get_part_and_cache_inner` call.
+    ///   This is the race-window safety net — when the leader's cache
+    ///   hasn't landed yet (or was abandoned via `try_send` Full),
+    ///   the waiter pays peer-fetch cost. This degrades gracefully to
+    ///   the pre-#130 behavior (each waiter does its own peer-fetch);
+    ///   no waiter is ever wedged.
+    /// * **Bypass** (cap exceeded): runs the closure too — same code
+    ///   path as Leader. Cache is detached either way.
+    ///
+    /// This is the "streaming-required" wire-up from
+    /// `project_sf_wireup_design_streaming_required` — there is NEVER
+    /// any `Vec<Bytes>` buffering of payload at the SF layer. The SF
+    /// payload is always `Vec::new()` (empty) and acts purely as a
+    /// barrier; bytes flow chunk-by-chunk through the leader's writer
+    /// (forward path) and the leader's cache task → CAS → waiter's
+    /// `inner.get_part` (waiter path).
+    ///
+    /// ## Choice (α): leader detaches cache and signals on forward only
+    ///
+    /// The Leader/Bypass closure DETACHES `cache_handle` (drops it
+    /// without awaiting) and signals SF based on `forward_result`
+    /// alone. Rationale: awaiting `cache_handle` would couple the
+    /// leader's outer return latency to the cache task's completion
+    /// time. With the existing slow-cache test
+    /// (`cdn_tee_slow_cache_abandons_does_not_block_bazel` —
+    /// 5 s/update inner store, 4 s assertion), an `await` would
+    /// regress the #229 contract that "Bazel rate is decoupled from
+    /// slow cache" — the leader's `proxy.get_part_unchunked` (which
+    /// `join!`s `rx.consume` AND `get_part`) would wait for `get_part`
+    /// to return, which would wait for cache.
+    ///
+    /// The cost of choice (α): a race window between leader-signal-Ok
+    /// and cache-task-complete. A waiter that wakes during this window
+    /// finds CAS empty and falls back to direct peer-fetch. In the
+    /// pathological "5 s slow cache" case the entire waiter cohort
+    /// falls back — equivalent to NO singleflight, which is the
+    /// pre-#130 baseline. In the COMMON case (cache write rate >>
+    /// peer fetch rate, e.g. 100s of MB/s SSD vs 10s of MB/s peer
+    /// gRPC), cache completes WHILE the leader's forward is still
+    /// streaming, so by the time the waiter reaches `inner.get_part`
+    /// the CAS already has the blob — full SF dedup engages.
+    ///
+    /// (β) — leader awaits cache before signaling — was prototyped
+    /// and rejected: it red-tripped the slow-cache decoupling test
+    /// and introduced architectural sign-off concerns under CLAUDE.md
+    /// "async↔sync coupling" trip-wire.
     ///
     /// # Architecture (#230 — user-approved 2026-05-02)
     ///
@@ -1565,6 +1662,12 @@ impl WorkerProxyStore {
             && length.is_none()
             && digest.size_bytes() <= Self::MAX_CACHE_BLOB_SIZE;
 
+        // SF dedup gate: same predicate as `should_cache`, plus reject
+        // empty digests (they're handled trivially elsewhere and dedup
+        // adds zero value). Per the design doc Option B: full-blob
+        // reads only.
+        let should_use_sf = should_cache && digest.size_bytes() > 0;
+
         if !should_cache {
             // Loop-terminator propagation: set IS_WORKER_REQUEST=true on
             // peer→peer calls so the receiving worker enters responder
@@ -1577,6 +1680,201 @@ impl WorkerProxyStore {
                 .scope(true, peer_store.get_part(key, &mut *writer, offset, length))
                 .await;
         }
+
+        if !should_use_sf {
+            // Eligible for cache but not SF (e.g., zero-length blob).
+            // Run the inner detached-cache path directly without SF
+            // coordination.
+            let (forward_result, cache_handle) = self
+                .get_part_and_cache_inner(peer_store, key, writer, offset, length)
+                .await;
+            // Detach (existing behavior — no bytes-in-flight latency cost).
+            drop(cache_handle);
+            return forward_result;
+        }
+
+        // ====================================================================
+        // SF wire-up — see fn-level docs for design rationale.
+        // ====================================================================
+        //
+        // Side-channel: the leader's closure populates this with the
+        // forward result so the leader's CALLER (this stack frame) can
+        // return the real outcome instead of the SF signal (which
+        // encodes cache outcome, not forward outcome).
+        let leader_forward_outcome: Arc<parking_lot::Mutex<Option<Result<(), Error>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let was_leader_or_bypass: Arc<core::sync::atomic::AtomicBool> =
+            Arc::new(core::sync::atomic::AtomicBool::new(false));
+
+        let outcome_for_closure = leader_forward_outcome.clone();
+        let was_leader_clone = was_leader_or_bypass.clone();
+
+        // The SF closure borrows `&mut writer`, `self`, and `peer_store`.
+        // Send: `&mut DropCloserWriteHalf` is Send (Bytes/sender are Send),
+        //       `&Self` is Send (WorkerProxyStore is Sync), `&Store` is
+        //       Send (Store wraps Arc<dyn StoreDriver + Send + Sync>).
+        // Lifetime: the closure / future is bounded by the
+        // `singleflight().await` call's lifetime — the SF API does NOT
+        // 'static-bound the fetcher (see `singleflight.rs:236-244`), it
+        // only requires Send. We await singleflight() inline below, so
+        // the borrows are valid.
+        //
+        // We re-borrow `writer` and clone `key` for the closure so the
+        // original bindings remain available on the waiter path after
+        // SF returns (FnOnce consumes the captures unconditionally,
+        // even on the waiter path where the closure body never runs).
+        let writer_for_closure: &mut DropCloserWriteHalf = &mut *writer;
+        let key_for_closure: StoreKey<'_> = key.borrow();
+        let sf_signal = self
+            .singleflight
+            .singleflight(
+                key.borrow().into_owned(),
+                digest.size_bytes(),
+                move || async move {
+                    was_leader_clone.store(true, Ordering::SeqCst);
+                    let (forward_result, cache_handle) = self
+                        .get_part_and_cache_inner(
+                            peer_store,
+                            key_for_closure,
+                            writer_for_closure,
+                            offset,
+                            length,
+                        )
+                        .await;
+
+                    // CRITICAL (#229 invariant — see fn-level docs choice
+                    // (α) section): DETACH `cache_handle` here. Do NOT
+                    // await — that would couple the leader's outer return
+                    // latency to the cache task and red-trip
+                    // `cdn_tee_slow_cache_abandons_does_not_block_bazel`.
+                    drop(cache_handle);
+
+                    // Stash forward result for the leader's caller path.
+                    // The SF signal IS the forward result here (no cache
+                    // outcome involved per choice (α)), but we route via
+                    // side-channel so the caller path is structurally
+                    // identical to a hypothetical (β) future redesign
+                    // and so the SF signal type remains decoupled from
+                    // the leader's caller-facing return type.
+                    let forward_for_caller = match &forward_result {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(e.clone()),
+                    };
+                    *outcome_for_closure.lock() = Some(forward_for_caller);
+
+                    // SF signal:
+                    // - forward Err → broadcast peer error to waiters
+                    //   (they'd hit the same peer; surface it cleanly).
+                    // - forward Ok → broadcast Ok(empty); waiters try
+                    //   `inner.get_part` (CAS may or may not have it
+                    //   yet — race window handled by waiter path).
+                    match forward_result {
+                        Err(e) => Err(e),
+                        Ok(()) => Ok(Vec::new()),
+                    }
+                },
+            )
+            .await;
+
+        if was_leader_or_bypass.load(Ordering::SeqCst) {
+            // Leader/Bypass path: closure ran; writer was populated by
+            // the inner forward loop. Return the actual forward result
+            // (NOT the SF signal — that encodes cache outcome).
+            return leader_forward_outcome
+                .lock()
+                .take()
+                .unwrap_or_else(|| {
+                    Err(make_err!(
+                        Code::Internal,
+                        "singleflight: leader closure ran but did not populate \
+                         forward outcome side-channel — bug"
+                    ))
+                });
+        }
+
+        // Waiter path: SF signal Ok ⇒ leader's forward succeeded.
+        // CAS may or may not contain the blob yet (race window — see
+        // choice (α) docs above). Try CAS; fall back to direct fetch
+        // if missed.
+        match sf_signal {
+            Ok(_payload) => {
+                // Capture writer's byte position so we can detect any
+                // partial-write before falling back (avoid stream
+                // corruption per #284 part 2 pattern).
+                let bytes_before = writer.get_bytes_written();
+                let inner_result = self
+                    .inner
+                    .get_part(key.borrow(), &mut *writer, offset, length)
+                    .await;
+                match inner_result {
+                    Ok(()) => Ok(()),
+                    Err(e)
+                        if e.code == Code::NotFound
+                            && writer.get_bytes_written() == bytes_before =>
+                    {
+                        // CAS race: leader's cache hasn't landed yet
+                        // (or was abandoned via try_send Full /
+                        // consumer EOF). Safe to fall back to direct
+                        // fetch — no bytes were written. The waiter
+                        // pays peer-fetch cost; SF dedup-amplification
+                        // protection is lost for this caller in this
+                        // race window, but no waiter is wedged.
+                        debug!(
+                            %digest,
+                            "singleflight: waiter NotFound in CAS despite leader \
+                             signal-Ok — cache write task hasn't completed \
+                             yet (or was abandoned); falling back to direct \
+                             peer fetch"
+                        );
+                        let (forward_result, cache_handle) = self
+                            .get_part_and_cache_inner(
+                                peer_store, key, writer, offset, length,
+                            )
+                            .await;
+                        drop(cache_handle); // detach — no SF cohort here
+                        forward_result
+                    }
+                    Err(e) => {
+                        // Either non-NotFound error, OR partial bytes
+                        // written (stream now corrupt). Surface as-is.
+                        Err(e).err_tip(|| {
+                            "singleflight waiter: inner.get_part error after \
+                             leader-signal-Ok"
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                // Leader's peer fetch failed — propagate to caller. The
+                // leader's caller already saw this error too; the
+                // waiter's upstream caller (try_read_from_worker) may
+                // try the next peer.
+                Err(e).err_tip(|| {
+                    "singleflight waiter: leader peer-fetch failed; surface \
+                     error to upstream peer-fallback loop"
+                })
+            }
+        }
+    }
+
+    /// Existing #230 detached-cache flow, refactored to:
+    /// * Return the spawned cache task's `JoinHandle<Result<(), Error>>`
+    ///   so the caller can choose to await it (Leader path under #130
+    ///   singleflight) or detach it (Bypass / pre-#130 behavior).
+    /// * Keep all the per-chunk forward-loop semantics from #230 intact.
+    ///
+    /// The cache task now returns `Result<(), Error>` (was `()`) — the
+    /// outcome flows into the SF signal computation in
+    /// `get_part_and_cache`.
+    async fn get_part_and_cache_inner(
+        &self,
+        peer_store: &Store,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> (Result<(), Error>, JoinHandle<Result<(), Error>>) {
+        let digest = key.borrow().into_digest();
 
         // Intermediate buf_channel that the peer's `get_part` writes into;
         // we then fan the bytes out to (a) the caller's writer and
@@ -1628,7 +1926,7 @@ impl WorkerProxyStore {
         // Wrap inner.update in a task-level timeout so a wedged inner
         // store cannot leak the spawned task (and its in-flight tracker
         // entry) indefinitely.
-        let cache_handle: JoinHandle<()> = tokio::spawn(async move {
+        let cache_handle: JoinHandle<Result<(), Error>> = tokio::spawn(async move {
             match tokio::time::timeout(
                 CDN_TEE_CACHE_TASK_TIMEOUT,
                 inner.update(cache_key, cache_rx, cache_size),
@@ -1642,6 +1940,7 @@ impl WorkerProxyStore {
                         size_bytes = digest.size_bytes(),
                         "proxy_cache: cached proxied blob in inner store"
                     );
+                    Ok(())
                 }
                 Ok(Err(e)) => {
                     warn!(
@@ -1650,6 +1949,7 @@ impl WorkerProxyStore {
                         ?e,
                         "proxy_cache: failed to cache proxied blob in inner store"
                     );
+                    Err(e)
                 }
                 Err(_elapsed) => {
                     error!(
@@ -1660,6 +1960,11 @@ impl WorkerProxyStore {
                          (temp file unlinked by EncodedFilePath::Drop background \
                          spawn since update_file did not reach emplace_file)"
                     );
+                    Err(make_err!(
+                        Code::DeadlineExceeded,
+                        "cache write task exceeded {}s timeout",
+                        CDN_TEE_CACHE_TASK_TIMEOUT.as_secs()
+                    ))
                 }
             }
         });
@@ -1848,25 +2153,30 @@ impl WorkerProxyStore {
             )),
         };
 
-        // Cache task is detached; we do NOT await it. The counters
-        // attempted/completed/abandoned-* expose its outcome to operators.
-        // The handle's drop is a no-op for `tokio::spawn`-detached tasks.
-        drop(cache_handle);
-
-        if let Err(get_err) = get_part_result {
+        // Cache task handle is RETURNED to the caller. The caller chooses:
+        // * Bypass / SF-disabled callers: drop(cache_handle) — preserves
+        //   the pre-#130 detached-cache behavior and the #229 "Bazel
+        //   reader never blocks on cache" invariant.
+        // * SF Leader: `cache_handle.await` — needed to determine the
+        //   waiter signal (Ok if cache landed in CAS, Err otherwise).
+        //   Awaiting happens AFTER the forward loop, so bytes-in-flight
+        //   to Bazel are unaffected; only response latency is paid.
+        let final_forward_result = if let Err(get_err) = get_part_result {
             // Peer's get_part errored — surface that. forward result is
             // derivative.
-            return Err(get_err);
-        }
-        // Peer succeeded. Surface forward error if any.
-        forward_result?;
+            Err(get_err)
+        } else if let Err(fwd_err) = forward_result {
+            Err(fwd_err)
+        } else {
+            debug!(
+                %digest,
+                size_bytes = total_bytes,
+                "get_part_and_cache: forward loop completed successfully"
+            );
+            Ok(())
+        };
 
-        debug!(
-            %digest,
-            size_bytes = total_bytes,
-            "get_part_and_cache: forward loop completed successfully"
-        );
-        Ok(())
+        (final_forward_result, cache_handle)
     }
 
     /// The original sequential get_part logic: try inner store, then parse

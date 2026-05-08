@@ -466,6 +466,21 @@ impl SingleflightMap {
         self.inner.current_inflight_bytes.load(Ordering::Relaxed)
     }
 
+    /// Cumulative count of waiters that joined an existing leader's
+    /// slot. Test/observability only — also published via the
+    /// `MetricsComponent` derive on the inner.
+    #[must_use]
+    pub fn total_dedup_hits(&self) -> u64 {
+        self.inner.total_dedup_hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of callers that bypassed dedup because the
+    /// cap would be exceeded. Test/observability only.
+    #[must_use]
+    pub fn total_bypasses_cap(&self) -> u64 {
+        self.inner.total_bypasses_cap.load(Ordering::Relaxed)
+    }
+
     /// Returns the current number of registered slots. Test only.
     #[must_use]
     pub fn slot_count(&self) -> usize {
