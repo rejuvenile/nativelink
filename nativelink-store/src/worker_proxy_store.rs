@@ -1859,19 +1859,22 @@ impl WorkerProxyStore {
                         // protection is lost for this caller in this
                         // race window, but no waiter is wedged.
                         //
-                        // The `!writer.is_pipe_broken()` guard is the
-                        // sibling-class to #171: today no production
-                        // layer between WPS and the leaf calls
-                        // `send_error` on NotFound (verified at
-                        // verify_store.rs ~:208-276 + memory_store.rs
-                        // ~:503), so the byte-counter alone catches
-                        // the live race. The pipe-broken check makes
-                        // the fall-back robust to a future
-                        // `WriteHalfGuard`-style defensive layer that
-                        // closes the writer on Err — without it,
-                        // `get_part_and_cache_inner` would re-enter
-                        // and trip "Tried to send while stream is
-                        // closed" on the first chunk.
+                        // The `!writer.is_pipe_broken()` guard is a
+                        // DEFENSIVE check against a hypothetical future
+                        // wrapper layer above WPS that closes the writer
+                        // on Err. Today, no such caller exists: WPS is
+                        // the outermost CAS wrapper, and no layer between
+                        // WPS and the leaf calls `send_error` on NotFound
+                        // (verified at verify_store.rs ~:208-276 +
+                        // memory_store.rs ~:503), so the byte-counter
+                        // alone catches the live race. If a future
+                        // `WriteHalfGuard`-style defensive wrapper lands
+                        // above WPS and starts closing the writer on
+                        // Err, this guard prevents `get_part_and_cache_inner`
+                        // from re-entering and tripping "Tried to send
+                        // while stream is closed" on the first chunk.
+                        // NOT a sibling of #171 (#171 was a real bug; this
+                        // is forward-compat hardening only).
                         self.singleflight.record_waiter_fallback();
                         debug!(
                             %digest,

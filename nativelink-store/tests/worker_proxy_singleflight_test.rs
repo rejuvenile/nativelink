@@ -1608,12 +1608,15 @@ mod wps_wireup {
     // Test 5 (writer-state robustness): waiter fall-back must NOT enter
     //   `get_part_and_cache_inner` when the borrowed writer is already
     //   closed (pipe broken via send_error from a wrapping layer).
-    //   This is the sibling-class to #171: today no production layer
-    //   between WPS and the leaf calls send_error on NotFound, but a
-    //   future defensive WriteHalfGuard-style wrapper would silently
-    //   trip "Tried to send while stream is closed" in the fall-back
-    //   path. The `is_pipe_broken()` guard at the waiter NotFound
-    //   match arm prevents that.
+    //   This is FORWARD-COMPAT HARDENING (NOT a sibling of #171 — #171
+    //   was a real production bug; this test guards against a
+    //   hypothetical future defensive WriteHalfGuard-style wrapper
+    //   above WPS). Today no production layer between WPS and the leaf
+    //   calls send_error on NotFound, so the byte-counter alone catches
+    //   the live race. If a future wrapper closes the writer on Err,
+    //   without this guard the fall-back would silently trip "Tried to
+    //   send while stream is closed" on the first chunk. Test simulates
+    //   the future-wrapper precondition by pre-closing the writer.
     // =================================================================
     //
     // We construct a wrapping store that:

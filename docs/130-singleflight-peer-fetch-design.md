@@ -313,11 +313,17 @@ with non-empty payloads — see Choice (α) below.
 
 V2 kept the SF API but had the leader signal `Ok(Vec::new())` and
 relied on every waiter to read CAS. The waiter path's CAS read
-worked when cache was fast (~1ms inner); failed when cache was slow
-(>100ms inner). Without a fall-back to direct peer-fetch, slow-cache
-waiters got `NotFound` and bubbled it up — production saw 0%
-fallback success rate during ZFS hiccups (5+ s txg waits). Discarded
-in favor of Choice (α) which adds the explicit fall-back path.
+worked when the leader's cache write completed before any waiter
+issued its CAS read; broke whenever the leader's cache write lagged
+the leader's `Ok` signal (the choice-α race window). Without a
+fall-back to direct peer-fetch, slow-cache waiters would get
+`NotFound` from CAS and bubble the error to the caller — turning
+what should have been a graceful SF-dedup miss into a hard failure.
+Demonstrated in prototype against the
+`cdn_tee_slow_cache_abandons_does_not_block_bazel`-shaped fixtures
+(slow inner `get_part`); never deployed to production. Discarded
+in favor of Choice (α), which adds the explicit waiter-side
+fall-back to direct `get_part_and_cache_inner`.
 
 ### V3 (current — Option C / Choice α)
 
