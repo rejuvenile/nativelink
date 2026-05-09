@@ -82,9 +82,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use async_trait::async_trait;
+use bytes::Bytes;
 use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreSpec};
-use nativelink_error::Error;
+use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
+use nativelink_metric::{
+    MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     UpdateForWorker, update_for_worker,
 };
@@ -95,8 +103,13 @@ use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::small_blob_dispatcher::{SmallBlobDispatcher, SmallBlobDispatcherConfig};
 use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::Store;
+use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+use nativelink_util::store_trait::{
+    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
+    StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+};
 use tokio::sync::mpsc;
 
 /// Bounded deadline for "drain_tick should pick up the digest +
@@ -494,9 +507,15 @@ async fn failed_slow_writes_tx_send_err_reinserts() -> Result<(), Error> {
         assert_eq!(stats.no_worker, 0, "stats={stats:?}");
         assert_eq!(stats.throttled, 0, "stats={stats:?}");
 
-        // M1 invariant: counters add up to drained.
+        // M1 invariant (extended for #335 V3 self-retry counters):
+        // counters add up to drained.
         assert_eq!(
-            stats.dispatched + stats.no_worker + stats.throttled + stats.send_failed,
+            stats.dispatched
+                + stats.no_worker
+                + stats.throttled
+                + stats.send_failed
+                + stats.self_retried
+                + stats.self_retry_failed,
             stats.drained,
             "M1 invariant violated: counters do not add up to drained; \
              stats={stats:?}"
@@ -516,5 +535,455 @@ async fn failed_slow_writes_tx_send_err_reinserts() -> Result<(), Error> {
     })
     .await
     .expect("tx-send-err test must not deadlock")?;
+    Ok(())
+}
+
+// =============================================================================
+// #335 V3 fix coverage (TLA+ liveness audit)
+// =============================================================================
+//
+// Background: the TLA+ audit (agent a88faadb49a541ea2) found a permanent-
+// stuck condition. After SlowWriteFailure for blob b1, the failed_slow_writes
+// drainer can ONLY retry via UploadMissingBlobs to a worker. If NO worker
+// has the bytes (mirror dispatch quarantined / slow / never reached the
+// worker), the drainer logs "no worker for digest" forever; the fast-tier
+// pin auto-expires (120 s); LRU evicts; the next Bazel read returns
+// NotFound. The Bazel-acked bytes are LOST.
+//
+// V3 fix: the server's MemoryStore (fast tier) holds the bytes for the
+// duration of the pin TTL — that's an authoritative source the drainer
+// can use. drain_tick now calls FastSlowStore::try_self_retry_slow_write
+// FIRST (before consulting the locality map). On Succeeded, no worker
+// round-trip needed.
+//
+// Tests below use a `GatedSlowStore` test fixture: a slow store whose
+// update_oneshot returns either Ok (proxying to an inner MemoryStore)
+// or Err depending on a runtime-toggleable AtomicBool. This lets one
+// test simulate "slow-write failed THEN recovered" within a single
+// process composition, without needing failpoints or wall-clock waits.
+
+/// Minimal slow-store test fixture: proxies to an inner MemoryStore but
+/// can be toggled to return Err on update_oneshot/update. Used to
+/// simulate transient slow-tier failures that the drainer must
+/// recover from.
+#[derive(Debug)]
+struct GatedSlowStore {
+    inner: Arc<MemoryStore>,
+    fail_updates: AtomicBool,
+}
+
+impl GatedSlowStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryStore::new(&MemorySpec::default()),
+            fail_updates: AtomicBool::new(false),
+        })
+    }
+
+    fn set_fail(&self, fail: bool) {
+        self.fail_updates.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl MetricsComponent for GatedSlowStore {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+#[async_trait]
+impl StoreDriver for GatedSlowStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        // Always delegate to inner — even when fail_updates is true,
+        // reads are unaffected (matches "transient write outage" model).
+        Pin::new(self.inner.as_ref())
+            .has_with_results(keys, results)
+            .await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        if self.fail_updates.load(Ordering::SeqCst) {
+            // Drain the reader so writers don't observe a "Sender
+            // dropped before EOF" error (writer-termination contract
+            // for borrowed reader).
+            drop(reader.drain().await);
+            return Err(make_err!(
+                Code::Internal,
+                "GatedSlowStore: simulated transient slow-tier failure"
+            ));
+        }
+        Pin::new(self.inner.as_ref())
+            .update(key, reader, size_info)
+            .await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        Pin::new(self.inner.as_ref())
+            .get_part(key, writer, offset, length)
+            .await
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+
+    fn optimized_for(&self, _optimization: StoreOptimizations) -> bool {
+        false
+    }
+}
+
+default_health_status_indicator!(GatedSlowStore);
+
+/// Build an FSS with a real MemoryStore fast tier and a togglable
+/// GatedSlowStore slow tier. Returns (fss, fast_store, gated_slow) so
+/// tests can pre-write bytes to the fast tier and toggle slow-tier
+/// failure mode.
+fn make_fss_with_gated_slow() -> (
+    Arc<FastSlowStore>,
+    Arc<MemoryStore>,
+    Arc<GatedSlowStore>,
+) {
+    let fast_arc = MemoryStore::new(&MemorySpec::default());
+    let slow_arc = GatedSlowStore::new();
+    let fast = Store::new(fast_arc.clone());
+    let slow = Store::new(slow_arc.clone());
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast,
+        slow,
+    );
+    (fss, fast_arc, slow_arc)
+}
+
+/// V3 headline case: failed_slow_writes drainer self-retries from the
+/// server's MemoryStore when the fast tier still holds the bytes.
+/// No worker round-trip; closes the TLA+ liveness gap.
+///
+/// Production composition: real FSS (Memory fast + GatedSlow), real
+/// BlobLocalityMap (DELIBERATELY EMPTY — no worker has the bytes),
+/// real SmallBlobDispatcher.
+#[nativelink_test]
+async fn failed_slow_writes_self_retries_from_server_fast_tier() -> Result<(), Error> {
+    tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let (fss, fast_arc, _slow_arc) = make_fss_with_gated_slow();
+        let cas_store_name = "cas_STORE_TEST";
+        let cas_stores: Vec<(String, Store)> =
+            vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
+
+        // Empty locality map: NO worker reports having this digest. This
+        // is the exact TLA+ scenario — without V3, drain_tick can only
+        // count `no_worker` and re-insert forever.
+        let locality_map = new_shared_blob_locality_map();
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+
+        // Worker IS connected (just doesn't have the digest in
+        // locality_map) — proves V3 fires even when the dispatch path
+        // is wired and ready.
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<UpdateForWorker>();
+        dispatcher.register_worker("grpc://test-worker:50071", 1, worker_tx);
+
+        // Pre-stage bytes in the FAST tier (matches the post-pin
+        // production state after a slow-tier write failure: the byte
+        // payload is still in MemoryStore via the failed_writes_inserter
+        // re-pin).
+        let digest = DigestInfo::try_new(VALID_HASH, 4).expect("valid digest");
+        let bytes = Bytes::from_static(b"V3!!");
+        Pin::new(fast_arc.as_ref())
+            .update_oneshot(StoreKey::Digest(digest), bytes.clone())
+            .await
+            .expect("seed fast tier with bytes");
+
+        // Mark the slow-tier write as failed (the trigger for V3
+        // recovery). failed_writes_inserter mirrors the production
+        // post-failure bookkeeping: insert into failed_slow_writes +
+        // re-pin the fast-tier replica.
+        let inserter = fss.failed_writes_inserter();
+        inserter(digest);
+
+        let mut inflight: HashMap<DigestInfo, Instant> = HashMap::new();
+        let stats = drain_tick(
+            &cas_stores,
+            &locality_map,
+            &dispatcher,
+            &mut inflight,
+            DEFAULT_DRAIN_COOLDOWN,
+            DEFAULT_DRAIN_BATCH_SIZE,
+            DEFAULT_DRAIN_INFLIGHT_CAP,
+        )
+        .await;
+
+        assert_eq!(
+            stats.drained, 1,
+            "drain_tick must drain the digest from failed_slow_writes; \
+             stats={stats:?}"
+        );
+        assert_eq!(
+            stats.self_retried, 1,
+            "V3 fix: failed_slow_writes drainer must self-retry from server \
+             MemoryStore when no worker source — TLA+ liveness contract \
+             violated. stats={stats:?}"
+        );
+        assert_eq!(
+            stats.no_worker, 0,
+            "V3 fix: when fast tier has the bytes, drainer must NOT count \
+             this as no_worker (the worker round-trip is unnecessary); \
+             stats={stats:?}"
+        );
+        assert_eq!(
+            stats.dispatched, 0,
+            "V3 fix: when self-retry succeeds, NO UploadMissingBlobs is \
+             dispatched; stats={stats:?}"
+        );
+        assert_eq!(stats.self_retry_failed, 0, "stats={stats:?}");
+        assert_eq!(stats.send_failed, 0, "stats={stats:?}");
+        assert_eq!(stats.throttled, 0, "stats={stats:?}");
+
+        // Worker rx must remain empty — V3 succeeds without dispatching
+        // an UploadMissingBlobs RPC. Over-action regression check.
+        let recv_result = worker_rx.try_recv();
+        assert!(
+            recv_result.is_err(),
+            "V3 fix: successful self-retry MUST NOT dispatch UploadMissingBlobs \
+             (over-action regression). got={recv_result:?}"
+        );
+
+        // Slow tier must now hold the bytes (Bazel's next read can be
+        // served from durable storage; pin can expire safely).
+        let slow_bytes = fss
+            .slow_store_handle()
+            .get_part_unchunked(StoreKey::Digest(digest), 0, Some(4))
+            .await
+            .expect("V3 fix: slow tier MUST hold the bytes after self-retry");
+        assert_eq!(
+            slow_bytes,
+            Bytes::from_static(b"V3!!"),
+            "V3 fix: slow-tier bytes after self-retry must equal the original \
+             fast-tier bytes"
+        );
+
+        // failed_slow_writes must be empty post-self-retry success
+        // (FSS clears it inside try_self_retry_slow_write on Ok).
+        assert!(
+            !fss.failed_slow_writes_contains(&digest),
+            "V3 fix: successful self-retry MUST clear the digest from \
+             failed_slow_writes — otherwise a second tick would re-process \
+             a permanently-recovered blob"
+        );
+
+        Ok::<(), Error>(())
+    })
+    .await
+    .expect(
+        "V3 self-retry test must not deadlock — production composition \
+         contract violated (TLA+ liveness gap)",
+    )?;
+    Ok(())
+}
+
+/// V3 fall-through case: when the fast tier has lost the bytes (pin
+/// expired before drainer ran), the drainer must fall through to the
+/// pre-#335 UploadMissingBlobs path. This guards backward compatibility.
+#[nativelink_test]
+async fn failed_slow_writes_falls_through_to_worker_on_fast_tier_miss() -> Result<(), Error> {
+    tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let (fss, _fast_arc, _slow_arc) = make_fss_with_gated_slow();
+        let cas_store_name = "cas_STORE_TEST";
+        let cas_stores: Vec<(String, Store)> =
+            vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
+
+        let locality_map = new_shared_blob_locality_map();
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+
+        // Worker connected AND claims to have the digest.
+        let worker_endpoint = "grpc://test-worker:50071";
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<UpdateForWorker>();
+        dispatcher.register_worker(worker_endpoint, 1, worker_tx);
+
+        let digest = DigestInfo::try_new(VALID_HASH, 1024).expect("valid digest");
+        locality_map
+            .write()
+            .register_blobs(worker_endpoint, &[digest]);
+
+        // DO NOT pre-stage the fast tier — simulates the post-pin-
+        // expire state where MemoryStore has evicted the bytes.
+        let inserter = fss.failed_writes_inserter();
+        inserter(digest);
+
+        let mut inflight: HashMap<DigestInfo, Instant> = HashMap::new();
+        let stats = drain_tick(
+            &cas_stores,
+            &locality_map,
+            &dispatcher,
+            &mut inflight,
+            DEFAULT_DRAIN_COOLDOWN,
+            DEFAULT_DRAIN_BATCH_SIZE,
+            DEFAULT_DRAIN_INFLIGHT_CAP,
+        )
+        .await;
+
+        assert_eq!(stats.drained, 1, "stats={stats:?}");
+        assert_eq!(
+            stats.self_retried, 0,
+            "V3 fall-through: when fast tier is empty, self-retry MUST NOT \
+             succeed; stats={stats:?}"
+        );
+        assert_eq!(
+            stats.dispatched, 1,
+            "V3 fall-through: fast-tier miss MUST dispatch UploadMissingBlobs \
+             to the worker (preserves pre-#335 path); stats={stats:?}"
+        );
+
+        // Receive-side: an UploadMissingBlobs MUST land on worker_tx
+        // (proves the fall-through actually wires through to dispatch).
+        let received = worker_rx.recv().await.expect(
+            "V3 fall-through: fast-tier miss MUST dispatch UploadMissingBlobs \
+             to a worker — backward-compat regression: rx returned None",
+        );
+        match received.update {
+            Some(update_for_worker::Update::UploadMissingBlobs(req)) => {
+                assert_eq!(req.digests.len(), 1);
+                assert_eq!(req.digests[0].hash, VALID_HASH);
+            }
+            other => panic!(
+                "expected UploadMissingBlobs on worker_tx; got {other:?} \
+                 (V3 fall-through wiring broken)"
+            ),
+        }
+
+        Ok::<(), Error>(())
+    })
+    .await
+    .expect("V3 fall-through test must not deadlock")?;
+    Ok(())
+}
+
+/// V3 transient slow-tier failure: when the fast tier has the bytes
+/// but the slow tier write returns Err, the drainer must (a) count
+/// self_retry_failed, (b) re-insert the digest for the next tick,
+/// (c) NOT dispatch UploadMissingBlobs (the worker round-trip would
+/// re-trigger the same slow-tier failure — pointless).
+#[nativelink_test]
+async fn failed_slow_writes_self_retry_err_reinserts_for_next_tick() -> Result<(), Error> {
+    tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let (fss, fast_arc, slow_arc) = make_fss_with_gated_slow();
+        let cas_store_name = "cas_STORE_TEST";
+        let cas_stores: Vec<(String, Store)> =
+            vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
+
+        let locality_map = new_shared_blob_locality_map();
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+
+        // Pre-stage fast tier (V3 will TRY self-retry)...
+        let digest = DigestInfo::try_new(VALID_HASH, 4).expect("valid digest");
+        Pin::new(fast_arc.as_ref())
+            .update_oneshot(StoreKey::Digest(digest), Bytes::from_static(b"data"))
+            .await
+            .expect("seed fast tier");
+
+        // ...but mark the slow tier as failing.
+        slow_arc.set_fail(true);
+
+        let inserter = fss.failed_writes_inserter();
+        inserter(digest);
+
+        let mut inflight: HashMap<DigestInfo, Instant> = HashMap::new();
+        let stats = drain_tick(
+            &cas_stores,
+            &locality_map,
+            &dispatcher,
+            &mut inflight,
+            DEFAULT_DRAIN_COOLDOWN,
+            DEFAULT_DRAIN_BATCH_SIZE,
+            DEFAULT_DRAIN_INFLIGHT_CAP,
+        )
+        .await;
+
+        assert_eq!(stats.drained, 1, "stats={stats:?}");
+        assert_eq!(
+            stats.self_retry_failed, 1,
+            "V3 fix: slow-tier transient failure during self-retry MUST count \
+             toward self_retry_failed (NOT no_worker, NOT send_failed); \
+             stats={stats:?}"
+        );
+        assert_eq!(stats.self_retried, 0, "stats={stats:?}");
+        assert_eq!(stats.dispatched, 0, "stats={stats:?}");
+
+        // The digest MUST be re-inserted so the next tick can retry.
+        assert!(
+            fss.failed_slow_writes_contains(&digest),
+            "V3 fix: slow-tier transient failure MUST re-insert into \
+             failed_slow_writes — otherwise a transient outage permanently \
+             loses the digest"
+        );
+
+        // M1 invariant.
+        assert_eq!(
+            stats.dispatched
+                + stats.no_worker
+                + stats.throttled
+                + stats.send_failed
+                + stats.self_retried
+                + stats.self_retry_failed,
+            stats.drained,
+            "M1 invariant violated: counters do not add up to drained; \
+             stats={stats:?}"
+        );
+
+        Ok::<(), Error>(())
+    })
+    .await
+    .expect("V3 self-retry-err test must not deadlock")?;
     Ok(())
 }
