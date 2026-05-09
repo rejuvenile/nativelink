@@ -5254,16 +5254,27 @@ async fn ac_failure_prune_is_scoped_to_store_id_and_digest() -> Result<(), Error
 // Production composition seam:
 //   default_store_factory → FastSlowStore::new_validated(spec, fast, slow)?
 //
-// Disk-backed slow tiers (FilesystemStore) MUST opt in to a non-zero cap.
-// In-memory and network-backed slow tiers (Memory, Grpc, Redis, S3, etc.)
-// are exempt because the failure mode (sustained slow-tier latency pinning
-// chunks in the in-flight buffer until OOM) does not apply.
+// Disk-backed slow tiers MUST opt in to a non-zero cap. The set of
+// disk-backed stores (each overrides `StoreDriver::requires_in_flight_
+// buffer_cap` to return `true`):
+//   - FilesystemStore  (local disk)
+//   - S3Store          (remote object store; sustained-latency cascade)
+//   - GcsStore         (remote object store; sustained-latency cascade)
+//   - AzureBlobStore   (remote object store; sustained-latency cascade)
+//   - OntapS3Store     (on-prem S3-compatible; sustained-latency cascade)
+//
+// Exempt (default `false`):
+//   - MemoryStore      (in-memory; bounded by EvictionPolicy)
+//   - GrpcStore        (workers' slow tier; intentional opt-out)
+//   - RedisStore       (small-payload, network-backed; deferred)
+//   - NoopStore        (discards writes; no buffer pressure)
 //
 // Mutation step (mandatory per CLAUDE.md "Tests" section):
 //   Comment out the `if spec.slow_writes_in_flight_max_bytes == 0 && ...`
 //   guard in `FastSlowStore::new_validated`. The path_c_disk_backed_slow_
-//   tier_with_zero_cap_rejected test MUST red-fail with a panic message
-//   containing "disk-backed slow tier" — the bespoke discriminator.
+//   tier_with_zero_cap_rejected test (and each of the per-store
+//   path_c_rejects_uncapped_*_slow_tier tests) MUST red-fail with a panic
+//   message containing "disk-backed slow tier" — the bespoke discriminator.
 // ─────────────────────────────────────────────────────────────────────────────
 
 mod path_c_startup_validation {
@@ -5409,6 +5420,235 @@ mod path_c_startup_validation {
              pressure). err={:?}",
             result.err()
         );
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Path C extension (cascade-bundle, 2026-05-09): the same admission
+    // check applies to remote-disk-backed object stores. A test stub
+    // (`RemoteDiskBackedStub`) parameterized by a label simulates each
+    // store type for the integration check below; the per-store override
+    // returning `true` is asserted in each store's own test file.
+    //
+    // Constructing real S3Store/GcsStore/AzureBlobStore/OntapS3Store
+    // instances requires per-store mock HTTP clients + spec wiring; the
+    // stub crosses the exact seam that matters at this layer
+    // (`Store::inner_store(...).requires_in_flight_buffer_cap()` inside
+    // `FastSlowStore::new_validated`) without dragging the AWS/GCS/Azure
+    // SDK fixtures into this test file.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use core::pin::Pin;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use nativelink_error::{Code, make_err};
+    use nativelink_metric::{
+        MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+    };
+    use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+    use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+    use nativelink_util::store_trait::{
+        ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, StoreDriver,
+        UploadSizeInfo,
+    };
+
+    /// Test stub that mimics a remote-disk-backed object store
+    /// (S3/GCS/Azure/OntapS3) for the Path C startup-check integration
+    /// test. Behaviour is NoopStore-like (drains reader on update,
+    /// returns NotFound on get_part); the only contract that matters
+    /// here is `requires_in_flight_buffer_cap → true`. The `label`
+    /// field lets each test distinguish which store-shape it is
+    /// simulating for assertion messages.
+    #[derive(Debug)]
+    struct RemoteDiskBackedStub {
+        label: &'static str,
+    }
+
+    impl RemoteDiskBackedStub {
+        fn new(label: &'static str) -> Arc<Self> {
+            Arc::new(Self { label })
+        }
+    }
+
+    impl MetricsComponent for RemoteDiskBackedStub {
+        fn publish(
+            &self,
+            _kind: MetricKind,
+            _field_metadata: MetricFieldData,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[async_trait]
+    impl StoreDriver for RemoteDiskBackedStub {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            _keys: &[nativelink_util::store_trait::StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            for r in results.iter_mut() {
+                *r = None;
+            }
+            Ok(())
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            _key: nativelink_util::store_trait::StoreKey<'_>,
+            mut reader: DropCloserReadHalf,
+            _size: UploadSizeInfo,
+        ) -> Result<(), Error> {
+            reader.drain().await?;
+            Ok(())
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            _key: nativelink_util::store_trait::StoreKey<'_>,
+            _writer: &mut DropCloserWriteHalf,
+            _offset: u64,
+            _length: Option<u64>,
+        ) -> Result<(), Error> {
+            Err(make_err!(
+                Code::NotFound,
+                "RemoteDiskBackedStub({}) has no data",
+                self.label
+            ))
+        }
+
+        fn inner_store(
+            &self,
+            _key: Option<nativelink_util::store_trait::StoreKey<'_>>,
+        ) -> &dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+
+        /// THIS is the contract under test: any remote-disk-backed
+        /// object store (S3/GCS/Azure/OntapS3) overrides the trait
+        /// default to return `true`. The Path C startup check in
+        /// `FastSlowStore::new_validated` consults this value to decide
+        /// whether `cap == 0` is admissible.
+        fn requires_in_flight_buffer_cap(&self) -> bool {
+            true
+        }
+    }
+
+    default_health_status_indicator!(RemoteDiskBackedStub);
+
+    /// Shared body for the four per-store rejection tests. Each test
+    /// passes the label of the store it is simulating so the assertion
+    /// messages identify the production composition that would have
+    /// been wedged.
+    fn assert_rejected_disk_backed(label: &'static str, err: Error) {
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("disk-backed slow tier"),
+            "[{label}] error message MUST contain the bespoke discriminator \"disk-backed slow \
+             tier\" so operators can grep production logs for this exact failure mode. \
+             actual: {msg}"
+        );
+        assert!(
+            msg.contains("slow_writes_in_flight_max_bytes"),
+            "[{label}] error message MUST name the config field operators set to fix it. \
+             actual: {msg}"
+        );
+        assert_eq!(
+            err.code,
+            Code::InvalidArgument,
+            "[{label}] Path C startup rejection is operator-visible config error → \
+             InvalidArgument"
+        );
+    }
+
+    /// Path C extension: S3Store as slow tier with cap == 0 must fail
+    /// at startup. Mirrors `path_c_disk_backed_slow_tier_with_zero_cap_
+    /// rejected` (which uses FilesystemStore) for the remote-object-
+    /// store variant. The `RemoteDiskBackedStub` simulates S3Store at
+    /// the seam that matters: `inner_store(...).
+    /// requires_in_flight_buffer_cap()` returns `true`.
+    #[nativelink_test]
+    async fn path_c_rejects_uncapped_s3_slow_tier() -> Result<(), Error> {
+        let fast = make_memory();
+        let slow = Store::new(RemoteDiskBackedStub::new("S3Store"));
+        let result = FastSlowStore::new_validated(&spec_with_cap(0), fast, slow);
+        let err = result
+            .err()
+            .expect("must reject S3Store-shaped slow tier with cap=0 — Path C extension");
+        assert_rejected_disk_backed("S3Store", err);
+        Ok(())
+    }
+
+    /// Path C extension: GcsStore as slow tier with cap == 0 must fail
+    /// at startup. See `path_c_rejects_uncapped_s3_slow_tier` for the
+    /// stub-vs-real-store rationale.
+    #[nativelink_test]
+    async fn path_c_rejects_uncapped_gcs_slow_tier() -> Result<(), Error> {
+        let fast = make_memory();
+        let slow = Store::new(RemoteDiskBackedStub::new("GcsStore"));
+        let result = FastSlowStore::new_validated(&spec_with_cap(0), fast, slow);
+        let err = result
+            .err()
+            .expect("must reject GcsStore-shaped slow tier with cap=0 — Path C extension");
+        assert_rejected_disk_backed("GcsStore", err);
+        Ok(())
+    }
+
+    /// Path C extension: AzureBlobStore as slow tier with cap == 0
+    /// must fail at startup. See `path_c_rejects_uncapped_s3_slow_tier`
+    /// for the stub-vs-real-store rationale.
+    #[nativelink_test]
+    async fn path_c_rejects_uncapped_azure_slow_tier() -> Result<(), Error> {
+        let fast = make_memory();
+        let slow = Store::new(RemoteDiskBackedStub::new("AzureBlobStore"));
+        let result = FastSlowStore::new_validated(&spec_with_cap(0), fast, slow);
+        let err = result
+            .err()
+            .expect("must reject AzureBlobStore-shaped slow tier with cap=0 — Path C extension");
+        assert_rejected_disk_backed("AzureBlobStore", err);
+        Ok(())
+    }
+
+    /// Path C extension: OntapS3Store as slow tier with cap == 0 must
+    /// fail at startup. See `path_c_rejects_uncapped_s3_slow_tier` for
+    /// the stub-vs-real-store rationale.
+    #[nativelink_test]
+    async fn path_c_rejects_uncapped_ontap_s3_slow_tier() -> Result<(), Error> {
+        let fast = make_memory();
+        let slow = Store::new(RemoteDiskBackedStub::new("OntapS3Store"));
+        let result = FastSlowStore::new_validated(&spec_with_cap(0), fast, slow);
+        let err = result
+            .err()
+            .expect("must reject OntapS3Store-shaped slow tier with cap=0 — Path C extension");
+        assert_rejected_disk_backed("OntapS3Store", err);
         Ok(())
     }
 }

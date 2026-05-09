@@ -816,6 +816,17 @@ where
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
     }
+
+    /// OntapS3Store is remote-disk-backed: a sustained latency hiccup
+    /// at the Ontap S3 endpoint (throttling, on-prem network saturation,
+    /// node failover) lets an unbounded in-flight write buffer pin one
+    /// chunk per concurrent stream until OOM. Compositions like
+    /// `FastSlowStore` that buffer slow-tier writes MUST carry an
+    /// explicit non-zero cap when wrapping an OntapS3Store. (Path C
+    /// extension, cascade-bundle, 2026-05-09.)
+    fn requires_in_flight_buffer_cap(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]

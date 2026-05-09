@@ -736,3 +736,24 @@ fn create_object_path(key: &StoreKey) -> ObjectPath {
         &format!("{}{}", KEY_PREFIX, key.as_str()),
     )
 }
+
+/// Path C extension (cascade-bundle, 2026-05-09): `GcsStore` MUST override
+/// the trait default and return `true` from
+/// `requires_in_flight_buffer_cap` so that any `FastSlowStore` wrapping a
+/// `GcsStore` slow tier with `slow_writes_in_flight_max_bytes == 0` is
+/// rejected at startup. Mutation step: comment out the
+/// `requires_in_flight_buffer_cap` override in `gcs_store.rs`; this test
+/// MUST red-fail with "GcsStore must override requires_in_flight_buffer_cap".
+#[nativelink_test]
+async fn requires_in_flight_buffer_cap_returns_true() -> Result<(), Error> {
+    use nativelink_util::store_trait::StoreDriver;
+    let mock_ops = Arc::new(MockGcsOperations::new());
+    let store = create_test_store(mock_ops).await?;
+    assert!(
+        StoreDriver::requires_in_flight_buffer_cap(&*store),
+        "GcsStore must override requires_in_flight_buffer_cap to return true so that \
+         FastSlowStore::new_validated rejects an uncapped slow tier at startup. See \
+         Path C extension (cascade-bundle, 2026-05-09)."
+    );
+    Ok(())
+}

@@ -1191,14 +1191,26 @@ pub trait StoreDriver:
     /// unbounded in-flight buffer cascade to OOM). Wrapper compositions
     /// like `FastSlowStore` that maintain an in-flight buffer for the
     /// slow tier MUST require an explicit non-zero capacity cap whenever
-    /// this returns `true`. Default is `false` for in-memory and
-    /// network-backed stores (Memory, Grpc, Redis, S3, etc.) where the
-    /// buffer cap is optional.
+    /// this returns `true`.
+    ///
+    /// Returns `true` (overridden by the store impl) for: `FilesystemStore`
+    /// and the remote-disk-backed object stores `S3Store`, `GcsStore`,
+    /// `AzureBlobStore`, `OntapS3Store`. All four object stores share the
+    /// failure mode: a regional/endpoint slowdown stalls the slow-tier
+    /// writer; the in-flight buffer pins one chunk per concurrent stream
+    /// until process RSS climbs to OOM.
+    ///
+    /// Default is `false` for in-memory and small-payload network stores
+    /// (Memory, Grpc, Redis) where the buffer cap is optional. `GrpcStore`
+    /// is intentionally exempt: it is the workers' slow tier and the
+    /// worker-side composition has no cap, by design.
     ///
     /// Path C (cascade-bundle, 2026-05-09): the M2 fixup that defaulted
     /// the cap to 8 GiB was reverted; instead, disk-backed slow tiers
     /// must carry an explicit cap or fail at startup. See
-    /// `FastSlowStore::new_validated`.
+    /// `FastSlowStore::new_validated`. Extended on the same date to
+    /// remote-disk-backed object stores (S3/GCS/Azure/OntapS3) — same
+    /// OOM-cascade failure mode under sustained slow-tier latency.
     fn requires_in_flight_buffer_cap(&self) -> bool {
         false
     }

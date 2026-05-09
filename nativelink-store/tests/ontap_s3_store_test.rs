@@ -734,3 +734,41 @@ async fn multipart_update_large_cas() -> Result<(), Error> {
     mock_client.assert_requests_match(&[]);
     Ok(())
 }
+
+/// Path C extension (cascade-bundle, 2026-05-09): `OntapS3Store` MUST
+/// override the trait default and return `true` from
+/// `requires_in_flight_buffer_cap` so that any `FastSlowStore` wrapping
+/// an `OntapS3Store` slow tier with `slow_writes_in_flight_max_bytes
+/// == 0` is rejected at startup. Mutation step: comment out the
+/// `requires_in_flight_buffer_cap` override in `ontap_s3_store.rs`;
+/// this test MUST red-fail with "OntapS3Store must override
+/// requires_in_flight_buffer_cap".
+#[nativelink_test]
+async fn requires_in_flight_buffer_cap_returns_true() -> Result<(), Error> {
+    use nativelink_util::store_trait::StoreDriver;
+    let mock_client = StaticReplayClient::new(vec![]);
+    let test_config = Builder::new()
+        .behavior_version(BehaviorVersion::v2025_08_07())
+        .region(Region::from_static(VSERVER_NAME))
+        .http_client(mock_client)
+        .build();
+    let s3_client = aws_sdk_s3::Client::from_conf(test_config);
+    let store = OntapS3Store::new_with_client_and_jitter(
+        &(ExperimentalOntapS3Spec {
+            bucket: BUCKET_NAME.to_string(),
+            vserver_name: VSERVER_NAME.to_string(),
+            endpoint: "https://example.com".to_string(),
+            ..Default::default()
+        }),
+        s3_client,
+        Arc::new(move |_delay| Duration::from_secs(0)),
+        MockInstantWrapped::default,
+    )?;
+    assert!(
+        StoreDriver::requires_in_flight_buffer_cap(&*store),
+        "OntapS3Store must override requires_in_flight_buffer_cap to return true so that \
+         FastSlowStore::new_validated rejects an uncapped slow tier at startup. See \
+         Path C extension (cascade-bundle, 2026-05-09)."
+    );
+    Ok(())
+}
