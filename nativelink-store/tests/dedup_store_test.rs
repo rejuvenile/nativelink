@@ -472,3 +472,67 @@ async fn mark_stable_delegates_to_index_store_test() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// #336 P1 production-composition test: the borrowed `writer` MUST be
+/// terminated on every exit path — including the early-return when the
+/// index_store has no entry for the digest.
+///
+/// Drive `Pin::new(&store).get_part(...)` with a borrowed writer paired
+/// with a separate consumer reading from the matching rx. If
+/// `dedup_store::get_part` early-returns Err on the index-store NotFound
+/// without terminating the writer (the bug being guarded), the consumer
+/// hangs and the 5-second `tokio::time::timeout` panics with the
+/// bespoke message below.
+///
+/// Mutation step: replace `WriteHalfGuard::new(writer)` with the bare
+/// `writer` parameter and remove the `commit_eof()` calls — the test
+/// must red-fail with the bespoke "writer-termination contract
+/// violated" message.
+#[nativelink_test]
+async fn dedup_store_get_part_terminates_writer_on_index_miss() -> Result<(), Error> {
+    use core::pin::Pin;
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::{DropCloserWriteHalf, make_buf_channel_pair};
+    use nativelink_util::store_trait::StoreKey;
+
+    let index_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let content_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let store = DedupStore::new(&make_default_config(), index_store, content_store)?;
+
+    // Digest never written to index_store — get_part will early-return
+    // Err(NotFound) from `index_store.get_part_unchunked(...)?`.
+    let digest = DigestInfo::try_new(VALID_HASH1, 100).unwrap();
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_store = Pin::new(&store);
+    let get_fut = async {
+        pinned_store
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    };
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "DedupStore::get_part writer-termination contract violated — wrapping caller \
+         deadlocked on un-EOF'd writer (index-store NotFound early-return path)",
+    );
+
+    let (get_res, _reader_res) = timeout_res;
+    assert!(get_res.is_err(), "expected dedup get_part Err on index-store NotFound");
+    Ok(())
+}

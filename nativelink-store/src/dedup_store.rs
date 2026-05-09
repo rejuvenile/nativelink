@@ -22,7 +22,7 @@ use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
 use nativelink_config::stores::DedupSpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::fastcdc::FastCDC;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
@@ -271,6 +271,21 @@ impl StoreDriver for DedupStore {
         Ok(())
     }
 
+    // LINT: writer-termination policy for `get_part` (#336 P1 fix).
+    //
+    // DedupStore is a wrapper layer (sub-stores: index_store + content_store).
+    // Its `get_part` writes to the OUTER caller's borrowed writer through
+    // multiple early-return Err paths (`?`-propagated index-store / content-
+    // store NotFound, deserialization errors, conversion-to-usize errors,
+    // mid-stream send failures) AND a happy-path `send_eof()` exit. Without
+    // termination on every exit path, any wrapping caller that joins
+    // `(get_fut, reader_fut)` over the writer's tx/rx pair (e.g. an upstream
+    // VerifyStore composing atop us) deadlocks.
+    //
+    // Wrap with `WriteHalfGuard::new(writer)`; the Drop fallback fires the
+    // synthesized `Code::Internal "buf_channel: writer dropped without
+    // commit"` on any uncommitted exit so the paired reader unblocks.
+    // Happy-path uses `commit_eof()` to suppress the fallback.
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,
@@ -278,10 +293,11 @@ impl StoreDriver for DedupStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        let mut writer_guard = WriteHalfGuard::new(writer);
         // Special case for if a client tries to read zero bytes.
         if length == Some(0) {
-            writer
-                .send_eof()
+            writer_guard
+                .commit_eof()
                 .err_tip(|| "Failed to write EOF out from get_part dedup")?;
             return Ok(());
         }
@@ -372,7 +388,7 @@ impl StoreDriver for DedupStore {
             if bytes_to_skip != 0 || data.len() > bytes_to_send {
                 data = data.slice(bytes_to_skip..end_pos);
             }
-            writer
+            writer_guard
                 .send(data)
                 .await
                 .err_tip(|| "Failed to write data to get_part dedup")?;
@@ -381,8 +397,8 @@ impl StoreDriver for DedupStore {
         }
 
         // Finish our stream by writing our EOF and shutdown the stream.
-        writer
-            .send_eof()
+        writer_guard
+            .commit_eof()
             .err_tip(|| "Failed to write EOF out from get_part dedup")?;
         Ok(())
     }
