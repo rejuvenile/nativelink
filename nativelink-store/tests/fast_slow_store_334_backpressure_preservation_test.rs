@@ -57,7 +57,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use nativelink_config::stores::{
-    EvictionPolicy, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
+    EvictionPolicy, ExistenceCacheSpec, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
+    VerifySpec,
 };
 use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
@@ -65,8 +66,10 @@ use nativelink_metric::MetricsComponent;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, backpressure_signal,
 };
+use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
+use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
@@ -181,11 +184,19 @@ fn make_fast_slow_with_tiny_fast_cap(fast_cap_bytes: usize) -> (Arc<FastSlowStor
 // Fix A — small-blob non-chunked path (the production hot path).
 // ---------------------------------------------------------------------
 
-/// **Fix A — small blob, under-action coverage.** Fill the fast tier to
-/// its byte cap with one blob; a second update that would force
-/// eviction MUST surface `ResourceExhausted +
-/// BackpressureSignal::MemoryStoreAtCapacity` through the FastSlowStore
-/// boundary. WITHOUT the fix, the data-stream future fails first with
+/// **Fix A — small blob, under-action coverage in production
+/// composition.** Wraps `FastSlowStore` in the same composition the
+/// production server CAS chain uses
+/// (`ExistenceCacheStore → VerifyStore → FastSlowStore`, see MEMORY.md
+/// "Server CAS Store Architecture"). Fills the inner fast tier to its
+/// byte cap with one blob; a second update that would force eviction
+/// MUST surface `ResourceExhausted +
+/// BackpressureSignal::MemoryStoreAtCapacity` through every wrapping
+/// layer. The bug being fixed is cross-component signal preservation;
+/// testing only at the FSS unit boundary would miss a regression where
+/// VerifyStore (or ExistenceCacheStore) demotes the typed signal to
+/// generic `Code::Internal` on its way out — exactly the #334 cascade
+/// shape. WITHOUT the fix, the FSS data-stream future fails first with
 /// `Code::Internal "receiver disconnected"` (because `fast_rx` was
 /// dropped) and the match at line 3789 returns it before checking
 /// `fast_res`, masking the typed signal.
@@ -201,7 +212,30 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
     // 1024-byte insert would exceed and triggers
     // `check_backpressure_gate` (`memory_store.rs:367`).
     let (fss, _fast, _slow) = make_fast_slow_with_tiny_fast_cap(1024);
-    let store: Store = Store::new(fss);
+    // Production composition wrap: `cas_STORE` =
+    // `ExistenceCacheStore → VerifyStore → FastSlowStore`. Without
+    // this wrap the test would not exercise the typed-signal
+    // survival contract across the wrapping `tokio::join!` /
+    // wrap-and-rethrow boundaries that production code crosses.
+    let verify = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(fss),
+    );
+    let cache = ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1024,
+                ..Default::default()
+            }),
+        },
+        Store::new(verify),
+    );
+    let store: Store = Store::new(cache);
 
     let payload1 = vec![0u8; 1024];
     let digest1 = DigestInfo::try_new(VALID_HASH1, payload1.len() as u64)?;
@@ -229,11 +263,10 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
         "second insert MUST return an Err — fast tier at capacity with \
          emit_backpressure_enabled=true",
     );
-    assert_backpressure_signal(&err, backpressure_signal::Reason::MemoryStoreAtCapacity);
-    // The mutation-step assertion below documents the canonical failure
-    // string for the mutation-step. The `assert_backpressure_signal`
-    // helper above panics with a similar message; this `assert!` below
-    // is the primary contract guard.
+    // Bespoke contract guard FIRST so the mutation step prints this
+    // canonical message, not the generic helper-internal `assert_eq!`
+    // panic. Documented in CLAUDE.md mutation-step procedure as the
+    // canonical red-fail string for Fix A.
     assert!(
         err.code == Code::ResourceExhausted && !err.details.is_empty(),
         "typed BackpressureSignal must be preserved when MemoryStore early-rejects \
@@ -245,6 +278,10 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
         err.messages,
         err.details.len(),
     );
+    // Discriminator-detail check: same contract, but goes deeper into
+    // the proto detail. Runs after the bespoke check so the mutation
+    // step's primary panic is the bespoke string.
+    assert_backpressure_signal(&err, backpressure_signal::Reason::MemoryStoreAtCapacity);
     Ok(())
 }
 
@@ -265,6 +302,12 @@ struct GatedSlowStore {
     in_flight: Arc<AtomicUsize>,
     /// Set by Drop so a leaked store at end-of-test surfaces.
     dropped: Arc<AtomicBool>,
+    /// When `true`, `update` returns `Err(Code::Internal "...")`
+    /// AFTER the gate releases. Used to exercise the slow-write
+    /// failure-path counter-decrement contract (Fix B failure arm at
+    /// `fast_slow_store.rs:4196-4221`). When `false` (default),
+    /// `update` returns Ok after release (success path).
+    fail_after_release: AtomicBool,
 }
 
 impl GatedSlowStore {
@@ -277,11 +320,18 @@ impl GatedSlowStore {
                 release: release.clone(),
                 in_flight: in_flight.clone(),
                 dropped: dropped.clone(),
+                fail_after_release: AtomicBool::new(false),
             }),
             release,
             in_flight,
             dropped,
         )
+    }
+
+    /// Test hook: if set to `true`, every subsequent `update` will
+    /// return `Err(Code::Internal)` after the gate releases.
+    fn set_fail_after_release(&self, fail: bool) {
+        self.fail_after_release.store(fail, Ordering::Release);
     }
 }
 
@@ -315,6 +365,12 @@ impl StoreDriver for GatedSlowStore {
         // Block until the test releases.
         self.release.notified().await;
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        if self.fail_after_release.load(Ordering::Acquire) {
+            return Err(make_err!(
+                Code::Internal,
+                "GatedSlowStore: fail_after_release was set"
+            ));
+        }
         Ok(())
     }
 
@@ -621,5 +677,379 @@ async fn fix_a_and_b_compose_to_typed_signal_only() -> Result<(), Error> {
     // Drain so the test cleans up.
     release.notify_waiters();
     release.notify_waiters();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Fix A — over-action coverage (predicate must not over-match).
+// ---------------------------------------------------------------------
+
+/// Fast-tier store that returns a BARE `Code::ResourceExhausted` with
+/// NO `BackpressureSignal` discriminator detail. Models a future
+/// fast-tier store kind (e.g. an SSD ExistenceCache returning
+/// disk-full) where the rejection is `ResourceExhausted` but is NOT
+/// the typed-backpressure shape Fix A is meant to preserve. Used to
+/// prove the strict heuristic at `fast_slow_store.rs:3922-3927`
+/// (`Code::ResourceExhausted && error_has_backpressure_signal(e)`)
+/// does NOT over-match a bare `ResourceExhausted` and silently demote
+/// it to a backpressure-shaped retry path.
+#[derive(MetricsComponent, Default)]
+struct BareResourceExhaustedFastStore {}
+
+#[async_trait]
+impl StoreDriver for BareResourceExhaustedFastStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _digests: &[StoreKey<'_>],
+        _results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Drain so the producer doesn't deadlock on send before we
+        // return our error.
+        let _ = reader.drain().await;
+        Err(make_err!(
+            Code::ResourceExhausted,
+            "BareResourceExhaustedFastStore: bare ResourceExhausted, no signal detail"
+        ))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(
+            Code::NotFound,
+            "BareResourceExhaustedFastStore: get_part not supported"
+        ))
+    }
+
+    fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+        self
+    }
+
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+default_health_status_indicator!(BareResourceExhaustedFastStore);
+
+/// **Fix A — over-action coverage.** A fast-tier store that emits
+/// `Code::ResourceExhausted` WITHOUT the `BackpressureSignal`
+/// discriminator (e.g. a future SSD-backed ExistenceCache returning
+/// disk-full) MUST NOT trigger Fix A's typed-signal-preservation
+/// branch. The strict heuristic
+/// (`Code::ResourceExhausted && error_has_backpressure_signal(e)`)
+/// would silently demote the bare `ResourceExhausted` to a
+/// backpressure-shaped retry path if loosened — Bazel would then
+/// retry an unrelated condition (disk-full) on a backpressure
+/// schedule and never make progress.
+///
+/// The expected behavior on a bare `ResourceExhausted` from the fast
+/// tier is: the data-stream future fires first (`Code::Internal
+/// "Failed to send message to fast_store"` because `fast_rx` was
+/// dropped), the match returns the Internal at line 3789 BEFORE the
+/// new Fix A branch ever runs. The caller sees Internal — NOT
+/// ResourceExhausted — proving Fix A did NOT match.
+///
+/// Mutation step: change the predicate to drop the
+/// `error_has_backpressure_signal(e)` clause (i.e. match on
+/// `Code::ResourceExhausted` alone). The test MUST red-fail with the
+/// bespoke "Fix A predicate over-matched: bare ResourceExhausted
+/// demoted to backpressure shape" message.
+#[nativelink_test]
+async fn fix_a_does_not_over_match_bare_resource_exhausted() -> Result<(), Error> {
+    let fast = Store::new(Arc::new(BareResourceExhaustedFastStore::default()));
+    let slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        fast,
+        slow,
+    );
+    let store: Store = Store::new(fss);
+
+    let payload = vec![0u8; 1024];
+    let digest = DigestInfo::try_new(VALID_HASH1, payload.len() as u64)?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_update(&store, digest.into(), Bytes::from(payload)),
+    )
+    .await
+    .expect("must not deadlock — fast tier rejects synchronously");
+
+    let err = result.expect_err(
+        "fast tier always returns Err(ResourceExhausted) — update MUST surface an Err",
+    );
+
+    // The OVER-ACTION contract: Fix A's heuristic must NOT match a
+    // bare ResourceExhausted (no BackpressureSignal). Since
+    // `fast_res` lacks the discriminator, the new branch must NOT
+    // fire; the existing match arms surface `data_res`'s `Code::Internal
+    // "Failed to send message to fast_store"` instead. Note: this
+    // assertion is the inverse of the under-action test — we EXPECT
+    // a non-ResourceExhausted error here.
+    let has_signal = err
+        .details
+        .iter()
+        .any(|any| any.type_url == BACKPRESSURE_SIGNAL_TYPE_URL);
+    assert!(
+        !has_signal,
+        "Fix A predicate over-matched: bare ResourceExhausted demoted to \
+         backpressure shape. err.code={:?} details={:?} (a future fast-tier \
+         store returning bare ResourceExhausted for disk-full would be \
+         silently treated as transient backpressure — Bazel would retry \
+         on a backpressure schedule and never make progress)",
+        err.code,
+        err.details.len(),
+    );
+    // Belt-and-suspenders: the actual code that fires is the data_res
+    // arm (`Code::Internal "Failed to send message to fast_store"`).
+    // Either Internal (data_res arm) or the bare ResourceExhausted
+    // surfacing through `fast_res?` is acceptable; the contract is
+    // "no typed BackpressureSignal demotion."
+    assert!(
+        err.code == Code::Internal || err.code == Code::ResourceExhausted,
+        "expected Internal (data_res arm) OR bare ResourceExhausted (fast_res? arm), \
+         got code={:?}",
+        err.code,
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Fix B — failure-path counter-decrement coverage.
+// ---------------------------------------------------------------------
+
+/// **Fix B — failure-path counter-decrement coverage.** When the
+/// background slow-write returns `Err(...)` (not `Ok(())`), the
+/// `in_flight_slow_writes_bytes` counter MUST still drain to zero.
+/// Without this, the cap-check at
+/// `check_slow_writes_capacity_gate` would over time admit fewer and
+/// fewer admissions until every admission is rejected (the counter
+/// drifts up by every failed write).
+///
+/// Mutation step: comment out the `in_flight.lock().remove()` (or the
+/// `fetch_sub`) in the failure-arm closure at `fast_slow_store.rs:4196-4221`.
+/// The test MUST red-fail with the bespoke "counter leaked on failure
+/// path — admission cap will permanently reject after first slow-write
+/// failure" message.
+#[nativelink_test]
+async fn fix_b_counter_decrements_on_slow_write_failure() -> Result<(), Error> {
+    let cap_bytes: u64 = 1024 * 1024 * 1024; // 1 GiB - way above what we use
+    let fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let (gated, release, in_flight, _dropped) = GatedSlowStore::new();
+    // Configure GatedSlowStore so its background `update` returns
+    // `Err(Internal)` after release — this drives the failure-arm at
+    // `fast_slow_store.rs:4196-4221` instead of the success-arm.
+    gated.set_fail_after_release(true);
+    let slow = Store::new(gated);
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: cap_bytes,
+        },
+        fast,
+        slow,
+    );
+    let store: Store = Store::new(fss.clone());
+
+    let payload = vec![0u8; 4096];
+    let digest = DigestInfo::try_new(VALID_HASH1, payload.len() as u64)?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_update(&store, digest.into(), Bytes::from(payload)),
+    )
+    .await
+    .expect("the update call must complete promptly (failure happens in background spawn)")?;
+
+    // Wait for the spawned task to begin — counter must be at the
+    // payload size while the gate is held.
+    wait_until("background spawn enters update (in_flight=1)", || {
+        in_flight.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        fss.in_flight_slow_write_bytes(),
+        4096,
+        "counter must reflect pinned bytes while spawn is active"
+    );
+
+    // Release the gate — slow-store update returns Err(Internal),
+    // background closure should run the failure-arm at :4196-4221:
+    // (a) record digest in failed_slow_writes, (b) re-pin, (c) remove
+    // from in_flight + fetch_sub.
+    release.notify_waiters();
+
+    // The counter MUST drain to zero on failure — same as on success.
+    // If the failure-arm forgets to decrement, the counter will be
+    // stuck at 4096 forever and this poll will time out + panic with
+    // the bespoke message.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fss.in_flight_slow_write_bytes() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "counter leaked on failure path — admission cap will permanently \
+             reject after first slow-write failure (counter stuck at {} bytes \
+             after slow-write returned Err; the failure-arm at \
+             fast_slow_store.rs:4196-4221 must remove the in-flight entry AND \
+             decrement the byte counter)",
+            fss.in_flight_slow_write_bytes()
+        )
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Fix B — `update_oneshot` sibling coverage.
+// ---------------------------------------------------------------------
+
+/// **Fix B — `update_oneshot` sibling under-action coverage.** Same
+/// shape as `fix_b_slow_writes_in_flight_byte_cap_emits_typed_signal`
+/// but exercises the `update_oneshot` cap-check at
+/// `fast_slow_store.rs:4330` and counter mutation at
+/// `:4338-4339`/`:4459-4471`. `update_oneshot` is reached when the
+/// caller has the entire payload in memory — common for AC writes
+/// and the worker_proxy_store parallel-fetch path. Without this
+/// sibling test, a regression in the `update_oneshot` cap-check
+/// would slip through (the streaming `update` test would still
+/// pass).
+///
+/// Mutation step: comment out the cap-check at `:4359` (the
+/// `if let Err(cap_err) = self.check_slow_writes_capacity_gate(...)`
+/// block in `update_oneshot`). The test MUST red-fail with the bespoke
+/// "update_oneshot in-flight slow-write byte cap not enforced" message.
+#[nativelink_test]
+async fn fix_b_update_oneshot_in_flight_byte_cap_emits_typed_signal() -> Result<(), Error> {
+    let cap_bytes: u64 = 4096;
+    let (fss, store, release, in_flight, _dropped) = make_fast_slow_with_gated_slow(cap_bytes);
+
+    // Use update_oneshot directly (Store::update_oneshot ultimately
+    // calls FastSlowStore::update_oneshot).
+    let payload1: Bytes = Bytes::from(vec![0u8; 2048]);
+    let digest1 = DigestInfo::try_new(VALID_HASH1, payload1.len() as u64)?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.update_oneshot(digest1, payload1),
+    )
+    .await
+    .expect("first update_oneshot must not deadlock")?;
+    wait_until("first slow-write spawn pinned (oneshot)", || {
+        in_flight.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    let payload2: Bytes = Bytes::from(vec![1u8; 2048]);
+    let digest2 = DigestInfo::try_new(VALID_HASH2, payload2.len() as u64)?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.update_oneshot(digest2, payload2),
+    )
+    .await
+    .expect("second update_oneshot must not deadlock; in_flight at exactly cap")?;
+    wait_until("second slow-write spawn pinned (oneshot, in_flight=2)", || {
+        in_flight.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    assert_eq!(
+        fss.in_flight_slow_write_bytes(),
+        cap_bytes,
+        "in-flight bytes counter must equal cap after two oneshot pins"
+    );
+
+    // Third update_oneshot exceeds the cap — MUST return typed signal.
+    let payload3: Bytes = Bytes::from(vec![2u8; 1024]);
+    let digest3 = DigestInfo::try_new(VALID_HASH3, payload3.len() as u64)?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.update_oneshot(digest3, payload3),
+    )
+    .await
+    .expect("third update_oneshot must not deadlock");
+
+    let err = result.expect_err(
+        "update_oneshot in-flight slow-write byte cap not enforced — \
+         the `update_oneshot` Fix B sibling at fast_slow_store.rs:4359 \
+         must emit the typed BackpressureSignal::SlowWritesAtCapacity",
+    );
+    assert_backpressure_signal(&err, backpressure_signal::Reason::SlowWritesAtCapacity);
+
+    // Counter must NOT have moved past the cap — the rejected oneshot
+    // insert must NOT have incremented (over-action would be broken).
+    assert_eq!(
+        fss.in_flight_slow_write_bytes(),
+        cap_bytes,
+        "in-flight bytes counter must NOT have incremented for the rejected \
+         oneshot insert (over-action — increment-after-cap-check is broken)"
+    );
+
+    // Release; counter drains; new oneshot fits.
+    release.notify_waiters();
+    release.notify_waiters();
+    wait_until("in-flight drains to zero after release (oneshot)", || {
+        fss.in_flight_slow_write_bytes() == 0
+    })
+    .await;
+
+    let payload4: Bytes = Bytes::from(vec![3u8; 1024]);
+    let digest4 = DigestInfo::try_new(VALID_HASH4, payload4.len() as u64)?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        store.update_oneshot(digest4, payload4),
+    )
+    .await
+    .expect("post-drain oneshot must succeed within timeout")?;
     Ok(())
 }
