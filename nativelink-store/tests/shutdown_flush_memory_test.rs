@@ -63,6 +63,7 @@ use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
+use nativelink_store::store_manager::StoreManager;
 use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
@@ -754,4 +755,155 @@ impl StoreDriver for NoUpdateExpectedProbe {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Inner(self.inner.as_store_driver())
     }
+}
+
+/// BLOCK-1 regression test (#335 follow-up): `StoreManager::flush_slow_writes`
+/// MUST descend the production wrapper chain to find the inner
+/// `FastSlowStore` and propagate the Phase-2 flush to it. Production
+/// composition is `ExistenceCacheStore → VerifyStore →
+/// SizePartitioningStore(16384) → FastSlowStore`. The previous local
+/// walker descended `inner_store(None)`, which terminates at
+/// `SizePartitioningStore` (its `inner_store(None)` returns `self`),
+/// so `flush_slow_writes` silently logged "no FastSlowStore registered;
+/// skipping" on every SIGTERM — defeating the #210 graceful-shutdown
+/// fix at the walker layer.
+///
+/// This test seeds the fast tier with a unique blob, registers the
+/// fully-wrapped chain via `StoreManager::add_store`, and calls
+/// `StoreManager::flush_slow_writes`. The Phase-2 `MemoryStore`-only
+/// drain MUST land the blob in the slow tier — and that only happens
+/// if the walker successfully descends through ECS → VS → SP → FSS.
+///
+/// Mutation step (CLAUDE.md mandate): change the
+/// `store.inner_store(Some(synthetic_large_key()))` argument back to
+/// `Option::<StoreKey<'_>>::None` in `store_manager.rs::flush_slow_writes`
+/// (the `find_fast_slow_via_chain` callsites). With `None`,
+/// `SizePartitioningStore::inner_store` returns `self`, the walker
+/// returns None for the upper-arm FSS, the Phase-2 drain is a silent
+/// no-op, the slow tier never sees the blob, and the `seen.expect(...)`
+/// below red-fails with the bespoke message
+/// `"BLOCK-1 regression: StoreManager walker failed to descend
+/// production composition — Phase-2 flush did not propagate; slow tier
+/// is missing the blob"`.
+#[nativelink_test]
+async fn store_manager_flush_descends_production_composition() -> Result<(), Error> {
+    const PARTITION_SIZE: u64 = 16 * 1024;
+
+    // Build the production-shaped upper-arm FastSlowStore (the one the
+    // walker MUST find).
+    let upper_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let upper_fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let upper_fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        upper_fast.clone(),
+        upper_slow.clone(),
+    );
+
+    // Build a lower-arm FastSlowStore (production's lower SizePartitioning
+    // arm is itself a FastSlowStore — see `prod-server.json5`). Required so
+    // SizePartitioning's `stable_delegation = Many { children: [lower,
+    // upper] }` doesn't trip a debug_assert when the StoreManager walks
+    // the chain.
+    let lower_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let lower_fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let lower_fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        lower_fast,
+        lower_slow,
+    );
+
+    let size_part = SizePartitioningStore::new(
+        &SizePartitioningSpec {
+            size: PARTITION_SIZE,
+            lower_store: StoreSpec::Memory(MemorySpec::default()),
+            upper_store: StoreSpec::Memory(MemorySpec::default()),
+        },
+        Store::new(lower_fss),
+        Store::new(upper_fss.clone()),
+    );
+
+    let verify = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: false,
+            verify_hash: false,
+        },
+        Store::new(size_part),
+    );
+
+    let cache = ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: Some(EvictionPolicy {
+                max_count: 1024,
+                ..Default::default()
+            }),
+        },
+        Store::new(verify),
+    );
+
+    // Seed the fast tier with a unique upper-arm blob (size > partition
+    // threshold so SizePartitioning routes upper). We bypass the wrapper
+    // chain on the WRITE side (writing directly to the upper-arm
+    // MemoryStore) to install the deterministic fast-only state that
+    // Phase-2 of `StoreManager::flush_slow_writes` is supposed to
+    // discover via the walker.
+    let payload = vec![0x42u8; PARTITION_SIZE as usize + 64];
+    let digest = unique_digest(2026, payload.len() as u64);
+    upper_fast
+        .update_oneshot(digest, Bytes::from(payload.clone()))
+        .await?;
+
+    // Sanity: slow tier starts empty for this digest.
+    assert!(upper_slow.has(digest).await?.is_none());
+
+    // Wire the production-shaped chain into a StoreManager (matches
+    // `default_store_factory.rs`'s `add_store` calls at startup).
+    let store_manager = Arc::new(StoreManager::new());
+    store_manager.add_store("cas_STORE", Store::new(cache));
+
+    // Drive the StoreManager's flush — this is the SIGTERM-time path
+    // (`nativelink.rs:2079`). Wrapped in a tokio timeout as the
+    // deadlock detector per CLAUDE.md.
+    tokio::time::timeout(
+        NO_DEADLOCK_TIMEOUT,
+        store_manager.flush_slow_writes(NO_DEADLOCK_TIMEOUT),
+    )
+    .await
+    .expect(
+        "StoreManager::flush_slow_writes must not deadlock — \
+         walker descent contract violated (see BLOCK-1 regression doc)",
+    );
+
+    // The load-bearing assertion: post-flush the slow tier MUST hold
+    // the blob. If the walker bottomed out at SizePartitioningStore
+    // (the BLOCK-1 bug) Phase-2 was a silent no-op and the slow tier
+    // is empty. Bespoke message names the exact failure mode per
+    // CLAUDE.md "specific .expect" rule.
+    let seen = upper_slow.get_part_unchunked(digest, 0, None).await;
+    let bytes = seen.expect(
+        "BLOCK-1 regression: StoreManager walker failed to descend \
+         production composition — Phase-2 flush did not propagate; \
+         slow tier is missing the blob",
+    );
+    assert_eq!(
+        bytes.as_ref(),
+        payload.as_slice(),
+        "BLOCK-1 regression: slow-tier bytes after StoreManager \
+         flush do not match the seeded fast-tier bytes"
+    );
+
+    Ok(())
 }
