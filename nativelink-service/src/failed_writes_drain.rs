@@ -81,10 +81,13 @@ use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     UpdateForWorker, UploadMissingBlobsRequest, update_for_worker,
 };
+use nativelink_store::existence_cache_store::ExistenceCacheStore;
+use nativelink_store::fast_slow_store::{FastSlowStore, SelfRetryOutcome};
 use nativelink_store::small_blob_dispatcher::SmallBlobDispatcher;
+use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::Store;
+use nativelink_util::store_trait::{Store, StoreDriver, StoreKey};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -127,39 +130,120 @@ pub struct DrainTickStats {
     /// dispatcher snapshot and the dispatch step. Re-inserted via
     /// the source store. M1 invariant: digests counted here are NOT
     /// counted in `dispatched`, so
-    /// `drained == dispatched + no_worker + throttled + send_failed`.
+    /// `drained == dispatched + no_worker + throttled + send_failed
+    /// + self_retried + self_retry_failed`.
     pub send_failed: usize,
+    /// #335 V3 fix: digests for which the server's MemoryStore (fast
+    /// tier) still held the bytes, so we re-issued the slow-tier
+    /// write directly without a worker round-trip. Counts the
+    /// successful self-retry path. Closes the TLA+ liveness gap where
+    /// no worker has the bytes (mirror dispatch quarantined / slow).
+    pub self_retried: usize,
+    /// #335 V3 fix: digests for which self-retry was attempted (fast
+    /// tier had bytes) but the slow-tier write returned Err. The
+    /// digest is re-inserted into `failed_slow_writes` for the next
+    /// tick (a transient slow-tier error should not lose the digest).
+    pub self_retry_failed: usize,
+}
+
+/// Walk the production CAS wrapper chain (WorkerProxyStore →
+/// ExistenceCacheStore → VerifyStore → FastSlowStore) to find the
+/// underlying [`FastSlowStore`]. Returns `None` if the chain doesn't
+/// terminate in an FSS (e.g. test stores that wrap a MemoryStore
+/// directly with no FSS in the path) — caller falls back to the
+/// pre-#335 worker-only retry behavior for that store.
+///
+/// Mirrors the `find_fast_slow_chunked` walker in `src/bin/nativelink.rs`
+/// (`#212` v4.5 chunked-dispatcher wiring), generalized to also
+/// handle `WorkerProxyStore`'s pass-through `inner_store` impl. Uses
+/// the standard `inner_store` delegation so any wrapper that doesn't
+/// shadow it (e.g. `WorkerProxyStore`) is traversed automatically;
+/// wrappers that shadow `inner_store` to return `self` (e.g. plain
+/// stores) terminate the walk via the ptr-eq guard.
+fn find_fast_slow(store: &dyn StoreDriver) -> Option<&FastSlowStore> {
+    if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
+        return Some(fss);
+    }
+    if let Some(ecs) = store
+        .as_any()
+        .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
+    {
+        // ExistenceCacheStore::inner_store returns the wrapped inner
+        // Store; recurse into its driver.
+        return find_fast_slow(ecs.inner_store().inner_store::<StoreKey<'_>>(None));
+    }
+    if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
+        return find_fast_slow(vs.inner_store().inner_store::<StoreKey<'_>>(None));
+    }
+    let inner = store.inner_store(None);
+    if core::ptr::eq(
+        inner as *const dyn StoreDriver,
+        store as *const dyn StoreDriver,
+    ) {
+        return None;
+    }
+    find_fast_slow(inner)
 }
 
 /// Run a single drain tick. Drains `failed_slow_writes` across every
-/// supplied CAS store, picks a connected worker per digest from the
-/// locality map, and dispatches `UploadMissingBlobs` to that worker's
-/// `worker_tx`. Returns a [`DrainTickStats`] summary.
+/// supplied CAS store, attempts an in-process self-retry from the
+/// server's fast tier (#335 V3 fix), and for digests where the fast
+/// tier no longer holds the bytes, picks a connected worker from the
+/// locality map and dispatches `UploadMissingBlobs`. Returns a
+/// [`DrainTickStats`] summary.
 ///
 /// `inflight` is the per-digest last-dispatch timestamp. Mutated in
 /// place: stale entries (older than `cooldown`) are GC'd at the start
 /// of the tick; new dispatches/throttles are recorded.
 ///
+/// ## #335 V3 self-retry path
+///
+/// For each drained digest the drainer calls
+/// [`FastSlowStore::try_self_retry_slow_write`] BEFORE consulting the
+/// locality map. On `SelfRetryOutcome::Succeeded` the digest is
+/// already removed from `failed_slow_writes` (FSS does it) and
+/// pushed to `stable_digests` for BIS broadcast — no worker dispatch.
+/// On `SelfRetryOutcome::FastTierMiss` (pin expired) the drainer
+/// falls through to the pre-#335 `UploadMissingBlobs` path. On Err
+/// (slow-tier transient) the digest is re-inserted via
+/// `reinsert_failed_digests` for the next tick.
+///
+/// This closes a TLA+ liveness violation where a slow-tier write
+/// failure plus no-worker-source produced a permanently stuck blob:
+/// the failed_slow_writes set held it forever, the fast-tier pin
+/// auto-expired, and the next Bazel read saw NotFound. With self-
+/// retry, the server uses its own MemoryStore as the recovery source
+/// when the pin is still alive — it nearly always is, since the
+/// drainer ticks every 5 s and the pin TTL is 120 s.
+///
 /// ## Edge cases
 ///
 /// - **Empty set**: returns `DrainTickStats::default()` immediately.
-/// - **No worker for digest**: re-inserts and counts in `no_worker`.
-/// - **Worker tx send error**: re-inserts the entire batch and counts
-///   the failure. The worker's `unregister_worker` will drop the tx
-///   from the dispatcher snapshot on the next tick, so a permanently
-///   dead worker stops being picked.
+/// - **Self-retry success**: counted in `self_retried`; not in
+///   `dispatched`; no worker round-trip.
+/// - **Self-retry slow-tier Err**: counted in `self_retry_failed`;
+///   re-inserted into source store.
+/// - **Fast-tier miss + no worker for digest**: re-inserts and
+///   counts in `no_worker`.
+/// - **Fast-tier miss + worker tx send error**: re-inserts the entire
+///   batch and counts the failure. The worker's `unregister_worker`
+///   will drop the tx from the dispatcher snapshot on the next tick,
+///   so a permanently dead worker stops being picked.
 /// - **Recently dispatched (cooldown)**: re-inserts and counts in
-///   `throttled`.
+///   `throttled`. Self-retry is also gated by the cooldown so we
+///   don't hammer the slow tier on a transient.
 ///
 /// ## Lock discipline
 ///
 /// Acquires `failed_slow_writes` (parking_lot::Mutex via
 /// `drain_failed_digests`/`reinsert_failed_digests`), the
 /// `BlobLocalityMap` (RwLock read), and the dispatcher's `worker_txs`
-/// (parking_lot::Mutex). All locks are dropped before any `.await`
-/// (none in this function). Per-digest dispatch is `tx.send()`, which
-/// returns immediately on an unbounded channel.
-pub fn drain_tick(
+/// (parking_lot::Mutex). Self-retry holds the FSS's
+/// `failed_slow_writes` and `stable_digests` Mutex briefly inside
+/// `try_self_retry_slow_write`; both are dropped before any `.await`.
+/// Per-digest dispatch is `tx.send()`, which returns immediately on
+/// an unbounded channel.
+pub async fn drain_tick(
     cas_stores: &[(String, Store)],
     locality_map: &SharedBlobLocalityMap,
     dispatcher: &SmallBlobDispatcher,
@@ -203,10 +287,28 @@ pub fn drain_tick(
     let mut per_endpoint: HashMap<Arc<str>, Vec<(String, DigestInfo)>> = HashMap::new();
     let mut reinsert: HashMap<String, Vec<DigestInfo>> = HashMap::new();
 
+    // Cache wrapper-walker results per store name. The walk is cheap
+    // (a few pointer compares) but doing it per-digest would still
+    // bloat the hot path; cache it once per tick.
+    //
+    // Stored as a parallel index into `cas_stores`. None means the
+    // chain doesn't terminate in a FastSlowStore (no self-retry path
+    // available) — drainer falls back to pre-#335 behavior.
+    let fss_for_store: HashMap<&str, Option<&FastSlowStore>> = cas_stores
+        .iter()
+        .map(|(name, store)| {
+            let driver: &dyn StoreDriver = store.inner_store::<StoreKey<'_>>(None);
+            (name.as_str(), find_fast_slow(driver))
+        })
+        .collect();
+
     for (store_name, digests) in all_failed {
         stats.drained += digests.len();
         for digest in digests {
-            // Throttle: digest dispatched within cooldown? re-insert + skip.
+            // Throttle: digest dispatched/attempted within cooldown?
+            // re-insert + skip. Self-retry is also throttled — a
+            // transient slow-tier failure should not be hammered every
+            // tick.
             if let Some(ts) = inflight.get(&digest) {
                 if now.duration_since(*ts) < cooldown {
                     stats.throttled += 1;
@@ -214,6 +316,45 @@ pub fn drain_tick(
                     continue;
                 }
             }
+
+            // #335 V3 self-retry: if the chain has an FSS, attempt
+            // an in-process slow-tier re-write from the fast tier.
+            // The FSS clears `failed_slow_writes` itself on success
+            // (no re-insert needed); on miss we fall through to the
+            // worker dispatch path; on Err we re-insert.
+            if let Some(Some(fss)) = fss_for_store.get(store_name.as_str()) {
+                match fss.try_self_retry_slow_write(digest).await {
+                    Ok(SelfRetryOutcome::Succeeded { .. }) => {
+                        stats.self_retried += 1;
+                        if inflight.len() < inflight_cap {
+                            inflight.insert(digest, now);
+                        }
+                        // Skip worker dispatch — bytes already in
+                        // slow tier, BIS will broadcast.
+                        continue;
+                    }
+                    Ok(SelfRetryOutcome::FastTierMiss) => {
+                        // Fall through to worker dispatch below.
+                    }
+                    Err(e) => {
+                        warn!(
+                            ?digest,
+                            store_name = %store_name,
+                            err = ?e,
+                            "failed_slow_writes_drain: self-retry slow-tier \
+                             write failed; re-inserting for next tick \
+                             (transient slow-tier outage)"
+                        );
+                        stats.self_retry_failed += 1;
+                        if inflight.len() < inflight_cap {
+                            inflight.insert(digest, now);
+                        }
+                        reinsert.entry(store_name.clone()).or_default().push(digest);
+                        continue;
+                    }
+                }
+            }
+
             // Pick the first worker that's currently connected.
             let workers = locality_map.read().lookup_workers(&digest);
             let picked = workers
@@ -240,7 +381,7 @@ pub fn drain_tick(
             // `tx.send()` Err). Counter is bumped only after a
             // successful `tx.send()` Ok arm so the invariant
             // `drained == dispatched + no_worker + throttled +
-            // send_failed` holds.
+            // send_failed + self_retried + self_retry_failed` holds.
         }
     }
 
@@ -312,6 +453,8 @@ pub fn drain_tick(
             no_worker = stats.no_worker,
             throttled = stats.throttled,
             send_failed = stats.send_failed,
+            self_retried = stats.self_retried,
+            self_retry_failed = stats.self_retry_failed,
             "failed_slow_writes_drain: tick complete"
         );
     }

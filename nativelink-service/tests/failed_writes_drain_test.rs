@@ -184,7 +184,8 @@ async fn failed_slow_writes_drains_via_upload_missing_blobs() -> Result<(), Erro
             DEFAULT_DRAIN_COOLDOWN,
             DEFAULT_DRAIN_BATCH_SIZE,
             DEFAULT_DRAIN_INFLIGHT_CAP,
-        );
+        )
+        .await;
 
         // Stats: dispatched 1, no_worker 0, throttled 0.
         assert_eq!(
@@ -277,7 +278,8 @@ async fn failed_slow_writes_skips_when_no_worker_has_blob() -> Result<(), Error>
             DEFAULT_DRAIN_COOLDOWN,
             DEFAULT_DRAIN_BATCH_SIZE,
             DEFAULT_DRAIN_INFLIGHT_CAP,
-        );
+        )
+        .await;
 
         assert_eq!(
             stats.drained, 1,
@@ -372,7 +374,8 @@ async fn failed_slow_writes_throttled_digest_reinserts() -> Result<(), Error> {
             DEFAULT_DRAIN_COOLDOWN,
             DEFAULT_DRAIN_BATCH_SIZE,
             DEFAULT_DRAIN_INFLIGHT_CAP,
-        );
+        )
+        .await;
 
         assert_eq!(
             stats.drained, 1,
@@ -468,7 +471,8 @@ async fn failed_slow_writes_tx_send_err_reinserts() -> Result<(), Error> {
             DEFAULT_DRAIN_COOLDOWN,
             DEFAULT_DRAIN_BATCH_SIZE,
             DEFAULT_DRAIN_INFLIGHT_CAP,
-        );
+        )
+        .await;
 
         assert_eq!(
             stats.drained, 1,

@@ -1059,7 +1059,8 @@ async fn inner_main(
                                 DEFAULT_DRAIN_COOLDOWN,
                                 DEFAULT_DRAIN_BATCH_SIZE,
                                 DEFAULT_DRAIN_INFLIGHT_CAP,
-                            );
+                            )
+                            .await;
                         }
                     });
                     info!(
