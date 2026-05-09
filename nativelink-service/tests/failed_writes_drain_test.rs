@@ -87,7 +87,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreSpec};
+use nativelink_config::stores::{
+    EvictionPolicy, ExistenceCacheSpec, FastSlowSpec, MemorySpec, SizePartitioningSpec, StoreSpec,
+    VerifySpec,
+};
 use nativelink_error::{Code, Error, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::{
@@ -99,9 +102,12 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_service::failed_writes_drain::{
     DEFAULT_DRAIN_BATCH_SIZE, DEFAULT_DRAIN_COOLDOWN, DEFAULT_DRAIN_INFLIGHT_CAP, drain_tick,
 };
+use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
+use nativelink_store::size_partitioning_store::SizePartitioningStore;
 use nativelink_store::small_blob_dispatcher::{SmallBlobDispatcher, SmallBlobDispatcherConfig};
+use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
@@ -822,6 +828,26 @@ async fn failed_slow_writes_self_retries_from_server_fast_tier() -> Result<(), E
              a permanently-recovered blob"
         );
 
+        // dsr M3 closer: V3's headline contract advertises that the
+        // self-retried digest is pushed to `stable_digests` so the BIS
+        // broadcaster picks it up — without this, the durability
+        // protocol that the rest of the cluster relies on (`mirror_blobs
+        // ≥2-replica + BlobsInStableStorage ack`) would not see the
+        // recovered blob, leaving downstream worker mirrors holding the
+        // bytes forever (dead-letter on a different layer). This
+        // assertion crosses the FSS → stable_digests seam that
+        // `try_self_retry_slow_write:1784` writes; the BIS broadcaster
+        // (`nativelink-service::*`) drains it on its tick.
+        let stable = fss.drain_stable_digests();
+        assert!(
+            stable.contains(&digest),
+            "V3 fix: successful self-retry MUST push the digest into \
+             stable_digests so the BIS broadcaster picks it up — \
+             missing means downstream worker-mirrors see no BIS ack and \
+             keep the bytes pinned forever (durability invariant violated). \
+             stable={stable:?}"
+        );
+
         Ok::<(), Error>(())
     })
     .await
@@ -985,5 +1011,236 @@ async fn failed_slow_writes_self_retry_err_reinserts_for_next_tick() -> Result<(
     })
     .await
     .expect("V3 self-retry-err test must not deadlock")?;
+    Ok(())
+}
+
+/// dsr M2 + code-reviewer + testing-czar BLOCK closer: production
+/// composition descent test.
+///
+/// The four V3 tests above all wrap a *bare* `FastSlowStore` — they
+/// exercise `drain_tick`'s self-retry branch but they never cross the
+/// production wrapper chain
+/// (`ExistenceCacheStore` → `VerifyStore` →
+/// `SizePartitioningStore(16384)` → `FastSlowStore`).
+/// The walker [`nativelink_store::wrapper_walker::find_fast_slow_via_chain`]
+/// must pass [`synthetic_large_key()`] (a `u64::MAX`-sized
+/// `DigestInfo`) into `inner_store(_)` so it descends
+/// `SizePartitioningStore` into its upper arm — without that, the
+/// walker terminates at the partitioning boundary and V3 self-retry
+/// is structurally inactive for the production composition. This test
+/// guards that contract bit-identically end-to-end.
+///
+/// Seams crossed (per dsr "name the seams" rule):
+///   1. `Store::inner_store(Some(synthetic_large_key))` (drain_tick:300)
+///   2. `find_fast_slow_via_chain` (`wrapper_walker.rs`):
+///      - `ExistenceCacheStore` downcast + recurse via typed
+///        `inner_store()` accessor
+///      - `VerifyStore` downcast + recurse via typed `inner_store()`
+///      - `SizePartitioningStore::inner_store(Some(large_key))`
+///        descends to upper arm (the FSS arm in production)
+///      - `FastSlowStore` downcast → `Some(fss)`
+///   3. `FastSlowStore::try_self_retry_slow_write` (the V3 entry point)
+///   4. `FastSlowStore::stable_digests` push (BIS broadcast contract)
+///
+/// Mutation step (CLAUDE.md mandate): comment out the
+/// `synthetic_large_key()` argument in
+/// `failed_writes_drain.rs::drain_tick`'s `fss_for_store` build (the
+/// `let driver = store.inner_store(Some(synthetic_large_key()));`
+/// line). With `None` instead, `SizePartitioningStore::inner_store`
+/// returns `self`, the walker terminates with `None`, V3 self-retry
+/// is bypassed, the drainer counts `no_worker = 1` (empty locality
+/// map), and `self_retried` stays at 0 — this assertion fires:
+///   "V3 walker failed to descend production composition —
+///    synthetic_large_key pattern broken: walker returned None for the
+///    cas_INNER chain so self-retry was structurally inactive"
+#[nativelink_test]
+async fn failed_slow_writes_v3_walker_descends_production_composition() -> Result<(), Error> {
+    tokio::time::timeout(DRAIN_TIMEOUT, async {
+        // Build the production CAS chain in miniature: ECS → VS →
+        // SizePartitioning(16384) → upper: FSS{Memory + GatedSlow},
+        // lower: trivial MemoryStore (small-blob path is irrelevant
+        // for this test — the digest will route to upper).
+        let fast_arc = MemoryStore::new(&MemorySpec::default());
+        let slow_arc = GatedSlowStore::new();
+        let fast = Store::new(fast_arc.clone());
+        let slow = Store::new(slow_arc.clone());
+        let fss = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Memory(MemorySpec::default()),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: nativelink_config::stores::StoreDirection::default(),
+                slow_direction: nativelink_config::stores::StoreDirection::default(),
+                chunked_reads_enabled: false,
+            },
+            fast,
+            slow,
+        );
+
+        // Lower arm of SizePartitioning routes <16384-byte digests
+        // (irrelevant for this test — the digest is large). It MUST
+        // be a `FastSlowStore`, not a bare `MemoryStore`, because
+        // `SizePartitioningStore::stable_delegation()` returns
+        // `Many { children: [lower, upper] }` so on a re-insert
+        // failure path the lower arm's `reinsert_failed_digests` is
+        // also invoked. A bare `MemoryStore` declares
+        // `StableDigestDelegation::Leaf` without overriding the
+        // method → `debug_assert!` panic. The production
+        // `SMALL_CAS_CACHED` is itself a `FastSlowStore`, so this
+        // matches production shape.
+        let lower_inner_fast =
+            Store::new(MemoryStore::new(&MemorySpec::default()));
+        let lower_inner_slow =
+            Store::new(MemoryStore::new(&MemorySpec::default()));
+        let lower_fss = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Memory(MemorySpec::default()),
+                slow: StoreSpec::Memory(MemorySpec::default()),
+                fast_direction: nativelink_config::stores::StoreDirection::default(),
+                slow_direction: nativelink_config::stores::StoreDirection::default(),
+                chunked_reads_enabled: false,
+            },
+            lower_inner_fast,
+            lower_inner_slow,
+        );
+        let lower_dummy = Store::new(lower_fss);
+        let upper_arm = Store::new(fss.clone());
+        let size_part = SizePartitioningStore::new(
+            &SizePartitioningSpec {
+                size: 16384, // matches production `prod-server.json5` cas_INNER threshold
+                lower_store: StoreSpec::Memory(MemorySpec::default()),
+                upper_store: StoreSpec::Memory(MemorySpec::default()),
+            },
+            lower_dummy,
+            upper_arm,
+        );
+
+        // VerifyStore wrap (production cas_STORE inserts VerifyStore
+        // between ExistenceCacheStore and the size-partitioned inner).
+        // For this test we put VS *between* ECS and SP since that's
+        // how `cas_STORE → cas_INNER` reads in prod-server.json5
+        // (cas_STORE = Verify{ backend: cas_INNER (ECS → SP) }).
+        // Wrapping order chosen to match: outer ECS → VS → SP → FSS.
+        let verify = VerifyStore::new(
+            &VerifySpec {
+                backend: StoreSpec::Memory(MemorySpec::default()),
+                verify_size: false, // GatedSlow doesn't honor verify
+                verify_hash: false,
+            },
+            Store::new(size_part),
+        );
+
+        // ExistenceCacheStore wrap (outermost layer matches production
+        // cas_INNER's outer ExistenceCacheStore).
+        let ecs = ExistenceCacheStore::new(
+            &ExistenceCacheSpec {
+                backend: StoreSpec::Memory(MemorySpec::default()),
+                eviction_policy: Some(EvictionPolicy {
+                    max_count: 1024,
+                    ..Default::default()
+                }),
+            },
+            Store::new(verify),
+        );
+
+        let cas_store_name = "cas_STORE_PROD";
+        let cas_stores: Vec<(String, Store)> =
+            vec![(cas_store_name.to_string(), Store::new(ecs))];
+
+        let locality_map = new_shared_blob_locality_map();
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+        // Worker IS connected but will not be picked because no entry
+        // for the digest exists in the locality map — guarantees that
+        // if the V3 walker fails to descend, `no_worker` increments
+        // (NOT `dispatched`).
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel::<UpdateForWorker>();
+        dispatcher.register_worker("grpc://test-worker:50071", 1, worker_tx);
+
+        // Use a 32 KiB digest — strictly above the 16 384 partition
+        // threshold so `SizePartitioningStore` routes to the upper
+        // arm (the FSS). A digest <16384 would route lower and miss
+        // the test seam entirely.
+        let payload_size: u64 = 32 * 1024;
+        let digest =
+            DigestInfo::try_new(VALID_HASH, payload_size).expect("valid 32 KiB digest");
+        let payload = Bytes::from(vec![0xab_u8; payload_size as usize]);
+
+        // Pre-stage bytes in the FAST tier (matches the post-pin
+        // production state after a slow-tier write failure).
+        Pin::new(fast_arc.as_ref())
+            .update_oneshot(StoreKey::Digest(digest), payload.clone())
+            .await
+            .expect("seed fast tier");
+
+        // Mark the digest as failed so the drainer picks it up.
+        let inserter = fss.failed_writes_inserter();
+        inserter(digest);
+
+        let mut inflight: HashMap<DigestInfo, Instant> = HashMap::new();
+        let stats = drain_tick(
+            &cas_stores,
+            &locality_map,
+            &dispatcher,
+            &mut inflight,
+            DEFAULT_DRAIN_COOLDOWN,
+            DEFAULT_DRAIN_BATCH_SIZE,
+            DEFAULT_DRAIN_INFLIGHT_CAP,
+        )
+        .await;
+
+        // The load-bearing assertion: V3 walker MUST have descended
+        // the full WPS-shaped chain and located the FSS, so the
+        // self-retry branch fires (NOT the worker-fallback branch).
+        // Bespoke message names the exact failure mode per CLAUDE.md
+        // "specific .expect" rule.
+        assert_eq!(
+            stats.self_retried, 1,
+            "V3 walker failed to descend production composition — \
+             synthetic_large_key pattern broken: walker returned None \
+             for the cas_INNER chain so self-retry was structurally \
+             inactive (drainer fell through to no_worker fallback). \
+             stats={stats:?}"
+        );
+        assert_eq!(
+            stats.no_worker, 0,
+            "production-composition test: when V3 walker descends \
+             correctly and fast tier has bytes, drainer MUST self-retry \
+             — no_worker > 0 means the walker bailed and the digest \
+             missed the V3 path. stats={stats:?}"
+        );
+        assert_eq!(
+            stats.dispatched, 0,
+            "successful self-retry MUST NOT dispatch UploadMissingBlobs; \
+             stats={stats:?}"
+        );
+        assert_eq!(stats.drained, 1, "stats={stats:?}");
+
+        // Worker rx must remain empty — V3 succeeded without
+        // dispatching an UploadMissingBlobs RPC.
+        let recv_result = worker_rx.try_recv();
+        assert!(
+            recv_result.is_err(),
+            "production-composition test: V3 success MUST NOT \
+             dispatch UploadMissingBlobs (over-action regression); \
+             got={recv_result:?}"
+        );
+
+        // BIS push assertion (dsr M3) — same as the headline test
+        // but crossed via the production wrapper chain.
+        let stable = fss.drain_stable_digests();
+        assert!(
+            stable.contains(&digest),
+            "production-composition test: V3 self-retry MUST push the \
+             digest into stable_digests for BIS broadcast — missing \
+             means the durability invariant breaks for digests \
+             recovered via the production-shaped chain. stable={stable:?}"
+        );
+
+        Ok::<(), Error>(())
+    })
+    .await
+    .expect(
+        "V3 production-composition test must not deadlock — walker \
+         descent contract violated (synthetic_large_key pattern)",
+    )?;
     Ok(())
 }

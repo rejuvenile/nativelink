@@ -1729,6 +1729,38 @@ impl FastSlowStore {
     /// dedups). However the drainer destructively drains
     /// `failed_slow_writes` per tick, so in practice each digest is
     /// retried at most once per tick.
+    ///
+    /// ## Cross-component dependency: Fix C (pin TTL)
+    ///
+    /// V3 self-retry's effectiveness depends on the fast-tier pin
+    /// outliving the slow-tier outage. Fix C
+    /// (`#334`/`PIN_TIMEOUT_SECS = 120`) sets the pin TTL at 120 s.
+    /// If the slow-tier outage exceeds the TTL, the pin auto-expires,
+    /// LRU evicts the bytes from MemoryStore, and this method returns
+    /// `Ok(SelfRetryOutcome::FastTierMiss)` — V3 silently re-opens
+    /// the failure window for any digest the drainer hadn't yet
+    /// retried. Operators reading the drainer's
+    /// `failed_slow_writes_drain: V3 self-retry inactive — fast tier
+    /// walker found no FastSlowStore in chain` warn can also see the
+    /// debug log `fast-tier miss (pin expired or never landed)` for
+    /// per-digest TTL-expiry visibility (closes dsr MINOR-2).
+    ///
+    /// ## Cap-rejected digest exclusion (red-team #5)
+    ///
+    /// V3 self-retry CANNOT recover digests that were rejected at
+    /// admission time (e.g. MemoryStore `Code::ResourceExhausted`
+    /// because the cap was hit before the bytes landed in fast tier).
+    /// Such digests never had a fast-tier replica taken; the pin
+    /// path was bypassed entirely; `try_self_retry_slow_write`
+    /// returns `Ok(SelfRetryOutcome::FastTierMiss)` without finding
+    /// bytes to retry. The `failed_slow_writes` drainer correctly
+    /// falls through to `UploadMissingBlobs`; without a worker
+    /// holding the bytes either, the digest stays stuck. This
+    /// exclusion is intentional — V3's domain is "writes that landed
+    /// then failed downstream", not "writes that never landed". The
+    /// admission-side fix lives in Fix A+B
+    /// (`#334`/`MemoryStore` BIS-driven backpressure) — without
+    /// admission gating that respects pinning, V3 cannot help.
     pub async fn try_self_retry_slow_write(
         &self,
         digest: DigestInfo,

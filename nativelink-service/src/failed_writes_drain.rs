@@ -81,13 +81,12 @@ use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     UpdateForWorker, UploadMissingBlobsRequest, update_for_worker,
 };
-use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::{FastSlowStore, SelfRetryOutcome};
 use nativelink_store::small_blob_dispatcher::SmallBlobDispatcher;
-use nativelink_store::verify_store::VerifyStore;
+use nativelink_store::wrapper_walker::{find_fast_slow_via_chain, synthetic_large_key};
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::{Store, StoreDriver, StoreKey};
+use nativelink_util::store_trait::Store;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -146,44 +145,21 @@ pub struct DrainTickStats {
     pub self_retry_failed: usize,
 }
 
-/// Walk the production CAS wrapper chain (WorkerProxyStore →
-/// ExistenceCacheStore → VerifyStore → FastSlowStore) to find the
-/// underlying [`FastSlowStore`]. Returns `None` if the chain doesn't
-/// terminate in an FSS (e.g. test stores that wrap a MemoryStore
-/// directly with no FSS in the path) — caller falls back to the
-/// pre-#335 worker-only retry behavior for that store.
-///
-/// Mirrors the `find_fast_slow_chunked` walker in `src/bin/nativelink.rs`
-/// (`#212` v4.5 chunked-dispatcher wiring), generalized to also
-/// handle `WorkerProxyStore`'s pass-through `inner_store` impl. Uses
-/// the standard `inner_store` delegation so any wrapper that doesn't
-/// shadow it (e.g. `WorkerProxyStore`) is traversed automatically;
-/// wrappers that shadow `inner_store` to return `self` (e.g. plain
-/// stores) terminate the walk via the ptr-eq guard.
-fn find_fast_slow(store: &dyn StoreDriver) -> Option<&FastSlowStore> {
-    if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
-        return Some(fss);
-    }
-    if let Some(ecs) = store
-        .as_any()
-        .downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>()
-    {
-        // ExistenceCacheStore::inner_store returns the wrapped inner
-        // Store; recurse into its driver.
-        return find_fast_slow(ecs.inner_store().inner_store::<StoreKey<'_>>(None));
-    }
-    if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
-        return find_fast_slow(vs.inner_store().inner_store::<StoreKey<'_>>(None));
-    }
-    let inner = store.inner_store(None);
-    if core::ptr::eq(
-        inner as *const dyn StoreDriver,
-        store as *const dyn StoreDriver,
-    ) {
-        return None;
-    }
-    find_fast_slow(inner)
-}
+// V3 walker now lives in `nativelink_store::wrapper_walker` so the
+// `chunked_fast_slow` dispatcher wiring (`src/bin/nativelink.rs`) and
+// this drainer share one canonical implementation. The previous
+// in-file `find_fast_slow` walker descended `inner_store(None)`,
+// which terminated at `SizePartitioningStore` (its `inner_store(None)`
+// returns `self`) — meaning the V3 self-retry was a structural no-op
+// for the production composition (`WorkerProxyStore` →
+// `ExistenceCacheStore` → `VerifyStore` → `SizePartitioningStore` →
+// `FastSlowStore`). The shared helper passes
+// `synthetic_large_key()` to descend the upper arm correctly.
+//
+// TODO(#303): a separate `find_fast_slow_for_pin` (small-key) walker
+// lives in `nativelink_store::small_blob_dispatcher`; once chunked-
+// dispatcher consolidation lands, evaluate folding both into one
+// helper parameterised by hint size.
 
 /// Run a single drain tick. Drains `failed_slow_writes` across every
 /// supplied CAS store, attempts an in-process self-retry from the
@@ -294,11 +270,39 @@ pub async fn drain_tick(
     // Stored as a parallel index into `cas_stores`. None means the
     // chain doesn't terminate in a FastSlowStore (no self-retry path
     // available) — drainer falls back to pre-#335 behavior.
+    //
+    // CRITICAL: pass `synthetic_large_key()` (not `None`) to descend
+    // `SizePartitioningStore` correctly. See `wrapper_walker` module
+    // docs for the partitioning trap details.
     let fss_for_store: HashMap<&str, Option<&FastSlowStore>> = cas_stores
         .iter()
         .map(|(name, store)| {
-            let driver: &dyn StoreDriver = store.inner_store::<StoreKey<'_>>(None);
-            (name.as_str(), find_fast_slow(driver))
+            let driver = store.inner_store(Some(synthetic_large_key()));
+            let fss = find_fast_slow_via_chain(driver);
+            // M1 observability (dsr blocker): when the walker returns
+            // None for a store that has digests to drain, V3 self-retry
+            // is structurally inactive for that composition. Without
+            // this warn the operator has no visibility — the drainer
+            // silently falls through to pre-#335 worker-only retry,
+            // re-opening the TLA+ liveness gap whenever no worker has
+            // the bytes. Emit once per tick per store (NOT per digest)
+            // so a wide failure storm doesn't spam the log; the
+            // per-tick cardinality is bounded by `cas_stores.len()`
+            // (production = 1, max plausible = ~10 with split-routing).
+            if fss.is_none() {
+                warn!(
+                    store_name = %name,
+                    walker_path = "no_fss_in_chain",
+                    composition = "WorkerProxyStore → ExistenceCacheStore → \
+                                   VerifyStore → SizePartitioningStore(upper) → \
+                                   FastSlowStore (production)",
+                    "failed_slow_writes_drain: V3 self-retry inactive — fast tier \
+                     walker found no FastSlowStore in chain; falling through to \
+                     pre-#335 worker-only retry (TLA+ liveness gap re-opens when \
+                     no worker has the bytes)"
+                );
+            }
+            (name.as_str(), fss)
         })
         .collect();
 
