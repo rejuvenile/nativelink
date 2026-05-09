@@ -27,7 +27,6 @@ use bytes::{Bytes, BytesMut};
 use nativelink_config::stores::MemorySpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
 #[cfg(feature = "chunked_fast_slow")]
-use tracing::info;
 use tracing::{debug, error};
 use nativelink_metric::MetricsComponent;
 #[cfg(feature = "chunked_fast_slow")]
@@ -281,7 +280,15 @@ impl MemoryStore {
             .evicting_map
             .evict_unpinned_lru_bytes(incoming_bytes);
         if report.evicted_count > 0 {
-            info!(
+            // Demoted to debug! to avoid log flooding (#262 burst-info
+            // demote class). The success path fires on every eviction-
+            // driven admission; in production at line rate that's
+            // hundreds of events per second per FastSlowStore. The
+            // distinct "eviction freed nothing" case is signaled via
+            // the `Err(...)` path below, where the warn-level message
+            // ("every byte is pinned") carries the operationally
+            // important info.
+            debug!(
                 key = ?owned_key,
                 incoming_bytes,
                 evicted_count = report.evicted_count,
