@@ -264,114 +264,259 @@ async fn digest_keyed_update_invokes_chunked_dispatcher() -> Result<(), Error> {
 }
 
 // ---------------------------------------------------------------------
-// #334 Fix A chunked-sibling regression — red-team #3 (bundle fixup #7)
+// M1 (cascade bundle pass-2 dsr review) — chunked-path mid-stream
+// rejection must preserve typed BackpressureSignal across the
+// generic data_res `Code::Internal` wrapper.
+//
+// Original guard (#334 bundle fixup #7 / red-team #3) used an
+// admit-time RejectingDispatcher that dropped `chunk_rx` before
+// observing any chunks; in that ordering the data-stream future
+// raced to EOF and the legacy `match dispatch_res` arm at
+// `:1248-1268` returned the typed err. The dsr review correctly
+// identified the production-active case is MID-STREAM rejection
+// (dispatcher consumes K chunks then rejects with PinnedBytesExhausted
+// or GlobalChunkBudgetExhausted), where the data-stream future is
+// guaranteed to be mid-`chunk_guard.send` when chunk_rx is dropped,
+// reliably producing `data_res = Err(Code::Internal "...Failed to
+// send to chunked dispatcher...")` BEFORE dispatch_res is consumed
+// by the legacy arm. The fix is the new pre-`data_res` typed-signal
+// guard at `fast_slow_store.rs:~1230`.
 // ---------------------------------------------------------------------
 
-/// Fake dispatcher that REJECTS the dispatch with a typed
-/// `BackpressureSignal::PerBlobMpscFull` AT ADMIT TIME (the live,
-/// production-active emit shape — see
-/// `nativelink-service/src/chunked_write_handler.rs:1487` for the
-/// analog production site, which rejects BEFORE consuming any
-/// chunks). Drops the reader immediately so the data-stream future's
-/// `chunk_guard.send(...)` fails with the generic Internal-wrapped
-/// channel-closed error — exactly the production race that masks the
-/// dispatcher's typed signal pre-fix.
+/// Fake dispatcher that consumes K non-empty chunks then rejects with a
+/// typed `BackpressureSignal::PinnedBytesExhausted` (the
+/// production-active PinBudget-exhaustion shape from
+/// `nativelink-service/src/chunked_write_handler.rs:1448-1452`). After
+/// consuming the K-th chunk and BEFORE returning Err, the dispatcher
+/// signals a barrier `Notify` so the test producer can release the next
+/// chunk and guarantee the data-stream future's
+/// `chunk_guard.send(...).await` is the in-flight site that observes
+/// the dropped chunk_rx.
+///
+/// This fake reproduces the production race the dsr review identified:
+///   1. `data_stream_fut` sends chunks 0..=K-1 to chunk_tx.
+///   2. dispatcher consumes those K chunks.
+///   3. dispatcher returns Err (typed BackpressureSignal). chunk_rx is
+///      dropped at end-of-scope as `dispatch_fut` resolves.
+///   4. `data_stream_fut` calls `chunk_guard.send(chunk K)` → fails with
+///      channel-closed → returns `Err(Code::Internal "Failed to send to
+///      chunked dispatcher")`.
+///   5. `join3(...)` resolves with `data_res = Err(Internal)` and
+///      `dispatch_res = Err(typed)`. Without the M1 guard, the generic
+///      `data_res` arm fires FIRST and the typed signal is lost.
 #[derive(Debug)]
-struct RejectingDispatcher {
+struct MidStreamRejectingDispatcher {
     invocations: Arc<AtomicUsize>,
+    chunks_to_consume_before_reject: usize,
+    /// Notified after the K-th chunk has been consumed so the test
+    /// producer can release the (K+1)-th chunk into chunk_tx, then the
+    /// dispatcher returns Err and chunk_rx is dropped — the producer's
+    /// in-flight send observes channel-closed.
+    threshold_reached: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
-impl BazelChunkedDispatcher for RejectingDispatcher {
+impl BazelChunkedDispatcher for MidStreamRejectingDispatcher {
     async fn dispatch(
         &self,
         _digest: DigestInfo,
-        _reader: DropCloserReadHalf,
+        mut reader: DropCloserReadHalf,
     ) -> Result<u64, Error> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
-        // Drop reader immediately — the data-stream future's
-        // chunk_guard.send will then fail with channel-closed,
-        // wrapped as generic Code::Internal in the data_stream_fut
-        // closure. That's the bug-precondition: dispatcher's typed
-        // signal MUST still surface despite data_res carrying that
-        // generic Internal.
+        let mut consumed = 0_usize;
+        while consumed < self.chunks_to_consume_before_reject {
+            let buf = reader.recv().await?;
+            if buf.is_empty() {
+                // Producer EOF before we hit the threshold — abort the
+                // setup so the test surfaces "race didn't fire" rather
+                // than a misleading pass.
+                return Err(nativelink_error::make_err!(
+                    nativelink_error::Code::FailedPrecondition,
+                    "MidStreamRejectingDispatcher: producer EOF'd before \
+                     consuming {} chunks (consumed {}); test fixture cannot \
+                     reproduce mid-stream rejection — increase chunk count \
+                     or reduce threshold",
+                    self.chunks_to_consume_before_reject,
+                    consumed,
+                ));
+            }
+            consumed += 1;
+        }
+        // Signal the producer to release the next chunk so the producer
+        // is mid-`chunk_guard.send` when we drop chunk_rx at our Err
+        // return below. This is the production race ordering — without
+        // the in-flight send, the producer would observe EOF instead of
+        // channel-closed.
+        self.threshold_reached.notify_one();
+        // Yield the runtime so the producer's pending send is scheduled
+        // and is observably blocked on chunk_tx capacity (chunk_tx has
+        // size 128 = 128 buffers in flight; consuming K=1 reads the head
+        // out so the producer's next send needs space).
+        tokio::task::yield_now().await;
+        // Drop reader implicitly via Err return. Producer's pending /
+        // next chunk_guard.send fails with channel-closed → generic
+        // Code::Internal in data_stream_fut closure.
         let detail = nativelink_store::chunked_signal::encode_backpressure_signal_any(
-            nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal::Reason::PerBlobMpscFull,
-            100,
+            nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal::Reason::PinnedBytesExhausted,
+            250,
         );
         Err(Error::resource_exhausted_backpressure(
-            "RejectingDispatcher: synthetic per-blob mpsc rejection at admit-time",
+            "MidStreamRejectingDispatcher: synthetic PinBudget exhaustion mid-stream",
             detail,
         ))
     }
 }
 
-/// **#334 Fix A chunked-sibling guard — red-team #3 (bundle fixup
-/// #7).** When the chunked dispatcher rejects a Digest-keyed
-/// `update()` with a typed `BackpressureSignal`, the FastSlowStore's
-/// chunked path MUST surface the typed signal to the caller — NOT
-/// the generic `Code::Internal "Failed to send to chunked dispatcher"`
-/// that the data-stream future would emit when `chunk_rx` is dropped
-/// by the rejecting dispatcher.
+/// Multi-chunk producer driving `StoreLike::update`. Sends `n_chunks`
+/// non-empty buffers (each `chunk_size` bytes) then EOF, with a barrier
+/// `Notify` between chunks `K-1` and `K` so the dispatcher fixture can
+/// reach its consume-K-then-reject state with the producer mid-send on
+/// chunk K. Mirrors the production gRPC ByteStream path which delivers
+/// the payload as a stream of chunks, not a single oneshot buffer.
+async fn drive_update_chunked(
+    store: &Store,
+    key: StoreKey<'_>,
+    n_chunks: usize,
+    chunk_size: usize,
+    threshold_at: usize,
+    threshold_reached: Arc<tokio::sync::Notify>,
+) -> Result<(), Error> {
+    use nativelink_util::buf_channel::make_buf_channel_pair;
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let total_size = (n_chunks * chunk_size) as u64;
+
+    let send_fut = async move {
+        let buf = Bytes::from(vec![0xAB_u8; chunk_size]);
+        for i in 0..n_chunks {
+            if i == threshold_at {
+                // Block until the dispatcher has consumed `threshold_at`
+                // chunks. The dispatcher then drops chunk_rx after this
+                // notify, so this send observes channel-closed mid-flight.
+                threshold_reached.notified().await;
+            }
+            // Best-effort send — the channel-closed Err on the
+            // post-threshold chunk is the load-bearing signal that the
+            // production race fired. The data_stream_fut consuming `rx`
+            // surfaces it as `Code::Internal "Failed to send to chunked
+            // dispatcher"`.
+            if let Err(e) = tx.send(buf.clone()).await {
+                return Err(e);
+            }
+        }
+        tx.send_eof()?;
+        Ok::<(), Error>(())
+    };
+
+    let update_fut = store.update(key, rx, UploadSizeInfo::ExactSize(total_size));
+    let (send_res, update_res) = tokio::join!(send_fut, update_fut);
+    // Producer-side Err (channel-closed mid-send) is expected and harmless;
+    // the load-bearing assertion is on `update_res`.
+    drop(send_res);
+    update_res
+}
+
+/// **M1 (cascade bundle pass-2 dsr review).** When the chunked
+/// dispatcher rejects a Digest-keyed `update()` MID-STREAM with a
+/// typed `BackpressureSignal::*`, the FastSlowStore's chunked path
+/// MUST surface the typed signal to the caller — NOT the generic
+/// `Code::Internal "Failed to send to chunked dispatcher"` that the
+/// data-stream future emits when `chunk_rx` is dropped by the
+/// rejecting dispatcher.
 ///
-/// Per the bundle fixup #7 investigation:
-///   - The dispatcher CAN emit `Code::ResourceExhausted +
-///     BackpressureSignal::{PerBlobMpscFull, GlobalChunkBudgetExhausted,
-///     PinnedBytesExhausted}` and `Code::Aborted +
-///     BackpressureSignal::PerBlobMpscFull`. See
-///     `nativelink-service/src/chunked_write_handler.rs:579,1422,1448,1487,1869`.
-///   - The existing `match dispatch_res { Err(err) => return Err(err) }`
-///     arm at the end of the chunked-update block ALREADY preserves
-///     the typed err to the caller — it is reached even when the
-///     dispatcher rejects-at-admit and drops `chunk_rx`, because the
-///     data-stream future races to EOF before observing the dropped
-///     rx in the test scenarios reproducible to date.
+/// **Production scenario.** The chunked dispatcher
+/// (`nativelink-service/src/chunked_write_handler.rs`) emits typed
+/// `BackpressureSignal::*` via `Error::resource_exhausted_backpressure`
+/// at four sites:
+///   - `:579` — per-blob mpsc full
+///   - `:1422` — global chunk budget exhausted
+///   - `:1448` — pinned bytes exhausted (this test)
+///   - `:1487` — per-blob mpsc full
+///   - `:1869` — concurrent same-digest stream (Code::Aborted)
 ///
-/// This test is a regression GUARD for that existing behavior. If a
-/// future change in the chunked path ever makes `data_res` reliably
-/// Err-before-dispatch-arm in this case, this test will red-fail and
-/// alert that a pre-data_res `dispatch_res_carries_typed_backpressure`
-/// guard symmetric to the `fast_res` one is now needed.
+/// Bazel respects backoff hints from the typed `BackpressureSignal`,
+/// retrying with the dispatcher-suggested `retry_after_ms`. Bazel
+/// does NOT honor backoff hints on `Code::Internal` — that is treated
+/// as a hard failure. So the typed-vs-generic distinction is
+/// load-bearing: if the typed signal is masked, builds fail rather
+/// than backing off and recovering.
+///
+/// **Mutation step.** Comment out the new pre-`data_res` guard in
+/// `fast_slow_store.rs` (the block introduced by M1 immediately
+/// after the `fast_res_carries_typed_backpressure` block, around
+/// `:~1230`). The test must red-fail with the bespoke
+/// `"typed BackpressureSignal lost — pre-data_res guard removed"`
+/// message because the generic `data_res` arm fires first and
+/// returns `Code::Internal` before the legacy `match dispatch_res`
+/// arm can be reached.
 #[nativelink_test]
-async fn fix_a_chunked_sibling_dispatch_typed_signal_preserved() -> Result<(), Error> {
+async fn m1_chunked_mid_stream_rejection_preserves_typed_backpressure(
+) -> Result<(), Error> {
     let _guard = kill_switch_lock().lock().await;
 
     let (fss, _fast, _slow) = make_fast_slow();
     let invocations = Arc::new(AtomicUsize::new(0));
-    let dispatcher: BazelChunkedDispatcherArc = Arc::new(RejectingDispatcher {
+    let threshold_reached = Arc::new(tokio::sync::Notify::new());
+    // Consume 1 chunk then signal the producer to release a 2nd chunk
+    // before returning Err. The 2nd chunk's `chunk_guard.send(...).await`
+    // is the in-flight site that observes the dropped chunk_rx — exactly
+    // the production race the dsr review identified.
+    let dispatcher: BazelChunkedDispatcherArc = Arc::new(MidStreamRejectingDispatcher {
         invocations: invocations.clone(),
+        chunks_to_consume_before_reject: 1,
+        threshold_reached: threshold_reached.clone(),
     });
     fss.set_bazel_chunked_dispatcher(dispatcher);
     fss.set_chunked_size_threshold_for_test(1);
 
     enable_bazel_facing_internal_chunking();
 
-    // Digest key + a larger payload so multiple chunk sends happen,
-    // raising the chance that chunk_guard.send is mid-await when the
-    // dispatcher drops chunk_rx (the bug-precondition race).
-    let payload = Bytes::from(vec![0xAB_u8; 64 * 1024]);
+    // 4 MiB total in 4 × 1 MiB chunks. Multi-chunk send is required so
+    // the data-stream future has more chunks queued AFTER the dispatcher
+    // consumes its threshold and drops chunk_rx — the production race
+    // the M1 fix is intended to catch. A single oneshot send would
+    // race to EOF before the rejection ever observes a second buffer
+    // (the failure mode the prior bundle-fixup-#7 fixture had: it
+    // passed even with the fix absent because the legacy `match
+    // dispatch_res` arm caught the typed err in a no-data-pending state).
+    let chunk_size = 1024 * 1024;
+    let n_chunks = 4;
+    let total_size = (n_chunks * chunk_size) as u64;
     let mut hash = [0u8; 32];
     hash[0] = 0x42;
-    let digest = DigestInfo::new(hash, payload.len() as u64);
+    let digest = DigestInfo::new(hash, total_size);
     let key: StoreKey<'static> = digest.into();
 
     let store: Store = Store::new(fss.clone());
 
+    // 5s deadlock detector — chunked-path rejection must complete
+    // promptly. A wedge here would surface as Elapsed rather than
+    // a silent pass.
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        drive_update(&store, key.borrow(), payload),
+        drive_update_chunked(
+            &store,
+            key.borrow(),
+            n_chunks,
+            chunk_size,
+            /* threshold_at */ 1,
+            threshold_reached,
+        ),
     )
     .await
-    .expect("update must not hang for Digest-keyed update — chunked-path must complete promptly");
+    .expect(
+        "update must not hang for Digest-keyed mid-stream rejection — \
+         chunked-path must complete promptly",
+    );
 
     // Restore kill-switch BEFORE the assertion so a failing assert
     // doesn't leak the toggle to sibling tests in the same process.
     disable_bazel_facing_internal_chunking();
 
     let err = result.expect_err(
-        "chunked-path update with rejecting dispatcher MUST return Err — \
-         #334 Fix A chunked-sibling: typed BackpressureSignal from dispatch_res \
-         must surface, not be masked by generic data_res Internal",
+        "chunked-path update with mid-stream rejecting dispatcher MUST return Err — \
+         M1: typed BackpressureSignal from dispatch_res must surface, not be \
+         masked by generic data_res Code::Internal",
     );
 
     use nativelink_error::Code;
@@ -379,12 +524,13 @@ async fn fix_a_chunked_sibling_dispatch_typed_signal_preserved() -> Result<(), E
     assert!(
         (err.code == Code::ResourceExhausted || err.code == Code::Aborted)
             && error_has_backpressure_signal(&err),
-        "typed BackpressureSignal from dispatch_res MUST be preserved on chunked path — \
-         #334 Fix A chunked-sibling regressed (red-team #3): got code={:?} \
-         messages={:?} details_len={} (chunked-path data_res check at \
-         fast_slow_store.rs:~1196 returned its generic Internal before the \
-         dispatch_res typed-signal check could fire — the same bug shape as \
-         the small-blob #334 cascade, half a fix earlier)",
+        "typed BackpressureSignal lost — pre-data_res guard removed (M1 regression): \
+         got code={:?} messages={:?} details_len={} \
+         (chunked-path data_res check at fast_slow_store.rs:~1252 returned its \
+         generic Internal before the new dispatch_res typed-signal guard at \
+         :~1230 could fire. Bazel does NOT honor backoff hints on Code::Internal, \
+         so this regression silently demotes the typed-signal-driven retry path \
+         to a hard failure)",
         err.code,
         err.messages,
         err.details.len(),

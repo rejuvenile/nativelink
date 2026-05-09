@@ -1171,27 +1171,6 @@ impl FastSlowStore {
         // change that allows MemoryStore to early-reject on this path
         // would replay #334 here too. Sibling-bug guard per CLAUDE.md
         // "Sibling-bug audit on every contract violation."
-        //
-        // Note (#334 bundle fixup #7 — red-team #3): also examined
-        // the `dispatch_res` typed-signal preservation path. The
-        // dispatcher CAN emit `Code::ResourceExhausted +
-        // BackpressureSignal::{PerBlobMpscFull, GlobalChunkBudgetExhausted,
-        // PinnedBytesExhausted}` and `Code::Aborted +
-        // BackpressureSignal::PerBlobMpscFull` (see
-        // `nativelink-service/src/chunked_write_handler.rs:579,1422,
-        // 1448,1487,1869`). The existing `match dispatch_res { Err(err)
-        // => return Err(err) }` arm at the end of this block ALREADY
-        // preserves the typed err to the caller — it is reached even
-        // when the dispatcher rejects-at-admit and drops `chunk_rx`,
-        // because the data-stream future races to EOF before observing
-        // the dropped rx in the test scenarios reproducible to date.
-        // The regression test
-        // `fast_slow_str_key_skips_chunked_dispatch_test::
-        //  fix_a_chunked_sibling_dispatch_typed_signal_preserved`
-        // guards this end-to-end behavior. If a future change makes
-        // `data_res` reliably Err-before-dispatch-arm in this case,
-        // a pre-data_res `dispatch_res_carries_typed_backpressure`
-        // guard symmetric to the `fast_res` one above would be needed.
         let fast_res_carries_typed_backpressure = fast_res
             .as_ref()
             .err()
@@ -1210,6 +1189,63 @@ impl FastSlowStore {
                 "FastSlowStore::update (chunked): fast store rejected with \
                  typed BackpressureSignal — preserving across data-stream \
                  channel-closed wrapper (#334 Fix A)",
+            );
+            return Err(err);
+        }
+
+        // **M1 (cascade bundle pass-2 dsr review)**: symmetric pre-`data_res`
+        // typed-signal guard for `dispatch_res`. The dispatcher CAN emit
+        // `Code::ResourceExhausted + BackpressureSignal::{PerBlobMpscFull,
+        // GlobalChunkBudgetExhausted, PinnedBytesExhausted}` (see
+        // `nativelink-service/src/chunked_write_handler.rs:579,1422,1448,
+        // 1487`) and `Code::Aborted + BackpressureSignal::PerBlobMpscFull`
+        // (`chunked_write_handler.rs:1869`).
+        //
+        // Production mid-stream rejection (dispatcher rejects after K
+        // chunks) drops `chunk_rx`. The next `chunk_guard.send(...).await`
+        // at `:1148` fails → `data_res = Err(Code::Internal "Failed to
+        // send to chunked dispatcher")`. Without this guard, the generic
+        // `data_res` arm immediately below (`:1252`) fires FIRST and
+        // returns the masked `Code::Internal`; the typed-signal
+        // `dispatch_res` arm at `:1283` is never reached. Bazel does
+        // NOT honor backoff hints on `Code::Internal`, so the
+        // typed-signal-driven retry-with-backoff path is silently
+        // demoted to a hard failure.
+        //
+        // Strict heuristic identical to the `fast_res` guard above, plus
+        // accept `Code::Aborted` (the existing `concurrent_same_digest`
+        // emit shape at `chunked_write_handler.rs:1869`). The discriminator
+        // + Code together ARE the contract — a bare `ResourceExhausted`
+        // or `Aborted` from a future dispatcher kind without the typed
+        // detail does NOT match. Over-matching would silently demote
+        // unrelated dispatcher failures to a backpressure-shaped retry.
+        //
+        // Note: this guard fires BEFORE the pin/`failed_slow_writes`
+        // bookkeeping in the existing `dispatch_res` arm at `:1283-1303`.
+        // That bookkeeping is intentionally skipped here because the
+        // mid-stream rejection means the fast tier did NOT receive a
+        // complete blob (the data-stream future erred mid-send), so
+        // pinning would pin a partial / absent entry. Callers retry with
+        // the typed-signal backoff and the next attempt re-runs the
+        // entire chunked-dispatch admission.
+        let dispatch_res_carries_typed_backpressure = dispatch_res.as_ref().err().is_some_and(|e| {
+            (e.code == Code::ResourceExhausted || e.code == Code::Aborted)
+                && error_has_backpressure_signal(e)
+        });
+        if dispatch_res_carries_typed_backpressure {
+            let Err(err) = dispatch_res else {
+                unreachable!(
+                    "dispatch_res_carries_typed_backpressure predicate gates on \
+                     dispatch_res.is_err(); dispatch_res must be Err here"
+                );
+            };
+            error!(
+                ?key,
+                elapsed_ms = data_elapsed.as_millis() as u64,
+                ?err,
+                "FastSlowStore::update (chunked): dispatcher rejected with \
+                 typed BackpressureSignal — preserving across data-stream \
+                 channel-closed wrapper (M1 cascade bundle pass-2 dsr)",
             );
             return Err(err);
         }
@@ -1248,10 +1284,13 @@ impl FastSlowStore {
         let dispatch_committed_size = match dispatch_res {
             Ok(size) => size,
             Err(err) => {
-                // Admission rejection (global budget, mpsc full, dup
-                // digest) or in-stream error. The fast tier already has
-                // the blob; record the digest for retry-on-reconnect so
-                // the mirror protocol can recover.
+                // Non-typed dispatcher Err (typed `BackpressureSignal::*`
+                // is caught earlier by the M1 pre-`data_res` guard
+                // above). Reachable for in-stream dispatcher failures
+                // and any future Err shape that lacks a
+                // `BackpressureSignal` discriminator. The fast tier
+                // already has the blob; record the digest for
+                // retry-on-reconnect so the mirror protocol can recover.
                 if let StoreKey::Digest(d) = &key {
                     self.failed_slow_writes.lock().insert(*d);
                     self.fast_store.pin_digests(&[*d]);
