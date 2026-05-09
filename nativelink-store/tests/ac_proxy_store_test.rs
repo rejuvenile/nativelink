@@ -628,3 +628,65 @@ async fn ac_proxy_store_wipe_callback_clears_connection_cache() -> Result<(), Er
     );
     Ok(())
 }
+
+/// #336 P1 production-composition test: AcProxyStore::get_part MUST
+/// terminate the borrowed `writer` on every exit path. Inner leaf
+/// stores (memory_store) do NOT terminate the writer on NotFound —
+/// the wrapper layer is the load-bearing guard. Pre-fix, the
+/// final-NotFound exit (after every peer failed AND no peers were
+/// registered) returned `Err(make_err!(Code::NotFound, ...))` without
+/// terminating the writer. AcServer's caller composition owns the
+/// writer and drops it on function return, masking the bug at the
+/// unit boundary; any future caller that joins `(get_fut,
+/// reader_fut)` over the writer's tx/rx pair (e.g. a wrapping
+/// VerifyStore on AC) deadlocks.
+///
+/// Drive `Pin::new(&proxy).get_part(...)` against a digest with NO
+/// inner entry AND NO registered peer. Read from the matching rx in
+/// `tokio::join!`. Without the WriteHalfGuard wrap, the reader hangs
+/// and the 5-second `tokio::time::timeout` panics with the bespoke
+/// message below.
+///
+/// Mutation step: comment out the `writer_guard.fail(err)` on the
+/// final NotFound branch (or revert the wrap) — the test must
+/// red-fail with the bespoke message.
+#[nativelink_test]
+async fn ac_proxy_store_get_part_terminates_writer_on_final_notfound() -> Result<(), Error> {
+    use nativelink_util::buf_channel::make_buf_channel_pair;
+
+    let (_wrapper_store, _inner, _registry, proxy) = make_proxy();
+    let digest = DigestInfo::try_new(VALID_HASH1, 8)?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_proxy = Pin::new(&*proxy);
+    let get_fut = async {
+        pinned_proxy
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    };
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        ASSERT_TIMEOUT,
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "AcProxyStore::get_part writer-termination contract violated — wrapping caller \
+         deadlocked on un-EOF'd writer (final-NotFound exit path: inner-NotFound + no peers)",
+    );
+
+    let (get_res, _reader_res) = timeout_res;
+    let get_err = get_res.expect_err("get_part should return NotFound when nothing has the entry");
+    assert_eq!(get_err.code, Code::NotFound, "expected NotFound, got: {get_err:?}");
+    Ok(())
+}

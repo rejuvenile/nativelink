@@ -68,7 +68,7 @@ use nativelink_config::stores::{ClientTlsConfig, GrpcEndpoint, GrpcSpec, Retry, 
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_util::ac_pin_registry::SharedAcPinRegistry;
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, WriteHalfGuard};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
@@ -426,6 +426,30 @@ impl StoreDriver for AcProxyStore {
             .optimized_for(optimization)
     }
 
+    // LINT: writer-termination policy for `get_part` (#336 P1 fix).
+    //
+    // AcProxyStore is a wrapper layer over an inner AC store and a peer
+    // AC pin registry. Its `get_part` writes to the OUTER caller's
+    // borrowed writer through several early-return Err paths:
+    //   - inner.get_part returned partial-bytes-then-NotFound (line ~440)
+    //   - inner.get_part returned non-NotFound Err (line ~451)
+    //   - try_read_from_peer Err propagation (line ~457)
+    //   - final NotFound after every peer failed (line ~467)
+    //
+    // Inner leaf stores (memory_store, etc.) do NOT terminate the writer
+    // on NotFound — the wrapper layer is the load-bearing guard (see
+    // `redis_store.rs:1689-1708` LINT). AcProxyStore IS that wrapper for
+    // AC reads. Today's AcServer caller composition does happen to own
+    // and drop the writer at function end, masking the bug at the unit
+    // boundary; any future composition that joins `(get_fut, reader_fut)`
+    // over the writer's tx/rx pair (e.g. an upstream VerifyStore on AC,
+    // or an AcProxyStore composed atop another AcProxyStore) deadlocks.
+    //
+    // Wrap in `WriteHalfGuard::new(writer)` at function top. Pass
+    // `&mut *guard` to inner.get_part / try_read_from_peer so they
+    // observe the same writer (their leaf-contract calls go through
+    // DerefMut). The Drop fallback fires synthesized `Code::Internal`
+    // on any uncommitted exit so the paired reader unblocks.
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,
@@ -444,6 +468,17 @@ impl StoreDriver for AcProxyStore {
         // keepalive (`60s`). Return the inner store's result
         // straight through. Mirrors the established
         // `IS_MIRROR_REQUEST` write-side cycle-breaker pattern.
+        //
+        // Writer-termination contract (#336 P1): this early-return passes
+        // `writer` straight through to the inner store WITHOUT the
+        // WriteHalfGuard wrap installed below. The inner-pass-through is
+        // safe because we are forwarding to the same downstream caller
+        // shape that the inner store would face at the originating hop;
+        // its writer-termination obligation is unchanged. Installing the
+        // guard here would double-wrap when this AcProxyStore is itself
+        // a leaf in a peer-fetch caller chain and would convert a
+        // structured inner Err into the synthesized Drop-fallback
+        // Internal error.
         if IS_AC_PEER_FETCH.try_with(|v| *v).unwrap_or(false) {
             trace!(
                 digest = ?key.borrow().into_digest(),
@@ -452,53 +487,74 @@ impl StoreDriver for AcProxyStore {
             return self.inner.get_part(key, writer, offset, length).await;
         }
 
+        let mut writer_guard = WriteHalfGuard::new(writer);
         // Capture the writer's byte position so we can detect
         // mid-stream failures from the inner store and refuse to
         // peer-fetch (peer would write the full blob again, producing
         // a corrupt prefix-from-inner + full-peer-copy stream).
-        let bytes_before_inner = writer.get_bytes_written();
-        let inner_result = self.inner.get_part(key.borrow(), &mut *writer, offset, length).await;
+        let bytes_before_inner = writer_guard.get_bytes_written();
+        let inner_result = self
+            .inner
+            .get_part(key.borrow(), &mut *writer_guard, offset, length)
+            .await;
         match inner_result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // Inner already terminated the writer with EOF on success;
+                // suppress the Drop fallback. Use commit_delegated_if_ok so
+                // a sub-store contract violation (Ok-with-no-EOF) still
+                // surfaces via the Drop fallback.
+                writer_guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
+                return Ok(());
+            }
             Err(e) if e.code == Code::NotFound => {
-                let bytes_written_by_inner = writer.get_bytes_written() - bytes_before_inner;
+                let bytes_written_by_inner =
+                    writer_guard.get_bytes_written() - bytes_before_inner;
                 if bytes_written_by_inner > 0 {
                     // Partial bytes already on the wire — the inner
                     // store violated its own contract by sending
                     // bytes before NotFound, but we cannot recover
                     // by trying peers now.
-                    return Err(make_err!(
+                    let err = make_err!(
                         e.code,
                         "AcProxyStore: inner store wrote {bytes_written_by_inner} bytes \
                          then returned NotFound; cannot peer-fetch without corrupting \
                          consumer stream",
-                    ));
+                    );
+                    return Err(writer_guard.fail(err));
                 }
                 trace!(
                     digest = ?key.borrow().into_digest(),
                     "AcProxyStore: inner NotFound — consulting AC pin registry"
                 );
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(writer_guard.fail(e)),
         }
 
         // Inner returned NotFound with no bytes written. Try each
         // peer that has advertised the digest.
-        if self
-            .try_read_from_peer(key.borrow(), writer, offset, length)
-            .await?
+        match self
+            .try_read_from_peer(key.borrow(), &mut *writer_guard, offset, length)
+            .await
         {
-            return Ok(());
+            Ok(true) => {
+                writer_guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
+                return Ok(());
+            }
+            Ok(false) => {
+                // Fall through to the final NotFound below.
+            }
+            Err(e) => return Err(writer_guard.fail(e)),
         }
 
         // No peer held it either — surface a clean NotFound. The
         // wrapper does NOT re-issue the inner call here (no race
         // window benefit on AC).
         let digest = key.borrow().into_digest();
-        Err(make_err!(
+        let err = make_err!(
             Code::NotFound,
             "AcProxyStore: AC entry {digest:?} not found in inner store or any peer"
-        ))
+        );
+        Err(writer_guard.fail(err))
     }
 
     fn inner_store(&self, key: Option<StoreKey>) -> &dyn StoreDriver {
