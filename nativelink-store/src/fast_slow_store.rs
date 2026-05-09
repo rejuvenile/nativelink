@@ -525,17 +525,43 @@ pub struct FastSlowStore {
     /// #334 Fix B: aggregate byte count of every payload currently
     /// pinned in `in_flight_slow_writes`. Maintained as a separate
     /// atomic so the cap-check on the hot insert path doesn't have to
-    /// walk the map. Increment AFTER successful insert (under the
-    /// `in_flight_slow_writes` mutex), decrement BEFORE remove (under
-    /// the same mutex). Wrapped in `Arc` so the spawned background
-    /// task can hold a clone for the post-write decrement (mirrors
+    /// walk the map.
+    ///
+    /// **Synchronization model (eventually-consistent, NOT
+    /// strongly-consistent w.r.t. the map):**
+    /// - Insert side: takes the `in_flight_slow_writes` mutex,
+    ///   inserts, releases the mutex, THEN does `fetch_add` (the
+    ///   mutex is dropped at end of the `lock().insert(...)`
+    ///   statement before the counter is bumped).
+    /// - Remove side: takes the same mutex, calls `remove`, THEN
+    ///   does `fetch_sub` while still holding the mutex.
+    /// - Cap-check (`check_slow_writes_capacity_gate`) reads this
+    ///   counter as a snapshot, with no map lock held.
+    ///
+    /// Consequence: a concurrent reader can observe a stale-low
+    /// counter for the brief window between insert (lock-released)
+    /// and `fetch_add`. The cap thus admits at most one in-flight
+    /// insert's worth of overshoot per concurrent admission — i.e.
+    /// `concurrent_admissions × max_admission_bytes` worst case.
+    /// At the 8 GiB default cap this is comfortably below OOM
+    /// territory and the cap remains an effective backpressure
+    /// signal. Counter monotonicity (no underflow) relies on
+    /// `tokio::spawn` parent-task ordering: the parent task's
+    /// `fetch_add` runs to completion before the spawned task's
+    /// `fetch_sub` can be polled. If a future change replaces
+    /// `tokio::spawn` with a synchronously-detached path, the
+    /// counter could underflow.
+    ///
+    /// Wrapped in `Arc` so the spawned background task can hold a
+    /// clone for the post-write decrement (mirrors
     /// `in_flight_slow_writes`'s `Arc<Mutex<...>>` ownership shape).
     in_flight_slow_writes_bytes: Arc<AtomicU64>,
     /// #334 Fix B: cap on `in_flight_slow_writes_bytes`. Zero = no cap
     /// (preserves the historic unbounded behavior bit-identically).
     /// Source: `FastSlowSpec::slow_writes_in_flight_max_bytes`. See
-    /// the spec field's doc-comment for the rationale.
-    slow_writes_in_flight_max_bytes: AtomicU64,
+    /// the spec field's doc-comment for the rationale. Set once at
+    /// construction; never mutated at runtime.
+    slow_writes_in_flight_max_bytes: u64,
     /// #212 fixup B2: chunked-path in-flight digest set. Separate from
     /// `in_flight_slow_writes` because the legacy map's `Vec<Bytes>`
     /// shape would (a) double-count memory vs the chunked-driver pin
@@ -825,9 +851,7 @@ impl FastSlowStore {
             populating_digests: Mutex::new(HashMap::new()),
             in_flight_slow_writes,
             in_flight_slow_writes_bytes: Arc::new(AtomicU64::new(0)),
-            slow_writes_in_flight_max_bytes: AtomicU64::new(
-                spec.slow_writes_in_flight_max_bytes,
-            ),
+            slow_writes_in_flight_max_bytes: spec.slow_writes_in_flight_max_bytes,
             chunked_in_flight_digests,
             in_flight_empty_notify: Arc::new(Notify::new()),
             stable_digests: Arc::new(Mutex::new(Vec::new())),
@@ -878,10 +902,10 @@ impl FastSlowStore {
     /// the admission gate immediately before a `tokio::spawn` that
     /// would pin a payload in the in-flight map. See the spec field
     /// `FastSlowSpec::slow_writes_in_flight_max_bytes` for the
-    /// rationale.
+    /// rationale. Set once at construction; never mutated at runtime.
     #[must_use]
     pub fn slow_writes_in_flight_max_bytes(&self) -> u64 {
-        self.slow_writes_in_flight_max_bytes.load(Ordering::Relaxed)
+        self.slow_writes_in_flight_max_bytes
     }
 
     /// #334 Fix B: best-effort capacity gate consulted at the
@@ -901,7 +925,7 @@ impl FastSlowStore {
         &self,
         incoming_bytes: u64,
     ) -> Result<(), Error> {
-        let cap = self.slow_writes_in_flight_max_bytes.load(Ordering::Relaxed);
+        let cap = self.slow_writes_in_flight_max_bytes;
         if cap == 0 {
             return Ok(());
         }
@@ -1809,9 +1833,7 @@ impl FastSlowStore {
             populating_digests: Mutex::new(HashMap::new()),
             in_flight_slow_writes,
             in_flight_slow_writes_bytes: Arc::new(AtomicU64::new(0)),
-            slow_writes_in_flight_max_bytes: AtomicU64::new(
-                spec.slow_writes_in_flight_max_bytes,
-            ),
+            slow_writes_in_flight_max_bytes: spec.slow_writes_in_flight_max_bytes,
             chunked_in_flight_digests,
             in_flight_empty_notify: Arc::new(Notify::new()),
             stable_digests: Arc::new(Mutex::new(Vec::new())),
@@ -4018,9 +4040,24 @@ impl StoreDriver for FastSlowStore {
         // increment so a concurrent admission cannot underflow the
         // accounting. On rejection we have NOT yet pinned anything,
         // and the fast tier already has the bytes (we passed the
-        // `fast_res?` line above), so callers retrying via the
-        // mirror-protocol's reconnect path are safe.
-        self.check_slow_writes_capacity_gate(bytes_sent)?;
+        // `fast_res?` line above).
+        //
+        // **Recovery contract on rejection (mirrors the chunked
+        // dispatcher's symmetric error site at `:1229-1232`):** insert
+        // the digest into `failed_slow_writes` and re-pin in the fast
+        // tier so the server-side `failed_writes_drain` →
+        // `UploadMissingBlobs` recovery loop picks it up. Without
+        // this, the digest is invisible to the drain pipeline; the
+        // bytes age out of MemoryStore (PIN_TIMEOUT_SECS=120) and
+        // disappear with no recovery if the upstream caller's retry
+        // budget exhausts.
+        if let Err(cap_err) = self.check_slow_writes_capacity_gate(bytes_sent) {
+            if let StoreKey::Digest(d) = key.borrow() {
+                self.failed_slow_writes.lock().insert(d);
+                self.fast_store.pin_digests(&[d]);
+            }
+            return Err(cap_err);
+        }
 
         // Insert into in-flight map so get_part can serve this blob even if
         // the fast store evicts it before the slow write completes.
@@ -4028,14 +4065,21 @@ impl StoreDriver for FastSlowStore {
         self.in_flight_slow_writes
             .lock()
             .insert(owned_key.clone(), data.clone());
-        // #334 Fix B: increment the byte counter ATOMICALLY after the
-        // insert lands; the watcher visibility window is bounded by
-        // the parking_lot::Mutex on `in_flight_slow_writes` (the lock
-        // serialises insert + counter update visibility w.r.t. the
-        // remove path, which decrements BEFORE removing under the
-        // same lock). The counter and the map are eventually
-        // consistent across the lock boundary, which matches the
-        // backpressure contract (best-effort, snapshot-driven).
+        // #334 Fix B: increment the byte counter after the insert
+        // lands. The `fetch_add` runs OUTSIDE the
+        // `in_flight_slow_writes` mutex (the lock was dropped at end
+        // of the `lock().insert(...)` statement above), so a
+        // concurrent reader of the counter may observe a stale-low
+        // value for the brief window before this `fetch_add`
+        // completes. The counter and the map are eventually
+        // consistent — see the struct field doc on
+        // `in_flight_slow_writes_bytes` for the full synchronization
+        // model and the worst-case overshoot analysis. The remove
+        // path (in the spawned task below) calls `remove()` THEN
+        // `fetch_sub` while holding the same mutex, so the order is
+        // not symmetric — counter monotonicity (no underflow) relies
+        // on `tokio::spawn` parent-task ordering: this `fetch_add`
+        // runs to completion before the spawned future is polled.
         self.in_flight_slow_writes_bytes
             .fetch_add(bytes_sent, Ordering::Relaxed);
 
@@ -4323,11 +4367,21 @@ impl StoreDriver for FastSlowStore {
 
         // #334 Fix B (`update_oneshot` sibling): same cap-check
         // shape as the streaming-`update` site above. Reject before
-        // pinning so the bytes can be retried via the mirror-protocol
-        // reconnect path; the fast tier already has the bytes
-        // (`fast_store.update_oneshot` ran above).
+        // the in-flight pin; the fast tier already has the bytes
+        // (`fast_store.update_oneshot` ran above). On rejection,
+        // insert into `failed_slow_writes` + re-pin so the
+        // server-side `failed_writes_drain` →
+        // `UploadMissingBlobs` recovery loop picks it up. See the
+        // streaming-`update` site for the full recovery-contract
+        // rationale.
         let data_bytes = data.len() as u64;
-        self.check_slow_writes_capacity_gate(data_bytes)?;
+        if let Err(cap_err) = self.check_slow_writes_capacity_gate(data_bytes) {
+            if let StoreKey::Digest(d) = &key {
+                self.failed_slow_writes.lock().insert(*d);
+                self.fast_store.pin_digests(&[*d]);
+            }
+            return Err(cap_err);
+        }
 
         // Spawn background slow store write.
         let owned_key = key.borrow().into_owned();
@@ -4849,12 +4903,27 @@ impl StoreDriver for FastSlowStore {
                              instead of serving short stream"
                         );
                         // Match the canonical bg-write completion path
-                        // (line ~2199): remove + notify if empty so any
-                        // graceful-shutdown waiter on `in_flight_empty_notify`
-                        // doesn't miss its wake-up.
+                        // (line ~4209-4222): remove + decrement the
+                        // `in_flight_slow_writes_bytes` counter together,
+                        // then notify if empty so any graceful-shutdown
+                        // waiter on `in_flight_empty_notify` doesn't miss
+                        // its wake-up. Failing to decrement here would
+                        // monotonically inflate the counter on every
+                        // size-mismatch trip; over time the cap-check at
+                        // `check_slow_writes_capacity_gate` rejects every
+                        // admission with `SlowWritesAtCapacity` even when
+                        // the actual map is empty.
                         {
                             let mut in_flight_guard = self.in_flight_slow_writes.lock();
-                            in_flight_guard.remove(&owned_key);
+                            let removed = in_flight_guard.remove(&owned_key);
+                            if let Some(removed_chunks) = removed {
+                                let removed_bytes: u64 = removed_chunks
+                                    .iter()
+                                    .map(|b| b.len() as u64)
+                                    .sum();
+                                self.in_flight_slow_writes_bytes
+                                    .fetch_sub(removed_bytes, Ordering::Relaxed);
+                            }
                             if in_flight_guard.is_empty() {
                                 self.in_flight_empty_notify.notify_waiters();
                             }
