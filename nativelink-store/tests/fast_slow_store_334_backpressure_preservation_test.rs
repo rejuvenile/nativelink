@@ -1053,3 +1053,112 @@ async fn fix_b_update_oneshot_in_flight_byte_cap_emits_typed_signal() -> Result<
     .expect("post-drain oneshot must succeed within timeout")?;
     Ok(())
 }
+
+/// **Fix B — recovery contract.** When a streaming `update` is rejected
+/// by the slow-write byte cap, the rejecting code path MUST also:
+///   1. Insert the digest into `failed_slow_writes` so the server-side
+///      `failed_writes_drain` → `UploadMissingBlobs` recovery loop can
+///      pick it up.
+///   2. Pin the digest in the fast tier so it stays alive long enough
+///      for that recovery loop to run.
+///
+/// Without these two side-effects the rejected payload is invisible to
+/// the recovery pipeline AND ages out of MemoryStore (PIN_TIMEOUT_SECS
+/// = 120) → silent data loss if the upstream caller's retry budget
+/// exhausts. Code-reviewer MA-5 — sibling of the typed-signal coverage
+/// already in `fix_b_slow_writes_in_flight_byte_cap_emits_typed_signal`.
+///
+/// Mutation step: comment out either the `failed_slow_writes.lock()
+/// .insert(d)` or the `fast_store.pin_digests(&[d])` call inside the
+/// cap-rejection arm at `fast_slow_store.rs:4022-4028`. The test MUST
+/// red-fail with a SPECIFIC bespoke message.
+#[nativelink_test]
+async fn fix_b_cap_rejection_inserts_into_failed_slow_writes() -> Result<(), Error> {
+    let cap_bytes: u64 = 4096;
+    let (fss, store, release, in_flight, _dropped) = make_fast_slow_with_gated_slow(cap_bytes);
+
+    // Fill the in-flight map to exactly the cap with two pinned writes.
+    let payload1 = vec![0u8; 2048];
+    let digest1 = DigestInfo::try_new(VALID_HASH1, payload1.len() as u64)?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_update(&store, digest1.into(), Bytes::from(payload1)),
+    )
+    .await
+    .expect("first 2048-byte insert must not deadlock")?;
+    wait_until("first slow-write spawn pinned", || {
+        in_flight.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    let payload2 = vec![1u8; 2048];
+    let digest2 = DigestInfo::try_new(VALID_HASH2, payload2.len() as u64)?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_update(&store, digest2.into(), Bytes::from(payload2)),
+    )
+    .await
+    .expect("second 2048-byte insert must not deadlock; in_flight at exactly cap")?;
+    wait_until("second slow-write spawn pinned (in_flight=2)", || {
+        in_flight.load(Ordering::SeqCst) == 2
+    })
+    .await;
+
+    // Submit a third write that the cap MUST reject. Verify both side-
+    // effects (failed_slow_writes insert + fast-tier pin) happened.
+    let payload3 = vec![2u8; 1024];
+    let payload3_len = payload3.len() as u64;
+    let digest3 = DigestInfo::try_new(VALID_HASH3, payload3_len)?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_update(&store, digest3.into(), Bytes::from(payload3)),
+    )
+    .await
+    .expect("third insert must not deadlock — Fix B must return promptly");
+
+    let err = result.expect_err(
+        "third insert MUST return Err — Fix B cap-rejection must drain digest \
+         into failed_slow_writes for recovery — contract violated",
+    );
+    assert_backpressure_signal(&err, backpressure_signal::Reason::SlowWritesAtCapacity);
+
+    // Side-effect #1: digest MUST be in `failed_slow_writes` so the
+    // server's drain loop picks it up.
+    assert!(
+        fss.failed_slow_writes_contains(&digest3),
+        "Fix B cap-rejection must drain digest into failed_slow_writes for \
+         recovery — contract violated (failed_slow_writes.lock().insert(d) \
+         missing from cap-rejection arm)"
+    );
+
+    // Side-effect #2: pin MUST be held on the fast tier so the bytes
+    // survive the 120s pin TTL window. We verify by calling
+    // `has_with_results` on the fast-tier delegate — the in-memory
+    // payload was successfully written to the fast tier BEFORE the
+    // cap-rejection (the cap check fires AFTER fast-tier write but
+    // BEFORE the in-flight pin). The pin call additionally protects
+    // it from LRU eviction.
+    let mut results = [None; 1];
+    let key3: StoreKey<'_> = digest3.into();
+    fss.fast_store_handle()
+        .has_with_results(&[key3.borrow()], &mut results)
+        .await
+        .expect("has_with_results must not error");
+    assert_eq!(
+        results[0],
+        Some(payload3_len),
+        "Fix B cap-rejection must keep the fast-tier payload alive via \
+         pin_digests — contract violated (fast_store.pin_digests(&[d]) \
+         missing from cap-rejection arm; the bytes will age out of \
+         MemoryStore in 120s if the recovery loop doesn't pick them up)"
+    );
+
+    // Cleanup: release the gate so the test's pinned slow writes drain.
+    release.notify_waiters();
+    release.notify_waiters();
+    wait_until("in-flight drains to zero after release", || {
+        fss.in_flight_slow_write_bytes() == 0
+    })
+    .await;
+    Ok(())
+}
