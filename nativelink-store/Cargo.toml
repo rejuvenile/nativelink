@@ -316,3 +316,15 @@ required-features = ["failpoints"]
 [[test]]
 name = "writer_termination_245_drop_fallback_test"
 required-features = ["chunked_fast_slow", "test-utils"]
+
+# #334 Fix C eviction extension: production-composition tests for the
+# `MemoryStore::check_backpressure_gate` LRU-eviction-before-emit path.
+# The gate path is `#[cfg(feature = "chunked_fast_slow")]` (it lives
+# alongside the typed BackpressureSignal emission), so this test is
+# also `#![cfg(feature = "chunked_fast_slow")]` at module level.
+# Declared explicitly so cargo silently skips it from default
+# `cargo test --all` (matches the pattern for
+# `memory_store_backpressure_emission_test`).
+[[test]]
+name = "memory_store_backpressure_eviction_test"
+required-features = ["chunked_fast_slow"]
