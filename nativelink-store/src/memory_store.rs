@@ -26,6 +26,8 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use nativelink_config::stores::MemorySpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
+#[cfg(feature = "chunked_fast_slow")]
+use tracing::info;
 use tracing::{debug, error};
 use nativelink_metric::MetricsComponent;
 #[cfg(feature = "chunked_fast_slow")]
@@ -263,11 +265,49 @@ impl MemoryStore {
         if !self.evicting_map.would_exceed_capacity(incoming_bytes) {
             return Ok(());
         }
+
+        // #334 Fix C eviction extension: at-cap detected. With the gate
+        // ENABLED we never let moka's natural admission-driven LRU
+        // evict (because we refuse the insert pre-emptively), which
+        // pre-fix turned the cache into write-once-evict-never the
+        // moment it filled. Restore liveness by actively evicting
+        // UNPINNED LRU entries here. Pinned entries are protected
+        // (they live in `pinned` DashMap, outside moka's cache).
+        //
+        // Eviction target = `incoming_bytes` (surgical — don't over-
+        // evict to avoid thrashing). If sustained pressure persists,
+        // the next admission will trigger another cycle.
+        let report = self
+            .evicting_map
+            .evict_unpinned_lru_bytes(incoming_bytes);
+        if report.evicted_count > 0 {
+            info!(
+                key = ?owned_key,
+                incoming_bytes,
+                evicted_count = report.evicted_count,
+                evicted_bytes = report.evicted_bytes,
+                "MemoryStore: backpressure-driven eviction freed unpinned \
+                 entries to admit incoming write",
+            );
+        }
+
+        // Re-check after the eviction attempt. If unpinned entries were
+        // available, this will succeed and we admit the write. If
+        // EVERY entry was pinned (BIS ack window saturating the cap),
+        // we fall through to the typed signal so the caller backs off
+        // and retries.
+        if !self.evicting_map.would_exceed_capacity(incoming_bytes) {
+            return Ok(());
+        }
+
         debug!(
             key = ?owned_key,
             incoming_bytes,
+            evicted_count = report.evicted_count,
+            evicted_bytes = report.evicted_bytes,
             "MemoryStore: emitting BackpressureSignal::MemoryStoreAtCapacity \
-             (kill-switch ON, insert would exceed cap)",
+             (kill-switch ON, even after evicting unpinned entries the cap \
+             still cannot accommodate the incoming write — every byte is pinned)",
         );
         let detail = encode_backpressure_signal_any(
             backpressure_signal::Reason::MemoryStoreAtCapacity,
@@ -276,8 +316,10 @@ impl MemoryStore {
         Err(Error::resource_exhausted_backpressure(
             format!(
                 "MemoryStore at capacity for key {owned_key:?}: \
-                 incoming {incoming_bytes} bytes would force eviction. \
-                 Retry after ~{MEMORY_STORE_BACKPRESSURE_RETRY_MS}ms."
+                 incoming {incoming_bytes} bytes would force eviction \
+                 of pinned entries (evicted {} unpinned freeing {} bytes \
+                 first, but still over cap). Retry after ~{MEMORY_STORE_BACKPRESSURE_RETRY_MS}ms.",
+                report.evicted_count, report.evicted_bytes
             ),
             detail,
         ))

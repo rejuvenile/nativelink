@@ -64,6 +64,21 @@ struct EvictionEvent<K, T> {
     value: T,
 }
 
+/// Result of [`MokaEvictingMap::evict_unpinned_lru_bytes`].
+///
+/// `evicted_bytes` may be less than the requested target if too few
+/// unpinned entries remain in the cache (e.g. all entries are pinned
+/// during a heavy BIS-ack window). Callers (notably
+/// `MemoryStore::check_backpressure_gate`) use the report for
+/// observability — the eviction-then-recheck loop in production
+/// re-checks `would_exceed_capacity` directly rather than trusting this
+/// number to determine whether to admit the new write.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EvictedReport {
+    pub evicted_count: u64,
+    pub evicted_bytes: u64,
+}
+
 /// A cache backed by `moka::sync::Cache` with an API that mirrors
 /// the previous LRU-based `EvictingMap`. Moka is configured with the
 /// pure LRU eviction policy (no TinyLFU admission filter) so that
@@ -1056,6 +1071,89 @@ where
         // not 0.
         let incoming_kb_bytes = incoming_bytes.div_ceil(SCALE).saturating_mul(SCALE);
         current_bytes.saturating_add(incoming_kb_bytes) > self.max_bytes
+    }
+
+    /// #334 Fix C eviction extension: actively evict UNPINNED entries
+    /// from the moka cache to free at least `target_bytes` of headroom.
+    /// Returns `(evicted_count, evicted_bytes)` — `evicted_bytes` may be
+    /// less than `target_bytes` if too few unpinned entries remain.
+    ///
+    /// **Why this exists.** With `MemoryStore::emit_backpressure_enabled
+    /// = true` (the production default for `cas_FAST_SLOW_STORE.fast`),
+    /// `check_backpressure_gate` refuses inserts BEFORE moka's natural
+    /// admission-driven LRU eviction can fire. Once the cache fills to
+    /// cap, NOTHING evicts (no insert pressure, no TTL, no explicit
+    /// removes), so the cache becomes write-once-evict-never until
+    /// process restart. This helper restores eviction by giving the
+    /// gate a way to free room before emitting backpressure.
+    ///
+    /// **Order caveat.** Moka's public API (`cache.iter()`) walks
+    /// entries in arbitrary order, NOT LRU order. Moka's internal
+    /// access-order queue (`access_order_q_node`) is `pub(crate)` and
+    /// not exposed. The "LRU" in this method's name is therefore
+    /// aspirational, not strict — we evict in iteration order, which is
+    /// neither hot-first nor cold-first. This is acceptable because:
+    ///   * Pinned entries (the load-bearing ones during the BIS ack
+    ///     window) are stored OUTSIDE moka's `cache` in the `pinned`
+    ///     DashMap, so this helper CANNOT evict them — pin protection
+    ///     is preserved regardless of iteration order.
+    ///   * Unpinned entries are by definition evictable; choosing them
+    ///     in arbitrary order is no worse than LRU for the BIS-ack
+    ///     durability invariant. A future moka release exposing an
+    ///     ordered LRU walker (or a `coldest_n` API) can be slotted in
+    ///     here without changing call sites.
+    ///
+    /// **Concurrency.** This is a sync method. Holds no awaits. Moka's
+    /// `cache.iter()` and `cache.invalidate()` are lock-free /
+    /// fine-grained-locked internally; concurrent inserts/reads remain
+    /// non-blocking.
+    pub fn evict_unpinned_lru_bytes(&self, target_bytes: u64) -> EvictedReport {
+        if target_bytes == 0 {
+            return EvictedReport::default();
+        }
+        // Flush in-flight admissions/evictions so iter() sees a stable
+        // snapshot of what's actually resident.
+        self.cache.run_pending_tasks();
+
+        let check_pinned = self.has_pinned();
+        let mut evicted_bytes: u64 = 0;
+        let mut evicted_count: u64 = 0;
+
+        // Collect candidates in iteration order. We collect first
+        // (rather than invalidate during iteration) because moka's
+        // iterator is documented to skip entries removed mid-iteration,
+        // and we want a deterministic "I considered N entries" result
+        // for tracing.
+        for (key_arc, value) in self.cache.iter() {
+            if evicted_bytes >= target_bytes {
+                break;
+            }
+            let q: &Q = (*key_arc).borrow();
+            // Skip pinned entries — pin protection is the whole point.
+            if check_pinned && self.pinned.contains_key(q) {
+                continue;
+            }
+            let size = value.len();
+            // Synchronous invalidate; the eviction listener will fire
+            // and route the entry to the background drainer for
+            // unref + callback. We do NOT await the unref here — that
+            // would require an async fn AND a borrow over .await of
+            // the moka iterator, neither acceptable.
+            self.cache.invalidate(q);
+            evicted_bytes = evicted_bytes.saturating_add(size);
+            evicted_count = evicted_count.saturating_add(1);
+        }
+
+        // Re-flush so the post-eviction `weighted_size()` reflects the
+        // invalidations we just issued. Without this, the caller's
+        // `would_exceed_capacity` re-check would see the stale (pre-
+        // eviction) size and emit backpressure unnecessarily.
+        self.cache.run_pending_tasks();
+
+        EvictedReport {
+            evicted_count,
+            evicted_bytes,
+        }
     }
 
     // ---------------------------------------------------------------
