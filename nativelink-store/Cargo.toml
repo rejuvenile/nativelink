@@ -307,3 +307,12 @@ required-features = ["failpoints"]
 [[test]]
 name = "fast_slow_store_325_regression_test"
 required-features = ["failpoints"]
+
+# #245 follow-up: the chunked-dispatch `data_stream_fut` regression test
+# uses `set_chunked_size_threshold_for_test` (gated on `test-utils`) and
+# `FastSlowStore::set_bazel_chunked_dispatcher` (gated on
+# `chunked_fast_slow`). Without these required-features the test fails
+# to compile when the chunked feature is on, and silently skips when off.
+[[test]]
+name = "writer_termination_245_drop_fallback_test"
+required-features = ["chunked_fast_slow", "test-utils"]
