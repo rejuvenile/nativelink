@@ -698,3 +698,79 @@ async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// #336 P1 production-composition test: when CompressionStore's inner
+/// store contains data that does NOT have a valid compression header,
+/// `read_fut` early-returns Err mid-stream (deserialization or
+/// `error_if!` trip). Pre-fix the OUTER `writer` was un-terminated
+/// because `read_fut` captured the writer by `&mut` and propagated `?`
+/// through every Err path. Wrapping callers (e.g. an upstream
+/// VerifyStore composing atop CompressionStore) that joined `(get_fut,
+/// reader_fut)` over the outer writer's tx/rx pair deadlocked.
+///
+/// Drive `Pin::new(&store).get_part(...)` against an inner store that
+/// holds corrupt bytes (raw bytes not formatted with a Header). Read
+/// from the matching rx in `tokio::join!`. Without the WriteHalfGuard
+/// wrap, the reader hangs and the 5-second `tokio::time::timeout`
+/// panics with the bespoke message below.
+///
+/// Mutation step: comment out the `WriteHalfGuard::new(writer)` line +
+/// revert `commit_eof()` to `send_eof()` and `writer_guard.send` to
+/// `writer.send` — the test must red-fail with the bespoke message.
+#[nativelink_test]
+async fn compression_store_get_part_terminates_writer_on_corrupt_inner() -> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::DropCloserWriteHalf;
+    use nativelink_util::store_trait::StoreKey;
+
+    let inner_store = MemoryStore::new(&MemorySpec::default());
+    let store = CompressionStore::new(
+        &CompressionSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            compression_algorithm: nativelink_config::stores::CompressionAlgorithm::Lz4(
+                nativelink_config::stores::Lz4Config::default(),
+            ),
+        },
+        Store::new(inner_store.clone()),
+    )
+    .err_tip(|| "Failed to create compression store")?;
+
+    // Bypass CompressionStore::update — write raw bytes (no Header) directly
+    // to the inner store so CompressionStore::get_part's header decode fails.
+    let corrupted = vec![0xAAu8; 256];
+    let digest = DigestInfo::new([0xCCu8; 32], corrupted.len() as u64);
+    inner_store.update_oneshot(digest, corrupted.into()).await?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_store = Pin::new(&store);
+    let get_fut = async {
+        pinned_store
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    };
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "CompressionStore::get_part writer-termination contract violated — wrapping \
+         caller deadlocked on un-EOF'd writer (corrupt-inner header decode path)",
+    );
+
+    let (get_res, _reader_res) = timeout_res;
+    assert!(get_res.is_err(), "expected compression get_part Err on corrupt inner header");
+    Ok(())
+}

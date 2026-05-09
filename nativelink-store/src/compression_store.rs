@@ -449,6 +449,28 @@ impl StoreDriver for CompressionStore {
         write_result.merge(update_result)
     }
 
+    // LINT: writer-termination policy for `get_part` (#336 P1 fix).
+    //
+    // CompressionStore is a wrapper layer (sub-store: inner_store). Its
+    // `get_part` writes to the OUTER caller's borrowed writer through
+    // SEVEN `error_if!` early-returns (header version mismatch, block-size
+    // overflow, init-frame underflow, frame-type mismatch, mid-frame
+    // underflow, footer underflow, footer index-count / chunks-count /
+    // size mismatches) AND eight `?`-propagated paths inside `read_fut`
+    // (consume, deserialize, decompress, send). Without termination on
+    // every exit path, any wrapping caller that joins `(get_fut,
+    // reader_fut)` over the OUTER writer's tx/rx pair (e.g. an upstream
+    // VerifyStore) deadlocks because the reader never observes EOF or
+    // error. The bug was historically catastrophic: a corrupt blob's
+    // header decode failure → `read_fut` returns Err → outer writer never
+    // terminated → upstream deadlock.
+    //
+    // Wrap the borrowed `writer` in `WriteHalfGuard::new(writer)` and
+    // move the guard into `read_fut` (which is the only future that
+    // touches the writer). The Drop fallback fires the synthesized
+    // `Code::Internal "buf_channel: writer dropped without commit"` on
+    // any uncommitted exit so the paired reader unblocks. Happy-path
+    // uses `commit_eof()` to suppress the fallback.
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,
@@ -482,6 +504,7 @@ impl StoreDriver for CompressionStore {
             },
         );
         let read_fut = async move {
+            let mut writer_guard = WriteHalfGuard::new(writer);
             let header = {
                 // Read header.
                 const EMPTY_HEADER: Header = Header {
@@ -585,7 +608,7 @@ impl StoreDriver for CompressionStore {
                         );
                         if end_pos != start_pos {
                             // Make sure we don't send an EOF by accident.
-                            writer
+                            writer_guard
                                 .send(uncompressed_data.freeze().slice(start_pos..end_pos))
                                 .await
                                 .err_tip(|| "Failed sending chunk in compression store")?;
@@ -655,8 +678,8 @@ impl StoreDriver for CompressionStore {
                 );
             }
 
-            writer
-                .send_eof()
+            writer_guard
+                .commit_eof()
                 .err_tip(|| "Failed to send eof in compression store write")?;
             Ok(())
         };
