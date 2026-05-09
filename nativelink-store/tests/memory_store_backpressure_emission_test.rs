@@ -63,17 +63,34 @@ const VALID_HASH1: &str = "0123456789abcdef0000000000000000000100000000000001234
 const VALID_HASH2: &str = "0123456789abcdef000000000000000000020000000000000123456789abcdef";
 const VALID_HASH3: &str = "0123456789abcdef000000000000000000030000000000000123456789abcdef";
 
-/// 1 KiB cap. Combined with a single 1 KiB-rounded entry that nearly
-/// fills the cap, a second insert of the same size MUST trip the
-/// `would_exceed_capacity` predicate.
+/// 1 KiB cap — used by the silent-evict over-action test. With cap
+/// this small, pin_cap = 256 B is too small for a 1 KiB entry to be
+/// pinned, but that's fine — the silent-evict test doesn't need pins.
 const TINY_CAP_BYTES: usize = 1024;
+
+/// 4 KiB cap — used by tests that need to pin an entry. pin_cap =
+/// 25% × cap = 1 KiB, which fits a 1 KiB entry. With cap = 4 KiB and
+/// pinned bytes = 1 KiB, a 4 KiB incoming write trips
+/// `would_exceed_capacity` (0 cache + 1024 pinned + 4096 incoming
+/// = 5120 > 4096). The Fix C eviction extension finds nothing
+/// evictable in cache (the only entry is pinned, so it lives outside
+/// moka's `cache`); the typed signal is then emitted. 4 KiB is the
+/// smallest cap that supports both a real pin and a gate trip after
+/// eviction.
+const PIN_TEST_CAP_BYTES: usize = 4096;
+/// Size of the pinned entry — must be ≤ pin_cap (= 25% × cap = 1 KiB).
+const PIN_FIT_BYTES: usize = 1024;
 
 /// Build a MemoryStore with a tiny byte cap so eviction pressure is
 /// reproducible without buffering megabytes in the test process.
 fn tiny_memory_store() -> std::sync::Arc<MemoryStore> {
+    memory_store_with_cap(TINY_CAP_BYTES)
+}
+
+fn memory_store_with_cap(cap: usize) -> std::sync::Arc<MemoryStore> {
     MemoryStore::new(&MemorySpec {
         eviction_policy: Some(EvictionPolicy {
-            max_bytes: TINY_CAP_BYTES,
+            max_bytes: cap,
             ..Default::default()
         }),
         emit_backpressure_enabled: false,
@@ -109,29 +126,45 @@ fn assert_backpressure_signal(err: &Error, expected_reason: backpressure_signal:
     );
 }
 
-/// **Under-action (positive case).** Kill-switch ON, store at capacity:
-/// the next `update_oneshot` MUST return `ResourceExhausted` with the
-/// new `MemoryStoreAtCapacity` reason. The `tokio::time::timeout`
-/// guards against any future regression that could deadlock instead of
-/// returning the error.
+/// **Under-action (positive case).** Kill-switch ON, cap saturated by
+/// PINNED entries: the next `update_oneshot` MUST return
+/// `ResourceExhausted` with the `MemoryStoreAtCapacity` reason.
+///
+/// **Why pin digest1 first** (#334 Fix C eviction extension): the gate
+/// now actively evicts UNPINNED LRU entries before emitting backpressure.
+/// Without pinning digest1, the gate would evict it to admit digest2
+/// and the test would no longer observe Err. Pinning models the
+/// production scenario the gate signal is FOR — every byte of capacity
+/// is durably-load-bearing (BIS ack window) and there's nothing safe to
+/// evict. The tokio::time::timeout guards against any future
+/// regression that could deadlock instead of returning the error.
 #[nativelink_test]
 async fn emits_resource_exhausted_when_emission_enabled_and_at_capacity() -> Result<(), Error> {
-    let store = tiny_memory_store();
+    let store = memory_store_with_cap(PIN_TEST_CAP_BYTES);
     store.enable_emit_backpressure();
 
-    // Fill most of the cap with a 1 KiB blob (the moka weigher rounds
-    // up to KB granularity, so this consumes ~1 KB of the 1 KiB
-    // capacity).
-    let big_payload = vec![0u8; 1024];
-    let digest1 = DigestInfo::try_new(VALID_HASH1, big_payload.len() as u64)?;
+    // Insert a 1 KiB blob (≤ pin_cap of 1 KiB so it can be pinned).
+    let payload1 = vec![0u8; PIN_FIT_BYTES];
+    let digest1 = DigestInfo::try_new(VALID_HASH1, payload1.len() as u64)?;
     store
-        .update_oneshot(digest1, big_payload.into())
+        .update_oneshot(digest1, payload1.into())
         .await
         .expect("first insert should fit");
+    // Pin digest1 so the Fix C eviction extension cannot free room. The
+    // gate's sole remaining option is to emit the typed signal.
+    // Pin via Store wrapper to dispatch the trait method without
+    // bringing StoreDriver into scope (avoids method-name conflict
+    // with StoreLike for tests that call e.g. `store.has(digest)`).
+    Store::new(store.clone()).pin_digests(&[digest1]);
 
-    // Second insert that would force eviction of digest1 must error.
-    let digest2 = DigestInfo::try_new(VALID_HASH2, 1024)?;
-    let payload2 = vec![1u8; 1024];
+    // Issue a write that combined with pinned bytes exceeds cap AND
+    // that the eviction extension cannot free room for (the pinned
+    // digest1 lives outside moka's cache and is unevictable; nothing
+    // else is in cache). 0 cache + 1024 pinned + 4096 incoming > 4096
+    // cap → would_exceed=true. Eviction frees 0 bytes. Re-check still
+    // over. Emits.
+    let digest2 = DigestInfo::try_new(VALID_HASH2, PIN_TEST_CAP_BYTES as u64)?;
+    let payload2 = vec![1u8; PIN_TEST_CAP_BYTES];
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         store.update_oneshot(digest2, payload2.into()),
@@ -141,7 +174,8 @@ async fn emits_resource_exhausted_when_emission_enabled_and_at_capacity() -> Res
 
     let err = result.expect_err(
         "second insert MUST return ResourceExhausted when kill-switch is ON \
-         (otherwise the silent-evict behavior leaked through the gate)",
+         and every byte of cap is pinned (Fix C eviction extension cannot \
+         free pinned room — typed signal is the contract)",
     );
     assert_backpressure_signal(&err, backpressure_signal::Reason::MemoryStoreAtCapacity);
     Ok(())
@@ -187,7 +221,7 @@ async fn preserves_silent_evict_when_emission_disabled() -> Result<(), Error> {
 /// classifier signal in production.
 #[nativelink_test]
 async fn verify_store_around_memory_store_propagates_backpressure_signal() -> Result<(), Error> {
-    let inner = tiny_memory_store();
+    let inner = memory_store_with_cap(PIN_TEST_CAP_BYTES);
     inner.enable_emit_backpressure();
 
     let store = VerifyStore::new(
@@ -205,15 +239,22 @@ async fn verify_store_around_memory_store_propagates_backpressure_signal() -> Re
         Store::new(inner.clone()),
     );
 
-    let big_payload = vec![0u8; 1024];
-    let digest1 = DigestInfo::try_new(VALID_HASH1, big_payload.len() as u64)?;
+    let payload1 = vec![0u8; PIN_FIT_BYTES];
+    let digest1 = DigestInfo::try_new(VALID_HASH1, payload1.len() as u64)?;
     store
-        .update_oneshot(digest1, big_payload.into())
+        .update_oneshot(digest1, payload1.into())
         .await
         .expect("first insert through VerifyStore should fit");
+    // Pin digest1 so the Fix C eviction extension cannot free room
+    // (see `emits_resource_exhausted_when_emission_enabled_and_at_capacity`
+    // for rationale). Pin via the inner Arc since VerifyStore is wrapped
+    // and we want to model the BIS-window pin set on the inner backend
+    // (matches production composition where FastSlowStore::update calls
+    // pin_digests on the inner MemoryStore).
+    Store::new(inner.clone()).pin_digests(&[digest1]);
 
-    let digest2 = DigestInfo::try_new(VALID_HASH2, 1024)?;
-    let payload2 = vec![1u8; 1024];
+    let digest2 = DigestInfo::try_new(VALID_HASH2, PIN_TEST_CAP_BYTES as u64)?;
+    let payload2 = vec![1u8; PIN_TEST_CAP_BYTES];
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         store.update_oneshot(digest2, payload2.into()),
@@ -241,22 +282,25 @@ async fn verify_store_around_memory_store_propagates_backpressure_signal() -> Re
 /// backpressure rate and reproduce #147.
 #[nativelink_test]
 async fn classifier_recognizes_memory_store_at_capacity_signal() -> Result<(), Error> {
-    let store = tiny_memory_store();
+    let store = memory_store_with_cap(PIN_TEST_CAP_BYTES);
     store.enable_emit_backpressure();
 
     // Fill cap and trigger backpressure to obtain a real production
     // error from the production code path (don't synthesize the error
     // ourselves — we want to prove the producer side wires the signal
     // identically to the way the classifier checks it).
-    let big_payload = vec![0u8; 1024];
-    let digest1 = DigestInfo::try_new(VALID_HASH1, big_payload.len() as u64)?;
+    let payload1 = vec![0u8; PIN_FIT_BYTES];
+    let digest1 = DigestInfo::try_new(VALID_HASH1, payload1.len() as u64)?;
     store
-        .update_oneshot(digest1, big_payload.into())
+        .update_oneshot(digest1, payload1.into())
         .await
         .expect("first insert should fit");
+    // Pin so Fix C eviction extension cannot free room — see other
+    // tests in this file for rationale.
+    Store::new(store.clone()).pin_digests(&[digest1]);
 
-    let digest2 = DigestInfo::try_new(VALID_HASH3, 1024)?;
-    let payload2 = vec![2u8; 1024];
+    let digest2 = DigestInfo::try_new(VALID_HASH3, PIN_TEST_CAP_BYTES as u64)?;
+    let payload2 = vec![2u8; PIN_TEST_CAP_BYTES];
     let err = tokio::time::timeout(
         Duration::from_secs(5),
         store.update_oneshot(digest2, payload2.into()),

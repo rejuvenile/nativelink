@@ -1065,7 +1065,17 @@ where
         // multiplier inline avoids exposing the constant publicly while
         // keeping the byte ↔ weight conversion local to one call-site.
         const SCALE: u64 = 1024;
-        let current_bytes = self.cache.weighted_size().saturating_mul(SCALE);
+        let cache_bytes = self.cache.weighted_size().saturating_mul(SCALE);
+        // #334 Fix C: account for pinned bytes too. Pinned entries live
+        // OUTSIDE moka's `cache` (in the `pinned` DashMap) and so do
+        // NOT count toward `cache.weighted_size()`. But they DO consume
+        // physical RSS — a 48 GB MemoryStore with 12 GB of pins still
+        // has only 36 GB of evictable headroom. Without this, the
+        // backpressure gate would mis-estimate capacity in the
+        // BIS-ack-window scenario (the very scenario the pin/unpin
+        // mechanism was added to address).
+        let pinned_bytes_now = self.pinned_bytes.load(Ordering::Relaxed);
+        let current_bytes = cache_bytes.saturating_add(pinned_bytes_now);
         // Round the incoming size up to KB to match the weigher's
         // own behavior: a 1-byte insert weighs 1 (=1 KB after scale),
         // not 0.

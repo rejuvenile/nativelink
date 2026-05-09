@@ -534,17 +534,24 @@ async fn update_rejects_upfront_when_declared_size_exceeds_capacity() -> Result<
     use nativelink_config::stores::EvictionPolicy;
     use nativelink_util::store_trait::UploadSizeInfo;
 
-    // 1 KiB cap — same shape as `memory_store_backpressure_emission_test`.
+    // 4 KiB cap — pin_cap = 25% × cap = 1 KiB which fits a 1 KiB
+    // entry. With pinned bytes consuming 1 KiB and the declared
+    // ExactSize incoming = 4 KiB, would_exceed_capacity returns true
+    // (0 cache + 1024 pinned + 4096 incoming > 4096 cap), the Fix C
+    // eviction extension finds nothing in cache to evict (the only
+    // entry is pinned), and the typed signal fires. A 1 KiB cap
+    // (the pre-Fix-C shape) is too small here — pin_cap would be
+    // 256 B and pin_keys would silently no-op on a 1 KiB entry.
     let store = MemoryStore::new(&MemorySpec {
         eviction_policy: Some(EvictionPolicy {
-            max_bytes: 1024,
+            max_bytes: 4096,
             ..Default::default()
         }),
         emit_backpressure_enabled: false,
     });
     store.enable_emit_backpressure();
 
-    // Fill the cap so any further write would force eviction.
+    // Insert a 1 KiB entry that fits within pin_cap.
     let payload1_len: u64 = 1024;
     let payload1 = vec![0u8; payload1_len as usize];
     let digest1 = DigestInfo::try_new(VALID_HASH1, payload1_len)?;
@@ -552,6 +559,17 @@ async fn update_rejects_upfront_when_declared_size_exceeds_capacity() -> Result<
         .update_oneshot(digest1, payload1.into())
         .await
         .expect("first insert should fit");
+    // #334 Fix C eviction extension: pin digest1 so the gate's new
+    // active-eviction path cannot silently free it. Without this pin
+    // the gate would evict digest1 (unpinned) to admit digest2 and the
+    // test's expect_err below would no longer hold. The early-reject
+    // contract this test guards (ResourceExhausted on declared
+    // ExactSize over cap) is unchanged; pinning models the production
+    // case where every byte of cap is BIS-window load-bearing.
+    // (Use Store wrapper to dispatch the trait method without bringing
+    // StoreDriver into scope and shadowing StoreLike's get/has methods
+    // that take StoreKey instead of DigestInfo.)
+    nativelink_util::store_trait::Store::new(store.clone()).pin_digests(&[digest1]);
 
     // Construct a buf-channel pair but NEVER send a chunk and NEVER
     // close the channel. If the early-reject works, `update` returns
@@ -559,12 +577,12 @@ async fn update_rejects_upfront_when_declared_size_exceeds_capacity() -> Result<
     // early-reject is broken, `update` blocks on `reader.recv()`
     // forever — the `tokio::time::timeout` distinguishes the two.
     let (_tx, rx) = make_buf_channel_pair();
-    let digest2 = DigestInfo::try_new(VALID_HASH2, 1024)?;
+    let digest2 = DigestInfo::try_new(VALID_HASH2, 4096)?;
     let store_pin = Pin::new(store.as_ref());
     let update_fut = store_pin.update(
         StoreKey::from(digest2),
         rx,
-        UploadSizeInfo::ExactSize(1024),
+        UploadSizeInfo::ExactSize(4096),
     );
 
     let result = tokio::time::timeout(Duration::from_secs(5), update_fut)
@@ -707,17 +725,19 @@ async fn update_rejects_upfront_under_verify_store_does_not_deadlock(
     use nativelink_store::verify_store::VerifyStore;
     use nativelink_util::store_trait::{Store, UploadSizeInfo};
 
-    // 1 KiB cap — same shape as the unit-boundary test above.
+    // 4 KiB cap — same pin-fitting shape as the unit-boundary test
+    // above. pin_cap = 25% × cap = 1 KiB which fits a 1 KiB pinned
+    // entry so the Fix C eviction extension cannot reclaim it.
     let inner = MemoryStore::new(&MemorySpec {
         eviction_policy: Some(EvictionPolicy {
-            max_bytes: 1024,
+            max_bytes: 4096,
             ..Default::default()
         }),
         emit_backpressure_enabled: false,
     });
     inner.enable_emit_backpressure();
 
-    // Fill the cap so any further write would force eviction.
+    // Insert a 1 KiB entry (≤ pin_cap of 1 KiB so it can be pinned).
     let payload1_len: u64 = 1024;
     let payload1 = vec![0u8; payload1_len as usize];
     let digest1 = DigestInfo::try_new(VALID_HASH1, payload1_len)?;
@@ -725,6 +745,11 @@ async fn update_rejects_upfront_under_verify_store_does_not_deadlock(
         .update_oneshot(digest1, payload1.into())
         .await
         .expect("first insert should fit");
+    // #334 Fix C eviction extension: pin so the gate's eviction path
+    // cannot silently free room. Same rationale as
+    // `update_rejects_upfront_when_declared_size_exceeds_capacity`.
+    // (See note above for why we go through Store::new.)
+    Store::new(inner.clone()).pin_digests(&[digest1]);
 
     // Wrap in VerifyStore with verify_size=true — the production
     // `cas_STORE` shape that joins `update_fut` and `check_fut` over
@@ -739,13 +764,13 @@ async fn update_rejects_upfront_under_verify_store_does_not_deadlock(
         Store::new(inner.clone()),
     );
 
-    let digest2 = DigestInfo::try_new(VALID_HASH2, 1024)?;
+    let digest2 = DigestInfo::try_new(VALID_HASH2, 4096)?;
     let (mut tx, rx) = make_buf_channel_pair();
     let verify_pin = Pin::new(verify.as_ref());
     let update_fut = verify_pin.update(
         StoreKey::from(digest2),
         rx,
-        UploadSizeInfo::ExactSize(1024),
+        UploadSizeInfo::ExactSize(4096),
     );
     // Producer: send a single chunk to give VerifyStore's
     // `inner_check_update` a chunk to forward to the inner store.
