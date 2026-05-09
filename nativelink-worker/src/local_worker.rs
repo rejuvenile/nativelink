@@ -2671,6 +2671,16 @@ pub async fn new_local_worker(
             // Worker-side wrapper FSS; the chunked-read cascade lives
             // on the server, never on the worker, so leave OFF.
             chunked_reads_enabled: false,
+            // #334 Fix B SLOW_WRITES_IN_FLIGHT cap intentionally
+            // disabled on worker: the worker's slow tier is
+            // GrpcStore→server, whose admission is bounded by upstream
+            // h2 windowing + the server-side cap on its own
+            // `FastSlowStore`. Double-capping here would short-circuit
+            // the existing budget tracker without the typed-signal
+            // benefit. The 2026-05-08 production OOM was on buildcache
+            // (server), not on workers. If a future worker FastSlow
+            // composition uses a cap-bounded slow tier (e.g. local
+            // disk with its own backpressure), set this explicitly.
             slow_writes_in_flight_max_bytes: 0,
         };
         let new_fss = FastSlowStore::new(&fss_spec, fast_store, proxy_store);
@@ -2775,6 +2785,10 @@ pub async fn new_local_worker(
             // Worker-side wrapper FSS; the chunked-read cascade lives
             // on the server, never on the worker, so leave OFF.
             chunked_reads_enabled: false,
+            // #334 Fix B cap moot here: `slow_direction = ReadOnly`
+            // means `update()` short-circuits before consulting the
+            // cap (no slow-tier write is admitted at all). Set 0 to
+            // match the wrapper FSS above for consistency.
             slow_writes_in_flight_max_bytes: 0,
         };
         FastSlowStore::new_with_shared_failed_writes(

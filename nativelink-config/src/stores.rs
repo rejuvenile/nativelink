@@ -826,10 +826,21 @@ pub struct FastSlowSpec {
     /// keeps `looks_like_dead_channel` from misclassifying the
     /// rejection as a dead h2 channel (#147 regression risk).
     ///
-    /// Default: 8 GiB. Conservative — big enough to absorb a multi-
-    /// second slow-tier hiccup at line-rate writes, small enough that
-    /// a multi-minute wedge cannot drag the process into OOM territory
-    /// at typical 64 GB worker / 256 GB server RAM footprints.
+    /// Default: 8 GiB. Conservative for a 256 GiB-RAM server: at a
+    /// 10GbE line rate (~1.2 GB/s for CAS uploads after framing
+    /// overhead) the cap absorbs ~6.4s of unrelieved slow-tier
+    /// pressure before firing — long enough to ride out typical txg
+    /// pauses or transient gRPC blips, short enough that a multi-
+    /// minute wedge cannot drag the process into OOM territory.
+    /// Operators on smaller hosts (e.g. 32–64 GB workers) should
+    /// reduce proportionally to leave headroom for the rest of the
+    /// process. **Worst-case overshoot** above the cap is bounded by
+    /// `concurrent_admissions × max_admission_bytes` (the cap-check is
+    /// snapshot-consistent, not strongly-consistent — see the
+    /// `in_flight_slow_writes_bytes` field doc on `FastSlowStore` for
+    /// the synchronization model). With ByteStream chunks at ≤3 MiB
+    /// and `parallel_chunk_count=64`, the worst-case overshoot is
+    /// ~192 MiB above the cap — comfortably below OOM territory.
     ///
     /// Zero is treated as "no cap" — preserves the historic unbounded
     /// behavior bit-identically for callers that explicitly opt out

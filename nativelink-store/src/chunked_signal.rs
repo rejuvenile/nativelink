@@ -293,6 +293,7 @@ mod tests {
         for (reason, retry_ms) in [
             (backpressure_signal::Reason::MemoryStoreAtCapacity, 25u64),
             (backpressure_signal::Reason::PinnedBytesExhausted, 100u64),
+            (backpressure_signal::Reason::SlowWritesAtCapacity, 100u64),
         ] {
             let any = encode_backpressure_signal_any(reason, retry_ms);
             assert_eq!(

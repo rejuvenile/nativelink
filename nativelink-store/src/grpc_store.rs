@@ -2957,6 +2957,7 @@ mod tests {
             backpressure_signal::Reason::PerBlobMpscFull,
             backpressure_signal::Reason::MemoryStoreAtCapacity,
             backpressure_signal::Reason::PinnedBytesExhausted,
+            backpressure_signal::Reason::SlowWritesAtCapacity,
         ] {
             let any = encode_backpressure_signal_any(reason, 100);
             let err = Error::resource_exhausted_backpressure("backpressure", any);

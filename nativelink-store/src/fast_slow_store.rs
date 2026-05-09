@@ -97,9 +97,20 @@ const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
 /// wedges (txg pause, transient gRPC unreachability) typically resolve in
 /// hundreds-of-ms; 100ms is short enough that a healthy slow tier
 /// reabsorbs the workload promptly, long enough that a real wedge isn't
-/// retried tightly enough to amplify pressure. Bazel will keep retrying
-/// past this hint until success — the hint is a per-attempt pacing floor,
-/// not a budget.
+/// retried tightly enough to amplify pressure. The hint is consumed only
+/// by the nativelink-internal classifier (`looks_like_dead_channel`,
+/// `chunked_client::classify_retryable`); upstream Bazel does not decode
+/// the `BackpressureSignal` proto detail and uses its own retry policy.
+///
+/// **Why 4× the `MEMORY_STORE_BACKPRESSURE_RETRY_MS = 25` floor:** the
+/// MemoryStore backpressure signal resolves on the eviction-loop
+/// timescale (single-digit ms — moka evicts on `weighted_size` cross),
+/// so 25ms suffices to let the LRU drain. Slow-write capacity, by
+/// contrast, resolves on the slow-tier acknowledgement timescale
+/// (gRPC h2 ack + ZFS txg or remote disk commit), which is hundreds of
+/// ms under load. 100ms balances (a) avoiding tight retry storms that
+/// amplify slow-tier pressure with (b) not over-delaying recovery
+/// once the slow tier drains.
 const SLOW_WRITES_AT_CAPACITY_RETRY_MS: u64 = 100;
 
 /// Process-global "most recent chunked-cascade error" tracker for the #320
