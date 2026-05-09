@@ -470,19 +470,42 @@ async fn bis_loop_e2e_write_drain_notify_unpin_contract() -> Result<(), Error> {
             .await
             .err_tip(|| format!("writing pressure blob {hash}"))?;
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let observed = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, h.fast_mem.has(pinned_digest))
-        .await
-        .expect("timed out asking fast-tier MemoryStore::has — chain regression")
-        .expect("MemoryStore::has returned Err");
+    // Poll the fast-tier in-process index for the eviction outcome,
+    // bounded by NO_DEADLOCK_TIMEOUT. Moka's eviction listener is
+    // eventually-consistent — `update_oneshot` returns before the
+    // background drainer has retired all evicted entries — so a single
+    // `has` call right after the writes can race with the drainer.
+    // A poll-loop bounded by an explicit timeout (CLAUDE.md "polling
+    // loops with explicit timeouts" is the approved alternative to
+    // `tokio::time::sleep` as synchronization) deterministically waits
+    // for the unpin's effect: blob A becomes evictable. If the unpin
+    // never lands (mutation step), the timeout fires and the assertion
+    // below produces the bespoke "BIS-loop unpin missing" message.
+    let evicted = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, async {
+        loop {
+            let has_res = h
+                .fast_mem
+                .has(pinned_digest)
+                .await
+                .expect("MemoryStore::has returned Err");
+            if has_res.is_none() {
+                return true;
+            }
+            // Yield to let moka's drainer make progress; the outer
+            // `timeout` is the ONLY synchronization gate.
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or(false);
 
     assert!(
-        observed.is_none(),
+        evicted,
         "BIS-loop unpin missing: blob survived sibling-pressure eviction \
-         even after the BIS-loop unpin call. The full e2e flow (write → \
-         stable_notify fire → drain → unpin → eviction-eligible) is \
-         broken at the unpin step. observed={observed:?}, \
+         even after the BIS-loop unpin call within {NO_DEADLOCK_TIMEOUT:?}. \
+         The full e2e flow (write → stable_notify fire → drain → unpin → \
+         eviction-eligible) is broken at the unpin step. \
          pinned_digest={pinned_digest:?}, pressure_blobs={} × {} bytes",
         PRESSURE_HASHES.len(),
         PRESSURE_SIZE,
