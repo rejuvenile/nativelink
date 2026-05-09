@@ -2915,3 +2915,74 @@ impl StoreDriver for FailingUpdateStore {
         MarkStableDelegation::Leaf
     }
 }
+
+/// #336 P1 production-composition test: WorkerProxyStore::get_part /
+/// get_part_sequential MUST terminate the borrowed `writer` on every
+/// exit path. Inner leaf stores (memory_store) do NOT terminate the
+/// writer on NotFound — the wrapper layer is the load-bearing guard.
+/// Pre-fix, the final-NotFound exit (after every peer was missing AND
+/// the locality map empty) returned Err without terminating the
+/// writer. WorkerProxyStore is composed UNDER FastSlowStore in
+/// production (which catches this via its OWN guard at :4664), but
+/// any future composition that uses WorkerProxyStore directly OR
+/// composes it under a custom join (e.g. an upstream VerifyStore on
+/// CAS) deadlocks.
+///
+/// Drive `Pin::new(&proxy_arc).get_part(...)` against an empty
+/// MemoryStore inner with no peers in the locality map. Read from
+/// the matching rx in `tokio::join!`. Without the WriteHalfGuard
+/// wrap at the WorkerProxyStore layer, the reader hangs and the
+/// 5-second `tokio::time::timeout` panics with the bespoke message
+/// below.
+///
+/// Mutation step: pre-suppress the guard's drop fallback in
+/// `get_part_sequential` — the test must red-fail with the bespoke
+/// "writer-termination contract violated" message.
+#[nativelink_test]
+async fn worker_proxy_get_part_sequential_terminates_writer_on_final_notfound() -> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::make_buf_channel_pair;
+
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(inner, locality_map);
+
+    // Digest never written to inner, no peers registered. Triggers
+    // the sequential path: inner returns NotFound -> no peers in
+    // locality_map -> final NotFound branch in `get_part_sequential`.
+    let digest = DigestInfo::try_new(VALID_HASH1, 8)?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_proxy = Pin::new(&*proxy_arc);
+    let get_fut = async {
+        pinned_proxy
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    };
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "WorkerProxyStore::get_part_sequential writer-termination contract violated \
+         -- wrapping caller deadlocked on un-EOF'd writer (final-NotFound exit path)",
+    );
+
+    let (get_res, _reader_res) = timeout_res;
+    let get_err = get_res.expect_err("get_part should return NotFound when nothing has the entry");
+    assert_eq!(get_err.code, Code::NotFound, "expected NotFound, got: {get_err:?}");
+    Ok(())
+}

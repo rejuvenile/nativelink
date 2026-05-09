@@ -2603,13 +2603,22 @@ impl WorkerProxyStore {
                     "WorkerProxyStore (worker side): incoming Read for missing blob — \
                      returning NotFound without chaining (responder mode never RPCs out)"
                 );
-                return Err(Error::not_found_with_detail(
+                let err = Error::not_found_with_detail(
                     format!(
                         "Blob {digest:?} not found in this worker's inner store \
                          (responder mode, no external RPCs)"
                     ),
                     make_precondition_failure_any(digest),
-                ));
+                );
+                // #336 P1: terminate the borrowed writer so any wrapping
+                // caller that joins on the writer's tx/rx pair sees the
+                // structured NotFound instead of deadlocking on the
+                // un-EOF'd writer. Inner store was not consulted in
+                // responder mode (we skipped via the gate at line 2484
+                // above), so no other party has terminated the writer.
+                // Idempotent — safe even if some earlier call did.
+                writer.send_error(err.clone());
+                return Err(err);
             }
             // Server side: generate a single-hop redirect to peers in
             // locality_map. The receiving worker handles the redirect by
@@ -2640,12 +2649,19 @@ impl WorkerProxyStore {
                     "{REDIRECT_PREFIX}{ep_str}|"
                 ));
             }
-            return Err(Error::not_found_with_detail(
+            let err = Error::not_found_with_detail(
                 format!(
                     "Blob {digest:?} not found in inner store or any peer (worker request)"
                 ),
                 make_precondition_failure_any(digest),
-            ));
+            );
+            // #336 P1: writer never written by inner (the inner.get_part
+            // upstream only ran in worker-side responder mode, which we
+            // ARE NOT in here — we're in worker-side server-fetch mode).
+            // Terminate explicitly so any wrapping caller's reader
+            // unblocks. Idempotent.
+            writer.send_error(err.clone());
+            return Err(err);
         }
 
         let bytes_before_workers = writer.get_bytes_written();
@@ -2674,7 +2690,7 @@ impl WorkerProxyStore {
         }
         match self
             .inner
-            .get_part(key.borrow(), writer, offset, length)
+            .get_part(key.borrow(), &mut *writer, offset, length)
             .await
         {
             Ok(()) => {
@@ -2691,10 +2707,18 @@ impl WorkerProxyStore {
         }
 
         let digest = key.borrow().into_digest();
-        Err(Error::not_found_with_detail(
+        let err = Error::not_found_with_detail(
             format!("Blob {digest:?} not found in inner store or any worker"),
             make_precondition_failure_any(digest),
-        ))
+        );
+        // #336 P1: terminate the borrowed writer so any wrapping caller
+        // that joins on the writer's tx/rx pair sees the structured
+        // NotFound instead of deadlocking on the un-EOF'd writer.
+        // Inner leaf stores (e.g. MemoryStore) do NOT terminate the
+        // writer on NotFound — the wrapper layer is the load-bearing
+        // guard. WorkerProxyStore IS that wrapper here. Idempotent.
+        writer.send_error(err.clone());
+        Err(err)
     }
 
     /// Cooperatively cancel a losing racer: drop its receive half (which
