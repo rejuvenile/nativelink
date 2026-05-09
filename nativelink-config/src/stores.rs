@@ -826,34 +826,47 @@ pub struct FastSlowSpec {
     /// keeps `looks_like_dead_channel` from misclassifying the
     /// rejection as a dead h2 channel (#147 regression risk).
     ///
-    /// Default: 8 GiB. Conservative for a 256 GiB-RAM server: at a
-    /// 10GbE line rate (~1.2 GB/s for CAS uploads after framing
-    /// overhead) the cap absorbs ~6.4s of unrelieved slow-tier
-    /// pressure before firing — long enough to ride out typical txg
-    /// pauses or transient gRPC blips, short enough that a multi-
-    /// minute wedge cannot drag the process into OOM territory.
-    /// Operators on smaller hosts (e.g. 32–64 GB workers) should
-    /// reduce proportionally to leave headroom for the rest of the
-    /// process. **Worst-case overshoot** above the cap is bounded by
+    /// **Default: 0 (uncapped).** Per red-team #1 (#334 bundle fixup
+    /// #6), an 8 GiB inherited-by-default cap on workers (16-32 GiB
+    /// RAM hosts where 8 GiB = 25-50% of host memory) would force
+    /// upstream ByteStream RPCs to block on slow-tier latency — the
+    /// exact pattern that caused the #203 OOM cascade. Server
+    /// deployments MUST set this explicitly (see `buildcache-native.json5`
+    /// for the production 8 GiB value). Workers explicitly override to
+    /// 0 at `local_worker.rs:2674,2778` — that override is now
+    /// redundant with this default but preserved for clarity.
+    ///
+    /// **Recommended values when set explicitly:**
+    /// - Server (≥128 GiB RAM, 10GbE): 8 GiB. At ~1.2 GB/s CAS upload
+    ///   throughput the cap absorbs ~6.4s of unrelieved slow-tier
+    ///   pressure before firing — long enough for typical txg pauses
+    ///   or transient gRPC blips, short enough that multi-minute
+    ///   wedges can't drag into OOM territory.
+    /// - Smaller hosts (32-64 GiB): scale proportionally to leave
+    ///   headroom for the rest of the process.
+    /// - Workers + tests: 0 (uncapped) — workers have a different
+    ///   durability protocol (mirror_blobs + BIS ack) that decouples
+    ///   slow-write completion from upstream RPC liveness.
+    ///
+    /// **Worst-case overshoot** above the cap is bounded by
     /// `concurrent_admissions × max_admission_bytes` (the cap-check is
     /// snapshot-consistent, not strongly-consistent — see the
     /// `in_flight_slow_writes_bytes` field doc on `FastSlowStore` for
     /// the synchronization model). With ByteStream chunks at ≤3 MiB
     /// and `parallel_chunk_count=64`, the worst-case overshoot is
-    /// ~192 MiB above the cap — comfortably below OOM territory.
-    ///
-    /// Zero is treated as "no cap" — preserves the historic unbounded
-    /// behavior bit-identically for callers that explicitly opt out
-    /// (e.g. for tests that want to drive the bug repro path).
+    /// ~192 MiB above the cap — comfortably below OOM territory on
+    /// any explicitly-capped server.
     #[serde(default = "default_slow_writes_in_flight_max_bytes")]
     #[serde(deserialize_with = "convert_data_size_with_shellexpand")]
     pub slow_writes_in_flight_max_bytes: u64,
 }
 
 /// Default cap for `FastSlowSpec::slow_writes_in_flight_max_bytes`.
-/// 8 GiB — see field doc-comment for the rationale.
+/// 0 = uncapped — preserves historic behavior bit-identically. Server
+/// deployments must opt in explicitly to OOM protection. See field
+/// doc-comment for the rationale (red-team #1 finding on #334 bundle).
 fn default_slow_writes_in_flight_max_bytes() -> u64 {
-    8 * 1024 * 1024 * 1024
+    0
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy)]

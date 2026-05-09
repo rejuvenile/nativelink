@@ -2677,6 +2677,11 @@ pub async fn new_local_worker(
             // (server), not on workers. If a future worker FastSlow
             // composition uses a cap-bounded slow tier (e.g. local
             // disk with its own backpressure), set this explicitly.
+            //
+            // Bundle fixup #6 (red-team #1) also changed the spec
+            // default to 0; this `: 0` is now redundant with the
+            // default but kept explicit so removing the default later
+            // wouldn't silently re-introduce a cap on workers.
             slow_writes_in_flight_max_bytes: 0,
         };
         let new_fss = FastSlowStore::new(&fss_spec, fast_store, proxy_store);
