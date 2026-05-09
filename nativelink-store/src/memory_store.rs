@@ -26,7 +26,6 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use nativelink_config::stores::MemorySpec;
 use nativelink_error::{Code, Error, ResultExt, make_err};
-#[cfg(feature = "chunked_fast_slow")]
 use tracing::{debug, error};
 use nativelink_metric::MetricsComponent;
 #[cfg(feature = "chunked_fast_slow")]
