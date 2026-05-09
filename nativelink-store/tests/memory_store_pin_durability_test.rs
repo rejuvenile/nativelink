@@ -83,7 +83,7 @@ use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::verify_store::VerifyStore;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::store_trait::{Store, StoreDriver, StoreLike};
 use tempfile::TempDir;
 
 /// Fast-tier MemoryStore cap (8 KiB; per `MokaEvictingMap`'s 1-KiB
@@ -377,6 +377,115 @@ async fn memory_store_unpin_releases_for_eviction() -> Result<(), Error> {
         PRESSURE_HASHES.len(),
         PRESSURE_SIZE,
         MEM_CAP_BYTES,
+    );
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------------
+// #334 bundle fixup #8a — BIS-loop e2e contract: write → drain → unpin.
+//
+// The production server's BIS broadcast loop in `src/bin/nativelink.rs`
+// runs this sequence in a background tokio task:
+//   1. Wait on `stable_notify`.
+//   2. `drain_stable_digests` — atomically remove + return queued
+//      digests pushed by `FastSlowStore::update`'s post-slow-write
+//      `mark_stable` call.
+//   3. Broadcast each digest to every scheduler.
+//   4. `unpin_digests` on the cas_STORE chain to release the fast-tier
+//      pin acquired at write time (the BIS-ack window has closed).
+//
+// This test exercises the full data flow against the same FSS the
+// production loop uses, validating each link in the chain:
+//   - `update` ⇒ stable_digests populated AND notify fired
+//   - `drain_stable_digests` returns the expected digest
+//   - `unpin_digests` releases the pin so eviction can proceed
+//
+// Mutation step: revert the new `unpin_digests` BIS-loop call in
+// `src/bin/nativelink.rs` (or revert the `MemoryStore::unpin_digests`
+// override). After write + drain + unpin (commented out) + sibling
+// pressure, the pinned blob would still be alive — the
+// `has(pinned_digest).is_none()` assertion at the end red-fails with
+// the bespoke "BIS-loop unpin missing" message.
+// -------------------------------------------------------------------------
+#[nativelink_test]
+async fn bis_loop_e2e_write_drain_notify_unpin_contract() -> Result<(), Error> {
+    let h = make_harness().await?;
+
+    let pinned_digest = DigestInfo::try_new(PINNED_HASH, PINNED_SIZE as u64)?;
+
+    // Subscribe to stable_notify BEFORE the write so we don't miss the
+    // notification. (Same pattern the production BIS loop uses —
+    // subscribe-before-predicate.)
+    let notify = h.fss.stable_notify();
+    let notified = notify.notified();
+    tokio::pin!(notified);
+
+    // Step 1 (production write side): write a CAS blob through the
+    // canonical chain; the FSS spawns the background slow-tier write
+    // and pins the digest in the fast tier.
+    h.cas_chain
+        .update_oneshot(pinned_digest, Bytes::from(vec![0xAAu8; PINNED_SIZE]))
+        .await
+        .err_tip(|| "writing pinned blob through CAS chain")?;
+    // Production BIS-broadcast loop pins via `pin_digests` after the
+    // FSS internal pin. Replicate here for test isolation (FSS's own
+    // internal pin path is a separate concern).
+    h.fss.fast_store().pin_digests(&[pinned_digest]);
+
+    // Step 2: stable_notify must have fired by now (the FSS's
+    // background slow-write task pushes the digest + fires the notify
+    // after the slow tier acks). 5s deadlock-detector timeout —
+    // without the notify, the BIS loop would never wake and the
+    // contract is broken.
+    tokio::time::timeout(Duration::from_secs(5), &mut notified)
+        .await
+        .expect(
+            "BIS-loop e2e contract violated: stable_notify did NOT fire \
+             within 5s of update_oneshot — the FSS background slow-write \
+             must push to stable_digests AND fire the notify before \
+             reporting completion",
+        );
+
+    // Step 3: drain_stable_digests must return our digest.
+    let drained = h.fss.drain_stable_digests();
+    assert!(
+        drained.contains(&pinned_digest),
+        "BIS-loop e2e contract violated: drain_stable_digests did NOT \
+         return the just-written digest — drained={drained:?}, \
+         expected to contain {pinned_digest:?}. The FSS's mark_stable \
+         queue is the BIS broadcast loop's input; without this digest \
+         in the drain, no BIS broadcast would fire for it"
+    );
+
+    // Step 4: unpin_digests on the chain (the production BIS loop's
+    // post-broadcast call). Then verify the pin is actually released
+    // by driving sibling pressure that should evict.
+    h.cas_chain.unpin_digests(&drained);
+
+    for hash in PRESSURE_HASHES {
+        let d = DigestInfo::try_new(hash, PRESSURE_SIZE as u64)?;
+        h.cas_chain
+            .update_oneshot(d, Bytes::from(vec![0xBBu8; PRESSURE_SIZE]))
+            .await
+            .err_tip(|| format!("writing pressure blob {hash}"))?;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let observed = tokio::time::timeout(NO_DEADLOCK_TIMEOUT, h.fast_mem.has(pinned_digest))
+        .await
+        .expect("timed out asking fast-tier MemoryStore::has — chain regression")
+        .expect("MemoryStore::has returned Err");
+
+    assert!(
+        observed.is_none(),
+        "BIS-loop unpin missing: blob survived sibling-pressure eviction \
+         even after the BIS-loop unpin call. The full e2e flow (write → \
+         stable_notify fire → drain → unpin → eviction-eligible) is \
+         broken at the unpin step. observed={observed:?}, \
+         pinned_digest={pinned_digest:?}, pressure_blobs={} × {} bytes",
+        PRESSURE_HASHES.len(),
+        PRESSURE_SIZE,
     );
 
     Ok(())

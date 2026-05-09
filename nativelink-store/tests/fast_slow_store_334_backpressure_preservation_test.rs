@@ -189,8 +189,9 @@ fn make_fast_slow_with_tiny_fast_cap(fast_cap_bytes: usize) -> (Arc<FastSlowStor
 /// production server CAS chain uses
 /// (`ExistenceCacheStore → VerifyStore → FastSlowStore`, see MEMORY.md
 /// "Server CAS Store Architecture"). Fills the inner fast tier to its
-/// byte cap with one blob; a second update that would force eviction
-/// MUST surface `ResourceExhausted +
+/// byte cap with one blob, PINS it (so the Fix C eviction extension
+/// cannot free room), then issues a second update that would force
+/// eviction. It MUST surface `ResourceExhausted +
 /// BackpressureSignal::MemoryStoreAtCapacity` through every wrapping
 /// layer. The bug being fixed is cross-component signal preservation;
 /// testing only at the FSS unit boundary would miss a regression where
@@ -201,6 +202,12 @@ fn make_fast_slow_with_tiny_fast_cap(fast_cap_bytes: usize) -> (Arc<FastSlowStor
 /// dropped) and the match at line 3789 returns it before checking
 /// `fast_res`, masking the typed signal.
 ///
+/// Cap bumped from 1 KiB to 4 KiB (#334 bundle fixup #8a-companion):
+/// pin_cap = 25% × cap, so a 1 KiB pinned entry needs ≥ 4 KiB cap to
+/// fit inside the pin budget. Mirrors the `fc365ac3` pattern that
+/// fixed three sibling tests for the Fix C eviction extension's
+/// "evict-unpinned-LRU-before-emit" behavior.
+///
 /// Mutation step: comment out the new "fast_res wins on
 /// BackpressureSignal" branch in `fast_slow_store.rs::update`. The test
 /// MUST red-fail with the bespoke "typed BackpressureSignal must be
@@ -208,10 +215,11 @@ fn make_fast_slow_with_tiny_fast_cap(fast_cap_bytes: usize) -> (Arc<FastSlowStor
 #[nativelink_test]
 async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store()
 -> Result<(), Error> {
-    // 1 KiB cap on the fast tier: first 1024-byte insert fits; second
-    // 1024-byte insert would exceed and triggers
-    // `check_backpressure_gate` (`memory_store.rs:367`).
-    let (fss, _fast, _slow) = make_fast_slow_with_tiny_fast_cap(1024);
+    // 4 KiB cap on the fast tier: 1 KiB pinned + 1 KiB pressure write
+    // = 2 KiB live; second 1 KiB write triggers backpressure gate (the
+    // pinned entry is unevictable so `evict_unpinned_lru_bytes` finds
+    // nothing in cache and the gate emits the typed signal).
+    let (fss, _fast, _slow) = make_fast_slow_with_tiny_fast_cap(4 * 1024);
     // Production composition wrap: `cas_STORE` =
     // `ExistenceCacheStore → VerifyStore → FastSlowStore`. Without
     // this wrap the test would not exercise the typed-signal
@@ -223,7 +231,7 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
             verify_size: true,
             verify_hash: false,
         },
-        Store::new(fss),
+        Store::new(fss.clone()),
     );
     let cache = ExistenceCacheStore::new(
         &ExistenceCacheSpec {
@@ -237,6 +245,11 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
     );
     let store: Store = Store::new(cache);
 
+    // Fill the cap. Pre-cap pressure writes so the cache holds 3 KiB
+    // worth of unpinned + 1 KiB pinned. The 4th 1 KiB write will face
+    // the gate: evict_unpinned_lru_bytes can only free unpinned, and
+    // even if it frees some, the pinned-bytes accounting in
+    // `would_exceed_capacity` keeps the cap honest.
     let payload1 = vec![0u8; 1024];
     let digest1 = DigestInfo::try_new(VALID_HASH1, payload1.len() as u64)?;
     tokio::time::timeout(
@@ -246,8 +259,30 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
     .await
     .expect("first insert must not deadlock — baseline contract")?;
 
-    // Second insert: same size, would force eviction in the fast tier.
-    let payload2 = vec![1u8; 1024];
+    // PIN the first entry so the Fix C eviction extension cannot free
+    // it. Without this pin, the gate's `evict_unpinned_lru_bytes` call
+    // would evict the 1 KiB entry, freeing room for the 4 KiB cap to
+    // accept another 1 KiB write — defeating the test's premise.
+    fss.fast_store_handle().pin_digests(&[digest1]);
+
+    // Pad cache to cap with two more 1 KiB writes (UNPINNED). After
+    // this: 1 KiB pinned + 2 KiB unpinned = 3 KiB used, cap 4 KiB.
+    for hash in [VALID_HASH3, VALID_HASH4] {
+        let payload_pad = vec![0xCDu8; 1024];
+        let digest_pad = DigestInfo::try_new(hash, payload_pad.len() as u64)?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_update(&store, digest_pad.into(), Bytes::from(payload_pad)),
+        )
+        .await
+        .expect("pad insert must not deadlock — baseline contract")?;
+    }
+
+    // Second insert: 2 KiB. After eviction of the 2 KiB unpinned, only
+    // 1 KiB pinned remains, leaving 3 KiB free — but a 2 KiB write
+    // would fit. Use 4 KiB instead (over cap even after evicting all
+    // unpinned: 4 KiB cap - 1 KiB pinned = 3 KiB free, 4 KiB > 3 KiB).
+    let payload2 = vec![1u8; 4 * 1024];
     let digest2 = DigestInfo::try_new(VALID_HASH2, payload2.len() as u64)?;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
@@ -261,7 +296,9 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
 
     let err = result.expect_err(
         "second insert MUST return an Err — fast tier at capacity with \
-         emit_backpressure_enabled=true",
+         emit_backpressure_enabled=true (4 KiB write into 4 KiB cap with \
+         1 KiB pinned cannot fit even after Fix C eviction extension frees \
+         the 2 KiB unpinned padding)",
     );
     // Bespoke contract guard FIRST so the mutation step prints this
     // canonical message, not the generic helper-internal `assert_eq!`
@@ -869,11 +906,20 @@ async fn fix_a_does_not_over_match_bare_resource_exhausted() -> Result<(), Error
 /// fewer admissions until every admission is rejected (the counter
 /// drifts up by every failed write).
 ///
-/// Mutation step: comment out the `in_flight.lock().remove()` (or the
-/// `fetch_sub`) in the failure-arm closure at `fast_slow_store.rs:4196-4221`.
-/// The test MUST red-fail with the bespoke "counter leaked on failure
-/// path — admission cap will permanently reject after first slow-write
-/// failure" message.
+/// Mutation step (corrected per #334 bundle fixup #8c — the original
+/// docstring pointed at `fast_slow_store.rs:4196-4221`, which is the
+/// failure-recovery `failed_slow_writes.insert + pin_digests` block,
+/// NOT the counter decrement). The actual counter-decrement site is
+/// at `fast_slow_store.rs:4237-4257` (the post-recovery
+/// `let mut guard = in_flight.lock(); let removed = guard.remove(...);
+/// if let Some(removed_chunks) = removed { ...
+/// in_flight_bytes.fetch_sub(removed_bytes, ...) }` block — which
+/// runs on BOTH success and failure paths because it's outside the
+/// `match res` arms). To mutate, comment out the
+/// `in_flight_bytes.fetch_sub(removed_bytes, Ordering::Relaxed);` call
+/// at `:4252`. The test MUST red-fail with the bespoke "counter
+/// leaked on failure path — admission cap will permanently reject
+/// after first slow-write failure" message.
 #[nativelink_test]
 async fn fix_b_counter_decrements_on_slow_write_failure() -> Result<(), Error> {
     let cap_bytes: u64 = 1024 * 1024 * 1024; // 1 GiB - way above what we use

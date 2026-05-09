@@ -196,13 +196,28 @@ async fn eviction_extension_admits_when_unpinned_entries_can_be_freed(
 //     invariant — the BIS-ack pin is the whole reason the gate
 //     refuses to silent-evict).
 //
-// Mutation step: in `evict_unpinned_lru_bytes`, comment out the
-// `if check_pinned && self.pinned.contains_key(q) { continue; }` skip
-// (so pinned entries are evictable). The pinned entry gets evicted,
-// the gate admits the new write, and this test red-fails on either
-// the `has(pinned_digest)` assertion (durability broken) OR the
-// `expect_err` assertion (gate did not emit signal). Both failure
-// modes carry the bespoke message.
+// Mutation step (corrected per #334 bundle fixup #8c): the original
+// docstring claimed the skip in `evict_unpinned_lru_bytes`'s iter
+// loop (`if check_pinned && self.pinned.contains_key(q) { continue;
+// }`) was the load-bearing site. That's misleading: `pin_keys` calls
+// `self.cache.invalidate(q)` at `moka_evicting_map.rs:895` so pinned
+// entries are MOVED OUT of the cache (they live in the `pinned`
+// DashMap exclusively, with `pinned_bytes` tracked separately). The
+// iter loop's `continue` is therefore dead — pinned keys never appear
+// in `cache.iter()` to skip in the first place.
+//
+// The actual guard is `pinned_bytes` accounting in
+// `would_exceed_capacity`: it reads `cache.weighted_size() +
+// pinned_bytes` so the over-cap check stays honest after entries are
+// pinned-into / unpinned-out. To mutate, replace the
+// `cache.weighted_size().saturating_add(pinned_bytes_now)` in
+// `would_exceed_capacity` with just `cache.weighted_size()`. The
+// pinned 1 KiB entry then becomes invisible to the cap check; the
+// gate believes it has 4 KiB free, attempts to admit, succeeds, and
+// the durability invariant is broken — `has(pinned_digest)` returns
+// None because the pinned entry was overwritten by the new admission.
+// This test red-fails on the `has(pinned_digest)` assertion with the
+// bespoke message below.
 // ---------------------------------------------------------------------------
 #[nativelink_test]
 async fn eviction_extension_emits_signal_when_all_bytes_pinned(

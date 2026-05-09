@@ -73,11 +73,31 @@ struct EvictionEvent<K, T> {
 /// observability — the eviction-then-recheck loop in production
 /// re-checks `would_exceed_capacity` directly rather than trusting this
 /// number to determine whether to admit the new write.
+///
+/// `iter_scanned` is the count of entries the iter loop visited
+/// (post-#334 bundle fixup #8b — perf MAJOR). When this approaches
+/// `EVICT_SCAN_HARD_CAP` (10K) the loop short-circuits to bound the
+/// O(N)-walk worst case under heavy backpressure churn; emit
+/// `iter_scanned` into tracing so a future operator can spot the
+/// truncation if it ever fires (currently not expected at production
+/// scales — the cas_FAST_SLOW MemoryStore caps at 1M entries).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EvictedReport {
     pub evicted_count: u64,
     pub evicted_bytes: u64,
+    pub iter_scanned: u64,
+    pub iter_truncated: bool,
 }
+
+/// Hard cap on entries `evict_unpinned_lru_bytes` may scan in a single
+/// call. Bounds the worst-case O(N) walk so the call latency stays
+/// predictable under sustained backpressure churn (the production
+/// cas_FAST_SLOW MemoryStore is capped at 1M entries; without this
+/// cap a bursty all-pinned scenario could iterate the full 1M before
+/// returning empty-handed). Truncation is observability-only — the
+/// caller's eviction-then-recheck loop in `check_backpressure_gate`
+/// still emits the typed signal correctly when no room is freed.
+const EVICT_SCAN_HARD_CAP: u64 = 10_000;
 
 /// A cache backed by `moka::sync::Cache` with an API that mirrors
 /// the previous LRU-based `EvictingMap`. Moka is configured with the
@@ -1121,6 +1141,7 @@ where
         if target_bytes == 0 {
             return EvictedReport::default();
         }
+        let start = Instant::now();
         // Flush in-flight admissions/evictions so iter() sees a stable
         // snapshot of what's actually resident.
         self.cache.run_pending_tasks();
@@ -1128,18 +1149,36 @@ where
         let check_pinned = self.has_pinned();
         let mut evicted_bytes: u64 = 0;
         let mut evicted_count: u64 = 0;
+        let mut iter_scanned: u64 = 0;
+        let mut iter_truncated = false;
 
         // Collect candidates in iteration order. We collect first
         // (rather than invalidate during iteration) because moka's
         // iterator is documented to skip entries removed mid-iteration,
         // and we want a deterministic "I considered N entries" result
         // for tracing.
+        //
+        // #334 bundle fixup #8b (perf MAJOR): hard cap at
+        // EVICT_SCAN_HARD_CAP entries per call. Bursty all-pinned
+        // scenarios could otherwise walk the full 1M-entry production
+        // cas_FAST_SLOW MemoryStore before giving up. The caller's
+        // `would_exceed_capacity` re-check is still authoritative for
+        // admission; this cap only bounds the SCAN, not the eviction
+        // contract.
         for (key_arc, value) in self.cache.iter() {
+            iter_scanned = iter_scanned.saturating_add(1);
             if evicted_bytes >= target_bytes {
+                break;
+            }
+            if iter_scanned >= EVICT_SCAN_HARD_CAP {
+                iter_truncated = true;
                 break;
             }
             let q: &Q = (*key_arc).borrow();
             // Skip pinned entries — pin protection is the whole point.
+            // (Note: pin_keys() invalidates from cache at ::pin_keys's
+            // end, so pinned entries normally never appear here. The
+            // check guards a stale-pin race window.)
             if check_pinned && self.pinned.contains_key(q) {
                 continue;
             }
@@ -1160,9 +1199,24 @@ where
         // eviction) size and emit backpressure unnecessarily.
         self.cache.run_pending_tasks();
 
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        if iter_truncated || elapsed_ms > 50 {
+            warn!(
+                evicted_count,
+                evicted_bytes,
+                iter_scanned,
+                iter_truncated,
+                elapsed_ms,
+                target_bytes,
+                "evict_unpinned_lru_bytes: scan-cap hit or slow scan",
+            );
+        }
+
         EvictedReport {
             evicted_count,
             evicted_bytes,
+            iter_scanned,
+            iter_truncated,
         }
     }
 
