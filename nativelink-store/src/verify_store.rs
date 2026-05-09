@@ -213,11 +213,22 @@ impl VerifyStore {
     /// check_fut)` over the writer's tx/rx pair (e.g. an upstream
     /// VerifyStore composed atop us, or any future composition that pairs
     /// our writer with a reader inside `tokio::join!`) deadlocks if we
-    /// return Err mid-stream without terminating. Wrap with
-    /// `WriteHalfGuard` so the size/hash mismatch Err paths use
-    /// `guard.fail(err)` to send the structured DataLoss to the paired
-    /// reader (vs the synthesized Internal from the Drop fallback) before
-    /// returning.
+    /// return Err mid-stream WITHOUT propagating a structured error to the
+    /// reader. The size-mismatch and hash-mismatch branches now call
+    /// `writer.send_error(err.clone())` explicitly before returning so the
+    /// reader observes the structured DataLoss instead of a generic
+    /// "Sender dropped" Internal.
+    ///
+    /// We do NOT use `WriteHalfGuard` here. Drop-fallback would set
+    /// `terminal_error = synthesized Internal` on every `?`-propagation
+    /// exit (e.g. `rx.recv().err_tip(...)?` when the inner store returned
+    /// NotFound) — but in that case the OUTER `tokio::join!` in
+    /// `verify_store::get_part` already propagates the structured upstream
+    /// error to the caller via the joined Result. The reader would
+    /// observe a noisy synthesized Internal that shadows the structured
+    /// upstream error semantics on the writer side, breaking established
+    /// test+production behavior. The over-action regression caught by
+    /// `cdn_cache_failure_*` tests during #336 P1 development.
     async fn inner_check_get_part<D: DigestHasher>(
         &self,
         writer: &mut DropCloserWriteHalf,
@@ -226,7 +237,6 @@ impl VerifyStore {
         original_hash: &PackedHash,
         mut maybe_hasher: Option<&mut D>,
     ) -> Result<(), Error> {
-        let mut writer_guard = WriteHalfGuard::new(writer);
         let mut sum_size: u64 = 0;
         loop {
             let chunk = rx
@@ -250,7 +260,14 @@ impl VerifyStore {
                             expected_size,
                             sum_size
                         );
-                        return Err(writer_guard.fail(err));
+                        // #336 P1: terminate the OUTER writer with the
+                        // structured DataLoss so any wrapping caller
+                        // that joins on the writer's tx/rx pair sees
+                        // the specific code instead of deadlocking on
+                        // an un-EOF'd writer. Idempotent — safe even
+                        // if the writer was already terminated.
+                        writer.send_error(err.clone());
+                        return Err(err);
                     }
                 }
                 if let Some(hasher) = maybe_hasher.as_mut() {
@@ -267,11 +284,13 @@ impl VerifyStore {
                             Code::DataLoss,
                             "Hash mismatch on read: expected {original_hash} but got {hash_result}",
                         );
-                        return Err(writer_guard.fail(err));
+                        // #336 P1: see size-mismatch branch above.
+                        writer.send_error(err.clone());
+                        return Err(err);
                     }
                 }
-                writer_guard
-                    .commit_eof()
+                writer
+                    .send_eof()
                     .err_tip(|| "In verify_store::check_get_part sending eof")?;
                 break;
             }
@@ -279,7 +298,7 @@ impl VerifyStore {
             sum_size += chunk.len() as u64;
 
             // Hash while forwarding to the caller's writer.
-            let write_future = writer_guard.send(chunk.clone());
+            let write_future = writer.send(chunk.clone());
 
             if let Some(hasher) = maybe_hasher.as_mut() {
                 hasher.update(chunk.as_ref());
