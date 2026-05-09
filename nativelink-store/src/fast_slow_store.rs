@@ -1171,6 +1171,27 @@ impl FastSlowStore {
         // change that allows MemoryStore to early-reject on this path
         // would replay #334 here too. Sibling-bug guard per CLAUDE.md
         // "Sibling-bug audit on every contract violation."
+        //
+        // Note (#334 bundle fixup #7 — red-team #3): also examined
+        // the `dispatch_res` typed-signal preservation path. The
+        // dispatcher CAN emit `Code::ResourceExhausted +
+        // BackpressureSignal::{PerBlobMpscFull, GlobalChunkBudgetExhausted,
+        // PinnedBytesExhausted}` and `Code::Aborted +
+        // BackpressureSignal::PerBlobMpscFull` (see
+        // `nativelink-service/src/chunked_write_handler.rs:579,1422,
+        // 1448,1487,1869`). The existing `match dispatch_res { Err(err)
+        // => return Err(err) }` arm at the end of this block ALREADY
+        // preserves the typed err to the caller — it is reached even
+        // when the dispatcher rejects-at-admit and drops `chunk_rx`,
+        // because the data-stream future races to EOF before observing
+        // the dropped rx in the test scenarios reproducible to date.
+        // The regression test
+        // `fast_slow_str_key_skips_chunked_dispatch_test::
+        //  fix_a_chunked_sibling_dispatch_typed_signal_preserved`
+        // guards this end-to-end behavior. If a future change makes
+        // `data_res` reliably Err-before-dispatch-arm in this case,
+        // a pre-data_res `dispatch_res_carries_typed_backpressure`
+        // guard symmetric to the `fast_res` one above would be needed.
         let fast_res_carries_typed_backpressure = fast_res
             .as_ref()
             .err()

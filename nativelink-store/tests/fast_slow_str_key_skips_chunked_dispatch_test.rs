@@ -262,3 +262,142 @@ async fn digest_keyed_update_invokes_chunked_dispatcher() -> Result<(), Error> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// #334 Fix A chunked-sibling regression — red-team #3 (bundle fixup #7)
+// ---------------------------------------------------------------------
+
+/// Fake dispatcher that REJECTS the dispatch with a typed
+/// `BackpressureSignal::PerBlobMpscFull` AT ADMIT TIME (the live,
+/// production-active emit shape — see
+/// `nativelink-service/src/chunked_write_handler.rs:1487` for the
+/// analog production site, which rejects BEFORE consuming any
+/// chunks). Drops the reader immediately so the data-stream future's
+/// `chunk_guard.send(...)` fails with the generic Internal-wrapped
+/// channel-closed error — exactly the production race that masks the
+/// dispatcher's typed signal pre-fix.
+#[derive(Debug)]
+struct RejectingDispatcher {
+    invocations: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl BazelChunkedDispatcher for RejectingDispatcher {
+    async fn dispatch(
+        &self,
+        _digest: DigestInfo,
+        _reader: DropCloserReadHalf,
+    ) -> Result<u64, Error> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        // Drop reader immediately — the data-stream future's
+        // chunk_guard.send will then fail with channel-closed,
+        // wrapped as generic Code::Internal in the data_stream_fut
+        // closure. That's the bug-precondition: dispatcher's typed
+        // signal MUST still surface despite data_res carrying that
+        // generic Internal.
+        let detail = nativelink_store::chunked_signal::encode_backpressure_signal_any(
+            nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal::Reason::PerBlobMpscFull,
+            100,
+        );
+        Err(Error::resource_exhausted_backpressure(
+            "RejectingDispatcher: synthetic per-blob mpsc rejection at admit-time",
+            detail,
+        ))
+    }
+}
+
+/// **#334 Fix A chunked-sibling guard — red-team #3 (bundle fixup
+/// #7).** When the chunked dispatcher rejects a Digest-keyed
+/// `update()` with a typed `BackpressureSignal`, the FastSlowStore's
+/// chunked path MUST surface the typed signal to the caller — NOT
+/// the generic `Code::Internal "Failed to send to chunked dispatcher"`
+/// that the data-stream future would emit when `chunk_rx` is dropped
+/// by the rejecting dispatcher.
+///
+/// Per the bundle fixup #7 investigation:
+///   - The dispatcher CAN emit `Code::ResourceExhausted +
+///     BackpressureSignal::{PerBlobMpscFull, GlobalChunkBudgetExhausted,
+///     PinnedBytesExhausted}` and `Code::Aborted +
+///     BackpressureSignal::PerBlobMpscFull`. See
+///     `nativelink-service/src/chunked_write_handler.rs:579,1422,1448,1487,1869`.
+///   - The existing `match dispatch_res { Err(err) => return Err(err) }`
+///     arm at the end of the chunked-update block ALREADY preserves
+///     the typed err to the caller — it is reached even when the
+///     dispatcher rejects-at-admit and drops `chunk_rx`, because the
+///     data-stream future races to EOF before observing the dropped
+///     rx in the test scenarios reproducible to date.
+///
+/// This test is a regression GUARD for that existing behavior. If a
+/// future change in the chunked path ever makes `data_res` reliably
+/// Err-before-dispatch-arm in this case, this test will red-fail and
+/// alert that a pre-data_res `dispatch_res_carries_typed_backpressure`
+/// guard symmetric to the `fast_res` one is now needed.
+#[nativelink_test]
+async fn fix_a_chunked_sibling_dispatch_typed_signal_preserved() -> Result<(), Error> {
+    let _guard = kill_switch_lock().lock().await;
+
+    let (fss, _fast, _slow) = make_fast_slow();
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let dispatcher: BazelChunkedDispatcherArc = Arc::new(RejectingDispatcher {
+        invocations: invocations.clone(),
+    });
+    fss.set_bazel_chunked_dispatcher(dispatcher);
+    fss.set_chunked_size_threshold_for_test(1);
+
+    enable_bazel_facing_internal_chunking();
+
+    // Digest key + a larger payload so multiple chunk sends happen,
+    // raising the chance that chunk_guard.send is mid-await when the
+    // dispatcher drops chunk_rx (the bug-precondition race).
+    let payload = Bytes::from(vec![0xAB_u8; 64 * 1024]);
+    let mut hash = [0u8; 32];
+    hash[0] = 0x42;
+    let digest = DigestInfo::new(hash, payload.len() as u64);
+    let key: StoreKey<'static> = digest.into();
+
+    let store: Store = Store::new(fss.clone());
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        drive_update(&store, key.borrow(), payload),
+    )
+    .await
+    .expect("update must not hang for Digest-keyed update — chunked-path must complete promptly");
+
+    // Restore kill-switch BEFORE the assertion so a failing assert
+    // doesn't leak the toggle to sibling tests in the same process.
+    disable_bazel_facing_internal_chunking();
+
+    let err = result.expect_err(
+        "chunked-path update with rejecting dispatcher MUST return Err — \
+         #334 Fix A chunked-sibling: typed BackpressureSignal from dispatch_res \
+         must surface, not be masked by generic data_res Internal",
+    );
+
+    use nativelink_error::Code;
+    use nativelink_store::chunked_signal::error_has_backpressure_signal;
+    assert!(
+        (err.code == Code::ResourceExhausted || err.code == Code::Aborted)
+            && error_has_backpressure_signal(&err),
+        "typed BackpressureSignal from dispatch_res MUST be preserved on chunked path — \
+         #334 Fix A chunked-sibling regressed (red-team #3): got code={:?} \
+         messages={:?} details_len={} (chunked-path data_res check at \
+         fast_slow_store.rs:~1196 returned its generic Internal before the \
+         dispatch_res typed-signal check could fire — the same bug shape as \
+         the small-blob #334 cascade, half a fix earlier)",
+        err.code,
+        err.messages,
+        err.details.len(),
+    );
+
+    let n = invocations.load(Ordering::SeqCst);
+    assert_eq!(
+        n, 1,
+        "dispatcher MUST have been invoked exactly once (count={n}); \
+         if 0, the chunked path didn't dispatch at all — the bug-precondition \
+         race didn't fire and the assertion proves nothing"
+    );
+
+    Ok(())
+}
+
