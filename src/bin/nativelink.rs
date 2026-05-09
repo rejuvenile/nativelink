@@ -928,10 +928,25 @@ async fn inner_main(
                     if !cas_digests.is_empty() {
                         batches.push((String::new(), cas_digests));
                     }
+                    // #334 Fix C extended (dsr MAJOR-1): symmetric per-AC-
+                    // store drain capture so we can call `unpin_digests`
+                    // on the originating AC store post-broadcast. AC
+                    // backends in production (`AC_BACKEND_CACHED` =
+                    // `FastSlowStore { fast: MemoryStore(4 GB), slow:
+                    // ref(REDIS_AC_STORE) }`) take the same fast-tier
+                    // pin at write time as CAS (`fast_slow_store.rs:4103`
+                    // / `:3805`). Without this AC-side unpin the 1 GB
+                    // pin budget (4 GB cap × 25%) fills after ~1 GB of
+                    // AC writes and `pin_keys: pin cap exceeded` floods.
+                    let mut ac_drains_per_store: Vec<(
+                        &nativelink_util::store_trait::Store,
+                        Vec<nativelink_util::common::DigestInfo>,
+                    )> = Vec::with_capacity(ac_bis_stores.len());
                     for (name, store) in &ac_bis_stores {
                         let drained = store.drain_stable_digests();
                         if !drained.is_empty() {
-                            batches.push((name.clone(), drained));
+                            batches.push((name.clone(), drained.clone()));
+                            ac_drains_per_store.push((store, drained));
                         }
                     }
                     if batches.is_empty() {
@@ -995,30 +1010,40 @@ async fn inner_main(
                     }
 
                     // #334 Fix C: release server-side fast-tier pins for
-                    // every CAS digest just broadcast. The broadcast told
-                    // workers the blob is durably mirrored (≥2 replicas);
-                    // the server's fast-tier pin acquired at write time
-                    // (`FastSlowStore::update`) is no longer load-bearing
-                    // past this point. Without this unpin, every CAS write
-                    // accumulates a permanent pin entry in MemoryStore's
-                    // 25%-of-cap pin budget — after the first ~12 GB of
-                    // writes (48 GB cap × 25%) `pin_keys: pin cap exceeded`
-                    // would warn-and-skip every subsequent pin, silently
-                    // re-opening the durability gap this fix closes.
+                    // every CAS and AC digest just broadcast. The
+                    // broadcast told workers the blob is durably
+                    // mirrored (≥2 replicas); the server's fast-tier
+                    // pin acquired at write time (`FastSlowStore::update`)
+                    // is no longer load-bearing past this point. Without
+                    // this unpin, every write accumulates a permanent
+                    // pin entry in the fast tier's 25%-of-cap pin budget
+                    // — for CAS that's 48 GB × 25% = ~12 GB, for AC
+                    // that's 4 GB × 25% = ~1 GB. After the cap fills
+                    // `pin_keys: pin cap exceeded` would warn-and-skip
+                    // every subsequent pin, silently re-opening the
+                    // durability gap this fix closes.
                     //
                     // Routed through `Store::unpin_digests` so the call
-                    // walks the same `pin_delegation` chain
-                    // `pin_digests` used at write time
-                    // (ExistenceCacheStore → VerifyStore → SizePartitioning
-                    // → FastSlowStore → MemoryStore + FilesystemStore).
+                    // walks the same `pin_delegation` chain `pin_digests`
+                    // used at write time:
+                    //   - CAS: ExistenceCacheStore → VerifyStore →
+                    //     SizePartitioning → FastSlowStore → MemoryStore
+                    //     + FilesystemStore.
+                    //   - AC: AcProxyStore → CompletenessCheckingStore →
+                    //     FastSlowStore → MemoryStore + ref(REDIS_AC_STORE)
+                    //     (production `AC_BACKEND_CACHED`).
+                    //
                     // Idempotent — `MokaEvictingMap::unpin_key` is a
                     // remove-if-present, so a digest re-pinned for a
                     // separate (later) write is not affected here, only
                     // the pin acquired at the originating write is
-                    // released. AC stores are NOT unpinned here: AC has
-                    // no fast-tier pin to acquire at write time (AC
-                    // backend is FilesystemStore-only in production).
+                    // released. Per-store accounting (drains_per_store)
+                    // keeps the unpin scoped to the BIS-acked write so
+                    // we don't race a fresh pin on the same digest.
                     for (store, drained) in &cas_drains_per_store {
+                        store.unpin_digests(drained);
+                    }
+                    for (store, drained) in &ac_drains_per_store {
                         store.unpin_digests(drained);
                     }
                 }
