@@ -77,6 +77,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use nativelink_proto::build::bazel::remote::execution::v2::Digest;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     UpdateForWorker, UploadMissingBlobsRequest, update_for_worker,
@@ -87,7 +88,7 @@ use nativelink_store::wrapper_walker::{find_fast_slow_via_chain, synthetic_large
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::Store;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 
 /// Default drain tick interval. Conservative — the failure rate is
@@ -331,6 +332,24 @@ pub async fn drain_tick(
         })
         .collect();
 
+    // dsr MAJOR-1 (parallel V3 self-retry).
+    //
+    // Phase A (sequential, cheap): per-digest triage. Each digest
+    // routes into ONE of three buckets:
+    //   - `throttled` (cooldown active) → counted + re-insert below
+    //   - `self_retry_queue` (FSS available + not throttled) → driven
+    //     in parallel under a Semaphore in Phase B
+    //   - `worker_dispatch_queue` (no FSS in chain) → handed straight
+    //     to the existing worker-dispatch logic
+    //
+    // The pre-fix loop did the V3 `await` inline per-digest, so 723
+    // digests × 2 s timeout = 24 minutes worst-case per tick. Now
+    // the timeouts overlap inside the Semaphore budget, capping
+    // aggregate per-tick wall-clock at roughly
+    // `(N / DEFAULT_SELF_RETRY_CONCURRENCY) × DEFAULT_SELF_RETRY_TIMEOUT`.
+    let mut self_retry_queue: Vec<(String, DigestInfo, &FastSlowStore)> = Vec::new();
+    let mut worker_dispatch_queue: Vec<(String, DigestInfo)> = Vec::new();
+
     for (store_name, digests) in all_failed {
         stats.drained += digests.len();
         for digest in digests {
@@ -338,89 +357,123 @@ pub async fn drain_tick(
             // re-insert + skip. Self-retry is also throttled — a
             // transient slow-tier failure should not be hammered every
             // tick.
-            if let Some(ts) = inflight.get(&digest) {
-                if now.duration_since(*ts) < cooldown {
-                    stats.throttled += 1;
-                    reinsert.entry(store_name.clone()).or_default().push(digest);
-                    continue;
-                }
-            }
-
-            // #335 V3 self-retry: if the chain has an FSS, attempt
-            // an in-process slow-tier re-write from the fast tier.
-            // The FSS clears `failed_slow_writes` itself on success
-            // (no re-insert needed); on miss we fall through to the
-            // worker dispatch path; on Err we re-insert.
-            //
-            // Red-team BLOCK-2: pass `DEFAULT_SELF_RETRY_TIMEOUT` so a
-            // wedged slow tier returns `Code::DeadlineExceeded` from
-            // FSS within bounded wall-clock; the Err arm below counts
-            // it as `self_retry_failed` and re-inserts for the next
-            // tick.
-            if let Some(Some(fss)) = fss_for_store.get(store_name.as_str()) {
-                match fss
-                    .try_self_retry_slow_write(digest, DEFAULT_SELF_RETRY_TIMEOUT)
-                    .await
-                {
-                    Ok(SelfRetryOutcome::Succeeded { .. }) => {
-                        stats.self_retried += 1;
-                        if inflight.len() < inflight_cap {
-                            inflight.insert(digest, now);
-                        }
-                        // Skip worker dispatch — bytes already in
-                        // slow tier, BIS will broadcast.
-                        continue;
-                    }
-                    Ok(SelfRetryOutcome::FastTierMiss) => {
-                        // Fall through to worker dispatch below.
-                    }
-                    Err(e) => {
-                        warn!(
-                            ?digest,
-                            store_name = %store_name,
-                            err = ?e,
-                            "failed_slow_writes_drain: self-retry slow-tier \
-                             write failed; re-inserting for next tick \
-                             (transient slow-tier outage or BLOCK-2 timeout)"
-                        );
-                        stats.self_retry_failed += 1;
-                        if inflight.len() < inflight_cap {
-                            inflight.insert(digest, now);
-                        }
-                        reinsert.entry(store_name.clone()).or_default().push(digest);
-                        continue;
-                    }
-                }
-            }
-
-            // Pick the first worker that's currently connected.
-            let workers = locality_map.read().lookup_workers(&digest);
-            let picked = workers
-                .iter()
-                .find(|w| endpoint_to_tx.contains_key(*w))
-                .cloned();
-            let Some(endpoint) = picked else {
-                stats.no_worker += 1;
-                if inflight.len() < inflight_cap {
-                    inflight.insert(digest, now);
-                }
+            if let Some(ts) = inflight.get(&digest)
+                && now.duration_since(*ts) < cooldown
+            {
+                stats.throttled += 1;
                 reinsert.entry(store_name.clone()).or_default().push(digest);
                 continue;
-            };
-            per_endpoint
-                .entry(endpoint)
-                .or_default()
-                .push((store_name.clone(), digest));
+            }
+
+            // Route by FSS availability. The FuturesUnordered batch
+            // below drives all queued self-retries in parallel under
+            // the Semaphore; on miss/err we re-route here in Phase C.
+            if let Some(Some(fss)) = fss_for_store.get(store_name.as_str()) {
+                self_retry_queue.push((store_name.clone(), digest, *fss));
+            } else {
+                worker_dispatch_queue.push((store_name.clone(), digest));
+            }
+        }
+    }
+
+    // Phase B (parallel V3 self-retry, dsr MAJOR-1).
+    //
+    // Each digest acquires a permit from a `Semaphore::new(
+    // DEFAULT_SELF_RETRY_CONCURRENCY)` then awaits
+    // `try_self_retry_slow_write` (already bounded by
+    // `DEFAULT_SELF_RETRY_TIMEOUT` per BLOCK-2). The permit is
+    // released on future completion. Worst-case in-flight slow-tier
+    // RPCs is bounded by the semaphore — protects the slow tier from
+    // being saturated by the drainer (which would be strictly worse
+    // than wedging on one digest).
+    //
+    // FSS references are borrowed from `fss_for_store` whose lifetime
+    // is bound by `cas_stores`; the `FuturesUnordered` is awaited
+    // here inline so the borrows stay valid.
+    if !self_retry_queue.is_empty() {
+        let semaphore = Arc::new(Semaphore::new(DEFAULT_SELF_RETRY_CONCURRENCY));
+        let mut futs = FuturesUnordered::new();
+        for (store_name, digest, fss) in self_retry_queue {
+            let sem = Arc::clone(&semaphore);
+            futs.push(async move {
+                // Permit acquisition only fails if the semaphore was
+                // explicitly closed; we never close it. `expect` is
+                // load-bearing — a silent skip would lose the digest.
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .expect("DEFAULT_SELF_RETRY semaphore closed unexpectedly");
+                let outcome = fss
+                    .try_self_retry_slow_write(digest, DEFAULT_SELF_RETRY_TIMEOUT)
+                    .await;
+                (store_name, digest, outcome)
+            });
+        }
+        while let Some((store_name, digest, outcome)) = futs.next().await {
+            match outcome {
+                Ok(SelfRetryOutcome::Succeeded { .. }) => {
+                    stats.self_retried += 1;
+                    if inflight.len() < inflight_cap {
+                        inflight.insert(digest, now);
+                    }
+                    // Bytes already in slow tier; BIS will broadcast.
+                }
+                Ok(SelfRetryOutcome::FastTierMiss) => {
+                    // Fall through to Phase C worker dispatch.
+                    worker_dispatch_queue.push((store_name, digest));
+                }
+                Err(e) => {
+                    warn!(
+                        ?digest,
+                        store_name = %store_name,
+                        err = ?e,
+                        "failed_slow_writes_drain: self-retry slow-tier \
+                         write failed; re-inserting for next tick \
+                         (transient slow-tier outage or BLOCK-2 timeout)"
+                    );
+                    stats.self_retry_failed += 1;
+                    if inflight.len() < inflight_cap {
+                        inflight.insert(digest, now);
+                    }
+                    reinsert.entry(store_name).or_default().push(digest);
+                }
+            }
+        }
+    }
+
+    // Phase C (sequential worker dispatch). Same pre-#335 fall-through
+    // path; entries here are either (a) digests whose chain has no
+    // FSS (no V3 path available) or (b) FastTierMiss results from
+    // Phase B (pin expired or never landed). The worker round-trip
+    // is fast; sequential is fine.
+    for (store_name, digest) in worker_dispatch_queue {
+        // Pick the first worker that's currently connected.
+        let workers = locality_map.read().lookup_workers(&digest);
+        let picked = workers
+            .iter()
+            .find(|w| endpoint_to_tx.contains_key(*w))
+            .cloned();
+        let Some(endpoint) = picked else {
+            stats.no_worker += 1;
             if inflight.len() < inflight_cap {
                 inflight.insert(digest, now);
             }
-            // M1 fix: do NOT increment `dispatched` here. The send
-            // can still fail downstream (race-loser tx-vanished or
-            // `tx.send()` Err). Counter is bumped only after a
-            // successful `tx.send()` Ok arm so the invariant
-            // `drained == dispatched + no_worker + throttled +
-            // send_failed + self_retried + self_retry_failed` holds.
+            reinsert.entry(store_name).or_default().push(digest);
+            continue;
+        };
+        per_endpoint
+            .entry(endpoint)
+            .or_default()
+            .push((store_name, digest));
+        if inflight.len() < inflight_cap {
+            inflight.insert(digest, now);
         }
+        // M1 fix: do NOT increment `dispatched` here. The send
+        // can still fail downstream (race-loser tx-vanished or
+        // `tx.send()` Err). Counter is bumped only after a
+        // successful `tx.send()` Ok arm so the invariant
+        // `drained == dispatched + no_worker + throttled +
+        // send_failed + self_retried + self_retry_failed` holds.
     }
 
     // Re-insert digests we couldn't dispatch (throttled / no-worker).

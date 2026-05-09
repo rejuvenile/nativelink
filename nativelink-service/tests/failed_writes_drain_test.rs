@@ -1586,3 +1586,132 @@ async fn failed_slow_writes_v3_self_retry_bounded_by_timeout() -> Result<(), Err
     )?;
     Ok(())
 }
+
+/// dsr MAJOR-1 regression test: `drain_tick` MUST drive V3 self-
+/// retries in parallel (FuturesUnordered + Semaphore) so a wedged
+/// digest does not serialize against subsequent digests within the
+/// same tick. Pre-fix the loop was sequential per-digest; with N
+/// digests at the BLOCK-2 timeout (2 s) the worst-case per-tick
+/// wall-clock was N × 2 s. With parallelism, only the first
+/// `DEFAULT_SELF_RETRY_CONCURRENCY` (16) overlap inside the same
+/// budget, capping per-tick wall-clock at roughly
+/// `(N / 16) × DEFAULT_SELF_RETRY_TIMEOUT`.
+///
+/// Test shape: enqueue 10 digests with the slow tier wedged. With
+/// sequential execution worst-case is 10 × 2 s = 20 s; with parallel
+/// execution it's max(2 s, ceil(10/16) × 2 s) ≈ 2 s. Assert the
+/// tick completes under a 5 s deadline — this margin separates the
+/// two execution models. Mutation step: revert Phase B to the
+/// inline `await` per-digest; the test red-fails with the bespoke
+/// message below.
+#[nativelink_test]
+async fn failed_slow_writes_v3_self_retry_parallel_within_tick() -> Result<(), Error> {
+    // 5 s budget separates parallel (~2 s) from sequential (~20 s).
+    const PARALLEL_BUDGET: Duration = Duration::from_secs(5);
+    // Whole-test deadlock detector — well above the parallel budget.
+    const OUTER_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(30);
+    const N_DIGESTS: usize = 10;
+
+    tokio::time::timeout(OUTER_DEADLOCK_TIMEOUT, async {
+        let (fss, fast_arc, slow_arc) = make_fss_with_blocking_slow();
+        let cas_store_name = "cas_STORE_TEST";
+        let cas_stores: Vec<(String, Store)> =
+            vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
+
+        let locality_map = new_shared_blob_locality_map();
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+
+        // Pre-stage N unique digests in the fast tier and mark each
+        // as failed. Each digest gets a unique hash so the FSS
+        // self-retry path is exercised separately for each.
+        let mut digests: Vec<DigestInfo> = Vec::with_capacity(N_DIGESTS);
+        for i in 0..N_DIGESTS {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[0] = (i as u8) + 1;
+            let digest = DigestInfo::new(hash_bytes, 4);
+            Pin::new(fast_arc.as_ref())
+                .update_oneshot(StoreKey::Digest(digest), Bytes::from_static(b"data"))
+                .await
+                .expect("seed fast tier");
+            digests.push(digest);
+        }
+        let inserter = fss.failed_writes_inserter();
+        for d in &digests {
+            inserter(*d);
+        }
+
+        // Drive one tick with the slow tier wedged. With parallel
+        // execution all 10 timeouts run inside one
+        // DEFAULT_SELF_RETRY_TIMEOUT window (~2 s); with sequential
+        // execution they stack to ~20 s.
+        let mut inflight: HashMap<DigestInfo, Instant> = HashMap::new();
+        let tick_start = Instant::now();
+        let stats = drain_tick(
+            &cas_stores,
+            &locality_map,
+            &dispatcher,
+            &mut inflight,
+            DEFAULT_DRAIN_COOLDOWN,
+            DEFAULT_DRAIN_BATCH_SIZE,
+            DEFAULT_DRAIN_INFLIGHT_CAP,
+        )
+        .await;
+        let tick_elapsed = tick_start.elapsed();
+
+        assert_eq!(
+            stats.drained,
+            N_DIGESTS,
+            "stats={stats:?}; expected {N_DIGESTS} drained"
+        );
+        assert_eq!(
+            stats.self_retry_failed, N_DIGESTS,
+            "BLOCK-2 + dsr MAJOR-1: every digest's slow-tier write must \
+             time out (slow tier wedged); stats={stats:?}"
+        );
+        assert_eq!(stats.self_retried, 0, "stats={stats:?}");
+
+        // The load-bearing assertion: per-tick wall-clock fits inside
+        // the parallel budget. A sequential drain would take
+        // N × DEFAULT_SELF_RETRY_TIMEOUT (~20 s) and blow this
+        // budget — the assertion fires with the bespoke dsr MAJOR-1
+        // regression message.
+        assert!(
+            tick_elapsed < PARALLEL_BUDGET,
+            "dsr MAJOR-1 regression: drain_tick took {tick_elapsed:?} > \
+             PARALLEL_BUDGET={PARALLEL_BUDGET:?} for {N_DIGESTS} wedged \
+             digests — V3 self-retry serialized rather than running in \
+             parallel via FuturesUnordered + Semaphore (each digest \
+             paid the full DEFAULT_SELF_RETRY_TIMEOUT instead of \
+             overlapping inside one budget)"
+        );
+
+        // BlockingSlowStore::update_oneshot was entered N times in
+        // parallel — every digest got a chance, none was dropped.
+        assert_eq!(
+            slow_arc.update_attempts_count(),
+            N_DIGESTS,
+            "dsr MAJOR-1: every digest's slow-tier write must be \
+             attempted in parallel; got {} attempts for {N_DIGESTS} \
+             digests",
+            slow_arc.update_attempts_count()
+        );
+
+        // All digests re-inserted for the next tick.
+        for d in &digests {
+            assert!(
+                fss.failed_slow_writes_contains(d),
+                "dsr MAJOR-1: digest {d:?} must be re-inserted into \
+                 failed_slow_writes after slow-tier timeout"
+            );
+        }
+
+        Ok::<(), Error>(())
+    })
+    .await
+    .expect(
+        "dsr MAJOR-1 regression: drain_tick must drive V3 self-retries \
+         in parallel via FuturesUnordered + Semaphore — N × \
+         DEFAULT_SELF_RETRY_TIMEOUT is unbounded aggregate per tick",
+    )?;
+    Ok(())
+}
