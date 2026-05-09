@@ -1265,6 +1265,22 @@ impl FastSlowStore {
             return Err(err);
         }
         if let Err(err) = &fast_res {
+            // #320 cascade diagnostic: name the underlying fast-store error
+            // BEFORE the existing chain log demotes it to a single `?err`
+            // debug-format (which is hard to grep in production by `code`).
+            // The 6h grep that found ZERO `MemoryStoreAtCapacity` log lines
+            // could not distinguish "no cap-exhaust ever fired" from "cap-
+            // exhaust fired and was buried in the ?err chain". Emit the
+            // underlying code + messages as STRUCTURED FIELDS so production
+            // grep can answer that question directly. Greppable via
+            // `path = "fast_store_fut_aborted_chunked"`.
+            warn!(
+                path = "fast_store_fut_aborted_chunked",
+                ?key,
+                code = ?err.code,
+                messages = ?err.messages,
+                "FastSlowStore::update (chunked): consumer task (fast_store.update) aborted",
+            );
             error!(
                 ?key,
                 elapsed_ms = data_elapsed.as_millis() as u64,
@@ -4018,6 +4034,23 @@ impl StoreDriver for FastSlowStore {
             }
         };
         if let Err(err) = &fast_res {
+            // #320 cascade diagnostic: name the underlying fast-store error
+            // BEFORE the existing chain log demotes it to a single `?err`
+            // debug-format. Sibling of the chunked-path warn at the
+            // earlier `record_chunked_cascade` site — same pattern, same
+            // contract: emit the underlying `code` + `messages` as
+            // STRUCTURED FIELDS so production grep can attribute a
+            // bytestream cascade to a specific MemoryStore failure mode
+            // (cap-exhaust, recv failure, ExactSize mismatch, etc.) rather
+            // than the buf_channel "Sender dropped" symptom that masks it.
+            // Greppable via `path = "fast_store_fut_aborted_stream"`.
+            warn!(
+                path = "fast_store_fut_aborted_stream",
+                ?key,
+                code = ?err.code,
+                messages = ?err.messages,
+                "FastSlowStore::update: consumer task (fast_store.update) aborted",
+            );
             error!(
                 ?key,
                 elapsed_ms = update_start.elapsed().as_millis() as u64,
