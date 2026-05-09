@@ -5246,3 +5246,169 @@ async fn ac_failure_prune_is_scoped_to_store_id_and_digest() -> Result<(), Error
     );
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Path C (cascade-bundle, 2026-05-09): startup-time check that disk-backed
+// slow tiers carry an explicit `slow_writes_in_flight_max_bytes > 0`.
+//
+// Production composition seam:
+//   default_store_factory → FastSlowStore::new_validated(spec, fast, slow)?
+//
+// Disk-backed slow tiers (FilesystemStore) MUST opt in to a non-zero cap.
+// In-memory and network-backed slow tiers (Memory, Grpc, Redis, S3, etc.)
+// are exempt because the failure mode (sustained slow-tier latency pinning
+// chunks in the in-flight buffer until OOM) does not apply.
+//
+// Mutation step (mandatory per CLAUDE.md "Tests" section):
+//   Comment out the `if spec.slow_writes_in_flight_max_bytes == 0 && ...`
+//   guard in `FastSlowStore::new_validated`. The path_c_disk_backed_slow_
+//   tier_with_zero_cap_rejected test MUST red-fail with a panic message
+//   containing "disk-backed slow tier" — the bespoke discriminator.
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod path_c_startup_validation {
+    use nativelink_config::stores::{
+        EvictionPolicy, FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
+    };
+    use nativelink_macro::nativelink_test;
+    use nativelink_store::fast_slow_store::FastSlowStore;
+    use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
+    use nativelink_store::memory_store::MemoryStore;
+    use nativelink_store::noop_store::NoopStore;
+    use nativelink_util::store_trait::Store;
+    use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
+
+    use super::Error;
+
+    /// Build a FastSlowSpec where everything but the cap is constant.
+    /// The slow-tier `StoreSpec` field on the spec is a placeholder
+    /// (the real backing store comes from the `slow` argument to
+    /// `FastSlowStore::new_validated`); only `slow_writes_in_flight_max_bytes`
+    /// is varied across the test cases.
+    fn spec_with_cap(cap: u64) -> FastSlowSpec {
+        FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: cap,
+        }
+    }
+
+    async fn make_filesystem_slow() -> Result<(Store, TempDir), Error> {
+        let root = tempfile::Builder::new()
+            .prefix("path_c_filesystem_slow_")
+            .tempdir()
+            .expect("tempdir");
+        let content_path = root.path().join("content");
+        let temp_path = root.path().join("temp");
+        tokio::fs::create_dir_all(&content_path).await.unwrap();
+        tokio::fs::create_dir_all(&temp_path).await.unwrap();
+        let arc = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.to_string_lossy().into_owned(),
+            temp_path: temp_path.to_string_lossy().into_owned(),
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes: 16 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await?;
+        Ok((Store::new(arc), root))
+    }
+
+    fn make_memory() -> Store {
+        Store::new(MemoryStore::new(&MemorySpec::default()))
+    }
+
+    fn make_noop() -> Store {
+        Store::new(NoopStore::new())
+    }
+
+    /// Disk-backed slow tier (FilesystemStore) WITH explicit cap > 0 must
+    /// construct successfully. This is the production server's
+    /// `cas_FAST_SLOW_STORE` shape.
+    #[nativelink_test]
+    async fn path_c_disk_backed_slow_tier_with_explicit_cap_constructs_ok() -> Result<(), Error> {
+        let fast = make_memory();
+        let (slow, _temp) = make_filesystem_slow().await?;
+        // 8 GiB — matches prod-server.json5 production cap.
+        let result =
+            FastSlowStore::new_validated(&spec_with_cap(8 * 1024 * 1024 * 1024), fast, slow);
+        assert!(
+            result.is_ok(),
+            "FastSlowStore over a FilesystemStore slow tier with explicit cap=8 GiB MUST \
+             construct successfully — production composition seam (cas_FAST_SLOW_STORE). \
+             err={:?}",
+            result.err()
+        );
+        Ok(())
+    }
+
+    /// Disk-backed slow tier (FilesystemStore) with cap == 0 must fail at
+    /// startup with a bespoke message naming "disk-backed slow tier".
+    /// This is the regression that Path C closes: an unbounded in-flight
+    /// buffer on a slow medium cascades to OOM under sustained latency.
+    #[nativelink_test]
+    async fn path_c_disk_backed_slow_tier_with_zero_cap_rejected() -> Result<(), Error> {
+        let fast = make_memory();
+        let (slow, _temp) = make_filesystem_slow().await?;
+        let result = FastSlowStore::new_validated(&spec_with_cap(0), fast, slow);
+        let err = result
+            .err()
+            .expect("must reject disk-backed slow tier with cap=0 — Path C invariant violated");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("disk-backed slow tier"),
+            "error message MUST contain the bespoke discriminator \"disk-backed slow tier\" so \
+             operators can grep production logs for this exact failure mode. actual: {msg}"
+        );
+        assert!(
+            msg.contains("slow_writes_in_flight_max_bytes"),
+            "error message MUST name the config field operators set to fix it. actual: {msg}"
+        );
+        assert_eq!(
+            err.code,
+            nativelink_error::Code::InvalidArgument,
+            "Path C startup rejection is operator-visible config error → InvalidArgument"
+        );
+        Ok(())
+    }
+
+    /// In-memory slow tier with cap == 0 must construct successfully.
+    /// MemoryStore's eviction is bounded by its own `EvictionPolicy.max_bytes`
+    /// (and by the moka admission gate), so the FastSlowStore in-flight
+    /// cap is optional in this composition.
+    #[nativelink_test]
+    async fn path_c_memory_slow_tier_with_zero_cap_constructs_ok() -> Result<(), Error> {
+        let fast = make_memory();
+        let slow = make_memory();
+        let result = FastSlowStore::new_validated(&spec_with_cap(0), fast, slow);
+        assert!(
+            result.is_ok(),
+            "FastSlowStore over a MemoryStore slow tier with cap=0 MUST construct (in-memory \
+             tiers are not vulnerable to the disk-backed sustained-latency failure mode). \
+             err={:?}",
+            result.err()
+        );
+        Ok(())
+    }
+
+    /// NoopStore slow tier with cap == 0 must construct (it discards
+    /// writes — no buffering pressure).
+    #[nativelink_test]
+    async fn path_c_noop_slow_tier_with_zero_cap_constructs_ok() -> Result<(), Error> {
+        let fast = make_memory();
+        let slow = make_noop();
+        let result = FastSlowStore::new_validated(&spec_with_cap(0), fast, slow);
+        assert!(
+            result.is_ok(),
+            "FastSlowStore over a NoopStore slow tier with cap=0 MUST construct (no buffer \
+             pressure). err={:?}",
+            result.err()
+        );
+        Ok(())
+    }
+}

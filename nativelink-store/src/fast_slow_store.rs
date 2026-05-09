@@ -30,7 +30,7 @@ use bytes::Bytes;
 use futures::join;
 use futures::stream::{FuturesUnordered, StreamExt};
 use nativelink_config::stores::{FastSlowSpec, StoreDirection};
-use nativelink_error::{Code, Error, ResultExt, make_err};
+use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
 use nativelink_util::buf_channel::{
@@ -895,6 +895,51 @@ impl FastSlowStore {
             store.enable_chunked_reads();
         }
         store
+    }
+
+    /// Path C (cascade-bundle, 2026-05-09) startup-time check: validates
+    /// that any disk-backed slow tier has an explicit non-zero
+    /// `slow_writes_in_flight_max_bytes`. The serde default for that
+    /// field is `0` (uncapped) — historic behavior — but a disk-backed
+    /// slow tier under sustained latency will let the in-flight buffer
+    /// climb until OOM (debacle 2026-05-08, see
+    /// `.claude/audits/debacle-2026-05-08-rca/`). M2 attempted to
+    /// paper over this by changing the default to 8 GiB; that violated
+    /// the principle that defaults should preserve existing behavior
+    /// bit-identically. Path C instead requires operators to opt in to
+    /// a disk-backed slow tier WITH an explicit cap, and refuses to
+    /// start otherwise.
+    ///
+    /// Returns `Ok(arc)` for:
+    /// - in-memory slow tiers (Memory, Noop) — cap optional
+    /// - network-backed slow tiers (Grpc, Redis, S3, Mongo) — cap optional
+    /// - disk-backed slow tiers WITH cap > 0
+    ///
+    /// Returns `Err(InvalidArgument)` for:
+    /// - disk-backed slow tier (FilesystemStore) WITH cap == 0
+    ///
+    /// Production composition is the seam this guards: server's
+    /// `cas_FAST_SLOW_STORE` (cap=8 GiB explicit) passes; workers'
+    /// `WORKER_FAST_SLOW_STORE` (cap=0 inherited, slow=Grpc) passes;
+    /// any future disk-backed slow tier wired up without an explicit
+    /// cap fails at startup instead of in production at the OOM cliff.
+    pub fn new_validated(
+        spec: &FastSlowSpec,
+        fast_store: Store,
+        slow_store: Store,
+    ) -> Result<Arc<Self>, Error> {
+        if spec.slow_writes_in_flight_max_bytes == 0
+            && slow_store.inner_store(None::<StoreKey<'_>>).requires_in_flight_buffer_cap()
+        {
+            return Err(make_input_err!(
+                "FastSlowStore wraps a disk-backed slow tier (e.g. FilesystemStore) but \
+                 `slow_writes_in_flight_max_bytes` is 0 (uncapped). Set an explicit cap \
+                 (e.g. 8 GiB = 8589934592) in the FastSlowSpec config — uncapped buffering \
+                 can cascade to OOM under sustained slow-tier latency. See cascade-bundle \
+                 Path C (2026-05-09) for context."
+            ));
+        }
+        Ok(Self::new(spec, fast_store, slow_store))
     }
 
     pub fn in_flight_slow_write_count(&self) -> usize {

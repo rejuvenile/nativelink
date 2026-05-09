@@ -1186,6 +1186,23 @@ pub trait StoreDriver:
     /// See: [`Store::inner_store`] for details.
     fn inner_store(&self, _digest: Option<StoreKey<'_>>) -> &dyn StoreDriver;
 
+    /// Returns `true` for stores whose write path is disk-backed (or any
+    /// other slow medium where a sustained latency hiccup can let an
+    /// unbounded in-flight buffer cascade to OOM). Wrapper compositions
+    /// like `FastSlowStore` that maintain an in-flight buffer for the
+    /// slow tier MUST require an explicit non-zero capacity cap whenever
+    /// this returns `true`. Default is `false` for in-memory and
+    /// network-backed stores (Memory, Grpc, Redis, S3, etc.) where the
+    /// buffer cap is optional.
+    ///
+    /// Path C (cascade-bundle, 2026-05-09): the M2 fixup that defaulted
+    /// the cap to 8 GiB was reverted; instead, disk-backed slow tiers
+    /// must carry an explicit cap or fail at startup. See
+    /// `FastSlowStore::new_validated`.
+    fn requires_in_flight_buffer_cap(&self) -> bool {
+        false
+    }
+
     /// Returns an Any variation of whatever Self is.
     fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static);
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static>;

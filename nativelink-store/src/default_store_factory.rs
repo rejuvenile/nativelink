@@ -100,11 +100,11 @@ pub fn store_factory<'a>(
                 store_factory(&spec.backend, store_manager, None).await?,
                 store_factory(&spec.cas_store, store_manager, None).await?,
             ),
-            StoreSpec::FastSlow(spec) => FastSlowStore::new(
+            StoreSpec::FastSlow(spec) => FastSlowStore::new_validated(
                 spec,
                 store_factory(&spec.fast, store_manager, None).await?,
                 store_factory(&spec.slow, store_manager, None).await?,
-            ),
+            )?,
             StoreSpec::Filesystem(spec) => <FilesystemStore>::new(spec).await?,
             StoreSpec::RefStore(spec) => RefStore::new(spec, Arc::downgrade(store_manager)),
             StoreSpec::SizePartitioning(spec) => SizePartitioningStore::new(

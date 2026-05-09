@@ -2377,6 +2377,17 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
     fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
         MarkStableDelegation::Leaf
     }
+
+    /// FilesystemStore is disk-backed: a sustained latency hiccup on the
+    /// underlying filesystem (ZFS txg sync, slow-tier saturation, page
+    /// cache eviction storm) lets an unbounded in-flight write buffer
+    /// pin one chunk per concurrent stream until OOM. Compositions like
+    /// `FastSlowStore` that buffer slow-tier writes MUST carry an
+    /// explicit non-zero cap when wrapping a FilesystemStore.
+    /// (Path C, cascade-bundle, 2026-05-09.)
+    fn requires_in_flight_buffer_cap(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
