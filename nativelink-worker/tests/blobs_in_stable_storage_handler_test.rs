@@ -90,7 +90,10 @@ async fn write_mirror(fss: &Arc<FastSlowStore>, digest: DigestInfo, data: Bytes)
     let store = Store::new(fss.clone());
     IS_MIRROR_REQUEST
         .scope(true, async move {
-            store.update_oneshot(digest, data).await.expect("mirror write");
+            store
+                .update_oneshot(digest, data)
+                .await
+                .expect("mirror write");
         })
         .await;
 }

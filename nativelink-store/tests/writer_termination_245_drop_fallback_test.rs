@@ -52,11 +52,15 @@
 //! Verified manually 2026-05-04 during the testing-czar follow-up.
 
 use core::pin::Pin;
+#[cfg(feature = "chunked_fast_slow")]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(feature = "chunked_fast_slow")]
+use nativelink_config::stores::FastSlowSpec;
 use nativelink_config::stores::{
     CompressionAlgorithm, CompressionSpec, Lz4Config, MemorySpec, StoreSpec,
 };
@@ -64,27 +68,22 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_store::compression_store::CompressionStore;
+#[cfg(feature = "chunked_fast_slow")]
+use nativelink_store::fast_slow_store::FastSlowStore;
+#[cfg(feature = "chunked_fast_slow")]
+use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::buf_channel::{
     DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
 };
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+#[cfg(feature = "chunked_fast_slow")]
+use nativelink_util::store_trait::StoreLike;
 use nativelink_util::store_trait::{
     ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
     StoreKey, UploadSizeInfo,
 };
 use parking_lot::Mutex;
-
-#[cfg(feature = "chunked_fast_slow")]
-use core::sync::atomic::AtomicUsize;
-#[cfg(feature = "chunked_fast_slow")]
-use nativelink_config::stores::FastSlowSpec;
-#[cfg(feature = "chunked_fast_slow")]
-use nativelink_store::fast_slow_store::FastSlowStore;
-#[cfg(feature = "chunked_fast_slow")]
-use nativelink_store::memory_store::MemoryStore;
-#[cfg(feature = "chunked_fast_slow")]
-use nativelink_util::store_trait::StoreLike;
 
 /// Tight upper bound. A non-deadlocked Err round-trip is sub-millisecond;
 /// 5s leaves headroom for a slow CI runner without masking a real
@@ -470,15 +469,15 @@ impl StoreDriver for RecordingFastStore {
 #[cfg(feature = "chunked_fast_slow")]
 #[nativelink_test]
 async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Result<(), Error> {
-    use nativelink_store::chunked::{
-        BazelChunkedDispatcherArc, disable_bazel_facing_internal_chunking,
-        enable_bazel_facing_internal_chunking,
-    };
-
     // Process-wide kill-switch is global state; serialize with a
     // process-local mutex (mirrors the pattern in
     // `fast_slow_str_key_skips_chunked_dispatch_test.rs`).
     use std::sync::OnceLock;
+
+    use nativelink_store::chunked::{
+        BazelChunkedDispatcherArc, disable_bazel_facing_internal_chunking,
+        enable_bazel_facing_internal_chunking,
+    };
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     let _guard = LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -506,8 +505,7 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
         slow,
     );
 
-    let dispatcher_observed: Arc<Mutex<Option<Result<(), Error>>>> =
-        Arc::new(Mutex::new(None));
+    let dispatcher_observed: Arc<Mutex<Option<Result<(), Error>>>> = Arc::new(Mutex::new(None));
     let invocations = Arc::new(AtomicUsize::new(0));
     let dispatcher: BazelChunkedDispatcherArc = Arc::new(RecordingDispatcher {
         last_observed: dispatcher_observed.clone(),
@@ -575,9 +573,8 @@ async fn fast_slow_store_chunked_data_stream_failure_drops_both_guards() -> Resu
         .as_ref()
         .expect("recording fast store must have observed the rx termination")
         .clone();
-    let fast_err = fast_observed.expect_err(
-        "fast tier must observe Err on rx when chunked data_stream_fut bails via `?`",
-    );
+    let fast_err = fast_observed
+        .expect_err("fast tier must observe Err on rx when chunked data_stream_fut bails via `?`");
 
     assert!(
         fast_err

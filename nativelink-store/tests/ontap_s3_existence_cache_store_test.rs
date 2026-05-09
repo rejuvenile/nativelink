@@ -21,8 +21,8 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use http::status::StatusCode;
 use nativelink_config::stores::{
-    CommonObjectSpec, ExperimentalOntapS3Spec, FastSlowSpec, MemorySpec,
-    OntapS3ExistenceCacheSpec, Retry, StoreDirection, StoreSpec,
+    CommonObjectSpec, ExperimentalOntapS3Spec, FastSlowSpec, MemorySpec, OntapS3ExistenceCacheSpec,
+    Retry, StoreDirection, StoreSpec,
 };
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;

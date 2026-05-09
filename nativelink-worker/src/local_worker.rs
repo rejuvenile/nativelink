@@ -40,12 +40,14 @@ use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::FilesystemStore;
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
+use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::shutdown_guard::ShutdownGuard;
-use nativelink_util::buf_channel::make_buf_channel_pair;
-use nativelink_util::store_trait::{ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo};
+use nativelink_util::store_trait::{
+    ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
+};
 use nativelink_util::task::JoinHandleDropGuard;
 use nativelink_util::{spawn, tls_utils};
 use opentelemetry::context::Context;
@@ -241,9 +243,18 @@ mod cpu_impl {
             debug_assert_eq!(kr, 0, "vm_deallocate failed: {kr}");
 
             Some(PerTypeCpuTimes {
-                aggregate: CpuTimes { busy: agg_busy, total: agg_total },
-                p_core: CpuTimes { busy: p_busy, total: p_total },
-                e_core: CpuTimes { busy: e_busy, total: e_total },
+                aggregate: CpuTimes {
+                    busy: agg_busy,
+                    total: agg_total,
+                },
+                p_core: CpuTimes {
+                    busy: p_busy,
+                    total: p_total,
+                },
+                e_core: CpuTimes {
+                    busy: e_busy,
+                    total: e_total,
+                },
                 has_e_cores: e_count > 0,
             })
         }
@@ -283,7 +294,13 @@ fn start_cpu_sampler() -> Result<(), Error> {
     std::thread::Builder::new()
         .name("cpu-sampler".into())
         .spawn(cpu_sample_loop)
-        .map_err(|e| make_err!(Code::Internal, "failed to spawn cpu-sampler thread: {:?}", e))?;
+        .map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "failed to spawn cpu-sampler thread: {:?}",
+                e
+            )
+        })?;
     Ok(())
 }
 
@@ -345,10 +362,19 @@ fn per_type_sample_loop(initial: cpu_impl::PerTypeCpuTimes) {
             E_CORE_PCT.store(0, Ordering::Relaxed);
             continue;
         };
-        CPU_PCT.store(compute_pct(&prev.aggregate, &curr.aggregate).min(100), Ordering::Relaxed);
-        P_CORE_PCT.store(compute_pct(&prev.p_core, &curr.p_core).min(100), Ordering::Relaxed);
+        CPU_PCT.store(
+            compute_pct(&prev.aggregate, &curr.aggregate).min(100),
+            Ordering::Relaxed,
+        );
+        P_CORE_PCT.store(
+            compute_pct(&prev.p_core, &curr.p_core).min(100),
+            Ordering::Relaxed,
+        );
         if curr.has_e_cores {
-            E_CORE_PCT.store(compute_pct(&prev.e_core, &curr.e_core).min(100), Ordering::Relaxed);
+            E_CORE_PCT.store(
+                compute_pct(&prev.e_core, &curr.e_core).min(100),
+                Ordering::Relaxed,
+            );
         } else {
             // No E-cores → report as fully saturated so scheduler
             // doesn't think idle E-cores are available.
@@ -375,7 +401,6 @@ fn get_p_core_load_pct() -> u32 {
 fn get_e_core_load_pct() -> u32 {
     E_CORE_PCT.load(Ordering::Relaxed)
 }
-
 
 /// Build the advertised gRPC endpoint for peer blob sharing.
 /// Uses the machine's hostname so a single config works across all workers.
@@ -422,20 +447,17 @@ fn start_worker_quic_server(
     routes: tonic::service::Routes,
 ) -> Result<JoinHandleDropGuard<Result<(), Error>>, Error> {
     use std::sync::Arc;
+
     use h3_quinn as _;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     // Generate self-signed certificate for this worker.
-    let cert = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        worker_name.to_string(),
-    ])
-    .map_err(|e| make_err!(Code::Internal, "Failed to generate self-signed cert: {e:?}"))?;
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), worker_name.to_string()])
+            .map_err(|e| make_err!(Code::Internal, "Failed to generate self-signed cert: {e:?}"))?;
 
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        cert.signing_key.serialize_der(),
-    ));
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
     let mut tls_config = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::aws_lc_rs::default_provider().into(),
@@ -475,8 +497,12 @@ fn start_worker_quic_server(
 
     // Bind UDP socket with large buffers.
     let socket_addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
-    let udp_socket = std::net::UdpSocket::bind(socket_addr)
-        .map_err(|e| make_err!(Code::Internal, "Worker QUIC UDP bind on {socket_addr}: {e:?}"))?;
+    let udp_socket = std::net::UdpSocket::bind(socket_addr).map_err(|e| {
+        make_err!(
+            Code::Internal,
+            "Worker QUIC UDP bind on {socket_addr}: {e:?}"
+        )
+    })?;
     let bufs = nativelink_util::tls_utils::tune_quic_udp_buffers(
         socket2::SockRef::from(&udp_socket),
         "worker_peer",
@@ -490,7 +516,12 @@ fn start_worker_quic_server(
         quinn::default_runtime()
             .ok_or_else(|| make_err!(Code::Internal, "No async runtime for worker QUIC"))?,
     )
-    .map_err(|e| make_err!(Code::Internal, "Failed to create worker QUIC endpoint: {e:?}"))?;
+    .map_err(|e| {
+        make_err!(
+            Code::Internal,
+            "Failed to create worker QUIC endpoint: {e:?}"
+        )
+    })?;
 
     let acceptor = tonic_h3::quinn::H3QuinnAcceptor::new(quinn_endpoint);
     let h3_router = tonic_h3::server::H3Router::new(routes);
@@ -742,10 +773,7 @@ impl BlobsAvailableState {
     /// ```
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
-    pub fn from_test_args(
-        fs_store: Arc<FilesystemStore>,
-        args: BlobsAvailableTestArgs,
-    ) -> Self {
+    pub fn from_test_args(fs_store: Arc<FilesystemStore>, args: BlobsAvailableTestArgs) -> Self {
         let BlobsAvailableTestArgs {
             cas_server_fss,
             ac_mirror_target,
@@ -839,11 +867,9 @@ pub fn handle_batch_write_small_blobs(
                 continue;
             }
         };
-        if let Err(err) = fss.insert_dispatched_mirror_blob(
-            &entry.store_id,
-            digest,
-            entry.data.clone(),
-        ) {
+        if let Err(err) =
+            fss.insert_dispatched_mirror_blob(&entry.store_id, digest, entry.data.clone())
+        {
             // insert_dispatched_mirror_blob already warns; bump the
             // skip counter and move on. Partial batches are fine
             // because the server's pin TTL recovers.
@@ -860,10 +886,7 @@ pub fn handle_batch_write_small_blobs(
     }
     info!(
         blob_count,
-        inserted,
-        skipped,
-        total_bytes,
-        "BatchWriteSmallBlobs: batch processed"
+        inserted, skipped, total_bytes, "BatchWriteSmallBlobs: batch processed"
     );
 }
 
@@ -1013,10 +1036,7 @@ pub fn handle_blobs_in_stable_storage_for_store(
             target.fss.remove_local_ac_pins(&acked_digests);
             info!(
                 unpinned = decoded,
-                failed,
-                digest_count,
-                store_id,
-                "BlobsInStableStorage AC: dropped local AC pins"
+                failed, digest_count, store_id, "BlobsInStableStorage AC: dropped local AC pins"
             );
             decoded
         } else {
@@ -1083,12 +1103,8 @@ pub fn handle_bis_chunk(
     chunk: &BlobsInStableStorageChunk,
     ack_sink: impl FnOnce(BisAck),
 ) -> BisUnpinOutcome {
-    let outcome = handle_blobs_in_stable_storage_for_store(
-        state,
-        cas_store,
-        &chunk.store_id,
-        &chunk.digests,
-    );
+    let outcome =
+        handle_blobs_in_stable_storage_for_store(state, cas_store, &chunk.store_id, &chunk.digests);
     if outcome.all_succeeded() {
         // Echo the server_instance_token from the chunk into the ack
         // (red-team #5: scheduler validates the token to drop acks
@@ -1322,12 +1338,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // Check which blobs we actually have locally (disk OR mirror) before
         // uploading. FastSlowStore::has_with_results checks fast_store, the
         // in_flight_slow_writes map, and mirror_blobs.
-        let keys: Vec<StoreKey<'_>> = digests
-            .iter()
-            .map(|d| StoreKey::from(*d))
-            .collect();
+        let keys: Vec<StoreKey<'_>> = digests.iter().map(|d| StoreKey::from(*d)).collect();
         let mut results = vec![None; keys.len()];
-        if let Err(err) = cas_store_wrapped.has_with_results(&keys, &mut results).await {
+        if let Err(err) = cas_store_wrapped
+            .has_with_results(&keys, &mut results)
+            .await
+        {
             warn!(?err, "UploadMissingBlobs: failed to check local store");
             return;
         }
@@ -1402,11 +1418,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         let write_fut = async {
                             let phase_start = std::time::Instant::now();
                             let res = slow_store
-                                .update(
-                                    digest,
-                                    rx,
-                                    UploadSizeInfo::ExactSize(digest.size_bytes()),
-                                )
+                                .update(digest, rx, UploadSizeInfo::ExactSize(digest.size_bytes()))
                                 .await;
                             let elapsed = phase_start.elapsed();
                             if elapsed >= SLOW_PHASE_WARN {
@@ -1440,11 +1452,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     match result {
                         Ok(()) => true,
                         Err(err) => {
-                            warn!(
-                                ?digest,
-                                ?err,
-                                "UploadMissingBlobs: failed to transfer blob"
-                            );
+                            warn!(?digest, ?err, "UploadMissingBlobs: failed to transfer blob");
                             false
                         }
                     }
@@ -1488,11 +1496,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             let p_load = get_p_core_load_pct();
             let e_load = get_e_core_load_pct();
             debug!("KeepAlive cpu_load_pct={load} p_core={p_load} e_core={e_load}");
-            if let Err(e) = grpc_client.keep_alive(KeepAliveRequest {
-                cpu_load_pct: load,
-                p_core_load_pct: p_load,
-                e_core_load_pct: e_load,
-            }).await {
+            if let Err(e) = grpc_client
+                .keep_alive(KeepAliveRequest {
+                    cpu_load_pct: load,
+                    p_core_load_pct: p_load,
+                    e_core_load_pct: e_load,
+                })
+                .await
+            {
                 return Err(make_err!(
                     Code::Internal,
                     "Failed to send KeepAlive in LocalWorker : {:?}",
@@ -1551,8 +1562,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             // backfill check sees them; the proto carries no timestamps,
             // entries persist in the locality map until explicit eviction.
             let changes = state.tracker.swap();
-            let mut all_present: HashSet<DigestInfo> =
-                changes.added.into_iter().collect();
+            let mut all_present: HashSet<DigestInfo> = changes.added.into_iter().collect();
             all_present.extend(changes.touched.into_iter());
 
             let infos: Vec<BlobDigestInfo> = all_present
@@ -1561,28 +1571,31 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     digest: Some((*digest).into()),
                 })
                 .collect();
-            let mut evicted_protos: Vec<_> =
-                changes.evicted.iter().map(|d| (*d).into()).collect();
+            let mut evicted_protos: Vec<_> = changes.evicted.iter().map(|d| (*d).into()).collect();
 
             // Mirror delta: drain → send `added` as `pinned_mirror_digests`
             // and merge `removed` into `evicted_digests` so the server cleans
             // up locality entries for blobs we no longer hold.
-            let mirror_added_protos: Vec<_> =
-                if let Some(ref fss) = state.cas_server_fss {
-                    let mc = fss.drain_mirror_changes();
-                    for d in mc.removed {
-                        evicted_protos.push(d.into());
-                    }
-                    mc.added.into_iter().map(|d| d.into()).collect()
-                } else {
-                    Vec::new()
-                };
+            let mirror_added_protos: Vec<_> = if let Some(ref fss) = state.cas_server_fss {
+                let mc = fss.drain_mirror_changes();
+                for d in mc.removed {
+                    evicted_protos.push(d.into());
+                }
+                mc.added.into_iter().map(|d| d.into()).collect()
+            } else {
+                Vec::new()
+            };
 
             (infos, evicted_protos, mirror_added_protos)
         };
 
         // Collect subtree delta or full snapshot.
-        let (cached_directory_digests, added_subtree_digests, removed_subtree_digests, is_full_subtree_snapshot) = if is_first {
+        let (
+            cached_directory_digests,
+            added_subtree_digests,
+            removed_subtree_digests,
+            is_full_subtree_snapshot,
+        ) = if is_first {
             // Full subtree snapshot: send ALL subtree digests in cached_directory_digests.
             // Also drain any pending changes accumulated during startup.
             drop(running_actions_manager.take_pending_subtree_changes().await);
@@ -1778,8 +1791,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             // changes — mirror writes were invisible until the next backstop
             // tick, and the mirror-TTL sweeper would sometimes drop the only
             // copy of a blob if the server was slow to ack stable storage.
-            let mirror_notify =
-                state.cas_server_fss.as_ref().map(|f| f.mirror_changes_notify());
+            let mirror_notify = state
+                .cas_server_fss
+                .as_ref()
+                .map(|f| f.mirror_changes_notify());
             // Sibling notify on the AC FSS: wake when an AC entry is
             // newly written (insert_local_ac_pin) or BIS-acked
             // (remove_local_ac_pins). The AC FSS is a DIFFERENT
@@ -1794,13 +1809,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 async move {
                     // Send full snapshot immediately on connect so the
                     // server has an accurate locality map right away.
-                    Self::send_periodic_blobs_available(
-                        &mut grpc_client,
-                        &state,
-                        &ram,
-                        true,
-                    )
-                    .await?;
+                    Self::send_periodic_blobs_available(&mut grpc_client, &state, &ram, true)
+                        .await?;
                     loop {
                         // Wait for any of:
                         // 1. A FilesystemStore blob insert/eviction (immediate wake)
@@ -1817,13 +1827,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                         // exactly one notification permit), so the future
                         // itself must be re-created; `tokio::pin!` keeps it
                         // on the stack.
-                        let mirror_wait = OptionFuture::from(
-                            mirror_notify.as_deref().map(Notify::notified),
-                        );
+                        let mirror_wait =
+                            OptionFuture::from(mirror_notify.as_deref().map(Notify::notified));
                         tokio::pin!(mirror_wait);
-                        let ac_wait = OptionFuture::from(
-                            ac_notify.as_deref().map(Notify::notified),
-                        );
+                        let ac_wait =
+                            OptionFuture::from(ac_notify.as_deref().map(Notify::notified));
                         tokio::pin!(ac_wait);
                         tokio::select! {
                             () = state.notify.notified() => {}
@@ -1831,13 +1839,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                             Some(()) = &mut ac_wait => {}
                             () = sleep(state.max_interval) => {}
                         }
-                        Self::send_periodic_blobs_available(
-                            &mut grpc_client,
-                            &state,
-                            &ram,
-                            false,
-                        )
-                        .await?;
+                        Self::send_periodic_blobs_available(&mut grpc_client, &state, &ram, false)
+                            .await?;
                     }
                 }
                 .boxed(),
@@ -1861,10 +1864,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 let failed = cas_store.drain_failed_digests();
                 if !failed.is_empty() {
                     let count = failed.len();
-                    info!(
-                        count,
-                        "retrying failed slow-store uploads on reconnect"
-                    );
+                    info!(count, "retrying failed slow-store uploads on reconnect");
                     // Re-pin to refresh the pin timeout before uploading. We
                     // pin on the inner fast (FilesystemStore) directly because
                     // that is the store whose eviction we are guarding against;
@@ -1874,10 +1874,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                     cas_store.fast_store().pin_digests(&failed);
                     tokio::spawn(async move {
                         Self::handle_upload_missing_blobs(&ram, failed).await;
-                        info!(
-                            count,
-                            "reconnect: failed upload retry complete"
-                        );
+                        info!(count, "reconnect: failed upload retry complete");
                     });
                 }
             }
@@ -2639,11 +2636,10 @@ pub async fn new_local_worker(
         // Wrap the slow store (central CAS) with WorkerProxyStore.
         // Enable racing so the worker races peer fetches against server fetches.
         let slow_store = fast_slow_store.slow_store().clone();
-        let mut proxy_arc =
-            nativelink_store::worker_proxy_store::WorkerProxyStore::new(
-                slow_store,
-                locality_map.clone(),
-            );
+        let mut proxy_arc = nativelink_store::worker_proxy_store::WorkerProxyStore::new(
+            slow_store,
+            locality_map.clone(),
+        );
         Arc::get_mut(&mut proxy_arc)
             .expect("WorkerProxyStore just created, no other refs")
             .enable_race_peers();
@@ -2684,9 +2680,7 @@ pub async fn new_local_worker(
             slow_writes_in_flight_max_bytes: 0,
         };
         let new_fss = FastSlowStore::new(&fss_spec, fast_store, proxy_store);
-        info!(
-            "Peer blob sharing enabled: wrapping slow store with WorkerProxyStore"
-        );
+        info!("Peer blob sharing enabled: wrapping slow store with WorkerProxyStore");
 
         (new_fss, Some(locality_map))
     } else {
@@ -2723,7 +2717,9 @@ pub async fn new_local_worker(
             worker_cache_config,
             Store::new(effective_cas_store.clone()),
             Some(effective_cas_store.clone()),
-        ).await {
+        )
+        .await
+        {
             Ok(cache) => {
                 tracing::info!("Directory cache initialized successfully");
                 Some(Arc::new(cache))
@@ -2813,43 +2809,41 @@ pub async fn new_local_worker(
     // Per the type-system invariant on `AcMirrorTarget`, both `fss`
     // and `store_id` are produced together — there is no "have one,
     // missing the other" half-Some shape.
-    let ac_mirror_target: Option<AcMirrorTarget> = match (
-        ac_store.as_ref(),
-        ac_store_name.as_deref(),
-    ) {
-        (Some(store), Some(name)) => {
-            // The walker borrows `&dyn StoreDriver` from the store
-            // it's given; call `.inner_store(None)` to obtain a
-            // borrow without requiring the store to clone its inner.
-            let driver = store.inner_store(None::<StoreKey<'_>>);
-            let fss_borrow =
-                nativelink_store::small_blob_dispatcher::find_fast_slow_for_pin(driver);
-            match fss_borrow.and_then(|fss| fss.get_arc()) {
-                Some(fss) => {
-                    info!(
-                        ac_store_name = name,
-                        "AC pin advertisement enabled — found FastSlowStore in AC chain"
-                    );
-                    Some(AcMirrorTarget {
-                        fss,
-                        store_id: Arc::from(name),
-                    })
-                }
-                None => {
-                    warn!(
-                        ac_store_name = name,
-                        "AC pin advertisement DISABLED — no FastSlowStore found in AC chain. \
+    let ac_mirror_target: Option<AcMirrorTarget> =
+        match (ac_store.as_ref(), ac_store_name.as_deref()) {
+            (Some(store), Some(name)) => {
+                // The walker borrows `&dyn StoreDriver` from the store
+                // it's given; call `.inner_store(None)` to obtain a
+                // borrow without requiring the store to clone its inner.
+                let driver = store.inner_store(None::<StoreKey<'_>>);
+                let fss_borrow =
+                    nativelink_store::small_blob_dispatcher::find_fast_slow_for_pin(driver);
+                match fss_borrow.and_then(|fss| fss.get_arc()) {
+                    Some(fss) => {
+                        info!(
+                            ac_store_name = name,
+                            "AC pin advertisement enabled — found FastSlowStore in AC chain"
+                        );
+                        Some(AcMirrorTarget {
+                            fss,
+                            store_id: Arc::from(name),
+                        })
+                    }
+                    None => {
+                        warn!(
+                            ac_store_name = name,
+                            "AC pin advertisement DISABLED — no FastSlowStore found in AC chain. \
                          AC writes still complete normally, but BlobsAvailable will not \
                          carry AC pins for this worker. If the production AC chain has \
                          changed shape (new wrapper above the FSS), extend \
                          `find_fast_slow_for_pin` to recurse through it."
-                    );
-                    None
+                        );
+                        None
+                    }
                 }
             }
-        }
-        _ => None,
-    };
+            _ => None,
+        };
 
     let running_actions_manager =
         Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
@@ -2906,11 +2900,11 @@ pub async fn new_local_worker(
 
             // Create change tracker and register it on the FilesystemStore.
             let tracker = BlobChangeTracker::new(notify.clone());
-            if let Err(err) = fs_store
-                .clone()
-                .register_item_callback(tracker.clone())
-            {
-                warn!(?err, "Failed to register blob change tracker on FilesystemStore");
+            if let Err(err) = fs_store.clone().register_item_callback(tracker.clone()) {
+                warn!(
+                    ?err,
+                    "Failed to register blob change tracker on FilesystemStore"
+                );
             } else {
                 info!(
                     max_interval_ms,
@@ -2928,7 +2922,9 @@ pub async fn new_local_worker(
                 ac_mirror_target: ac_mirror_target.clone(),
             })
         } else {
-            warn!("FastSlowStore's fast store is not a FilesystemStore; BlobsAvailable reporting disabled");
+            warn!(
+                "FastSlowStore's fast store is not a FilesystemStore; BlobsAvailable reporting disabled"
+            );
             None
         }
     } else {
@@ -2962,11 +2958,15 @@ pub async fn new_local_worker(
         // other workers. Pass `None` here so the dispatcher hook is
         // entirely inert on the worker side. Server-side wire-up lives
         // in `src/bin/nativelink.rs:957-973`.
-        let cas_server = nativelink_service::cas_server::CasServer::new(&cas_configs, &store_manager, None)
-            .err_tip(|| "Failed to create worker CAS server")?;
-        let bytestream_server =
-            nativelink_service::bytestream_server::ByteStreamServer::new(&bytestream_configs, &store_manager, None)
-                .err_tip(|| "Failed to create worker ByteStream server")?;
+        let cas_server =
+            nativelink_service::cas_server::CasServer::new(&cas_configs, &store_manager, None)
+                .err_tip(|| "Failed to create worker CAS server")?;
+        let bytestream_server = nativelink_service::bytestream_server::ByteStreamServer::new(
+            &bytestream_configs,
+            &store_manager,
+            None,
+        )
+        .err_tip(|| "Failed to create worker ByteStream server")?;
 
         let addr: std::net::SocketAddr = ([0, 0, 0, 0, 0, 0, 0, 0], cas_port).into();
         let advertised = cas_advertised_endpoint(cas_port, use_tls);
@@ -3025,8 +3025,9 @@ pub async fn new_local_worker(
             );
             let mut builder = tonic::transport::Server::builder();
             if let Some(tls) = tls_server_config {
-                builder = builder.tls_config(tls)
-                    .map_err(|e| make_err!(Code::Internal, "Worker CAS TCP TLS config failed: {e:?}"))?;
+                builder = builder.tls_config(tls).map_err(|e| {
+                    make_err!(Code::Internal, "Worker CAS TCP TLS config failed: {e:?}")
+                })?;
             }
             let result = builder
                 .add_service(tcp_cas_svc)
@@ -3050,7 +3051,10 @@ pub async fn new_local_worker(
             match start_worker_quic_server(cas_port, &worker_name, quic_routes) {
                 Ok(guard) => Some(guard),
                 Err(e) => {
-                    warn!(?e, "Failed to start worker QUIC CAS server, falling back to TCP only");
+                    warn!(
+                        ?e,
+                        "Failed to start worker QUIC CAS server, falling back to TCP only"
+                    );
                     None
                 }
             }
@@ -3080,7 +3084,11 @@ pub async fn new_local_worker(
                 info!(port = config.pprof_port, "pprof HTTP server started");
             }
             Err(e) => {
-                warn!(?e, port = config.pprof_port, "failed to start pprof HTTP server");
+                warn!(
+                    ?e,
+                    port = config.pprof_port,
+                    "failed to start pprof HTTP server"
+                );
             }
         }
     }
@@ -3105,11 +3113,12 @@ pub async fn new_local_worker(
                         tcp_nodelay: true,
                         use_http3: true,
                     };
-                    let quic_channel = tls_utils::h3_channel(&grpc_endpoint, 1)
-                        .map_err(|e| make_err!(
+                    let quic_channel = tls_utils::h3_channel(&grpc_endpoint, 1).map_err(|e| {
+                        make_err!(
                             Code::Internal,
                             "Failed to create QUIC channel for worker API: {e:?}"
-                        ))?;
+                        )
+                    })?;
                     info!(
                         uri = %config.worker_api_endpoint.uri,
                         decode_limit_mib = WORKER_API_MAX_DECODING_MESSAGE_SIZE / (1024 * 1024),
@@ -3414,9 +3423,10 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nativelink_util::common::DigestInfo;
     use nativelink_util::store_trait::StoreKey;
+
+    use super::*;
 
     #[test]
     fn test_blob_change_tracker_eviction_collects_and_swaps() {
@@ -3634,18 +3644,9 @@ mod tests {
                 2,
                 "Expected 2 added digests after initial inserts"
             );
-            assert!(
-                changes.added.contains(&d1),
-                "Expected d1 in added set"
-            );
-            assert!(
-                changes.added.contains(&d2),
-                "Expected d2 in added set"
-            );
-            assert!(
-                changes.evicted.is_empty(),
-                "Expected no evictions yet"
-            );
+            assert!(changes.added.contains(&d1), "Expected d1 in added set");
+            assert!(changes.added.contains(&d2), "Expected d2 in added set");
+            assert!(changes.evicted.is_empty(), "Expected no evictions yet");
 
             // Now insert a third item — exceeds max_count=2 so the LRU
             // entry (d1) must be evicted. Promote d2 explicitly via get

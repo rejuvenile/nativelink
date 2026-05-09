@@ -302,7 +302,8 @@ async fn mark_stable_routes_by_size_threshold_test() -> Result<(), Error> {
          production-composition test in \
          mark_stable_on_blobs_available_test.rs uses only digests \
          below the 16 KiB threshold and would NOT catch the swap.",
-        lower_drained, upper_drained,
+        lower_drained,
+        upper_drained,
     );
     assert_eq!(
         upper_drained,
@@ -310,7 +311,8 @@ async fn mark_stable_routes_by_size_threshold_test() -> Result<(), Error> {
         "SizePartitioningStore::mark_stable must route digests with \
          size_bytes >= partition_size to upper_store; got lower={:?}, \
          upper={:?}.",
-        lower_drained, upper_drained,
+        lower_drained,
+        upper_drained,
     );
 
     Ok(())

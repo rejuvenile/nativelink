@@ -57,7 +57,7 @@ async fn fast_slow_store_new_honors_chunked_reads_enabled_true() -> Result<(), E
         fast_direction: StoreDirection::default(),
         slow_direction: StoreDirection::default(),
         chunked_reads_enabled: true,
-            slow_writes_in_flight_max_bytes: 0,
+        slow_writes_in_flight_max_bytes: 0,
     };
     let fss = FastSlowStore::new(&spec, fast, slow);
     assert!(
@@ -78,7 +78,7 @@ async fn fast_slow_store_new_honors_chunked_reads_enabled_false() -> Result<(), 
         fast_direction: StoreDirection::default(),
         slow_direction: StoreDirection::default(),
         chunked_reads_enabled: false,
-            slow_writes_in_flight_max_bytes: 0,
+        slow_writes_in_flight_max_bytes: 0,
     };
     let fss = FastSlowStore::new(&spec, fast, slow);
     assert!(
@@ -137,12 +137,9 @@ async fn memory_store_new_honors_emit_backpressure_enabled_false() -> Result<(),
     hash[0] = 0xcd;
     let digest = DigestInfo::new(hash, 2048);
     let payload = bytes::Bytes::from(vec![0u8; 2048]);
-    store_handle
-        .update_oneshot(digest, payload)
-        .await
-        .expect(
-            "MemoryStore with emit_backpressure_enabled=false MUST silent-evict (legacy behaviour); \
-             a regression would surface as ResourceExhausted on what was previously an Ok path"
-        );
+    store_handle.update_oneshot(digest, payload).await.expect(
+        "MemoryStore with emit_backpressure_enabled=false MUST silent-evict (legacy behaviour); \
+             a regression would surface as ResourceExhausted on what was previously an Ok path",
+    );
     Ok(())
 }

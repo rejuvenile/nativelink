@@ -26,7 +26,6 @@
 //! failures.
 
 use bytes::Bytes;
-use serial_test::serial;
 use nativelink_config::stores::{
     ExistenceCacheSpec, FastSlowSpec, MemorySpec, NoopSpec, StoreDirection, StoreSpec,
 };
@@ -37,6 +36,7 @@ use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::{Store, StoreLike};
+use serial_test::serial;
 
 const VALID_HASH: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 
@@ -384,11 +384,7 @@ async fn existence_cache_get_part_not_found_cleans_cache() -> Result<(), Error> 
         "get_part should fail with NotFound failpoint"
     );
     let err = result.unwrap_err();
-    assert_eq!(
-        err.code,
-        Code::NotFound,
-        "expected NotFound error code"
-    );
+    assert_eq!(err.code, Code::NotFound, "expected NotFound error code");
 
     // The failpoint triggers a return before the cache cleanup code runs,
     // but the real NotFound handler in the match block removes the entry.
@@ -472,7 +468,11 @@ async fn streaming_blob_reader_failpoint_returns_error() -> Result<(), Error> {
 
     // After disabling, the reader should work normally.
     let chunk = reader.next_chunk().await.unwrap();
-    assert_eq!(chunk.len(), 256, "should get first chunk after failpoint off");
+    assert_eq!(
+        chunk.len(),
+        256,
+        "should get first chunk after failpoint off"
+    );
     assert_eq!(chunk[0], 0xAA, "first chunk should be 0xAA");
 
     let chunk2 = reader.next_chunk().await.unwrap();
@@ -511,7 +511,9 @@ async fn fast_slow_populate_unavailable_then_partial_read() -> Result<(), Error>
 
     // First attempt: failpoint active, should fail.
     fail::cfg("fast_slow_populate_slow_store_unavailable", "return").unwrap();
-    let result = fast_slow_store.get_part_unchunked(digest, 100, Some(200)).await;
+    let result = fast_slow_store
+        .get_part_unchunked(digest, 100, Some(200))
+        .await;
     assert!(result.is_err(), "should fail with failpoint active");
 
     // Second attempt: failpoint off, partial read should return correct range.
@@ -560,10 +562,7 @@ async fn existence_cache_concurrent_write_one_fails() -> Result<(), Error> {
 
     // First write (will fail due to failpoint).
     let result1 = store.update_oneshot(digest1, data1.clone()).await;
-    assert!(
-        result1.is_err(),
-        "first write should fail from failpoint"
-    );
+    assert!(result1.is_err(), "first write should fail from failpoint");
 
     // Second write (failpoint auto-disabled after first activation).
     let result2 = store.update_oneshot(digest2, data2.clone()).await;
@@ -736,16 +735,8 @@ async fn populate_unchecked_double_evict_returns_aborted() -> Result<(), Error> 
     let digest = DigestInfo::try_new(VALID_HASH, 128).unwrap();
     slow_store.update_oneshot(digest, data.clone()).await?;
 
-    fail::cfg(
-        "fast_slow_populate_unchecked_force_evict_first",
-        "return",
-    )
-    .unwrap();
-    fail::cfg(
-        "fast_slow_populate_unchecked_force_evict_second",
-        "return",
-    )
-    .unwrap();
+    fail::cfg("fast_slow_populate_unchecked_force_evict_first", "return").unwrap();
+    fail::cfg("fast_slow_populate_unchecked_force_evict_second", "return").unwrap();
 
     let res = fss.populate_fast_store_unchecked(digest.into()).await;
 
@@ -762,8 +753,7 @@ async fn populate_unchecked_double_evict_returns_aborted() -> Result<(), Error> 
     );
     let combined = err.messages.join(" ");
     assert!(
-        combined.contains("over-pressured")
-            || combined.contains("not present after copy + retry"),
+        combined.contains("over-pressured") || combined.contains("not present after copy + retry"),
         "expected over-pressure message, got: {combined}"
     );
     Ok(())
@@ -806,7 +796,10 @@ async fn populate_unchecked_replacement_not_eviction_no_retry() -> Result<(), Er
     fail::cfg("fast_slow_populate_unchecked_force_evict_second", "off").unwrap();
 
     let res = fss.populate_fast_store_unchecked(digest.into()).await;
-    assert!(res.is_ok(), "verify should see Some, no retry; got: {res:?}");
+    assert!(
+        res.is_ok(),
+        "verify should see Some, no retry; got: {res:?}"
+    );
     assert!(fast_store.has(digest).await?.is_some());
     Ok(())
 }
@@ -856,7 +849,9 @@ async fn fast_slow_background_slow_write_failpoint_records_failure() -> Result<(
         .err_tip(|| "update_oneshot")?;
 
     // Wait for the spawned background task to terminate.
-    let remaining = fss.flush_slow_writes(std::time::Duration::from_secs(5)).await;
+    let remaining = fss
+        .flush_slow_writes(std::time::Duration::from_secs(5))
+        .await;
     assert_eq!(remaining, 0, "in-flight slow writes should drain");
 
     // Failure recovery must have run: digest in failed_writes, blob still

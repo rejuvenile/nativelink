@@ -516,7 +516,7 @@ async fn has_checks_fast_store_when_noop() -> Result<(), Error> {
         fast_direction: StoreDirection::default(),
         slow_direction: StoreDirection::default(),
         chunked_reads_enabled: false,
-            slow_writes_in_flight_max_bytes: 0,
+        slow_writes_in_flight_max_bytes: 0,
     };
     let fast_slow_store = Arc::new(FastSlowStore::new(
         &fast_slow_store_config,
@@ -887,6 +887,7 @@ async fn partial_slow_store_read_does_not_poison_fast_store() -> Result<(), Erro
 async fn update_with_whole_file_writes_to_both_stores() -> Result<(), Error> {
     use std::ffi::OsString;
     use std::io::Write;
+
     use nativelink_util::store_trait::{StoreOptimizations, UploadSizeInfo};
 
     /// MemoryStore wrapper that reports FileUpdates optimization, causing
@@ -1013,9 +1014,11 @@ async fn update_with_whole_file_writes_to_both_stores() -> Result<(), Error> {
     // Write data to a real temp file.
     let mut tmpfile = tempfile::NamedTempFile::new()
         .map_err(|e| make_err!(Code::Internal, "Failed to create tempfile: {:?}", e))?;
-    tmpfile.write_all(&original_data)
+    tmpfile
+        .write_all(&original_data)
         .map_err(|e| make_err!(Code::Internal, "Failed to write tempfile: {:?}", e))?;
-    tmpfile.flush()
+    tmpfile
+        .flush()
         .map_err(|e| make_err!(Code::Internal, "Failed to flush tempfile: {:?}", e))?;
     let path = tmpfile.path().to_owned();
 
@@ -1090,14 +1093,14 @@ async fn streaming_populate_fallback_on_buffer_eviction() -> Result<(), Error> {
     // Both should receive the complete, correct data.
     let fss = fast_slow_store.clone();
     let data_len = original_data.len() as u64;
-    let (result1, result2) = tokio::join!(
-        fss.get_part_unchunked(digest, 0, Some(data_len)),
-        async {
+    let (result1, result2) =
+        tokio::join!(fss.get_part_unchunked(digest, 0, Some(data_len)), async {
             // Small yield to increase chance the first call becomes the populator.
             tokio::task::yield_now().await;
-            fast_slow_store.get_part_unchunked(digest, 0, Some(data_len)).await
-        }
-    );
+            fast_slow_store
+                .get_part_unchunked(digest, 0, Some(data_len))
+                .await
+        });
 
     let data1 = result1?;
     let data2 = result2?;
@@ -1164,9 +1167,7 @@ async fn streaming_populate_fallback_arithmetic() -> Result<(), Error> {
     );
 
     // Full read should work after the populate completed.
-    let full_result = fast_slow_store
-        .get_part_unchunked(digest, 0, None)
-        .await?;
+    let full_result = fast_slow_store.get_part_unchunked(digest, 0, None).await?;
     assert_eq!(
         full_result.as_ref(),
         original_data.as_slice(),
@@ -1365,7 +1366,9 @@ async fn concurrent_get_part_same_digest_both_return_correct_data() -> Result<()
         async {
             tokio::task::yield_now().await;
             tokio::task::yield_now().await;
-            fast_slow_store.get_part_unchunked(digest, 0, Some(data_len)).await
+            fast_slow_store
+                .get_part_unchunked(digest, 0, Some(data_len))
+                .await
         }
     );
 
@@ -1402,6 +1405,7 @@ async fn concurrent_get_part_same_digest_both_return_correct_data() -> Result<()
 #[nativelink_test]
 async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Error> {
     use core::time::Duration;
+
     use nativelink_util::streaming_blob::StreamingBlob;
     use tokio::sync::Notify;
 
@@ -1609,6 +1613,7 @@ async fn populate_early_not_found_propagates_via_send_error() -> Result<(), Erro
 #[nativelink_test]
 async fn populate_survives_caller_cancellation() -> Result<(), Error> {
     use core::time::Duration;
+
     use nativelink_util::streaming_blob::StreamingBlob;
     use tokio::sync::Notify;
 
@@ -1730,14 +1735,17 @@ async fn populate_survives_caller_cancellation() -> Result<(), Error> {
     // launching, so we don't miss the wake-up.
     let entered_wait = get_entered.notified();
     let fss_a = Arc::clone(&fast_slow_store);
-    let caller_a = tokio::spawn(async move {
-        fss_a.get_part_unchunked(digest, 0, None).await
-    });
+    let caller_a = tokio::spawn(async move { fss_a.get_part_unchunked(digest, 0, None).await });
 
     // Wait until caller A's populate has entered slow_store.get_part().
     tokio::time::timeout(Duration::from_secs(5), entered_wait)
         .await
-        .map_err(|_| make_err!(Code::DeadlineExceeded, "caller A never entered slow get_part"))?;
+        .map_err(|_| {
+            make_err!(
+                Code::DeadlineExceeded,
+                "caller A never entered slow get_part"
+            )
+        })?;
 
     // Capture the streaming buffer Arc BEFORE cancelling A, while the
     // populating_digests entry is live.
@@ -1808,6 +1816,7 @@ async fn populate_survives_caller_cancellation() -> Result<(), Error> {
 async fn populate_producer_error_propagates_to_waiters() -> Result<(), Error> {
     use core::sync::atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrd};
     use core::time::Duration;
+
     use nativelink_util::streaming_blob::StreamingBlob;
     use tokio::sync::Notify;
 
@@ -1937,15 +1946,18 @@ async fn populate_producer_error_propagates_to_waiters() -> Result<(), Error> {
 
     let entered_wait = get_entered.notified();
     let fss = Arc::clone(&fast_slow_store);
-    let caller = tokio::spawn(async move {
-        fss.get_part_unchunked(digest, 0, None).await
-    });
+    let caller = tokio::spawn(async move { fss.get_part_unchunked(digest, 0, None).await });
 
     // Wait until the producer has entered slow_store.get_part() and is
     // parked on the gate.
     tokio::time::timeout(Duration::from_secs(5), entered_wait)
         .await
-        .map_err(|_| make_err!(Code::DeadlineExceeded, "producer never entered slow get_part"))?;
+        .map_err(|_| {
+            make_err!(
+                Code::DeadlineExceeded,
+                "producer never entered slow get_part"
+            )
+        })?;
 
     // Capture the streaming buffer Arc while the producer is parked.
     let streaming_inner = fast_slow_store
@@ -2034,9 +2046,7 @@ async fn populate_inline_does_not_spawn() -> Result<(), Error> {
         0,
         "test setup: populate_spawn_count must start at 0",
     );
-    fast_slow_store
-        .populate_fast_store(digest_a.into())
-        .await?;
+    fast_slow_store.populate_fast_store(digest_a.into()).await?;
     assert_eq!(
         fast_slow_store.populate_spawn_count(),
         0,
@@ -2092,8 +2102,8 @@ async fn populate_inline_does_not_spawn() -> Result<(), Error> {
 /// remains), then `send_error`. The drain MUST surface the structured
 /// error code, not the buffered data.
 #[nativelink_test]
-async fn drain_streaming_buffer_propagates_terminal_error_over_buffered_data()
--> Result<(), Error> {
+async fn drain_streaming_buffer_propagates_terminal_error_over_buffered_data() -> Result<(), Error>
+{
     use nativelink_util::streaming_blob::{StreamingBlobInner, StreamingBlobWriter};
 
     let digest = DigestInfo::try_new(VALID_HASH, 50).unwrap();
@@ -2103,10 +2113,16 @@ async fn drain_streaming_buffer_propagates_terminal_error_over_buffered_data()
     for i in 0..5u8 {
         writer.send(Bytes::from(vec![i; 10])).await?;
     }
-    writer.send_error(make_err!(Code::DataLoss, "synthetic producer mid-stream failure"));
+    writer.send_error(make_err!(
+        Code::DataLoss,
+        "synthetic producer mid-stream failure"
+    ));
     drop(writer);
 
-    assert!(inner.is_terminal(), "writer.send_error should mark terminal");
+    assert!(
+        inner.is_terminal(),
+        "writer.send_error should mark terminal"
+    );
     assert!(
         inner.earliest_chunk_idx() > 0,
         "test setup: writes must trigger eviction (earliest > 0)",
@@ -2229,14 +2245,13 @@ async fn flush_slow_writes_no_lost_wakeup() -> Result<(), Error> {
                 fast_direction: StoreDirection::default(),
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
-            slow_writes_in_flight_max_bytes: 0,
+                slow_writes_in_flight_max_bytes: 0,
             },
             fast,
             slow,
         ));
 
-        let key: StoreKey<'static> =
-            StoreKey::Digest(DigestInfo::try_new(VALID_HASH, 1).unwrap());
+        let key: StoreKey<'static> = StoreKey::Digest(DigestInfo::try_new(VALID_HASH, 1).unwrap());
         fss.test_insert_in_flight(key.clone(), vec![Bytes::from_static(b"x")]);
 
         // Barrier ensures both racers release at the same instant, maximising
@@ -2301,8 +2316,8 @@ async fn flush_slow_writes_no_lost_wakeup() -> Result<(), Error> {
 /// the `.has()` call and bypass the construction site under test.
 #[nativelink_test]
 async fn fast_slow_store_not_found_carries_precondition_failure_detail() -> Result<(), Error> {
-    use prost::Message;
     use nativelink_util::common::PreconditionFailure;
+    use prost::Message;
 
     let (fast_slow_store, _fast_store, _slow_store) = make_stores();
     let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
@@ -2326,11 +2341,7 @@ async fn fast_slow_store_not_found_carries_precondition_failure_detail() -> Resu
         .expect("detail value must decode as PreconditionFailure");
     assert_eq!(pf.violations.len(), 1, "expected one violation");
     assert_eq!(pf.violations[0].r#type, "MISSING");
-    let expected_subject = format!(
-        "blobs/{}/{}",
-        digest.packed_hash(),
-        digest.size_bytes(),
-    );
+    let expected_subject = format!("blobs/{}/{}", digest.packed_hash(), digest.size_bytes(),);
     assert_eq!(
         pf.violations[0].subject, expected_subject,
         "violation subject must be 'blobs/<hash>/<size>', got: {}",
@@ -2403,7 +2414,10 @@ impl StoreDriver for CountingNotFoundSlowStore {
         _length: Option<u64>,
     ) -> Result<(), Error> {
         self.get_calls.fetch_add(1, Ordering::Relaxed);
-        Err(make_err!(Code::NotFound, "CountingNotFoundSlowStore: blob absent"))
+        Err(make_err!(
+            Code::NotFound,
+            "CountingNotFoundSlowStore: blob absent"
+        ))
     }
 
     fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
@@ -2672,8 +2686,8 @@ async fn terminal_internal_err_falls_back_to_slow_store() -> Result<(), Error> {
 /// (not `?`) so a deadlock surfaces as a panic with an explicit
 /// "must not deadlock" message rather than a generic timeout error.
 #[nativelink_test]
-async fn verify_store_around_fast_slow_does_not_deadlock_on_populator_notfound()
--> Result<(), Error> {
+async fn verify_store_around_fast_slow_does_not_deadlock_on_populator_notfound() -> Result<(), Error>
+{
     use core::time::Duration;
 
     use nativelink_config::stores::VerifySpec;
@@ -2804,10 +2818,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_mirror_blobs_size_mi
     // of `get_part` notices the mismatch, removes the entry, and
     // returns `Err(NotFound)` — the early return that pre-fix did
     // NOT terminate the writer.
-    fast_slow_store.test_insert_mirror_blob_unchecked(
-        digest,
-        Bytes::from_static(b"short"),
-    );
+    fast_slow_store.test_insert_mirror_blob_unchecked(digest, Bytes::from_static(b"short"));
 
     let verify_store = VerifyStore::new(
         &VerifySpec {
@@ -3047,8 +3058,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_in_flight_size_misma
     // guard fires.
     let digest = DigestInfo::try_new(VALID_HASH, 100).unwrap();
     let owned_key: StoreKey<'static> = StoreKey::from(digest);
-    fast_slow_store
-        .test_insert_in_flight(owned_key, vec![Bytes::from_static(b"hello world!")]);
+    fast_slow_store.test_insert_in_flight(owned_key, vec![Bytes::from_static(b"hello world!")]);
 
     let verify_store = VerifyStore::new(
         &VerifySpec {
@@ -3089,8 +3099,8 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_in_flight_size_misma
 /// `rx.recv()`. Same mechanism as the populator-NotFound case; this
 /// guards the sibling site at `fast_slow_store.rs` ~2831.
 #[nativelink_test]
-async fn verify_store_around_fast_slow_does_not_deadlock_on_local_only_reads()
--> Result<(), Error> {
+async fn verify_store_around_fast_slow_does_not_deadlock_on_local_only_reads() -> Result<(), Error>
+{
     use core::time::Duration;
 
     use nativelink_config::stores::VerifySpec;
@@ -3230,7 +3240,10 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
             _offset: u64,
             _length: Option<u64>,
         ) -> Result<(), Error> {
-            Err(make_err!(Code::NotFound, "blob raced eviction between has and get"))
+            Err(make_err!(
+                Code::NotFound,
+                "blob raced eviction between has and get"
+            ))
         }
 
         fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
@@ -3318,8 +3331,7 @@ async fn phantom_blob_warn_fires_on_real_has_then_get_notfound() -> Result<(), E
 ///      Without the Drop body, the wire-side identifier is gone.
 ///   4. Restore the line and re-run to confirm the test passes again.
 #[nativelink_test]
-async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
--> Result<(), Error> {
+async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock() -> Result<(), Error> {
     use core::time::Duration;
 
     use nativelink_config::stores::VerifySpec;
@@ -3372,10 +3384,7 @@ async fn write_half_guard_drop_fallback_prevents_uncommitted_deadlock()
         fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
             self
         }
-        fn register_item_callback(
-            self: Arc<Self>,
-            _: Arc<dyn ItemCallback>,
-        ) -> Result<(), Error> {
+        fn register_item_callback(self: Arc<Self>, _: Arc<dyn ItemCallback>) -> Result<(), Error> {
             Ok(())
         }
 
@@ -3480,10 +3489,7 @@ async fn dispatched_mirror_pin_snapshot_is_sorted_by_store_id() -> Result<(), Er
     // digest.size_bytes()).
     let d_a = DigestInfo::try_new(VALID_HASH, 16).unwrap();
     // Construct a 2nd digest by changing the 1st byte (still 64 hex chars).
-    let alt_hash: String = format!(
-        "f{}",
-        &VALID_HASH[1..]
-    );
+    let alt_hash: String = format!("f{}", &VALID_HASH[1..]);
     let d_b = DigestInfo::try_new(&alt_hash, 16).unwrap();
 
     // Insert in non-sorted order to verify BTreeMap re-sorts.
@@ -3581,8 +3587,7 @@ fn d(byte: u8) -> DigestInfo {
 /// `insert_local_ac_pin` and confirm the snapshot assertion red-fails
 /// with the bespoke "MUST contain the inserted entry" message.
 #[nativelink_test]
-async fn insert_local_ac_pin_advertises_without_touching_mirror_blobs(
-) -> Result<(), Error> {
+async fn insert_local_ac_pin_advertises_without_touching_mirror_blobs() -> Result<(), Error> {
     let fss = make_fss_for_ac_pin();
     let digest = d(0x42);
     let snap0 = fss.dispatched_mirror_pin_snapshot();
@@ -3590,10 +3595,9 @@ async fn insert_local_ac_pin_advertises_without_touching_mirror_blobs(
     let blob_count_before = fss.mirror_blob_count();
     let blob_bytes_before = fss.mirror_blobs_used_bytes();
 
-    tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async { fss.insert_local_ac_pin("AC_MAIN_STORE", digest); },
-    )
+    tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        fss.insert_local_ac_pin("AC_MAIN_STORE", digest);
+    })
     .await
     .expect("must not deadlock — insert_local_ac_pin contract violated");
 
@@ -3648,10 +3652,9 @@ async fn remove_local_ac_pins_drops_only_matched_digests() -> Result<(), Error> 
     assert_eq!(fss.dispatched_mirror_pin_snapshot().len(), 2);
 
     // Drive the BIS-ack drain.
-    tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async { fss.remove_local_ac_pins(&[d_ack]); },
-    )
+    tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        fss.remove_local_ac_pins(&[d_ack]);
+    })
     .await
     .expect("must not deadlock — remove_local_ac_pins contract violated");
 
@@ -3709,10 +3712,9 @@ async fn ac_and_cas_fss_pin_maps_are_isolated_by_construction() -> Result<(), Er
     assert_eq!(ac_fss.dispatched_mirror_pin_snapshot().len(), 1);
 
     // Direction A: CAS BIS ack arrives — drains CAS only, leaves AC.
-    tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async { cas_fss.remove_mirror_blobs(&[aliased]); },
-    )
+    tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        cas_fss.remove_mirror_blobs(&[aliased]);
+    })
     .await
     .expect("must not deadlock");
     assert!(
@@ -3731,10 +3733,9 @@ async fn ac_and_cas_fss_pin_maps_are_isolated_by_construction() -> Result<(), Er
     // Direction B: AC BIS ack arrives — drains AC only.
     // (CAS already empty so direction-A's invariant is
     // trivially preserved here.)
-    tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async { ac_fss.remove_local_ac_pins(&[aliased]); },
-    )
+    tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        ac_fss.remove_local_ac_pins(&[aliased]);
+    })
     .await
     .expect("must not deadlock");
     assert!(
@@ -3897,20 +3898,18 @@ async fn cas_pin_snapshot_filters_strictly_by_store_id() -> Result<(), Error> {
     fss.insert_local_ac_pin("OTHER_STORE", d_other);
     fss.insert_local_ac_pin("THIRD_STORE", d_third);
 
-    let main_slice = tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async { fss.dispatched_mirror_pin_snapshot_for_store("cas_STORE") },
-    )
+    let main_slice = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        fss.dispatched_mirror_pin_snapshot_for_store("cas_STORE")
+    })
     .await
     .expect(
         "dispatched_mirror_pin_snapshot_for_store must complete within 5s — \
          deadlock detector: snapshot path was refactored to hold a lock \
          across an .await",
     );
-    let other_slice = tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async { fss.dispatched_mirror_pin_snapshot_for_store("OTHER_STORE") },
-    )
+    let other_slice = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        fss.dispatched_mirror_pin_snapshot_for_store("OTHER_STORE")
+    })
     .await
     .expect(
         "dispatched_mirror_pin_snapshot_for_store must complete within 5s — \
@@ -3919,13 +3918,17 @@ async fn cas_pin_snapshot_filters_strictly_by_store_id() -> Result<(), Error> {
 
     // Under-action: matching store_id's pin appears in its own slice.
     assert!(
-        main_slice.iter().any(|(sid, dg)| sid.as_ref() == "cas_STORE" && *dg == d_main),
+        main_slice
+            .iter()
+            .any(|(sid, dg)| sid.as_ref() == "cas_STORE" && *dg == d_main),
         "CAS slice for cas_STORE MUST include its own pin entry; \
          under-action: snapshot filter dropped a matching digest \
          (store_id=cas_STORE, digest_byte=0x50)"
     );
     assert!(
-        other_slice.iter().any(|(sid, dg)| sid.as_ref() == "OTHER_STORE" && *dg == d_other),
+        other_slice
+            .iter()
+            .any(|(sid, dg)| sid.as_ref() == "OTHER_STORE" && *dg == d_other),
         "CAS slice for OTHER_STORE MUST include its own pin entry; \
          under-action: snapshot filter dropped a matching digest"
     );
@@ -3954,14 +3957,11 @@ async fn cas_pin_snapshot_filters_strictly_by_store_id() -> Result<(), Error> {
 
     // Empty-string sentinel: preserves the current no-filter
     // semantics so CAS callers passing `""` see the entire map.
-    let unfiltered = tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async { fss.dispatched_mirror_pin_snapshot_for_store("") },
-    )
+    let unfiltered = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        fss.dispatched_mirror_pin_snapshot_for_store("")
+    })
     .await
-    .expect(
-        "dispatched_mirror_pin_snapshot_for_store(\"\") must complete within 5s",
-    );
+    .expect("dispatched_mirror_pin_snapshot_for_store(\"\") must complete within 5s");
     assert_eq!(
         unfiltered.len(),
         3,
@@ -4048,12 +4048,12 @@ async fn cas_pin_snapshot_filters_strictly_by_store_id() -> Result<(), Error> {
 /// 2026-05-06: with the mutation, the test fails with the bespoke
 /// message; without the mutation, it passes.
 #[nativelink_test]
-async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream(
-) -> Result<(), Error> {
+async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream() -> Result<(), Error> {
     use core::time::Duration;
+
     use nativelink_config::stores::{EvictionPolicy, FastSlowSpec, MemorySpec, StoreSpec};
-    use nativelink_store::chunked_signal::encode_backpressure_signal_any;
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
+    use nativelink_store::chunked_signal::encode_backpressure_signal_any;
     use nativelink_util::buf_channel::DropCloserWriteHalf;
     use nativelink_util::store_trait::Store;
     use sha2::{Digest as _, Sha256};
@@ -4237,7 +4237,9 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream(
                     .await
                     .err_tip(|| "GatedSlowStore: send remainder failed")?;
             }
-            writer.send_eof().err_tip(|| "GatedSlowStore: send_eof failed")?;
+            writer
+                .send_eof()
+                .err_tip(|| "GatedSlowStore: send_eof failed")?;
             Ok(())
         }
 
@@ -4346,9 +4348,7 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream(
     // which is the path the bug fires through.
     let consumer_handle = tokio::spawn({
         let store = fss_store.clone();
-        async move {
-            store.get_part_unchunked(digest, 0, None).await
-        }
+        async move { store.get_part_unchunked(digest, 0, None).await }
     });
 
     // Wait until the slow store has sent chunk 0 (proves the producer
@@ -4383,9 +4383,7 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream(
         .await
         .expect("populator must warn-and-continue on MemoryStore at-cap — no deadlock")
         .expect("consumer task must not panic")
-        .expect(
-            "populator must warn-and-continue — consumer must see clean EOF, not Err",
-        );
+        .expect("populator must warn-and-continue — consumer must see clean EOF, not Err");
 
     assert_eq!(
         bytes.len(),
@@ -4436,6 +4434,7 @@ async fn populate_at_capacity_does_not_abort_consumer_when_caps_mid_stream(
 #[nativelink_test]
 async fn populate_at_capacity_pre_stream_returns_clean_error() -> Result<(), Error> {
     use core::time::Duration;
+
     use nativelink_config::stores::{EvictionPolicy, FastSlowSpec, MemorySpec, StoreSpec};
     use nativelink_util::store_trait::Store;
 
@@ -4543,12 +4542,13 @@ async fn populate_at_capacity_pre_stream_returns_clean_error() -> Result<(), Err
 /// would then receive truncated bytes + clean EOF (Ok with len=1024
 /// instead of Err) — the test's `.expect_err(...)` red-fails.
 #[nativelink_test]
-async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream(
-) -> Result<(), Error> {
+async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream() -> Result<(), Error>
+{
     use core::time::Duration;
+
     use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreSpec};
-    use nativelink_store::chunked_signal::encode_backpressure_signal_any;
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::backpressure_signal;
+    use nativelink_store::chunked_signal::encode_backpressure_signal_any;
     use nativelink_util::buf_channel::DropCloserWriteHalf;
     use nativelink_util::store_trait::Store;
     use sha2::{Digest as _, Sha256};
@@ -4669,7 +4669,10 @@ async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream(
             _reader: nativelink_util::buf_channel::DropCloserReadHalf,
             _size_info: nativelink_util::store_trait::UploadSizeInfo,
         ) -> Result<(), Error> {
-            Err(make_err!(Code::Unimplemented, "MidStreamErrSlowStore::update unused"))
+            Err(make_err!(
+                Code::Unimplemented,
+                "MidStreamErrSlowStore::update unused"
+            ))
         }
 
         async fn get_part(
@@ -4786,7 +4789,9 @@ async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream(
     let digest = DigestInfo::new(hash_arr, payload.len() as u64);
 
     let fast_store_arc = Arc::new(AlwaysAtCapFastStore { _marker: 0 });
-    let slow_store_arc = Arc::new(MidStreamErrSlowStore { declared_size: payload.len() as u64 });
+    let slow_store_arc = Arc::new(MidStreamErrSlowStore {
+        declared_size: payload.len() as u64,
+    });
 
     let fss_arc = FastSlowStore::new(
         &FastSlowSpec {
@@ -4862,6 +4867,7 @@ async fn populate_at_capacity_does_not_demote_when_slow_tier_errors_mid_stream(
 #[nativelink_test]
 async fn populate_does_not_demote_non_at_cap_fast_tier_error() -> Result<(), Error> {
     use core::time::Duration;
+
     use nativelink_config::stores::{EvictionPolicy, FastSlowSpec, MemorySpec, StoreSpec};
     use nativelink_util::buf_channel::DropCloserWriteHalf;
     use nativelink_util::store_trait::Store;

@@ -428,11 +428,7 @@ impl StoreDriver for SlowSlowProbe {
         self.inner.update(key, reader, upload_size).await
     }
 
-    async fn update_oneshot(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        data: Bytes,
-    ) -> Result<(), Error> {
+    async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
         tokio::time::sleep(self.per_update_delay).await;
         self.update_count.fetch_add(1, Ordering::SeqCst);
         self.inner.update_oneshot(key, data).await
@@ -575,11 +571,7 @@ impl StoreDriver for EveryOtherFailsProbe {
         self.inner.update(key, reader, upload_size).await
     }
 
-    async fn update_oneshot(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        data: Bytes,
-    ) -> Result<(), Error> {
+    async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
         let n = self.call_count.fetch_add(1, Ordering::SeqCst);
         if n % 2 == 0 {
             return Err(make_err!(
@@ -665,8 +657,7 @@ async fn shutdown_flush_skips_blobs_already_in_slow_tier() -> Result<(), Error> 
         fast_slow.flush_fast_to_slow_at_shutdown(NO_DEADLOCK_TIMEOUT),
     )
     .await
-    .expect("DEADLOCK: flush did not return")
-    ;
+    .expect("DEADLOCK: flush did not return");
     // 0 unflushed (skip-counted) AND the probe was never invoked for
     // update_oneshot (would have panicked on call).
     assert_eq!(

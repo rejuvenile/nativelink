@@ -16,9 +16,7 @@ use core::pin::Pin;
 
 use futures::future::pending;
 use futures::try_join;
-use nativelink_config::stores::{
-    FastSlowSpec, MemorySpec, StoreDirection, StoreSpec, VerifySpec,
-};
+use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec, VerifySpec};
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_store::fast_slow_store::FastSlowStore;
@@ -398,7 +396,11 @@ async fn verify_hash_on_read_catches_corrupted_data() -> Result<(), Error> {
 
     // Reading through the verify store should detect the hash mismatch.
     let result = store.get_part_unchunked(digest, 0, None).await;
-    assert!(result.is_err(), "Expected hash mismatch error, got: {:?}", result);
+    assert!(
+        result.is_err(),
+        "Expected hash mismatch error, got: {:?}",
+        result
+    );
     let err = result.unwrap_err();
     assert!(
         err.to_string().contains("Hash mismatch on read"),
@@ -425,9 +427,7 @@ async fn verify_hash_on_read_passes_for_correct_data() -> Result<(), Error> {
     );
 
     let digest = DigestInfo::try_new(HASH, VALUE.len() as u64).unwrap();
-    inner_store
-        .update_oneshot(digest, VALUE.into())
-        .await?;
+    inner_store.update_oneshot(digest, VALUE.into()).await?;
 
     let result = store.get_part_unchunked(digest, 0, None).await;
     assert_eq!(
@@ -460,10 +460,15 @@ async fn verify_size_on_read_catches_wrong_size() -> Result<(), Error> {
         .await?;
 
     let result = store.get_part_unchunked(digest, 0, None).await;
-    assert!(result.is_err(), "Expected size mismatch error, got: {:?}", result);
+    assert!(
+        result.is_err(),
+        "Expected size mismatch error, got: {:?}",
+        result
+    );
     let err = result.unwrap_err();
     assert!(
-        err.to_string().contains("Expected size 5 but got size 2 on read"),
+        err.to_string()
+            .contains("Expected size 5 but got size 2 on read"),
         "Error should mention size mismatch, got: {err:?}"
     );
     assert_eq!(err.code, Code::DataLoss, "Error code should be DataLoss");
@@ -487,9 +492,7 @@ async fn verify_hash_on_partial_read_is_skipped() -> Result<(), Error> {
     );
 
     let digest = DigestInfo::try_new(HASH, VALUE.len() as u64).unwrap();
-    inner_store
-        .update_oneshot(digest, VALUE.into())
-        .await?;
+    inner_store.update_oneshot(digest, VALUE.into()).await?;
 
     // Partial read with offset -- verification should be skipped.
     let result = store.get_part_unchunked(digest, 1, Some(2)).await;
@@ -530,7 +533,11 @@ async fn verify_blake3_hash_on_read_catches_corruption() -> Result<(), Error> {
         .with_context(make_ctx_for_hash_func(DigestHasherFunc::Blake3)?)
         .await;
 
-    assert!(result.is_err(), "Expected hash mismatch error, got: {:?}", result);
+    assert!(
+        result.is_err(),
+        "Expected hash mismatch error, got: {:?}",
+        result
+    );
     let err = result.unwrap_err();
     assert!(
         err.to_string().contains("Hash mismatch on read"),
@@ -557,9 +564,7 @@ async fn verify_both_size_and_hash_on_read_succeeds() -> Result<(), Error> {
     );
 
     let digest = DigestInfo::try_new(HASH, VALUE.len() as u64).unwrap();
-    inner_store
-        .update_oneshot(digest, VALUE.into())
-        .await?;
+    inner_store.update_oneshot(digest, VALUE.into()).await?;
 
     let result = store.get_part_unchunked(digest, 0, None).await;
     assert_eq!(

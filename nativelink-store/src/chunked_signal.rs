@@ -113,10 +113,7 @@ pub fn error_has_backpressure_signal(err: &Error) -> bool {
 /// undecodable bytes has violated the wire contract — better to
 /// surface the original error than to demote it.
 #[must_use]
-pub fn error_has_backpressure_reason(
-    err: &Error,
-    wanted: &[backpressure_signal::Reason],
-) -> bool {
+pub fn error_has_backpressure_reason(err: &Error, wanted: &[backpressure_signal::Reason]) -> bool {
     if err.details.is_empty() {
         return false;
     }
@@ -188,9 +185,8 @@ pub fn error_has_watchdog_timeout_signal(err: &Error) -> bool {
 mod tests {
     use nativelink_error::{Code, Error, make_err};
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-        BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal,
-        WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL, WatchdogTimeoutSignal, backpressure_signal,
-        watchdog_timeout_signal,
+        BACKPRESSURE_SIGNAL_TYPE_URL, BackpressureSignal, WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL,
+        WatchdogTimeoutSignal, backpressure_signal, watchdog_timeout_signal,
     };
     use prost::Message;
 
@@ -220,10 +216,7 @@ mod tests {
         assert_eq!(decoded.retry_after_ms, 1234);
 
         // Second variant for completeness.
-        let any2 = encode_backpressure_signal_any(
-            backpressure_signal::Reason::PerBlobMpscFull,
-            17,
-        );
+        let any2 = encode_backpressure_signal_any(backpressure_signal::Reason::PerBlobMpscFull, 17);
         let decoded2 = BackpressureSignal::decode(&*any2.value).expect("decode");
         assert_eq!(
             decoded2.reason,
@@ -270,10 +263,7 @@ mod tests {
         // Non-ResourceExhausted code carrying our signal: the helper
         // still returns true because callers already gate on Code; the
         // helper is purely a detail-presence check.
-        let any2 = encode_backpressure_signal_any(
-            backpressure_signal::Reason::PerBlobMpscFull,
-            5,
-        );
+        let any2 = encode_backpressure_signal_any(backpressure_signal::Reason::PerBlobMpscFull, 5);
         let mut not_resource_exhausted: Error = make_err!(Code::Internal, "huh");
         not_resource_exhausted.details.push(any2);
         assert!(
@@ -332,12 +322,9 @@ mod tests {
     /// disk-full discriminator) MUST NOT be silently demoted.
     #[test]
     fn error_has_backpressure_reason_discriminates() {
-        let memcap_any = encode_backpressure_signal_any(
-            backpressure_signal::Reason::MemoryStoreAtCapacity,
-            25,
-        );
-        let memcap_err =
-            Error::resource_exhausted_backpressure("memcap", memcap_any);
+        let memcap_any =
+            encode_backpressure_signal_any(backpressure_signal::Reason::MemoryStoreAtCapacity, 25);
+        let memcap_err = Error::resource_exhausted_backpressure("memcap", memcap_any);
         assert!(
             error_has_backpressure_reason(
                 &memcap_err,

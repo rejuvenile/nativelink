@@ -31,9 +31,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use nativelink_config::stores::{
-    FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
-};
+use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::Digest as ProtoDigest;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::SmallBlobEntry;

@@ -290,6 +290,9 @@ async fn populate_pin_cap_exhaustion_warns() -> Result<(), Error> {
             present += 1;
         }
     }
-    assert!(present > 0, "fast store should still have some pinned blobs");
+    assert!(
+        present > 0,
+        "fast store should still have some pinned blobs"
+    );
     Ok(())
 }

@@ -41,7 +41,9 @@ use nativelink_proto::google::bytestream::{
     QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
     WriteResponse,
 };
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair};
+use nativelink_util::buf_channel::{
+    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
+};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::connection_manager::ConnectionManager;
 use nativelink_util::digest_hasher::{DigestHasherFunc, default_digest_hasher_func};
@@ -308,8 +310,9 @@ impl GrpcStore {
                         if endpoint_config.use_http3 {
                             continue;
                         }
-                        let endpoint = tls_utils::endpoint(endpoint_config)
-                            .map_err(|e| make_input_err!("Invalid URI for GrpcStore endpoint (dual/tcp): {e:?}"))?;
+                        let endpoint = tls_utils::endpoint(endpoint_config).map_err(|e| {
+                            make_input_err!("Invalid URI for GrpcStore endpoint (dual/tcp): {e:?}")
+                        })?;
                         tcp_endpoints.push(endpoint);
                     }
                     let tcp_cm = ConnectionManager::new(
@@ -325,7 +328,10 @@ impl GrpcStore {
                         connections,
                         "GrpcStore: using dual transport (TCP for parallel reads/large writes, QUIC for batched/small RPCs)",
                     );
-                    Transport::Dual { tcp: tcp_cm, quic: quic_channel }
+                    Transport::Dual {
+                        tcp: tcp_cm,
+                        quic: quic_channel,
+                    }
                 } else {
                     let channel = tls_utils::h3_channel(ep, connections)
                         .map_err(|e| make_input_err!("Failed to create QUIC channel: {e:?}"))?;
@@ -361,13 +367,12 @@ impl GrpcStore {
 
         let batch_update_threshold = spec.batch_update_threshold_bytes;
 
-        let (batch_tx, batch_rx) =
-            if batch_update_threshold > 0 {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
+        let (batch_tx, batch_rx) = if batch_update_threshold > 0 {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         let store = Arc::new(Self {
             instance_name: spec.instance_name.clone(),
@@ -400,8 +405,7 @@ impl GrpcStore {
             tokio::spawn(Self::batch_flush_loop(weak, rx, semaphore));
             info!(
                 batch_update_threshold,
-                max_concurrent,
-                "GrpcStore: BatchUpdateBlobs opportunistic batching enabled",
+                max_concurrent, "GrpcStore: BatchUpdateBlobs opportunistic batching enabled",
             );
         }
 
@@ -462,9 +466,7 @@ impl GrpcStore {
     /// the path is dormant under the default kill-switch).
     #[cfg(feature = "chunked_fast_slow")]
     #[must_use]
-    pub fn chunked_metrics(
-        &self,
-    ) -> &Arc<crate::chunked::chunked_client::ChunkedClientMetrics> {
+    pub fn chunked_metrics(&self) -> &Arc<crate::chunked::chunked_client::ChunkedClientMetrics> {
         &self.chunked_metrics
     }
 
@@ -571,8 +573,8 @@ impl GrpcStore {
         T::ResponseBody: tonic::codegen::Body<Data = Bytes> + Send + 'static,
         <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
     {
-        let mut client = ByteStreamClient::new(channel)
-            .max_decoding_message_size(MAX_GRPC_DECODING_SIZE);
+        let mut client =
+            ByteStreamClient::new(channel).max_decoding_message_size(MAX_GRPC_DECODING_SIZE);
         if self.zstd_compression {
             client = client
                 .send_compressed(tonic::codec::CompressionEncoding::Zstd)
@@ -589,8 +591,8 @@ impl GrpcStore {
         T::ResponseBody: tonic::codegen::Body<Data = Bytes> + Send + 'static,
         <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
     {
-        let mut client = ActionCacheClient::new(channel)
-            .max_decoding_message_size(MAX_GRPC_DECODING_SIZE);
+        let mut client =
+            ActionCacheClient::new(channel).max_decoding_message_size(MAX_GRPC_DECODING_SIZE);
         if self.zstd_compression {
             client = client
                 .send_compressed(tonic::codec::CompressionEncoding::Zstd)
@@ -640,10 +642,7 @@ impl GrpcStore {
             Ok(resp) => resp,
             Err(e) => {
                 let err = e.append("In GrpcStore::do_batch_update");
-                return digests
-                    .iter()
-                    .map(|d| (*d, Err(err.clone())))
-                    .collect();
+                return digests.iter().map(|d| (*d, Err(err.clone()))).collect();
             }
         };
 
@@ -668,9 +667,9 @@ impl GrpcStore {
 
         // Fill in missing responses as errors.
         for d in digests {
-            results
-                .entry(*d)
-                .or_insert_with(|| Err(make_input_err!("BatchUpdateBlobs: no response for digest")));
+            results.entry(*d).or_insert_with(|| {
+                Err(make_input_err!("BatchUpdateBlobs: no response for digest"))
+            });
         }
         results
     }
@@ -718,8 +717,7 @@ impl GrpcStore {
                 match rx.try_recv() {
                     Ok(entry) => {
                         let new_total = total_size + entry.data.len();
-                        if new_total > Self::MAX_BATCH_TOTAL_SIZE && !batch.is_empty()
-                        {
+                        if new_total > Self::MAX_BATCH_TOTAL_SIZE && !batch.is_empty() {
                             // Would exceed limit — hold for next batch.
                             held_entry = Some(entry);
                             break;
@@ -748,11 +746,7 @@ impl GrpcStore {
             };
 
             let num = batch.len();
-            trace!(
-                count = num,
-                total_size,
-                "GrpcStore: flushing batch",
-            );
+            trace!(count = num, total_size, "GrpcStore: flushing batch",);
 
             // Spawn the RPC and result distribution as a separate task
             // so the loop can immediately collect the next batch.
@@ -826,19 +820,21 @@ impl GrpcStore {
         self.perform_request(request, |request| async move {
             match &self.transport {
                 Transport::Tcp(cm) => {
-                    let channel = cm.connection("find_missing_blobs".into()).await.err_tip(|| "in find_missing_blobs")?;
+                    let channel = cm
+                        .connection("find_missing_blobs".into())
+                        .await
+                        .err_tip(|| "in find_missing_blobs")?;
                     self.cas_client(channel)
                         .find_missing_blobs(Request::new(request))
                         .await
                         .err_tip(|| "in GrpcStore::find_missing_blobs")
                 }
                 #[cfg(feature = "quic")]
-                Transport::Quic(ch) => {
-                    self.cas_client(ch.clone())
-                        .find_missing_blobs(Request::new(request))
-                        .await
-                        .err_tip(|| "in GrpcStore::find_missing_blobs (quic)")
-                }
+                Transport::Quic(ch) => self
+                    .cas_client(ch.clone())
+                    .find_missing_blobs(Request::new(request))
+                    .await
+                    .err_tip(|| "in GrpcStore::find_missing_blobs (quic)"),
                 #[cfg(feature = "quic")]
                 Transport::Dual { quic, .. } => {
                     // Small/batched RPC: prefer QUIC (1.1x faster)
@@ -888,19 +884,21 @@ impl GrpcStore {
             }
             match &self.transport {
                 Transport::Tcp(cm) => {
-                    let channel = cm.connection("batch_update_blobs".into()).await.err_tip(|| "in batch_update_blobs")?;
+                    let channel = cm
+                        .connection("batch_update_blobs".into())
+                        .await
+                        .err_tip(|| "in batch_update_blobs")?;
                     self.cas_client(channel)
                         .batch_update_blobs(grpc_request)
                         .await
                         .err_tip(|| "in GrpcStore::batch_update_blobs")
                 }
                 #[cfg(feature = "quic")]
-                Transport::Quic(ch) => {
-                    self.cas_client(ch.clone())
-                        .batch_update_blobs(grpc_request)
-                        .await
-                        .err_tip(|| "in GrpcStore::batch_update_blobs (quic)")
-                }
+                Transport::Quic(ch) => self
+                    .cas_client(ch.clone())
+                    .batch_update_blobs(grpc_request)
+                    .await
+                    .err_tip(|| "in GrpcStore::batch_update_blobs (quic)"),
                 #[cfg(feature = "quic")]
                 Transport::Dual { quic, .. } => {
                     // Batched RPC: prefer QUIC (9x faster)
@@ -936,19 +934,21 @@ impl GrpcStore {
             }
             match &self.transport {
                 Transport::Tcp(cm) => {
-                    let channel = cm.connection("batch_read_blobs".into()).await.err_tip(|| "in batch_read_blobs")?;
+                    let channel = cm
+                        .connection("batch_read_blobs".into())
+                        .await
+                        .err_tip(|| "in batch_read_blobs")?;
                     self.cas_client(channel)
                         .batch_read_blobs(grpc_request)
                         .await
                         .err_tip(|| "in GrpcStore::batch_read_blobs")
                 }
                 #[cfg(feature = "quic")]
-                Transport::Quic(ch) => {
-                    self.cas_client(ch.clone())
-                        .batch_read_blobs(grpc_request)
-                        .await
-                        .err_tip(|| "in GrpcStore::batch_read_blobs (quic)")
-                }
+                Transport::Quic(ch) => self
+                    .cas_client(ch.clone())
+                    .batch_read_blobs(grpc_request)
+                    .await
+                    .err_tip(|| "in GrpcStore::batch_read_blobs (quic)"),
                 #[cfg(feature = "quic")]
                 Transport::Dual { quic, .. } => {
                     // Batched RPC: prefer QUIC
@@ -976,19 +976,21 @@ impl GrpcStore {
         self.perform_request(request, |request| async move {
             match &self.transport {
                 Transport::Tcp(cm) => {
-                    let channel = cm.connection("get_tree".into()).await.err_tip(|| "in get_tree")?;
+                    let channel = cm
+                        .connection("get_tree".into())
+                        .await
+                        .err_tip(|| "in get_tree")?;
                     self.cas_client(channel)
                         .get_tree(Request::new(request))
                         .await
                         .err_tip(|| "in GrpcStore::get_tree")
                 }
                 #[cfg(feature = "quic")]
-                Transport::Quic(ch) => {
-                    self.cas_client(ch.clone())
-                        .get_tree(Request::new(request))
-                        .await
-                        .err_tip(|| "in GrpcStore::get_tree (quic)")
-                }
+                Transport::Quic(ch) => self
+                    .cas_client(ch.clone())
+                    .get_tree(Request::new(request))
+                    .await
+                    .err_tip(|| "in GrpcStore::get_tree (quic)"),
                 #[cfg(feature = "quic")]
                 Transport::Dual { quic, .. } => {
                     // Metadata RPC: prefer QUIC
@@ -1032,7 +1034,10 @@ impl GrpcStore {
         let resource_for_log = grpc_request.get_ref().resource_name.clone();
         let mut response = match &self.transport {
             Transport::Tcp(cm) => {
-                let channel = cm.connection("bytestream_read".into()).await.err_tip(|| "in read_internal")?;
+                let channel = cm
+                    .connection("bytestream_read".into())
+                    .await
+                    .err_tip(|| "in read_internal")?;
                 let (ep_idx, conn_idx) = channel.channel_id_for_log();
                 info!(
                     resource_name = %resource_for_log,
@@ -1065,7 +1070,10 @@ impl GrpcStore {
                 if prefer_tcp {
                     // Parallel chunked reads: prefer TCP (2x faster at
                     // high concurrency)
-                    let channel = tcp.connection("bytestream_read".into()).await.err_tip(|| "in read_internal (dual/tcp)")?;
+                    let channel = tcp
+                        .connection("bytestream_read".into())
+                        .await
+                        .err_tip(|| "in read_internal (dual/tcp)")?;
                     let (ep_idx, conn_idx) = channel.channel_id_for_log();
                     info!(
                         resource_name = %resource_for_log,
@@ -1407,19 +1415,21 @@ impl GrpcStore {
         self.perform_request(request, |request| async move {
             match &self.transport {
                 Transport::Tcp(cm) => {
-                    let channel = cm.connection("query_write_status".into()).await.err_tip(|| "in query_write_status")?;
+                    let channel = cm
+                        .connection("query_write_status".into())
+                        .await
+                        .err_tip(|| "in query_write_status")?;
                     self.bs_client(channel)
                         .query_write_status(Request::new(request))
                         .await
                         .err_tip(|| "in GrpcStore::query_write_status")
                 }
                 #[cfg(feature = "quic")]
-                Transport::Quic(ch) => {
-                    self.bs_client(ch.clone())
-                        .query_write_status(Request::new(request))
-                        .await
-                        .err_tip(|| "in GrpcStore::query_write_status (quic)")
-                }
+                Transport::Quic(ch) => self
+                    .bs_client(ch.clone())
+                    .query_write_status(Request::new(request))
+                    .await
+                    .err_tip(|| "in GrpcStore::query_write_status (quic)"),
                 #[cfg(feature = "quic")]
                 Transport::Dual { quic, .. } => {
                     // Small metadata RPC: prefer QUIC
@@ -1442,19 +1452,21 @@ impl GrpcStore {
         self.perform_request(request, |request| async move {
             match &self.transport {
                 Transport::Tcp(cm) => {
-                    let channel = cm.connection("get_action_result".into()).await.err_tip(|| "in get_action_result")?;
+                    let channel = cm
+                        .connection("get_action_result".into())
+                        .await
+                        .err_tip(|| "in get_action_result")?;
                     self.ac_client(channel)
                         .get_action_result(Request::new(request))
                         .await
                         .err_tip(|| "in GrpcStore::get_action_result")
                 }
                 #[cfg(feature = "quic")]
-                Transport::Quic(ch) => {
-                    self.ac_client(ch.clone())
-                        .get_action_result(Request::new(request))
-                        .await
-                        .err_tip(|| "in GrpcStore::get_action_result (quic)")
-                }
+                Transport::Quic(ch) => self
+                    .ac_client(ch.clone())
+                    .get_action_result(Request::new(request))
+                    .await
+                    .err_tip(|| "in GrpcStore::get_action_result (quic)"),
                 #[cfg(feature = "quic")]
                 Transport::Dual { quic, .. } => {
                     // AC lookup: prefer QUIC
@@ -1496,19 +1508,21 @@ impl GrpcStore {
             }
             match &self.transport {
                 Transport::Tcp(cm) => {
-                    let channel = cm.connection("update_action_result".into()).await.err_tip(|| "in update_action_result")?;
+                    let channel = cm
+                        .connection("update_action_result".into())
+                        .await
+                        .err_tip(|| "in update_action_result")?;
                     self.ac_client(channel)
                         .update_action_result(grpc_request)
                         .await
                         .err_tip(|| "in GrpcStore::update_action_result")
                 }
                 #[cfg(feature = "quic")]
-                Transport::Quic(ch) => {
-                    self.ac_client(ch.clone())
-                        .update_action_result(grpc_request)
-                        .await
-                        .err_tip(|| "in GrpcStore::update_action_result (quic)")
-                }
+                Transport::Quic(ch) => self
+                    .ac_client(ch.clone())
+                    .update_action_result(grpc_request)
+                    .await
+                    .err_tip(|| "in GrpcStore::update_action_result (quic)"),
                 #[cfg(feature = "quic")]
                 Transport::Dual { quic, .. } => {
                     // Small AC update: prefer QUIC
@@ -1634,8 +1648,7 @@ impl GrpcStore {
         let local_state = LocalState {
             resource_name,
             writer,
-            read_offset: i64::try_from(offset)
-                .err_tip(|| "Could not convert offset to i64")?,
+            read_offset: i64::try_from(offset).err_tip(|| "Could not convert offset to i64")?,
             read_limit: i64::try_from(length.unwrap_or(0))
                 .err_tip(|| "Could not convert length to i64")?,
             bytes_received_this_stream: 0,
@@ -1809,10 +1822,7 @@ impl GrpcStore {
             .await;
         let elapsed_ms = entry_at.elapsed().as_millis() as u64;
         match &result {
-            Ok(()) => info!(
-                elapsed_ms,
-                "GrpcStore::get_part_single_stream exit Ok",
-            ),
+            Ok(()) => info!(elapsed_ms, "GrpcStore::get_part_single_stream exit Ok",),
             Err(err) => info!(
                 elapsed_ms,
                 code = ?err.code,
@@ -1891,12 +1901,10 @@ impl GrpcStore {
         );
 
         // Build chunk descriptors: (chunk_offset, chunk_length).
-        let mut chunks: Vec<(u64, u64)> =
-            Vec::with_capacity(chunk_count as usize);
+        let mut chunks: Vec<(u64, u64)> = Vec::with_capacity(chunk_count as usize);
         let mut current_offset = offset;
         for i in 0..chunk_count {
-            let this_chunk =
-                base_chunk_size + if i < remainder { 1 } else { 0 };
+            let this_chunk = base_chunk_size + if i < remainder { 1 } else { 0 };
             if this_chunk == 0 {
                 break;
             }
@@ -1909,14 +1917,9 @@ impl GrpcStore {
         // Create a bounded channel per chunk. Fetch tasks push data
         // into their channel as it arrives from the gRPC stream;
         // the writer drains channels sequentially (ch0 then ch1 …).
-        let (senders, receivers): (Vec<_>, Vec<_>) =
-            (0..actual_chunk_count)
-                .map(|_| {
-                    tokio::sync::mpsc::channel::<Bytes>(
-                        Self::PARALLEL_CHUNK_CHANNEL_SIZE,
-                    )
-                })
-                .unzip();
+        let (senders, receivers): (Vec<_>, Vec<_>) = (0..actual_chunk_count)
+            .map(|_| tokio::sync::mpsc::channel::<Bytes>(Self::PARALLEL_CHUNK_CHANNEL_SIZE))
+            .unzip();
 
         // Fetch future: drives all chunk reads concurrently.
         // Each fetch streams data into its bounded channel.
@@ -2262,23 +2265,21 @@ impl GrpcStore {
             for mut rx in receivers {
                 while let Some(data) = rx.recv().await {
                     total_bytes += data.len() as u64;
-                    writer.send(data).await.err_tip(|| {
-                        "while writing parallel chunk data"
-                    })?;
+                    writer
+                        .send(data)
+                        .await
+                        .err_tip(|| "while writing parallel chunk data")?;
                 }
             }
             Result::<u64, Error>::Ok(total_bytes)
         };
 
-        let (fetch_result, write_result) =
-            tokio::join!(fetch_all, write_all);
+        let (fetch_result, write_result) = tokio::join!(fetch_all, write_all);
         // Check both — fetch errors take priority since they indicate
         // upstream data issues; write errors indicate downstream
         // backpressure or client disconnect.
-        fetch_result
-            .err_tip(|| "in GrpcStore::get_part_parallel fetch")?;
-        let total_bytes = write_result
-            .err_tip(|| "in GrpcStore::get_part_parallel write")?;
+        fetch_result.err_tip(|| "in GrpcStore::get_part_parallel fetch")?;
+        let total_bytes = write_result.err_tip(|| "in GrpcStore::get_part_parallel write")?;
 
         writer
             .send_eof()
@@ -2286,8 +2287,7 @@ impl GrpcStore {
 
         let elapsed = read_start.elapsed();
         let throughput_mbps = if elapsed.as_secs_f64() > 0.0 {
-            (total_bytes as f64 / (1024.0 * 1024.0))
-                / elapsed.as_secs_f64()
+            (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
         } else {
             0.0
         };
@@ -2336,8 +2336,8 @@ impl GrpcStore {
     ) -> Result<(), Error> {
         use crate::chunked::CHUNK_SIZE;
         use crate::chunked::chunked_client::{
-            ChunkedClientOptions, WorkerApiWriteChunkedDispatcher,
-            WriteChunkedDispatcher, write_chunked_stream,
+            ChunkedClientOptions, WorkerApiWriteChunkedDispatcher, WriteChunkedDispatcher,
+            write_chunked_stream,
         };
 
         let options = ChunkedClientOptions {
@@ -2379,12 +2379,7 @@ impl GrpcStore {
                                     )
                                     .await
                                 }
-                                None => {
-                                    cm.connection(
-                                        "worker_api_write_chunked".to_string(),
-                                    )
-                                    .await
-                                }
+                                None => cm.connection("worker_api_write_chunked".to_string()).await,
                             }
                             .err_tip(|| "in GrpcStore::update_via_chunked_inner (tcp)")
                         })
@@ -2417,12 +2412,7 @@ impl GrpcStore {
                                     )
                                     .await
                                 }
-                                None => {
-                                    cm.connection(
-                                        "worker_api_write_chunked".to_string(),
-                                    )
-                                    .await
-                                }
+                                None => cm.connection("worker_api_write_chunked".to_string()).await,
                             }
                             .err_tip(|| "in GrpcStore::update_via_chunked_inner (dual/tcp)")
                         })
@@ -2647,11 +2637,7 @@ impl StoreDriver for GrpcStore {
         Ok(())
     }
 
-    async fn update_oneshot(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        data: Bytes,
-    ) -> Result<(), Error> {
+    async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
         // Route small CAS blobs through BatchUpdateBlobs.
         if !matches!(self.store_type, nativelink_config::stores::StoreType::Ac)
             && self.batch_update_threshold > 0
@@ -2675,8 +2661,7 @@ impl StoreDriver for GrpcStore {
 
             // Fallback: immediate single-element BatchUpdateBlobs (no batch loop).
             let digests = [digest];
-            let mut results =
-                self.do_batch_update(&digests, vec![(digest, data)]).await;
+            let mut results = self.do_batch_update(&digests, vec![(digest, data)]).await;
             return results.remove(&digest).unwrap_or_else(|| {
                 Err(make_input_err!("BatchUpdateBlobs: no response for digest"))
             });
@@ -2724,13 +2709,9 @@ impl StoreDriver for GrpcStore {
     ) -> Result<(), Error> {
         let digest = key.into_digest();
         if matches!(self.store_type, nativelink_config::stores::StoreType::Ac) {
-            let offset = usize::try_from(offset)
-                .err_tip(|| "Could not convert offset to usize")?;
+            let offset = usize::try_from(offset).err_tip(|| "Could not convert offset to usize")?;
             let length = length
-                .map(|v| {
-                    usize::try_from(v)
-                        .err_tip(|| "Could not convert length to usize")
-                })
+                .map(|v| usize::try_from(v).err_tip(|| "Could not convert length to usize"))
                 .transpose()?;
 
             return self
@@ -2771,9 +2752,7 @@ impl StoreDriver for GrpcStore {
         // N bytes from this offset" — so a tiny blob stays on the
         // single-stream path regardless of what the caller asked for.
         let blob_remaining = digest.size_bytes().saturating_sub(offset);
-        let effective_length = length
-            .unwrap_or(blob_remaining)
-            .min(blob_remaining);
+        let effective_length = length.unwrap_or(blob_remaining).min(blob_remaining);
 
         // Use parallel chunked reads for large blobs.
         if self.parallel_chunk_read_threshold > 0
@@ -2799,13 +2778,8 @@ impl StoreDriver for GrpcStore {
         // be harmless on the wire today; tightening here prevents a
         // future refactor that uses `length` for client-side
         // allocation/timing from inheriting the un-clamped value.
-        self.get_part_single_stream(
-            resource_name,
-            writer,
-            offset,
-            Some(effective_length),
-        )
-        .await
+        self.get_part_single_stream(resource_name, writer, offset, Some(effective_length))
+            .await
     }
 
     fn inner_store(&self, _digest: Option<StoreKey>) -> &dyn StoreDriver {
@@ -2879,7 +2853,8 @@ mod tests {
         }
 
         // True for the production Internal signature.
-        let production_err: Error = make_err!(Code::Internal, "Tried to send while stream is closed");
+        let production_err: Error =
+            make_err!(Code::Internal, "Tried to send while stream is closed");
         assert!(
             looks_like_dead_channel(&production_err),
             "the production wedge message must classify as dead channel"
@@ -2997,8 +2972,7 @@ mod tests {
     #[test]
     fn classify_clean_eof_short_blob_is_clean_short() {
         let outcome = classify_chunk_attempt(
-            /*clean_eof=*/ true,
-            /*bytes_received=*/ 183,
+            /*clean_eof=*/ true, /*bytes_received=*/ 183,
             /*chunk_length=*/ 2_500_000,
         );
         assert_eq!(
@@ -3033,9 +3007,7 @@ mod tests {
     #[test]
     fn classify_empty_data_break_is_ambiguous_early_break() {
         let outcome = classify_chunk_attempt(
-            /*clean_eof=*/ false,
-            /*bytes_received=*/ 100,
-            /*chunk_length=*/ 1024,
+            /*clean_eof=*/ false, /*bytes_received=*/ 100, /*chunk_length=*/ 1024,
         );
         assert_eq!(outcome, ChunkAttemptOutcome::AmbiguousEarlyBreak);
     }

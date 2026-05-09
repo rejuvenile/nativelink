@@ -507,7 +507,10 @@ pub struct KillOperationRequest {
 /// / Communication from the scheduler to the worker.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateForWorker {
-    #[prost(oneof = "update_for_worker::Update", tags = "1, 2, 3, 4, 5, 7, 8, 9, 10, 11")]
+    #[prost(
+        oneof = "update_for_worker::Update",
+        tags = "1, 2, 3, 4, 5, 7, 8, 9, 10, 11"
+    )]
     pub update: ::core::option::Option<update_for_worker::Update>,
 }
 /// Nested message and enum types in `UpdateForWorker`.
@@ -591,7 +594,10 @@ pub struct BisAck {
 /// / Communication from the worker to the scheduler.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateForScheduler {
-    #[prost(oneof = "update_for_scheduler::Update", tags = "1, 2, 3, 4, 5, 7, 8, 9")]
+    #[prost(
+        oneof = "update_for_scheduler::Update",
+        tags = "1, 2, 3, 4, 5, 7, 8, 9"
+    )]
     pub update: ::core::option::Option<update_for_scheduler::Update>,
 }
 /// Nested message and enum types in `UpdateForScheduler`.
@@ -731,17 +737,7 @@ pub struct BackpressureSignal {
 }
 /// Nested message and enum types in `BackpressureSignal`.
 pub mod backpressure_signal {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Reason {
         Unspecified = 0,
@@ -832,17 +828,7 @@ pub struct WatchdogTimeoutSignal {
 }
 /// Nested message and enum types in `WatchdogTimeoutSignal`.
 pub mod watchdog_timeout_signal {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Reason {
         Unspecified = 0,
@@ -879,8 +865,7 @@ pub mod watchdog_timeout_signal {
 /// and decoder (`classify_retryable` in chunked_client.rs) agree on
 /// the exact wire string. The discriminator is the load-bearing gate
 /// for the `DeadlineExceeded → Retry` arm.
-pub const WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL: &str =
-    "type.googleapis.com/com.github.trace_machina.nativelink.remote_execution.WatchdogTimeoutSignal";
+pub const WATCHDOG_TIMEOUT_SIGNAL_TYPE_URL: &str = "type.googleapis.com/com.github.trace_machina.nativelink.remote_execution.WatchdogTimeoutSignal";
 /// / #212 Phase 2.2: one chunk of a `WriteChunked` client-streaming
 /// / upload. See worker_api.proto for the full schema documentation.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -924,10 +909,10 @@ pub mod worker_api_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// / This API describes how schedulers communicate with Worker nodes.
     /// /
     /// / When a worker node comes online it must be pre-configured with the
@@ -962,14 +947,13 @@ pub mod worker_api_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<
+                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    >,
                 >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             WorkerApiClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -1015,33 +999,23 @@ pub mod worker_api_client {
         /// / the worker what worker ID to place in action results.
         pub async fn connect_worker(
             &mut self,
-            request: impl tonic::IntoStreamingRequest<
-                Message = super::UpdateForScheduler,
-            >,
+            request: impl tonic::IntoStreamingRequest<Message = super::UpdateForScheduler>,
         ) -> std::result::Result<
             tonic::Response<tonic::codec::Streaming<super::UpdateForWorker>>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker",
             );
             let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "com.github.trace_machina.nativelink.remote_execution.WorkerApi",
-                        "ConnectWorker",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "com.github.trace_machina.nativelink.remote_execution.WorkerApi",
+                "ConnectWorker",
+            ));
             self.inner.streaming(req, path, codec).await
         }
     }
@@ -1053,7 +1027,7 @@ pub mod worker_api_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with WorkerApiServer.
@@ -1062,8 +1036,7 @@ pub mod worker_api_server {
         /// Server streaming response type for the ConnectWorker method.
         type ConnectWorkerStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::UpdateForWorker, tonic::Status>,
-            >
-            + std::marker::Send
+            > + std::marker::Send
             + 'static;
         /// / Registers this worker and informs the scheduler what properties
         /// / this worker supports. The response must be listened on the client
@@ -1077,10 +1050,7 @@ pub mod worker_api_server {
         async fn connect_worker(
             &self,
             request: tonic::Request<tonic::Streaming<super::UpdateForScheduler>>,
-        ) -> std::result::Result<
-            tonic::Response<Self::ConnectWorkerStream>,
-            tonic::Status,
-        >;
+        ) -> std::result::Result<tonic::Response<Self::ConnectWorkerStream>, tonic::Status>;
     }
     /// / This API describes how schedulers communicate with Worker nodes.
     /// /
@@ -1110,10 +1080,7 @@ pub mod worker_api_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -1168,21 +1135,16 @@ pub mod worker_api_server {
                 "/com.github.trace_machina.nativelink.remote_execution.WorkerApi/ConnectWorker" => {
                     #[allow(non_camel_case_types)]
                     struct ConnectWorkerSvc<T: WorkerApi>(pub Arc<T>);
-                    impl<
-                        T: WorkerApi,
-                    > tonic::server::StreamingService<super::UpdateForScheduler>
-                    for ConnectWorkerSvc<T> {
+                    impl<T: WorkerApi> tonic::server::StreamingService<super::UpdateForScheduler>
+                        for ConnectWorkerSvc<T>
+                    {
                         type Response = super::UpdateForWorker;
                         type ResponseStream = T::ConnectWorkerStream;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::ResponseStream>,
-                            tonic::Status,
-                        >;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
                         fn call(
                             &mut self,
-                            request: tonic::Request<
-                                tonic::Streaming<super::UpdateForScheduler>,
-                            >,
+                            request: tonic::Request<tonic::Streaming<super::UpdateForScheduler>>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
@@ -1213,25 +1175,19 @@ pub mod worker_api_server {
                     };
                     Box::pin(fut)
                 }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
             }
         }
     }
@@ -1266,10 +1222,10 @@ pub mod cas_extensions_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// / NativeLink-owned extensions to the standard REAPI CAS-side
     /// / surface (worker→server `WriteChunked`, future capability
     /// / discovery, etc.).
@@ -1300,14 +1256,13 @@ pub mod cas_extensions_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<
+                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    >,
                 >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             CasExtensionsClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -1348,30 +1303,20 @@ pub mod cas_extensions_client {
         pub async fn write_chunked(
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = super::WriteChunk>,
-        ) -> std::result::Result<
-            tonic::Response<super::WriteChunkedResponse>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::WriteChunkedResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/com.github.trace_machina.nativelink.remote_execution.CasExtensions/WriteChunked",
             );
             let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "com.github.trace_machina.nativelink.remote_execution.CasExtensions",
-                        "WriteChunked",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "com.github.trace_machina.nativelink.remote_execution.CasExtensions",
+                "WriteChunked",
+            ));
             self.inner.client_streaming(req, path, codec).await
         }
     }
@@ -1383,7 +1328,7 @@ pub mod cas_extensions_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with CasExtensionsServer.
@@ -1397,15 +1342,11 @@ pub mod cas_extensions_server {
         async fn write_chunked(
             &self,
             _request: tonic::Request<tonic::Streaming<super::WriteChunk>>,
-        ) -> std::result::Result<
-            tonic::Response<super::WriteChunkedResponse>,
-            tonic::Status,
-        > {
-            Err(
-                tonic::Status::unimplemented(
-                    "WriteChunked is not enabled on this server (chunked_fast_slow feature is OFF)",
-                ),
-            )
+        ) -> std::result::Result<tonic::Response<super::WriteChunkedResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented(
+                "WriteChunked is not enabled on this server (chunked_fast_slow feature is OFF)",
+            ))
         }
     }
     /// / NativeLink-owned extensions to the standard REAPI CAS-side
@@ -1431,10 +1372,7 @@ pub mod cas_extensions_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(
-            inner: T,
-            interceptor: F,
-        ) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -1486,18 +1424,15 @@ pub mod cas_extensions_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/com.github.trace_machina.nativelink.remote_execution.CasExtensions/WriteChunked" => {
+                "/com.github.trace_machina.nativelink.remote_execution.CasExtensions/WriteChunked" =>
+                {
                     #[allow(non_camel_case_types)]
                     struct WriteChunkedSvc<T: CasExtensions>(pub Arc<T>);
-                    impl<
-                        T: CasExtensions,
-                    > tonic::server::ClientStreamingService<super::WriteChunk>
-                    for WriteChunkedSvc<T> {
+                    impl<T: CasExtensions> tonic::server::ClientStreamingService<super::WriteChunk>
+                        for WriteChunkedSvc<T>
+                    {
                         type Response = super::WriteChunkedResponse;
-                        type Future = BoxFuture<
-                            tonic::Response<Self::Response>,
-                            tonic::Status,
-                        >;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
                         fn call(
                             &mut self,
                             request: tonic::Request<tonic::Streaming<super::WriteChunk>>,
@@ -1531,25 +1466,19 @@ pub mod cas_extensions_server {
                     };
                     Box::pin(fut)
                 }
-                _ => {
-                    Box::pin(async move {
-                        let mut response = http::Response::new(
-                            tonic::body::Body::default(),
-                        );
-                        let headers = response.headers_mut();
-                        headers
-                            .insert(
-                                tonic::Status::GRPC_STATUS,
-                                (tonic::Code::Unimplemented as i32).into(),
-                            );
-                        headers
-                            .insert(
-                                http::header::CONTENT_TYPE,
-                                tonic::metadata::GRPC_CONTENT_TYPE,
-                            );
-                        Ok(response)
-                    })
-                }
+                _ => Box::pin(async move {
+                    let mut response = http::Response::new(tonic::body::Body::default());
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        tonic::Status::GRPC_STATUS,
+                        (tonic::Code::Unimplemented as i32).into(),
+                    );
+                    headers.insert(
+                        http::header::CONTENT_TYPE,
+                        tonic::metadata::GRPC_CONTENT_TYPE,
+                    );
+                    Ok(response)
+                }),
             }
         }
     }
@@ -1566,7 +1495,8 @@ pub mod cas_extensions_server {
         }
     }
     /// Generated gRPC service name
-    pub const SERVICE_NAME: &str = "com.github.trace_machina.nativelink.remote_execution.CasExtensions";
+    pub const SERVICE_NAME: &str =
+        "com.github.trace_machina.nativelink.remote_execution.CasExtensions";
     impl<T> tonic::server::NamedService for CasExtensionsServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }

@@ -68,8 +68,7 @@ use nativelink_util::store_trait::{
 };
 use pretty_assertions::assert_eq;
 
-const VALID_HASH_MIRROR: &str =
-    "0123456789abcdef000000000000000000020000000000000123456789abcdef";
+const VALID_HASH_MIRROR: &str = "0123456789abcdef000000000000000000020000000000000123456789abcdef";
 
 /// A peer-side store that delays before serving any chunk. Models a
 /// real network peer that takes a few hundred ms to respond, opening
@@ -196,8 +195,8 @@ impl StoreDriver for DelayedPeerStore {
 /// the OUTER writer is closed mid-recovery. With the fix, the read
 /// receives all peer bytes.
 #[nativelink_test]
-async fn mirror_blobs_size_mismatch_does_not_terminate_outer_writer_when_gate_set(
-) -> Result<(), Error> {
+async fn mirror_blobs_size_mismatch_does_not_terminate_outer_writer_when_gate_set()
+-> Result<(), Error> {
     let value: Vec<u8> = (0..32_000u32).map(|i| (i & 0xFF) as u8).collect();
     let digest = DigestInfo::try_new(VALID_HASH_MIRROR, value.len() as u64)?;
 
@@ -223,10 +222,7 @@ async fn mirror_blobs_size_mismatch_does_not_terminate_outer_writer_when_gate_se
     // Plant a phantom-positive entry: data.len() (10 bytes) does NOT
     // match digest.size_bytes() (32_000). The first byte of `get_part`
     // will hit the size-mismatch branch and synthesize NotFound.
-    fast_slow_arc.test_insert_mirror_blob_unchecked(
-        digest,
-        Bytes::from_static(b"phantom!!!"),
-    );
+    fast_slow_arc.test_insert_mirror_blob_unchecked(digest, Bytes::from_static(b"phantom!!!"));
     assert_eq!(
         fast_slow_arc.mirror_blob_count(),
         1,

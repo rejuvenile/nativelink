@@ -167,8 +167,7 @@ async fn has_falls_back_to_locality_map_when_inner_missing() -> Result<(), Error
 //    (locality-aware FMB; commit d3399e48, 2026-04-22).
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn has_with_results_falls_back_to_locality_map_when_inner_missing()
--> Result<(), Error> {
+async fn has_with_results_falls_back_to_locality_map_when_inner_missing() -> Result<(), Error> {
     let (proxy, _inner, locality_map) = make_proxy_store();
 
     let value = b"test data";
@@ -177,9 +176,7 @@ async fn has_with_results_falls_back_to_locality_map_when_inner_missing()
     let d3 = DigestInfo::try_new(VALID_HASH3, 50)?;
 
     // Only d1 is in the inner store.
-    proxy
-        .update_oneshot(d1, Bytes::from_static(value))
-        .await?;
+    proxy.update_oneshot(d1, Bytes::from_static(value)).await?;
 
     // Register d2 and d3 on workers — has_with_results consults the
     // locality_map for digests still missing after the inner check and
@@ -221,8 +218,7 @@ async fn has_with_results_falls_back_to_locality_map_when_inner_missing()
 //     Guards the operator escape hatch at worker_proxy_store.rs:454.
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn has_with_results_skips_locality_after_disable_locality_in_has()
--> Result<(), Error> {
+async fn has_with_results_skips_locality_after_disable_locality_in_has() -> Result<(), Error> {
     let (proxy_arc, _inner, locality_map) = make_proxy_store_with_arc();
     let proxy = Store::new(proxy_arc.clone());
 
@@ -243,8 +239,7 @@ async fn has_with_results_skips_locality_after_disable_locality_in_has()
     proxy.has_with_results(&keys, &mut results).await?;
 
     assert_eq!(
-        results[0],
-        None,
+        results[0], None,
         "disable_locality_in_has() must bypass the locality_map fallback; \
          the inner store is empty so has_with_results must report None"
     );
@@ -330,16 +325,15 @@ async fn get_part_with_offset_and_length_from_inner() -> Result<(), Error> {
 //    => the queried digest is still NotFound (locality map miss)
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn get_part_inner_miss_locality_has_different_digest_returns_not_found() -> Result<(), Error> {
+async fn get_part_inner_miss_locality_has_different_digest_returns_not_found() -> Result<(), Error>
+{
     let (proxy, _inner, locality_map) = make_proxy_store();
 
     let d1 = DigestInfo::try_new(VALID_HASH1, 100)?;
     let d2 = DigestInfo::try_new(VALID_HASH2, 200)?;
 
     // Register d2 on a worker, but NOT d1.
-    locality_map
-        .write()
-        .register_blobs("worker-a:50081", &[d2]);
+    locality_map.write().register_blobs("worker-a:50081", &[d2]);
 
     // Query d1 — not in inner store, not in locality map.
     let result = proxy.get_part_unchunked(d1, 0, None).await;
@@ -425,12 +419,8 @@ async fn has_with_results_multiple_blobs_mixed() -> Result<(), Error> {
     let d2 = DigestInfo::try_new(VALID_HASH2, 999)?; // not stored
     let d3 = DigestInfo::try_new(VALID_HASH3, v3.len() as u64)?;
 
-    proxy
-        .update_oneshot(d1, Bytes::from_static(v1))
-        .await?;
-    proxy
-        .update_oneshot(d3, Bytes::from_static(v3))
-        .await?;
+    proxy.update_oneshot(d1, Bytes::from_static(v1)).await?;
+    proxy.update_oneshot(d3, Bytes::from_static(v3)).await?;
 
     let keys: Vec<StoreKey<'_>> = vec![d1.into(), d2.into(), d3.into()];
     let mut results = vec![None; 3];
@@ -696,7 +686,10 @@ impl StoreDriver for PartialFailStore {
         length: Option<u64>,
     ) -> Result<(), Error> {
         // Read the full blob from the inner store.
-        let data = self.inner.get_part_unchunked(key.borrow(), offset, length).await?;
+        let data = self
+            .inner
+            .get_part_unchunked(key.borrow(), offset, length)
+            .await?;
 
         // Write up to `fail_after_bytes` bytes, then return an error.
         let write_len = core::cmp::min(data.len() as u64, self.fail_after_bytes) as usize;
@@ -820,7 +813,10 @@ async fn worker_request_returns_redirect_with_peer_endpoints() -> Result<(), Err
         .scope(true, proxy.get_part_unchunked(digest, 0, None))
         .await;
 
-    assert!(result.is_err(), "Expected redirect error for worker request");
+    assert!(
+        result.is_err(),
+        "Expected redirect error for worker request"
+    );
     let err = result.unwrap_err();
     assert_eq!(
         err.code,
@@ -1050,7 +1046,9 @@ async fn peer_unavailable_mid_stream_drops_cached_connection() -> Result<(), Err
 
     // Sanity: connection is in the pool before the call.
     assert!(
-        proxy_arc.peer_stores().contains_key(&Arc::from(peer_endpoint)),
+        proxy_arc
+            .peer_stores()
+            .contains_key(&Arc::from(peer_endpoint)),
         "Expected injected connection to be present before fetch"
     );
 
@@ -1068,7 +1066,9 @@ async fn peer_unavailable_mid_stream_drops_cached_connection() -> Result<(), Err
     // ("Sender dropped before sending EOF") and the connection would
     // have remained cached.
     assert!(
-        !proxy_arc.peer_stores().contains_key(&Arc::from(peer_endpoint)),
+        !proxy_arc
+            .peer_stores()
+            .contains_key(&Arc::from(peer_endpoint)),
         "Expected cached connection to be removed after upstream Unavailable; \
          peer_stores={:?}",
         proxy_arc.peer_stores().keys().collect::<Vec<_>>()
@@ -1116,7 +1116,9 @@ async fn peer_dataloss_mid_stream_keeps_cached_connection() -> Result<(), Error>
     // remains. Locality entry IS evicted (always-on under 2fe4b1cb),
     // but the connection pool entry must persist.
     assert!(
-        proxy_arc.peer_stores().contains_key(&Arc::from(peer_endpoint)),
+        proxy_arc
+            .peer_stores()
+            .contains_key(&Arc::from(peer_endpoint)),
         "Expected cached connection to remain after non-connection upstream error"
     );
 
@@ -1159,7 +1161,9 @@ async fn peer_unavailable_pre_eof_drops_cached_connection() -> Result<(), Error>
     let _unused = proxy.get_part_unchunked(digest, 0, None).await;
 
     assert!(
-        !proxy_arc.peer_stores().contains_key(&Arc::from(peer_endpoint)),
+        !proxy_arc
+            .peer_stores()
+            .contains_key(&Arc::from(peer_endpoint)),
         "Expected cached connection to be removed after pre-EOF Unavailable"
     );
 
@@ -1176,8 +1180,8 @@ async fn peer_unavailable_pre_eof_drops_cached_connection() -> Result<(), Error>
 /// Helper to assert that an error carries a single `PreconditionFailure`
 /// MISSING violation whose `subject` is `"blobs/<hash>/<size>"`.
 fn assert_precondition_failure_for_digest(err: &Error, digest: DigestInfo) {
-    use prost::Message;
     use nativelink_util::common::PreconditionFailure;
+    use prost::Message;
 
     assert_eq!(
         err.details.len(),
@@ -1195,11 +1199,7 @@ fn assert_precondition_failure_for_digest(err: &Error, digest: DigestInfo) {
         .expect("detail value must decode as PreconditionFailure");
     assert_eq!(pf.violations.len(), 1, "expected one violation");
     assert_eq!(pf.violations[0].r#type, "MISSING");
-    let expected_subject = format!(
-        "blobs/{}/{}",
-        digest.packed_hash(),
-        digest.size_bytes(),
-    );
+    let expected_subject = format!("blobs/{}/{}", digest.packed_hash(), digest.size_bytes(),);
     assert_eq!(
         pf.violations[0].subject, expected_subject,
         "violation subject must be 'blobs/<hash>/<size>', got: {}",
@@ -1225,7 +1225,9 @@ async fn worker_request_no_redirect_not_found_carries_precondition_detail() -> R
         .scope(true, proxy.get_part_unchunked(digest, 0, None))
         .await;
 
-    let err = result.err().expect("expected NotFound for worker request with no peers");
+    let err = result
+        .err()
+        .expect("expected NotFound for worker request with no peers");
     assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
     assert_precondition_failure_for_digest(&err, digest);
     Ok(())
@@ -1255,7 +1257,9 @@ async fn inner_store_and_all_workers_miss_carries_precondition_detail() -> Resul
         .scope(false, proxy.get_part_unchunked(digest, 0, None))
         .await;
 
-    let err = result.err().expect("expected NotFound after all workers fail and inner misses");
+    let err = result
+        .err()
+        .expect("expected NotFound after all workers fail and inner misses");
     assert_eq!(err.code, Code::NotFound, "expected NotFound, got: {err:?}");
     assert_precondition_failure_for_digest(&err, digest);
     Ok(())
@@ -1321,8 +1325,7 @@ async fn inner_fallthrough_codes_invoke_peer_fetch() -> Result<(), Error> {
     ];
 
     for (code, marker) in cases {
-        let (proxy_arc, proxy, locality_map) =
-            make_proxy_with_failing_inner(*code, marker);
+        let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(*code, marker);
 
         let value = b"data only on the peer worker";
         let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
@@ -1359,10 +1362,8 @@ async fn inner_fallthrough_codes_invoke_peer_fetch() -> Result<(), Error> {
 // -------------------------------------------------------------------
 #[nativelink_test]
 async fn inner_permission_denied_does_not_invoke_peer_fetch() -> Result<(), Error> {
-    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
-        Code::PermissionDenied,
-        "INNER_PERMISSION_DENIED_MARKER",
-    );
+    let (proxy_arc, proxy, locality_map) =
+        make_proxy_with_failing_inner(Code::PermissionDenied, "INNER_PERMISSION_DENIED_MARKER");
 
     let value = b"this peer data must NOT be returned";
     let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
@@ -1386,7 +1387,8 @@ async fn inner_permission_denied_does_not_invoke_peer_fetch() -> Result<(), Erro
         "PermissionDenied must propagate; peer-fetch must NOT be invoked. err={err:?}"
     );
     assert!(
-        err.message_string().contains("INNER_PERMISSION_DENIED_MARKER"),
+        err.message_string()
+            .contains("INNER_PERMISSION_DENIED_MARKER"),
         "Expected the original inner-store error message to surface, got: {}",
         err.message_string()
     );
@@ -1464,7 +1466,10 @@ impl StoreDriver for EmptyEofStore {
         _reader: DropCloserReadHalf,
         _upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
-        Err(make_err!(Code::Unimplemented, "EmptyEofStore does not support update"))
+        Err(make_err!(
+            Code::Unimplemented,
+            "EmptyEofStore does not support update"
+        ))
     }
 
     async fn get_part(
@@ -1649,9 +1654,7 @@ async fn drive_empty_eof_race(
     // scheduled, spawns its racer tasks, drains the winner's EOF, and
     // enters the relevant `await_*_after_empty_*` arm before the
     // loser produces its EOF.
-    let handle = tokio::spawn(async move {
-        proxy.get_part_unchunked(digest, 0, None).await
-    });
+    let handle = tokio::spawn(async move { proxy.get_part_unchunked(digest, 0, None).await });
     for _ in 0..64 {
         tokio::task::yield_now().await;
     }
@@ -1750,8 +1753,7 @@ async fn await_server_after_empty_peer_carries_precondition_detail() -> Result<(
 // `Ok(21 bytes)` instead of `Err`.
 // -------------------------------------------------------------------
 #[nativelink_test]
-async fn inner_partial_write_then_error_is_not_papered_over_by_peer_fetch()
--> Result<(), Error> {
+async fn inner_partial_write_then_error_is_not_papered_over_by_peer_fetch() -> Result<(), Error> {
     // Every code in `should_try_peers`'s allowlist; all 6 must be
     // guarded — keeping the guard code-agnostic keeps the corruption
     // surface zero regardless of which code the inner store emits.
@@ -1761,7 +1763,10 @@ async fn inner_partial_write_then_error_is_not_papered_over_by_peer_fetch()
         (Code::Unavailable, "INNER_PARTIAL_THEN_UNAVAILABLE"),
         (Code::OutOfRange, "INNER_PARTIAL_THEN_OUT_OF_RANGE"),
         (Code::Unknown, "INNER_PARTIAL_THEN_UNKNOWN"),
-        (Code::ResourceExhausted, "INNER_PARTIAL_THEN_RESOURCE_EXHAUSTED"),
+        (
+            Code::ResourceExhausted,
+            "INNER_PARTIAL_THEN_RESOURCE_EXHAUSTED",
+        ),
     ];
 
     // Inner partial-prefix length and peer blob length differ on
@@ -1832,10 +1837,8 @@ async fn inner_partial_write_then_error_is_not_papered_over_by_peer_fetch()
 // -------------------------------------------------------------------
 #[nativelink_test]
 async fn inner_aborted_does_not_invoke_peer_fetch() -> Result<(), Error> {
-    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
-        Code::Aborted,
-        "INNER_ABORTED_MARKER",
-    );
+    let (proxy_arc, proxy, locality_map) =
+        make_proxy_with_failing_inner(Code::Aborted, "INNER_ABORTED_MARKER");
 
     let value = b"this peer data must NOT be returned for Aborted";
     let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
@@ -1876,10 +1879,8 @@ async fn inner_aborted_does_not_invoke_peer_fetch() -> Result<(), Error> {
 // -------------------------------------------------------------------
 #[nativelink_test]
 async fn inner_deadline_exceeded_does_not_invoke_peer_fetch() -> Result<(), Error> {
-    let (proxy_arc, proxy, locality_map) = make_proxy_with_failing_inner(
-        Code::DeadlineExceeded,
-        "INNER_DEADLINE_EXCEEDED_MARKER",
-    );
+    let (proxy_arc, proxy, locality_map) =
+        make_proxy_with_failing_inner(Code::DeadlineExceeded, "INNER_DEADLINE_EXCEEDED_MARKER");
 
     let value = b"this peer data must NOT be returned for DeadlineExceeded";
     let digest = DigestInfo::try_new(VALID_HASH1, value.len() as u64)?;
@@ -1903,7 +1904,8 @@ async fn inner_deadline_exceeded_does_not_invoke_peer_fetch() -> Result<(), Erro
         "DeadlineExceeded must propagate; peer-fetch must NOT be invoked. err={err:?}"
     );
     assert!(
-        err.message_string().contains("INNER_DEADLINE_EXCEEDED_MARKER"),
+        err.message_string()
+            .contains("INNER_DEADLINE_EXCEEDED_MARKER"),
         "Expected the original inner-store error message to surface, got: {}",
         err.message_string()
     );
@@ -2255,8 +2257,7 @@ async fn cdn_cache_populates_local_on_first_peer_fetch() -> Result<(), Error> {
     ));
 
     let locality_map = new_shared_blob_locality_map();
-    let proxy_arc =
-        WorkerProxyStore::new(existence_cache.clone(), locality_map.clone());
+    let proxy_arc = WorkerProxyStore::new(existence_cache.clone(), locality_map.clone());
     let proxy = Store::new(proxy_arc.clone());
 
     // Peer holds the blob.
@@ -2328,9 +2329,7 @@ async fn cdn_cache_populates_local_on_first_peer_fetch() -> Result<(), Error> {
     // CAS, the second read hits local and succeeds; if not, it
     // panics on the empty locality_map / unreachable peer.
     proxy_arc.remove_worker_endpoint(peer_endpoint);
-    locality_map
-        .write()
-        .evict_blobs(peer_endpoint, &[digest]);
+    locality_map.write().evict_blobs(peer_endpoint, &[digest]);
 
     let bytes2 = tokio::time::timeout(
         Duration::from_secs(5),
@@ -2386,8 +2385,7 @@ async fn cdn_cache_populates_local_on_first_peer_fetch() -> Result<(), Error> {
 /// becomes 1 instead of 0.
 #[nativelink_test]
 async fn cdn_cache_does_not_populate_on_partial_range_read() -> Result<(), Error> {
-    use core::sync::atomic::AtomicU64;
-    use core::sync::atomic::Ordering as AOrdering;
+    use core::sync::atomic::{AtomicU64, Ordering as AOrdering};
     use core::time::Duration;
 
     let value: Vec<u8> = (0..10_000u32).map(|i| (i & 0xFF) as u8).collect();
@@ -2457,11 +2455,7 @@ async fn cdn_cache_does_not_populate_on_partial_range_read() -> Result<(), Error
          within 5s; production composition wraps a RecordingInnerStore",
     )?;
 
-    assert_eq!(
-        bytes.len(),
-        100,
-        "partial bytes must be returned correctly",
-    );
+    assert_eq!(bytes.len(), 100, "partial bytes must be returned correctly",);
     assert_eq!(bytes.as_ref(), &value[10..110]);
 
     // CRITICAL: tee MUST NOT have called inner.update() — partial-range
@@ -2791,9 +2785,7 @@ async fn cdn_cache_failure_on_peer_mid_stream_err_does_not_deadlock() -> Result<
         proxy.get_part_unchunked(digest, 0, None),
     )
     .await
-    .expect(
-        "must not deadlock — cache_tx un-terminated on peer-mid-stream-Err",
-    );
+    .expect("must not deadlock — cache_tx un-terminated on peer-mid-stream-Err");
 
     // (a) The outer caller saw an error (NOT Ok). The peer mid-stream
     // err is consumed by `try_read_from_worker`'s peer-iteration loop

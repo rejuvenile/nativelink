@@ -172,20 +172,12 @@ async fn ac_chunk_drains_ac_only_not_cas() {
 
     let proto = vec![proto_digest_for(&aliased)];
 
-    let outcome = tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async {
-            // handle_blobs_in_stable_storage_for_store is synchronous;
-            // wrap in async block + timeout to satisfy the deadlock
-            // detector contract for borrowed-state lifecycle changes.
-            handle_blobs_in_stable_storage_for_store(
-                &state,
-                None,
-                AC_STORE_NAME,
-                &proto,
-            )
-        },
-    )
+    let outcome = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        // handle_blobs_in_stable_storage_for_store is synchronous;
+        // wrap in async block + timeout to satisfy the deadlock
+        // detector contract for borrowed-state lifecycle changes.
+        handle_blobs_in_stable_storage_for_store(&state, None, AC_STORE_NAME, &proto)
+    })
     .await
     .expect("must not deadlock — AC chunk routing contract violated");
 
@@ -232,12 +224,9 @@ async fn cas_chunk_does_not_touch_ac_pins_even_under_aliased_digest() {
     let proto = vec![proto_digest_for(&aliased)];
 
     // Empty store_id → CAS path.
-    let outcome = tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async {
-            handle_blobs_in_stable_storage_for_store(&state, None, "", &proto)
-        },
-    )
+    let outcome = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        handle_blobs_in_stable_storage_for_store(&state, None, "", &proto)
+    })
     .await
     .expect("must not deadlock — CAS chunk routing contract violated");
 
@@ -281,17 +270,9 @@ async fn unknown_store_id_chunk_is_noop_with_ac_target_present() {
 
     let proto = vec![proto_digest_for(&digest)];
 
-    let outcome = tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async {
-            handle_blobs_in_stable_storage_for_store(
-                &state,
-                None,
-                "AC_GHOST_STORE",
-                &proto,
-            )
-        },
-    )
+    let outcome = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        handle_blobs_in_stable_storage_for_store(&state, None, "AC_GHOST_STORE", &proto)
+    })
     .await
     .expect("must not deadlock — unknown store_id handling violated");
 
@@ -341,17 +322,9 @@ async fn ac_store_id_chunk_with_no_ac_target_is_noop() {
 
     let proto = vec![proto_digest_for(&digest)];
 
-    let outcome = tokio::time::timeout(
-        core::time::Duration::from_secs(5),
-        async {
-            handle_blobs_in_stable_storage_for_store(
-                &state,
-                None,
-                AC_STORE_NAME,
-                &proto,
-            )
-        },
-    )
+    let outcome = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        handle_blobs_in_stable_storage_for_store(&state, None, AC_STORE_NAME, &proto)
+    })
     .await
     .expect("must not deadlock — no-AC-target routing contract violated");
 

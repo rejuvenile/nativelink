@@ -20,9 +20,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::sync::{Arc, Weak};
 #[cfg(feature = "chunked_fast_slow")]
 use std::sync::OnceLock;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -729,7 +729,8 @@ pub struct FastSlowStore {
     /// concrete type lives in `nativelink-store`, but the production
     /// wiring lives in `nativelink-service` (post-hoc install).
     #[cfg(feature = "chunked_fast_slow")]
-    chunked_read_registry: OnceLock<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>>,
+    chunked_read_registry:
+        OnceLock<Arc<crate::chunked::chunked_read_registry::ChunkedReadRegistry>>,
     /// #212 Phase 2.5 runtime kill-switch for the read cascade's
     /// `failed_writes` pin step. Default OFF — even with the
     /// `chunked_fast_slow` feature compiled in AND a registry wired,
@@ -932,10 +933,7 @@ impl FastSlowStore {
     /// acceptable for a backpressure signal: the cap exists to STOP an
     /// over-capacity hot loop, not to enforce hard accounting; and the
     /// caller's retry budget closes the residual race.
-    fn check_slow_writes_capacity_gate(
-        &self,
-        incoming_bytes: u64,
-    ) -> Result<(), Error> {
+    fn check_slow_writes_capacity_gate(&self, incoming_bytes: u64) -> Result<(), Error> {
         let cap = self.slow_writes_in_flight_max_bytes;
         if cap == 0 {
             return Ok(());
@@ -981,9 +979,7 @@ impl FastSlowStore {
     /// map would double-count memory AND trip the legacy map's
     /// size-mismatch eviction guard.
     #[must_use]
-    pub fn chunked_in_flight_digests_handle(
-        &self,
-    ) -> Arc<Mutex<HashSet<DigestInfo>>> {
+    pub fn chunked_in_flight_digests_handle(&self) -> Arc<Mutex<HashSet<DigestInfo>>> {
         self.chunked_in_flight_digests.clone()
     }
 
@@ -1178,9 +1174,7 @@ impl FastSlowStore {
         let fast_res_carries_typed_backpressure = fast_res
             .as_ref()
             .err()
-            .is_some_and(|e| {
-                e.code == Code::ResourceExhausted && error_has_backpressure_signal(e)
-            });
+            .is_some_and(|e| e.code == Code::ResourceExhausted && error_has_backpressure_signal(e));
         if fast_res_carries_typed_backpressure {
             let Err(err) = fast_res else {
                 unreachable!(
@@ -1300,9 +1294,7 @@ impl FastSlowStore {
     /// `#220` D7: lock-free `OnceLock::get` + one `Arc::clone`.
     #[cfg(feature = "chunked_fast_slow")]
     #[must_use]
-    pub fn bazel_chunked_dispatcher(
-        &self,
-    ) -> Option<crate::chunked::BazelChunkedDispatcherArc> {
+    pub fn bazel_chunked_dispatcher(&self) -> Option<crate::chunked::BazelChunkedDispatcherArc> {
         self.bazel_chunked_dispatcher.get().cloned()
     }
 
@@ -1392,10 +1384,7 @@ impl FastSlowStore {
     /// propagated via `send_error` BEFORE the writer was dropped, rather
     /// than the writer's `Drop` impl setting a generic Internal error.
     #[doc(hidden)]
-    pub fn populating_streaming_inner(
-        &self,
-        key: StoreKey<'_>,
-    ) -> Option<Arc<StreamingBlobInner>> {
+    pub fn populating_streaming_inner(&self, key: StoreKey<'_>) -> Option<Arc<StreamingBlobInner>> {
         let owned = key.into_owned();
         self.populating_digests
             .lock()
@@ -1453,9 +1442,7 @@ impl FastSlowStore {
     /// `populate_inline_does_not_spawn` to keep the optimisation honest.
     #[doc(hidden)]
     pub fn populate_spawn_count(&self) -> u64 {
-        self.metrics
-            .populate_spawn_count
-            .load(Ordering::Acquire)
+        self.metrics.populate_spawn_count.load(Ordering::Acquire)
     }
 
     /// #325 (option D.1) diagnostic / test counter: every populator-caller
@@ -1529,11 +1516,7 @@ impl FastSlowStore {
                         );
                         for (key, chunks) in guard.iter() {
                             let bytes: usize = chunks.iter().map(|b| b.len()).sum();
-                            warn!(
-                                ?key,
-                                bytes,
-                                "FastSlowStore: unflushed write at shutdown"
-                            );
+                            warn!(?key, bytes, "FastSlowStore: unflushed write at shutdown");
                         }
                         for digest in chunked_guard.iter() {
                             warn!(
@@ -1741,8 +1724,7 @@ impl FastSlowStore {
             deadline_remaining = deadline_remaining.saturating_sub(1);
         }
 
-        let elapsed_ms =
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if errored > 0 || deadline_remaining > 0 {
             // Loud summary line that ops will grep for after a restart
             // when investigating "Lost inputs" / missing-CAS reports.
@@ -1986,7 +1968,8 @@ impl FastSlowStore {
         drop(changes);
         drop(blobs);
         if freed > 0 {
-            self.mirror_blobs_total_bytes.fetch_sub(freed, Ordering::Relaxed);
+            self.mirror_blobs_total_bytes
+                .fetch_sub(freed, Ordering::Relaxed);
         }
         // task #168 item 5: also clean up the parallel
         // `dispatched_mirror_pins` index for removed digests so the
@@ -2084,9 +2067,7 @@ impl FastSlowStore {
     /// `(drained_changes, snapshot_digests)`. The drained `removed` set MUST
     /// be merged into `evicted_digests` on the wire to keep the locality map
     /// consistent.
-    pub fn snapshot_and_reset_mirror_changes(
-        &self,
-    ) -> (MirrorChanges, Vec<DigestInfo>) {
+    pub fn snapshot_and_reset_mirror_changes(&self) -> (MirrorChanges, Vec<DigestInfo>) {
         // Hold both locks across the swap+snapshot so neither an inserter
         // nor a remover can interleave and split a single change across
         // the boundary. The snapshot reflects exactly the post-drain state.
@@ -2177,12 +2158,15 @@ impl FastSlowStore {
         if let Some((old_data, _)) = blobs.insert(digest, (data, now)) {
             let old_len = old_data.len() as u64;
             if data_len >= old_len {
-                self.mirror_blobs_total_bytes.fetch_add(data_len - old_len, Ordering::Relaxed);
+                self.mirror_blobs_total_bytes
+                    .fetch_add(data_len - old_len, Ordering::Relaxed);
             } else {
-                self.mirror_blobs_total_bytes.fetch_sub(old_len - data_len, Ordering::Relaxed);
+                self.mirror_blobs_total_bytes
+                    .fetch_sub(old_len - data_len, Ordering::Relaxed);
             }
         } else {
-            self.mirror_blobs_total_bytes.fetch_add(data_len, Ordering::Relaxed);
+            self.mirror_blobs_total_bytes
+                .fetch_add(data_len, Ordering::Relaxed);
         }
         // Record in change tracker (insert wins over a pending removal).
         changes.removed.remove(&digest);
@@ -2397,10 +2381,7 @@ impl FastSlowStore {
     /// cleanly partitioned from the CAS pin slice on the wire so the
     /// server's CAS `register_blobs(...)` call can NEVER see an AC
     /// entry by accident.
-    pub fn dispatched_ac_pin_snapshot_for_store(
-        &self,
-        ac_store_id: &str,
-    ) -> Vec<DigestInfo> {
+    pub fn dispatched_ac_pin_snapshot_for_store(&self, ac_store_id: &str) -> Vec<DigestInfo> {
         let pins = self.dispatched_mirror_pins.lock();
         if pins.is_empty() {
             return Vec::new();
@@ -2429,21 +2410,17 @@ impl FastSlowStore {
         // path still inserts once. The Loader is `Arc<()>` (vestige from
         // 01b68015's spawn-detach refactor — no OnceCell needed).
         let mut guard = self.populating_digests.lock();
-        let (loader, streaming_inner, is_new) =
-            if let Some((l, s)) = guard.get(&owned_key) {
-                (l.clone(), s.clone(), false)
-            } else {
-                let inner = Arc::new(StreamingBlobInner::new(
-                    digest,
-                    Self::POPULATE_STREAM_BUFFER_BYTES,
-                ));
-                let loader: Loader = Arc::new(());
-                guard.insert(
-                    owned_key,
-                    (Arc::clone(&loader), Arc::clone(&inner)),
-                );
-                (loader, inner, true)
-            };
+        let (loader, streaming_inner, is_new) = if let Some((l, s)) = guard.get(&owned_key) {
+            (l.clone(), s.clone(), false)
+        } else {
+            let inner = Arc::new(StreamingBlobInner::new(
+                digest,
+                Self::POPULATE_STREAM_BUFFER_BYTES,
+            ));
+            let loader: Loader = Arc::new(());
+            guard.insert(owned_key, (Arc::clone(&loader), Arc::clone(&inner)));
+            (loader, inner, true)
+        };
         drop(guard);
         LoaderGuard {
             weak_store: self.weak_self.clone(),
@@ -2768,7 +2745,10 @@ impl FastSlowStore {
                     key = %key_for_slow,
                     "populate slow_store.get branch entry",
                 );
-                let res = arc_for_slow.slow_store.get(key_for_slow.borrow(), slow_tx).await;
+                let res = arc_for_slow
+                    .slow_store
+                    .get(key_for_slow.borrow(), slow_tx)
+                    .await;
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
                 match &res {
                     Ok(()) => debug!(
@@ -3021,9 +3001,8 @@ impl FastSlowStore {
             if let Some(terminal) = streaming_inner.terminal_result() {
                 return terminal;
             }
-            let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(
-                streaming_inner.clone(),
-            );
+            let mut reader =
+                nativelink_util::streaming_blob::StreamingBlobReader::new(streaming_inner.clone());
             loop {
                 match reader.next_chunk().await {
                     Ok(c) if c.is_empty() => return Ok(()),
@@ -3078,12 +3057,9 @@ impl FastSlowStore {
             ));
         }
 
-        let arc_self = self.get_arc().ok_or_else(|| {
-            make_err!(
-                Code::Internal,
-                "FastSlowStore dropped during populate"
-            )
-        })?;
+        let arc_self = self
+            .get_arc()
+            .ok_or_else(|| make_err!(Code::Internal, "FastSlowStore dropped during populate"))?;
         let loader_guard = arc_self.get_loader(key.borrow());
         let streaming_inner = Arc::clone(&loader_guard.streaming_inner);
         if loader_guard.is_new {
@@ -3207,10 +3183,7 @@ impl FastSlowStore {
     /// the server is the slow store and is down or has lost the blob,
     /// the populate would fail with NotFound even though the worker
     /// holds the bytes in memory.
-    async fn materialize_mirror_to_fast(
-        &self,
-        key: StoreKey<'_>,
-    ) -> Result<bool, Error> {
+    async fn materialize_mirror_to_fast(&self, key: StoreKey<'_>) -> Result<bool, Error> {
         let digest = key.borrow().into_digest();
         let maybe_data = self
             .mirror_blobs
@@ -3223,12 +3196,9 @@ impl FastSlowStore {
         // Write directly to fast_store via the standard update path.
         // `update_oneshot` is a single-buffer write — no streaming
         // required since the bytes are already in RAM.
-        self.fast_store
-            .update_oneshot(digest, data)
-            .await
-            .err_tip(|| {
-                "materialize_mirror_to_fast: writing in-memory mirror blob to fast store"
-            })?;
+        self.fast_store.update_oneshot(digest, data).await.err_tip(
+            || "materialize_mirror_to_fast: writing in-memory mirror blob to fast store",
+        )?;
         Ok(true)
     }
 
@@ -3284,11 +3254,7 @@ impl FastSlowStore {
     ) -> Result<bool, Error> {
         #[cfg(feature = "failpoints")]
         fail::fail_point!(_failpoint_name, |_| { Ok(false) });
-        Ok(fast_store
-            .has(key)
-            .await
-            .err_tip(|| err_tip)?
-            .is_some())
+        Ok(fast_store.has(key).await.err_tip(|| err_tip)?.is_some())
     }
 
     pub async fn populate_fast_store_unchecked(&self, key: StoreKey<'_>) -> Result<(), Error> {
@@ -3409,8 +3375,7 @@ impl FastSlowStore {
         // channel; blocking_send() applies backpressure so only a few
         // chunks are in memory at once (channel capacity = 4).
         const CHUNK_SIZE: usize = 256 * 1024;
-        let (bridge_tx, mut bridge_rx) =
-            tokio::sync::mpsc::channel::<Result<Bytes, Error>>(4);
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Error>>(4);
 
         let read_handle = tokio::task::spawn_blocking(move || {
             use std::io::Read;
@@ -3434,9 +3399,7 @@ impl FastSlowStore {
                     match file.read(&mut buf[filled..]) {
                         Ok(0) => break,
                         Ok(n) => filled += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                            continue
-                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(e) => {
                             let err = make_err!(
                                 Code::Internal,
@@ -3505,8 +3468,7 @@ impl FastSlowStore {
         let write_fut = store.update(key.borrow(), rx, upload_size);
 
         const CHUNK_SIZE: usize = 256 * 1024;
-        let (bridge_tx, mut bridge_rx) =
-            tokio::sync::mpsc::channel::<Result<Bytes, Error>>(4);
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Error>>(4);
 
         let read_handle = tokio::task::spawn_blocking(move || {
             use std::io::Read;
@@ -3668,8 +3630,7 @@ impl StoreDriver for FastSlowStore {
                     if result.is_none() {
                         let owned = k.borrow().into_owned();
                         if let Some(chunks) = in_flight.get(&owned) {
-                            let total_len: u64 =
-                                chunks.iter().map(|c| c.len() as u64).sum();
+                            let total_len: u64 = chunks.iter().map(|c| c.len() as u64).sum();
                             debug!(
                                 key = %owned.as_str(),
                                 data_len = total_len,
@@ -3778,7 +3739,10 @@ impl StoreDriver for FastSlowStore {
             return Ok(());
         }
         if ignore_slow {
-            let result = self.fast_store.update(key.borrow(), reader, size_info).await;
+            let result = self
+                .fast_store
+                .update(key.borrow(), reader, size_info)
+                .await;
             if result.is_ok() {
                 if let StoreKey::Digest(digest) = &key {
                     self.fast_store.pin_digests(&[*digest]);
@@ -3873,11 +3837,7 @@ impl StoreDriver for FastSlowStore {
         // blocking the fast-store (MemoryStore) write path.
         let (mut fast_tx, fast_rx) = make_buf_channel_pair_with_size(128);
 
-        debug!(
-            ?key,
-            ?size_info,
-            "FastSlowStore::update: start",
-        );
+        debug!(?key, ?size_info, "FastSlowStore::update: start",);
 
         // Read from upstream, forward to fast store, collect chunks as
         // Vec<Bytes> (O(1) refcount bump per chunk, no copying) for the
@@ -3955,9 +3915,7 @@ impl StoreDriver for FastSlowStore {
         let fast_res_carries_typed_backpressure = fast_res
             .as_ref()
             .err()
-            .is_some_and(|e| {
-                e.code == Code::ResourceExhausted && error_has_backpressure_signal(e)
-            });
+            .is_some_and(|e| e.code == Code::ResourceExhausted && error_has_backpressure_signal(e));
         if fast_res_carries_typed_backpressure {
             let Err(err) = fast_res else {
                 unreachable!(
@@ -4031,12 +3989,11 @@ impl StoreDriver for FastSlowStore {
             let write_fut = self.slow_store.update(key.borrow(), rx, size_info);
             let send_fut = async {
                 for chunk in data {
-                    tx.send(chunk).await.map_err(|e| {
-                        make_err!(Code::Internal, "shutdown flush send: {:?}", e)
-                    })?;
+                    tx.send(chunk)
+                        .await
+                        .map_err(|e| make_err!(Code::Internal, "shutdown flush send: {:?}", e))?;
                 }
-                tx.send_eof()
-                    .err_tip(|| "shutdown flush send_eof")?;
+                tx.send_eof().err_tip(|| "shutdown flush send_eof")?;
                 Result::<(), Error>::Ok(())
             };
             let (write_result, send_result) = tokio::join!(write_fut, send_fut);
@@ -4106,8 +4063,7 @@ impl StoreDriver for FastSlowStore {
         let spawn_instant = std::time::Instant::now();
         debug!(
             ?key,
-            bytes_sent,
-            "FastSlowStore::update: background slow write spawned",
+            bytes_sent, "FastSlowStore::update: background slow write spawned",
         );
         tokio::spawn(async move {
             let schedule_delay_ms = spawn_instant.elapsed().as_millis();
@@ -4139,9 +4095,9 @@ impl StoreDriver for FastSlowStore {
                         )
                     })?;
                 }
-                slow_tx.send_eof().err_tip(
-                    || "Failed to send eof to slow store in background write",
-                )?;
+                slow_tx
+                    .send_eof()
+                    .err_tip(|| "Failed to send eof to slow store in background write")?;
                 Result::<(), Error>::Ok(())
             };
             // Watchdog: if the slow-write hasn't terminated by
@@ -4271,8 +4227,7 @@ impl StoreDriver for FastSlowStore {
                 // different code path (e.g. an early failure-recovery
                 // remove) cannot drift the counter.
                 if let Some(removed_chunks) = removed {
-                    let removed_bytes: u64 =
-                        removed_chunks.iter().map(|b| b.len() as u64).sum();
+                    let removed_bytes: u64 = removed_chunks.iter().map(|b| b.len() as u64).sum();
                     in_flight_bytes.fetch_sub(removed_bytes, Ordering::Relaxed);
                 }
                 if guard.is_empty() {
@@ -4284,11 +4239,7 @@ impl StoreDriver for FastSlowStore {
         Ok(())
     }
 
-    async fn update_oneshot(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        data: Bytes,
-    ) -> Result<(), Error> {
+    async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
         // Mirror writes: hold in memory only.
         let is_mirror = IS_MIRROR_REQUEST.try_with(|v| *v).unwrap_or(false);
         if is_mirror {
@@ -4341,11 +4292,7 @@ impl StoreDriver for FastSlowStore {
         });
 
         let data_len = data.len();
-        debug!(
-            ?key,
-            data_len,
-            "FastSlowStore::update_oneshot: start",
-        );
+        debug!(?key, data_len, "FastSlowStore::update_oneshot: start",);
 
         // Write to fast store first (blocking — typically MemoryStore, near-instant).
         let fast_start = std::time::Instant::now();
@@ -4415,8 +4362,7 @@ impl StoreDriver for FastSlowStore {
         let spawn_instant = std::time::Instant::now();
         debug!(
             ?key,
-            data_len,
-            "FastSlowStore::update_oneshot: background slow write spawned",
+            data_len, "FastSlowStore::update_oneshot: background slow write spawned",
         );
         tokio::spawn(async move {
             let schedule_delay_ms = spawn_instant.elapsed().as_millis();
@@ -4460,9 +4406,7 @@ impl StoreDriver for FastSlowStore {
                     }
                 })
             };
-            let mut result = slow_store
-                .update_oneshot(key_for_bg.borrow(), data)
-                .await;
+            let mut result = slow_store.update_oneshot(key_for_bg.borrow(), data).await;
             completed.store(true, Ordering::Release);
             watchdog_handle.abort();
 
@@ -4528,8 +4472,7 @@ impl StoreDriver for FastSlowStore {
                 let removed = guard.remove(&key_for_bg);
                 // #334 Fix B: decrement counter under map mutex.
                 if let Some(removed_chunks) = removed {
-                    let removed_bytes: u64 =
-                        removed_chunks.iter().map(|b| b.len() as u64).sum();
+                    let removed_bytes: u64 = removed_chunks.iter().map(|b| b.len() as u64).sum();
                     in_flight_bytes.fetch_sub(removed_bytes, Ordering::Relaxed);
                 }
                 if guard.is_empty() {
@@ -4588,21 +4531,22 @@ impl StoreDriver for FastSlowStore {
                 // opening before the rename races is safe. Opening after
                 // the join!() starts risks ENOENT if emplace_file's
                 // background rename completes first.
-                let slow_file = std::fs::File::open(std::path::Path::new(&path))
-                    .map_err(|e| make_err!(
+                let slow_file = std::fs::File::open(std::path::Path::new(&path)).map_err(|e| {
+                    make_err!(
                         Code::Internal,
                         "Failed to open file for slow store streaming: {:?}",
                         e
-                    ))?;
+                    )
+                })?;
                 let slow_fut = Self::stream_file_to_store(
                     slow_file,
                     &self.slow_store,
                     key.borrow(),
                     upload_size,
                 );
-                let fast_fut = self
-                    .fast_store
-                    .update_with_whole_file(key.borrow(), path, file, upload_size);
+                let fast_fut =
+                    self.fast_store
+                        .update_with_whole_file(key.borrow(), path, file, upload_size);
 
                 let (slow_res, fast_res) = join!(slow_fut, fast_fut);
                 slow_res.err_tip(|| "In FastSlowStore::update_with_whole_file slow_store")?;
@@ -4654,21 +4598,22 @@ impl StoreDriver for FastSlowStore {
                 // opening before the rename races is safe. Opening after
                 // the join!() starts risks ENOENT if emplace_file's
                 // background rename completes first.
-                let fast_file = std::fs::File::open(std::path::Path::new(&path))
-                    .map_err(|e| make_err!(
+                let fast_file = std::fs::File::open(std::path::Path::new(&path)).map_err(|e| {
+                    make_err!(
                         Code::Internal,
                         "Failed to open file for fast store streaming: {:?}",
                         e
-                    ))?;
+                    )
+                })?;
                 let fast_fut = Self::stream_file_to_store(
                     fast_file,
                     &self.fast_store,
                     key.borrow(),
                     upload_size,
                 );
-                let slow_fut = self
-                    .slow_store
-                    .update_with_whole_file(key.borrow(), path, file, upload_size);
+                let slow_fut =
+                    self.slow_store
+                        .update_with_whole_file(key.borrow(), path, file, upload_size);
 
                 let (fast_res, slow_res) = join!(fast_fut, slow_fut);
                 fast_res.err_tip(|| "In FastSlowStore::update_with_whole_file fast_store")?;
@@ -4731,7 +4676,11 @@ impl StoreDriver for FastSlowStore {
         // to us that we hold in memory only.
         {
             let digest = key.borrow().into_digest();
-            let maybe_data = self.mirror_blobs.lock().get(&digest).map(|(d, _)| d.clone());
+            let maybe_data = self
+                .mirror_blobs
+                .lock()
+                .get(&digest)
+                .map(|(d, _)| d.clone());
             if let Some(data) = maybe_data {
                 // Defensive guard against a phantom-positive entry: by the
                 // insert_mirror_blob invariant, data.len() must equal
@@ -4833,7 +4782,9 @@ impl StoreDriver for FastSlowStore {
                     StoreKey::Digest(d) => d.size_bytes(),
                     StoreKey::Str(_) => 0,
                 };
-                if expected_size > 0 && offset == 0 && length.is_none()
+                if expected_size > 0
+                    && offset == 0
+                    && length.is_none()
                     && bytes_written < expected_size
                 {
                     error!(
@@ -4879,10 +4830,7 @@ impl StoreDriver for FastSlowStore {
             }
             Err(err) if err.code == Code::NotFound && guard.get_bytes_written() == bytes_before => {
                 // Fast store miss — no bytes written, safe to fall through.
-                debug!(
-                    ?key,
-                    "fast store miss, falling through to slow store"
-                );
+                debug!(?key, "fast store miss, falling through to slow store");
             }
             Err(err) => {
                 // Non-NotFound err OR NotFound-with-partial-bytes: surface
@@ -4928,10 +4876,8 @@ impl StoreDriver for FastSlowStore {
                             let mut in_flight_guard = self.in_flight_slow_writes.lock();
                             let removed = in_flight_guard.remove(&owned_key);
                             if let Some(removed_chunks) = removed {
-                                let removed_bytes: u64 = removed_chunks
-                                    .iter()
-                                    .map(|b| b.len() as u64)
-                                    .sum();
+                                let removed_bytes: u64 =
+                                    removed_chunks.iter().map(|b| b.len() as u64).sum();
                                 self.in_flight_slow_writes_bytes
                                     .fetch_sub(removed_bytes, Ordering::Relaxed);
                             }
@@ -4957,8 +4903,8 @@ impl StoreDriver for FastSlowStore {
                         return res;
                     }
                 }
-                let offset_usize = usize::try_from(offset)
-                    .err_tip(|| "Could not convert offset to usize")?;
+                let offset_usize =
+                    usize::try_from(offset).err_tip(|| "Could not convert offset to usize")?;
                 let end = length
                     .and_then(|l| usize::try_from(l).ok())
                     .map(|l| (offset_usize.saturating_add(l)).min(total_len))
@@ -5027,9 +4973,8 @@ impl StoreDriver for FastSlowStore {
                     // from `offset`. The driver's accessor is
                     // all-or-nothing for the requested range — partial
                     // coverage falls through.
-                    let want_len = length.unwrap_or_else(|| {
-                        digest.size_bytes().saturating_sub(offset)
-                    });
+                    let want_len =
+                        length.unwrap_or_else(|| digest.size_bytes().saturating_sub(offset));
                     if let Some(bytes) = driver.try_get_chunk_from_pin(offset, want_len) {
                         // Pin hit — serve the whole assembled range
                         // from memory. Atomic counter; no awaits inside
@@ -5037,10 +4982,9 @@ impl StoreDriver for FastSlowStore {
                         registry.record_pin_hit();
                         let bytes_len = bytes.len();
                         if !bytes.is_empty() {
-                            guard
-                                .send(bytes)
-                                .await
-                                .err_tip(|| "Failed to send chunked-pin data in fast_slow get_part")?;
+                            guard.send(bytes).await.err_tip(
+                                || "Failed to send chunked-pin data in fast_slow get_part",
+                            )?;
                         }
                         guard
                             .commit_eof()
@@ -5083,12 +5027,9 @@ impl StoreDriver for FastSlowStore {
                     // REPLACES an existing immediate Err return (callers were
                     // already awaiting Result), (b) the wait is bounded at
                     // 500 ms, (c) without it production Bazel builds fail.
-                    const PARTIAL_MISS_WAIT_BUDGET: Duration =
-                        Duration::from_millis(500);
-                    const PARTIAL_MISS_POLL_INTERVAL: Duration =
-                        Duration::from_millis(10);
-                    let deadline =
-                        tokio::time::Instant::now() + PARTIAL_MISS_WAIT_BUDGET;
+                    const PARTIAL_MISS_WAIT_BUDGET: Duration = Duration::from_millis(500);
+                    const PARTIAL_MISS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+                    let deadline = tokio::time::Instant::now() + PARTIAL_MISS_WAIT_BUDGET;
                     let mut served_from_pin = false;
                     loop {
                         if tokio::time::Instant::now() >= deadline {
@@ -5106,9 +5047,7 @@ impl StoreDriver for FastSlowStore {
                             break;
                         }
                         tokio::time::sleep(PARTIAL_MISS_POLL_INTERVAL).await;
-                        if let Some(bytes) =
-                            driver.try_get_chunk_from_pin(offset, want_len)
-                        {
+                        if let Some(bytes) = driver.try_get_chunk_from_pin(offset, want_len) {
                             // Late chunks landed — serve assembled bytes
                             // from the pin (case 1 above).
                             registry.record_pin_hit();
@@ -5229,9 +5168,9 @@ impl StoreDriver for FastSlowStore {
         // caller would also get a usable error from the slow-store
         // fallback). Requires updating the failpoint test suite that
         // currently asserts populator-vs-waiter error semantics.
-        let arc_self = self.get_arc().ok_or_else(|| {
-            make_err!(Code::Internal, "FastSlowStore dropped during get_part")
-        })?;
+        let arc_self = self
+            .get_arc()
+            .ok_or_else(|| make_err!(Code::Internal, "FastSlowStore dropped during get_part"))?;
         let (streaming_inner, is_populator_caller) =
             Self::spawn_populate_producer_with_role(arc_self, key.borrow());
 
@@ -5275,9 +5214,7 @@ impl StoreDriver for FastSlowStore {
                     // case; honor it by returning the structured Err WITHOUT
                     // terminating the writer. The caller owns downstream
                     // termination from this point on.
-                    let no_terminate = INNER_MISS_NO_TERMINATE
-                        .try_with(|v| *v)
-                        .unwrap_or(false);
+                    let no_terminate = INNER_MISS_NO_TERMINATE.try_with(|v| *v).unwrap_or(false);
                     if no_terminate {
                         // Suppress the WriteHalfGuard Drop fallback — the
                         // caller (WorkerProxyStore) is now responsible for
@@ -5309,8 +5246,7 @@ impl StoreDriver for FastSlowStore {
             {
                 Ok(()) => Ok(()),
                 Err(err)
-                    if err.code == Code::NotFound
-                        && guard.get_bytes_written() == bytes_before =>
+                    if err.code == Code::NotFound && guard.get_bytes_written() == bytes_before =>
                 {
                     warn!(
                         ?key,
@@ -5338,8 +5274,7 @@ impl StoreDriver for FastSlowStore {
         if earliest > 0 {
             debug!(
                 ?key,
-                earliest,
-                "streaming populate: chunks evicted, falling back to slow store"
+                earliest, "streaming populate: chunks evicted, falling back to slow store"
             );
             let bytes_before = guard.get_bytes_written();
             let res = self
@@ -5352,12 +5287,9 @@ impl StoreDriver for FastSlowStore {
 
         debug!(
             ?key,
-            is_populator_caller,
-            "streaming populate: reading concurrently from populate buffer"
+            is_populator_caller, "streaming populate: reading concurrently from populate buffer"
         );
-        let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(
-            streaming_inner,
-        );
+        let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(streaming_inner);
         let mut pos = 0u64;
         let end = offset + length.unwrap_or(u64::MAX);
         loop {
@@ -5417,8 +5349,7 @@ impl StoreDriver for FastSlowStore {
                         // completes the byte range), so WPS never sees
                         // Code::Unavailable and never reaches the
                         // peer-fetch refusal.
-                        let is_sliding_window_eviction = err.code
-                            == Code::Unavailable
+                        let is_sliding_window_eviction = err.code == Code::Unavailable
                             && err
                                 .messages
                                 .iter()
@@ -5426,8 +5357,7 @@ impl StoreDriver for FastSlowStore {
                         if is_sliding_window_eviction {
                             let bytes_already_sent = guard.get_bytes_written();
                             let new_offset = offset + bytes_already_sent;
-                            let new_length =
-                                length.map(|l| l.saturating_sub(bytes_already_sent));
+                            let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
                             self.metrics
                                 .streaming_buffer_reader_fallback_to_direct_total
                                 .fetch_add(1, Ordering::Relaxed);
@@ -5446,18 +5376,9 @@ impl StoreDriver for FastSlowStore {
                             );
                             let res = self
                                 .slow_store
-                                .get_part(
-                                    key.borrow(),
-                                    &mut *guard,
-                                    new_offset,
-                                    new_length,
-                                )
+                                .get_part(key.borrow(), &mut *guard, new_offset, new_length)
                                 .await;
-                            commit_with_inner_miss_gate(
-                                &mut guard,
-                                &res,
-                                bytes_already_sent,
-                            );
+                            commit_with_inner_miss_gate(&mut guard, &res, bytes_already_sent);
                             return res;
                         }
                         // Pre-#325 populator semantics for non-sliding-window
@@ -5481,17 +5402,14 @@ impl StoreDriver for FastSlowStore {
                         let bytes_written = guard.get_bytes_written();
                         let no_terminate = err.code == Code::NotFound
                             && bytes_written == 0
-                            && INNER_MISS_NO_TERMINATE
-                                .try_with(|v| *v)
-                                .unwrap_or(false);
+                            && INNER_MISS_NO_TERMINATE.try_with(|v| *v).unwrap_or(false);
                         if no_terminate {
                             guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
                             return Err(err)
                                 .err_tip(|| "populate failed for the requesting caller");
                         }
-                        return Err(guard.fail(err)).err_tip(|| {
-                            "populate failed for the requesting caller"
-                        });
+                        return Err(guard.fail(err))
+                            .err_tip(|| "populate failed for the requesting caller");
                     }
                     // Waiter path: streaming buffer error (producer
                     // errored or cursor fell behind sliding window).
@@ -5527,8 +5445,7 @@ impl StoreDriver for FastSlowStore {
                     // path. Other waiter-path triggers (genuine producer
                     // errors) keep the existing warn! without bumping the
                     // sliding-window-specific counter.
-                    let is_sliding_window_eviction = err.code
-                        == Code::Unavailable
+                    let is_sliding_window_eviction = err.code == Code::Unavailable
                         && err
                             .messages
                             .iter()
@@ -5559,11 +5476,7 @@ impl StoreDriver for FastSlowStore {
                         .slow_store
                         .get_part(key.borrow(), &mut *guard, new_offset, new_length)
                         .await;
-                    commit_with_inner_miss_gate(
-                        &mut guard,
-                        &res,
-                        bytes_already_sent,
-                    );
+                    commit_with_inner_miss_gate(&mut guard, &res, bytes_already_sent);
                     return res;
                 }
             }
@@ -5594,22 +5507,22 @@ impl StoreDriver for FastSlowStore {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(
                 LOCAL_ONLY_READS_BATCH_CONCURRENCY,
             ));
-            let futs: FuturesUnordered<_> = keys
-                .into_iter()
-                .enumerate()
-                .map(|(idx, key)| {
-                    let semaphore = Arc::clone(&semaphore);
-                    async move {
-                        // Permit acquisition cannot fail: we never close
-                        // the semaphore.
-                        let _permit = semaphore.acquire_owned().await.expect(
-                            "LOCAL_ONLY_READS_BATCH_CONCURRENCY semaphore is never closed",
-                        );
-                        let result = self.get_part_unchunked(key, 0, length).await;
-                        (idx, result)
-                    }
-                })
-                .collect();
+            let futs: FuturesUnordered<_> =
+                keys.into_iter()
+                    .enumerate()
+                    .map(|(idx, key)| {
+                        let semaphore = Arc::clone(&semaphore);
+                        async move {
+                            // Permit acquisition cannot fail: we never close
+                            // the semaphore.
+                            let _permit = semaphore.acquire_owned().await.expect(
+                                "LOCAL_ONLY_READS_BATCH_CONCURRENCY semaphore is never closed",
+                            );
+                            let result = self.get_part_unchunked(key, 0, length).await;
+                            (idx, result)
+                        }
+                    })
+                    .collect();
             let mut results: Vec<Result<Bytes, Error>> =
                 vec![Err(make_err!(Code::Internal, "batch slot not filled")); n];
             let mut stream = futs;
@@ -5743,7 +5656,6 @@ impl StoreDriver for FastSlowStore {
         self.stable_notify.notify_one();
     }
 
-
     fn drain_failed_digests(&self) -> Vec<DigestInfo> {
         let mut guard = self.failed_slow_writes.lock();
         guard.drain().collect()
@@ -5805,7 +5717,9 @@ struct FastSlowStoreMetrics {
     /// fast-tier rejection that does NOT match the discriminator-narrow
     /// predicate (slow tier ALSO failed, or backpressure reason was not
     /// MemoryStoreAtCapacity) does NOT bump this counter.
-    #[metric(help = "Count of populates that skipped fast-tier cache-tee due to MemoryStoreAtCapacity")]
+    #[metric(
+        help = "Count of populates that skipped fast-tier cache-tee due to MemoryStoreAtCapacity"
+    )]
     cache_tee_disabled_at_cap_count: AtomicU64,
     /// #325 (option D.1) populator-caller path: per-reader fallback to a
     /// fresh `slow_store.get_part` triggered by `Code::Unavailable: reader
@@ -5823,7 +5737,9 @@ struct FastSlowStoreMetrics {
     /// Splitting populator vs waiter makes the per-caller-class fallback
     /// rate independently observable AND lets the regression suite
     /// distinguish which code-path actually fired.
-    #[metric(help = "Count of streaming-buffer populator-caller readers that fell behind the sliding window and spliced into a fresh slow-store read")]
+    #[metric(
+        help = "Count of streaming-buffer populator-caller readers that fell behind the sliding window and spliced into a fresh slow-store read"
+    )]
     streaming_buffer_reader_fallback_to_direct_total: AtomicU64,
     /// #325 (option D.1) waiter path: same semantics as
     /// `streaming_buffer_reader_fallback_to_direct_total` but bumped only
@@ -5835,7 +5751,9 @@ struct FastSlowStoreMetrics {
     /// Asserts the waiter-path fired in the regression suite without
     /// risking a populator-caller-bump-only test passing on a regression
     /// that breaks the waiter path.
-    #[metric(help = "Count of streaming-buffer waiter (non-populator) readers that fell behind the sliding window and spliced into a fresh slow-store read")]
+    #[metric(
+        help = "Count of streaming-buffer waiter (non-populator) readers that fell behind the sliding window and spliced into a fresh slow-store read"
+    )]
     streaming_buffer_reader_fallback_to_direct_waiter_total: AtomicU64,
 }
 
@@ -5852,7 +5770,10 @@ impl Drop for FastSlowStore {
         );
         for (key, chunks) in guard.iter() {
             let bytes: usize = chunks.iter().map(|b| b.len()).sum();
-            warn!(?key, bytes, "FastSlowStore: unflushed write lost on shutdown");
+            warn!(
+                ?key,
+                bytes, "FastSlowStore: unflushed write lost on shutdown"
+            );
         }
     }
 }

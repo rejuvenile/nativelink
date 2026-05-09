@@ -160,9 +160,7 @@ async fn make_filesystem_store() -> Arc<FilesystemStore<FileEntryImpl>> {
 /// `BazelChunkedDispatcherImpl` carrying the
 /// `stable_digests_pusher()` closure. Mirrors the production wiring
 /// in `wire_bazel_chunked_dispatcher`.
-async fn make_e2e_fast_slow_with_sink(
-    chunk_size: usize,
-) -> Arc<FastSlowStore> {
+async fn make_e2e_fast_slow_with_sink(chunk_size: usize) -> Arc<FastSlowStore> {
     let fs_store = make_filesystem_store().await;
     let fast_store: Store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let slow_store: Store = Store::new(fs_store.clone());
@@ -500,9 +498,7 @@ async fn chunked_commit_no_visibility_gap_between_in_flight_and_stable() {
                 // appears AFTER stable is observed (it shouldn't, but
                 // the loop is cheap).
                 for _ in 0..100 {
-                    let in_flight_post = chunked_set_for_observer
-                        .lock()
-                        .contains(&digest);
+                    let in_flight_post = chunked_set_for_observer.lock().contains(&digest);
                     let in_stable_post = accumulated_drains.contains(&digest);
                     if !in_flight_post && !in_stable_post {
                         gap_obs_for_obs.fetch_add(1, AtomicOrdering::Relaxed);
@@ -520,12 +516,11 @@ async fn chunked_commit_no_visibility_gap_between_in_flight_and_stable() {
     // Drive the upload.
     let updater_fut = run_update(&fast_slow, digest, Bytes::from(blob));
 
-    let (update_res, observer_res) =
-        tokio::time::timeout(Duration::from_secs(15), async {
-            tokio::join!(updater_fut, observer_fut)
-        })
-        .await
-        .expect("must not deadlock — race-coverage test");
+    let (update_res, observer_res) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(updater_fut, observer_fut)
+    })
+    .await
+    .expect("must not deadlock — race-coverage test");
 
     update_res.expect("chunked update must succeed");
     observer_res.expect("observer task panic");
@@ -917,10 +912,9 @@ async fn chunked_commit_notifies_stable_notify_waiters() {
     // NOT fire, the outer timeout panics with the bespoke message.
     let updater_fut = run_update(&fast_slow, digest, Bytes::from(blob));
 
-    let (update_res, _notify_res) = tokio::time::timeout(
-        Duration::from_secs(5),
-        async move { tokio::join!(updater_fut, notified_fut) },
-    )
+    let (update_res, _notify_res) = tokio::time::timeout(Duration::from_secs(5), async move {
+        tokio::join!(updater_fut, notified_fut)
+    })
     .await
     .expect(
         "chunked commit must wake stable_notify waiters — BIS broadcast \
@@ -1711,8 +1705,7 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
     // The commit-failures metric should have been incremented (the
     // watchdog Err arm goes through the same metrics increment as a
     // natural commit-Err).
-    let failures =
-        metrics.commit_failures_total.load(AtomicOrdering::Relaxed);
+    let failures = metrics.commit_failures_total.load(AtomicOrdering::Relaxed);
     assert!(
         failures >= 1,
         "watchdog arm MUST increment commit_failures_total (natural \
@@ -1730,8 +1723,9 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
     // `run_async_commit_reaper`'s watchdog Err arm. This test then
     // red-fails with the bespoke "watchdog fires must be observable
     // as a distinct metric" message.
-    let watchdog_fires =
-        metrics.commit_watchdog_fires_total.load(AtomicOrdering::Relaxed);
+    let watchdog_fires = metrics
+        .commit_watchdog_fires_total
+        .load(AtomicOrdering::Relaxed);
     assert!(
         watchdog_fires >= 1,
         "watchdog fires must be observable as a distinct metric — \
@@ -2401,8 +2395,9 @@ async fn chunked_synchronous_commit_watchdog_fires_on_stalled_completion() {
     // Without this, the Sync-arm watchdog firing would be
     // indistinguishable from a natural Err in operator dashboards —
     // sibling-bug parity gap.
-    let watchdog_fires =
-        metrics.commit_watchdog_fires_total.load(AtomicOrdering::Relaxed);
+    let watchdog_fires = metrics
+        .commit_watchdog_fires_total
+        .load(AtomicOrdering::Relaxed);
     assert!(
         watchdog_fires >= 1,
         "sync-arm watchdog fires must be observable as a distinct \

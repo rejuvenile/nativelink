@@ -143,7 +143,9 @@ async fn failed_slow_writes_drains_via_upload_missing_blobs() -> Result<(), Erro
             vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
 
         let locality_map = new_shared_blob_locality_map();
-        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(
+            SmallBlobDispatcherConfig::default(),
+        ));
 
         // Register a worker stream — what `WorkerApiServer::connect_worker`
         // does at production setup time. The endpoint string is what
@@ -258,7 +260,9 @@ async fn failed_slow_writes_skips_when_no_worker_has_blob() -> Result<(), Error>
             vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
 
         let locality_map = new_shared_blob_locality_map();
-        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(
+            SmallBlobDispatcherConfig::default(),
+        ));
 
         // Register a worker tx, but DO NOT register the digest in
         // BlobLocalityMap — so `lookup_workers(digest)` returns [].
@@ -340,7 +344,9 @@ async fn failed_slow_writes_throttled_digest_reinserts() -> Result<(), Error> {
             vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
 
         let locality_map = new_shared_blob_locality_map();
-        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(
+            SmallBlobDispatcherConfig::default(),
+        ));
 
         // Worker IS connected and DOES claim to have the digest — so
         // without the cooldown the drain WOULD dispatch. The cooldown
@@ -441,7 +447,9 @@ async fn failed_slow_writes_tx_send_err_reinserts() -> Result<(), Error> {
             vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
 
         let locality_map = new_shared_blob_locality_map();
-        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(
+            SmallBlobDispatcherConfig::default(),
+        ));
 
         // Register worker, then DROP the rx side BEFORE the drain
         // runs. The dispatcher snapshot returns the tx (still alive

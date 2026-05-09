@@ -14,8 +14,8 @@
 
 use core::pin::Pin;
 use core::ptr::from_ref;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -37,7 +37,6 @@ use nativelink_util::store_trait::{
 use parking_lot::Mutex;
 use pretty_assertions::assert_eq;
 use tokio::sync::Notify;
-use std::sync::mpsc;
 
 const VALID_HASH1: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 

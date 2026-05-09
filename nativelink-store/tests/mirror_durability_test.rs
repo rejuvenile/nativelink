@@ -113,7 +113,10 @@ async fn pinned_mirror_digest_advertised_separately() {
     // The mirror change tracker should report this as added since the
     // last drain.
     let changes = fss.drain_mirror_changes();
-    assert!(changes.added.contains(&digest), "delta tracker recorded add");
+    assert!(
+        changes.added.contains(&digest),
+        "delta tracker recorded add"
+    );
     assert!(changes.removed.is_empty());
 
     // After draining, the next drain is empty.
@@ -175,7 +178,10 @@ async fn try_write_mirror(
 ) -> Result<(), Error> {
     let store: Store = Store::new(fss.clone());
     IS_MIRROR_REQUEST
-        .scope(true, async move { store.update_oneshot(digest, data).await })
+        .scope(
+            true,
+            async move { store.update_oneshot(digest, data).await },
+        )
         .await
 }
 
@@ -207,9 +213,16 @@ async fn mirror_blob_dropped_when_cap_exceeded() {
     );
 
     // Pin map and change tracker must NOT have been mutated by the rejected insert.
-    assert_eq!(fss.mirror_blob_count(), 1, "rejected insert must not bump count");
+    assert_eq!(
+        fss.mirror_blob_count(),
+        1,
+        "rejected insert must not bump count"
+    );
     let snap = fss.mirror_blob_digests();
-    assert!(!snap.contains(&d2), "rejected digest must not appear in snapshot");
+    assert!(
+        !snap.contains(&d2),
+        "rejected digest must not appear in snapshot"
+    );
     let mc = fss.drain_mirror_changes();
     assert!(
         mc.added.is_empty() && mc.removed.is_empty(),
@@ -313,8 +326,7 @@ async fn insert_triggers_mirror_changes_notify() {
     tokio::pin!(waiter);
 
     // Before the insert, the future must NOT be ready.
-    let poll1 =
-        futures::poll!(waiter.as_mut());
+    let poll1 = futures::poll!(waiter.as_mut());
     assert!(matches!(poll1, std::task::Poll::Pending), "no notify yet");
 
     write_mirror(&fss, d(40, 1), Bytes::from_static(b"i")).await;
@@ -426,7 +438,10 @@ async fn populate_fast_store_unchecked_materializes_mirror_only_blob() {
         .get_part_unchunked(digest, 0, None)
         .await
         .expect("read-back from fast store");
-    assert_eq!(read_back, data, "fast store has the materialized mirror bytes");
+    assert_eq!(
+        read_back, data,
+        "fast store has the materialized mirror bytes"
+    );
 }
 
 /// Test (review #3): same flow via `populate_fast_store` (which checks
@@ -520,7 +535,8 @@ async fn mirror_materialize_sets_0o555_mode_on_disk() {
     });
     let mode = meta.permissions().mode() & 0o7777;
     assert_eq!(
-        mode, 0o555,
+        mode,
+        0o555,
         "materialized CAS file mode must be 0o555 (got {mode:o}) at {}",
         std::path::Path::new(&on_disk_path).display()
     );
@@ -598,12 +614,7 @@ async fn lock_ordering_no_deadlock_under_contention() {
                                 break;
                             }
                             let digest = d((i % 200) as u8, 1);
-                            let _ = try_write_mirror(
-                                &fss,
-                                digest,
-                                Bytes::from_static(b"x"),
-                            )
-                            .await;
+                            let _ = try_write_mirror(&fss, digest, Bytes::from_static(b"x")).await;
                         }
                     });
                 })

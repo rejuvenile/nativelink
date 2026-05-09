@@ -367,15 +367,9 @@ async fn waiter_path_inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_d
     let proxy2 = proxy.clone();
     let proxy3 = proxy.clone();
     let len = value.len() as u64;
-    let read1 = tokio::spawn(async move {
-        proxy1.get_part_unchunked(digest, 0, Some(len)).await
-    });
-    let read2 = tokio::spawn(async move {
-        proxy2.get_part_unchunked(digest, 0, Some(len)).await
-    });
-    let read3 = tokio::spawn(async move {
-        proxy3.get_part_unchunked(digest, 0, Some(len)).await
-    });
+    let read1 = tokio::spawn(async move { proxy1.get_part_unchunked(digest, 0, Some(len)).await });
+    let read2 = tokio::spawn(async move { proxy2.get_part_unchunked(digest, 0, Some(len)).await });
+    let read3 = tokio::spawn(async move { proxy3.get_part_unchunked(digest, 0, Some(len)).await });
 
     let timed = tokio::time::timeout(Duration::from_secs(8), async move {
         let r1 = read1
@@ -387,9 +381,14 @@ async fn waiter_path_inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_d
         let r3 = read3
             .await
             .map_err(|e| make_err!(Code::Internal, "task3 join: {e}"))?;
-        Ok::<(Result<Bytes, Error>, Result<Bytes, Error>, Result<Bytes, Error>), Error>(
-            (r1, r2, r3),
-        )
+        Ok::<
+            (
+                Result<Bytes, Error>,
+                Result<Bytes, Error>,
+                Result<Bytes, Error>,
+            ),
+            Error,
+        >((r1, r2, r3))
     })
     .await
     .expect(

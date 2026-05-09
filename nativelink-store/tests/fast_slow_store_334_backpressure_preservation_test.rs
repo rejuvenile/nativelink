@@ -128,11 +128,7 @@ fn assert_backpressure_signal(err: &Error, expected_reason: backpressure_signal:
 /// Fix A in place. (Production has the same race window, but with
 /// gRPC ByteStream chunks crossing the wire there is always
 /// inter-chunk latency that lets the consumer poll first.)
-async fn drive_update(
-    store: &Store,
-    key: StoreKey<'_>,
-    payload: Bytes,
-) -> Result<(), Error> {
+async fn drive_update(store: &Store, key: StoreKey<'_>, payload: Bytes) -> Result<(), Error> {
     let (mut tx, rx) = make_buf_channel_pair();
     let payload_len = payload.len() as u64;
     let send_fut = async move {
@@ -157,9 +153,7 @@ async fn drive_update(
 /// (`emit_backpressure_enabled = true`) and a real `MemoryStore` slow
 /// tier. The fast tier mirrors the production `MemoryStore` wired
 /// inside `cas_FAST_SLOW_STORE`'s `SizePartitioningStore` fast branch.
-fn make_fast_slow_with_tiny_fast_cap(
-    fast_cap_bytes: usize,
-) -> (Arc<FastSlowStore>, Store, Store) {
+fn make_fast_slow_with_tiny_fast_cap(fast_cap_bytes: usize) -> (Arc<FastSlowStore>, Store, Store) {
     let fast = Store::new(MemoryStore::new(&MemorySpec {
         eviction_policy: Some(EvictionPolicy {
             max_bytes: fast_cap_bytes,
@@ -235,10 +229,7 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
         "second insert MUST return an Err — fast tier at capacity with \
          emit_backpressure_enabled=true",
     );
-    assert_backpressure_signal(
-        &err,
-        backpressure_signal::Reason::MemoryStoreAtCapacity,
-    );
+    assert_backpressure_signal(&err, backpressure_signal::Reason::MemoryStoreAtCapacity);
     // The mutation-step assertion below documents the canonical failure
     // string for the mutation-step. The `assert_backpressure_signal`
     // helper above panics with a similar message; this `assert!` below
@@ -334,7 +325,10 @@ impl StoreDriver for GatedSlowStore {
         _offset: u64,
         _length: Option<u64>,
     ) -> Result<(), Error> {
-        Err(make_err!(Code::NotFound, "GatedSlowStore: get_part not supported"))
+        Err(make_err!(
+            Code::NotFound,
+            "GatedSlowStore: get_part not supported"
+        ))
     }
 
     fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
@@ -430,8 +424,7 @@ async fn wait_until<F: Fn() -> bool>(label: &str, cond: F) {
 #[nativelink_test]
 async fn fix_b_slow_writes_in_flight_byte_cap_emits_typed_signal() -> Result<(), Error> {
     let cap_bytes: u64 = 4096;
-    let (fss, store, release, in_flight, _dropped) =
-        make_fast_slow_with_gated_slow(cap_bytes);
+    let (fss, store, release, in_flight, _dropped) = make_fast_slow_with_gated_slow(cap_bytes);
 
     let payload1 = vec![0u8; 2048];
     let digest1 = DigestInfo::try_new(VALID_HASH1, payload1.len() as u64)?;
@@ -482,10 +475,7 @@ async fn fix_b_slow_writes_in_flight_byte_cap_emits_typed_signal() -> Result<(),
         "third insert MUST return Err — in-flight slow-write byte cap not \
          enforced — unbounded memory growth contract violated",
     );
-    assert_backpressure_signal(
-        &err,
-        backpressure_signal::Reason::SlowWritesAtCapacity,
-    );
+    assert_backpressure_signal(&err, backpressure_signal::Reason::SlowWritesAtCapacity);
 
     // Sanity: in_flight_bytes counter MUST NOT have moved past the cap
     // (the rejected insert must NOT have incremented).
@@ -524,8 +514,7 @@ async fn fix_b_slow_writes_in_flight_byte_cap_emits_typed_signal() -> Result<(),
 #[nativelink_test]
 async fn fix_b_does_not_fire_below_cap() -> Result<(), Error> {
     let cap_bytes: u64 = 1024 * 1024 * 1024; // 1 GiB
-    let (_fss, store, release, _in_flight, _dropped) =
-        make_fast_slow_with_gated_slow(cap_bytes);
+    let (_fss, store, release, _in_flight, _dropped) = make_fast_slow_with_gated_slow(cap_bytes);
 
     for (i, hash) in [VALID_HASH1, VALID_HASH2, VALID_HASH3, VALID_HASH4]
         .iter()

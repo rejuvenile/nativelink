@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use nativelink_config::stores::{
-    DedupSpec, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec,
-};
+use nativelink_config::stores::{DedupSpec, FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
 use nativelink_error::{Code, Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;

@@ -281,8 +281,7 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
     const SCHEDULER_NAME: &str = "MARK_STABLE_BIS_TEST_SCHEDULER";
     const UUID_SIZE: usize = 36;
 
-    let (cas_store, store_manager, lower_fast_slow, upper_fast_slow) =
-        make_production_cas_store();
+    let (cas_store, store_manager, lower_fast_slow, upper_fast_slow) = make_production_cas_store();
 
     let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
     let tasks_or_worker_change_notify = Arc::new(Notify::new());
@@ -436,11 +435,8 @@ async fn await_stable_drain_contains_all(cas_store: &Store, targets: &[DigestInf
                  call site instead of per digest) would surface here."
             );
         }
-        let _ = tokio::time::timeout(
-            remaining.min(Duration::from_millis(50)),
-            notify.notified(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(remaining.min(Duration::from_millis(50)), notify.notified()).await;
     }
 }
 
@@ -475,11 +471,8 @@ async fn await_stable_drain_contains(cas_store: &Store, target: DigestInfo) {
                  unpin signal."
             );
         }
-        let _ = tokio::time::timeout(
-            remaining.min(Duration::from_millis(50)),
-            notify.notified(),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(remaining.min(Duration::from_millis(50)), notify.notified()).await;
     }
 }
 
@@ -617,12 +610,7 @@ async fn mark_stable_fires_for_back_to_back_blobs_available_within_cooldown_test
     drop(test_context.cas_store.drain_stable_digests());
 
     // First BlobsAvailable: target_a. This trips the cooldown gate.
-    send_blobs_available(
-        &test_context.worker_stream,
-        CAS_ENDPOINT,
-        vec![target_a],
-    )
-    .await?;
+    send_blobs_available(&test_context.worker_stream, CAS_ENDPOINT, vec![target_a]).await?;
     await_stable_drain_contains(&test_context.cas_store, target_a).await;
     drop(test_context.cas_store.drain_stable_digests());
 
@@ -630,12 +618,7 @@ async fn mark_stable_fires_for_back_to_back_blobs_available_within_cooldown_test
     // well inside `BACKFILL_COOLDOWN_SECS=5`. The contract:
     // mark_stable must fire for target_b even though we are inside the
     // upload-backfill cooldown window.
-    send_blobs_available(
-        &test_context.worker_stream,
-        CAS_ENDPOINT,
-        vec![target_b],
-    )
-    .await?;
+    send_blobs_available(&test_context.worker_stream, CAS_ENDPOINT, vec![target_b]).await?;
     await_stable_drain_contains(&test_context.cas_store, target_b).await;
 
     Ok(())
@@ -700,11 +683,7 @@ async fn mark_stable_fires_for_multi_digest_then_within_cooldown_test()
     // drain that returns multiple digests retains only the matched one in
     // the local accumulator), so wait for ALL three to flush via a single
     // multi-target loop and then drop.
-    await_stable_drain_contains_all(
-        &test_context.cas_store,
-        &[target_a, target_b, target_c],
-    )
-    .await;
+    await_stable_drain_contains_all(&test_context.cas_store, &[target_a, target_b, target_c]).await;
     drop(test_context.cas_store.drain_stable_digests());
 
     // First BlobsAvailable carries TWO present digests in one tick.
@@ -718,11 +697,7 @@ async fn mark_stable_fires_for_multi_digest_then_within_cooldown_test()
         vec![target_a, target_b],
     )
     .await?;
-    await_stable_drain_contains_all(
-        &test_context.cas_store,
-        &[target_a, target_b],
-    )
-    .await;
+    await_stable_drain_contains_all(&test_context.cas_store, &[target_a, target_b]).await;
     drop(test_context.cas_store.drain_stable_digests());
 
     // Second BlobsAvailable carries `c` ALONE, sent IMMEDIATELY after
@@ -731,12 +706,7 @@ async fn mark_stable_fires_for_multi_digest_then_within_cooldown_test()
     // cooldown gate around the mark_stable call (not just around the
     // upload-protocol throttle) would suppress this and the test panics
     // with the specific deadlock-detector message naming target_c.
-    send_blobs_available(
-        &test_context.worker_stream,
-        CAS_ENDPOINT,
-        vec![target_c],
-    )
-    .await?;
+    send_blobs_available(&test_context.worker_stream, CAS_ENDPOINT, vec![target_c]).await?;
     await_stable_drain_contains(&test_context.cas_store, target_c).await;
 
     Ok(())

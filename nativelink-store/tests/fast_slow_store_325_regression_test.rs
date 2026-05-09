@@ -43,9 +43,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use nativelink_config::stores::{
-    FastSlowSpec, MemorySpec, StoreDirection, StoreSpec, VerifySpec,
-};
+use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec, VerifySpec};
 use nativelink_error::{Error, ResultExt};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
@@ -95,8 +93,7 @@ async fn update_multi_chunk(
                 .await
                 .err_tip(|| "update_multi_chunk: send chunk")?;
         }
-        tx.send_eof()
-            .err_tip(|| "update_multi_chunk: send_eof")?;
+        tx.send_eof().err_tip(|| "update_multi_chunk: send_eof")?;
         Ok::<(), Error>(())
     };
     let update_fut = store.update(digest, rx, UploadSizeInfo::ExactSize(total_size));
@@ -178,8 +175,7 @@ async fn d1_populator_caller_falls_back_on_sliding_window_eviction() -> Result<(
         bytes.len()
     );
     assert_eq!(
-        bytes,
-        data,
+        bytes, data,
         "spliced bytes must match the original blob byte-for-byte"
     );
 
@@ -419,8 +415,8 @@ async fn d1_populator_caller_splice_after_partial_consumption() -> Result<(), Er
 // -------------------------------------------------------------------------
 #[serial(failpoints)]
 #[nativelink_test]
-async fn d1_verify_store_around_fast_slow_survives_fallback_with_correct_hash()
--> Result<(), Error> {
+async fn d1_verify_store_around_fast_slow_survives_fallback_with_correct_hash() -> Result<(), Error>
+{
     let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let fss = FastSlowStore::new(
@@ -609,7 +605,9 @@ impl StoreDriver for GatedSlowStore {
         digests: &[StoreKey<'_>],
         results: &mut [Option<u64>],
     ) -> Result<(), Error> {
-        Pin::new(&*self.inner).has_with_results(digests, results).await
+        Pin::new(&*self.inner)
+            .has_with_results(digests, results)
+            .await
     }
 
     async fn update(
@@ -618,7 +616,9 @@ impl StoreDriver for GatedSlowStore {
         reader: DropCloserReadHalf,
         upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
-        Pin::new(&*self.inner).update(key, reader, upload_size).await
+        Pin::new(&*self.inner)
+            .update(key, reader, upload_size)
+            .await
     }
 
     async fn get_part(
@@ -634,7 +634,9 @@ impl StoreDriver for GatedSlowStore {
         // release us before serving any bytes.
         self.get_part_arrived.notify_one();
         self.release_get_part.notified().await;
-        Pin::new(&*self.inner).get_part(key, writer, offset, length).await
+        Pin::new(&*self.inner)
+            .get_part(key, writer, offset, length)
+            .await
     }
 
     fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
@@ -748,9 +750,7 @@ async fn d1_waiter_path_falls_back_on_sliding_window_eviction() -> Result<(), Er
     // calls `slow_store.get_part`, which is gated — so the
     // populating_digests entry stays alive until we release.
     let store_a = store.clone();
-    let task_a = tokio::spawn(async move {
-        store_a.get_part_unchunked(digest, 0, None).await
-    });
+    let task_a = tokio::spawn(async move { store_a.get_part_unchunked(digest, 0, None).await });
 
     // Wait until the producer task has reached `slow.get_part` (its
     // entry is now registered in populating_digests AND the producer is
@@ -769,9 +769,7 @@ async fn d1_waiter_path_falls_back_on_sliding_window_eviction() -> Result<(), Er
     // a WAITER. Both A and B's readers will call `next_chunk()` on the
     // streaming buffer; the failpoint trips on both.
     let store_b = store.clone();
-    let task_b = tokio::spawn(async move {
-        store_b.get_part_unchunked(digest, 0, None).await
-    });
+    let task_b = tokio::spawn(async move { store_b.get_part_unchunked(digest, 0, None).await });
 
     // Brief grace for caller B to attach its reader before we unblock
     // the producer. Without this, caller B might still be inside

@@ -102,21 +102,20 @@ impl StoreDriver for HangingSlowStore {
         let (mut tx, rx) = nativelink_util::buf_channel::make_buf_channel_pair_with_size(8);
         let inner_fut = Pin::new(self.inner.as_ref()).update(digest, rx, size_info);
         let send_fut = async {
-            tx.send_eof().err_tip(|| "send_eof in HangingSlowStore::update")?;
+            tx.send_eof()
+                .err_tip(|| "send_eof in HangingSlowStore::update")?;
             Result::<(), Error>::Ok(())
         };
         let (write_res, send_res) = tokio::join!(inner_fut, send_fut);
         send_res.and(write_res)
     }
 
-    async fn update_oneshot(
-        self: Pin<&Self>,
-        key: StoreKey<'_>,
-        data: Bytes,
-    ) -> Result<(), Error> {
+    async fn update_oneshot(self: Pin<&Self>, key: StoreKey<'_>, data: Bytes) -> Result<(), Error> {
         self.update_entered.notify_waiters();
         self.release_update.notified().await;
-        Pin::new(self.inner.as_ref()).update_oneshot(key, data).await
+        Pin::new(self.inner.as_ref())
+            .update_oneshot(key, data)
+            .await
     }
 
     async fn get_part(

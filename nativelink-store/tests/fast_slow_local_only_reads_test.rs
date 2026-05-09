@@ -75,16 +75,13 @@ async fn local_only_reads_returns_not_found_on_local_miss() -> Result<(), Error>
     let (fss, _fast, slow) = make_local_only_fss();
     let digest = d(1, 5);
     // Pre-populate ONLY the slow tier with the blob.
-    slow.update_oneshot(digest, Bytes::from_static(b"hello")).await?;
+    slow.update_oneshot(digest, Bytes::from_static(b"hello"))
+        .await?;
 
     let store: Store = Store::new(fss);
     let result = store.get_part_unchunked(digest, 0, None).await;
     let err = result.expect_err("expected NotFound — slow tier must not be consulted");
-    assert_eq!(
-        err.code,
-        Code::NotFound,
-        "expected NotFound, got {err:?}"
-    );
+    assert_eq!(err.code, Code::NotFound, "expected NotFound, got {err:?}");
     Ok(())
 }
 
@@ -93,7 +90,8 @@ async fn local_only_reads_returns_not_found_on_local_miss() -> Result<(), Error>
 async fn local_only_reads_serves_from_fast_store() -> Result<(), Error> {
     let (fss, fast, _slow) = make_local_only_fss();
     let digest = d(2, 5);
-    fast.update_oneshot(digest, Bytes::from_static(b"world")).await?;
+    fast.update_oneshot(digest, Bytes::from_static(b"world"))
+        .await?;
 
     let store: Store = Store::new(fss);
     let data = store.get_part_unchunked(digest, 0, None).await?;
@@ -135,7 +133,8 @@ async fn local_only_reads_serves_from_mirror_blobs() -> Result<(), Error> {
 async fn local_only_reads_has_with_results_does_not_consult_slow() -> Result<(), Error> {
     let (fss, _fast, slow) = make_local_only_fss();
     let digest = d(4, 7);
-    slow.update_oneshot(digest, Bytes::from_static(b"slowonly")).await?;
+    slow.update_oneshot(digest, Bytes::from_static(b"slowonly"))
+        .await?;
 
     let keys: Vec<StoreKey<'_>> = vec![StoreKey::from(digest)];
     let mut results: Vec<Option<u64>> = vec![None];
@@ -159,7 +158,8 @@ async fn local_only_reads_batch_get_part_routes_per_key() -> Result<(), Error> {
     let d_mirror = d(6, 6);
     let d_missing = d(7, 8);
 
-    fast.update_oneshot(d_fast, Bytes::from_static(b"FAST")).await?;
+    fast.update_oneshot(d_fast, Bytes::from_static(b"FAST"))
+        .await?;
     {
         let store: Store = Store::new(fss.clone());
         nativelink_util::store_trait::IS_MIRROR_REQUEST
@@ -172,7 +172,8 @@ async fn local_only_reads_batch_get_part_routes_per_key() -> Result<(), Error> {
             .await;
     }
     // Slow has the third blob, but local_only_reads MUST NOT consult it.
-    slow.update_oneshot(d_missing, Bytes::from_static(b"SLOWBLOB")).await?;
+    slow.update_oneshot(d_missing, Bytes::from_static(b"SLOWBLOB"))
+        .await?;
 
     let keys: Vec<StoreKey<'_>> = vec![
         StoreKey::from(d_fast),

@@ -181,8 +181,7 @@ async fn verify_store_around_filesystem_does_not_deadlock_on_get_part_err() -> R
 }
 
 #[nativelink_test]
-async fn verify_store_around_worker_proxy_does_not_deadlock_on_get_part_err() -> Result<(), Error>
-{
+async fn verify_store_around_worker_proxy_does_not_deadlock_on_get_part_err() -> Result<(), Error> {
     // WorkerProxyStore backed by an empty MemoryStore + empty locality map:
     // get_part for any non-zero digest returns NotFound (no inner hit, no
     // peers to race).
@@ -281,8 +280,7 @@ async fn verify_store_around_dedup_does_not_deadlock_on_get_part_err() -> Result
 }
 
 #[nativelink_test]
-async fn verify_store_around_verify_store_does_not_deadlock_on_get_part_err() -> Result<(), Error>
-{
+async fn verify_store_around_verify_store_does_not_deadlock_on_get_part_err() -> Result<(), Error> {
     // Defense in depth: nested VerifyStore. The inner-most layer Errs from
     // an empty MemoryStore; the middle and outer VerifyStores must each
     // honor the writer-termination contract.
@@ -353,8 +351,7 @@ async fn verify_store_around_verify_store_does_not_deadlock_on_get_part_err() ->
 /// distinguishes "structured guard.fail call" from "fell through to
 /// Drop synthesizer".
 #[nativelink_test]
-async fn verify_store_around_fast_slow_does_not_deadlock_on_get_part_err()
--> Result<(), Error> {
+async fn verify_store_around_fast_slow_does_not_deadlock_on_get_part_err() -> Result<(), Error> {
     // Empty MemoryStore on both fast + slow tiers; local_only_reads
     // forces FastSlowStore to take the `guard.fail(NotFound)` path
     // at line ~2986 (worker public CAS server variant).
@@ -366,7 +363,7 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_get_part_err()
         fast_direction: StoreDirection::Both,
         slow_direction: StoreDirection::Both,
         chunked_reads_enabled: false,
-            slow_writes_in_flight_max_bytes: 0,
+        slow_writes_in_flight_max_bytes: 0,
     };
     let fast_slow = FastSlowStore::new(&spec, fast, slow).with_local_only_reads();
     let fast_slow_store = Store::new(fast_slow);
@@ -399,4 +396,3 @@ async fn verify_store_around_fast_slow_does_not_deadlock_on_get_part_err()
     );
     Ok(())
 }
-

@@ -1348,7 +1348,6 @@ fn default_batch_update_threshold_bytes() -> u64 {
     1_048_576
 }
 
-
 const fn default_connections_per_endpoint() -> usize {
     32
 }
@@ -1396,7 +1395,10 @@ pub struct GrpcSpec {
 
     /// The number of connections to make to each specified endpoint to balance
     /// the load over multiple TCP connections.  Default 16.
-    #[serde(default = "default_connections_per_endpoint", deserialize_with = "convert_numeric_with_shellexpand")]
+    #[serde(
+        default = "default_connections_per_endpoint",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
     pub connections_per_endpoint: usize,
 
     /// Per-chunk no-progress timeout (seconds) for `ByteStream.Write`.

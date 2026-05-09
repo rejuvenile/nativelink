@@ -85,8 +85,7 @@ const SIZE_PARTITION_THRESHOLD: u64 = 16 * 1024;
 
 /// SHA256("hello world\n"). Used as the precomputed digest for tests
 /// that go through VerifyStore with `verify_hash: true`.
-const HELLO_WORLD_SHA256: &str =
-    "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447";
+const HELLO_WORLD_SHA256: &str = "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447";
 
 fn make_temp_path(data: &str) -> String {
     format!(
@@ -206,8 +205,7 @@ async fn build_cas_chain() -> Result<(Store, std::sync::Arc<FilesystemStore<File
 /// design, the SizePartitioningStore.stable_delegation() == Many wires
 /// the merged Notify automatically.
 #[nativelink_test]
-async fn outer_stable_notify_fires_when_inner_fastslow_completes_slow_write()
--> Result<(), Error> {
+async fn outer_stable_notify_fires_when_inner_fastslow_completes_slow_write() -> Result<(), Error> {
     let (cas_store, _fs_backend) = build_cas_chain().await?;
 
     // Subscribe to the OUTERMOST Notify before writing. This must reach
@@ -259,8 +257,7 @@ async fn outer_stable_notify_fires_when_inner_fastslow_completes_slow_write()
 /// Same bug class as Property 1 but verified via the drain side of the
 /// drain-then-fire pattern.
 #[nativelink_test]
-async fn outer_drain_stable_digests_returns_inner_fastslow_completed_digest()
--> Result<(), Error> {
+async fn outer_drain_stable_digests_returns_inner_fastslow_completed_digest() -> Result<(), Error> {
     let (cas_store, _fs_backend) = build_cas_chain().await?;
 
     let outer_notify = cas_store.as_store_driver().stable_notify();
@@ -336,15 +333,12 @@ async fn outer_pin_digests_survives_eviction_pressure_on_fs_backend() -> Result<
     // Wait for slow-write completion so the blob is on disk before pinning.
     tokio::time::timeout(NO_DEADLOCK_TIMEOUT, outer_notify.notified())
         .await
-        .expect("write notify wedged before pin")
-        ;
+        .expect("write notify wedged before pin");
     let _ = cas_store.as_store_driver().drain_stable_digests();
 
     // Pin at the OUTERMOST layer. Per the chain trace above, this MUST
     // reach FilesystemStore::pin_digests for the pin to land.
-    cas_store
-        .as_store_driver()
-        .pin_digests(&[pinned_digest]);
+    cas_store.as_store_driver().pin_digests(&[pinned_digest]);
 
     // Verify the pin landed on the FS backend by checking the evicting map
     // sees the blob as resident.

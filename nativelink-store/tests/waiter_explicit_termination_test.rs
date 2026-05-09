@@ -113,11 +113,7 @@ impl StoreDriver for StructuredNotFoundSlowStore {
         // sub-store's contract was violated. Either way the `err`
         // carries the marker and FastSlowStore's helper must propagate
         // it (via `guard.fail(err)`) instead of falling through to Drop.
-        Err(make_err!(
-            Code::NotFound,
-            "{}",
-            SLOW_STORE_NOTFOUND_MARKER
-        ))
+        Err(make_err!(Code::NotFound, "{}", SLOW_STORE_NOTFOUND_MARKER))
     }
 
     fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
@@ -193,7 +189,7 @@ async fn non_wps_slow_store_fallback_err_terminates_writer_with_structured_error
         fast_direction: StoreDirection::Both,
         slow_direction: StoreDirection::Both,
         chunked_reads_enabled: false,
-            slow_writes_in_flight_max_bytes: 0,
+        slow_writes_in_flight_max_bytes: 0,
     };
     let fast_slow = FastSlowStore::new(&spec, fast, slow);
 

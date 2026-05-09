@@ -122,7 +122,7 @@ mod tests {
                 fast_direction: StoreDirection::default(),
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
-            slow_writes_in_flight_max_bytes: 0,
+                slow_writes_in_flight_max_bytes: 0,
             },
             Store::new(fast_store.clone()),
             Store::new(slow_store.clone()),
@@ -440,8 +440,8 @@ mod tests {
     }
 
     #[nativelink_test]
-    async fn download_to_directory_batch_existence_check_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_batch_existence_check_test()
+    -> Result<(), Box<dyn core::error::Error>> {
         // Verifies that files already in the fast store are hardlinked
         // without being re-fetched from the slow store.
         const FILE1_NAME: &str = "cached_file.txt";
@@ -518,8 +518,7 @@ mod tests {
     }
 
     #[nativelink_test]
-    async fn download_to_directory_dedup_digests_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_dedup_digests_test() -> Result<(), Box<dyn core::error::Error>> {
         // Verifies that multiple files sharing the same digest content
         // are all materialized correctly (the digest is only downloaded once
         // but hardlinked to multiple destinations).
@@ -588,8 +587,8 @@ mod tests {
     }
 
     #[nativelink_test]
-    async fn download_to_directory_deep_nested_tree_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_deep_nested_tree_test() -> Result<(), Box<dyn core::error::Error>>
+    {
         // Verifies that deeply nested directory trees (3 levels) are resolved
         // correctly via the recursive fallback path (MemoryStore).
         const LEAF_FILE_NAME: &str = "leaf.txt";
@@ -676,8 +675,8 @@ mod tests {
     }
 
     #[nativelink_test]
-    async fn download_to_directory_empty_directory_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_empty_directory_test() -> Result<(), Box<dyn core::error::Error>>
+    {
         // Verifies that an empty root directory is handled correctly.
         let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
 
@@ -711,8 +710,7 @@ mod tests {
     }
 
     #[nativelink_test]
-    async fn download_to_directory_many_files_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_many_files_test() -> Result<(), Box<dyn core::error::Error>> {
         // Verifies that a directory with many files (simulating a real build
         // with many inputs) is handled correctly by the batch existence check
         // and parallel download paths.
@@ -793,8 +791,8 @@ mod tests {
     }
 
     #[nativelink_test]
-    async fn download_to_directory_missing_blob_returns_error_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_missing_blob_returns_error_test()
+    -> Result<(), Box<dyn core::error::Error>> {
         // Verifies that a reference to a missing blob in the slow store
         // propagates an error (not silently ignored).
         const FILE_NAME: &str = "missing.txt";
@@ -839,8 +837,8 @@ mod tests {
     }
 
     #[nativelink_test]
-    async fn download_to_directory_missing_directory_digest_returns_error_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_missing_directory_digest_returns_error_test()
+    -> Result<(), Box<dyn core::error::Error>> {
         // Verifies that a DirectoryNode referencing a non-existent directory
         // digest propagates an error during tree resolution.
         let (fast_store, slow_store, cas_store, _ac_store) = setup_stores().await?;
@@ -877,13 +875,16 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "Expected error for missing directory digest");
+        assert!(
+            result.is_err(),
+            "Expected error for missing directory digest"
+        );
         Ok(())
     }
 
     #[nativelink_test]
-    async fn download_to_directory_zero_digest_file_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_zero_digest_file_test() -> Result<(), Box<dyn core::error::Error>>
+    {
         // Verifies that zero-digest (empty) files are created correctly.
         // Zero-digest files have special handling and skip batch existence checks.
         const EMPTY_FILE_NAME: &str = "empty.txt";
@@ -2050,7 +2051,7 @@ mod tests {
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await?;
@@ -2235,7 +2236,7 @@ exit 0
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await?;
@@ -2426,7 +2427,7 @@ exit 0
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await?;
@@ -2588,7 +2589,7 @@ exit 1
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await?;
@@ -3478,7 +3479,7 @@ exit 1
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .and_then(|action| async move {
@@ -3634,7 +3635,7 @@ exit 1
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await?;
@@ -3902,7 +3903,7 @@ exit 1
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await?;
@@ -4228,7 +4229,7 @@ exit 1
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await?;
@@ -4352,7 +4353,7 @@ exit 1
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await;
@@ -4468,7 +4469,7 @@ exit 1
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await?;
@@ -4492,7 +4493,7 @@ exit 1
                     worker_id: WORKER_ID.to_string(),
                     resolved_directories: Vec::new(),
                     resolved_directory_digests: Vec::new(),
-                        missing_digests: Vec::new(),
+                    missing_digests: Vec::new(),
                 },
             )
             .await;
@@ -4511,10 +4512,9 @@ exit 1
         Ok(())
     }
 
-
     #[nativelink_test]
-    async fn parse_get_tree_response_with_missing_directory_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn parse_get_tree_response_with_missing_directory_test()
+    -> Result<(), Box<dyn core::error::Error>> {
         // Regression test: when the server's GetTree response skips a missing
         // directory (tolerant mode), the digest-based parsing must still
         // correctly identify each directory. The tree structure is:
@@ -4632,8 +4632,8 @@ exit 1
     }
 
     #[nativelink_test]
-    async fn parse_get_tree_response_orphan_root_fallback_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn parse_get_tree_response_orphan_root_fallback_test()
+    -> Result<(), Box<dyn core::error::Error>> {
         // Test the orphan-detection fallback: when the caller's root_digest
         // doesn't match the computed digest of any directory (e.g., due to
         // protobuf serialization differences), the function identifies the
@@ -4697,8 +4697,8 @@ exit 1
     }
 
     #[nativelink_test]
-    async fn download_to_directory_nested_std_directory_test(
-    ) -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_nested_std_directory_test()
+    -> Result<(), Box<dyn core::error::Error>> {
         // Regression test for the rustix `maybe_polyfill/std/mod.rs` bug.
         // Verifies that a directory literally named "std" (which collides with
         // Rust's standard library name) is materialized correctly during
@@ -4808,8 +4808,7 @@ exit 1
         .await?;
 
         // The critical assertion: std/mod.rs must exist.
-        let mod_rs_path =
-            format!("{download_dir}/src/maybe_polyfill/std/mod.rs");
+        let mod_rs_path = format!("{download_dir}/src/maybe_polyfill/std/mod.rs");
         let content = fs::read(&mod_rs_path).await?;
         assert_eq!(
             from_utf8(&content)?,
@@ -4818,8 +4817,7 @@ exit 1
         );
 
         // Verify the directory named "std" exists as a directory.
-        let std_meta =
-            fs::metadata(format!("{download_dir}/src/maybe_polyfill/std")).await?;
+        let std_meta = fs::metadata(format!("{download_dir}/src/maybe_polyfill/std")).await?;
         assert!(std_meta.is_dir(), "std should be a directory");
 
         // Verify lib.rs also exists.
@@ -4884,10 +4882,7 @@ exit 1
         };
         slow_store
             .as_ref()
-            .update_oneshot(
-                root_directory_digest,
-                root_directory.encode_to_vec().into(),
-            )
+            .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
             .await?;
 
         // Provide server hints saying file2 is missing.
@@ -4920,8 +4915,8 @@ exit 1
     /// actually cached) still work -- the blob gets re-fetched from
     /// the slow store even though it was already in the fast store.
     #[nativelink_test]
-    async fn download_to_directory_stale_missing_hints()
-    -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_stale_missing_hints() -> Result<(), Box<dyn core::error::Error>>
+    {
         const FILE_NAME: &str = "stale.txt";
         const FILE_CONTENT: &str = "STALE_HINT_FILE";
 
@@ -4950,10 +4945,7 @@ exit 1
         };
         slow_store
             .as_ref()
-            .update_oneshot(
-                root_directory_digest,
-                root_directory.encode_to_vec().into(),
-            )
+            .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
             .await?;
 
         // Provide stale hints: claim the file is missing even though
@@ -4983,8 +4975,8 @@ exit 1
     /// Verify that an empty server_missing_digests set (all blobs
     /// hinted as cached) still downloads correctly.
     #[nativelink_test]
-    async fn download_to_directory_empty_missing_hints()
-    -> Result<(), Box<dyn core::error::Error>> {
+    async fn download_to_directory_empty_missing_hints() -> Result<(), Box<dyn core::error::Error>>
+    {
         const FILE_NAME: &str = "all_cached.txt";
         const FILE_CONTENT: &str = "ALL_CACHED_FILE";
 
@@ -5013,10 +5005,7 @@ exit 1
         };
         slow_store
             .as_ref()
-            .update_oneshot(
-                root_directory_digest,
-                root_directory.encode_to_vec().into(),
-            )
+            .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
             .await?;
 
         // Empty hints set: everything is "cached" (nothing missing).
@@ -5070,10 +5059,7 @@ exit 1
         };
         slow_store
             .as_ref()
-            .update_oneshot(
-                root_directory_digest,
-                root_directory.encode_to_vec().into(),
-            )
+            .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
             .await?;
 
         let download_dir = make_temp_path("download_dir_no_hints");
@@ -5132,7 +5118,10 @@ exit 1
         // Confirm the missing blob is NOT in fast store before the test.
         let key: StoreKey<'_> = missing_digest.into();
         let has = fast_store.as_ref().has(key).await?;
-        assert!(has.is_none(), "missing_blob should not be in fast store yet");
+        assert!(
+            has.is_none(),
+            "missing_blob should not be in fast store yet"
+        );
 
         let root_directory_digest = DigestInfo::new([62u8; 32], 32);
         let root_directory = Directory {
@@ -5152,10 +5141,7 @@ exit 1
         };
         slow_store
             .as_ref()
-            .update_oneshot(
-                root_directory_digest,
-                root_directory.encode_to_vec().into(),
-            )
+            .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
             .await?;
 
         let mut missing_set = HashSet::new();
@@ -5238,10 +5224,7 @@ exit 1
         };
         slow_store
             .as_ref()
-            .update_oneshot(
-                root_directory_digest,
-                root_directory.encode_to_vec().into(),
-            )
+            .update_oneshot(root_directory_digest, root_directory.encode_to_vec().into())
             .await?;
 
         let download_dir = make_temp_path("download_dir_large_missing");
@@ -5412,8 +5395,8 @@ exit 1
             #[prost(message, repeated, tag = "1")]
             violations: Vec<PfViolation>,
         }
-        let decoded = PfFailure::decode(any.value.as_slice())
-            .expect("PreconditionFailure must decode");
+        let decoded =
+            PfFailure::decode(any.value.as_slice()).expect("PreconditionFailure must decode");
         assert!(
             !decoded.violations.is_empty(),
             "PreconditionFailure must contain at least one violation",
@@ -5458,8 +5441,7 @@ exit 1
     /// upload_ac_results — production-composition contract violated"
     /// message — not a generic `is_err()` / `assert_eq` mismatch.
     #[nativelink_test]
-    async fn upload_ac_results_registers_pin_in_fss()
-    -> Result<(), Box<dyn core::error::Error>> {
+    async fn upload_ac_results_registers_pin_in_fss() -> Result<(), Box<dyn core::error::Error>> {
         let (_, _, cas_store, _) = setup_stores().await?;
 
         // Build a REAL `FastSlowStore` for AC: memory-fast over
@@ -5477,7 +5459,7 @@ exit 1
                 fast_direction: StoreDirection::default(),
                 slow_direction: StoreDirection::default(),
                 chunked_reads_enabled: false,
-            slow_writes_in_flight_max_bytes: 0,
+                slow_writes_in_flight_max_bytes: 0,
             },
             Store::new(ac_fast),
             Store::new(ac_slow),
@@ -5573,8 +5555,7 @@ exit 1
         // action_digest under the configured store_id, observable via
         // the SAME accessor the production `send_periodic_blobs_available`
         // loop uses.
-        let snapshot =
-            ac_fss.dispatched_ac_pin_snapshot_for_store(ac_store_id.as_ref());
+        let snapshot = ac_fss.dispatched_ac_pin_snapshot_for_store(ac_store_id.as_ref());
         assert!(
             snapshot.iter().any(|d| *d == action_digest),
             "AC pin must be registered after upload_ac_results — \
