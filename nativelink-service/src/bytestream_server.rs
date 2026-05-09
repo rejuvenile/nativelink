@@ -1654,13 +1654,25 @@ impl ByteStreamServer {
                     // Send EOF to mirror (non-fatal, synchronous). Skip when we
                     // dropped any chunks: the byte count won't match expected_size
                     // and the receiver would either error on size mismatch or,
-                    // worse, accept a corrupt blob. Letting the writer drop
-                    // signals the receiver to abort cleanly.
+                    // worse, accept a corrupt blob. Instead of a silent writer
+                    // drop (which surfaces in the mirror task as the generic
+                    // `Code::Internal "Sender dropped before sending EOF"`),
+                    // send a typed `Code::Aborted` carrying the
+                    // `MIRROR_TEE_BACKPRESSURE_MARKER` so the downstream
+                    // `worker_proxy_store::mirror_blob_via_stream` WARN site
+                    // can demote the by-design event to DEBUG (#344). The
+                    // single per-blob INFO at the end of `inner_write`
+                    // ("receiver will re-fetch on demand") already records
+                    // the operator-visible signal.
                     if let Some(mtx) = mirror_tx {
-                        if !*mirror_dropped_any {
-                            if let Err(_err) = mtx.send_eof() {
-                                warn!("mirror EOF send failed, dropping mirror");
-                            }
+                        if *mirror_dropped_any {
+                            mtx.send_error(make_err!(
+                                Code::Aborted,
+                                "{}",
+                                nativelink_store::worker_proxy_store::MIRROR_TEE_BACKPRESSURE_MARKER
+                            ));
+                        } else if let Err(_err) = mtx.send_eof() {
+                            warn!("mirror EOF send failed, dropping mirror");
                         }
                     }
                     // Gracefully close our store stream.

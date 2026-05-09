@@ -555,6 +555,38 @@ fn classify_mirror_failure(e: &Error) -> MirrorFailureKind {
     MirrorFailureKind::Generic
 }
 
+/// Marker substring embedded by the bytestream tee producer in the
+/// `send_error` it fires on the mirror channel when one or more chunks
+/// were dropped due to backpressure (the 16-slot mirror_tx tee filled).
+///
+/// The downstream mirror task observes this exact substring on the Error
+/// returned from `GrpcStore::update` (the producer's `send_error` payload
+/// is what `buf_channel::recv` surfaces, with `err_tip` strings appended
+/// by intermediate layers but the original message preserved). When the
+/// substring is present AND the Code is `Code::Aborted`, the
+/// `mirror_stream: failed to stream blob to worker` event is the
+/// by-design consequence of best-effort tee backpressure (the receiver
+/// will re-fetch on demand), NOT a real worker failure — log at DEBUG.
+///
+/// (#344, 2026-05-09: 21/min residual WARN noise was double-counting an
+/// expected event already logged at INFO by the producer.)
+pub const MIRROR_TEE_BACKPRESSURE_MARKER: &str = "mirror tee backpressure: chunks dropped";
+
+/// Returns true if the error originated from the bytestream tee producer
+/// signalling that chunks were dropped to backpressure (and therefore
+/// the mirror failure is by-design, not a network/peer fault).
+///
+/// Robust against `err_tip` wrapping by intermediate layers: matches on
+/// the marker substring inside any of the error's accumulated messages,
+/// AND requires `Code::Aborted` so a coincidental substring in a
+/// different code path cannot trigger the demotion.
+fn is_mirror_tee_backpressure_error(e: &Error) -> bool {
+    e.code == Code::Aborted
+        && e.messages
+            .iter()
+            .any(|m| m.contains(MIRROR_TEE_BACKPRESSURE_MARKER))
+}
+
 impl WorkerProxyStore {
     pub fn new(inner: Store, locality_map: SharedBlobLocalityMap) -> Arc<Self> {
         Arc::new(Self {
@@ -3286,13 +3318,32 @@ impl WorkerProxyStore {
             }
             Err(e) => {
                 self.record_mirror_failure(&endpoint, classify_mirror_failure(&e));
-                warn!(
-                    %digest,
-                    size_bytes,
-                    endpoint = endpoint.as_ref(),
-                    ?e,
-                    "mirror_stream: failed to stream blob to worker"
-                );
+                // #344: when the error is the typed signal from the
+                // bytestream tee producer ("chunks dropped to backpressure"),
+                // the failure is by-design — the producer already logged a
+                // single per-blob INFO ("receiver will re-fetch on demand")
+                // and bumped `mirror_chunks_dropped_backpressure`. Logging
+                // a WARN here double-counts an expected event. Demote to
+                // DEBUG so genuine worker failures (h2 GOAWAY, TCP RST,
+                // peer disconnect — different Codes / no marker) remain
+                // visible at WARN.
+                if is_mirror_tee_backpressure_error(&e) {
+                    debug!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        ?e,
+                        "mirror_stream: tee backpressure dropped chunks; receiver will re-fetch on demand"
+                    );
+                } else {
+                    warn!(
+                        %digest,
+                        size_bytes,
+                        endpoint = endpoint.as_ref(),
+                        ?e,
+                        "mirror_stream: failed to stream blob to worker"
+                    );
+                }
             }
         }
     }
