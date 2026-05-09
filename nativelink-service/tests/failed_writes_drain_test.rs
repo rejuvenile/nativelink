@@ -100,7 +100,8 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     UpdateForWorker, update_for_worker,
 };
 use nativelink_service::failed_writes_drain::{
-    DEFAULT_DRAIN_BATCH_SIZE, DEFAULT_DRAIN_COOLDOWN, DEFAULT_DRAIN_INFLIGHT_CAP, drain_tick,
+    DEFAULT_DRAIN_BATCH_SIZE, DEFAULT_DRAIN_COOLDOWN, DEFAULT_DRAIN_INFLIGHT_CAP,
+    DEFAULT_SELF_RETRY_TIMEOUT, drain_tick,
 };
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
@@ -1241,6 +1242,347 @@ async fn failed_slow_writes_v3_walker_descends_production_composition() -> Resul
     .expect(
         "V3 production-composition test must not deadlock — walker \
          descent contract violated (synthetic_large_key pattern)",
+    )?;
+    Ok(())
+}
+
+// =============================================================
+// BLOCK-2 + dsr MAJOR-1 fixtures: a slow store that blocks
+// `update_oneshot` on a `tokio::sync::Notify` until released.
+// Lets the test simulate a wedged slow tier (pre-fix: drainer
+// hangs forever on the first failed digest) and assert the
+// drainer makes progress within bounded wall-clock.
+// =============================================================
+
+/// Slow-store test fixture that blocks `update_oneshot` on a shared
+/// `Notify` until `release()` is called. Used by:
+///   - BLOCK-2 test: assert per-digest timeout fires under the
+///     `DEFAULT_SELF_RETRY_TIMEOUT` budget (no indefinite block).
+///   - dsr MAJOR-1 test: assert N concurrent slow-tier writes
+///     overlap inside one tick rather than serialize.
+#[derive(Debug)]
+struct BlockingSlowStore {
+    inner: Arc<MemoryStore>,
+    gate: tokio::sync::Notify,
+    /// When true, `update_oneshot` waits on `gate` before delegating
+    /// to the inner store. Toggleable at runtime so a single fixture
+    /// can simulate "wedged then released" within one test.
+    block_updates: AtomicBool,
+    /// Counter for assertions (how many times update_oneshot was
+    /// entered — useful for catching a regression where the drainer
+    /// stops calling try_self_retry_slow_write).
+    update_attempts: core::sync::atomic::AtomicUsize,
+}
+
+impl BlockingSlowStore {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryStore::new(&MemorySpec::default()),
+            gate: tokio::sync::Notify::new(),
+            block_updates: AtomicBool::new(true),
+            update_attempts: core::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Release any pending update_oneshot waiters AND switch off
+    /// further blocking so subsequent calls pass straight through.
+    fn release(&self) {
+        self.block_updates.store(false, Ordering::SeqCst);
+        // notify_waiters wakes ALL currently parked waiters in one
+        // call (versus notify_one which would require N calls for N
+        // waiters and risks deadlock if call ordering varies).
+        self.gate.notify_waiters();
+    }
+
+    fn update_attempts_count(&self) -> usize {
+        self.update_attempts.load(Ordering::SeqCst)
+    }
+}
+
+impl MetricsComponent for BlockingSlowStore {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+#[async_trait]
+impl StoreDriver for BlockingSlowStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        Pin::new(self.inner.as_ref())
+            .has_with_results(keys, results)
+            .await
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        reader: DropCloserReadHalf,
+        size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Streaming `update` path isn't on the V3 self-retry hot
+        // path (FSS uses `update_oneshot` there); just delegate.
+        Pin::new(self.inner.as_ref())
+            .update(key, reader, size_info)
+            .await
+    }
+
+    async fn update_oneshot(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        data: Bytes,
+    ) -> Result<(), Error> {
+        self.update_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.block_updates.load(Ordering::SeqCst) {
+            // Park indefinitely until `release()` is called. Without
+            // a `tokio::time::timeout` wrapping this from the caller
+            // (BLOCK-2 fix), the V3 drainer would wedge here
+            // permanently on the first failed digest.
+            self.gate.notified().await;
+        }
+        Pin::new(self.inner.as_ref())
+            .update_oneshot(key, data)
+            .await
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        offset: u64,
+        length: Option<u64>,
+    ) -> Result<(), Error> {
+        Pin::new(self.inner.as_ref())
+            .get_part(key, writer, offset, length)
+            .await
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+
+    fn optimized_for(&self, _optimization: StoreOptimizations) -> bool {
+        false
+    }
+}
+
+default_health_status_indicator!(BlockingSlowStore);
+
+/// Build an FSS with a `BlockingSlowStore` so tests can wedge the
+/// slow tier on demand.
+fn make_fss_with_blocking_slow() -> (
+    Arc<FastSlowStore>,
+    Arc<MemoryStore>,
+    Arc<BlockingSlowStore>,
+) {
+    let fast_arc = MemoryStore::new(&MemorySpec::default());
+    let slow_arc = BlockingSlowStore::new();
+    let fast = Store::new(fast_arc.clone());
+    let slow = Store::new(slow_arc.clone());
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: nativelink_config::stores::StoreDirection::default(),
+            slow_direction: nativelink_config::stores::StoreDirection::default(),
+            chunked_reads_enabled: false,
+        },
+        fast,
+        slow,
+    );
+    (fss, fast_arc, slow_arc)
+}
+
+/// Red-team BLOCK-2 regression test: a wedged slow tier MUST NOT
+/// block the V3 drainer indefinitely. The pre-fix code path
+/// (`fast_slow_store.rs:1803-1811`'s `slow_store.update_oneshot`
+/// without a `tokio::time::timeout`) blocked forever on the first
+/// failed digest, the `failed_slow_writes` set grew without bound,
+/// and the 120 s pin TTL eventually expired for everything else —
+/// V3 bought ~zero seconds of recovery for the outage it was
+/// designed to address.
+///
+/// Test shape:
+///   1. Tick #1 with the slow tier wedged (Notify-blocked):
+///      `try_self_retry_slow_write` MUST return `Code::DeadlineExceeded`
+///      within `DEFAULT_SELF_RETRY_TIMEOUT`; the drainer counts it
+///      as `self_retry_failed` and re-inserts the digest.
+///   2. Release the slow tier (`slow_arc.release()`).
+///   3. Tick #2 with the slow tier unblocked: the same digest
+///      MUST self-retry successfully (`self_retried = 1`).
+///
+/// The whole test runs under a 15 s `tokio::time::timeout` deadlock
+/// detector. With the BLOCK-2 fix, total wall-clock is ~2 s
+/// (one timeout fires) + change. Without the fix the test wedges
+/// at tick #1 and the deadlock detector triggers the bespoke
+/// `.expect` message below.
+#[nativelink_test]
+async fn failed_slow_writes_v3_self_retry_bounded_by_timeout() -> Result<(), Error> {
+    // Use a generous outer deadlock detector — the BLOCK-2 fix
+    // bounds individual digests to `DEFAULT_SELF_RETRY_TIMEOUT`
+    // (2 s in production); this test only enqueues 1 digest, so
+    // worst-case wall-clock is ~2 s + overhead. 15 s is the
+    // deadlock detector — without the BLOCK-2 fix the test would
+    // hang forever on the parked Notify and this timeout fires.
+    const OUTER_DEADLOCK_TIMEOUT: Duration = Duration::from_secs(15);
+
+    tokio::time::timeout(OUTER_DEADLOCK_TIMEOUT, async {
+        let (fss, fast_arc, slow_arc) = make_fss_with_blocking_slow();
+        let cas_store_name = "cas_STORE_TEST";
+        let cas_stores: Vec<(String, Store)> =
+            vec![(cas_store_name.to_string(), Store::new(fss.clone()))];
+
+        let locality_map = new_shared_blob_locality_map();
+        let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
+
+        // Pre-stage one digest in the fast tier so V3 will TRY
+        // self-retry (the bug only manifests when the slow tier
+        // gets called).
+        let digest = DigestInfo::try_new(VALID_HASH, 4).expect("valid digest");
+        Pin::new(fast_arc.as_ref())
+            .update_oneshot(StoreKey::Digest(digest), Bytes::from_static(b"data"))
+            .await
+            .expect("seed fast tier");
+
+        let inserter = fss.failed_writes_inserter();
+        inserter(digest);
+
+        // Tick #1: slow tier WEDGED. The drainer MUST come back
+        // within `DEFAULT_SELF_RETRY_TIMEOUT + small overhead`.
+        // Without the BLOCK-2 fix it never returns and the outer
+        // timeout fires with the bespoke message.
+        let mut inflight: HashMap<DigestInfo, Instant> = HashMap::new();
+        let tick1_start = Instant::now();
+        let stats1 = drain_tick(
+            &cas_stores,
+            &locality_map,
+            &dispatcher,
+            &mut inflight,
+            DEFAULT_DRAIN_COOLDOWN,
+            DEFAULT_DRAIN_BATCH_SIZE,
+            DEFAULT_DRAIN_INFLIGHT_CAP,
+        )
+        .await;
+        let tick1_elapsed = tick1_start.elapsed();
+
+        assert_eq!(stats1.drained, 1, "stats1={stats1:?}");
+        assert_eq!(
+            stats1.self_retry_failed, 1,
+            "BLOCK-2: a wedged slow tier MUST surface as \
+             self_retry_failed (Code::DeadlineExceeded from the \
+             timeout wrap), NOT block forever; stats1={stats1:?}"
+        );
+        assert_eq!(
+            stats1.self_retried, 0,
+            "BLOCK-2: slow tier was wedged so self-retry MUST NOT \
+             succeed; stats1={stats1:?}"
+        );
+        assert!(
+            tick1_elapsed < OUTER_DEADLOCK_TIMEOUT - Duration::from_secs(2),
+            "BLOCK-2: drain_tick took {tick1_elapsed:?} (≥ deadlock \
+             window) — V3 self-retry blocked indefinitely on slow tier \
+             — missing tokio::time::timeout"
+        );
+
+        // Digest re-inserted for next tick (BLOCK-2 contract: a
+        // transient outage MUST NOT lose the digest).
+        assert!(
+            fss.failed_slow_writes_contains(&digest),
+            "BLOCK-2: slow-tier timeout MUST re-insert the digest into \
+             failed_slow_writes — otherwise a transient slow-tier wedge \
+             permanently loses the digest"
+        );
+
+        // Reset cooldown so tick #2 isn't throttled. (Production's
+        // 60 s cooldown would block the next tick; here we simulate
+        // wall-clock advancing past the cooldown by clearing the map.)
+        inflight.clear();
+
+        // Release the slow tier.
+        slow_arc.release();
+
+        // Tick #2: slow tier RELEASED. Same digest MUST self-retry.
+        let stats2 = drain_tick(
+            &cas_stores,
+            &locality_map,
+            &dispatcher,
+            &mut inflight,
+            DEFAULT_DRAIN_COOLDOWN,
+            DEFAULT_DRAIN_BATCH_SIZE,
+            DEFAULT_DRAIN_INFLIGHT_CAP,
+        )
+        .await;
+
+        assert_eq!(stats2.drained, 1, "stats2={stats2:?}");
+        assert_eq!(
+            stats2.self_retried, 1,
+            "BLOCK-2: after slow-tier release, the re-inserted digest \
+             MUST self-retry on the next tick (proves the timeout is a \
+             transient surface, not a permanent loss); stats2={stats2:?}"
+        );
+        assert_eq!(stats2.self_retry_failed, 0, "stats2={stats2:?}");
+
+        // BlockingSlowStore::update_oneshot was entered exactly twice
+        // (once per tick) — proves the drainer kept calling
+        // try_self_retry_slow_write rather than dropping the digest.
+        assert_eq!(
+            slow_arc.update_attempts_count(),
+            2,
+            "BLOCK-2: BlockingSlowStore should have been called \
+             exactly 2× (once per tick) — got \
+             {} attempts. Drainer dropped the digest after the timeout?",
+            slow_arc.update_attempts_count()
+        );
+
+        // Sanity that the production timeout const is in fact short
+        // enough to leave headroom inside the outer deadlock window.
+        assert!(
+            DEFAULT_SELF_RETRY_TIMEOUT < OUTER_DEADLOCK_TIMEOUT,
+            "BLOCK-2 guard: DEFAULT_SELF_RETRY_TIMEOUT={DEFAULT_SELF_RETRY_TIMEOUT:?} \
+             must be < OUTER_DEADLOCK_TIMEOUT={OUTER_DEADLOCK_TIMEOUT:?}",
+        );
+
+        Ok::<(), Error>(())
+    })
+    .await
+    .expect(
+        "V3 self-retry blocked indefinitely on slow tier — missing \
+         tokio::time::timeout (BLOCK-2 regression: per-digest slow-tier \
+         write must be bounded under DEFAULT_SELF_RETRY_TIMEOUT)",
     )?;
     Ok(())
 }

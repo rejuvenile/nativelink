@@ -1707,10 +1707,25 @@ impl FastSlowStore {
     ///   fall through to UploadMissingBlobs; the digest is NOT touched
     ///   in `failed_slow_writes`.
     /// - `Err(_)`: slow-tier write failed for some other reason
-    ///   (transient unavailability). Caller should re-insert the
-    ///   digest for the next drain tick. Fast-tier read errors are
-    ///   treated as miss → `Ok(FastTierMiss)` so they get a worker
-    ///   retry; only slow-tier write errors propagate.
+    ///   (transient unavailability OR `Code::DeadlineExceeded` from
+    ///   the `slow_write_timeout` guard, see below). Caller should
+    ///   re-insert the digest for the next drain tick. Fast-tier read
+    ///   errors are treated as miss → `Ok(FastTierMiss)` so they get
+    ///   a worker retry; only slow-tier write errors propagate.
+    ///
+    /// ## Per-call slow-tier timeout (red-team BLOCK-2)
+    ///
+    /// `slow_write_timeout` bounds the slow-tier `update_oneshot` so a
+    /// wedged backend (e.g. ZFS tank pool degraded for hours) cannot
+    /// block the drainer indefinitely. Pre-fix the drainer was
+    /// sequential per-tick: a single wedged digest blocked every other
+    /// digest in the tick, the `failed_slow_writes` set grew without
+    /// bound, and the 120 s pin TTL eventually expired for everything
+    /// — V3 bought ~zero seconds of recovery for the outage it was
+    /// designed to address. Production uses
+    /// `failed_writes_drain::DEFAULT_SELF_RETRY_TIMEOUT` (≤ the drain
+    /// interval) so a wedged digest at most delays its own tick
+    /// finish, not the next tick.
     ///
     /// ## Lock discipline
     ///
@@ -1764,6 +1779,7 @@ impl FastSlowStore {
     pub async fn try_self_retry_slow_write(
         &self,
         digest: DigestInfo,
+        slow_write_timeout: core::time::Duration,
     ) -> Result<SelfRetryOutcome, Error> {
         let key = StoreKey::Digest(digest);
         // Fast-tier read. NotFound or any other read error → miss
@@ -1800,15 +1816,52 @@ impl FastSlowStore {
         // Slow-tier write. Errors propagate to the caller, which will
         // re-insert into `failed_slow_writes` so the next drain tick
         // can retry.
-        self.slow_store
-            .update_oneshot(key.borrow(), bytes)
-            .await
-            .err_tip(|| {
-                format!(
+        //
+        // Red-team BLOCK-2: bound the slow-tier write under
+        // `slow_write_timeout` so a wedged backend (e.g. ZFS tank pool
+        // degraded for hours) cannot block the drainer indefinitely.
+        // Pre-fix the drainer was sequential per-tick: a single wedged
+        // digest blocked every other digest in the tick, the
+        // `failed_slow_writes` set grew without bound, and the 120 s
+        // pin TTL eventually expired for everything else — V3 bought
+        // ~zero seconds of recovery for the outage it was designed to
+        // address. On `Elapsed` we propagate `Code::DeadlineExceeded`
+        // with a bespoke message; the drainer catches it on the
+        // existing Err arm, counts it as `self_retry_failed`, and
+        // re-inserts the digest for the next tick.
+        match tokio::time::timeout(
+            slow_write_timeout,
+            self.slow_store.update_oneshot(key.borrow(), bytes),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(e).err_tip(|| {
+                    format!(
+                        "FastSlowStore::try_self_retry_slow_write: slow-tier write \
+                         failed for digest {digest:?}"
+                    )
+                });
+            }
+            Err(_elapsed) => {
+                let elapsed_secs = slow_write_timeout.as_secs();
+                warn!(
+                    ?digest,
+                    elapsed_secs,
+                    bytes = bytes_len,
                     "FastSlowStore::try_self_retry_slow_write: slow-tier write \
-                     failed for digest {digest:?}"
-                )
-            })?;
+                     timed out; treating as transient failure (caller will \
+                     re-insert into failed_slow_writes for next tick)"
+                );
+                return Err(make_err!(
+                    Code::DeadlineExceeded,
+                    "FastSlowStore::try_self_retry_slow_write: slow-tier write \
+                     for digest {digest:?} did not complete within {elapsed_secs}s \
+                     (V3 self-retry timeout — caller re-inserts for next tick)"
+                ));
+            }
+        }
         // Success: clear from `failed_slow_writes` and notify BIS.
         // Mirrors the legacy success path at
         // `:3972-3975` (background slow-write Ok arm).

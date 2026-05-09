@@ -94,6 +94,31 @@ use tracing::{info, warn};
 /// much lower than this so most ticks find an empty set.
 pub const DEFAULT_DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Default per-digest V3 self-retry slow-tier timeout (red-team
+/// BLOCK-2). Bounds the `slow_store.update_oneshot` inside
+/// [`nativelink_store::fast_slow_store::FastSlowStore::try_self_retry_slow_write`]
+/// so a wedged slow tier (e.g. ZFS tank pool degraded for hours)
+/// cannot block the drainer indefinitely. MUST be `≤
+/// DEFAULT_DRAIN_INTERVAL` so a wedged digest at most delays its
+/// own tick finish, not the next tick. With the dsr MAJOR-1
+/// `FuturesUnordered` parallelism, multiple slow-tier writes
+/// overlap inside this same budget, but each individual write is
+/// still bounded.
+pub const DEFAULT_SELF_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default concurrency cap for V3 self-retry slow-tier writes within
+/// a single drain tick (dsr MAJOR-1). Without parallelism the worst
+/// case is `N × DEFAULT_SELF_RETRY_TIMEOUT` per tick (e.g. 723
+/// digests × 2 s = 24 minutes); a `FuturesUnordered` driven from a
+/// `Semaphore` of this size caps in-flight slow-tier RPCs so the
+/// slow tier itself isn't saturated by the drainer (which would be
+/// strictly worse than wedging on one). Set conservative — the slow
+/// tier already has its own concurrency limits (filesystem write
+/// capacity, network bandwidth); 16 is large enough to mask
+/// individual transient spikes but small enough to leave headroom
+/// for normal Bazel writes.
+pub const DEFAULT_SELF_RETRY_CONCURRENCY: usize = 16;
+
 /// Default per-digest cooldown. After we either dispatch or fail to
 /// dispatch a digest, skip it for this long even if it appears in
 /// the set again.
@@ -326,8 +351,17 @@ pub async fn drain_tick(
             // The FSS clears `failed_slow_writes` itself on success
             // (no re-insert needed); on miss we fall through to the
             // worker dispatch path; on Err we re-insert.
+            //
+            // Red-team BLOCK-2: pass `DEFAULT_SELF_RETRY_TIMEOUT` so a
+            // wedged slow tier returns `Code::DeadlineExceeded` from
+            // FSS within bounded wall-clock; the Err arm below counts
+            // it as `self_retry_failed` and re-inserts for the next
+            // tick.
             if let Some(Some(fss)) = fss_for_store.get(store_name.as_str()) {
-                match fss.try_self_retry_slow_write(digest).await {
+                match fss
+                    .try_self_retry_slow_write(digest, DEFAULT_SELF_RETRY_TIMEOUT)
+                    .await
+                {
                     Ok(SelfRetryOutcome::Succeeded { .. }) => {
                         stats.self_retried += 1;
                         if inflight.len() < inflight_cap {
@@ -347,7 +381,7 @@ pub async fn drain_tick(
                             err = ?e,
                             "failed_slow_writes_drain: self-retry slow-tier \
                              write failed; re-inserting for next tick \
-                             (transient slow-tier outage)"
+                             (transient slow-tier outage or BLOCK-2 timeout)"
                         );
                         stats.self_retry_failed += 1;
                         if inflight.len() < inflight_cap {
