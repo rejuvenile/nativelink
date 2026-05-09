@@ -86,6 +86,8 @@ fn make_fss(
             slow: StoreSpec::Memory(MemorySpec::default()),
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
         },
         fast,
         slow,

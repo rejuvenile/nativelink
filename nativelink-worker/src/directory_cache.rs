@@ -5376,6 +5376,8 @@ mod tests {
                     slow: StoreSpec::Memory(MemorySpec::default()),
                     fast_direction: Default::default(),
                     slow_direction: Default::default(),
+                    chunked_reads_enabled: false,
+                    slow_writes_in_flight_max_bytes: 0,
                 },
                 fast.clone(),
                 slow.clone(),
