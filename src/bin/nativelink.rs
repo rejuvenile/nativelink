@@ -1033,13 +1033,29 @@ async fn inner_main(
                     //     FastSlowStore → MemoryStore + ref(REDIS_AC_STORE)
                     //     (production `AC_BACKEND_CACHED`).
                     //
-                    // Idempotent — `MokaEvictingMap::unpin_key` is a
-                    // remove-if-present, so a digest re-pinned for a
-                    // separate (later) write is not affected here, only
-                    // the pin acquired at the originating write is
-                    // released. Per-store accounting (drains_per_store)
-                    // keeps the unpin scoped to the BIS-acked write so
-                    // we don't race a fresh pin on the same digest.
+                    // Race safety. `MokaEvictingMap::unpin_key` is wholesale
+                    // `pinned.remove(key)` (no per-write epoch tracking), so a
+                    // concurrent re-pin between drain and unpin DOES lose
+                    // its pin here. That race is benign — but for a
+                    // different reason than per-write scoping. The actual
+                    // safety:
+                    //   - BIS-ack implies the SLOW TIER (FilesystemStore for
+                    //     CAS, Redis for AC) already has the bytes. The
+                    //     fast-tier pin is no longer load-bearing past this
+                    //     point — it only existed to hold the in-memory
+                    //     replica across the ack window.
+                    //   - For CAS specifically, content-addressing means a
+                    //     re-uploaded same-key blob has identical bytes; the
+                    //     slow tier already has them, so even an unpinned-
+                    //     then-evicted entry is recoverable on the next
+                    //     read via the slow-tier fallback.
+                    //   - For AC, an unpinned entry that's evicted before
+                    //     a follow-up read just means the next reader pays
+                    //     a Redis round-trip (the slow tier holds it).
+                    // The comment is intentionally specific because future
+                    // readers might assume per-write epoch tracking exists
+                    // (the prior version of this comment did make that
+                    // claim incorrectly).
                     for (store, drained) in &cas_drains_per_store {
                         store.unpin_digests(drained);
                     }

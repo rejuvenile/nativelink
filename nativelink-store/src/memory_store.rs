@@ -734,6 +734,23 @@ impl StoreDriver for MemoryStore {
     /// [`Self::pin_digests_with_results`]. Server BIS broadcast loop
     /// calls this after telling workers a digest is durably mirrored;
     /// the fast-tier pin is no longer load-bearing past that point.
+    ///
+    /// **Race semantics — read carefully.** `MokaEvictingMap::unpin_key`
+    /// is wholesale `pinned.remove(key)` (no per-write epoch tracking).
+    /// A concurrent re-pin between an upstream caller's `pin_digests` and
+    /// this `unpin_digests` DOES lose its pin. The race is benign for the
+    /// BIS-ack call site (the only caller as of #334 Fix C), because:
+    ///   - BIS-ack implies the SLOW TIER (FilesystemStore for CAS, Redis
+    ///     for AC) already has the bytes — the fast-tier pin existed
+    ///     only to hold the in-memory replica across the ack window.
+    ///   - For CAS, content-addressing means a re-uploaded same-key blob
+    ///     has identical bytes; the slow tier already has them.
+    ///   - For AC, an unpinned-then-evicted entry costs a Redis round-trip
+    ///     on the next read (slow tier holds it).
+    /// Future callers that need different per-write semantics will need
+    /// epoch tracking in `MokaEvictingMap` — do NOT assume this is
+    /// safe in arbitrary contexts.
+    ///
     /// Idempotent — `MokaEvictingMap::unpin_key` is a remove-if-present.
     fn unpin_digests(&self, digests: &[DigestInfo]) {
         for d in digests {
