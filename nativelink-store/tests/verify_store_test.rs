@@ -625,3 +625,182 @@ async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// #336 P1 production-composition test: verify the writer-termination
+/// contract on the SIZE-MISMATCH `inner_check_get_part` Err path.
+///
+/// Mechanism guarded: when the underlying inner store returns fewer
+/// bytes than the digest expects, `inner_check_get_part` returns
+/// `Err(Code::DataLoss "Expected size N but got size M on read")`
+/// without (pre-#336-fix) terminating the borrowed `writer`. Direct
+/// callers (e.g. `get_part_unchunked`) own the writer and drop it on
+/// function return so the bug is invisible at that boundary; any
+/// wrapping caller that joins (get_fut, reader_fut) over the writer's
+/// tx/rx pair deadlocks because the reader never observes EOF or
+/// error.
+///
+/// This test sets up the wrapping composition by hand: it drives
+/// VerifyStore::get_part with a borrowed writer and concurrently
+/// reads from the matching rx in `tokio::join!`. The reader sees the
+/// structured DataLoss error if-and-only-if `writer_guard.fail(err)`
+/// fired in `inner_check_get_part`. A 5-second `tokio::time::timeout`
+/// is the deadlock detector — without the fix, the reader future
+/// hangs indefinitely.
+///
+/// Mutation step: comment out the `Err(writer_guard.fail(err))` /
+/// replace with `Err(err)` for the size branch in
+/// `verify_store::inner_check_get_part`. The test must red-fail
+/// with the bespoke message below.
+#[nativelink_test]
+async fn verify_store_inner_check_get_part_size_mismatch_terminates_writer() -> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::DropCloserWriteHalf;
+    use nativelink_util::store_trait::StoreKey;
+
+    const VALUE_SHORT: &str = "12";
+
+    let inner_store = MemoryStore::new(&MemorySpec::default());
+    let store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(inner_store.clone()),
+    );
+
+    // Digest claims 5 bytes but inner_store has only 2 — the
+    // `if sum_size != expected_size` branch fires inside
+    // `inner_check_get_part` after EOF from inner.
+    let digest = DigestInfo::try_new(VALID_HASH1, 5).unwrap();
+    inner_store.update_oneshot(digest, VALUE_SHORT.into()).await?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    // Drive get_part and reader concurrently — this is the production-
+    // composition seam. Without writer termination the reader hangs.
+    let pinned_store = Pin::new(&store);
+    let get_fut = async {
+        pinned_store
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    };
+    let reader_fut = async {
+        // Drain to EOF or first error. If `inner_check_get_part`
+        // bailed without `fail(err)` (the bug being guarded), the
+        // mpsc Sender is still alive and `recv` blocks until the
+        // outer scope drops it — past the timeout below.
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "VerifyStore::inner_check_get_part writer-termination contract violated \
+         — wrapping caller deadlocked on un-EOF'd writer (size-mismatch path)",
+    );
+
+    let (get_res, reader_res) = timeout_res;
+    let get_err = get_res.expect_err("get_part should return DataLoss size mismatch");
+    assert_eq!(get_err.code, Code::DataLoss);
+    assert!(
+        get_err.to_string().contains("Expected size 5 but got size 2 on read"),
+        "expected size-mismatch DataLoss, got: {get_err:?}"
+    );
+
+    // Reader observes the structured DataLoss as well (proving the
+    // guard's `fail(err)` actually delivered the error to the
+    // paired reader, not just terminated with the synthesized
+    // Drop-fallback Internal).
+    let reader_err = reader_res
+        .expect_err("reader should observe the structured DataLoss from writer.send_error");
+    assert!(
+        reader_err.code == Code::DataLoss
+            || reader_err.to_string().contains("Expected size 5 but got size 2 on read"),
+        "reader should see DataLoss propagated by guard.fail; got: {reader_err:?}"
+    );
+    Ok(())
+}
+
+/// #336 P1 sibling production-composition test: HASH-MISMATCH branch
+/// of `inner_check_get_part`. Same writer-termination contract.
+#[nativelink_test]
+async fn verify_store_inner_check_get_part_hash_mismatch_terminates_writer() -> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::DropCloserWriteHalf;
+    use nativelink_util::store_trait::StoreKey;
+
+    /// sha256("123")
+    const CORRECT_HASH: &str = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3";
+    const CORRECT_VALUE: &str = "123";
+    const CORRUPTED_VALUE: &str = "999";
+
+    let inner_store = MemoryStore::new(&MemorySpec::default());
+    let store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: false,
+            verify_hash: true,
+        },
+        Store::new(inner_store.clone()),
+    );
+
+    let digest = DigestInfo::try_new(CORRECT_HASH, CORRECT_VALUE.len() as u64).unwrap();
+    inner_store.update_oneshot(digest, CORRUPTED_VALUE.into()).await?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_store = Pin::new(&store);
+    let get_fut = async {
+        pinned_store
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    };
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "VerifyStore::inner_check_get_part writer-termination contract violated \
+         — wrapping caller deadlocked on un-EOF'd writer (hash-mismatch path)",
+    );
+
+    let (get_res, reader_res) = timeout_res;
+    let get_err = get_res.expect_err("get_part should return DataLoss hash mismatch");
+    assert_eq!(get_err.code, Code::DataLoss);
+    assert!(
+        get_err.to_string().contains("Hash mismatch on read"),
+        "expected hash-mismatch DataLoss, got: {get_err:?}"
+    );
+
+    let reader_err = reader_res
+        .expect_err("reader should observe the structured DataLoss from writer.send_error");
+    assert!(
+        reader_err.code == Code::DataLoss
+            || reader_err.to_string().contains("Hash mismatch on read"),
+        "reader should see DataLoss propagated by guard.fail; got: {reader_err:?}"
+    );
+    Ok(())
+}

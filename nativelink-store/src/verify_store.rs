@@ -205,6 +205,19 @@ impl VerifyStore {
 
     /// Verifies data read from the inner store by hashing and size-checking
     /// each chunk as it streams through to the caller's writer.
+    ///
+    /// Writer-termination contract (#336 P1): the borrowed `writer` is the
+    /// OUTER caller's writer. Direct `StoreLike::get` callers own and drop
+    /// the writer at function end, so missing termination is invisible at
+    /// that boundary. But any wrapping caller that joins `(get_fut,
+    /// check_fut)` over the writer's tx/rx pair (e.g. an upstream
+    /// VerifyStore composed atop us, or any future composition that pairs
+    /// our writer with a reader inside `tokio::join!`) deadlocks if we
+    /// return Err mid-stream without terminating. Wrap with
+    /// `WriteHalfGuard` so the size/hash mismatch Err paths use
+    /// `guard.fail(err)` to send the structured DataLoss to the paired
+    /// reader (vs the synthesized Internal from the Drop fallback) before
+    /// returning.
     async fn inner_check_get_part<D: DigestHasher>(
         &self,
         writer: &mut DropCloserWriteHalf,
@@ -213,6 +226,7 @@ impl VerifyStore {
         original_hash: &PackedHash,
         mut maybe_hasher: Option<&mut D>,
     ) -> Result<(), Error> {
+        let mut writer_guard = WriteHalfGuard::new(writer);
         let mut sum_size: u64 = 0;
         loop {
             let chunk = rx
@@ -230,12 +244,13 @@ impl VerifyStore {
                             actual_size = sum_size,
                             "size mismatch on read in verify store"
                         );
-                        return Err(make_err!(
+                        let err = make_err!(
                             Code::DataLoss,
                             "Expected size {} but got size {} on read",
                             expected_size,
                             sum_size
-                        ));
+                        );
+                        return Err(writer_guard.fail(err));
                     }
                 }
                 if let Some(hasher) = maybe_hasher.as_mut() {
@@ -248,14 +263,15 @@ impl VerifyStore {
                             %hash_result,
                             "hash mismatch on read in verify store"
                         );
-                        return Err(make_err!(
+                        let err = make_err!(
                             Code::DataLoss,
                             "Hash mismatch on read: expected {original_hash} but got {hash_result}",
-                        ));
+                        );
+                        return Err(writer_guard.fail(err));
                     }
                 }
-                writer
-                    .send_eof()
+                writer_guard
+                    .commit_eof()
                     .err_tip(|| "In verify_store::check_get_part sending eof")?;
                 break;
             }
@@ -263,7 +279,7 @@ impl VerifyStore {
             sum_size += chunk.len() as u64;
 
             // Hash while forwarding to the caller's writer.
-            let write_future = writer.send(chunk.clone());
+            let write_future = writer_guard.send(chunk.clone());
 
             if let Some(hasher) = maybe_hasher.as_mut() {
                 hasher.update(chunk.as_ref());
