@@ -509,6 +509,28 @@ fn register_pin_expire_listener(
     }
 }
 
+/// #335 V3 fix: outcome of [`FastSlowStore::try_self_retry_slow_write`].
+///
+/// The drainer at `nativelink-service::failed_writes_drain::drain_tick`
+/// uses this to decide whether to dispatch `UploadMissingBlobs` to a
+/// worker (only for `FastTierMiss`) or skip the worker round-trip
+/// entirely (`Succeeded`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfRetryOutcome {
+    /// Fast-tier had the bytes; slow-tier write succeeded; digest was
+    /// removed from `failed_slow_writes` and pushed to
+    /// `stable_digests` (BIS will broadcast). No worker round-trip
+    /// needed.
+    Succeeded {
+        /// Bytes written to the slow tier.
+        bytes: u64,
+    },
+    /// Fast-tier returned NotFound (or read errored). Caller should
+    /// fall through to UploadMissingBlobs so a worker can supply the
+    /// bytes. The digest is NOT touched in `failed_slow_writes`.
+    FastTierMiss,
+}
+
 // TODO(palfrey) We should consider copying the data in the background to allow the
 // client to hang up while the data is buffered. An alternative is to possibly make a
 // "BufferedStore" that could be placed on the "slow" store that would hang up early
@@ -1914,6 +1936,210 @@ impl FastSlowStore {
         for digest in digests {
             guard.remove(digest);
         }
+    }
+
+    /// #335 V3 fix (TLA+ liveness audit): self-retry a failed slow-tier
+    /// write directly from the server's fast tier.
+    ///
+    /// ## Why this exists
+    ///
+    /// The TLA+ audit (agent a88faadb49a541ea2) found a permanent-stuck
+    /// liveness violation: when the slow-tier background write fails
+    /// AND no worker has the bytes (mirror dispatch quarantined / slow
+    /// / never reached the worker), the `#287` server-side
+    /// `failed_slow_writes` drainer's only retry path is
+    /// `UploadMissingBlobs` to a worker. With no worker source the
+    /// digest stays in `failed_slow_writes` forever; the fast-tier pin
+    /// auto-expires (120 s); LRU evicts the bytes; the next Bazel read
+    /// returns NotFound. The Bazel-acked bytes are LOST.
+    ///
+    /// The server's MemoryStore (fast tier) holds the bytes for the
+    /// duration of the pin TTL — that's an authoritative source the
+    /// drainer can use without a worker round-trip. This method does
+    /// exactly that: read from `self.fast_store`; if found, write to
+    /// `self.slow_store`; on success, clear from `failed_slow_writes`
+    /// and push to `stable_digests` so the BIS broadcaster picks it
+    /// up.
+    ///
+    /// ## Returns
+    ///
+    /// - `Ok(SelfRetryOutcome::Succeeded { bytes })`: fast-tier hit,
+    ///   slow-tier write succeeded, digest removed from
+    ///   `failed_slow_writes`, pushed to `stable_digests` (BIS
+    ///   downstream).
+    /// - `Ok(SelfRetryOutcome::FastTierMiss)`: fast-tier returned
+    ///   NotFound (pin expired before drainer ran). Caller should
+    ///   fall through to UploadMissingBlobs; the digest is NOT touched
+    ///   in `failed_slow_writes`.
+    /// - `Err(_)`: slow-tier write failed for some other reason
+    ///   (transient unavailability OR `Code::DeadlineExceeded` from
+    ///   the `slow_write_timeout` guard, see below). Caller should
+    ///   re-insert the digest for the next drain tick. Fast-tier read
+    ///   errors are treated as miss → `Ok(FastTierMiss)` so they get
+    ///   a worker retry; only slow-tier write errors propagate.
+    ///
+    /// ## Per-call slow-tier timeout (red-team BLOCK-2)
+    ///
+    /// `slow_write_timeout` bounds the slow-tier `update_oneshot` so a
+    /// wedged backend (e.g. ZFS tank pool degraded for hours) cannot
+    /// block the drainer indefinitely. Pre-fix the drainer was
+    /// sequential per-tick: a single wedged digest blocked every other
+    /// digest in the tick, the `failed_slow_writes` set grew without
+    /// bound, and the 120 s pin TTL eventually expired for everything
+    /// — V3 bought ~zero seconds of recovery for the outage it was
+    /// designed to address. Production uses
+    /// `failed_writes_drain::DEFAULT_SELF_RETRY_TIMEOUT` (≤ the drain
+    /// interval) so a wedged digest at most delays its own tick
+    /// finish, not the next tick.
+    ///
+    /// ## Lock discipline
+    ///
+    /// `failed_slow_writes` (parking_lot::Mutex, single remove) and
+    /// `stable_digests` (parking_lot::Mutex, single push) are held
+    /// briefly and never across `.await`. The fast-tier read and
+    /// slow-tier write are async and use the standard
+    /// `get_part_unchunked` / `update_oneshot` paths.
+    ///
+    /// ## Idempotency
+    ///
+    /// Calling more than once for the same digest is safe: the second
+    /// call's fast-tier read still succeeds (read-through) and the
+    /// second slow-tier `update_oneshot` is a benign re-write. The
+    /// `stable_digests` push tolerates duplicates (BIS broadcast
+    /// dedups). However the drainer destructively drains
+    /// `failed_slow_writes` per tick, so in practice each digest is
+    /// retried at most once per tick.
+    ///
+    /// ## Cross-component dependency: Fix C (pin TTL)
+    ///
+    /// V3 self-retry's effectiveness depends on the fast-tier pin
+    /// outliving the slow-tier outage. Fix C
+    /// (`#334`/`PIN_TIMEOUT_SECS = 120`) sets the pin TTL at 120 s.
+    /// If the slow-tier outage exceeds the TTL, the pin auto-expires,
+    /// LRU evicts the bytes from MemoryStore, and this method returns
+    /// `Ok(SelfRetryOutcome::FastTierMiss)` — V3 silently re-opens
+    /// the failure window for any digest the drainer hadn't yet
+    /// retried. Operators reading the drainer's
+    /// `failed_slow_writes_drain: V3 self-retry inactive — fast tier
+    /// walker found no FastSlowStore in chain` warn can also see the
+    /// debug log `fast-tier miss (pin expired or never landed)` for
+    /// per-digest TTL-expiry visibility (closes dsr MINOR-2).
+    ///
+    /// ## Cap-rejected digest exclusion (red-team #5)
+    ///
+    /// V3 self-retry CANNOT recover digests that were rejected at
+    /// admission time (e.g. MemoryStore `Code::ResourceExhausted`
+    /// because the cap was hit before the bytes landed in fast tier).
+    /// Such digests never had a fast-tier replica taken; the pin
+    /// path was bypassed entirely; `try_self_retry_slow_write`
+    /// returns `Ok(SelfRetryOutcome::FastTierMiss)` without finding
+    /// bytes to retry. The `failed_slow_writes` drainer correctly
+    /// falls through to `UploadMissingBlobs`; without a worker
+    /// holding the bytes either, the digest stays stuck. This
+    /// exclusion is intentional — V3's domain is "writes that landed
+    /// then failed downstream", not "writes that never landed". The
+    /// admission-side fix lives in Fix A+B
+    /// (`#334`/`MemoryStore` BIS-driven backpressure) — without
+    /// admission gating that respects pinning, V3 cannot help.
+    pub async fn try_self_retry_slow_write(
+        &self,
+        digest: DigestInfo,
+        slow_write_timeout: core::time::Duration,
+    ) -> Result<SelfRetryOutcome, Error> {
+        let key = StoreKey::Digest(digest);
+        // Fast-tier read. NotFound or any other read error → miss
+        // (caller falls through to UploadMissingBlobs). Treating read
+        // errors as miss is intentional: a fast-tier transient should
+        // not promote to a permanent slow-tier failure; a worker can
+        // re-supply the bytes from its own copy.
+        let bytes = match self
+            .fast_store
+            .get_part_unchunked(key.borrow(), 0, Some(digest.size_bytes()))
+            .await
+        {
+            Ok(b) => b,
+            Err(e) if e.code == Code::NotFound => {
+                debug!(
+                    ?digest,
+                    "FastSlowStore::try_self_retry_slow_write: fast-tier miss \
+                     (pin expired or never landed); falling through to worker \
+                     retry"
+                );
+                return Ok(SelfRetryOutcome::FastTierMiss);
+            }
+            Err(e) => {
+                warn!(
+                    ?digest,
+                    err = ?e,
+                    "FastSlowStore::try_self_retry_slow_write: fast-tier read \
+                     errored; treating as miss for worker fall-through"
+                );
+                return Ok(SelfRetryOutcome::FastTierMiss);
+            }
+        };
+        let bytes_len = bytes.len() as u64;
+        // Slow-tier write. Errors propagate to the caller, which will
+        // re-insert into `failed_slow_writes` so the next drain tick
+        // can retry.
+        //
+        // Red-team BLOCK-2: bound the slow-tier write under
+        // `slow_write_timeout` so a wedged backend (e.g. ZFS tank pool
+        // degraded for hours) cannot block the drainer indefinitely.
+        // Pre-fix the drainer was sequential per-tick: a single wedged
+        // digest blocked every other digest in the tick, the
+        // `failed_slow_writes` set grew without bound, and the 120 s
+        // pin TTL eventually expired for everything else — V3 bought
+        // ~zero seconds of recovery for the outage it was designed to
+        // address. On `Elapsed` we propagate `Code::DeadlineExceeded`
+        // with a bespoke message; the drainer catches it on the
+        // existing Err arm, counts it as `self_retry_failed`, and
+        // re-inserts the digest for the next tick.
+        match tokio::time::timeout(
+            slow_write_timeout,
+            self.slow_store.update_oneshot(key.borrow(), bytes),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(e).err_tip(|| {
+                    format!(
+                        "FastSlowStore::try_self_retry_slow_write: slow-tier write \
+                         failed for digest {digest:?}"
+                    )
+                });
+            }
+            Err(_elapsed) => {
+                let elapsed_secs = slow_write_timeout.as_secs();
+                warn!(
+                    ?digest,
+                    elapsed_secs,
+                    bytes = bytes_len,
+                    "FastSlowStore::try_self_retry_slow_write: slow-tier write \
+                     timed out; treating as transient failure (caller will \
+                     re-insert into failed_slow_writes for next tick)"
+                );
+                return Err(make_err!(
+                    Code::DeadlineExceeded,
+                    "FastSlowStore::try_self_retry_slow_write: slow-tier write \
+                     for digest {digest:?} did not complete within {elapsed_secs}s \
+                     (V3 self-retry timeout — caller re-inserts for next tick)"
+                ));
+            }
+        }
+        // Success: clear from `failed_slow_writes` and notify BIS.
+        // Mirrors the legacy success path at
+        // `:3972-3975` (background slow-write Ok arm).
+        self.failed_slow_writes.lock().remove(&digest);
+        self.stable_digests.lock().push(digest);
+        self.stable_notify.notify_one();
+        info!(
+            ?digest,
+            bytes = bytes_len,
+            "FastSlowStore::try_self_retry_slow_write: self-retry from server \
+             fast tier succeeded (V3 liveness fix; no worker round-trip needed)"
+        );
+        Ok(SelfRetryOutcome::Succeeded { bytes: bytes_len })
     }
 
     /// Create a new FastSlowStore that shares the failed_slow_writes

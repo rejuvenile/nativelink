@@ -68,44 +68,22 @@ impl StoreManager {
     /// deadline, not N×deadline. Stores are flushed concurrently so a
     /// single backend that takes its full budget does not starve the others.
     pub async fn flush_slow_writes(&self, timeout: core::time::Duration) {
-        use crate::existence_cache_store::ExistenceCacheStore;
         use crate::fast_slow_store::FastSlowStore;
-        use crate::verify_store::VerifyStore;
+        use crate::wrapper_walker::{find_fast_slow_via_chain, synthetic_large_key};
         use nativelink_util::store_trait::StoreDriver;
 
-        /// Walk the store wrapper chain to find a FastSlowStore.
-        /// ExistenceCacheStore and VerifyStore return `self` from
-        /// `inner_store()` (trait method), so we use `as_any()` to
-        /// downcast to known wrapper types and access their typed
-        /// inner_store() methods instead.
-        fn find_fast_slow<'a>(store: &'a dyn StoreDriver) -> Option<&'a FastSlowStore> {
-            if let Some(fss) = store.as_any().downcast_ref::<FastSlowStore>() {
-                return Some(fss);
-            }
-            if let Some(ecs) = store.as_any().downcast_ref::<ExistenceCacheStore<std::time::SystemTime>>() {
-                return find_fast_slow(
-                    ecs.inner_store().inner_store(
-                        Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                    ),
-                );
-            }
-            if let Some(vs) = store.as_any().downcast_ref::<VerifyStore>() {
-                return find_fast_slow(
-                    vs.inner_store().inner_store(
-                        Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                    ),
-                );
-            }
-            // Unknown wrapper — try the trait inner_store as fallback.
-            let inner = store.inner_store(None);
-            if core::ptr::eq(
-                inner as *const dyn StoreDriver,
-                store as *const dyn StoreDriver,
-            ) {
-                return None;
-            }
-            find_fast_slow(inner)
-        }
+        // BLOCK-1 fix (#335 follow-up): the previous local walker
+        // descended `inner_store(None)`, which terminates at
+        // `SizePartitioningStore` (its `inner_store(None)` returns
+        // `self`). For the production composition
+        // (`WorkerProxyStore` → `ExistenceCacheStore` → `VerifyStore` →
+        // `SizePartitioningStore` → `FastSlowStore`), the walker
+        // returned `None` and `flush_slow_writes` silently logged
+        // "no FastSlowStore registered; skipping" on every SIGTERM —
+        // defeating the #210 graceful-shutdown fix. Migrate to the
+        // canonical `find_fast_slow_via_chain` (shared with the V3
+        // self-retry drainer in `nativelink-service`), which passes
+        // `synthetic_large_key()` to descend the upper arm correctly.
 
         let stores: Vec<(String, Store)> = {
             let guard = self.stores.read();
@@ -121,10 +99,10 @@ impl StoreManager {
         let mut total_pending: usize = 0;
         for (name, store) in stores {
             let initial = {
-                let driver: &dyn StoreDriver = store.inner_store(
-                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                );
-                find_fast_slow(driver).map(FastSlowStore::in_flight_slow_write_count)
+                let driver: &dyn StoreDriver =
+                    store.inner_store(Some(synthetic_large_key()));
+                find_fast_slow_via_chain(driver)
+                    .map(FastSlowStore::in_flight_slow_write_count)
             };
             if let Some(count) = initial {
                 total_pending += count;
@@ -158,11 +136,13 @@ impl StoreManager {
             let store_clone = store.clone();
             joins.push(tokio::spawn(async move {
                 // Re-resolve the FastSlowStore from the cloned wrapper so
-                // we do not borrow across the spawn boundary.
-                let driver: &dyn StoreDriver = store_clone.inner_store(
-                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                );
-                let Some(fss) = find_fast_slow(driver) else {
+                // we do not borrow across the spawn boundary. Pass
+                // `synthetic_large_key()` so any inner
+                // `SizePartitioningStore` descends into its upper arm
+                // (where production's `FastSlowStore` lives).
+                let driver: &dyn StoreDriver =
+                    store_clone.inner_store(Some(synthetic_large_key()));
+                let Some(fss) = find_fast_slow_via_chain(driver) else {
                     return (name_owned, 0, core::time::Duration::ZERO);
                 };
                 let store_started = std::time::Instant::now();
@@ -201,10 +181,9 @@ impl StoreManager {
                     _ = progress_ticker.tick() => {
                         let snapshot: usize = targets.iter()
                             .filter_map(|(_, store, _)| {
-                                let driver: &dyn StoreDriver = store.inner_store(
-                                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                                );
-                                find_fast_slow(driver)
+                                let driver: &dyn StoreDriver =
+                                    store.inner_store(Some(synthetic_large_key()));
+                                find_fast_slow_via_chain(driver)
                                     .map(FastSlowStore::in_flight_slow_write_count)
                             })
                             .sum();
@@ -309,10 +288,9 @@ impl StoreManager {
             let store_clone = store.clone();
             let phase_2_per_store = phase_2_deadline;
             phase_2_joins.push(tokio::spawn(async move {
-                let driver: &dyn StoreDriver = store_clone.inner_store(
-                    Option::<nativelink_util::store_trait::StoreKey<'_>>::None,
-                );
-                let Some(fss) = find_fast_slow(driver) else {
+                let driver: &dyn StoreDriver =
+                    store_clone.inner_store(Some(synthetic_large_key()));
+                let Some(fss) = find_fast_slow_via_chain(driver) else {
                     return (name_owned, 0, core::time::Duration::ZERO);
                 };
                 let store_started = std::time::Instant::now();
