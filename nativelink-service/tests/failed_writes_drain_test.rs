@@ -109,6 +109,7 @@ use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::size_partitioning_store::SizePartitioningStore;
 use nativelink_store::small_blob_dispatcher::{SmallBlobDispatcher, SmallBlobDispatcherConfig};
 use nativelink_store::verify_store::VerifyStore;
+use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::blob_locality_map::new_shared_blob_locality_map;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
@@ -1021,7 +1022,7 @@ async fn failed_slow_writes_self_retry_err_reinserts_for_next_tick() -> Result<(
 /// The four V3 tests above all wrap a *bare* `FastSlowStore` — they
 /// exercise `drain_tick`'s self-retry branch but they never cross the
 /// production wrapper chain
-/// (`ExistenceCacheStore` → `VerifyStore` →
+/// (`WorkerProxyStore` → `ExistenceCacheStore` → `VerifyStore` →
 /// `SizePartitioningStore(16384)` → `FastSlowStore`).
 /// The walker [`nativelink_store::wrapper_walker::find_fast_slow_via_chain`]
 /// must pass [`synthetic_large_key()`] (a `u64::MAX`-sized
@@ -1034,6 +1035,10 @@ async fn failed_slow_writes_self_retry_err_reinserts_for_next_tick() -> Result<(
 /// Seams crossed (per dsr "name the seams" rule):
 ///   1. `Store::inner_store(Some(synthetic_large_key))` (drain_tick:300)
 ///   2. `find_fast_slow_via_chain` (`wrapper_walker.rs`):
+///      - `WorkerProxyStore` (outermost in production cas_STORE chain;
+///        its trait `inner_store` delegates to `self.inner.inner_store(key)`
+///        so the synthetic key flows through transparently — testing-czar
+///        MAJOR-2 closer: this test now crosses that delegation)
 ///      - `ExistenceCacheStore` downcast + recurse via typed
 ///        `inner_store()` accessor
 ///      - `VerifyStore` downcast + recurse via typed `inner_store()`
@@ -1043,17 +1048,31 @@ async fn failed_slow_writes_self_retry_err_reinserts_for_next_tick() -> Result<(
 ///   3. `FastSlowStore::try_self_retry_slow_write` (the V3 entry point)
 ///   4. `FastSlowStore::stable_digests` push (BIS broadcast contract)
 ///
-/// Mutation step (CLAUDE.md mandate): comment out the
-/// `synthetic_large_key()` argument in
-/// `failed_writes_drain.rs::drain_tick`'s `fss_for_store` build (the
-/// `let driver = store.inner_store(Some(synthetic_large_key()));`
-/// line). With `None` instead, `SizePartitioningStore::inner_store`
-/// returns `self`, the walker terminates with `None`, V3 self-retry
-/// is bypassed, the drainer counts `no_worker = 1` (empty locality
-/// map), and `self_retried` stays at 0 — this assertion fires:
+/// Mutation step (CLAUDE.md mandate, MAJOR-1 doc-fix): the load-bearing
+/// site is NOT `failed_writes_drain.rs`'s `fss_for_store` build — that
+/// call's `synthetic_large_key()` is silently recovered by the walker's
+/// own internal `synthetic_large_key()` calls. The walker has resilient
+/// recovery: ECS recursion (line 115), VS recursion (line 120), and the
+/// generic-fallback (line 128) all pass `synthetic_large_key()`, and
+/// any single one of them suffices to descend the production chain
+/// because the previous hop's `None` falls through to the next downcast.
+///
+/// To physically demonstrate that this test guards the `synthetic_large_key`
+/// pattern end-to-end, mutate ALL THREE `Some(synthetic_large_key())`
+/// arguments inside `wrapper_walker.rs::find_fast_slow_via_chain`
+/// (lines 115, 120, 128) to `None::<StoreKey>` simultaneously. With
+/// every key argument set to None, every layer in the chain
+/// (`SizePartitioningStore`, `ExistenceCacheStore`, `VerifyStore`)
+/// returns `self` from `inner_store(None)`, the walker bottoms out at
+/// the partitioning boundary, V3 self-retry is structurally bypassed,
+/// the drainer counts `no_worker = 1` (empty locality map), and
+/// `self_retried` stays at 0. The bespoke assertion below fires:
 ///   "V3 walker failed to descend production composition —
 ///    synthetic_large_key pattern broken: walker returned None for the
 ///    cas_INNER chain so self-retry was structurally inactive"
+/// (Verified physically — see commit message; sed-style mutation is
+/// `s/Some(synthetic_large_key())/None::<StoreKey>/g` inside
+/// `wrapper_walker.rs`.)
 #[nativelink_test]
 async fn failed_slow_writes_v3_walker_descends_production_composition() -> Result<(), Error> {
     tokio::time::timeout(DRAIN_TIMEOUT, async {
@@ -1130,8 +1149,8 @@ async fn failed_slow_writes_v3_walker_descends_production_composition() -> Resul
             Store::new(size_part),
         );
 
-        // ExistenceCacheStore wrap (outermost layer matches production
-        // cas_INNER's outer ExistenceCacheStore).
+        // ExistenceCacheStore wrap (matches production cas_INNER's outer
+        // ExistenceCacheStore).
         let ecs = ExistenceCacheStore::new(
             &ExistenceCacheSpec {
                 backend: StoreSpec::Memory(MemorySpec::default()),
@@ -1143,11 +1162,25 @@ async fn failed_slow_writes_v3_walker_descends_production_composition() -> Resul
             Store::new(verify),
         );
 
+        // testing-czar MAJOR-2 closer: WorkerProxyStore wrap. The
+        // production cas_STORE chain is
+        // `WorkerProxyStore → ExistenceCacheStore → VerifyStore →
+        // SizePartitioningStore → FastSlowStore`. Pre-fix this test
+        // wrapped only ECS → VS → SP → FSS (4 of the 5 seams). WPS's
+        // trait `inner_store` delegates to `self.inner.inner_store(key)`
+        // today, so the synthetic key flows through transparently —
+        // but if a future change shadowed WPS::inner_store to return
+        // `self` (matching the ECS/VS pattern), the walker would
+        // silently terminate at the WPS boundary and the V3 path
+        // would re-open the liveness gap in production while every
+        // other test stayed green. Wrapping WPS into the test now
+        // forces the walker to cross every production seam.
+        let locality_map = new_shared_blob_locality_map();
+        let wps = WorkerProxyStore::new(Store::new(ecs), locality_map.clone());
+
         let cas_store_name = "cas_STORE_PROD";
         let cas_stores: Vec<(String, Store)> =
-            vec![(cas_store_name.to_string(), Store::new(ecs))];
-
-        let locality_map = new_shared_blob_locality_map();
+            vec![(cas_store_name.to_string(), Store::new(wps))];
         let dispatcher = Arc::new(SmallBlobDispatcher::new(SmallBlobDispatcherConfig::default()));
         // Worker IS connected but will not be picked because no entry
         // for the digest exists in the locality map — guarantees that
