@@ -601,8 +601,17 @@ impl BlobsAvailableAccumulator {
         // chunk's payload was already extended into the accumulator's
         // body — peak memory could overshoot by one chunk's worth
         // before the broadcast is dropped.
-        let prev_total = inner.total_accumulated;
-        let projected_total = prev_total.saturating_add(in_chunk);
+        //
+        // Inlined fresh read of `inner.total_accumulated` (no
+        // `prev_total` local) per red-team + assumption-auditor:
+        // snapshot-then-write-back is the exact anti-pattern we just
+        // fixed in the Ok branch (commit f8fd6fd2). This site is
+        // currently safe — the early-return below means no write-back
+        // happens after the cap fires — but a future refactor that
+        // moves a write-back into this site (e.g. recovery bookkeeping)
+        // would re-introduce the bug. Keeping the read as a fresh
+        // expression makes the cap-projection-only intent explicit.
+        let projected_total = inner.total_accumulated.saturating_add(in_chunk);
         if projected_total > MAX_ACCUMULATED_ENTRIES_PER_CONN {
             self.drop_counts
                 .dropped_per_conn_entries_cap
