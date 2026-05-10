@@ -688,9 +688,10 @@ impl BlobsAvailableAccumulator {
                 );
                 inner.broadcasts.remove(&broadcast_id);
                 // Subtraction safety: `BroadcastAccumulator::merge` only
-                // mutates `accumulated_entries` AFTER all validation
-                // checks succeed (line 250 is reached only past every
-                // `Err` return). So when merge() returns Err:
+                // mutates `accumulated_entries` AFTER every validation
+                // gate (the `entries_in_chunk(&chunk)` + saturating_add
+                // is reached only past every `Err` return). So when
+                // merge() returns Err:
                 //   - keep-existing case: acc was the prior accumulator
                 //     and `acc_accumulated_entries == prev_entries`,
                 //     which is already counted in inner.total_accumulated
@@ -703,24 +704,30 @@ impl BlobsAvailableAccumulator {
                 //     freshly-constructed `BroadcastAccumulator::new(&chunk)`
                 //     whose `accumulated_entries` starts at 0 and was not
                 //     mutated by the failing merge() — so subtracting 0
-                //     is a no-op and the prior wipe at line 549-550
-                //     stands. This branch will not double-subtract.
-                // Audit citation: `merge()` Err returns at lines 196-206
-                // all precede the `accumulated_entries` mutation at line
-                // 250.
+                //     is a no-op and the prior token-mismatch wipe (the
+                //     `saturating_sub(removed_entries)` near the
+                //     `existing.worker_instance_token != token` branch
+                //     above) stands. This branch will not double-subtract.
+                // Audit citation: `merge()` Err returns span the early
+                // validation gates from the `worker_instance_token`
+                // mismatch through the `duplicate sequence within one
+                // broadcast` Err — all precede the
+                // `accumulated_entries` mutation.
                 inner.total_accumulated =
                     inner.total_accumulated.saturating_sub(acc_accumulated_entries);
                 None
             }
             Ok(is_terminal) => {
-                // Read CURRENT total — NOT the pre-wipe `prev_total`
-                // snapshot — so the token-mismatch wipe at line 549-550
-                // (which already decremented inner.total_accumulated by
-                // the stale broadcast's accumulated_entries) is preserved.
-                // Pre-fix, `prev_total.saturating_add(delta)`
-                // unconditionally overwrote the wipe, leaving the stale
-                // broadcast's entries double-counted in
-                // total_accumulated indefinitely. Regression-tested by
+                // Read CURRENT total — NOT a pre-wipe snapshot — so the
+                // token-mismatch wipe in the
+                // `existing.worker_instance_token != token` branch
+                // above (the `saturating_sub(removed_entries)` call
+                // before `BroadcastAccumulator::new(&chunk)` is
+                // re-inserted) is preserved. Pre-fix,
+                // `prev_total.saturating_add(delta)` unconditionally
+                // overwrote the wipe, leaving the stale broadcast's
+                // entries double-counted in `total_accumulated`
+                // indefinitely. Regression-tested by
                 // `token_mismatch_drift_total_accumulated_consistency`.
                 inner.total_accumulated = inner.total_accumulated.saturating_add(delta);
                 if !is_terminal {
@@ -913,9 +920,11 @@ mod tests {
     /// token-mismatch rebuild, surfaced by the code-reviewer's audit of
     /// the prior fixup at 8fa531ae. Pre-fix `merge_chunk` captured
     /// `prev_total = inner.total_accumulated` BEFORE the token-mismatch
-    /// wipe at line 549-550 decremented it, then unconditionally
-    /// overwrote `inner.total_accumulated = prev_total + delta` at the
-    /// end. The wipe was undone, leaving the stale broadcast's entries
+    /// wipe (`saturating_sub(removed_entries)` in the
+    /// `existing.worker_instance_token != token` branch of `merge_chunk`)
+    /// decremented it, then unconditionally overwrote
+    /// `inner.total_accumulated = prev_total + delta` at the end. The
+    /// wipe was undone, leaving the stale broadcast's entries
     /// double-counted in `total_accumulated` indefinitely (until next
     /// process restart). Impact: per-conn entries cap fires prematurely
     /// once enough token-mismatches accumulate, dropping legitimate
@@ -932,9 +941,10 @@ mod tests {
     /// Step 2 is the bug-detection assertion. Pre-fix it red-fails with
     /// `left: 100, right: 20`.
     ///
-    /// Mutation step (CLAUDE.md TDD #5): revert the fix at line 596 (use
-    /// `prev_total.saturating_add(delta)` instead of
-    /// `inner.total_accumulated.saturating_add(delta)`). This test MUST
+    /// Mutation step (CLAUDE.md TDD #5): revert the fix in the Ok branch
+    /// of `merge_chunk` (the `inner.total_accumulated =
+    /// inner.total_accumulated.saturating_add(delta)` line — change it
+    /// back to `prev_total.saturating_add(delta)`). This test MUST
     /// red-fail at the step-2 assertion with the bespoke message
     /// `expected total_accumulated == M after token-mismatch rebuild,
     /// got total_accumulated == N + M — bookkeeping drift not fixed`.
@@ -957,9 +967,13 @@ mod tests {
         );
 
         // Step 2: token-mismatch rebuild with token=7777, M=20 entries.
-        // The wipe at line 549-550 must drop the 80 stale entries; the
-        // post-merge increment at line 596 must add the 20 new entries
-        // on top of the WIPED total, not on top of the pre-wipe snapshot.
+        // The token-mismatch wipe (in the
+        // `existing.worker_instance_token != token` branch of
+        // merge_chunk) must drop the 80 stale entries; the Ok-branch
+        // increment (`inner.total_accumulated =
+        // inner.total_accumulated.saturating_add(delta)`) must add the
+        // 20 new entries on top of the WIPED total, not on top of the
+        // pre-wipe snapshot.
         let m_entries = 20usize;
         let payload_m: Vec<BlobDigestInfo> =
             (0..m_entries as u64).map(bdi).collect();
@@ -983,7 +997,9 @@ mod tests {
 
         // Step 3: terminal commit on the rebuilt broadcast. After commit
         // the accumulator must be empty AND total_accumulated zero
-        // (the post-commit subtraction at line 605-607 must cancel the
+        // (the post-commit subtraction in the terminal arm of the Ok
+        // branch — `saturating_sub(removed.accumulated_entries)` after
+        // `inner.broadcasts.remove(&broadcast_id)` — must cancel the
         // bookkeeping drift if any).
         let k_entries = 5usize;
         let payload_k: Vec<BlobDigestInfo> =
@@ -1011,13 +1027,16 @@ mod tests {
         assert_eq!(acc.in_flight_count(), 0);
     }
 
-    /// Sibling-bug guard for the Err-branch subtraction at lines
-    /// 590-592. The Err branch subtracts `acc_accumulated_entries` from
-    /// `inner.total_accumulated`. The subtraction is safe today because
-    /// `BroadcastAccumulator::merge` returns Err only at validation
-    /// gates that all precede the `accumulated_entries` mutation at
-    /// line 250 — see the doc comment at the subtraction site for the
-    /// per-case proof.
+    /// Sibling-bug guard for the Err-branch subtraction in
+    /// `merge_chunk` (the `inner.total_accumulated =
+    /// inner.total_accumulated.saturating_sub(acc_accumulated_entries)`
+    /// in the `Err(reason) =>` arm). The Err branch subtracts
+    /// `acc_accumulated_entries` from `inner.total_accumulated`. The
+    /// subtraction is safe today because `BroadcastAccumulator::merge`
+    /// returns Err only at validation gates that all precede the
+    /// `accumulated_entries = self.accumulated_entries.saturating_add(
+    /// entries_in_chunk)` mutation — see the doc comment at the
+    /// subtraction site for the per-case proof.
     ///
     /// This test exercises the multi-broadcast Err-branch composition
     /// where multiple in-flight broadcasts coexist and one of them
@@ -1052,8 +1071,10 @@ mod tests {
         assert_eq!(acc.in_flight_count(), 2);
 
         // Drive broadcast 2 into the Err branch via duplicate-sequence
-        // (sequence 0 already seen). merge() rejects at line 220 BEFORE
-        // mutating accumulated_entries. The Err handler then subtracts
+        // (sequence 0 already seen). merge() rejects at the
+        // `duplicate sequence within one broadcast` Err — BEFORE the
+        // `accumulated_entries = ... saturating_add(entries_in_chunk)`
+        // mutation. The Err handler then subtracts
         // `acc_accumulated_entries` (== 30 — the prior successful merge
         // sum) from total_accumulated and removes broadcast 2 from the
         // map. Broadcast 1's 50 entries MUST remain intact.
