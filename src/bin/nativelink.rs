@@ -445,6 +445,16 @@ async fn inner_main(
         }
     }
 
+    // #160 Phase 1: process-wide registry of MetricsComponent roots.
+    // Components register themselves at construction; per-server admin
+    // routes mount `/metrics` backed by this single registry so every
+    // listener exposes the same view.
+    let metrics_registry = nativelink_util::metrics_publisher::MetricsRegistry::new();
+    // First-listener-wins guard: when more than one ServerConfig hosts
+    // a worker_api block, the SECOND construction would register the
+    // same metrics tree under the same prefix and double every line.
+    let mut worker_api_metrics_registered = false;
+
     // Periodically log tokio runtime metrics to detect thread pool exhaustion.
     // Requires tokio_unstable cfg for blocking thread metrics.
     #[cfg(tokio_unstable)]
@@ -1367,7 +1377,20 @@ async fn inner_main(
                             small_blob_dispatcher.clone(),
                             Some(ac_pin_registry.clone()),
                         )
-                        .map(|v| Some(svc_setup!(v)))
+                        .map(|v| {
+                            // #160 Phase 1: register the WorkerApiMetrics
+                            // tree (which transitively walks
+                            // ChunkDropCounts via #99-fixup-2) before
+                            // `into_service()` consumes the server.
+                            // First-listener wins per registry semantics
+                            // (the metrics tree is process-wide).
+                            if !worker_api_metrics_registered {
+                                metrics_registry
+                                    .register("worker_api", v.metrics());
+                                worker_api_metrics_registered = true;
+                            }
+                            Some(svc_setup!(v))
+                        })
                     })
                     .err_tip(|| "Could not create WorkerApi service")?,
             )
@@ -1464,6 +1487,22 @@ async fn inner_main(
                             })
                         },
                     ),
+                ),
+            );
+        }
+
+        // #160 Phase 1: mount the metrics publisher at `/metrics` on
+        // every HTTP listener that gets a `services` block. Each
+        // listener serves a snapshot of the SAME process-wide
+        // registry (the registry holds Arc handles, so the per-listener
+        // route receives a cheap clone). Cfg-gated on the `pprof`
+        // feature because that gates `axum` in `nativelink-util`; the
+        // production binary is always built with `--features pprof`.
+        #[cfg(feature = "pprof")]
+        {
+            svc = svc.merge(
+                nativelink_util::metrics_publisher::metrics_router(
+                    metrics_registry.clone(),
                 ),
             );
         }
