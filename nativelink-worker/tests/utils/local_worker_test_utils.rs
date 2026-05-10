@@ -194,6 +194,30 @@ impl MockWorkerApiClient {
         req
     }
 
+    /// (#99 / Fix #10) Receive the next call as a `ChunkedMessage`.
+    /// Used by tests that exercise the worker's chunked
+    /// `BlobsAvailable` emit path; pairs with the test-utils mock's
+    /// `chunked_message` impl at the bottom of this file.
+    #[allow(dead_code, reason = "exercised by future worker-side chunked tests")]
+    pub(crate) async fn expect_chunked_message(
+        &self,
+        result: Result<(), Error>,
+    ) -> ChunkedMessage {
+        let mut rx_call_lock = self.rx_call.lock().await;
+        let req = match rx_call_lock
+            .recv()
+            .await
+            .expect("Could not receive msg in mpsc")
+        {
+            WorkerClientApiCalls::ChunkedMessage(req) => req,
+            other => panic!("expect_chunked_message expected ChunkedMessage, got : {other:?}"),
+        };
+        self.tx_resp
+            .send(WorkerClientApiReturns::ChunkedMessage(result))
+            .expect("Could not send request to mpsc");
+        req
+    }
+
     /// (#97) Drain calls until a `BisAck` arrives, auto-ack'ing every
     /// `BlobsAvailable` along the way (those are the periodic loop
     /// firing on every blob-set change and not what the BIS-dispatch
@@ -326,9 +350,14 @@ impl WorkerApiClientTrait for MockWorkerApiClient {
     }
 
     async fn chunked_message(&mut self, request: ChunkedMessage) -> Result<(), Error> {
-        // (#99) Record the chunked-emit call so production-composition
-        // tests (`blobs_available_chunked_*`) can pull the per-chunk
-        // slices and assert reassembly.
+        // (#99) Record the chunked-emit call. Server-side end-to-end
+        // coverage lives in
+        // `nativelink-service/tests/blobs_available_chunked_e2e_test.rs`,
+        // which composes the same chunker through the real
+        // `WorkerApiServer` + accumulator. This worker-side mock is
+        // wired so future tests on the worker-emit path (drive the
+        // `should_chunk` threshold, assert chunks-emitted-in-order)
+        // can use the `expect_chunked_message` helper above.
         self.tx_call
             .send(WorkerClientApiCalls::ChunkedMessage(request))
             .expect("Could not send ChunkedMessage to mpsc");
