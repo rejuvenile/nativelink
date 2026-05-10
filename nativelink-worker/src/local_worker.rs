@@ -727,6 +727,18 @@ pub struct BlobsAvailableState {
     /// wrap), or any wrapper hides the FSS that the
     /// `find_fast_slow_for_pin` walker can't see through.
     ac_mirror_target: Option<AcMirrorTarget>,
+    /// (#99) Worker-process nonce, randomized at construction. Stamped
+    /// onto every `BlobsAvailableChunk` the worker emits so the
+    /// server's per-broadcast accumulator can detect a worker-process
+    /// restart mid-broadcast (impossible in steady state, but
+    /// defensive). Mirrors #97's `server_instance_token` pattern in
+    /// the opposite direction.
+    worker_instance_token: u64,
+    /// (#99) Lock-free monotonic counter for `BlobsAvailableChunk`
+    /// `broadcast_id` allocation. Resets on worker restart (the new
+    /// `worker_instance_token` makes this safe — the server's
+    /// accumulator keys on `(broadcast_id, worker_instance_token)`).
+    next_broadcast_id: Arc<AtomicU64>,
 }
 
 /// Test-only builder for [`BlobsAvailableState`]. Lets each test set only
@@ -786,6 +798,10 @@ impl BlobsAvailableState {
             max_interval: Duration::from_secs(60),
             cas_server_fss,
             ac_mirror_target,
+            // (#99) Tests get a deterministic non-zero token so accumulator
+            // identity assertions work without unwrapping random state.
+            worker_instance_token: 0xA5A5_A5A5_A5A5_A5A5,
+            next_broadcast_id: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1726,7 +1742,92 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             pinned_ac_mirror_entries,
         };
 
-        if let Err(err) = grpc_client.blobs_available(notification).await {
+        // (#99) If the notification's encoded estimate exceeds the
+        // chunking threshold, partition into bounded
+        // `BlobsAvailableChunk` envelopes and send each via the unified
+        // `Update::ChunkedMessage` arm. The server's per-broadcast
+        // accumulator buffers chunks and commits atomically on
+        // `is_last=true` (Path A semantics). Below the threshold,
+        // continue using the legacy single-message path for lower
+        // per-tick overhead.
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+            ChunkedMessage, chunked_message,
+        };
+        use nativelink_util::blobs_available_chunking::{
+            BLOBS_AVAILABLE_PER_CHUNK, chunk_blobs_available, should_chunk,
+        };
+
+        if should_chunk(&notification) {
+            let broadcast_id = state
+                .next_broadcast_id
+                .fetch_add(1, Ordering::Relaxed);
+            let worker_instance_token = state.worker_instance_token;
+            let chunks = match chunk_blobs_available(
+                notification,
+                broadcast_id,
+                worker_instance_token,
+                String::new(),
+                BLOBS_AVAILABLE_PER_CHUNK,
+            ) {
+                Ok(chunks) => chunks,
+                Err(reason) => {
+                    // (Fix #2 / dsr BLOCK-1) The notification would
+                    // require more chunks than the server's
+                    // MAX_SEQUENCES cap accepts. Log loudly and skip
+                    // this tick — better than emitting chunks the
+                    // server will silently discard. The next tick
+                    // will retry; if the worker's snapshot has
+                    // grown past 1M entries the operator should
+                    // investigate (FSS sizing pressure).
+                    warn!(
+                        reason,
+                        new_or_touched_count,
+                        evicted_count,
+                        cached_dir_count,
+                        added_subtree_count,
+                        removed_subtree_count,
+                        pinned_mirror_count,
+                        is_first,
+                        broadcast_id,
+                        "BlobsAvailable chunker rejected: snapshot too large for one broadcast"
+                    );
+                    return Ok(());
+                }
+            };
+            let chunk_count = chunks.len();
+            for chunk in chunks {
+                let envelope = ChunkedMessage {
+                    payload: Some(chunked_message::Payload::BlobsAvailable(chunk)),
+                };
+                if let Err(err) = grpc_client.chunked_message(envelope).await {
+                    warn!(
+                        ?err,
+                        new_or_touched_count,
+                        evicted_count,
+                        cached_dir_count,
+                        added_subtree_count,
+                        removed_subtree_count,
+                        pinned_mirror_count,
+                        is_first,
+                        broadcast_id,
+                        "Failed to send chunked BlobsAvailable"
+                    );
+                    return Err(err);
+                }
+            }
+            info!(
+                new_or_touched_count,
+                evicted_count,
+                cached_dir_count,
+                added_subtree_count,
+                removed_subtree_count,
+                pinned_mirror_count,
+                is_first,
+                broadcast_id,
+                chunk_count,
+                "Sent chunked BlobsAvailable (#99 path)"
+            );
+        } else if let Err(err) = grpc_client.blobs_available(notification).await {
             warn!(
                 ?err,
                 new_or_touched_count,
@@ -2074,6 +2175,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             "blobs_available_state is None, dropping BIS chunk + ack (BUG?)"
                                         );
                                     }
+                                }
+                                Some(chunked_message::Payload::BlobsAvailable(_chunk)) => {
+                                    // (#99) BlobsAvailable is the
+                                    // worker→server direction; the
+                                    // scheduler must never emit this
+                                    // arm to a worker. Ignore + warn
+                                    // for defensive observability.
+                                    warn!(
+                                        "Update::ChunkedMessage(BlobsAvailable) from scheduler; \
+                                         wrong-direction payload — ignoring"
+                                    );
                                 }
                                 None => {
                                     warn!(
@@ -2925,6 +3037,22 @@ pub async fn new_local_worker(
                 max_interval: Duration::from_millis(max_interval_ms),
                 cas_server_fss: Some(cas_server_fss.clone()),
                 ac_mirror_target: ac_mirror_target.clone(),
+                // (#99) Random worker-process token. SystemTime nanos
+                // XOR'd with PID gives an effectively-unique value per
+                // worker process without pulling in `rand`. Equivalent
+                // to #97's `server_instance_token` strategy in
+                // `api_worker_scheduler.rs`.
+                worker_instance_token: {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    let pid = std::process::id() as u64;
+                    let t = nanos ^ pid.rotate_left(32);
+                    // Defensive: 0 is the proto3 default; coerce to 1.
+                    if t == 0 { 1 } else { t }
+                },
+                next_broadcast_id: Arc::new(AtomicU64::new(0)),
             })
         } else {
             warn!(

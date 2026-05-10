@@ -15,6 +15,7 @@
 pub mod ac_pin_registry;
 pub mod action_messages;
 pub mod blob_locality_map;
+pub mod blobs_available_chunking;
 pub mod build_sha;
 pub mod buf_channel;
 pub mod channel_body_for_tests;

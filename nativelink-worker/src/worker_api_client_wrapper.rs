@@ -19,7 +19,7 @@ use nativelink_error::{make_err, Error, ResultExt};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::update_for_scheduler::Update;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::worker_api_client::WorkerApiClient;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BisAck, BlobsAvailableNotification, ConnectWorkerRequest, ExecuteComplete,
+    BisAck, BlobsAvailableNotification, ChunkedMessage, ConnectWorkerRequest, ExecuteComplete,
     ExecuteResult, GoingAwayRequest, KeepAliveRequest, UpdateForScheduler, UpdateForWorker,
 };
 use tokio::sync::mpsc::Sender;
@@ -64,6 +64,13 @@ pub trait WorkerApiClientTrait: Clone + Sync + Send + Sized + Unpin {
     fn bis_ack(
         &mut self,
         request: BisAck,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// (#99) Send one `ChunkedMessage` envelope (today carrying
+    /// `BlobsAvailableChunk`) to the scheduler.
+    fn chunked_message(
+        &mut self,
+        request: ChunkedMessage,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 }
 
@@ -186,5 +193,9 @@ impl WorkerApiClientTrait for WorkerApiClientWrapper {
 
     async fn bis_ack(&mut self, request: BisAck) -> Result<(), Error> {
         self.send_update(Update::BisAck(request)).await
+    }
+
+    async fn chunked_message(&mut self, request: ChunkedMessage) -> Result<(), Error> {
+        self.send_update(Update::ChunkedMessage(request)).await
     }
 }

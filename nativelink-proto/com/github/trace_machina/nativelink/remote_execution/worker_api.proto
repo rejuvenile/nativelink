@@ -435,19 +435,135 @@ message BlobsInStableStorageChunk {
     string store_id = 6;
 }
 
+/// One chunk of a streaming `BlobsAvailable` notification (task #99).
+/// Carries per-chunk slices of the FIVE unbounded fields a single
+/// `BlobsAvailableNotification` may otherwise pile up:
+///   * `digests` (bag of generic digests; legacy field 5)
+///   * `cached_directory_digests` (legacy field 7)
+///   * `pinned_mirror_entries` (legacy field 16)
+///   * `pinned_ac_mirror_entries` (legacy field 17)
+///   * `evicted_digests` (legacy field 4; only meaningful in delta mode)
+///
+/// Each chunk MAY have any of those slices empty; the
+/// `(broadcast_id, sequence, is_last)` triple plus `is_full_snapshot`
+/// lets the server re-assemble the original notification exactly.
+/// Scalar fields (`worker_cas_endpoint`, `mirror_used_bytes`,
+/// `mirror_max_bytes`, `cpu_load_pct`, `p_core_load_pct`,
+/// `e_core_load_pct`, `is_full_subtree_snapshot`) ride only on the
+/// FIRST chunk (sequence == 0); subsequent chunks leave them at proto3
+/// defaults.
+///
+/// **Path A semantics: defer wipe until terminal chunk.** When
+/// `is_full_snapshot=true`, the server's accumulator buffers ALL
+/// slices across every chunk in the broadcast and applies them
+/// ATOMICALLY when `is_last=true` arrives. The pre-existing
+/// `remove_endpoint(...)` wipe in the legacy non-chunked handler is
+/// invoked inside the same atomic block, AFTER the accumulator's full
+/// digest set is materialised. This prevents the half-applied-snapshot
+/// bug class where chunks 0..N-1 have landed but the terminal chunk is
+/// lost and the locality map is left with a partial view.
+///
+/// `worker_instance_token` mirrors the #97 nonce pattern but in the
+/// reverse direction: the worker stamps its own connection-lifetime
+/// random u64 and the server's accumulator validates it across chunks
+/// of one broadcast. A token mismatch means a different worker process
+/// took over on the same stream (impossible in steady state, but
+/// defensive); the server discards the partial accumulator and
+/// processes the new chunk as a fresh broadcast.
+message BlobsAvailableChunk {
+    /// Worker-allocated identifier of the broadcast event this chunk
+    /// belongs to. Monotonic per-worker-process; resets on worker
+    /// restart (server sees a brand-new sequence and accumulates
+    /// normally). Allocated lock-free via `AtomicU64::fetch_add`
+    /// per the #97 precedent.
+    uint64 broadcast_id = 1;
+    /// Monotonic sequence within one broadcast_id (0, 1, 2, ...).
+    uint32 sequence = 2;
+    /// True on the FINAL chunk of one broadcast_id's stream. Per
+    /// Path A semantics, the server's accumulator commits ONLY when
+    /// this flag is observed (and every prior sequence has landed).
+    /// The empty-input case still emits a single `is_last=true`
+    /// chunk so the server always sees a terminal marker. Receivers
+    /// MUST tolerate empty slices on the terminal chunk.
+    bool is_last = 3;
+    /// Worker-process nonce (random u64 chosen at worker startup).
+    /// The server's accumulator validates this across all chunks of
+    /// one broadcast — a mismatch means the worker process restarted
+    /// mid-broadcast (impossible in steady state, but defensive).
+    /// Mirrors #97's nonce pattern in the opposite direction.
+    uint64 worker_instance_token = 4;
+    /// Worker-side store identifier this broadcast targets. Empty
+    /// string is the only valid value today (single-store
+    /// BlobsAvailable wire); reserved for future per-store routing.
+    string store_id = 5;
+    /// Whether the accumulator should treat the full broadcast as
+    /// REPLACE (true) or DELTA (false) of the server's per-endpoint
+    /// view. Repeated identically on every chunk so a late-arriving
+    /// chunk 0 doesn't drop the flag. Path A semantics: the
+    /// `remove_endpoint` wipe fires INSIDE the terminal-chunk
+    /// commit block, not when chunk 0 arrives.
+    bool is_full_snapshot = 6;
+
+    /// Worker-self-reported CAS endpoint. Only meaningful on chunk 0
+    /// (sequence == 0); subsequent chunks leave it at proto3 default
+    /// "" and the accumulator carries the value forward. The
+    /// server still cross-checks against the connection's
+    /// `cas_endpoint` (#168 security MEDIUM Q2) on every commit.
+    string worker_cas_endpoint = 7;
+    /// True on the first BlobsAvailable after (re)connect. Only
+    /// meaningful on chunk 0; carried forward by the accumulator.
+    bool is_full_subtree_snapshot = 8;
+
+    /// Per-chunk slice of `BlobsAvailableNotification.digest_infos`.
+    /// May be empty on any chunk.
+    repeated BlobDigestInfo digests = 9;
+    /// Per-chunk slice of `BlobsAvailableNotification.cached_directory_digests`.
+    /// May be empty on any chunk.
+    repeated build.bazel.remote.execution.v2.Digest cached_directory_digests = 10;
+    /// Per-chunk slice of `BlobsAvailableNotification.pinned_mirror_entries`.
+    /// May be empty on any chunk. The sorted-by-store_id invariant
+    /// is preserved across the union of all chunks (the chunker
+    /// partitions a sorted source iterator).
+    repeated MirrorPinEntry pinned_mirror_entries = 11;
+    /// Per-chunk slice of `BlobsAvailableNotification.pinned_ac_mirror_entries`.
+    /// May be empty on any chunk. The sorted-by-store_id invariant
+    /// is preserved across the union of all chunks.
+    repeated MirrorPinEntry pinned_ac_mirror_entries = 12;
+    /// Per-chunk slice of `BlobsAvailableNotification.evicted_digests`.
+    /// May be empty on any chunk. Only meaningful when
+    /// `is_full_snapshot=false` (per legacy field 4 semantics).
+    repeated build.bazel.remote.execution.v2.Digest evicted_digests = 13;
+
+    /// CPU load — only meaningful on chunk 0; subsequent chunks
+    /// leave at proto3 default 0.
+    uint32 cpu_load_pct = 14;
+    uint32 p_core_load_pct = 15;
+    uint32 e_core_load_pct = 16;
+    /// Mirror capacity report — only meaningful on chunk 0;
+    /// subsequent chunks leave at proto3 default 0.
+    uint64 mirror_used_bytes = 17;
+    uint64 mirror_max_bytes = 18;
+    /// Per-chunk slice of `BlobsAvailableNotification.added_subtree_digests`.
+    repeated build.bazel.remote.execution.v2.Digest added_subtree_digests = 19;
+    /// Per-chunk slice of `BlobsAvailableNotification.removed_subtree_digests`.
+    repeated build.bazel.remote.execution.v2.Digest removed_subtree_digests = 20;
+    /// Per-chunk slice of `BlobsAvailableNotification.pinned_mirror_digests`.
+    repeated build.bazel.remote.execution.v2.Digest pinned_mirror_digests = 21;
+}
+
 /// A streaming-message envelope shared across the cas→worker, scheduler→
 /// worker, and worker→scheduler chunk producers. Exactly ONE of the
 /// `oneof payload` arms is set; receivers route on the arm.
 ///
 /// Today's payloads (added incrementally per the streaming-design plan):
-///   * `peer_hints` — task #98 (PR2)
-///   * `blobs_in_stable_storage` — task #97 (PR1, this PR)
-/// Reserved for follow-up PRs:
-///   * `blobs_available` — task #99 (PR3)
+///   * `peer_hints` — task #98 (PR2, scheduler→worker)
+///   * `blobs_in_stable_storage` — task #97 (PR1, scheduler→worker)
+///   * `blobs_available` — task #99 (PR3, worker→scheduler)
 message ChunkedMessage {
     oneof payload {
         PeerHintsChunk peer_hints = 1;
         BlobsInStableStorageChunk blobs_in_stable_storage = 2;
+        BlobsAvailableChunk blobs_available = 3;
     }
 }
 
@@ -641,6 +757,13 @@ message UpdateForScheduler {
         ExecuteComplete execute_complete = 5;
 
         /// Notifies the scheduler that new blobs are available on this worker.
+        ///
+        /// Legacy single-message wire shape — kept for backward
+        /// compatibility with workers built before #99 (BlobsAvailable
+        /// chunking). New workers SHOULD prefer the chunked path
+        /// (`chunked_message` tag 10 carrying `BlobsAvailableChunk`)
+        /// which avoids the gRPC max-message-size cliff under fleet-wide
+        /// reconnect storms.
         BlobsAvailableNotification blobs_available = 7;
 
         /// Notifies the scheduler that blobs have been evicted from this worker.
@@ -650,6 +773,14 @@ message UpdateForScheduler {
         /// scheduler can drop the matching chunk from its per-worker
         /// resend buffer (task #97).
         BisAck bis_ack = 9;
+
+        /// One chunk of a streaming protocol message FROM the worker
+        /// TO the scheduler. Today carries `BlobsAvailableChunk`
+        /// (task #99) under the unified `ChunkedMessage` envelope.
+        /// Receivers MUST be prepared to see chunks arrive interleaved
+        /// with other Update arms; the per-broadcast accumulator
+        /// scopes state by `(broadcast_id, worker_instance_token)`.
+        ChunkedMessage chunked_message = 10;
     }
     reserved 6; // Previously NextId, now reserved.
 }
