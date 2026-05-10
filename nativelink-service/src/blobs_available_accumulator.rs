@@ -588,12 +588,42 @@ impl BlobsAvailableAccumulator {
                     "discarding chunk + partial accumulator on validation failure"
                 );
                 inner.broadcasts.remove(&broadcast_id);
+                // Subtraction safety: `BroadcastAccumulator::merge` only
+                // mutates `accumulated_entries` AFTER all validation
+                // checks succeed (line 250 is reached only past every
+                // `Err` return). So when merge() returns Err:
+                //   - keep-existing case: acc was the prior accumulator
+                //     and `acc_accumulated_entries == prev_entries`,
+                //     which is already counted in inner.total_accumulated
+                //     from PRIOR successful merges. Subtracting it
+                //     correctly removes those prior contributions, and
+                //     the failing chunk's payload (still in `chunk`,
+                //     never extended into acc.body) carries no
+                //     accumulator state forward.
+                //   - new / token-mismatch-rebuild case: acc is the
+                //     freshly-constructed `BroadcastAccumulator::new(&chunk)`
+                //     whose `accumulated_entries` starts at 0 and was not
+                //     mutated by the failing merge() — so subtracting 0
+                //     is a no-op and the prior wipe at line 549-550
+                //     stands. This branch will not double-subtract.
+                // Audit citation: `merge()` Err returns at lines 196-206
+                // all precede the `accumulated_entries` mutation at line
+                // 250.
                 inner.total_accumulated =
                     inner.total_accumulated.saturating_sub(acc_accumulated_entries);
                 None
             }
             Ok(is_terminal) => {
-                inner.total_accumulated = prev_total.saturating_add(delta);
+                // Read CURRENT total — NOT the pre-wipe `prev_total`
+                // snapshot — so the token-mismatch wipe at line 549-550
+                // (which already decremented inner.total_accumulated by
+                // the stale broadcast's accumulated_entries) is preserved.
+                // Pre-fix, `prev_total.saturating_add(delta)`
+                // unconditionally overwrote the wipe, leaving the stale
+                // broadcast's entries double-counted in
+                // total_accumulated indefinitely. Regression-tested by
+                // `token_mismatch_drift_total_accumulated_consistency`.
+                inner.total_accumulated = inner.total_accumulated.saturating_add(delta);
                 if !is_terminal {
                     return None;
                 }
@@ -780,6 +810,99 @@ mod tests {
         assert_eq!(acc.in_flight_count(), 1);
     }
 
+    /// Regression test for the `total_accumulated` bookkeeping drift on
+    /// token-mismatch rebuild, surfaced by the code-reviewer's audit of
+    /// the prior fixup at 8fa531ae. Pre-fix `merge_chunk` captured
+    /// `prev_total = inner.total_accumulated` BEFORE the token-mismatch
+    /// wipe at line 549-550 decremented it, then unconditionally
+    /// overwrote `inner.total_accumulated = prev_total + delta` at the
+    /// end. The wipe was undone, leaving the stale broadcast's entries
+    /// double-counted in `total_accumulated` indefinitely (until next
+    /// process restart). Impact: per-conn entries cap fires prematurely
+    /// once enough token-mismatches accumulate, dropping legitimate
+    /// broadcasts.
+    ///
+    /// Test sequence:
+    ///   1. broadcast 1, token=99, seq=0, N=80 entries, NOT terminal.
+    ///      Verify total_accumulated == 80.
+    ///   2. broadcast 1, token=7777, seq=0, M=20 entries (token-mismatch
+    ///      rebuild fires). ASSERT total_accumulated == 20 (NOT 100).
+    ///   3. broadcast 1, token=7777, seq=1 terminal, K=5 entries.
+    ///      Verify accumulator drained on commit (total_accumulated == 0).
+    ///
+    /// Step 2 is the bug-detection assertion. Pre-fix it red-fails with
+    /// `left: 100, right: 20`.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): revert the fix at line 596 (use
+    /// `prev_total.saturating_add(delta)` instead of
+    /// `inner.total_accumulated.saturating_add(delta)`). This test MUST
+    /// red-fail at the step-2 assertion with the bespoke message
+    /// `expected total_accumulated == M after token-mismatch rebuild,
+    /// got total_accumulated == N + M — bookkeeping drift not fixed`.
+    #[test]
+    fn token_mismatch_drift_total_accumulated_consistency() {
+        let acc = BlobsAvailableAccumulator::new();
+
+        // Step 1: open broadcast 1 with token=99, N=80 entries.
+        let n_entries = 80usize;
+        let payload_n: Vec<BlobDigestInfo> =
+            (0..n_entries as u64).map(bdi).collect();
+        assert!(
+            acc.merge_chunk(chunk(1, 0, false, 99, payload_n)).is_none(),
+            "non-terminal first chunk must not commit"
+        );
+        assert_eq!(
+            acc.total_accumulated_entries(),
+            n_entries,
+            "after first chunk total_accumulated must equal first-chunk entries"
+        );
+
+        // Step 2: token-mismatch rebuild with token=7777, M=20 entries.
+        // The wipe at line 549-550 must drop the 80 stale entries; the
+        // post-merge increment at line 596 must add the 20 new entries
+        // on top of the WIPED total, not on top of the pre-wipe snapshot.
+        let m_entries = 20usize;
+        let payload_m: Vec<BlobDigestInfo> =
+            (0..m_entries as u64).map(bdi).collect();
+        assert!(
+            acc.merge_chunk(chunk(1, 0, false, 7777, payload_m)).is_none(),
+            "non-terminal rebuild chunk must not commit"
+        );
+        // Bug-detection assertion: pre-fix, this fails with left=100 right=20.
+        assert_eq!(
+            acc.total_accumulated_entries(),
+            m_entries,
+            "expected total_accumulated == M after token-mismatch rebuild, \
+             got total_accumulated == N + M — bookkeeping drift not fixed"
+        );
+        // Sanity: token_mismatch counter incremented exactly once.
+        let snap = acc.drop_counts.snapshot();
+        assert_eq!(
+            snap["dropped_token_mismatch"], 1,
+            "token-mismatch drop counter must increment exactly once on rebuild"
+        );
+
+        // Step 3: terminal commit on the rebuilt broadcast. After commit
+        // the accumulator must be empty AND total_accumulated zero
+        // (the post-commit subtraction at line 605-607 must cancel the
+        // bookkeeping drift if any).
+        let k_entries = 5usize;
+        let payload_k: Vec<BlobDigestInfo> =
+            (0..k_entries as u64).map(bdi).collect();
+        let out = acc
+            .merge_chunk(chunk(1, 1, true, 7777, payload_k))
+            .expect("terminal commit must succeed for in-order rebuild");
+        assert_eq!(out.digest_infos.len(), m_entries + k_entries);
+        assert_eq!(acc.in_flight_count(), 0);
+        assert_eq!(
+            acc.total_accumulated_entries(),
+            0,
+            "after terminal commit total_accumulated must drain to zero — \
+             any non-zero value indicates the bookkeeping drift survived \
+             the terminal commit subtraction"
+        );
+    }
+
     #[test]
     fn duplicate_sequence_drops_accumulator() {
         let acc = BlobsAvailableAccumulator::new();
@@ -787,6 +910,78 @@ mod tests {
         acc.merge_chunk(chunk(1, 0, false, 99, vec![bdi(2)]));
         // After dup, the broadcast was discarded.
         assert_eq!(acc.in_flight_count(), 0);
+    }
+
+    /// Sibling-bug guard for the Err-branch subtraction at lines
+    /// 590-592. The Err branch subtracts `acc_accumulated_entries` from
+    /// `inner.total_accumulated`. The subtraction is safe today because
+    /// `BroadcastAccumulator::merge` returns Err only at validation
+    /// gates that all precede the `accumulated_entries` mutation at
+    /// line 250 — see the doc comment at the subtraction site for the
+    /// per-case proof.
+    ///
+    /// This test exercises the multi-broadcast Err-branch composition
+    /// where multiple in-flight broadcasts coexist and one of them
+    /// triggers an Err: the OTHER broadcast's contributions to
+    /// `total_accumulated` MUST survive intact (no double-subtract /
+    /// no over-subtract that bleeds into other broadcasts).
+    ///
+    /// Mutation step: in the Err branch, change the saturating_sub to
+    /// subtract a wrong value (e.g. `acc_accumulated_entries * 2` or
+    /// `inner.total_accumulated`); the second-broadcast assertion below
+    /// must red-fail with the bespoke "Err-branch over-subtracted"
+    /// message.
+    #[test]
+    fn err_branch_does_not_double_subtract() {
+        let acc = BlobsAvailableAccumulator::new();
+
+        // Open broadcast 1 with 50 entries (success path).
+        let payload_1: Vec<BlobDigestInfo> = (0..50u64).map(bdi).collect();
+        assert!(
+            acc.merge_chunk(chunk(1, 0, false, 99, payload_1)).is_none(),
+            "non-terminal first chunk on broadcast 1 must not commit"
+        );
+        assert_eq!(acc.total_accumulated_entries(), 50);
+
+        // Open broadcast 2 with 30 entries (success path).
+        let payload_2: Vec<BlobDigestInfo> = (0..30u64).map(bdi).collect();
+        assert!(
+            acc.merge_chunk(chunk(2, 0, false, 99, payload_2)).is_none(),
+            "non-terminal first chunk on broadcast 2 must not commit"
+        );
+        assert_eq!(acc.total_accumulated_entries(), 80);
+        assert_eq!(acc.in_flight_count(), 2);
+
+        // Drive broadcast 2 into the Err branch via duplicate-sequence
+        // (sequence 0 already seen). merge() rejects at line 220 BEFORE
+        // mutating accumulated_entries. The Err handler then subtracts
+        // `acc_accumulated_entries` (== 30 — the prior successful merge
+        // sum) from total_accumulated and removes broadcast 2 from the
+        // map. Broadcast 1's 50 entries MUST remain intact.
+        let payload_2_dup: Vec<BlobDigestInfo> = (0..7u64).map(bdi).collect();
+        let result = acc.merge_chunk(chunk(2, 0, false, 99, payload_2_dup));
+        assert!(result.is_none(), "duplicate-sequence chunk must not commit");
+
+        // Broadcast 2 was discarded; broadcast 1 survives.
+        assert_eq!(acc.in_flight_count(), 1);
+        // Critical assertion: only broadcast 2's 30 entries were
+        // subtracted; broadcast 1's 50 entries remain. If the Err branch
+        // double-subtracted (e.g. removed acc.body's pre-merge state
+        // PLUS the failing chunk's payload) total would be 50 - 7 = 43
+        // or some other wrong value.
+        assert_eq!(
+            acc.total_accumulated_entries(),
+            50,
+            "Err-branch over-subtracted: broadcast 2 Err removed broadcast \
+             1's contributions from total_accumulated; expected 50 \
+             (broadcast 1 untouched), got something else"
+        );
+        // The validation_other counter incremented exactly once.
+        let snap = acc.drop_counts.snapshot();
+        assert_eq!(
+            snap["dropped_validation_other"], 1,
+            "exactly one validation_other drop must fire on duplicate sequence"
+        );
     }
 
     #[test]
