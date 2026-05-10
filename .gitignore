@@ -27,3 +27,11 @@ buck-out/
 nativelink_config.schema.json
 .cargo/config.toml
 .cargo/config.toml
+
+# TLC scratch artifacts (counterexample traces + state snapshots).
+# verify_tla.sh treats *.tla files in specs/ as standalone specs and
+# fails on the auto-generated *_TTrace_*.tla counterexample tracers,
+# which reference modules outside specs/.
+specs/*_TTrace_*.tla
+specs/*_TTrace_*.bin
+specs/states/

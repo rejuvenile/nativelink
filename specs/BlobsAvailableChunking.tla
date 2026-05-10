@@ -93,19 +93,55 @@ Init ==
     /\ terminalEmitted = FALSE
     /\ everCommitted = FALSE
 
-\* Deliver one pending chunk. If `seq` is the terminal (NumChunks-1),
-\* this is the commit point.
+\* Deliver one pending chunk. Three cases:
+\*   1. Terminal (NumChunks-1) WITH complete sequence set => COMMIT.
+\*   2. Terminal WITH gaps =>
+\*        Path A post-fix (BugMode=FALSE): REJECT — drop the partial
+\*          accumulator; serverView unchanged; partial state cleared so
+\*          the worker can re-broadcast (modeled via subsequent
+\*          ReconnectFreshBroadcast).
+\*        Path B (BugMode=TRUE): commit the partial anyway — the bug.
+\*   3. Non-terminal chunk: accumulate; never commit (Path A) or
+\*      partial-apply (Path B).
 DeliverChunk(seq) ==
     /\ seq \in pendingChunks
     /\ pendingChunks' = pendingChunks \ {seq}
-    /\ seenSequences' = seenSequences \cup {seq}
-    /\ serverPartial' = [serverPartial EXCEPT ![seq] = ChunkDigests(seq)]
-    /\ \/ /\ seq = NumChunks - 1
+    /\ \/ \* Case 1: terminal + complete.
+          /\ seq = NumChunks - 1
+          /\ seenSequences \cup {seq} = 0..(NumChunks - 1)
+          /\ seenSequences' = seenSequences \cup {seq}
+          /\ serverPartial' = [serverPartial EXCEPT ![seq] = ChunkDigests(seq)]
           /\ terminalEmitted' = TRUE
-          \* Commit: full assembled view becomes serverView.
           /\ serverView' = UNION { serverPartial'[s] : s \in 0..(NumChunks - 1) }
           /\ everCommitted' = TRUE
-       \/ /\ seq # NumChunks - 1
+       \/ \* Case 2a: terminal + gaps + Path B (BugMode=TRUE) — buggy commit.
+          /\ seq = NumChunks - 1
+          /\ seenSequences \cup {seq} # 0..(NumChunks - 1)
+          /\ BugMode
+          /\ seenSequences' = seenSequences \cup {seq}
+          /\ serverPartial' = [serverPartial EXCEPT ![seq] = ChunkDigests(seq)]
+          /\ terminalEmitted' = TRUE
+          /\ serverView' = UNION { serverPartial'[s] : s \in 0..(NumChunks - 1) }
+          /\ everCommitted' = TRUE
+       \/ \* Case 2b: terminal + gaps + Path A (BugMode=FALSE) — reject.
+          \* The accumulator's `inner.broadcasts.remove(&broadcast_id)` +
+          \* `total_accumulated.fetch_sub(...)` discards partial state.
+          \* serverView unchanged; pendingChunks decremented for fairness
+          \* (the worker has emitted this chunk; the server saw it but
+          \* dropped it). seenSequences/serverPartial cleared so a
+          \* subsequent ReconnectFreshBroadcast can re-deliver cleanly.
+          /\ seq = NumChunks - 1
+          /\ seenSequences \cup {seq} # 0..(NumChunks - 1)
+          /\ ~BugMode
+          /\ seenSequences' = {}
+          /\ serverPartial' = [s \in 0..(NumChunks - 1) |-> {}]
+          /\ terminalEmitted' = terminalEmitted
+          /\ serverView' = serverView
+          /\ everCommitted' = everCommitted
+       \/ \* Case 3: non-terminal chunk.
+          /\ seq # NumChunks - 1
+          /\ seenSequences' = seenSequences \cup {seq}
+          /\ serverPartial' = [serverPartial EXCEPT ![seq] = ChunkDigests(seq)]
           /\ terminalEmitted' = terminalEmitted
           /\ everCommitted' = everCommitted
           \* Path A: serverView unchanged.
@@ -150,8 +186,18 @@ Next ==
     \/ ReconnectFreshBroadcast
     \/ SteadyState
 
+\* Fairness declarations are present for documentation but the
+\* Fixed.cfg does not check any temporal property. Under the post-fix
+\* Path A logic (terminal-with-gaps is rejected), purely adversarial
+\* chunk-arrival ordering can trap the system in a reject-then-
+\* reconnect loop. In production, gRPC stream FIFO + the chunker's
+\* in-order emit guarantee makes adversarial reorderings unreachable;
+\* the spec's `\E seq` over-counts the reachable state space. The
+\* SAFETY invariant (no half-applied snapshot) still holds under all
+\* chunk-arrival orderings — that is the property #99 guards.
 Spec == Init /\ [][Next]_vars
-        /\ WF_vars(\E seq \in 0..(NumChunks - 1) : DeliverChunk(seq))
+        /\ \A seq \in 0..(NumChunks - 1) : SF_vars(DeliverChunk(seq))
+        /\ WF_vars(ReconnectFreshBroadcast)
 
 \* INVARIANT: serverView is {} or full-snapshot, never a partial.
 \* Path A (BugMode=FALSE): holds.
@@ -160,7 +206,10 @@ LocalityMapMatchesEndpointOrPriorFull ==
     \/ serverView = {}
     \/ serverView = WorkerSnapshot
 
-\* TEMPORAL: eventual convergence under fairness on DeliverChunk.
+\* TEMPORAL: eventual convergence. Defined but NOT checked under the
+\* shipped `BlobsAvailableChunkingFixed.cfg` — see the fairness comment
+\* above. Production-realistic FIFO delivery would satisfy this; the
+\* spec's adversarial `\E seq` does not.
 EventuallyConverges == <>(serverView = WorkerSnapshot)
 
 ============================================================================
