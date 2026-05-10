@@ -123,8 +123,20 @@ where
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(maybe_message)) => maybe_message
                     .err_tip(|| format!("Stream error at byte {}", self.bytes_received)),
-                Poll::Ready(None) => Err(make_input_err!(
-                    "Expected WriteRequest struct in stream (got None)"
+                // Bazel's DynamicSpawnStrategy half-closes the
+                // ByteStream upload (HTTP/2 END_STREAM, no error frame)
+                // when the local-execution branch wins the race
+                // against remote. That's a cancellation, not a
+                // protocol error — `Code::Cancelled` so the client's
+                // gRPC status classifier treats it as retryable.
+                // `make_input_err!` (InvalidArgument) misclassified
+                // this as fatal and polluted Bazel build logs with
+                // thousands of misleading errors per CI run. See #357.
+                Poll::Ready(None) => Err(make_err!(
+                    Code::Cancelled,
+                    "client closed write stream mid-upload before sending finish_write=true (bytes_received={}/{})",
+                    self.bytes_received,
+                    self.resource_info.expected_size,
                 )),
             }
         };

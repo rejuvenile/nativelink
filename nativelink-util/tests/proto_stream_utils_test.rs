@@ -498,3 +498,185 @@ async fn write_state_progress_timeout_survives_resume() -> Result<(), Error> {
     drop(tx);
     Ok(())
 }
+
+// --------------------------------------------------------------------
+// #357: clean client half-close mid-stream MUST surface as
+// `Code::Cancelled`, NOT `Code::InvalidArgument`.
+//
+// Background: Bazel's DynamicSpawnStrategy normally cancels in-flight
+// ByteStream uploads via clean half-close (HTTP/2 END_STREAM with no
+// preceding error frame) when the local-execution branch wins the
+// race against remote. The previous `make_input_err!` at the
+// "got None" branch surfaced this Bazel-by-design cancellation as
+// `InvalidArgument`, which Bazel's status classifier treats as a
+// fatal protocol error rather than a retryable cancellation,
+// polluting build logs with thousands of misleading errors per CI run
+// (#353 RCA).
+//
+// The discriminator is `!self.write_finished`: when the inner stream
+// returns `None` and the wrapper has not yet observed
+// `finish_write: true` from the client, the upload was abandoned
+// mid-flight (whether mid-data or pre-data — both are client choices,
+// not protocol errors). The genuine `InvalidArgument` cases — byte
+// overrun, finish_write+wrong-size — flow through different branches
+// (the `error_if!` size check at the `write_finished` short-circuit,
+// and the explicit overrun check) and are covered by the
+// `genuine_overrun_is_still_rejected` and
+// `client_finish_write_true_with_byte_mismatch_returns_invalid_argument`
+// tests respectively.
+//
+// Mutation step: revert the fix in
+// `nativelink-util/src/proto_stream_utils.rs` to `make_input_err!`
+// for the "got None" branch. Both
+// `client_half_close_*_returns_cancelled` tests must red-fail with
+// the bespoke `expect()` messages below.
+// --------------------------------------------------------------------
+
+/// Bazel half-closes mid-upload (sends N data chunks, then END_STREAM
+/// with N < expected_size) when the DynamicSpawnStrategy local branch
+/// wins. The wrapper MUST surface this as `Code::Cancelled` — not
+/// `Code::InvalidArgument` — so Bazel's gRPC status classifier treats
+/// it as the by-design cancellation it is, not a fatal protocol
+/// error.
+#[nativelink_test]
+async fn client_half_close_mid_stream_returns_cancelled() -> Result<(), Error> {
+    // Declare a 24-byte upload, send only 8 bytes (2 chunks × 4),
+    // then close cleanly without finish_write=true.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"data", false, Some(24)))).unwrap();
+    tx.send(Ok(chunk(4, b"data", false, None))).unwrap();
+    drop(tx); // Clean half-close — no error frame, no finish_write.
+
+    let mut wrapper =
+        WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?;
+
+    // Drain the two delivered chunks.
+    wrapper.next().await.expect("first chunk").expect("first chunk ok");
+    wrapper.next().await.expect("second chunk").expect("second chunk ok");
+
+    // The next poll observes the inner-stream EOF without
+    // finish_write=true having been seen — this is the #353 case.
+    let next = wrapper.next().await.expect("EOF must surface as Some(Err) not None");
+    let err = next.expect_err(
+        "clean client half-close mid-stream MUST surface as Cancelled (not InvalidArgument) — see #353 RCA",
+    );
+    assert_eq!(
+        err.code,
+        Code::Cancelled,
+        "client half-close mid-stream MUST be Cancelled (not {:?}) so Bazel treats it as retryable cancellation, not a fatal protocol error — see #357",
+        err.code,
+    );
+
+    Ok(())
+}
+
+/// Bazel cancels the upload before sending any data chunk (only the
+/// resource-name first message arrived). Same discriminator
+/// (`!write_finished`) — same verdict (`Code::Cancelled`).
+#[nativelink_test]
+async fn client_half_close_before_any_data_returns_cancelled() -> Result<(), Error> {
+    // First message carries the resource name (with `data` empty) so
+    // `from()` can extract resource_info. Then the client closes
+    // without ever sending data or finish_write=true.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"", false, Some(24)))).unwrap();
+    drop(tx);
+
+    let mut wrapper =
+        WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?;
+
+    // The first message (cached in `first_msg`) is yielded.
+    let first = wrapper.next().await.expect("first message").expect("first ok");
+    assert_eq!(first.write_offset, 0);
+
+    // The next poll falls through to the inner stream which is
+    // already at EOF — same "got None" branch, same Cancelled
+    // verdict.
+    let next = wrapper.next().await.expect("EOF must surface as Some(Err) not None");
+    let err = next.expect_err(
+        "clean client half-close mid-stream MUST surface as Cancelled (not InvalidArgument) — see #353 RCA",
+    );
+    assert_eq!(
+        err.code,
+        Code::Cancelled,
+        "pre-data client half-close MUST be Cancelled (not {:?}) — Bazel cancelling before sending data is still a cancellation, see #357",
+        err.code,
+    );
+
+    Ok(())
+}
+
+/// Control: a well-formed upload (finish_write=true, bytes match
+/// declared size) must yield clean EOF (`None`) without any error.
+/// Guards against a regression that collapses Case D into the
+/// Cancelled branch.
+#[nativelink_test]
+async fn client_finish_write_true_with_complete_bytes_succeeds() -> Result<(), Error> {
+    // 24-byte upload, 6 chunks × 4 bytes, last chunk carries
+    // finish_write=true and bytes_received hits expected_size.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"data", false, Some(24)))).unwrap();
+    for i in 1..5 {
+        tx.send(Ok(chunk(i64::from(i) * 4, b"data", false, None))).unwrap();
+    }
+    tx.send(Ok(chunk(20, b"data", true, None))).unwrap();
+    drop(tx);
+
+    let mut wrapper =
+        WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?;
+
+    for _ in 0..6 {
+        wrapper
+            .next()
+            .await
+            .expect("chunk must yield")
+            .expect("chunk must succeed");
+    }
+    // After finish_write=true the wrapper short-circuits with
+    // Poll::Ready(None) on the next poll, signalling clean EOF.
+    assert!(
+        wrapper.next().await.is_none(),
+        "complete upload MUST yield clean None EOF, not an error — Case D",
+    );
+
+    Ok(())
+}
+
+/// Control: `finish_write=true` but `bytes_received != expected_size`.
+/// This is Case E — the genuine `InvalidArgument` case (client claimed
+/// done but byte count mismatched) — and MUST remain
+/// `Code::InvalidArgument`. Without this control test, a future
+/// change could collapse all "got None"-shaped paths into Cancelled
+/// and silently strip the size-validation contract.
+#[nativelink_test]
+async fn client_finish_write_true_with_byte_mismatch_returns_invalid_argument()
+-> Result<(), Error> {
+    // Declare 24 bytes but stop at 8 with finish_write=true. The
+    // wrapper accepts the chunk (high-watermark 8 < 24, no overrun),
+    // sets `write_finished`, then on the next poll the size check at
+    // the `write_finished` short-circuit fires.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
+    tx.send(Ok(chunk(0, b"data", false, Some(24)))).unwrap();
+    tx.send(Ok(chunk(4, b"data", true, None))).unwrap();
+    drop(tx);
+
+    let mut wrapper =
+        WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?;
+
+    wrapper.next().await.expect("first chunk").expect("first ok");
+    wrapper.next().await.expect("second chunk").expect("second ok");
+
+    // The next poll triggers the size check.
+    let next = wrapper.next().await.expect("size mismatch must surface as Some(Err)");
+    let err = next.expect_err(
+        "finish_write=true with byte-count mismatch MUST surface as InvalidArgument — Case E",
+    );
+    assert_eq!(
+        err.code,
+        Code::InvalidArgument,
+        "finish_write=true with byte mismatch MUST stay InvalidArgument (got {:?}) — this is the genuine protocol-error path, NOT the #357 Cancelled path",
+        err.code,
+    );
+
+    Ok(())
+}
