@@ -198,6 +198,24 @@ pub struct WorkerApiMetrics {
                 or expand the allowlist if the rollout is intentional."
     )]
     pub stale_workers_rejected_total: AtomicU64,
+
+    /// (#99 S1 code-reviewer follow-up) Per-reason BlobsAvailable
+    /// chunk-drop counters (`ChunkDropCounts`). Shared via Arc with
+    /// every per-connection `BlobsAvailableAccumulator` so all
+    /// per-connection drops aggregate into a single set of
+    /// server-wide counters. Without this Arc-share, each connection
+    /// would have its own `ChunkDropCounts` and per-connection
+    /// counters would die with the connection — operators couldn't
+    /// alert on a sustained drop rate. The
+    /// `#[metric(group = "chunked_blobs_available")]` annotation
+    /// publishes the inner counters under that group on the metrics
+    /// tree (each `ChunkDropCounts` field has its own
+    /// `#[metric(help = ...)]` per the `MetricsComponent` derive).
+    /// Note: production-visible only after `RootMetricsComponent`
+    /// publisher lands per #160.
+    #[metric(group = "chunked_blobs_available")]
+    pub chunked_blobs_available_drop_counts:
+        Arc<crate::blobs_available_accumulator::ChunkDropCounts>,
 }
 
 /// Per-endpoint state for the #141 boot_epoch wipe path. See
@@ -801,12 +819,20 @@ impl WorkerConnection {
             worker_tx,
             last_backfill_epoch_secs: AtomicU64::new(0),
             backfill_inflight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            metrics,
             // (#99) Per-connection accumulator. Created fresh per
             // ConnectWorker so a worker reconnect starts with empty
-            // partial state.
+            // partial state. The drop_counts Arc is shared with the
+            // server-level `WorkerApiMetrics`
+            // (`chunked_blobs_available_drop_counts`) so per-reason
+            // drops aggregate across every connection on this server
+            // and surface on the metrics tree (S1 follow-up to the
+            // 8fa531ae code-reviewer pass). Built BEFORE moving
+            // `metrics` into the struct so we can read its Arc field.
             blobs_available_accumulator:
-                crate::blobs_available_accumulator::BlobsAvailableAccumulator::new(),
+                crate::blobs_available_accumulator::BlobsAvailableAccumulator::new_with_drop_counts(
+                    Arc::clone(&metrics.chunked_blobs_available_drop_counts),
+                ),
+            metrics,
         };
 
         background_spawn!("worker_api", async move {

@@ -59,6 +59,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use nativelink_metric::MetricsComponent;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     BlobsAvailableChunk, BlobsAvailableNotification,
 };
@@ -326,16 +327,88 @@ fn entries_in_chunk(chunk: &BlobsAvailableChunk) -> usize {
 /// silent server-side drops without these). Each counter is bumped
 /// whenever the matching code path fires; warn-level logs carry the
 /// reason string AND the counter values stay queryable for dashboards.
-#[derive(Debug, Default)]
+///
+/// `#[derive(MetricsComponent)]` (S1 from the 8fa531ae code-reviewer
+/// pass) makes these counters discoverable on the metrics tree
+/// — without it the AtomicU64s live only in process memory and never
+/// reach Prometheus scrapes (cf. red-team BLOCK-2 on `WorkerApiMetrics`
+/// at `worker_api_server.rs:171-201`). The counters get wired to the
+/// `WorkerApiServer` parent surface via an `Arc<ChunkDropCounts>` field
+/// on `WorkerApiMetrics`, shared (Arc-cloned) into every
+/// `WorkerConnection`'s accumulator so per-connection drops aggregate
+/// into a single set of server-wide counters. Note: the
+/// `RootMetricsComponent` publisher itself is NOT wired in
+/// `bin/nativelink.rs` today (separate tracker #160 — Wire
+/// RootMetricsComponent publisher in src/bin/nativelink.rs); this
+/// change pre-positions so when #160 lands, chunk-drop counters appear
+/// on dashboards without further plumbing.
+#[derive(Debug, Default, MetricsComponent)]
 pub struct ChunkDropCounts {
+    #[metric(
+        help = "Total BlobsAvailable chunks rejected because their \
+                worker_instance_token field was 0 (uninitialised — \
+                pre-fixup or buggy worker per the #97 precedent)."
+    )]
     pub dropped_token_zero: AtomicU64,
+    #[metric(
+        help = "Total BlobsAvailable chunks that triggered a token-mismatch \
+                rebuild — the partial accumulator for the broadcast was \
+                discarded because a chunk arrived with a worker_instance_token \
+                differing from the one that started the broadcast (worker \
+                process restart mid-broadcast; impossible in steady state)."
+    )]
     pub dropped_token_mismatch: AtomicU64,
+    #[metric(
+        help = "Total BlobsAvailable chunks dropped because the per-connection \
+                in-flight broadcast cap (MAX_INFLIGHT_BROADCASTS_PER_CONN = 8) \
+                was reached. Indicates a worker emitted chunks for new \
+                broadcast_ids without ever sending the terminal is_last."
+    )]
     pub dropped_per_conn_broadcasts_cap: AtomicU64,
+    #[metric(
+        help = "Total BlobsAvailable chunks dropped because the per-connection \
+                accumulated-entries cap (MAX_ACCUMULATED_ENTRIES_PER_CONN = \
+                1_000_000) projection exceeded the cap. The partial accumulator \
+                is dropped; the worker re-broadcasts on the next tick."
+    )]
     pub dropped_per_conn_entries_cap: AtomicU64,
+    #[metric(
+        help = "Total BlobsAvailable chunks rejected because a single chunk \
+                carried more than MAX_ENTRIES_PER_CHUNK entries (security M1 \
+                / Fix #11; defends against transient peak-memory overshoot \
+                from a hostile chunk)."
+    )]
     pub dropped_per_chunk_entries_cap: AtomicU64,
+    #[metric(
+        help = "Total BlobsAvailable chunks rejected because the chunk's \
+                sequence value exceeded MAX_SEQUENCES (256). Indicates a \
+                worker chunker bug — chunker MUST cap sequence at 255 per \
+                BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST."
+    )]
     pub dropped_sequence_cap: AtomicU64,
+    #[metric(
+        help = "Total BlobsAvailable chunks rejected by other validation \
+                gates (store_id mismatch within one broadcast, \
+                is_full_snapshot inconsistency across chunks, duplicate \
+                sequence within one broadcast). The partial accumulator is \
+                dropped; the worker re-broadcasts on the next tick."
+    )]
     pub dropped_validation_other: AtomicU64,
+    #[metric(
+        help = "Total BlobsAvailable terminal commits rejected because the \
+                sequence-completeness gate observed a gap in [0, \
+                max_seen_sequence] (Fix #1 / invariant-prover BLOCK). \
+                Without this gate a partial commit half-applies a strict \
+                subset of the worker's snapshot — the bug class the entire \
+                Path A semantics is meant to prevent."
+    )]
     pub dropped_incomplete_sequence: AtomicU64,
+    #[metric(
+        help = "Total BlobsAvailable terminal commits rejected because the \
+                sequence=0 chunk (which carries header scalars) never \
+                arrived (Fix #3). Without header_scalars the legacy \
+                handle_blobs_available cannot route the snapshot."
+    )]
     pub dropped_missing_chunk_zero: AtomicU64,
 }
 
@@ -393,7 +466,16 @@ pub struct BlobsAvailableAccumulator {
     inner: Mutex<AccumulatorInner>,
     /// Per-reason drop counters; queryable by tests and metrics
     /// dashboards. (dsr MAJOR-1)
-    pub drop_counts: ChunkDropCounts,
+    ///
+    /// `Arc<ChunkDropCounts>` so the production wiring can share a single
+    /// counter pool across every per-connection accumulator. Each
+    /// `BlobsAvailableAccumulator::new()` call creates a fresh
+    /// (per-test) `Arc`; production constructs via
+    /// `BlobsAvailableAccumulator::new_with_drop_counts(shared)` so
+    /// every connection bumps the same set of counters that
+    /// `WorkerApiMetrics::chunked_blobs_available_drop_counts`
+    /// publishes.
+    pub drop_counts: Arc<ChunkDropCounts>,
 }
 
 #[derive(Debug, Default)]
@@ -412,8 +494,25 @@ struct AccumulatorInner {
 }
 
 impl BlobsAvailableAccumulator {
+    /// Construct with a fresh per-instance `ChunkDropCounts`. Used by
+    /// tests; production callers should prefer
+    /// `new_with_drop_counts` so all per-connection accumulators
+    /// aggregate into a single counter pool that the metrics tree
+    /// publishes once.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Construct with a shared `Arc<ChunkDropCounts>`. The same Arc
+    /// must be the one held by `WorkerApiMetrics::chunked_blobs_available_drop_counts`
+    /// so per-connection drops aggregate into a single set of
+    /// server-wide counters that surface on the metrics tree (S1 from
+    /// the 8fa531ae code-reviewer pass).
+    pub fn new_with_drop_counts(drop_counts: Arc<ChunkDropCounts>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(AccumulatorInner::default()),
+            drop_counts,
+        })
     }
 
     /// Process one chunk. Returns `Some(notification)` when this chunk
