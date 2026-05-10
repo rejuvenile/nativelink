@@ -3447,6 +3447,7 @@ dependencies = [
  "bytes",
  "fail",
  "futures",
+ "h2 0.4.13",
  "hex",
  "http 1.4.0",
  "http-body 1.0.1",

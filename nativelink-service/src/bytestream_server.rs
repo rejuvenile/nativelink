@@ -2515,7 +2515,14 @@ impl ByteStreamServer {
 
         let is_worker = metadata.contains_key("x-nativelink-worker");
         let is_mirror = metadata.contains_key("x-nativelink-mirror");
-        let stream = WriteRequestStreamWrapper::from(stream)
+        // #355: same terminal-frame inspector as the tonic write path. The
+        // zero-copy stream's errors flow through `Status::from_error(e.into())`
+        // (zero_copy_codec.rs:229), preserving the h2::Error in the source
+        // chain so `inspect_terminal_status` can pull `h2::Reason` out.
+        let inspected = crate::bytestream_terminal_inspector::TerminalFrameInspectingStream::new(
+            stream,
+        );
+        let stream = WriteRequestStreamWrapper::from(inspected)
             .await
             .err_tip(|| "Could not unwrap first stream message")
             .map_err(Into::<Status>::into)?;
@@ -2814,7 +2821,15 @@ impl ByteStream for ByteStreamServer {
         let is_worker = grpc_request.metadata().contains_key("x-nativelink-worker");
         let is_mirror = grpc_request.metadata().contains_key("x-nativelink-mirror");
         let request = grpc_request.into_inner();
-        let stream = WriteRequestStreamWrapper::from(request)
+        // #355: tap the inbound stream BEFORE WriteRequestStreamWrapper so we
+        // observe the raw terminal frame (clean END_STREAM vs h2 RST_STREAM
+        // with reason code vs gRPC error). The wrapper consumes the typed
+        // `tonic::Status` and converts to the untyped nativelink `Error`,
+        // dropping the h2 source-chain we need.
+        let inspected = crate::bytestream_terminal_inspector::TerminalFrameInspectingStream::new(
+            request,
+        );
+        let stream = WriteRequestStreamWrapper::from(inspected)
             .await
             .err_tip(|| "Could not unwrap first stream message")
             .map_err(Into::<Status>::into)?;
