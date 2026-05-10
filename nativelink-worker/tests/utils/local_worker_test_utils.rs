@@ -196,9 +196,10 @@ impl MockWorkerApiClient {
 
     /// (#99 / Fix #10) Receive the next call as a `ChunkedMessage`.
     /// Used by tests that exercise the worker's chunked
-    /// `BlobsAvailable` emit path; pairs with the test-utils mock's
-    /// `chunked_message` impl at the bottom of this file.
-    #[allow(dead_code, reason = "exercised by future worker-side chunked tests")]
+    /// `BlobsAvailable` emit path (e.g.
+    /// `tests/blobs_available_chunked_handler_test.rs`); pairs with the
+    /// test-utils mock's `chunked_message` impl at the bottom of this
+    /// file.
     pub(crate) async fn expect_chunked_message(
         &self,
         result: Result<(), Error>,

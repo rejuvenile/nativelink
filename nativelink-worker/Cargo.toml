@@ -130,3 +130,11 @@ required-features = ["test-utils"]
 # the other BIS tests above.
 name = "bis_ac_routing_test"
 required-features = ["test-utils"]
+
+[[test]]
+# (#99 S2) Worker-crate seam test for the chunked BlobsAvailable emit
+# path. Pulls in `tests/utils/local_worker_test_utils.rs` whose
+# `MockRunningActionsManager` import path requires the same `test-utils`
+# feature gate as the other utils-using tests above.
+name = "blobs_available_chunked_handler_test"
+required-features = ["test-utils"]
