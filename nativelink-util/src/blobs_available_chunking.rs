@@ -61,6 +61,18 @@ pub const BLOBS_AVAILABLE_PER_CHUNK: usize = 4096;
 /// carry < 100 entries, ~4 KiB encoded).
 pub const BLOBS_AVAILABLE_CHUNK_THRESHOLD_BYTES: usize = 32 * 1024;
 
+/// Hard cap on the number of chunks a single broadcast can emit.
+/// MUST equal the server's `MAX_SEQUENCES` constant in
+/// `nativelink-service/src/blobs_available_accumulator.rs`.
+///
+/// 256 chunks × `BLOBS_AVAILABLE_PER_CHUNK` (4096) = 1_048_576 entries
+/// per broadcast, comfortably above the per-conn entries cap of 1M.
+///
+/// If a worker would emit > 256 chunks for one broadcast, the chunker
+/// returns Err — better to fail loudly at the producer than to emit
+/// chunks the server will silently discard at sequence ≥ 256.
+pub const BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST: usize = 256;
+
 /// Split a `BlobsAvailableNotification` into one-or-more
 /// `BlobsAvailableChunk` envelopes.
 ///
@@ -77,13 +89,19 @@ pub const BLOBS_AVAILABLE_CHUNK_THRESHOLD_BYTES: usize = 32 * 1024;
 /// the chunker fills each chunk by pulling entries in declaration order
 /// from the 8 source slices until the cap is hit OR the source is
 /// exhausted, whichever comes first.
+///
+/// Returns `Err` if the notification would require more than
+/// `BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST` chunks. The server's
+/// accumulator rejects sequences ≥ that cap; failing fast at the
+/// producer is strictly better than emitting chunks the server will
+/// silently discard.
 pub fn chunk_blobs_available(
     notification: BlobsAvailableNotification,
     broadcast_id: u64,
     worker_instance_token: u64,
     store_id: String,
     max_per_chunk: usize,
-) -> Vec<BlobsAvailableChunk> {
+) -> Result<Vec<BlobsAvailableChunk>, &'static str> {
     let max_per_chunk = max_per_chunk.max(1);
 
     let BlobsAvailableNotification {
@@ -220,9 +238,22 @@ pub fn chunk_blobs_available(
 
         chunks.push(chunk);
         sequence = sequence.saturating_add(1);
+
+        // (Fix #2 / dsr BLOCK-1) Hard cap on chunk count per broadcast
+        // mirroring the server's MAX_SEQUENCES. If we are about to
+        // emit a chunk at sequence == MAX_CHUNKS, fail loudly: the
+        // server would silently discard sequences ≥ the cap, and the
+        // worker would have no signal that the broadcast didn't
+        // commit.
+        if (sequence as usize) >= BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST {
+            return Err(
+                "BlobsAvailable broadcast would exceed BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST \
+                 (256); chunker output cannot round-trip the server's MAX_SEQUENCES cap",
+            );
+        }
     }
 
-    chunks
+    Ok(chunks)
 }
 
 /// Should the worker emit `notification` via the chunked path or the
@@ -316,7 +347,8 @@ mod tests {
     #[test]
     fn empty_notification_yields_one_terminal_chunk() {
         let n = BlobsAvailableNotification::default();
-        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 4096);
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 4096)
+            .expect("empty notification must chunk successfully");
         assert_eq!(chunks.len(), 1, "empty input must still emit terminal");
         assert!(chunks[0].is_last);
         assert_eq!(chunks[0].sequence, 0);
@@ -331,7 +363,8 @@ mod tests {
             cached_directory_digests: (10..12).map(d).collect(),
             ..Default::default()
         };
-        let chunks = chunk_blobs_available(n, 7, 42, String::new(), 4096);
+        let chunks = chunk_blobs_available(n, 7, 42, String::new(), 4096)
+            .expect("single chunk must succeed");
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].sequence, 0);
         assert!(chunks[0].is_last);
@@ -347,7 +380,8 @@ mod tests {
             pinned_mirror_entries: (20..25).map(|i| mpe(i, "store_a")).collect(),
             ..Default::default()
         };
-        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 6);
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 6)
+            .expect("3-chunk partition must succeed");
         assert_eq!(chunks.len(), 3);
         assert!(!chunks[0].is_last);
         assert!(!chunks[1].is_last);
@@ -379,7 +413,8 @@ mod tests {
             digest_infos: (0..8).map(bdi).collect(),
             ..Default::default()
         };
-        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 4);
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 4)
+            .expect("2+ chunks must succeed");
         assert!(chunks.len() >= 2);
         assert_eq!(chunks[0].worker_cas_endpoint, "grpc://w1:50081");
         assert_eq!(chunks[0].cpu_load_pct, 42);
@@ -400,7 +435,8 @@ mod tests {
             digest_infos: (0..10).map(bdi).collect(),
             ..Default::default()
         };
-        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 3);
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 3)
+            .expect("multi-chunk must succeed");
         assert!(chunks.len() >= 3);
         for c in &chunks {
             assert!(
@@ -422,7 +458,8 @@ mod tests {
             evicted_digests: (40..42).map(d).collect(),
             ..Default::default()
         };
-        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 1);
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 1)
+            .expect("8-chunk partition must succeed");
         // 2 + 2 + 1 + 1 + 2 = 8 entries -> 8 chunks; last is is_last.
         assert_eq!(chunks.len(), 8);
         assert!(chunks.last().unwrap().is_last);
@@ -441,15 +478,61 @@ mod tests {
 
     #[test]
     fn one_million_digests_no_truncation() {
+        // 1M / 4096 = ~245 chunks; well under the 256 cap.
         let n = BlobsAvailableNotification {
             digest_infos: (0..1_000_000).map(bdi).collect(),
             ..Default::default()
         };
-        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 4096);
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 4096)
+            .expect("1M digests must round-trip within the 256-chunk cap");
         let total: usize = chunks.iter().map(|c| c.digests.len()).sum();
         assert_eq!(total, 1_000_000);
         assert!(chunks.last().unwrap().is_last);
         assert!(chunks[..chunks.len() - 1].iter().all(|c| !c.is_last));
+        assert!(
+            chunks.len() <= BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST,
+            "chunk count {} must stay within the per-broadcast cap {}",
+            chunks.len(),
+            BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST
+        );
+    }
+
+    /// (Fix #2 / dsr BLOCK-1) When a notification would require more
+    /// than `BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST` chunks, the
+    /// chunker MUST fail loudly. Forcing `max_per_chunk = 1` lets
+    /// us hit the cap with a tiny, fast test rather than allocating
+    /// 1M+ entries.
+    #[test]
+    fn chunker_errors_when_exceeding_max_chunks_per_broadcast() {
+        // 257 entries × 1-per-chunk = 257 chunks > 256 cap.
+        let count = (BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST as u64) + 1;
+        let n = BlobsAvailableNotification {
+            digest_infos: (0..count).map(bdi).collect(),
+            ..Default::default()
+        };
+        let result = chunk_blobs_available(n, 1, 99, String::new(), 1);
+        assert!(
+            result.is_err(),
+            "chunker must reject broadcasts requiring > {} chunks; \
+             saw Ok({:?}) — Fix #2 (dsr BLOCK-1) regression",
+            BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST,
+            result.as_ref().map(|c| c.len()),
+        );
+    }
+
+    /// Boundary: exactly `BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST`
+    /// chunks must succeed (the cap is "exceed", not "reach").
+    #[test]
+    fn chunker_allows_exact_max_chunks_per_broadcast() {
+        let count = BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST as u64;
+        let n = BlobsAvailableNotification {
+            digest_infos: (0..count).map(bdi).collect(),
+            ..Default::default()
+        };
+        let chunks = chunk_blobs_available(n, 1, 99, String::new(), 1)
+            .expect("exactly-cap broadcast must succeed");
+        assert_eq!(chunks.len(), BLOBS_AVAILABLE_MAX_CHUNKS_PER_BROADCAST);
+        assert!(chunks.last().unwrap().is_last);
     }
 
     #[test]

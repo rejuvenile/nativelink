@@ -1762,13 +1762,38 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 .next_broadcast_id
                 .fetch_add(1, Ordering::Relaxed);
             let worker_instance_token = state.worker_instance_token;
-            let chunks = chunk_blobs_available(
+            let chunks = match chunk_blobs_available(
                 notification,
                 broadcast_id,
                 worker_instance_token,
                 String::new(),
                 BLOBS_AVAILABLE_PER_CHUNK,
-            );
+            ) {
+                Ok(chunks) => chunks,
+                Err(reason) => {
+                    // (Fix #2 / dsr BLOCK-1) The notification would
+                    // require more chunks than the server's
+                    // MAX_SEQUENCES cap accepts. Log loudly and skip
+                    // this tick — better than emitting chunks the
+                    // server will silently discard. The next tick
+                    // will retry; if the worker's snapshot has
+                    // grown past 1M entries the operator should
+                    // investigate (FSS sizing pressure).
+                    warn!(
+                        reason,
+                        new_or_touched_count,
+                        evicted_count,
+                        cached_dir_count,
+                        added_subtree_count,
+                        removed_subtree_count,
+                        pinned_mirror_count,
+                        is_first,
+                        broadcast_id,
+                        "BlobsAvailable chunker rejected: snapshot too large for one broadcast"
+                    );
+                    return Ok(());
+                }
+            };
             let chunk_count = chunks.len();
             for chunk in chunks {
                 let envelope = ChunkedMessage {
