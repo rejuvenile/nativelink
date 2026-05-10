@@ -717,6 +717,10 @@ fn make_fss_with_gated_slow() -> (
             fast_direction: nativelink_config::stores::StoreDirection::default(),
             slow_direction: nativelink_config::stores::StoreDirection::default(),
             chunked_reads_enabled: false,
+            // 0 = uncapped (test default per FastSlowSpec doc-comment).
+            // MemoryStore slow tier is exempt from Path C's required-cap
+            // check (only FilesystemStore is disk-backed).
+            slow_writes_in_flight_max_bytes: 0,
         },
         fast,
         slow,
@@ -1100,6 +1104,9 @@ async fn failed_slow_writes_v3_walker_descends_production_composition() -> Resul
                 fast_direction: nativelink_config::stores::StoreDirection::default(),
                 slow_direction: nativelink_config::stores::StoreDirection::default(),
                 chunked_reads_enabled: false,
+                // 0 = uncapped (test default); MemoryStore slow tier is
+                // exempt from Path C's required-cap check.
+                slow_writes_in_flight_max_bytes: 0,
             },
             fast,
             slow,
@@ -1127,6 +1134,9 @@ async fn failed_slow_writes_v3_walker_descends_production_composition() -> Resul
                 fast_direction: nativelink_config::stores::StoreDirection::default(),
                 slow_direction: nativelink_config::stores::StoreDirection::default(),
                 chunked_reads_enabled: false,
+                // 0 = uncapped (test default); MemoryStore slow tier is
+                // exempt from Path C's required-cap check.
+                slow_writes_in_flight_max_bytes: 0,
             },
             lower_inner_fast,
             lower_inner_slow,
@@ -1462,6 +1472,10 @@ fn make_fss_with_blocking_slow() -> (
             fast_direction: nativelink_config::stores::StoreDirection::default(),
             slow_direction: nativelink_config::stores::StoreDirection::default(),
             chunked_reads_enabled: false,
+            // 0 = uncapped (test default per FastSlowSpec doc-comment).
+            // MemoryStore slow tier is exempt from Path C's required-cap
+            // check (only FilesystemStore is disk-backed).
+            slow_writes_in_flight_max_bytes: 0,
         },
         fast,
         slow,

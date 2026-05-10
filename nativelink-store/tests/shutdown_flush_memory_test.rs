@@ -794,6 +794,9 @@ async fn store_manager_flush_descends_production_composition() -> Result<(), Err
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
+            // 0 = uncapped (test default); MemoryStore slow tier is
+            // exempt from Path C's required-cap check.
+            slow_writes_in_flight_max_bytes: 0,
         },
         upper_fast.clone(),
         upper_slow.clone(),
@@ -813,6 +816,9 @@ async fn store_manager_flush_descends_production_composition() -> Result<(), Err
             fast_direction: StoreDirection::default(),
             slow_direction: StoreDirection::default(),
             chunked_reads_enabled: false,
+            // 0 = uncapped (test default); MemoryStore slow tier is
+            // exempt from Path C's required-cap check.
+            slow_writes_in_flight_max_bytes: 0,
         },
         lower_fast,
         lower_slow,
