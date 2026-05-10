@@ -1488,4 +1488,117 @@ mod tests {
         assert!(snap["dropped_sequence_cap"] >= 1, "snap: {:?}", snap);
         assert!(snap["dropped_incomplete_sequence"] >= 1, "snap: {:?}", snap);
     }
+
+    /// Regression test for #354 (testing-czar MAJOR-1 from #99 fix-up-2
+    /// cadre review). `BlobsAvailableAccumulator::new_with_drop_counts`
+    /// has exactly one production caller — `WorkerApiServer` at
+    /// `worker_api_server.rs` (search literal `Arc::clone(&metrics
+    /// .chunked_blobs_available_drop_counts)`) — and zero pre-#354 test
+    /// callers. The contract: every per-connection accumulator
+    /// constructed via `new_with_drop_counts` shares ONE `ChunkDropCounts`
+    /// pool, so a future refactor that swaps `Arc::clone` for
+    /// `Arc::new(ChunkDropCounts::default())` would silently fork the
+    /// counters per connection — server-wide totals would underreport,
+    /// dashboards would lie, and no existing test would red-fail.
+    ///
+    /// Composition exercised: TWO accumulators both built with
+    /// `new_with_drop_counts(Arc::clone(&shared))`. Each is driven
+    /// through a `dropped_token_mismatch` path (open broadcast with
+    /// token=99, send second chunk with token=7777 — the
+    /// `existing.worker_instance_token != token` branch of `merge_chunk`
+    /// fires `fetch_add(1, Ordering::Relaxed)` on `dropped_token_mismatch`).
+    /// Three increments via accumulator A + five via accumulator B must
+    /// surface as `8` through the original `shared` Arc handle, AND the
+    /// view through A's own `drop_counts`, AND the view through B's own
+    /// `drop_counts` — all three handles are aliases for ONE
+    /// `ChunkDropCounts` instance.
+    ///
+    /// Mutation step (CLAUDE.md TDD #5): replace the `Arc::clone` in
+    /// `worker_api_server.rs` (or the `drop_counts` field assignment
+    /// inside `new_with_drop_counts`) with
+    /// `Arc::new(ChunkDropCounts::default())`. This test red-fails with
+    /// the bespoke message naming the regression.
+    #[test]
+    fn new_with_drop_counts_aggregates_across_accumulators() {
+        let shared = Arc::new(ChunkDropCounts::default());
+        let acc_a = BlobsAvailableAccumulator::new_with_drop_counts(Arc::clone(&shared));
+        let acc_b = BlobsAvailableAccumulator::new_with_drop_counts(Arc::clone(&shared));
+
+        // Drive 3 token-mismatch increments through accumulator A.
+        // Each pair (open with token=99, then send a chunk with
+        // token=7777 reusing the same broadcast_id) bumps
+        // `dropped_token_mismatch` exactly once.
+        for broadcast_id in [10u64, 11, 12] {
+            assert!(
+                acc_a
+                    .merge_chunk(chunk(broadcast_id, 0, false, 99, vec![bdi(1)]))
+                    .is_none()
+            );
+            assert!(
+                acc_a
+                    .merge_chunk(chunk(broadcast_id, 0, false, 7777, vec![bdi(2)]))
+                    .is_none()
+            );
+        }
+
+        // Drive 5 token-mismatch increments through accumulator B.
+        for broadcast_id in [20u64, 21, 22, 23, 24] {
+            assert!(
+                acc_b
+                    .merge_chunk(chunk(broadcast_id, 0, false, 99, vec![bdi(1)]))
+                    .is_none()
+            );
+            assert!(
+                acc_b
+                    .merge_chunk(chunk(broadcast_id, 0, false, 7777, vec![bdi(2)]))
+                    .is_none()
+            );
+        }
+
+        let shared_view = shared.dropped_token_mismatch.load(Ordering::Relaxed);
+        let a_view = acc_a.drop_counts.dropped_token_mismatch.load(Ordering::Relaxed);
+        let b_view = acc_b.drop_counts.dropped_token_mismatch.load(Ordering::Relaxed);
+
+        assert_eq!(
+            shared_view, 8,
+            "Arc<ChunkDropCounts> shared-aggregation broken — N accumulators \
+             with Arc::clone MUST sum into one shared counter pool. If this \
+             test fails, someone replaced Arc::clone with Arc::new in \
+             worker_api_server.rs (the call to \
+             BlobsAvailableAccumulator::new_with_drop_counts) or inside \
+             new_with_drop_counts itself; got shared_view={shared_view}, \
+             expected 8 (= 3 from acc_a + 5 from acc_b)"
+        );
+        assert_eq!(
+            a_view, shared_view,
+            "Arc<ChunkDropCounts> aliasing broken — acc_a.drop_counts and \
+             the shared Arc must observe the same counter value; got \
+             a_view={a_view}, shared_view={shared_view}"
+        );
+        assert_eq!(
+            b_view, shared_view,
+            "Arc<ChunkDropCounts> aliasing broken — acc_b.drop_counts and \
+             the shared Arc must observe the same counter value; got \
+             b_view={b_view}, shared_view={shared_view}"
+        );
+
+        // Pointer identity: the three Arcs must point at the SAME
+        // ChunkDropCounts allocation. `Arc::ptr_eq` is the load-bearing
+        // assertion; equal counter values could in principle arise from
+        // two independent counters that happen to coincide, but
+        // pointer-equality forces the test to falsify if anyone forks
+        // the Arc.
+        assert!(
+            Arc::ptr_eq(&shared, &acc_a.drop_counts),
+            "shared Arc and acc_a.drop_counts must point at the same \
+             ChunkDropCounts allocation — Arc::ptr_eq returned false, \
+             meaning new_with_drop_counts forked the Arc"
+        );
+        assert!(
+            Arc::ptr_eq(&shared, &acc_b.drop_counts),
+            "shared Arc and acc_b.drop_counts must point at the same \
+             ChunkDropCounts allocation — Arc::ptr_eq returned false, \
+             meaning new_with_drop_counts forked the Arc"
+        );
+    }
 }
