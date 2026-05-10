@@ -188,6 +188,21 @@ impl MemoryStore {
         self.evicting_map.len_for_test().await
     }
 
+    /// #332: aggregate bytes currently held by `MokaEvictingMap::pinned`.
+    /// Used by the regression test that verifies
+    /// `CompletenessCheckingStore` no longer pins verified CAS digests
+    /// (deletion landed because the slow tier transparently covers any
+    /// fast-tier eviction during the check-to-fetch window, while the
+    /// 120s-TTL pin was eating into the 12 GB pin cap and starving the
+    /// BIS-feeder pin path). Production code MUST NOT depend on this
+    /// accessor; it exists solely to make the contract observable from
+    /// integration tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn pinned_bytes_for_test(&self) -> u64 {
+        self.evicting_map.pinned_bytes()
+    }
+
     pub async fn remove_entry(&self, key: StoreKey<'_>) -> bool {
         self.evicting_map.remove(&key.into_owned()).await
     }

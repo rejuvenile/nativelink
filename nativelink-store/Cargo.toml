@@ -328,3 +328,17 @@ required-features = ["chunked_fast_slow", "test-utils"]
 [[test]]
 name = "memory_store_backpressure_eviction_test"
 required-features = ["chunked_fast_slow"]
+
+# #332: regression that `CompletenessCheckingStore::has_with_results`
+# does NOT pin verified CAS digests in the underlying MemoryStore.
+# Uses the test-utils-gated `MemoryStore::pinned_bytes_for_test` accessor
+# to inspect pin state through the production-composition wrapping chain.
+# `chunked_fast_slow` is required because the SECOND test in this file
+# (`ccs_pin_deletion_satisfies_composite_invariant`) wires the
+# `emit_backpressure_enabled` gate corner — the gate path is itself
+# `#[cfg(feature = "chunked_fast_slow")]` (see `memory_store.rs:269`),
+# so the composite invariant the second test exercises is only
+# observable with that feature enabled.
+[[test]]
+name = "completeness_checking_pin_accumulation_test"
+required-features = ["test-utils", "chunked_fast_slow"]

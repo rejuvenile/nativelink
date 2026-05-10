@@ -36,7 +36,7 @@ use nativelink_util::store_trait::{
 use parking_lot::Mutex;
 use prost::Message;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::ac_utils::{get_and_decode_digest, get_size_and_decode_digest};
 
@@ -296,30 +296,28 @@ impl CompletenessCheckingStore {
                     .err_tip(
                         || "Error calling has_with_results() inside CompletenessCheckingStore::has",
                     )?;
-                // Pin verified digests immediately to minimize
-                // the TOCTOU window between existence check and pin.
-                let mut verified_batch = Vec::new();
+                // #332: post-verification CAS pin removed. Originally
+                // (`f9566c82` / `2015b32b`, March 2026) the verified
+                // digests were pinned here to narrow the TOCTOU window
+                // between the existence check and the worker's eventual
+                // read. The pin had no matching unpin and relied on the
+                // 120s `MokaEvictingMap::PIN_TIMEOUT_SECS` to release.
+                // Once `MemoryStore::pin_digests` was reinstated by
+                // `#334` Fix C, this accumulator started consuming the
+                // 12 GB pin cap on `cas_FAST_SLOW_STORE.fast` (25 % of
+                // the configured 48 GB `max_bytes`), racing
+                // the BIS-feeder pin path that protects the
+                // ≥2-replica durability invariant. The protection was
+                // in any case vestigial: the FilesystemStore slow tier
+                // covers a fast-tier eviction transparently for any
+                // CAS read in the check-to-fetch window.
                 {
                     let mut state = state_mux.lock();
-                    for (i, (r, index)) in
-                        has_results.iter().zip(indexes).enumerate()
-                    {
-                        if r.is_some() {
-                            if let StoreKey::Digest(d) = &digests[i] {
-                                verified_batch.push(*d);
-                            }
-                        } else {
-                            // Digest missing — mark the action result as incomplete
+                    for (r, index) in has_results.iter().zip(indexes) {
+                        if r.is_none() {
                             state.results[index] = None;
                         }
                     }
-                }
-                if !verified_batch.is_empty() {
-                    info!(
-                        count = verified_batch.len(),
-                        "pinning verified CAS digests to prevent eviction"
-                    );
-                    self.cas_store.pin_digests(&verified_batch);
                 }
             }
             Result::<(), Error>::Ok(())
@@ -442,26 +440,19 @@ impl CompletenessCheckingStore {
                 .await
                 .err_tip(|| "Error checking CAS existence in get_and_verify_single")?;
 
-            let mut verified_batch = Vec::new();
-            for (i, r) in has_results.iter().enumerate() {
-                if r.is_some() {
-                    if let StoreKey::Digest(d) = &digest_infos[i] {
-                        verified_batch.push(*d);
-                    }
-                } else {
+            // #332: post-verification CAS pin removed (see the matching
+            // explanation above in `inner_has_with_results`). The
+            // existence check still gates the AC entry's completeness;
+            // missing CAS digests still surface as `Code::NotFound` so
+            // callers fall back to a full re-execute.
+            for r in has_results.iter() {
+                if r.is_none() {
                     self.incomplete_entries_counter.inc();
                     return Err(make_err!(
                         Code::NotFound,
                         "Digest found, but not all parts were found in CompletenessCheckingStore::get_part"
                     ));
                 }
-            }
-            if !verified_batch.is_empty() {
-                info!(
-                    count = verified_batch.len(),
-                    "pinning verified CAS digests to prevent eviction"
-                );
-                self.cas_store.pin_digests(&verified_batch);
             }
         }
 
@@ -560,16 +551,16 @@ impl StoreDriver for CompletenessCheckingStore {
 
     /// CompletenessCheckingStore wraps the AC store (entry-point for AC
     /// queries). The CAS store is consulted for verification reads only.
-    /// External `drain_stable_digests` / `stable_notify` flow through the
-    /// AC store path. (Internal `cas_store.pin_digests` calls inside the
-    /// completeness check loop are separate from the public pin API.)
+    /// External `drain_stable_digests` / `stable_notify` flow through
+    /// the AC store path.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {
         StableDigestDelegation::Inner(self.ac_store.as_store_driver())
     }
 
-    /// External pin requests forward to the AC store. The internal CAS-
-    /// pinning that happens inside the completeness check is independent
-    /// of this public API surface.
+    /// External pin requests forward to the AC store. (#332 deleted the
+    /// post-verification CAS pin loop that previously fired inside
+    /// `inner_has_with_results` / `get_and_verify_single`; see the
+    /// in-line comments at those sites for the rationale.)
     fn pin_delegation(&self) -> PinDelegation<'_> {
         PinDelegation::Inner(self.ac_store.as_store_driver())
     }
