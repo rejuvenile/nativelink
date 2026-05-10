@@ -5248,6 +5248,421 @@ async fn ac_failure_prune_is_scoped_to_store_id_and_digest() -> Result<(), Error
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// #367: BIS stable_digests must be invalidated on slow-tier eviction.
+//
+// Production composition (cas_FAST_SLOW_STORE.slow = FilesystemStore on
+// /srv/bulk, or SMALL_CAS_CACHED.slow = Redis):
+//   - FastSlowStore takes a fast-tier write, spawns slow-tier write,
+//     and on success pushes the digest into `stable_digests` so the
+//     BIS broadcast loop emits `BlobsInStableStorage` to workers.
+//   - Workers receive BIS, drop their mirror replica (server is now
+//     the durable holder).
+//   - If the slow tier later evicts the digest (Redis LRU/TTL,
+//     FilesystemStore size-cap, S3 lifecycle), the durability claim
+//     becomes false. Pre-#367 the eviction was silent — `stable_digests`
+//     would re-broadcast the digest as still-durable, but reads would
+//     return NotFound.
+//
+// Composite invariant under audit:
+//   `BIS-acked ⇒ (digest in stable_digests) AND
+//                (digest in slow OR digest in fast OR worker has mirror)`
+//
+// Triangle of: gate (BIS-ack), pin (fast-store pin), eviction (this
+// listener + the existing PinExpireFailedWritesListener on the fast
+// tier). Pre-fix the slow-eviction corner had no observer.
+//
+// Mutation step (mandatory per CLAUDE.md "Tests" section):
+//   Comment out the `register_slow_eviction_stable_set_listener(&slow_store, ...)`
+//   call in `FastSlowStore::new`. The
+//   `stable_digests_invalidated_on_slow_tier_eviction` test MUST red-fail
+//   with the bespoke message "BIS stable_digests must drop on slow-tier
+//   eviction or server claims durability for blob that exists nowhere — see #367".
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Regression test for #367. Wraps real `FastSlowStore` with `MemoryStore`
+/// as both fast and slow (MemoryStore fires real eviction callbacks, same
+/// kernel-of-the-callback as `FilesystemStore`'s evicting_map). Drives:
+///   1. Mark a digest as stably stored via `mark_stable` — analog of the
+///      `populate_fast_store` background-write success arm pushing into
+///      `stable_digests`.
+///   2. Confirm `drain_stable_digests` would observe the digest.
+///   3. Trigger a slow-tier eviction via `MemoryStore::remove_entry`.
+///      Same code path as natural LRU eviction (evicting_map's eviction
+///      listener fires on both Explicit and Size removals).
+///   4. Poll up to `tokio::time::timeout(few seconds)` for the listener
+///      to drain `stable_digests` AND insert into `failed_slow_writes`.
+///
+/// Seam coverage: producer (`mark_stable` push) → slow-store eviction
+/// callback (`SlowEvictionInvalidatesStableSetListener::callback`) →
+/// `stable_digests` retain + `failed_slow_writes` insert. Bespoke
+/// message names #367 to anchor the regression.
+#[nativelink_test]
+async fn stable_digests_invalidated_on_slow_tier_eviction() -> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
+
+    // Produce a digest. Use a non-zero size so the `mark_stable` /
+    // `drain_stable_digests` round-trip is realistic.
+    let digest = DigestInfo::new([0xCAu8; 32], 4);
+    let payload = Bytes::from_static(b"BIS!");
+
+    // Real FastSlowStore with MemoryStore as both fast and slow.
+    // MemoryStore fires `register_item_callback` on evictions via
+    // its evicting_map — same callback wiring as FilesystemStore.
+    let fast = MemoryStore::new(&MemorySpec::default());
+    let slow = MemoryStore::new(&MemorySpec::default());
+    let slow_inner_arc = Arc::clone(&slow); // For direct eviction trigger.
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        Store::new(fast),
+        Store::new(slow),
+    );
+
+    // Step 1: write the blob to the slow store directly so the
+    // eviction-callback step has something to evict. This bypasses
+    // the populate_fast_store path so we can independently push into
+    // stable_digests via `mark_stable`.
+    Pin::new(slow_inner_arc.as_ref())
+        .update_oneshot(StoreKey::from(digest), payload.clone())
+        .await?;
+
+    // Step 2: simulate the BIS-feeder push via `mark_stable` (same
+    // path the worker_api_server's BlobsAvailable handler uses).
+    fss.as_ref().mark_stable(&[digest]);
+
+    // Sanity: stable_digests has the entry.
+    let pre_drain = fss.drain_stable_digests();
+    assert!(
+        pre_drain.contains(&digest),
+        "test setup: mark_stable must have pushed the digest into stable_digests"
+    );
+    // Re-push so the eviction-callback has something to remove.
+    fss.as_ref().mark_stable(&[digest]);
+
+    // Step 3: trigger slow-tier eviction. `remove_entry` on the
+    // underlying MemoryStore fires the same eviction listener path as
+    // natural cap-driven eviction (Explicit vs Size removal cause —
+    // both route to the moka eviction listener which routes to the
+    // ItemCallback chain).
+    assert!(
+        slow_inner_arc.remove_entry(StoreKey::from(digest)).await,
+        "test setup: slow-store remove_entry must report the entry was present"
+    );
+
+    // Step 4: poll for the #367 listener to observe the eviction and
+    // perform the cleanup. The listener runs on the moka background
+    // drainer, so it fires asynchronously after `remove_entry` returns.
+    // The `tokio::time::timeout` is the deadlock-detector — without
+    // the #367 listener wired, the assertion below NEVER becomes true.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            // Snapshot stable_digests without draining (peek by drain +
+            // reinsert) so the production-shape assertion is "the
+            // listener removed the digest from the queue", not "the
+            // test transiently drained it during polling".
+            let drained = fss.drain_stable_digests();
+            let still_in_stable = drained.contains(&digest);
+            if !drained.is_empty() {
+                fss.as_ref().mark_stable(&drained);
+            }
+            // Same peek pattern for failed_slow_writes.
+            let failed = fss.drain_failed_digests();
+            let in_failed = failed.contains(&digest);
+            if !failed.is_empty() {
+                fss.as_ref().reinsert_failed_digests(&failed);
+            }
+            if !still_in_stable && in_failed {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "BIS stable_digests must drop on slow-tier eviction or server claims durability \
+         for blob that exists nowhere — see #367",
+    );
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #367 fix-up: over-action coverage for SlowEvictionInvalidatesStableSetListener.
+//
+// The original #367 test (`stable_digests_invalidated_on_slow_tier_eviction`)
+// covers the UNDER-action direction: the listener MUST insert into
+// `failed_slow_writes` for digests that WERE marked stable. This test
+// covers the complementary OVER-action direction: the listener MUST NOT
+// insert into `failed_slow_writes` for digests that were NEVER marked
+// stable.
+//
+// Why this matters: in production the slow tier
+// (`cas_FAST_SLOW_STORE.slow = FilesystemStore` on /srv/bulk, ~800 GiB cap)
+// evicts CONTINUOUSLY under Bazel cache churn. The vast majority of
+// evicted digests were transient reads / eager admits / blobs the
+// server never claimed durable to a worker. An unconditional insert
+// would manufacture continuous spurious failed-writes → V3 self-retry
+// FastTierMiss → UploadMissingBlobs flood (recovery storm). The
+// `removed > 0` gate added in the fix-up ensures the insert only
+// fires when the eviction actually invalidated a prior durability
+// claim. Mirrors the sibling `PinExpireFailedWritesListener`'s
+// `in_legacy || in_chunked` gate.
+//
+// Mutation step (mandatory per CLAUDE.md "Tests" section):
+//   Remove the `if removed > 0 {` gate around the
+//   `failed_slow_writes.insert(digest)` call in
+//   `SlowEvictionInvalidatesStableSetListener::callback` (move the
+//   insert back outside the conditional). This test MUST red-fail
+//   with the bespoke message
+//   "failed_slow_writes received insert for digest never marked stable".
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Regression test for #367 fix-up over-action coverage. Same fixture
+/// as `stable_digests_invalidated_on_slow_tier_eviction` (deliberate
+/// duplication: each test isolates one direction of the asymmetric
+/// contract).
+///
+/// 1. Wire real `FastSlowStore` with `MemoryStore` as both fast and
+///    slow (MemoryStore fires real eviction callbacks via its
+///    `evicting_map`, same kernel as `FilesystemStore`).
+/// 2. Write a digest directly to the slow store but DO NOT call
+///    `mark_stable` on it. The digest never enters `stable_digests`,
+///    so a pre-fix listener would still insert it into
+///    `failed_slow_writes` (over-action).
+/// 3. Trigger slow-tier eviction.
+/// 4. Within `tokio::time::timeout(5)`, assert that
+///    `failed_slow_writes` remains empty AFTER the eviction has been
+///    observed.
+///
+/// Step (4) needs a way to know the eviction callback has actually
+/// run before checking emptiness — otherwise a "still empty" reading
+/// could be the listener simply not having fired yet. We use the
+/// existing under-action mechanism as a tripwire: ALSO mark a SEPARATE
+/// "tracer" digest stable, write it to slow, evict it. When the tracer
+/// digest shows up in `failed_slow_writes`, we know the listener has
+/// processed evictions; at that point the never-stable digest must
+/// still NOT be present.
+#[nativelink_test]
+async fn evict_never_stable_digest_does_not_queue_failed_slow_writes() -> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
+
+    let never_stable = DigestInfo::new([0xAAu8; 32], 4);
+    let tracer_stable = DigestInfo::new([0xBBu8; 32], 4);
+    let payload = Bytes::from_static(b"DATA");
+
+    let fast = MemoryStore::new(&MemorySpec::default());
+    let slow = MemoryStore::new(&MemorySpec::default());
+    let slow_inner_arc = Arc::clone(&slow);
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        Store::new(fast),
+        Store::new(slow),
+    );
+
+    // Step 1: write both digests directly to slow.
+    Pin::new(slow_inner_arc.as_ref())
+        .update_oneshot(StoreKey::from(never_stable), payload.clone())
+        .await?;
+    Pin::new(slow_inner_arc.as_ref())
+        .update_oneshot(StoreKey::from(tracer_stable), payload.clone())
+        .await?;
+
+    // Step 2: ONLY tracer is marked stable. never_stable is not.
+    fss.as_ref().mark_stable(&[tracer_stable]);
+
+    // Step 3: evict both. Order doesn't matter; both eviction callbacks
+    // are processed by the moka background drainer FIFO/concurrently.
+    assert!(
+        slow_inner_arc.remove_entry(StoreKey::from(never_stable)).await,
+        "test setup: slow-store remove_entry must report never_stable was present"
+    );
+    assert!(
+        slow_inner_arc.remove_entry(StoreKey::from(tracer_stable)).await,
+        "test setup: slow-store remove_entry must report tracer_stable was present"
+    );
+
+    // Step 4: poll for tracer to appear in failed_slow_writes (proves
+    // listener ran), then assert never_stable is NOT present.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let failed = fss.drain_failed_digests();
+            let tracer_present = failed.contains(&tracer_stable);
+            let never_stable_present = failed.contains(&never_stable);
+            if tracer_present {
+                // Reinsert tracer to keep the asymmetry visible if the
+                // assertion is repeated by a future revision.
+                fss.as_ref().reinsert_failed_digests(&[tracer_stable]);
+                assert!(
+                    !never_stable_present,
+                    "failed_slow_writes received insert for digest never marked stable — \
+                     recovery-storm risk; see #367 red-team RECONSIDER and \
+                     PinExpireFailedWritesListener sibling pattern. \
+                     never_stable={never_stable:?} failed={failed:?}",
+                );
+                return;
+            }
+            if !failed.is_empty() {
+                fss.as_ref().reinsert_failed_digests(&failed);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "tracer digest must reach failed_slow_writes within 5s — listener may not be wired",
+    );
+
+    Ok(())
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #367 fix-up: production-seam test using real FilesystemStore as the
+// slow tier (DSR M1).
+//
+// The original #367 test uses MemoryStore as both fast AND slow because
+// MemoryStore fires `register_item_callback` evictions through the same
+// `evicting_map`-style listener path that FilesystemStore uses. That
+// covers the in-process callback wiring but not the actual disk-backed
+// store production wires (`cas_FAST_SLOW_STORE.slow = FilesystemStore`
+// on /srv/bulk).
+//
+// This test bridges the seam by wiring `FastSlowStore { fast:
+// MemoryStore, slow: FilesystemStore { max_bytes: tiny } }` and using
+// cap-driven LRU eviction on the FilesystemStore to evict a
+// previously-marked-stable digest. Asserts (a) the digest leaves
+// `stable_digests` AND (b) appears in `failed_slow_writes` — the same
+// composite invariant as the existing test, but verified at the
+// production-shape seam.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Regression test for #367 DSR M1. Wires the production-shape slow
+/// tier (real `FilesystemStore` with a tiny `max_bytes`) and drives
+/// cap-pressure-driven LRU eviction.
+#[nativelink_test]
+async fn stable_digests_invalidated_on_filesystemstore_eviction() -> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_config::stores::{
+        EvictionPolicy, FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
+    };
+    use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
+    use tempfile::TempDir;
+
+    // Build a real FilesystemStore with a tiny max_bytes so a few
+    // small writes drive cap-based LRU eviction.
+    let content_dir = TempDir::new().expect("tempdir");
+    let temp_dir = TempDir::new().expect("tempdir");
+    let fs_store: Arc<FilesystemStore<FileEntryImpl>> =
+        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_dir.path().to_str().unwrap().to_string(),
+            temp_path: temp_dir.path().to_str().unwrap().to_string(),
+            eviction_policy: Some(EvictionPolicy {
+                // 5 bytes — first write of 4 bytes fits; next 4-byte
+                // write evicts the first.
+                max_bytes: 5,
+                ..Default::default()
+            }),
+            block_size: 1,
+            ..Default::default()
+        })
+        .await?;
+    let fs_store_for_direct_writes = Arc::clone(&fs_store);
+    let slow_store = Store::new(fs_store);
+
+    let fast_mem = MemoryStore::new(&MemorySpec::default());
+
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()), // placeholder; real backing is `slow_store`
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        Store::new(fast_mem),
+        slow_store,
+    );
+
+    // Distinct 4-byte digests so each fits, but two together exceed the
+    // 5-byte cap and the older one is evicted.
+    let evicted = DigestInfo::new([0x11u8; 32], 4);
+    let evictor = DigestInfo::new([0x22u8; 32], 4);
+    let payload_evicted = Bytes::from_static(b"OLDD");
+    let payload_evictor = Bytes::from_static(b"NEWW");
+
+    // Step 1: write `evicted` to the FilesystemStore directly so it
+    // becomes the LRU-evictable entry; mark stable so the
+    // SlowEvictionInvalidatesStableSetListener has something to act
+    // on when it gets evicted.
+    Pin::new(fs_store_for_direct_writes.as_ref())
+        .update_oneshot(StoreKey::from(evicted), payload_evicted)
+        .await?;
+    fss.as_ref().mark_stable(&[evicted]);
+
+    // Sanity: stable_digests has it.
+    let pre_drain = fss.drain_stable_digests();
+    assert!(
+        pre_drain.contains(&evicted),
+        "test setup: mark_stable must have pushed `evicted` into stable_digests"
+    );
+    fss.as_ref().mark_stable(&pre_drain);
+
+    // Step 2: write a second blob that pushes the first past the cap,
+    // triggering FilesystemStore's evicting_map LRU eviction of `evicted`.
+    Pin::new(fs_store_for_direct_writes.as_ref())
+        .update_oneshot(StoreKey::from(evictor), payload_evictor)
+        .await?;
+
+    // Step 3: poll for the #367 listener to observe the
+    // FilesystemStore-driven eviction and update both books.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let drained = fss.drain_stable_digests();
+            let still_in_stable = drained.contains(&evicted);
+            if !drained.is_empty() {
+                fss.as_ref().mark_stable(&drained);
+            }
+            let failed = fss.drain_failed_digests();
+            let in_failed = failed.contains(&evicted);
+            if !failed.is_empty() {
+                fss.as_ref().reinsert_failed_digests(&failed);
+            }
+            if !still_in_stable && in_failed {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "production-seam test failed: real FilesystemStore eviction must trigger \
+         SlowEvictionInvalidatesStableSetListener — see #367 DSR M1",
+    );
+
+    Ok(())
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Path C (cascade-bundle, 2026-05-09): startup-time check that disk-backed
 // slow tiers carry an explicit `slow_writes_in_flight_max_bytes > 0`.
 //

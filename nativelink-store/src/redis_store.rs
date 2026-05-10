@@ -2089,6 +2089,20 @@ where
         Ok(())
     }
 
+    /// `register_item_callback` accepts the registration (returns
+    /// `Ok(())`) but is a SILENT no-op — Redis-side eviction events
+    /// (LRU/TTL/operator-flush) are not piped into the listener chain
+    /// until #100's keyspace-notification dispatcher lands.
+    ///
+    /// Wrappers like `FastSlowStore`'s #367
+    /// `SlowEvictionInvalidatesStableSetListener` consult this flag at
+    /// registration time so they can warn the operator that the
+    /// listener is silently disabled for the Redis-backed slow tier
+    /// (durability-claim invalidation will not auto-fire).
+    fn supports_removal_callbacks(&self) -> bool {
+        false
+    }
+
     /// RedisStore is a leaf — Redis is the persistent backing for small
     /// CAS blobs. The BIS pipeline is owned by the wrapping `FastSlowStore`,
     /// not this leaf. Treat as Leaf with empty drains.

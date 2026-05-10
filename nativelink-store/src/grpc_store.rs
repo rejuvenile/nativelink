@@ -2804,6 +2804,17 @@ impl StoreDriver for GrpcStore {
         ))
     }
 
+    /// `register_item_callback` rejects the registration with
+    /// `Code::Internal` — a gRPC client leaf has no removal-event
+    /// semantics on its side. Wrappers consult this flag so they can
+    /// route the "no listener installed" condition to a `debug!`
+    /// instead of an operator-visible startup `warn!` on every worker
+    /// `WORKER_FAST_SLOW_STORE` (whose slow tier is `WorkerProxyStore`
+    /// over `GrpcStore`).
+    fn supports_removal_callbacks(&self) -> bool {
+        false
+    }
+
     /// GrpcStore is a leaf — the remote endpoint owns its own BIS pipeline
     /// (if any). This client side does not produce stable digests. Treat
     /// as a leaf with empty drains.

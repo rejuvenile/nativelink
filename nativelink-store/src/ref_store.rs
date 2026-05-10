@@ -198,6 +198,26 @@ impl StoreDriver for RefStore {
         Ok(())
     }
 
+    /// Forward to the resolved inner if available; otherwise fall back
+    /// to the trait default (`true`). Wrappers that consult this flag
+    /// at registration time to warn about silent-no-op slow tiers
+    /// (e.g. `FastSlowStore`'s #367 listener over a Redis-backed AC
+    /// chain) call this AFTER `register_item_callback`, by which time
+    /// `get_store()` has typically been called at least once and the
+    /// inner is resolved. The `false` for unresolved is acceptable: a
+    /// store that never resolves never fires events either, so the
+    /// downstream warn is informationally correct.
+    fn supports_removal_callbacks(&self) -> bool {
+        let ref_store = self.inner.cell.0.get();
+        unsafe {
+            if let Some(ref store) = *ref_store {
+                return store.supports_removal_callbacks();
+            }
+        }
+        // Inner not resolved yet; conservatively report the default.
+        true
+    }
+
     /// RefStore resolves its inner store lazily. We cannot safely return a
     /// `Passthrough(s)` borrow at trait-dispatch time because `get_store()`
     /// can fail (returns Err if the named store is missing from the

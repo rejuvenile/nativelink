@@ -509,6 +509,238 @@ fn register_pin_expire_listener(
     }
 }
 
+/// #367: listener registered on the SLOW store that, on slow-tier
+/// eviction, removes the digest from `stable_digests` AND records it in
+/// `failed_slow_writes` so the #335 V3 drainer re-establishes durability.
+///
+/// ## Why this exists
+///
+/// `stable_digests` is the queue the BIS (`BlobsInStableStorage`) feeder
+/// drains; once a digest is in `stable_digests` and gets broadcast, the
+/// owning worker treats the server's ack as authoritative and may drop
+/// its mirror replica (the `≥2-replica-during-BIS-ack-window` invariant
+/// transitions to `server is the single durable holder`). If the
+/// slow-tier subsequently evicts the digest (Redis LRU/TTL/operator
+/// flush, FilesystemStore size-cap eviction, future S3 lifecycle), the
+/// claim that the digest is in stable storage becomes false. Reads
+/// return NotFound — Bazel-acked bytes are LOST.
+///
+/// ## Composite invariant
+///
+/// Triangle for the BIS-feeder durability claim:
+///   - **gate**: the BIS-ack ("we are durable")
+///   - **pin**: `FastSlowStore.fast` pin holds bytes for the BIS window
+///   - **eviction**: slow-tier eviction (this listener) + fast-tier
+///     eviction (the existing `PinExpireFailedWritesListener`)
+///
+/// `BIS-acked ⇒ (digest in stable_digests) AND (digest in slow OR
+/// digest in fast OR worker has mirror)`.
+///
+/// Pre-#367 the slow-tier-eviction corner had no observer for the
+/// `stable_digests` and `failed_slow_writes` bookkeeping — eviction was
+/// silent w.r.t. durability. This listener closes that corner.
+///
+/// ## Recovery flow (composes with #335)
+///
+/// On slow-tier eviction:
+///   1. `stable_digests` cleanup — drop the now-stale durability claim
+///      so the next BIS broadcast does not redundantly ack a digest that
+///      the slow tier no longer holds.
+///   2. `failed_slow_writes` insert — surfaces the digest to the
+///      server-side `failed_writes_drain` tick. Recovery routes:
+///      - V3 self-retry (`try_self_retry_slow_write`): if the fast tier
+///        still has the bytes (pin not yet expired), re-write to slow
+///        and re-add to `stable_digests` for a fresh BIS broadcast.
+///      - V3 `FastTierMiss` → `UploadMissingBlobs` to a worker that
+///        registered the digest in `BlobLocalityMap`. Without a worker
+///        source the digest stays stuck (cap-rejected exclusion class
+///        per V3 doc-comment); operator-visible via the drainer's
+///        existing instrumentation.
+///
+/// ## Idempotency / over-fire tolerance
+///
+/// - `stable_digests` is a `Vec<DigestInfo>`; the cleanup loop walks
+///   the vector and removes every matching entry (a single push site
+///   may have produced more than one entry historically). Safe to call
+///   on a digest that isn't in `stable_digests` (no-op).
+/// - `failed_slow_writes` is a `HashSet<DigestInfo>`; insertion is
+///   idempotent. Safe to call repeatedly for the same digest.
+///
+/// ## Why `failed_slow_writes` is gated on `removed > 0`
+///
+/// Production slow tiers (e.g. `cas_FAST_SLOW_STORE.slow =
+/// FilesystemStore` on /srv/bulk, ~800 GiB cap) evict CONTINUOUSLY under
+/// Bazel cache churn. The vast majority of evicted digests were NEVER
+/// in `stable_digests` — they were transient reads, eager admits, or
+/// blobs the server never claimed durable to a worker. An unconditional
+/// `failed_slow_writes.insert` on every eviction would manufacture
+/// continuous spurious entries → V3 self-retry FastTierMiss →
+/// UploadMissingBlobs flood (a self-inflicted recovery storm).
+///
+/// The `removed > 0` gate ensures the insert only fires when the
+/// eviction actually invalidates a prior durability claim — the only
+/// case where `failed_slow_writes` re-establishment is meaningful.
+/// This mirrors the sibling [`PinExpireFailedWritesListener`] (above),
+/// which gates its own `failed_slow_writes` insert on
+/// `in_legacy || in_chunked` for the same recovery-storm-prevention
+/// reason: only fire when *this wrapper* has a write outstanding for
+/// the digest. Read that listener's doc-comment for the full rationale.
+///
+/// ## What this listener does NOT do
+///
+/// - It does NOT touch `fast_store` pinning. The fast-tier pin is
+///   re-established only if the V3 drainer re-writes successfully (the
+///   existing slow-write success arm at the
+///   `populate_fast_store`/`spawn_blocking` background path takes care
+///   of pinning on re-write).
+/// - It does NOT broadcast a "lost durability" notification to the
+///   worker. The recovery path is single-direction: rebuild stable
+///   storage transparently. If the rebuild itself fails, the failed
+///   write surfaces via the drainer's existing `warn!` channels.
+#[derive(Debug)]
+struct SlowEvictionInvalidatesStableSetListener {
+    stable_digests: Arc<Mutex<Vec<DigestInfo>>>,
+    failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
+}
+
+impl ItemCallback for SlowEvictionInvalidatesStableSetListener {
+    fn callback<'a>(
+        &'a self,
+        store_key: StoreKey<'a>,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        if let StoreKey::Digest(digest) = store_key {
+            // (1) Remove digest from `stable_digests` so the next BIS
+            // drain does not re-broadcast a durability claim that no
+            // longer holds. The vec is small in steady state (drained
+            // every `STABLE_NOTIFY_TICK_INTERVAL`), so an O(n) retain
+            // is acceptable for the eviction-callback path.
+            let removed = {
+                let mut guard = self.stable_digests.lock();
+                let before = guard.len();
+                guard.retain(|d| d != &digest);
+                before - guard.len()
+            };
+            // (2) ONLY when the eviction actually invalidated a prior
+            // durability claim (i.e. `removed > 0`), insert into
+            // `failed_slow_writes` so the #335 V3 drainer picks the
+            // digest up on its next tick and either re-writes from the
+            // fast tier (if still pinned) or dispatches
+            // `UploadMissingBlobs` to a worker. Insertion is idempotent.
+            //
+            // Recovery-storm prevention: at production scale the slow
+            // tier evicts CONTINUOUSLY (FilesystemStore size-cap, Redis
+            // LRU/TTL); inserting on every eviction would manufacture
+            // continuous spurious failed-writes for digests the server
+            // never claimed durable. See struct doc-comment + sibling
+            // `PinExpireFailedWritesListener::on_pin_expired` (above)
+            // for the same gating pattern (`in_legacy || in_chunked`).
+            if removed > 0 {
+                let was_new = self.failed_slow_writes.lock().insert(digest);
+                warn!(
+                    ?digest,
+                    removed_from_stable_digests = removed,
+                    inserted_into_failed_writes = was_new,
+                    "slow-tier evicted digest that was previously marked stable; \
+                     queued for V3 drainer re-establishment of durability (#367)"
+                );
+            }
+        }
+        Box::pin(core::future::ready(()))
+    }
+}
+
+/// Best-effort registration of the #367 slow-eviction-invalidates-stable
+/// listener on the slow store. The slow store falls into one of three
+/// classes today:
+///
+///   1. Real removal-callback support
+///      (`FilesystemStore`, `MemoryStore`, S3 with TTL,
+///      [`StoreDriver::supports_removal_callbacks`] = `true`,
+///      `register_item_callback` returns `Ok`): full coverage —
+///      evictions invalidate the BIS stable set live.
+///   2. Silent no-op accept
+///      (`RedisStore`: `supports_removal_callbacks` = `false`,
+///      `register_item_callback` returns `Ok`): the registration is
+///      accepted but the listener is never fired. This is
+///      operator-visible (loud `warn!`) because the AC chain on
+///      `cas_FAST_SLOW_STORE` (and any future Redis-backed slow tier)
+///      silently lacks durability-claim invalidation until #100's
+///      keyspace-notification dispatcher lands.
+///   3. Reject on registration
+///      (`GrpcStore`: `supports_removal_callbacks` = `false`,
+///      `register_item_callback` returns `Err(Code::Internal,
+///      "gRPC stores are incompatible with removal callbacks")`):
+///      this is the worker-side `WORKER_FAST_SLOW_STORE.slow =
+///      WorkerProxyStore(GrpcStore)` composition; the listener has
+///      nothing to do because workers are not the durable-storage
+///      holder. Demoted to `debug!` to avoid noisy startup warns
+///      on every worker.
+///
+/// Any OTHER registration failure (a store impl that returns Err
+/// despite reporting `supports_removal_callbacks() = true`) is a
+/// genuine bug and gets a loud `warn!` — durability claim accuracy
+/// degrades to "best-effort with stale entries", operator-visible.
+fn register_slow_eviction_stable_set_listener(
+    slow_store: &Store,
+    stable_digests: Arc<Mutex<Vec<DigestInfo>>>,
+    failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
+) {
+    let listener: Arc<dyn ItemCallback> = Arc::new(SlowEvictionInvalidatesStableSetListener {
+        stable_digests,
+        failed_slow_writes,
+    });
+    let supports_removal = slow_store.supports_removal_callbacks();
+    let registration = slow_store.register_item_callback(listener);
+    match (supports_removal, registration) {
+        (true, Ok(())) => {
+            // The common, healthy case: real removal events will fire
+            // the listener. Nothing to log.
+        }
+        (false, Ok(())) => {
+            // Silent-no-op accept (today: `RedisStore`). The listener
+            // is wired but will never fire until #100's keyspace
+            // dispatcher delivers Redis-side eviction events into
+            // `register_item_callback`. Operator-visible because the
+            // AC chain on `cas_FAST_SLOW_STORE` silently lacks
+            // durability-claim invalidation in this state.
+            warn!(
+                "SlowEvictionInvalidatesStableSetListener registered against a slow store \
+                 whose register_item_callback is a silent no-op (likely RedisStore). \
+                 Durability-claim invalidation is silently disabled for this FastSlowStore \
+                 until #100 (keyspace-notification dispatcher) lands. Workaround: size the \
+                 fast tier high enough that Redis evictions are non-issue, or wait for \
+                 #100. (#367)"
+            );
+        }
+        (false, Err(err)) => {
+            // Reject-on-registration with the capability flag set
+            // accordingly (today: `GrpcStore`). This is the worker
+            // composition (`WORKER_FAST_SLOW_STORE.slow =
+            // WorkerProxyStore(GrpcStore)`); the worker is not the
+            // durable-storage holder so the listener is irrelevant
+            // here. Demote to `debug!` to avoid a startup warn on
+            // every worker.
+            debug!(
+                ?err,
+                "FastSlowStore: slow store does not support removal callbacks \
+                 (expected on workers — slow tier is GrpcStore); skipping #367 \
+                 SlowEvictionInvalidatesStableSetListener"
+            );
+        }
+        (true, Err(err)) => {
+            // A store that reports support but rejected — genuine bug.
+            warn!(
+                ?err,
+                "FastSlowStore: failed to register #367 slow-eviction-invalidates-stable \
+                 listener on a slow store that reports supports_removal_callbacks=true; \
+                 BIS-acked digests evicted from slow tier will NOT auto-clean \
+                 stable_digests / re-queue for V3 drainer — operator-visible durability \
+                 gap until process restart"
+            );
+        }
+    }
+}
+
 /// #335 V3 fix: outcome of [`FastSlowStore::try_self_retry_slow_write`].
 ///
 /// The drainer at `nativelink-service::failed_writes_drain::drain_tick`
@@ -869,11 +1101,21 @@ impl FastSlowStore {
             Arc::new(Mutex::new(HashMap::new()));
         let chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>> =
             Arc::new(Mutex::new(HashSet::new()));
+        // Lifted out of `Arc::new_cyclic` so the #367 slow-eviction
+        // listener can carry a clone — the BIS-feeder queue must be
+        // observable from the slow-store eviction callback to drop
+        // stale durability claims when slow tier sheds bytes.
+        let stable_digests: Arc<Mutex<Vec<DigestInfo>>> = Arc::new(Mutex::new(Vec::new()));
         register_pin_expire_listener(
             &fast_store,
             failed_slow_writes.clone(),
             in_flight_slow_writes.clone(),
             chunked_in_flight_digests.clone(),
+        );
+        register_slow_eviction_stable_set_listener(
+            &slow_store,
+            stable_digests.clone(),
+            failed_slow_writes.clone(),
         );
         let store = Arc::new_cyclic(|weak_self| Self {
             fast_store,
@@ -888,7 +1130,7 @@ impl FastSlowStore {
             slow_writes_in_flight_max_bytes: spec.slow_writes_in_flight_max_bytes,
             chunked_in_flight_digests,
             in_flight_empty_notify: Arc::new(Notify::new()),
-            stable_digests: Arc::new(Mutex::new(Vec::new())),
+            stable_digests,
             stable_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             failed_slow_writes,
@@ -2157,11 +2399,19 @@ impl FastSlowStore {
             Arc::new(Mutex::new(HashMap::new()));
         let chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>> =
             Arc::new(Mutex::new(HashSet::new()));
+        // See `new` for rationale: lifted so the #367 slow-eviction
+        // listener can observe the BIS-feeder queue.
+        let stable_digests: Arc<Mutex<Vec<DigestInfo>>> = Arc::new(Mutex::new(Vec::new()));
         register_pin_expire_listener(
             &fast_store,
             shared.clone(),
             in_flight_slow_writes.clone(),
             chunked_in_flight_digests.clone(),
+        );
+        register_slow_eviction_stable_set_listener(
+            &slow_store,
+            stable_digests.clone(),
+            shared.clone(),
         );
         let store = Arc::new_cyclic(|weak_self| Self {
             fast_store,
@@ -2176,7 +2426,7 @@ impl FastSlowStore {
             slow_writes_in_flight_max_bytes: spec.slow_writes_in_flight_max_bytes,
             chunked_in_flight_digests,
             in_flight_empty_notify: Arc::new(Notify::new()),
-            stable_digests: Arc::new(Mutex::new(Vec::new())),
+            stable_digests,
             stable_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             failed_slow_writes: shared,

@@ -618,6 +618,16 @@ impl Store {
         self.inner.clone().register_item_callback(callback)
     }
 
+    /// See [`StoreDriver::supports_removal_callbacks`]. Wrappers that
+    /// register removal-event-dependent listeners on the slow tier
+    /// consult this to emit a startup warn for stores that accept the
+    /// registration but never fire it (today: `RedisStore`).
+    #[inline]
+    #[must_use]
+    pub fn supports_removal_callbacks(&self) -> bool {
+        self.inner.supports_removal_callbacks()
+    }
+
     /// Observe a `pinned_mirror_entries` (BlobsAvailableNotification field 16)
     /// ack broadcast. Delegates to the inner
     /// [`StoreDriver::observe_pinned_mirror_ack`]. See trait doc for
@@ -1226,6 +1236,31 @@ pub trait StoreDriver:
         self: Arc<Self>,
         callback: Arc<dyn ItemCallback>,
     ) -> Result<(), Error>;
+
+    /// Returns `true` for stores whose `register_item_callback`
+    /// implementation actually fires the registered listener on
+    /// item-removal events. Default is `true` (the common case for
+    /// in-process stores: `MemoryStore`, `FilesystemStore`).
+    ///
+    /// Returns `false` for stores whose `register_item_callback` is a
+    /// silent no-op or rejects the registration:
+    /// - `RedisStore` accepts the registration but never fires it
+    ///   (Redis-side eviction events are not piped into the listener
+    ///   chain until the #100 keyspace-notification dispatcher lands).
+    /// - `GrpcStore` rejects with `Code::Internal` (network leaf has no
+    ///   removal-event semantics on the client side).
+    ///
+    /// Wrappers that register listeners which depend on actually
+    /// receiving eviction events (e.g.
+    /// `FastSlowStore`'s #367 `SlowEvictionInvalidatesStableSetListener`)
+    /// use this flag to emit a loud operator-visible warn AT
+    /// REGISTRATION TIME instead of silently degrading at runtime.
+    /// The flag is informational; `register_item_callback`'s `Result`
+    /// remains the source of truth on whether the call itself
+    /// succeeded.
+    fn supports_removal_callbacks(&self) -> bool {
+        true
+    }
 
     /// Observe a `pinned_mirror_entries` ack broadcast (per Bug A small-CAS
     /// peer-mirror dispatcher; task #168 integration). The

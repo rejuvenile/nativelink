@@ -3693,6 +3693,13 @@ impl StoreDriver for WorkerProxyStore {
         self.inner.register_item_callback(callback)
     }
 
+    /// Forward to inner so that wrappers querying the slow tier of an
+    /// FSS see the underlying store's true capability (the proxy does
+    /// not synthesize its own removal events — it only forwards).
+    fn supports_removal_callbacks(&self) -> bool {
+        self.inner.supports_removal_callbacks()
+    }
+
     /// WorkerProxyStore is a single-inner wrapper. The proxy adds locality
     /// + mirror routing on top of the inner store but does not own the BIS
     /// or pin chain — both forward unchanged via the trait defaults.
