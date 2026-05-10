@@ -755,6 +755,17 @@ struct WorkerConnection {
     backfill_inflight: Arc<parking_lot::Mutex<HashMap<DigestInfo, Instant>>>,
     /// Shared metrics handle (cloned from `WorkerApiServer::metrics`).
     metrics: Arc<WorkerApiMetrics>,
+    /// (#99) Per-connection accumulator for chunked
+    /// `BlobsAvailableChunk` envelopes. Path A semantics: chunks
+    /// buffer here until `is_last=true` lands; the accumulator then
+    /// hands the fully-assembled `BlobsAvailableNotification` to the
+    /// existing `handle_blobs_available` for the legacy
+    /// `remove_endpoint` + `register_blobs_iter` + AC pin replace +
+    /// mirror pipeline. Bound: at most
+    /// `MAX_INFLIGHT_BROADCASTS_PER_CONN` × per-broadcast cap of
+    /// `MAX_ACCUMULATED_ENTRIES_PER_CONN` entries (~20 MB worst-case
+    /// per connection). Dropped on disconnect via `drop_all_inflight`.
+    blobs_available_accumulator: Arc<crate::blobs_available_accumulator::BlobsAvailableAccumulator>,
 }
 
 impl WorkerConnection {
@@ -791,6 +802,11 @@ impl WorkerConnection {
             last_backfill_epoch_secs: AtomicU64::new(0),
             backfill_inflight: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             metrics,
+            // (#99) Per-connection accumulator. Created fresh per
+            // ConnectWorker so a worker reconnect starts with empty
+            // partial state.
+            blobs_available_accumulator:
+                crate::blobs_available_accumulator::BlobsAvailableAccumulator::new(),
         };
 
         background_spawn!("worker_api", async move {
@@ -857,6 +873,59 @@ impl WorkerConnection {
                             .await;
                         Ok(())
                     }
+                    Update::ChunkedMessage(envelope) => {
+                        // (#99) One chunk of a streaming protocol message
+                        // FROM the worker. Today the only payload arm is
+                        // `BlobsAvailableChunk`; future PRs may add more
+                        // worker→server chunked types under the same
+                        // envelope.
+                        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::chunked_message;
+                        match envelope.payload {
+                            Some(chunked_message::Payload::BlobsAvailable(chunk)) => {
+                                if let Some(notification) = instance
+                                    .blobs_available_accumulator
+                                    .merge_chunk(chunk)
+                                {
+                                    // Path A commit: accumulator yielded a
+                                    // fully-assembled notification on
+                                    // is_last=true. Hand to the legacy
+                                    // handler, which performs the
+                                    // remove_endpoint wipe (when
+                                    // is_full_snapshot=true) +
+                                    // register_blobs_iter + AC pin
+                                    // replace + mirror pipeline
+                                    // ATOMICALLY in one block.
+                                    instance.handle_blobs_available(notification).await
+                                } else {
+                                    // Non-terminal chunk: nothing more
+                                    // to do until the terminal arrives.
+                                    Ok(())
+                                }
+                            }
+                            // Other payload arms (PeerHints,
+                            // BlobsInStableStorage) are scheduler→worker
+                            // direction; receiving them on the
+                            // worker→server stream is invalid.
+                            Some(other) => {
+                                tracing::warn!(
+                                    worker_id=?instance.worker_id,
+                                    payload=?core::mem::discriminant(&other),
+                                    "ChunkedMessage with wrong-direction \
+                                     payload arm on worker→server stream; \
+                                     ignoring"
+                                );
+                                Ok(())
+                            }
+                            None => {
+                                tracing::warn!(
+                                    worker_id=?instance.worker_id,
+                                    "ChunkedMessage with empty payload on \
+                                     worker→server stream; ignoring"
+                                );
+                                Ok(())
+                            }
+                        }
+                    }
                 };
                 if let Err(err) = result {
                     let msg = format!("{err:?}");
@@ -874,6 +943,14 @@ impl WorkerConnection {
                 }
             }
             tracing::debug!(worker_id=?instance.worker_id, "Update for scheduler dropped");
+
+            // (#99) Discard any in-flight chunked BlobsAvailable
+            // partial state. Path A semantics: a broadcast that never
+            // receives its terminal chunk MUST NOT leak its accumulated
+            // entries forward to the next connection (the worker
+            // re-broadcasts on reconnect anyway). Bounded memory
+            // contract requires this drop on disconnect.
+            instance.blobs_available_accumulator.drop_all_inflight();
 
             // Clean up locality map on disconnect — but ONLY if the
             // endpoint is still owned by THIS connection. A newer

@@ -21,8 +21,8 @@ use hyper::body::Frame;
 use nativelink_config::cas_server::{EndpointConfig, LocalWorkerConfig, WorkerProperty};
 use nativelink_error::Error;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BisAck, BlobsAvailableNotification, ConnectWorkerRequest, ExecuteComplete, ExecuteResult,
-    GoingAwayRequest, KeepAliveRequest, UpdateForWorker,
+    BisAck, BlobsAvailableNotification, ChunkedMessage, ConnectWorkerRequest, ExecuteComplete,
+    ExecuteResult, GoingAwayRequest, KeepAliveRequest, UpdateForWorker,
 };
 use nativelink_util::channel_body_for_tests::ChannelBody;
 use nativelink_util::shutdown_guard::ShutdownGuard;
@@ -60,6 +60,12 @@ enum WorkerClientApiCalls {
     /// `bis_chunk_handler_test`'s direct ack-sink injection which
     /// bypasses the dispatch arm).
     BisAck(BisAck),
+    /// (#99) Recorded `Update::ChunkedMessage(ChunkedMessage(BlobsAvailableChunk))`
+    /// from the chunked-emit path. Tests that exercise the chunked
+    /// envelope-encode path can pull these to verify slicing,
+    /// `(broadcast_id, sequence, is_last)` triples, and that the per-
+    /// chunk slices reassemble to the expected snapshot.
+    ChunkedMessage(ChunkedMessage),
 }
 
 #[derive(Debug)]
@@ -72,6 +78,7 @@ enum WorkerClientApiReturns {
     ExecutionResponse(Result<(), Error>),
     BlobsAvailable(Result<(), Error>),
     BisAck(Result<(), Error>),
+    ChunkedMessage(Result<(), Error>),
 }
 
 #[derive(Clone)]
@@ -315,6 +322,24 @@ impl WorkerApiClientTrait for MockWorkerApiClient {
         {
             WorkerClientApiReturns::BisAck(result) => result,
             resp => panic!("bis_ack expected BisAck response, received {resp:?}"),
+        }
+    }
+
+    async fn chunked_message(&mut self, request: ChunkedMessage) -> Result<(), Error> {
+        // (#99) Record the chunked-emit call so production-composition
+        // tests (`blobs_available_chunked_*`) can pull the per-chunk
+        // slices and assert reassembly.
+        self.tx_call
+            .send(WorkerClientApiCalls::ChunkedMessage(request))
+            .expect("Could not send ChunkedMessage to mpsc");
+        let mut rx_resp_lock = self.rx_resp.lock().await;
+        match rx_resp_lock
+            .recv()
+            .await
+            .expect("Could not receive msg in mpsc")
+        {
+            WorkerClientApiReturns::ChunkedMessage(result) => result,
+            resp => panic!("chunked_message expected ChunkedMessage response, received {resp:?}"),
         }
     }
 }

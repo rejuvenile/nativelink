@@ -411,12 +411,101 @@ pub struct BlobsInStableStorageChunk {
     #[prost(string, tag = "6")]
     pub store_id: ::prost::alloc::string::String,
 }
+/// / One chunk of a streaming `BlobsAvailable` notification (task #99).
+/// / Carries per-chunk slices of the FIVE unbounded fields a single
+/// / `BlobsAvailableNotification` may otherwise pile up. Path A
+/// / semantics: when `is_full_snapshot=true`, the server's
+/// / accumulator buffers all slices across chunks and applies them
+/// / atomically when `is_last=true` arrives. The `remove_endpoint`
+/// / wipe fires INSIDE the terminal-chunk commit block, not on
+/// / chunk 0.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BlobsAvailableChunk {
+    /// / Worker-allocated identifier of the broadcast event this chunk
+    /// / belongs to. Monotonic per-worker-process; resets on worker
+    /// / restart.
+    #[prost(uint64, tag = "1")]
+    pub broadcast_id: u64,
+    /// / Monotonic sequence within one broadcast_id (0, 1, 2, ...).
+    #[prost(uint32, tag = "2")]
+    pub sequence: u32,
+    /// / True on the FINAL chunk of one broadcast_id's stream. Per
+    /// / Path A semantics, the server's accumulator commits ONLY
+    /// / when this flag is observed.
+    #[prost(bool, tag = "3")]
+    pub is_last: bool,
+    /// / Worker-process nonce (random u64 chosen at worker startup).
+    #[prost(uint64, tag = "4")]
+    pub worker_instance_token: u64,
+    /// / Worker-side store identifier this broadcast targets. Empty
+    /// / string is the only valid value today.
+    #[prost(string, tag = "5")]
+    pub store_id: ::prost::alloc::string::String,
+    /// / Whether the accumulator should treat the broadcast as
+    /// / REPLACE (true) or DELTA (false). Repeated identically on
+    /// / every chunk so a late-arriving chunk 0 doesn't drop the flag.
+    #[prost(bool, tag = "6")]
+    pub is_full_snapshot: bool,
+    /// / Worker-self-reported CAS endpoint. Only meaningful on chunk 0.
+    #[prost(string, tag = "7")]
+    pub worker_cas_endpoint: ::prost::alloc::string::String,
+    /// / True on the first BlobsAvailable after (re)connect. Only
+    /// / meaningful on chunk 0; carried forward by the accumulator.
+    #[prost(bool, tag = "8")]
+    pub is_full_subtree_snapshot: bool,
+    /// / Per-chunk slice of `BlobsAvailableNotification.digest_infos`.
+    #[prost(message, repeated, tag = "9")]
+    pub digests: ::prost::alloc::vec::Vec<BlobDigestInfo>,
+    /// / Per-chunk slice of `BlobsAvailableNotification.cached_directory_digests`.
+    #[prost(message, repeated, tag = "10")]
+    pub cached_directory_digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / Per-chunk slice of `BlobsAvailableNotification.pinned_mirror_entries`.
+    #[prost(message, repeated, tag = "11")]
+    pub pinned_mirror_entries: ::prost::alloc::vec::Vec<MirrorPinEntry>,
+    /// / Per-chunk slice of `BlobsAvailableNotification.pinned_ac_mirror_entries`.
+    #[prost(message, repeated, tag = "12")]
+    pub pinned_ac_mirror_entries: ::prost::alloc::vec::Vec<MirrorPinEntry>,
+    /// / Per-chunk slice of `BlobsAvailableNotification.evicted_digests`.
+    #[prost(message, repeated, tag = "13")]
+    pub evicted_digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / CPU load — only meaningful on chunk 0.
+    #[prost(uint32, tag = "14")]
+    pub cpu_load_pct: u32,
+    #[prost(uint32, tag = "15")]
+    pub p_core_load_pct: u32,
+    #[prost(uint32, tag = "16")]
+    pub e_core_load_pct: u32,
+    /// / Mirror capacity report — only meaningful on chunk 0.
+    #[prost(uint64, tag = "17")]
+    pub mirror_used_bytes: u64,
+    #[prost(uint64, tag = "18")]
+    pub mirror_max_bytes: u64,
+    /// / Per-chunk slice of `BlobsAvailableNotification.added_subtree_digests`.
+    #[prost(message, repeated, tag = "19")]
+    pub added_subtree_digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / Per-chunk slice of `BlobsAvailableNotification.removed_subtree_digests`.
+    #[prost(message, repeated, tag = "20")]
+    pub removed_subtree_digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+    /// / Per-chunk slice of `BlobsAvailableNotification.pinned_mirror_digests`.
+    #[prost(message, repeated, tag = "21")]
+    pub pinned_mirror_digests: ::prost::alloc::vec::Vec<
+        super::super::super::super::super::build::bazel::remote::execution::v2::Digest,
+    >,
+}
 /// / A streaming-message envelope shared across the cas->worker, scheduler->
 /// / worker, and worker->scheduler chunk producers. Exactly ONE of the
 /// / `oneof payload` arms is set; receivers route on the arm.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChunkedMessage {
-    #[prost(oneof = "chunked_message::Payload", tags = "1, 2")]
+    #[prost(oneof = "chunked_message::Payload", tags = "1, 2, 3")]
     pub payload: ::core::option::Option<chunked_message::Payload>,
 }
 /// Nested message and enum types in `ChunkedMessage`.
@@ -427,6 +516,8 @@ pub mod chunked_message {
         PeerHints(super::PeerHintsChunk),
         #[prost(message, tag = "2")]
         BlobsInStableStorage(super::BlobsInStableStorageChunk),
+        #[prost(message, tag = "3")]
+        BlobsAvailable(super::BlobsAvailableChunk),
     }
 }
 /// / The result of an ExecutionRequest.
@@ -596,7 +687,7 @@ pub struct BisAck {
 pub struct UpdateForScheduler {
     #[prost(
         oneof = "update_for_scheduler::Update",
-        tags = "1, 2, 3, 4, 5, 7, 8, 9"
+        tags = "1, 2, 3, 4, 5, 7, 8, 9, 10"
     )]
     pub update: ::core::option::Option<update_for_scheduler::Update>,
 }
@@ -643,6 +734,11 @@ pub mod update_for_scheduler {
         /// / Acknowledges one BlobsInStableStorageChunk delivery (task #97).
         #[prost(message, tag = "9")]
         BisAck(super::BisAck),
+        /// / One chunk of a streaming protocol message FROM the worker
+        /// / TO the scheduler. Today carries `BlobsAvailableChunk`
+        /// / (task #99) under the unified `ChunkedMessage` envelope.
+        #[prost(message, tag = "10")]
+        ChunkedMessage(super::ChunkedMessage),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
