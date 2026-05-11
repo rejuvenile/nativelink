@@ -15,7 +15,7 @@
 use core::convert::Into;
 use core::pin::Pin;
 use core::time::Duration;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -199,6 +199,29 @@ pub struct WorkerApiMetrics {
     )]
     pub stale_workers_rejected_total: AtomicU64,
 
+    /// (#387) Total flap-detection warns emitted on the
+    /// `worker reconnect storm` log line. Increments at the same moment
+    /// the `warn!` fires (after the cooldown gate), so the metric and
+    /// the journald line are 1:1. Sustained non-zero rate means at
+    /// least one worker on the fleet is restart-looping at process
+    /// granularity (likely whole-process OOM kill, not the per-action
+    /// SIGKILL covered by
+    /// `simple_scheduler_state_manager.rs:758-766`). This counter
+    /// rides on the `worker_api` group that is already published
+    /// through `#[metric(group = "worker_api")]` at
+    /// `WorkerApiServer.metrics`, so it is scrapable today — distinct
+    /// from #386's signal which can only rely on `warn!` until #380
+    /// lands.
+    #[metric(
+        help = "Total `worker reconnect storm` warns emitted by the boot_epoch \
+                flap detector. Increments 1:1 with the journald warn line. \
+                Sustained non-zero rate indicates one or more workers are \
+                restart-looping at the process level (whole-process OOM kill, \
+                not per-action SIGKILL); check the warn line for the offending \
+                cas_endpoint."
+    )]
+    pub worker_flap_warns_total: AtomicU64,
+
     /// (#99 S1 code-reviewer follow-up) Per-reason BlobsAvailable
     /// chunk-drop counters (`ChunkDropCounts`). Shared via Arc with
     /// every per-connection `BlobsAvailableAccumulator` so all
@@ -218,6 +241,18 @@ pub struct WorkerApiMetrics {
         Arc<crate::blobs_available_accumulator::ChunkDropCounts>,
 }
 
+/// (#387) Flap-detection thresholds. Three boot_epoch_id changes for
+/// the same `cas_endpoint` within `FLAP_WINDOW` are unambiguously a
+/// worker restart loop — a healthy `just deploy` is one rolling
+/// restart, well under threshold. After a warn fires we suppress
+/// re-warn for `FLAP_COOLDOWN` so a sustained 1-per-minute flap
+/// doesn't drown the log. These are `const` so an operator can tune
+/// them at compile time; runtime configuration was deemed not
+/// load-bearing for the initial signal (#387 audit Q2).
+const FLAP_THRESHOLD: usize = 3;
+const FLAP_WINDOW: Duration = Duration::from_secs(300);
+const FLAP_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// Per-endpoint state for the #141 boot_epoch wipe path. See
 /// `WorkerApiServer::endpoint_state` for design.
 #[derive(Debug, Clone)]
@@ -229,6 +264,30 @@ struct EndpointState {
     /// connection has taken over and the cleanup must be suppressed
     /// to avoid wiping the new worker's just-registered entries.
     owner_worker_id: WorkerId,
+    /// (#387) Sliding window of timestamps at which this endpoint's
+    /// `boot_epoch_id` was observed to change (i.e. a fresh worker
+    /// process took over the endpoint). Bounded above by
+    /// `FLAP_THRESHOLD` after each insert evicts entries older than
+    /// `FLAP_WINDOW` — for a steady-state non-flapping worker the
+    /// deque carries 0–1 entries, and a flapping worker is the case
+    /// we explicitly want to detect. Timestamps come from `now_fn` so
+    /// tests can drive the cooldown / window logic deterministically;
+    /// in production this is wall-clock (Duration since UNIX_EPOCH).
+    ///
+    /// Producer: the `needs_wipe == true` branch in
+    /// `inner_connect_worker`. Consumer: only the same branch (read
+    /// the count, compare to threshold + cooldown, emit the warn).
+    /// `parking_lot::Mutex` on `endpoint_state` already serializes
+    /// access; no separate lock.
+    // UNBOUNDED-OK: capped at FLAP_THRESHOLD entries per endpoint after
+    // each push (older entries dropped). One push per worker reconnect;
+    // not attacker-controlled (#216 build_sha allowlist gates connects).
+    epoch_changes: VecDeque<Duration>,
+    /// (#387) Last time the flap-warn fired for this endpoint, used to
+    /// suppress re-warn within `FLAP_COOLDOWN`. `None` if the warn has
+    /// not fired yet. Timestamps come from the same `now_fn` as
+    /// `epoch_changes`.
+    last_flap_warn_at: Option<Duration>,
 }
 
 impl core::fmt::Debug for WorkerApiServer {
@@ -587,11 +646,61 @@ impl WorkerApiServer {
                     "wiped locality_map + dispatcher state on worker boot_epoch_id change"
                 );
             }
+            // (#387) Flap detection. Only fires on the
+            // `needs_wipe == true` branch — same-epoch reconnects are
+            // transient stream drops, not whole-process restarts, and
+            // would inflate the count past the threshold for a
+            // perfectly healthy worker. Carries the sliding window
+            // and cooldown timestamp across the `state.insert()` below
+            // so history survives the EndpointState replacement.
+            let (mut epoch_changes, mut last_flap_warn_at) = prev
+                .as_ref()
+                .map(|p| (p.epoch_changes.clone(), p.last_flap_warn_at))
+                .unwrap_or_default();
+            if needs_wipe {
+                // Use `now_fn` (not `SystemTime::now()`) so tests can
+                // drive the window/cooldown logic deterministically;
+                // production wraps `SystemTime::now() - UNIX_EPOCH`.
+                let now_dur = (self.now_fn)()?;
+                // Drop entries older than `FLAP_WINDOW`. The deque is
+                // already sorted oldest-front because pushes are
+                // monotonic in `now_dur`, so a single front-pop loop
+                // suffices.
+                while let Some(front) = epoch_changes.front() {
+                    if now_dur.saturating_sub(*front) > FLAP_WINDOW {
+                        epoch_changes.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                epoch_changes.push_back(now_dur);
+                if epoch_changes.len() >= FLAP_THRESHOLD {
+                    let cooldown_active = last_flap_warn_at
+                        .is_some_and(|prev_warn| {
+                            now_dur.saturating_sub(prev_warn) < FLAP_COOLDOWN
+                        });
+                    if !cooldown_active {
+                        warn!(
+                            endpoint = %worker_cas_endpoint,
+                            flips_in_window = epoch_changes.len(),
+                            window_secs = FLAP_WINDOW.as_secs(),
+                            "worker reconnect storm — process restarting repeatedly \
+                             (likely whole-process OOM, not just per-action SIGKILL)"
+                        );
+                        self.metrics
+                            .worker_flap_warns_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        last_flap_warn_at = Some(now_dur);
+                    }
+                }
+            }
             state.insert(
                 worker_cas_endpoint.clone(),
                 EndpointState {
                     boot_epoch: new_boot_epoch,
                     owner_worker_id: worker_id.clone(),
+                    epoch_changes,
+                    last_flap_warn_at,
                 },
             );
             needs_wipe

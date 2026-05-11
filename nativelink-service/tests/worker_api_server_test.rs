@@ -2803,3 +2803,289 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
 
     Ok(())
 }
+
+// =====================================================================
+// #387: worker-flap detection on rapid boot_epoch reconnects
+// =====================================================================
+//
+// `worker_api_server.rs:520-660` already wipes per-endpoint state when
+// a worker reconnects with a fresh `boot_epoch_id` (new process took
+// over the same `cas_endpoint`). That tells the server "the old
+// process died" but does NOT distinguish a one-off crash from a tight
+// restart loop — and an OOM-restart-looping worker keeps flipping
+// epochs while the operator only sees per-action SIGKILL noise.
+//
+// #387 adds a sliding-window flap counter (3 epoch changes within
+// 5 min) co-located on `EndpointState` (no new lock — already
+// serialized by the same `endpoint_state` mutex the wipe takes) plus
+// a `worker_flap_warns_total` counter on `WorkerApiMetrics`. A
+// 60-second cooldown suppresses re-warn so a sustained 1-per-minute
+// flap doesn't drown the log.
+//
+// Invariant: when the same `cas_endpoint` undergoes
+// `FLAP_THRESHOLD` boot_epoch changes within `FLAP_WINDOW`, exactly
+// one `worker_flap_warns_total` increment fires. The next change
+// within `FLAP_COOLDOWN` MUST NOT re-increment; a change after the
+// cooldown MUST re-increment.
+//
+// Mutation step (per CLAUDE.md TDD step 5): comment out the
+// `self.metrics.worker_flap_warns_total.fetch_add(1, Ordering::Relaxed)`
+// line in `worker_api_server.rs` — this test MUST then panic with
+// the specific assertion message
+// "worker-flap warn missing — operator-blind to whole-process restart loop".
+
+/// Mutable-time `NowFn` factory for #387 flap tests. Test calls
+/// `set_now_secs(N)` to advance the clock between connect_worker
+/// invocations so we can exercise the sliding window AND the cooldown
+/// gate deterministically (no `tokio::time::sleep`, no real-time
+/// dependency — per CLAUDE.md "no thread::sleep as synchronization").
+#[derive(Clone)]
+struct MockClock {
+    now_secs: Arc<core::sync::atomic::AtomicU64>,
+}
+
+impl MockClock {
+    fn new(initial: u64) -> Self {
+        Self {
+            now_secs: Arc::new(core::sync::atomic::AtomicU64::new(initial)),
+        }
+    }
+
+    fn set_now_secs(&self, secs: u64) {
+        self.now_secs
+            .store(secs, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn now_fn(&self) -> NowFn {
+        let clk = self.now_secs.clone();
+        Box::new(move || {
+            Ok(Duration::from_secs(
+                clk.load(core::sync::atomic::Ordering::Relaxed),
+            ))
+        })
+    }
+}
+
+/// Build a `WorkerApiServer` whose `now_fn` returns a clock value the
+/// test can drive. Returns the server + the clock handle. Mirrors
+/// `setup_multi_connect()` but injects a controllable clock so the
+/// flap window + cooldown can be exercised without real time.
+async fn setup_multi_connect_with_clock(
+    clock: MockClock,
+) -> Result<(WorkerApiServer, MockClock), Error> {
+    const SCHEDULER_NAME: &str = "DUMMY_SCHEDULE_NAME";
+
+    let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
+    let tasks_or_worker_change_notify = Arc::new(Notify::new());
+    let state_manager = Arc::new(MockWorkerStateManager::new());
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let scheduler = ApiWorkerScheduler::new(
+        state_manager.clone(),
+        platform_property_manager,
+        WorkerAllocationStrategy::default(),
+        tasks_or_worker_change_notify,
+        BASE_WORKER_TIMEOUT_S,
+        worker_registry,
+    );
+
+    let locality_map = new_shared_blob_locality_map();
+
+    let mut schedulers: HashMap<String, Arc<dyn WorkerScheduler>> = HashMap::new();
+    schedulers.insert(SCHEDULER_NAME.to_string(), scheduler.clone());
+    let worker_api_server = WorkerApiServer::new_with_now_fn(
+        &WorkerApiConfig {
+            scheduler: SCHEDULER_NAME.to_string(),
+            compatible_build_shas: None,
+        },
+        &schedulers,
+        clock.now_fn(),
+        [1u8; 6],
+        Some(locality_map),
+        None,
+        None,
+        None,
+        None,
+    )
+    .err_tip(|| "Error creating WorkerApiServer")?;
+    Ok((worker_api_server, clock))
+}
+
+/// Three boot_epoch flips within `FLAP_WINDOW` (300s) MUST fire
+/// exactly one `worker_flap_warns_total` increment. A fourth flip
+/// inside the 60s cooldown MUST NOT re-fire. Advancing past the
+/// cooldown and flipping again MUST re-fire.
+///
+/// Seams crossed: `inner_connect_worker` epoch-wipe branch
+/// (`worker_api_server.rs:580-660`) → `EndpointState.epoch_changes`
+/// deque → cooldown check → `WorkerApiMetrics.worker_flap_warns_total`
+/// AtomicU64. The metric counter is the operator-visible signal
+/// (warn line is the load-bearing signal in journald per
+/// `.claude/audits/384-exec-log-2026-05-10/server-worker-oom-detection.md`
+/// Q2; counter is belt-and-suspenders for when the metrics exporter
+/// scrapes worker_api group).
+#[nativelink_test]
+pub async fn worker_flap_detection_fires_warn_and_respects_cooldown_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    use core::sync::atomic::Ordering;
+
+    let cas_endpoint = "grpc://192.168.1.99:50081";
+    let clock = MockClock::new(1_000_000);
+    let (server, clock) = setup_multi_connect_with_clock(clock).await?;
+    let metrics = server.metrics();
+
+    // Helper: open a stream with the given epoch at the current mock
+    // time. Drops both ends immediately so connection state is left
+    // for the next call without holding background tasks open.
+    async fn flip(
+        server: &WorkerApiServer,
+        cas_endpoint: &str,
+        epoch: u64,
+    ) -> Result<(), Error> {
+        let (tx, stream) = open_worker_connection(server, cas_endpoint, epoch).await?;
+        drop(tx);
+        drop(stream);
+        Ok(())
+    }
+
+    // First connect — establishes baseline; needs_wipe == false on
+    // first-ever connect, so no flap entry recorded yet.
+    clock.set_now_secs(1_000_000);
+    flip(&server, cas_endpoint, 1).await?;
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        0,
+        "first connect must not fire flap warn — no prior epoch to differ from"
+    );
+
+    // Two epoch changes — still below threshold (FLAP_THRESHOLD = 3).
+    clock.set_now_secs(1_000_010);
+    flip(&server, cas_endpoint, 2).await?;
+    clock.set_now_secs(1_000_020);
+    flip(&server, cas_endpoint, 3).await?;
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        0,
+        "two flips within window must not yet fire — threshold is 3, observed 2"
+    );
+
+    // Third epoch change — len == 3 == FLAP_THRESHOLD, fire.
+    clock.set_now_secs(1_000_030);
+    flip(&server, cas_endpoint, 4).await?;
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        1,
+        "worker-flap warn missing — operator-blind to whole-process restart loop \
+         (3 epoch flips within FLAP_WINDOW must fire exactly one warn at threshold \
+         crossover)"
+    );
+
+    // Fourth flip inside cooldown — MUST NOT re-fire.
+    clock.set_now_secs(1_000_050); // 20s after last warn, well below 60s cooldown
+    flip(&server, cas_endpoint, 5).await?;
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        1,
+        "flap warn re-fired inside FLAP_COOLDOWN — cooldown gate broken; \
+         a 1/min sustained flap would drown the log"
+    );
+
+    // Advance past the cooldown and flip again — MUST re-fire.
+    // last_flap_warn_at was set at 1_000_030; cooldown is 60s, so any
+    // now >= 1_000_090 lifts the gate. Use 1_000_100 for headroom.
+    // All four prior flips are still inside the 300s window
+    // (oldest at 1_000_000 + 1_000_010, both within 300s of 1_000_100
+    // — but the first one at t=1_000_010 falls out at t > 1_000_310).
+    // So at t=1_000_100 the deque carries [1_000_010, 1_000_020,
+    // 1_000_030, 1_000_050, 1_000_100] -> 5 entries, well above
+    // threshold; cooldown now lifted -> warn fires.
+    clock.set_now_secs(1_000_100);
+    flip(&server, cas_endpoint, 6).await?;
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        2,
+        "flap warn must re-fire after FLAP_COOLDOWN elapses — sustained flapping \
+         deserves periodic re-notification (otherwise a stuck-in-loop worker would \
+         go silent after the first 60s)"
+    );
+
+    Ok(())
+}
+
+/// Sliding-window eviction: a flip that's older than `FLAP_WINDOW`
+/// (300s) MUST fall out of the deque so a slow drumbeat of epoch
+/// changes (one every 200s) never accumulates to threshold.
+#[nativelink_test]
+pub async fn worker_flap_window_evicts_stale_entries_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    use core::sync::atomic::Ordering;
+
+    let cas_endpoint = "grpc://192.168.1.100:50081";
+    let clock = MockClock::new(2_000_000);
+    let (server, clock) = setup_multi_connect_with_clock(clock).await?;
+    let metrics = server.metrics();
+
+    async fn flip(
+        server: &WorkerApiServer,
+        cas_endpoint: &str,
+        epoch: u64,
+    ) -> Result<(), Error> {
+        let (tx, stream) = open_worker_connection(server, cas_endpoint, epoch).await?;
+        drop(tx);
+        drop(stream);
+        Ok(())
+    }
+
+    // First connect — baseline, no flap entry.
+    clock.set_now_secs(2_000_000);
+    flip(&server, cas_endpoint, 1).await?;
+
+    // Flip every 400s (well past 300s window). Each push evicts the
+    // prior entry, so deque len stays at 1 -> never reaches threshold.
+    for i in 0..10u64 {
+        clock.set_now_secs(2_000_000 + (i + 1) * 400);
+        flip(&server, cas_endpoint, 2 + i).await?;
+    }
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        0,
+        "slow-drumbeat epoch flips (one every 400s, beyond FLAP_WINDOW=300s) must \
+         never accumulate to threshold — sliding-window eviction broken"
+    );
+    Ok(())
+}
+
+/// Same-epoch reconnects (transient stream drops, not whole-process
+/// restarts) MUST NOT count against the flap threshold. Otherwise
+/// network jitter would falsely trigger flap warns.
+#[nativelink_test]
+pub async fn worker_flap_same_epoch_reconnects_dont_count_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    use core::sync::atomic::Ordering;
+
+    let cas_endpoint = "grpc://192.168.1.101:50081";
+    let clock = MockClock::new(3_000_000);
+    let (server, clock) = setup_multi_connect_with_clock(clock).await?;
+    let metrics = server.metrics();
+
+    // First connect.
+    clock.set_now_secs(3_000_000);
+    let (tx1, stream1) = open_worker_connection(&server, cas_endpoint, 42).await?;
+    drop(tx1);
+    drop(stream1);
+
+    // Five reconnects at the SAME epoch — these are transient stream
+    // drops; needs_wipe == false, so flap deque stays empty.
+    for i in 0..5u64 {
+        clock.set_now_secs(3_000_001 + i);
+        let (tx, stream) = open_worker_connection(&server, cas_endpoint, 42).await?;
+        drop(tx);
+        drop(stream);
+    }
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        0,
+        "same-epoch reconnects must not count as flaps — those are transient \
+         stream drops, not whole-process restarts"
+    );
+    Ok(())
+}
