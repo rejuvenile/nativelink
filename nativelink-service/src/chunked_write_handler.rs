@@ -2439,6 +2439,124 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
     }
 }
 
+/// #401 cancel-safety RAII guard for the FastSlowStore's
+/// `chunked_in_flight_digests` set.
+///
+/// **The bug it fixes.** `BazelChunkedDispatcherImpl::dispatch` used to
+/// be a manual insert/await/remove pattern:
+///
+/// ```ignore
+/// set.lock().insert(digest);
+/// let res = inner.await;            // <-- cancellation point
+/// match res { ... set.lock().remove(&digest); ... }
+/// ```
+///
+/// If the future is cancelled mid-await — typical production trigger:
+/// `bytestream_server.rs:1761-1775`'s `try_join!` short-circuits on a
+/// producer Err and drops the dispatch future — the removal never runs.
+/// The digest leaks until process restart;
+/// `FastSlowStore::has_with_results` reports `Some(size)` for leaked
+/// digests forever; `ExistenceCacheStore` caches the `Some`; `FMB`
+/// returns "present" forever; subsequent populates NotFound on the
+/// missing bytes.
+///
+/// **Why an RAII guard fixes it.** `Drop` runs on every exit path —
+/// success, error, panic, AND cancellation — so removal cannot be
+/// skipped by future cancellation. This is the canonical fix for
+/// "leak-on-cancel" patterns around shared mutable state.
+///
+/// **The two operating modes.** The success path needs the digest to
+/// stay in the set past `dispatch.await` returning Ok, until the
+/// chunked-driver's in-flight tracker drains (so that #210 graceful
+/// drain in `flush_slow_writes` still waits for chunked commits). The
+/// guard supports this via `disarm()`, which extracts the (set, digest,
+/// notify) tuple and makes the subsequent Drop a no-op so that the
+/// post-dispatch reaper can perform the removal at the correct moment.
+///
+/// **Fields are private** — construction goes through `new`, removal
+/// goes through Drop or `disarm`. There is no other API surface; the
+/// guard must remain trivially auditable.
+#[derive(Debug)]
+pub struct InFlightChunkedGuard {
+    set: Arc<Mutex<std::collections::HashSet<DigestInfo>>>,
+    digest: DigestInfo,
+    /// Mirrors the existing notify-on-empty contract: when the set
+    /// transitions from non-empty to empty, wake any
+    /// `flush_slow_writes` waiters. `None` for tests / call-sites that
+    /// don't observe the notify.
+    notify: Option<Arc<tokio::sync::Notify>>,
+    /// `true` until `disarm()` is called. `false` makes Drop a no-op.
+    /// Required so the success path can hand removal to the spawned
+    /// reaper without double-removing.
+    armed: bool,
+}
+
+impl InFlightChunkedGuard {
+    /// Insert `digest` into `set` and return a guard that will remove
+    /// it on Drop (and, if the removal empties the set, fire
+    /// `notify_waiters()` on `notify`).
+    #[must_use]
+    pub fn new(
+        set: Arc<Mutex<std::collections::HashSet<DigestInfo>>>,
+        digest: DigestInfo,
+        notify: Option<Arc<tokio::sync::Notify>>,
+    ) -> Self {
+        set.lock().insert(digest);
+        Self {
+            set,
+            digest,
+            notify,
+            armed: true,
+        }
+    }
+
+    /// Disarm the guard and return its state for hand-off to a
+    /// post-dispatch reaper. After disarm, Drop is a no-op — the caller
+    /// is responsible for removing the digest at the appropriate moment
+    /// AND firing `notify.notify_waiters()` if the set becomes empty.
+    ///
+    /// Used exclusively by the `dispatch` Ok branch: the chunked-driver
+    /// continues asynchronously after `dispatch.await` returns; the
+    /// digest must stay in the set until the driver's in-flight tracker
+    /// drains (preserving #210 graceful-drain).
+    #[must_use]
+    pub fn disarm(
+        mut self,
+    ) -> (
+        Arc<Mutex<std::collections::HashSet<DigestInfo>>>,
+        DigestInfo,
+        Option<Arc<tokio::sync::Notify>>,
+    ) {
+        self.armed = false;
+        // Cloning the Arcs is cheap and lets Drop run with placeholder
+        // values that satisfy the no-op path. Alternative: ManuallyDrop
+        // + ptr::read; not worth the unsafe to save two AtomicUsize bumps.
+        (
+            Arc::clone(&self.set),
+            self.digest,
+            self.notify.as_ref().map(Arc::clone),
+        )
+    }
+}
+
+impl Drop for InFlightChunkedGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            // Disarmed: success-path reaper owns removal. No-op here.
+            return;
+        }
+        let mut guard = self.set.lock();
+        guard.remove(&self.digest);
+        let became_empty = guard.is_empty();
+        drop(guard);
+        if became_empty {
+            if let Some(n) = self.notify.as_ref() {
+                n.notify_waiters();
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
     for BazelChunkedDispatcherImpl<Fe>
@@ -2448,9 +2566,10 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
         digest: DigestInfo,
         reader: DropCloserReadHalf,
     ) -> Result<u64, Error> {
-        // #212 fixup B2: register the digest in the FastSlowStore's
-        // chunked_in_flight_digests set BEFORE dispatch. Preserves
-        // these contracts for chunked-path blobs:
+        // #212 fixup B2 + #401 cancel-safety: register the digest in the
+        // FastSlowStore's chunked_in_flight_digests set BEFORE dispatch
+        // via an RAII guard. Preserves these contracts for chunked-path
+        // blobs:
         //   - has_with_results: chunked check returns Some(size_bytes).
         //   - flush_slow_writes (#210 graceful drain): waits for the
         //     digest set to drain before returning.
@@ -2458,9 +2577,19 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
         // legacy `in_flight_slow_writes` (`Vec<Bytes>` shape) because
         // chunked-path bytes are tracked via the chunked-driver pin
         // (registered through ChunkedReadRegistry for cascade step 2).
-        if let Some(set) = self.chunked_in_flight_digests.as_ref() {
-            set.lock().insert(digest);
-        }
+        //
+        // RAII (vs the prior manual insert/remove): the inner await
+        // below is a cancellation point. A `try_join!`/`select!` upstream
+        // can drop this future mid-await; manual `remove(&digest)` would
+        // never run, leaking the digest forever. Drop runs on every exit
+        // path including cancellation. See InFlightChunkedGuard above.
+        let inflight_guard = self.chunked_in_flight_digests.as_ref().map(|set| {
+            InFlightChunkedGuard::new(
+                Arc::clone(set),
+                digest,
+                self.in_flight_empty_notify.clone(),
+            )
+        });
         let dispatch_res = dispatch_bazel_facing_internal_chunking(
             Arc::clone(&self.filesystem_store),
             Arc::clone(&self.in_flight),
@@ -2481,19 +2610,19 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
         // chunked_in_flight_digests entry to survive until commit
         // drains (otherwise B2's #210 graceful-drain contract is
         // violated: the drainer would return as soon as dispatch
-        // returns Ok, before commit lands). Solution: spawn a small
-        // reaper that waits on the chunked-driver's in_flight tracker
-        // emptying for THIS digest, then removes the digest from the
-        // set + notifies the empty-notify.
+        // returns Ok, before commit lands). Solution: disarm the RAII
+        // guard and spawn a small reaper that waits on the chunked-
+        // driver's in_flight tracker emptying for THIS digest, then
+        // removes the digest from the set + notifies the empty-notify.
         //
         // On dispatch error (admission rejected before any chunk):
-        // remove the digest now (no chunked driver was created or it
-        // was torn down by the cleanup_guard).
-        match (dispatch_res, self.chunked_in_flight_digests.clone()) {
-            (Ok(outcome), Some(set)) => {
+        // do NOT disarm — the guard's Drop performs the removal +
+        // notify (no chunked driver was created or it was torn down by
+        // the cleanup_guard).
+        match (dispatch_res, inflight_guard) {
+            (Ok(outcome), Some(guard)) => {
+                let (set, dig, notify) = guard.disarm();
                 let in_flight_for_reaper = Arc::clone(&self.in_flight);
-                let notify = self.in_flight_empty_notify.clone();
-                let dig = digest;
                 tokio::spawn(async move {
                     loop {
                         if !in_flight_for_reaper.contains_digest(&dig) {
@@ -2514,19 +2643,13 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                 Ok(outcome.committed_size)
             }
             (Ok(outcome), None) => Ok(outcome.committed_size),
-            (Err(err), Some(set)) => {
-                let mut guard = set.lock();
-                guard.remove(&digest);
-                let became_empty = guard.is_empty();
-                drop(guard);
-                if became_empty {
-                    if let Some(n) = self.in_flight_empty_notify.as_ref() {
-                        n.notify_waiters();
-                    }
-                }
+            (Err(err), _guard) => {
+                // _guard (if any) drops here, removing the digest +
+                // notifying. On Err the dispatch never produced a
+                // chunked driver to drain, so immediate removal is
+                // correct.
                 Err(err)
             }
-            (Err(err), None) => Err(err),
         }
     }
 }
