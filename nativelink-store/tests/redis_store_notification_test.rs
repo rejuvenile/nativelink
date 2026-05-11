@@ -1116,3 +1116,76 @@ async fn standard_mode_keyspace_db_mismatch_still_rejected_for_sibling_check()
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Spec test 10 (testing-czar MAJOR — over-action coverage on
+// `register_item_callback`): when `enable_keyspace_notifications=false`,
+// `RedisStore::register_item_callback` MUST return
+// `Err(Code::FailedPrecondition)`. ECS::new_with_time `.expect()`s this
+// call to succeed; an Ok return on the disabled path would silently drop
+// every keyevent invalidation for the wrapped cache, leaving operators
+// with stale-positive entries forever.
+//
+// Spec (derived from the BLOCKER 1 design + the 2026-05-10 cadre
+// finding, NOT from reading the implementation):
+// - Construction with `enable_keyspace_notifications=false` MUST succeed
+//   (the operator opted out — there is no Valkey CONFIG mutation to do).
+// - The constructed store's `register_item_callback` MUST return
+//   `Err(Code::FailedPrecondition)`. That Err is what callers above
+//   (FastSlow → SizePartitioning → ECS) `.expect()` against to surface
+//   the misconfiguration loudly rather than degrade silently.
+//
+// Mutation step (CLAUDE.md TDD rule 5): change the
+// `Err(make_err!(Code::FailedPrecondition, ...))` arm at
+// `redis_store.rs:2741-2750` to `Ok(())` (or to a different Code). The
+// test must red-fail with the bespoke
+// `"register_item_callback must return FailedPrecondition when ..."`
+// message.
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn register_item_callback_returns_failed_precondition_when_disabled()
+-> Result<(), Error> {
+    use nativelink_error::Code;
+
+    // Standard-mode Valkey running on an ephemeral port. We don't need
+    // keyspace notifications to be ENABLED to reach the Err path — the
+    // whole point is that with `enable_keyspace_notifications=false` the
+    // dispatcher OnceCell is never populated and `register_item_callback`
+    // returns Err.
+    let (port, _guard) = spawn_server(&[]).await;
+    let mut spec = make_spec(port, "cas:");
+    spec.enable_keyspace_notifications = false;
+    // `keyspace_notifications_db` is irrelevant when notifications are
+    // disabled, but URL is `redis://.../` (db=0) so 0 is the only value
+    // that wouldn't trip the URL/db cross-check (it's gated on
+    // notifications=true today, but be explicit so this test survives a
+    // future loosening of that gate).
+    spec.keyspace_notifications_db = 0;
+
+    let store = RedisStore::new_standard(spec)
+        .await
+        .expect("RedisStore::new_standard must succeed when notifications are disabled");
+
+    let (cb, _notify) = CapturingCallback::new();
+    let err = store
+        .clone()
+        .register_item_callback(cb)
+        .expect_err(
+            "register_item_callback must return FailedPrecondition when \
+             enable_keyspace_notifications=false (callers like ExistenceCacheStore \
+             rely on this to surface the misconfiguration loudly rather than silently \
+             dropping eviction events)",
+        );
+
+    assert_eq!(
+        err.code,
+        Code::FailedPrecondition,
+        "register_item_callback Err must be Code::FailedPrecondition (the \
+         discriminator FastSlow/SizePartitioning/ECS classify against to panic at \
+         construction); got code={:?}, msg={:?}",
+        err.code,
+        err.messages
+    );
+
+    Ok(())
+}

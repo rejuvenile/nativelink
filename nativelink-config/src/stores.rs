@@ -1974,3 +1974,66 @@ pub struct AcPinRegistryConfig {
     )]
     pub max_entries_per_endpoint: Option<usize>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default-value regression test (testing-czar MAJOR — 2026-05-10
+    /// 9-reviewer cadre).
+    ///
+    /// `enable_keyspace_notifications` MUST default to `true` for the
+    /// production CAS chain on buildcache to construct without panic. The
+    /// chain is `cas_INNER (ExistenceCacheStore) → SizePartitioning →
+    /// FastSlow { fast: Memory, slow: REDIS_CAS_SMALL_STORE }`. ECS calls
+    /// `register_item_callback(...).expect("Register item callback should
+    /// work")` at `existence_cache_store.rs:215-216`;
+    /// SizePartitioning/FastSlow propagate the `Err`;
+    /// `RedisStore::register_item_callback` returns
+    /// `Code::FailedPrecondition` whenever
+    /// `enable_keyspace_notifications=false`. Result: ECS construction
+    /// panic → `nativelink.service` enters a systemd restart loop.
+    /// Production Valkey grants `+@all` (verified by `valkey-cli ACL
+    /// LIST` 2026-05-10), so the `true` default is correct for the
+    /// deployment.
+    ///
+    /// Mutation step (CLAUDE.md TDD rule 5): flip
+    /// `default_enable_keyspace_notifications` to return `false` — this
+    /// test must red-fail with the bespoke
+    /// `"enable_keyspace_notifications default MUST stay true ..."`
+    /// message.
+    #[test]
+    fn enable_keyspace_notifications_defaults_to_true() {
+        // Minimal RedisSpec JSON5 — only the required `addresses` field
+        // is set so every other field, including
+        // `enable_keyspace_notifications`, lands on its serde default.
+        let spec: RedisSpec = serde_json5::from_str(
+            r#"{ "addresses": ["redis://127.0.0.1:6379/"] }"#,
+        )
+        .expect("RedisSpec must deserialize from minimal JSON5");
+
+        assert!(
+            spec.enable_keyspace_notifications,
+            "enable_keyspace_notifications default MUST stay true — flipping to \
+             false will boot-panic the production CAS chain (ECS → SizePartitioning \
+             → FSS → REDIS_CAS_SMALL_STORE) because ECS::new_with_time .expect()s \
+             register_item_callback to succeed; verified by code-reviewer + DSR \
+             cadre on 2026-05-11."
+        );
+    }
+
+    /// Companion: confirm the `default_enable_keyspace_notifications()`
+    /// const-fn itself returns `true`. Belt-and-suspenders coverage —
+    /// the deserialization test above goes through serde while this one
+    /// touches the const directly, so a misguided refactor that swaps in
+    /// a different defaulting mechanism is still caught.
+    #[test]
+    fn default_enable_keyspace_notifications_const_returns_true() {
+        assert!(
+            default_enable_keyspace_notifications(),
+            "default_enable_keyspace_notifications() MUST return true — see \
+             enable_keyspace_notifications_defaults_to_true for the production \
+             boot-panic mechanism this guards."
+        );
+    }
+}
