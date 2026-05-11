@@ -754,7 +754,11 @@ where
                     // Exit code 9 = SIGKILL, typically from the OOM killer.
                     // Treat as a retryable infrastructure error rather than
                     // a permanent action failure.
-                    if let ActionStage::Completed(result) = stage {
+                    let is_sigkill = matches!(
+                        stage,
+                        ActionStage::Completed(r) if r.exit_code == 9
+                    );
+                    let new_stage = if let ActionStage::Completed(result) = stage {
                         if result.exit_code == 9 {
                             awaited_action.attempts += 1;
                             if awaited_action.attempts <= self.max_job_retries {
@@ -779,7 +783,25 @@ where
                         }
                     } else {
                         stage.clone()
+                    };
+                    // (#386) Server-wide worker-OOM aggregate. The per-action
+                    // warns above are operator-noise during a SIGKILL storm
+                    // (41/27min on 2026-05-11). Aggregate by stable
+                    // worker identity (`cas_endpoint`); emit a single
+                    // worker-aggregate `warn!` once the per-worker count
+                    // crosses `SIGKILL_AGGREGATE_THRESHOLD` within
+                    // `SIGKILL_AGGREGATE_WINDOW`, with `SIGKILL_AGGREGATE_COOLDOWN`
+                    // between re-warns. Operator-visible immediately via
+                    // journald — no exporter dependency (#160/#380 visibility hole).
+                    if is_sigkill {
+                        if let (Some(reg), Some(wid)) =
+                            (&self.worker_registry, maybe_worker_id)
+                        {
+                            reg.record_sigkill(wid, std::time::Instant::now())
+                                .await;
+                        }
                     }
+                    new_stage
                 }
                 UpdateOperationType::UpdateWithError(err) => {
                     // Don't count a backpressure failure as an attempt for an action.

@@ -3723,7 +3723,13 @@ impl WorkerScheduler for ApiWorkerScheduler {
         drop(inner);
 
         let now = UNIX_EPOCH + Duration::from_secs(worker_timestamp);
-        self.worker_registry.register_worker(&worker_id, now).await;
+        // (#386) Register the worker against its `cas_endpoint` so the
+        // SIGKILL aggregate counter survives `worker_id` regeneration on
+        // reconnect (`worker_api_server.rs:498-502`). Same stable-identity
+        // precedent as `bis_resend_buffers` keying (see this file `:267-282`).
+        self.worker_registry
+            .register_worker_with_endpoint(&worker_id, &cas_endpoint_for_replay, now)
+            .await;
 
         // (#97) Replay any buffered BIS chunks for this endpoint. Same
         // boot_epoch_id only — `inner_connect_worker` clears the buffer
