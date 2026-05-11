@@ -797,8 +797,17 @@ where
                         if let (Some(reg), Some(wid)) =
                             (&self.worker_registry, maybe_worker_id)
                         {
-                            reg.record_sigkill(wid, std::time::Instant::now())
-                                .await;
+                            let now = std::time::Instant::now();
+                            reg.record_sigkill(wid, now).await;
+                            // (#390) Fleet-wide companion to the per-worker
+                            // aggregate above. Per-worker fires at 5/10min for
+                            // any single worker; fleet-wide fires at 15/10min
+                            // across ALL workers, catching diffuse jetsam
+                            // storms (2026-05-11: 41 events / 27 min across
+                            // 4-5 workers) where no single worker crosses the
+                            // per-worker threshold in lockstep but the fleet
+                            // collectively does.
+                            reg.record_fleet_sigkill(now).await;
                         }
                     }
                     new_stage
