@@ -596,4 +596,97 @@ mod tests {
             "empty registry must produce empty body, got:\n{body}"
         );
     }
+
+    /// #380 fix gate: end-to-end check that `MokaEvictingMap`'s
+    /// hand-rolled `MetricsComponent::publish` actually emits
+    /// `pinned_bytes` (and the other load-bearing fields) on a real
+    /// `/metrics` scrape — not just the `Component` marker the prior
+    /// hollow-stub impl returned.
+    ///
+    /// This unblocks #160 ship per the red-team RECONSIDER-PREMISE
+    /// second pass (2026-05-11): the whole point of #160 was making
+    /// `cas_FAST_SLOW_STORE.fast.memory.evicting_map.pinned_bytes`
+    /// scrapable so #332's prophylactic pin-cap-headroom claim is
+    /// operationally falsifiable post-deploy. With the publisher
+    /// hollow, scrapes returned an empty body for this branch and the
+    /// claim was unverifiable.
+    ///
+    /// Mutation step (per CLAUDE.md TDD discipline): comment out the
+    /// `pinned_bytes` `nativelink_metric::publish!` call inside
+    /// `MokaEvictingMap::publish` (`nativelink-util/src/moka_evicting_map.rs`,
+    /// the impl block immediately following the `Debug` impl). The
+    /// assertion below MUST red-fail with the bespoke message starting
+    /// `#380 fix gate: ...` so an operator who later regresses the
+    /// emission knows immediately which contract was broken.
+    #[test]
+    fn moka_evicting_map_publish_emits_pinned_bytes() {
+        use core::time::Duration;
+        use std::time::SystemTime;
+
+        use nativelink_config::stores::EvictionPolicy;
+
+        use crate::evicting_map::NoopCallback;
+        use crate::moka_evicting_map::MokaEvictingMap;
+
+        // Minimal LenEntry impl — value type is not exercised by the
+        // publisher walk; we only need a constructable map.
+        #[derive(Debug, Clone)]
+        struct Entry(u64);
+        impl crate::evicting_map::LenEntry for Entry {
+            fn len(&self) -> u64 {
+                self.0
+            }
+            fn is_empty(&self) -> bool {
+                self.0 == 0
+            }
+        }
+
+        let cfg = EvictionPolicy {
+            max_bytes: 1024,
+            evict_bytes: 0,
+            max_seconds: 0,
+            max_count: 0,
+        };
+        let map: MokaEvictingMap<u64, u64, Entry, SystemTime, NoopCallback> =
+            MokaEvictingMap::with_anchor(&cfg, SystemTime::now());
+
+        let registry = MetricsRegistry::new();
+        registry.register("memstore", Arc::new(map));
+
+        let body = render_prometheus(&registry);
+
+        // The bespoke message names #380 + the red-team RECONSIDER
+        // origin so a future regression triage points straight at the
+        // contract. Generic `is_ok()`-style messages would mask the
+        // class of failure (e.g. wrong group nesting -> all
+        // pinned_bytes lines go missing too, but the body is still
+        // non-empty).
+        assert!(
+            body.contains("memstore_pinned_bytes"),
+            "#380 fix gate: MokaEvictingMap::publish must emit pinned_bytes for #332 falsifiability via #160 publisher (red-team RECONSIDER 2026-05-11). body=\n{body}"
+        );
+        assert!(
+            body.contains("memstore_pin_cap"),
+            "#380 fix gate: MokaEvictingMap::publish must emit pin_cap for #332 falsifiability via #160 publisher (red-team RECONSIDER 2026-05-11). body=\n{body}"
+        );
+        assert!(
+            body.contains("memstore_entry_count"),
+            "#380 fix gate: MokaEvictingMap::publish must emit entry_count for #332 falsifiability via #160 publisher (red-team RECONSIDER 2026-05-11). body=\n{body}"
+        );
+
+        // Belt-and-braces: verify pin_cap matches the documented
+        // PIN_CAP_FRACTION (25% of max_bytes = 256). This catches the
+        // accidental wrong-field regression (e.g. someone swaps
+        // `pin_cap` for `max_bytes` in publish! and the contains-check
+        // still passes).
+        assert!(
+            body.contains("\nmemstore_pin_cap 256\n"),
+            "#380 fix gate: pin_cap must equal max_bytes * 25% = 256 for max_bytes=1024 (red-team RECONSIDER 2026-05-11). body=\n{body}"
+        );
+
+        // Silence unused-import warnings on Duration when the test
+        // body shrinks during edits — we keep the import for future
+        // assertions about anchor-time-derived gauges.
+        let _ = Duration::from_secs(0);
+    }
 }

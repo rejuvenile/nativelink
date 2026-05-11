@@ -188,6 +188,30 @@ where
     }
 }
 
+/// Hand-rolled `MetricsComponent` impl: `MokaEvictingMap`'s observable
+/// state is split between live moka-cache accessors (`entry_count`,
+/// `weighted_size`) and owned atomic / counter fields (`pinned_bytes`,
+/// `pin_cap`, `max_bytes`, `max_count`, plus the lifetime counters).
+/// The derive macro can only emit named struct fields, so it cannot
+/// reach the cache accessors — hence the manual impl.
+///
+/// Required fields (per #380 / red-team #160 RECONSIDER 2026-05-11):
+/// - `pinned_bytes`  — load-bearing for #332 falsifiability (pin-cap
+///   headroom is meaningful only if the operator can scrape the live
+///   pinned-byte usage).
+/// - `pin_cap`       — companion to `pinned_bytes`; the ceiling.
+/// - `entry_count`   — live moka entry count.
+/// - `weighted_size` — bytes resident in moka (does NOT include pinned).
+/// - `evicted_bytes`, `evicted_items`, `replaced_bytes`,
+///   `replaced_items`, `lifetime_inserted_bytes` — existing counters
+///   already maintained by the eviction listener / insert paths.
+///
+/// Naming note: every field is published under the leaf name shown
+/// here. The parent group (e.g. `evicting_map` from `MemoryStore`'s
+/// derive) is already on the span stack at call time, so leaves do
+/// NOT enter another `group!(field_metadata.name)` — that would
+/// double-namespace the resulting Prometheus metric (e.g.
+/// `..evicting_map_evicting_map_pinned_bytes`).
 impl<K, Q, T, I, C> MetricsComponent for MokaEvictingMap<K, Q, T, I, C>
 where
     K: Ord + Hash + Eq + Clone + Debug + Send + Borrow<Q>,
@@ -201,6 +225,93 @@ where
         _kind: nativelink_metric::MetricKind,
         _field_metadata: nativelink_metric::MetricFieldData,
     ) -> Result<nativelink_metric::MetricPublishKnownKindData, nativelink_metric::Error> {
+        // Live cache accessors — gauges, not counters.
+        let entry_count: u64 = self.cache.entry_count();
+        let weighted_size: u64 = self.cache.weighted_size();
+        // Atomic gauge — current pinned bytes (admission/eviction/pin
+        // composite invariant: `pinned_bytes <= pin_cap`).
+        let pinned_bytes: u64 = self.pinned_bytes.load(Ordering::Relaxed);
+        let pinned_count: u64 = self.pinned.len() as u64;
+
+        // Pinned-bytes gauge — load-bearing for #332 prophylactic pin-cap
+        // headroom falsifiability. If this exceeds `pin_cap` in
+        // production, #332's reclaim is insufficient and a follow-up
+        // tracker is required.
+        nativelink_metric::publish!(
+            "pinned_bytes",
+            &pinned_bytes,
+            nativelink_metric::MetricKind::Default,
+            "Bytes currently pinned (un-evictable) in this MokaEvictingMap. Composite invariant: must stay <= pin_cap; #332 / #380."
+        );
+        nativelink_metric::publish!(
+            "pin_cap",
+            &self.pin_cap,
+            nativelink_metric::MetricKind::Default,
+            "Configured pin cap = max_bytes * 25% (PIN_CAP_FRACTION). Ceiling for pinned_bytes; admission rejects new pins above this."
+        );
+        nativelink_metric::publish!(
+            "pinned_count",
+            &pinned_count,
+            nativelink_metric::MetricKind::Default,
+            "Number of currently-pinned entries (companion to pinned_bytes)."
+        );
+        nativelink_metric::publish!(
+            "entry_count",
+            &entry_count,
+            nativelink_metric::MetricKind::Default,
+            "Live entry count in the moka cache (does not include pinned-only entries)."
+        );
+        nativelink_metric::publish!(
+            "weighted_size",
+            &weighted_size,
+            nativelink_metric::MetricKind::Default,
+            "Live weighted size (bytes) of moka cache entries; pinned-only bytes accounted separately under pinned_bytes."
+        );
+        nativelink_metric::publish!(
+            "max_bytes",
+            &self.max_bytes,
+            nativelink_metric::MetricKind::Default,
+            "Configured max_bytes (capacity ceiling for the moka cache)."
+        );
+        nativelink_metric::publish!(
+            "max_count",
+            &self.max_count,
+            nativelink_metric::MetricKind::Default,
+            "Configured max_count (entry-count ceiling for the moka cache; 0 = unlimited)."
+        );
+
+        // Lifetime counters — monotone, suitable for Counter kind.
+        nativelink_metric::publish!(
+            "evicted_bytes",
+            &self.evicted_bytes,
+            nativelink_metric::MetricKind::Counter,
+            "Cumulative bytes evicted from this MokaEvictingMap by LRU / TTL / explicit remove."
+        );
+        nativelink_metric::publish!(
+            "evicted_items",
+            &self.evicted_items,
+            nativelink_metric::MetricKind::Component,
+            "Cumulative entries evicted from this MokaEvictingMap (CounterWithTime — emits .counter and .last_time)."
+        );
+        nativelink_metric::publish!(
+            "replaced_bytes",
+            &self.replaced_bytes,
+            nativelink_metric::MetricKind::Counter,
+            "Cumulative bytes replaced (existing key overwritten) in this MokaEvictingMap."
+        );
+        nativelink_metric::publish!(
+            "replaced_items",
+            &self.replaced_items,
+            nativelink_metric::MetricKind::Component,
+            "Cumulative entries replaced in this MokaEvictingMap (CounterWithTime — emits .counter and .last_time)."
+        );
+        nativelink_metric::publish!(
+            "lifetime_inserted_bytes",
+            &self.lifetime_inserted_bytes,
+            nativelink_metric::MetricKind::Counter,
+            "Cumulative bytes inserted into this MokaEvictingMap over the process lifetime."
+        );
+
         Ok(nativelink_metric::MetricPublishKnownKindData::Component)
     }
 }
