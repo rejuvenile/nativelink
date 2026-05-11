@@ -654,32 +654,33 @@ impl ItemCallback for SlowEvictionInvalidatesStableSetListener {
 /// classes today:
 ///
 ///   1. Real removal-callback support
-///      (`FilesystemStore`, `MemoryStore`, S3 with TTL,
+///      (`FilesystemStore`, `MemoryStore`, S3 with TTL, `RedisStore`
+///      with `enable_keyspace_notifications=true` (the default; #100
+///      shipped),
 ///      [`StoreDriver::supports_removal_callbacks`] = `true`,
 ///      `register_item_callback` returns `Ok`): full coverage —
 ///      evictions invalidate the BIS stable set live.
-///   2. Silent no-op accept
-///      (`RedisStore`: `supports_removal_callbacks` = `false`,
-///      `register_item_callback` returns `Ok`): the registration is
-///      accepted but the listener is never fired. This is
-///      operator-visible (loud `warn!`) because the AC chain on
-///      `cas_FAST_SLOW_STORE` (and any future Redis-backed slow tier)
-///      silently lacks durability-claim invalidation until #100's
-///      keyspace-notification dispatcher lands.
-///   3. Reject on registration
-///      (`GrpcStore`: `supports_removal_callbacks` = `false`,
-///      `register_item_callback` returns `Err(Code::Internal,
-///      "gRPC stores are incompatible with removal callbacks")`):
-///      this is the worker-side `WORKER_FAST_SLOW_STORE.slow =
-///      WorkerProxyStore(GrpcStore)` composition; the listener has
-///      nothing to do because workers are not the durable-storage
-///      holder. Demoted to `debug!` to avoid noisy startup warns
-///      on every worker.
+///   2. Reject-on-registration with the capability flag low
+///      (`RedisStore` with `enable_keyspace_notifications=false`
+///      (operator-disabled or cluster-mode forced-disable);
+///      `GrpcStore`: `supports_removal_callbacks` = `false`,
+///      `register_item_callback` returns
+///      `Err(Code::FailedPrecondition | Code::Internal, ...)`): the
+///      listener cannot wire. This is `debug!`-demoted because
+///      production has known compositions in this class — workers
+///      (`GrpcStore` slow tier) and operators who explicitly disabled
+///      keyspace notifications. Operator-actionable startup error
+///      lives at the leaf store (RedisStore) and at the wrapper
+///      (ExistenceCacheStore degrades to vulnerable-mode), not here.
+///   3. Asymmetric — capability flag high, registration low
+///      (a store impl that reports support but rejects): genuine bug,
+///      loud `warn!`.
 ///
-/// Any OTHER registration failure (a store impl that returns Err
-/// despite reporting `supports_removal_callbacks() = true`) is a
-/// genuine bug and gets a loud `warn!` — durability claim accuracy
-/// degrades to "best-effort with stale entries", operator-visible.
+/// Note: prior to #100 (keyspace-notification dispatcher), `RedisStore`
+/// fell into class 2 with `(false, Ok)` (silent no-op accept). That arm
+/// is now unreachable in current code — kept in the match for
+/// exhaustiveness and to surface a `warn!` if some future leaf
+/// regresses to silent acceptance.
 fn register_slow_eviction_stable_set_listener(
     slow_store: &Store,
     stable_digests: Arc<Mutex<Vec<DigestInfo>>>,
@@ -697,33 +698,39 @@ fn register_slow_eviction_stable_set_listener(
             // the listener. Nothing to log.
         }
         (false, Ok(())) => {
-            // Silent-no-op accept (today: `RedisStore`). The listener
-            // is wired but will never fire until #100's keyspace
-            // dispatcher delivers Redis-side eviction events into
-            // `register_item_callback`. Operator-visible because the
-            // AC chain on `cas_FAST_SLOW_STORE` silently lacks
-            // durability-claim invalidation in this state.
+            // Silent-no-op accept. Unreachable in current code — pre-#100
+            // RedisStore was the only example, and #100 wired the dispatcher
+            // (`supports_removal_callbacks` now returns
+            // `enable_keyspace_notifications`, `register_item_callback`
+            // returns `Err(FailedPrecondition)` when notifications are
+            // disabled). Kept for exhaustiveness; if a future leaf regresses
+            // to this shape, the loud `warn!` surfaces it immediately.
             warn!(
                 "SlowEvictionInvalidatesStableSetListener registered against a slow store \
-                 whose register_item_callback is a silent no-op (likely RedisStore). \
-                 Durability-claim invalidation is silently disabled for this FastSlowStore \
-                 until #100 (keyspace-notification dispatcher) lands. Workaround: size the \
-                 fast tier high enough that Redis evictions are non-issue, or wait for \
-                 #100. (#367)"
+                 whose supports_removal_callbacks=false yet register_item_callback returned \
+                 Ok — silent no-op accept. Durability-claim invalidation is silently \
+                 disabled for this FastSlowStore. (#367)"
             );
         }
         (false, Err(err)) => {
-            // Reject-on-registration with the capability flag set
-            // accordingly (today: `GrpcStore`). This is the worker
-            // composition (`WORKER_FAST_SLOW_STORE.slow =
-            // WorkerProxyStore(GrpcStore)`); the worker is not the
-            // durable-storage holder so the listener is irrelevant
-            // here. Demote to `debug!` to avoid a startup warn on
-            // every worker.
+            // Reject-on-registration with the capability flag low.
+            // Reachable production cases:
+            //   - Worker `WORKER_FAST_SLOW_STORE.slow =
+            //     WorkerProxyStore(GrpcStore)`: the worker is not the
+            //     durable-storage holder so the listener is irrelevant.
+            //   - Server `cas_FAST_SLOW_STORE.slow = RedisStore` with
+            //     `enable_keyspace_notifications=false` (operator-disabled
+            //     or cluster-mode forced-disable per
+            //     `set_spec_defaults`): operator opted out of push
+            //     invalidation. `ExistenceCacheStore` will log + degrade to
+            //     vulnerable mode at construction.
+            // Demote to `debug!` — operator-actionable signal lives at the
+            // leaf and at the ECS wrapper, not here.
             debug!(
                 ?err,
-                "FastSlowStore: slow store does not support removal callbacks \
-                 (expected on workers — slow tier is GrpcStore); skipping #367 \
+                "FastSlowStore: slow store rejected register_item_callback (expected for \
+                 GrpcStore-backed workers, or RedisStore with \
+                 enable_keyspace_notifications=false); skipping #367 \
                  SlowEvictionInvalidatesStableSetListener"
             );
         }

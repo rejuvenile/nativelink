@@ -2734,10 +2734,12 @@ where
         // sender ready to forward registrations — or `new_standard` itself
         // returned `Err` and the server failed to start. Reaching this code
         // with an empty OnceCell means `enable_keyspace_notifications=false`
-        // (the disabled-on-purpose path) and the caller is asking for
-        // invalidation that will never fire — surface that as an Err so
-        // wrappers like `ExistenceCacheStore::new_with_time` panic at
-        // construction rather than silently retain stale-positive entries.
+        // (the disabled-on-purpose path or cluster-mode forced-disable) and
+        // the caller is asking for invalidation that will never fire —
+        // surface that as a typed `Code::FailedPrecondition` Err so wrappers
+        // like `ExistenceCacheStore::new_with_time` can degrade gracefully
+        // (log + vulnerable-mode flag) instead of silently retaining
+        // stale-positive entries.
         let Some(tx) = self.keyspace_dispatcher_tx.get() else {
             return Err(make_err!(
                 Code::FailedPrecondition,
@@ -2763,18 +2765,29 @@ where
         Ok(())
     }
 
-    /// `register_item_callback` accepts the registration (returns
-    /// `Ok(())`) but is a SILENT no-op — Redis-side eviction events
-    /// (LRU/TTL/operator-flush) are not piped into the listener chain
-    /// until #100's keyspace-notification dispatcher lands.
+    /// Reports whether `register_item_callback` will dispatch real
+    /// Redis-side eviction events (`del` / `expired` / `evicted`
+    /// keyspace notifications) to registered listeners.
+    ///
+    /// Returns `self.enable_keyspace_notifications` — the OnceCell
+    /// `keyspace_dispatcher_tx` is populated iff the spec opted in AND
+    /// `init_keyspace_dispatcher_eager` succeeded at construction.
+    /// `RedisStore::new_standard` returns `Err` if the eager init
+    /// failed, so reaching the trait impl with
+    /// `enable_keyspace_notifications=true` guarantees the dispatcher
+    /// is wired. Cluster mode is forced to `false` in
+    /// `set_spec_defaults` (cluster keyspace-notification semantics
+    /// are documented as undefined in Redis).
     ///
     /// Wrappers like `FastSlowStore`'s #367
     /// `SlowEvictionInvalidatesStableSetListener` consult this flag at
-    /// registration time so they can warn the operator that the
-    /// listener is silently disabled for the Redis-backed slow tier
-    /// (durability-claim invalidation will not auto-fire).
+    /// registration time to classify their warn arm correctly. When
+    /// `false`, `register_item_callback` returns
+    /// `Code::FailedPrecondition` so wrappers like
+    /// `ExistenceCacheStore` can either fail or degrade explicitly
+    /// rather than silently retain stale-positive entries.
     fn supports_removal_callbacks(&self) -> bool {
-        false
+        self.enable_keyspace_notifications
     }
 
     /// RedisStore is a leaf — Redis is the persistent backing for small

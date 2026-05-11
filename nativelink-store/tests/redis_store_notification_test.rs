@@ -1181,10 +1181,222 @@ async fn register_item_callback_returns_failed_precondition_when_disabled()
         err.code,
         Code::FailedPrecondition,
         "register_item_callback Err must be Code::FailedPrecondition (the \
-         discriminator FastSlow/SizePartitioning/ECS classify against to panic at \
-         construction); got code={:?}, msg={:?}",
+         discriminator FastSlow/SizePartitioning/ECS classify against to log + enter \
+         vulnerable_mode at construction); got code={:?}, msg={:?}",
         err.code,
         err.messages
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MAJOR-1 (DSR second pass): production-seam composition test.
+//
+// Production CAS chain (from prod-server.json5):
+//   cas_INNER (ExistenceCacheStore)
+//     -> SizePartitioning(size=16384, lower=SMALL_CAS_CACHED, upper=...)
+//        -> SMALL_CAS_CACHED (FastSlow{ Memory, REDIS_CAS_SMALL_STORE })
+//
+// Earlier `existence_cache_drops_positive_after_redis_eviction` wraps
+// RedisStore directly in ECS — fine for the basic dispatcher contract,
+// but skips the `SizePartitioning -> FastSlow{Memory, Redis}` seams.
+// Each of those seams calls `register_item_callback` on the way down;
+// the FastSlow's #367 listener AND the SizePartitioning composite each
+// add their own `Arc<dyn ItemCallback>` to the dispatcher's Vec, so
+// the dispatcher must fan-out to ALL of them when Redis evicts.
+//
+// This test composes the full chain and asserts that an ECS positive
+// is invalidated when a key is evicted from Redis at the leaf, even
+// with the FastSlow's MemoryStore fast tier sitting in front. Without
+// the dispatcher (or with a dropped Weak from a partial registration
+// path) the test would deadlock at `wait_for_cache_drop`.
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn existence_cache_drops_positive_through_full_production_seam() -> Result<(), Error> {
+    use nativelink_config::stores::{
+        EvictionPolicy, FastSlowSpec, MemorySpec, SizePartitioningSpec,
+    };
+    use nativelink_store::fast_slow_store::FastSlowStore;
+    use nativelink_store::memory_store::MemoryStore;
+    use nativelink_store::size_partitioning_store::SizePartitioningStore;
+
+    let (port, _guard) = spawn_server(&[]).await;
+    let redis = RedisStore::new_standard(make_spec(port, "cas:"))
+        .await
+        .expect("redis");
+    let redis_store = Store::new(redis);
+
+    // Mimic SMALL_CAS_CACHED (FastSlow{ Memory(small), Redis }).
+    let memory_fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let small_cas_cached = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Noop(NoopSpec::default()),
+            fast_direction: Default::default(),
+            slow_direction: Default::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        memory_fast,
+        redis_store,
+    ));
+
+    // SizePartitioning: blob is 5 bytes (lower path), so this exercises
+    // the lower_store register_item_callback path (which is where Redis
+    // lives in production).
+    let upper = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let partitioned = Store::new(SizePartitioningStore::new(
+        &SizePartitioningSpec {
+            size: 16384,
+            lower_store: StoreSpec::Memory(MemorySpec::default()),
+            upper_store: StoreSpec::Memory(MemorySpec::default()),
+        },
+        small_cas_cached,
+        upper,
+    ));
+
+    // ECS at the top.
+    let ec_spec = ExistenceCacheSpec {
+        backend: StoreSpec::Noop(NoopSpec::default()),
+        eviction_policy: Some(EvictionPolicy {
+            max_count: 1_000_000,
+            ..Default::default()
+        }),
+    };
+    let ec = ExistenceCacheStore::new(&ec_spec, partitioned);
+
+    let digest = DigestInfo::try_new(TEST_HASH, 5).unwrap();
+    ec.clone()
+        .update_oneshot(digest, Bytes::from_static(b"hello"))
+        .await
+        .expect("ec update");
+
+    assert!(
+        ec.exists_in_cache(&digest).await,
+        "cache must hold positive after update through full production seam"
+    );
+
+    wait_until_subscribed(port, 3, Duration::from_secs(5)).await;
+
+    raw_del(port, &format!("cas:{digest}")).await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !ec.exists_in_cache(&digest).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "must not deadlock — ExistenceCacheStore retained stale positive after Redis \
+         eviction through SizePartitioning -> FastSlow{Memory, Redis} composition. \
+         Seams: ECS::register_item_callback -> SizePartitioning(lower+upper register) -> \
+         FastSlow(fast+slow register) -> RedisStore dispatcher. If this deadlocks but \
+         the simpler `existence_cache_drops_positive_after_redis_eviction` passes, the \
+         dispatcher fan-out skipped one of the wrapper-added listeners.",
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// RECONSIDER-fix regression (red-team pre-mortem variant): Redis with
+// `enable_keyspace_notifications=false` MUST allow ECS construction
+// without panic. The prior `.expect("Register item callback should
+// work")` converted operator-controllable misconfiguration into a
+// systemd restart loop. Verify the new behavior:
+//   1. ECS construction succeeds (no panic).
+//   2. ECS reports `vulnerable_mode = true` via the metric path.
+//   3. Stale positives still self-correct on the read path
+//      (`get_part` removes on `NotFound`).
+//
+// Mutation: revert ExistenceCacheStore::new_with_time to the panic
+// behavior; this test must FAIL with a panic on ECS construction.
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn existence_cache_construction_does_not_panic_when_redis_notifications_disabled()
+-> Result<(), Error> {
+    let (port, _guard) = spawn_server(&[]).await;
+    let mut spec = make_spec(port, "cas:");
+    spec.enable_keyspace_notifications = false;
+    spec.keyspace_notifications_db = 0;
+
+    let redis = RedisStore::new_standard(spec)
+        .await
+        .expect("RedisStore::new_standard must succeed when notifications are disabled");
+    let inner = Store::new(redis);
+
+    let ec_spec = ExistenceCacheSpec {
+        backend: StoreSpec::Noop(NoopSpec::default()),
+        eviction_policy: None,
+    };
+    // The load-bearing assertion: this MUST NOT panic. The pre-fix
+    // `.expect("Register item callback should work")` would panic here.
+    let ec = ExistenceCacheStore::new(&ec_spec, inner);
+
+    // Sanity: store still works for puts/gets (vulnerable_mode is the
+    // missing eager invalidation, not a degraded read/write path).
+    let digest = DigestInfo::try_new(TEST_HASH, 5).unwrap();
+    ec.clone()
+        .update_oneshot(digest, Bytes::from_static(b"hello"))
+        .await
+        .expect("ec update must succeed in vulnerable_mode");
+
+    assert!(
+        ec.exists_in_cache(&digest).await,
+        "cache must hold positive after update even in vulnerable_mode"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// supports_removal_callbacks BLOCK-2 regression.
+//
+// `RedisStore::supports_removal_callbacks()` MUST return
+// `enable_keyspace_notifications`. Pre-fix it returned `false`
+// unconditionally, causing fast_slow_store.rs's
+// `register_slow_eviction_stable_set_listener` to fire its
+// "wait for #100" warn at every server boot for the production
+// `cas_FAST_SLOW_STORE.slow = REDIS_CAS_SMALL_STORE` composition,
+// AND causing ExistenceCacheStore to incorrectly skip the eager
+// callback registration on otherwise-healthy Redis stores.
+//
+// Mutation: change `supports_removal_callbacks` back to `false`; this
+// test must FAIL with the BLOCK-2 message.
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn supports_removal_callbacks_reflects_enable_keyspace_notifications()
+-> Result<(), Error> {
+    // Case 1: notifications enabled (the production default) -> true.
+    let (port_on, _guard_on) = spawn_server(&[]).await;
+    let store_on = RedisStore::new_standard(make_spec(port_on, "cas:"))
+        .await
+        .expect("redis (on)");
+    assert!(
+        store_on.supports_removal_callbacks(),
+        "BLOCK-2: supports_removal_callbacks() MUST return true when \
+         enable_keyspace_notifications=true (the production default). Pre-fix \
+         hardcoded false causes fast_slow_store.rs's #367 listener to log a \
+         misleading 'wait for #100' warn at every server boot, AND causes \
+         ExistenceCacheStore to skip eager callback registration on healthy stores."
+    );
+
+    // Case 2: operator-disabled -> false.
+    let (port_off, _guard_off) = spawn_server(&[]).await;
+    let mut spec_off = make_spec(port_off, "cas:");
+    spec_off.enable_keyspace_notifications = false;
+    spec_off.keyspace_notifications_db = 0;
+    let store_off = RedisStore::new_standard(spec_off)
+        .await
+        .expect("redis (off)");
+    assert!(
+        !store_off.supports_removal_callbacks(),
+        "BLOCK-2: supports_removal_callbacks() MUST return false when \
+         enable_keyspace_notifications=false. ExistenceCacheStore reads this \
+         flag and degrades to vulnerable_mode rather than panic-on-Err."
     );
 
     Ok(())

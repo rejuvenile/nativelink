@@ -134,6 +134,25 @@ pub struct ExistenceCacheStore<I: InstantWrapper> {
     // existence cache, then update() re-inserts it. Any transient stale
     // positive is self-correcting: get_part() removes on NotFound, and
     // update() bypasses the cache to check the inner store.
+    /// Set to `true` when `inner_store.register_item_callback` failed
+    /// at construction (e.g. wrapping a Redis store with
+    /// `enable_keyspace_notifications=false`, or any other inner store
+    /// that returned `Err(Code::FailedPrecondition | Code::Internal)`
+    /// from `register_item_callback`). Stale positives become
+    /// self-correcting on the read path (`get_part` removes on
+    /// `NotFound`) and on the write path (`update` bypasses the cache
+    /// to check the inner store), so the cache stays correct under
+    /// load — but the eager invalidation that the callback provides
+    /// is gone, which expands the stale-positive window during inner
+    /// store evictions. Operator-visible via metric +
+    /// loud-startup-`error!`. RECONSIDER fix: prior behavior was
+    /// `.expect()` panic at construction, which converted any
+    /// inner-store hiccup at boot into a systemd restart loop —
+    /// hostile to operator-driven flag-flips. CLAUDE.md "Never panic
+    /// in library code" + "Mechanism, not operator" demand a
+    /// recoverable signal.
+    #[metric(help = "1 if register_item_callback failed at construction (stale positives self-correct via get_part/update bypass, but eager invalidation is gone)")]
+    vulnerable_mode: bool,
 }
 
 impl ExistenceCacheStore<SystemTime> {
@@ -205,15 +224,65 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
         let eviction_policy = spec.eviction_policy.as_ref().unwrap_or(&empty_policy);
         let existence_cache = Arc::new(MokaEvictingMap::with_anchor(eviction_policy, anchor_time));
         existence_cache.start_background_eviction();
+        // Pre-flight: ask the inner store whether it can accept removal
+        // callbacks at all. If not, we still construct ECS but in
+        // `vulnerable_mode` — the prior behavior (`.expect("Register item
+        // callback should work")`) converted an operator-controllable
+        // misconfiguration (e.g. RedisStore with
+        // `enable_keyspace_notifications=false`, or cluster-mode forced
+        // disable) into a systemd restart loop. CLAUDE.md "Never panic in
+        // library code" + "Mechanism, not operator" demand a recoverable
+        // signal; the operator who flips a config flag must not get a
+        // boot-time hard failure when a graceful degradation is correct.
+        //
+        // Stale positives in vulnerable_mode are self-correcting on both
+        // hot paths: `get_part` removes the cache entry on `NotFound`,
+        // and `update` bypasses the cache when checking the inner store.
+        // The eager invalidation from `register_item_callback` is what's
+        // missing — the stale-positive window expands from "fired
+        // immediately" to "next read/write touch."
+        let supports_callbacks = inner_store.supports_removal_callbacks();
         let existence_cache_store = Arc::new(Self {
             inner_store,
             existence_cache,
+            vulnerable_mode: !supports_callbacks,
         });
-        let other_ref = Arc::downgrade(&existence_cache_store);
-        existence_cache_store
-            .inner_store
-            .register_item_callback(Arc::new(ExistenceCacheCallback { cache: other_ref }))
-            .expect("Register item callback should work");
+        if supports_callbacks {
+            let weak_ref = Arc::downgrade(&existence_cache_store);
+            if let Err(err) = existence_cache_store
+                .inner_store
+                .register_item_callback(Arc::new(ExistenceCacheCallback { cache: weak_ref }))
+            {
+                // Asymmetric: inner reported `supports_removal_callbacks=true`
+                // but `register_item_callback` rejected. This is a contract
+                // bug in the inner store. Log loudly; we cannot mutate
+                // vulnerable_mode through the Arc now (other callers may
+                // have cloned), so the metric will under-report — but the
+                // operator-actionable signal is the error line.
+                error!(
+                    ?err,
+                    "ExistenceCacheStore: inner_store reports supports_removal_callbacks=true \
+                     but register_item_callback returned Err. This is a contract bug in the \
+                     inner store impl. ExistenceCacheStore is effectively in vulnerable_mode \
+                     (no eager invalidation) but the metric will report vulnerable_mode=false \
+                     because the flag was set before this attempt. Stale-positive entries \
+                     remain self-correcting via get_part/update bypass."
+                );
+            }
+        } else {
+            error!(
+                "ExistenceCacheStore: inner_store.supports_removal_callbacks()=false at \
+                 construction; entering vulnerable_mode. Stale positives are still \
+                 self-correcting (get_part removes on NotFound; update bypasses cache), \
+                 but eager invalidation from inner-store evictions is GONE — the \
+                 stale-positive window expands to the size of the eviction-detection \
+                 latency on the read/write paths. To restore eager invalidation: ensure \
+                 the inner store supports register_item_callback (RedisStore: set \
+                 enable_keyspace_notifications=true and grant the +config ACL; cluster \
+                 mode forces this off and is incompatible with ExistenceCacheStore's \
+                 eager-invalidation path today)."
+            );
+        }
         existence_cache_store
     }
 
