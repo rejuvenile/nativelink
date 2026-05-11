@@ -1384,11 +1384,25 @@ impl FastSlowStore {
     /// during the async-commit window) AND the chunked dispatcher
     /// (which drives the per-blob `ChunkedDriver`).
     ///
-    /// Returns Ok as soon as the dispatcher's admission completes (not
-    /// after commit). The driver continues on its own task; reads
-    /// during the async-commit window are served from the fast tier
-    /// (inline write below) OR via Phase 2.5's `failed_writes` /
-    /// in-flight pin once that lands.
+    /// **Observability contract (post audit
+    /// `.claude/audits/chunked-admission-p99-2026-05-11.md`):** This
+    /// function emits two `info!` markers per call:
+    /// 1. `"FastSlowStore::update (chunked): admission accepted"` — fires
+    ///    BEFORE `join3.await` and carries `admission_elapsed_ms` (only
+    ///    the channel + future setup span).
+    /// 2. `"FastSlowStore::update (chunked): commit complete (driver
+    ///    continues async β-commit)"` — fires AFTER `join3.await` and
+    ///    carries both `elapsed_ms` (total wall-clock) AND
+    ///    `admission_elapsed_ms`. Operators compute the commit-pipeline
+    ///    span via `commit_elapsed_ms = elapsed_ms - admission_elapsed_ms`.
+    ///
+    /// In practice this function returns Ok only AFTER the dispatcher's
+    /// `dispatch(...)` future resolves — i.e. after the full commit
+    /// pipeline (per-chunk SHA-256 / pwrite / `commit_and_verify` /
+    /// rename / `finalize_holding`) completes inside `join3`. The driver
+    /// task itself continues serving reads from the fast-tier replica
+    /// during the async-commit window via Phase 2.5's `failed_writes` /
+    /// in-flight pin.
     ///
     /// (β) async-commit. Anti-#203 mandatory.
     #[cfg(feature = "chunked_fast_slow")]
@@ -1473,6 +1487,24 @@ impl FastSlowStore {
 
         let fast_store_fut = self.fast_store.update(key.borrow(), fast_rx, size_info);
         let dispatch_fut = dispatcher.dispatch(digest, chunk_rx);
+
+        // True-admission timestamp: captured BEFORE `join3.await` so it
+        // measures only the wall-clock spent setting up the data-stream
+        // tee + the two channels + binding the dispatcher / fast-store
+        // futures. The end-to-end commit pipeline (per-chunk SHA-256 +
+        // pwrite + `commit_and_verify`'s full-blob BLAKE3 + rename +
+        // `finalize_holding`) runs INSIDE `join3` and is reported by
+        // the `commit complete` log below (see audit:
+        // `.claude/audits/chunked-admission-p99-2026-05-11.md`). The
+        // pair of logs lets operators compute `commit_elapsed_ms =
+        // total_elapsed_ms - admission_elapsed_ms`.
+        let admission_elapsed = update_start.elapsed();
+        info!(
+            ?key,
+            admission_elapsed_ms = admission_elapsed.as_millis() as u64,
+            size_bytes = digest.size_bytes(),
+            "FastSlowStore::update (chunked): admission accepted"
+        );
 
         let (data_res, fast_res, dispatch_res) =
             futures::future::join3(data_stream_fut, fast_store_fut, dispatch_fut).await;
@@ -1638,13 +1670,23 @@ impl FastSlowStore {
             }
         };
 
+        // End-of-pipeline timestamp: `data_elapsed` is captured AFTER
+        // `join3` resolves, which means it spans the chunked dispatcher's
+        // FULL commit pipeline (per-chunk pwrite + per-chunk BLAKE3 +
+        // `commit_and_verify`'s full-blob BLAKE3 + rename +
+        // `finalize_holding`), NOT just admission. The previously-emitted
+        // "admission complete" name was misleading per the audit at
+        // `.claude/audits/chunked-admission-p99-2026-05-11.md`. Operators
+        // can compute `commit_elapsed_ms = elapsed_ms - admission_elapsed_ms`
+        // by joining this log with the matching "admission accepted" log
+        // emitted just before `join3.await`.
         info!(
             ?key,
             elapsed_ms = data_elapsed.as_millis() as u64,
+            admission_elapsed_ms = admission_elapsed.as_millis() as u64,
             size_bytes = digest.size_bytes(),
             committed_size = dispatch_committed_size,
-            "FastSlowStore::update (chunked): admission complete; \
-             driver continues async (β commit)"
+            "FastSlowStore::update (chunked): commit complete (driver continues async β-commit)"
         );
 
         Ok(())
