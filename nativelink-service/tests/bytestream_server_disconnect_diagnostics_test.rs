@@ -40,6 +40,21 @@
 //! 3. **Diagnostic 3** — buf_channel write-side state at drop. The failure
 //!    warn must report `store_tx_bytes_written` and `store_tx_pipe_broken`
 //!    plus mirror counterparts. Same mutation strategy.
+//!
+//! 4. **Diagnostic 4 (#396)** — operator-friendly truncation diagnosis.
+//!    On a mid-upload half-close (no `finish_write: true`, bytes_received
+//!    < expected_size, underlying error is `Code::Cancelled` from the
+//!    proto_stream_utils wrapper materializing `Poll::Ready(None)` into a
+//!    Cancelled Err), the server must emit a SEPARATE info log carrying
+//!    the literal phrase `"client half-closed upload before finish_write"`
+//!    so an operator grepping the journal can identify the truncation
+//!    class at a glance, rather than re-deriving it from the 14-field
+//!    `inner_write failed` warn. Cause attribution (which client, why
+//!    the close) is deliberately NOT in the message — see NL #311.
+//!    Mutation: comment out the new `info!` block at the chunked-path
+//!    outer warn site in `inner_write`; the test asserts
+//!    `logs_contain("client half-closed upload before finish_write")` so
+//!    the assertion goes red.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -496,6 +511,185 @@ pub async fn diagnostic_1_finish_write_seen_true_on_size_mismatch()
         logs_contain("finish_write_seen=true"),
         "MUST report finish_write_seen=true when client sent finish_write but with \
          wrong byte count — discriminates from #320 case (Diagnostic 1 asymmetry guard)"
+    );
+
+    Ok(())
+}
+
+/// Test 6 (#396) — operator-friendly truncation diagnosis.
+///
+/// When a Bazel client half-closes the ByteStream/Write RPC mid-upload
+/// — bytes were sent, but no `finish_write: true` chunk arrived before
+/// the gRPC stream returned `Poll::Ready(None)` — the server MUST emit
+/// a SEPARATE `info!` line containing the literal phrase
+/// `"client half-closed upload before finish_write"` so an operator
+/// grepping the journal can identify the truncation class at a glance,
+/// instead of having to re-derive it from the 14-field
+/// `inner_write failed` warn. Cause attribution (why the client closed
+/// pre-finish) is deliberately not in the message — that's tracked by
+/// NL #311 ("Bazel partial-upload not detected as hard error post-9.1").
+///
+/// The new info also surfaces structured fields the operator needs:
+/// `bytes_received`, `expected_bytes`, `digest`, and the gRPC `code` of
+/// the underlying error (Cancelled per #357 / commit 3a184f40).
+///
+/// Mutation step: comment out the new `info!` block at the chunked-path
+/// outer warn site in `inner_write`. The assertion below requires the
+/// literal phrase, so the test goes red.
+#[nativelink_test]
+pub async fn diagnostic_4_truncation_clarity_info_for_half_close()
+-> Result<(), Box<dyn core::error::Error>> {
+    let _guard = cascade_test_lock().lock().await;
+    cascade_diag::reset_for_test();
+
+    let store_manager = make_store_manager().await?;
+    let bs_server = Arc::new(make_bytestream_server(store_manager.as_ref())?);
+    let (tx, join_handle) = spawn_write(bs_server);
+
+    // Send a partial chunk (no finish_write). Declared size is 100 but we
+    // only send 12 bytes. Then drop the sender — the wrapper's
+    // poll_next observes `Poll::Ready(None)` and materializes a
+    // Code::Cancelled Err (per #357). The chunked-path outer warn site
+    // observes `!finish_write_seen && bytes_received < expected_size`
+    // and must emit the operator-friendly info.
+    let resource_name = make_resource_name(100);
+    let partial = WriteRequest {
+        resource_name,
+        write_offset: 0,
+        finish_write: false,
+        data: Bytes::from_static(b"partial-data"), // 12 bytes
+    };
+    tx.send(Frame::data(encode_stream_proto(&partial)?)).await?;
+
+    // Yield so the server has a chance to consume the chunk before we
+    // close the stream.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    drop(tx);
+
+    let server_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect(
+                "join did not return — #396 truncation-clarity info path stalled \
+                 (deadlock detector)",
+            )
+            .expect("write task panicked");
+    assert!(
+        server_result.is_err(),
+        "half-close MUST cause the write to fail — got {server_result:?}"
+    );
+
+    // (a) The new operator-friendly info MUST fire with the literal phrase.
+    assert!(
+        logs_contain("client half-closed upload before finish_write"),
+        "MUST emit operator-friendly truncation-clarity info containing the literal \
+         phrase 'client half-closed upload before finish_write' (#396 Diagnostic 4)"
+    );
+
+    // (b) The info MUST carry structured fields. tracing-test formats
+    //     numeric fields as `name=N` and `%`-Display fields as
+    //     `name=Display`. We assert on substrings so the test is robust
+    //     to ordering changes.
+    assert!(
+        logs_contain("bytes_received="),
+        "MUST carry bytes_received field (#396 Diagnostic 4)"
+    );
+    assert!(
+        logs_contain("expected_bytes=100"),
+        "MUST carry expected_bytes=100 — the declared upload size (#396 Diagnostic 4)"
+    );
+    assert!(
+        logs_contain("digest="),
+        "MUST carry digest field so operator can correlate with the upload \
+         (#396 Diagnostic 4)"
+    );
+    assert!(
+        logs_contain("grpc_code="),
+        "MUST carry grpc_code field so operator can distinguish Cancelled \
+         (client half-close, #357) from Internal (server-side mid-write) \
+         from Unavailable (out-of-order) (#396 Diagnostic 4)"
+    );
+
+    // (c) The existing 14-field `inner_write failed` warn MUST still fire —
+    //     the new info is ADDITIVE, not a replacement. Diagnostic 1 / 2 / 3
+    //     guards continue to rely on the original warn shape.
+    assert!(
+        logs_contain("inner_write failed"),
+        "MUST also emit the original 14-field inner_write failed warn — the new \
+         info is additive (#396 Diagnostic 4)"
+    );
+
+    Ok(())
+}
+
+/// Test 7 (#396 asymmetry guard) — the new info MUST NOT fire on the
+/// size-mismatch path where the client DID send `finish_write: true`
+/// but with the wrong byte count. That path is a different bug class
+/// (client over- or under-declared size) and the operator should NOT
+/// see "client half-closed before finish_write" when the wire DID
+/// carry a `finish_write: true` chunk.
+///
+/// This is the over-action guard for the new diagnostic: it fires when
+/// it should NOT fire is just as much a bug as failing to fire when it
+/// should. Without this test, a refactor dropping the
+/// `!finish_write_seen` precondition would silently misclassify
+/// size-mismatch as half-close.
+#[nativelink_test]
+pub async fn diagnostic_4_truncation_clarity_silent_on_size_mismatch()
+-> Result<(), Box<dyn core::error::Error>> {
+    let _guard = cascade_test_lock().lock().await;
+    cascade_diag::reset_for_test();
+
+    let store_manager = make_store_manager().await?;
+    let bs_server = Arc::new(make_bytestream_server(store_manager.as_ref())?);
+    let (tx, join_handle) = spawn_write(bs_server);
+
+    // Two chunks: first chunk has finish_write=false (forces chunked
+    // path), second chunk has finish_write=true but total bytes
+    // (11 + 5 = 16) != declared size (100). This is the size-mismatch
+    // bug class — the new info MUST NOT fire.
+    let resource_name = make_resource_name(100);
+    let first = WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: false,
+        data: Bytes::from_static(b"first-piece"), // 11 bytes
+    };
+    tx.send(Frame::data(encode_stream_proto(&first)?)).await?;
+    let second = WriteRequest {
+        resource_name: String::new(),
+        write_offset: 11,
+        finish_write: true,
+        data: Bytes::from_static(b"oops!"), // 5 bytes
+    };
+    tx.send(Frame::data(encode_stream_proto(&second)?)).await?;
+    drop(tx);
+
+    let server_result =
+        tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("join did not return")
+            .expect("write task panicked");
+    assert!(
+        server_result.is_err(),
+        "size mismatch MUST fail the write"
+    );
+
+    // The new info MUST NOT fire — client sent finish_write=true, so
+    // this is not the half-close case even though bytes_received <
+    // expected_size.
+    assert!(
+        !logs_contain("client half-closed upload before finish_write"),
+        "MUST NOT emit truncation-clarity info when client sent finish_write=true \
+         (this is the size-mismatch bug class, a different code path) — \
+         over-action guard (#396 Diagnostic 4 asymmetry)"
+    );
+    // But the original warn MUST still fire (sanity that the test wired
+    // the failure path).
+    assert!(
+        logs_contain("inner_write failed"),
+        "the original warn must still fire on size mismatch"
     );
 
     Ok(())

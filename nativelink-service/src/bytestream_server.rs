@@ -1869,6 +1869,66 @@ impl ByteStreamServer {
                 err = ?write_result.as_ref().err(),
                 "inner_write failed"
             );
+
+            // #396: operator-friendly truncation-clarity diagnosis.
+            //
+            // The `inner_write failed` warn above carries 14 diagnostic
+            // fields for triage but its message ("inner_write failed")
+            // does not name the shape an operator sees in production.
+            // The shape: a Bazel client half-closes the HTTP/2 stream
+            // (END_STREAM, no error frame) without ever sending a
+            // `WriteRequest { finish_write: true, .. }`. The wrapper
+            // (`proto_stream_utils.rs:135`, #357) materializes this as
+            // a `Code::Cancelled` Err; the chunked path here observes
+            // `!finish_write_seen && bytes_received < expected_size`.
+            //
+            // The reason the client closes the stream pre-finish is
+            // NOT YET ROOT-CAUSED. NL #311 ("Bazel partial-upload not
+            // detected as hard error post-9.1") tracks the
+            // client-side investigation. The 2026-05-11 incident
+            // (ci-mac-1, ~30s into a 44 MB upload) was kernel-
+            // confirmed to be a Bazel-internal close — not network,
+            // not server timeout, not configured Bazel timeout.
+            // Until #311 lands, this site emits the operator-grep
+            // phrase so the class is greppable without forwarding a
+            // possibly-wrong cause attribution.
+            //
+            // Emit a SEPARATE `info!` (not warn — this fires at
+            // observed-frequent rates during incidents; warn would
+            // flood) whose message contains the literal operator-grep
+            // phrase. Fields are pre-named so triage doesn't re-derive
+            // "is this a Cancel half-close or something else?" from
+            // the 14-field warn above.
+            //
+            // Heuristic gating:
+            //   - `!finish_write_seen`: client never sent
+            //     `finish_write: true`. Distinguishes from
+            //     size-mismatch (where finish_write WAS sent with
+            //     wrong byte count) — a different bug class.
+            //   - `bytes_received < expected_size`: confirms
+            //     truncation, not a 0-byte connection setup race.
+            //   - `err.code == Code::Cancelled`: matches the
+            //     wrapper's materialized half-close error (#357).
+            //     Filters out store-side mid-write Internal errors,
+            //     out-of-order Unavailable errors, and other failure
+            //     modes that COULD also have `!finish_write_seen`.
+            if !finish_write_seen
+                && bytes_received < expected_size
+                && let Some(err) = write_result.as_ref().err()
+                && err.code == Code::Cancelled
+            {
+                info!(
+                    %digest,
+                    bytes_received,
+                    expected_bytes = expected_size,
+                    grpc_code = ?err.code,
+                    is_worker,
+                    is_mirror,
+                    "client half-closed upload before finish_write \
+                     (received {bytes_received}/{expected_size} bytes; \
+                     cause not yet root-caused — see NL #311)",
+                );
+            }
         } else if elapsed_ms > 5000 {
             info!(
                 %digest,
