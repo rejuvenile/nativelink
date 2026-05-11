@@ -638,7 +638,6 @@ async fn chunked_synchronous_commit_pushes_digest_to_stable_digests() {
             let chunk_bytes = Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
             Ok(PreparedChunk {
                 chunk_offset: (i * CHUNK) as u64,
-                chunk_sha256: sha256(&chunk_bytes),
                 chunk_bytes,
                 finish: i == N - 1,
             })
@@ -1409,15 +1408,16 @@ async fn chunked_synchronous_commit_failure_inserts_failed_writes_and_repins() {
         "fixture invariant: no pin_digests calls before the commit attempt",
     );
 
-    // Build per-chunk PreparedChunks from the ACTUAL bytes (so each
-    // chunk's per-chunk SHA matches what the driver computes and
-    // admits). Only the e2e SHA verify at commit will mismatch.
+    // Build per-chunk PreparedChunks from the ACTUAL bytes. Only the
+    // e2e SHA verify at commit will mismatch. (After #395 perf
+    // follow-up, `PreparedChunk` has no per-chunk SHA field — the
+    // wire-corruption SHA verify lives in `verify_and_prepare_chunk`
+    // before the `PreparedChunk` is built.)
     let chunks: Vec<Result<PreparedChunk, nativelink_error::Error>> = (0..N)
         .map(|i| {
             let chunk_bytes = Bytes::copy_from_slice(&actual_blob[i * CHUNK..(i + 1) * CHUNK]);
             Ok(PreparedChunk {
                 chunk_offset: (i * CHUNK) as u64,
-                chunk_sha256: sha256(&chunk_bytes),
                 chunk_bytes,
                 finish: i == N - 1,
             })

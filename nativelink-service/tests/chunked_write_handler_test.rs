@@ -1142,7 +1142,6 @@ async fn admit_prepared_chunk_returns_aborted_when_driver_mpsc_closed() {
     let prepared = PreparedChunk {
         chunk_offset: 0,
         chunk_bytes: Bytes::from(blob.clone()),
-        chunk_sha256: sha256(&blob),
         finish: true,
     };
 

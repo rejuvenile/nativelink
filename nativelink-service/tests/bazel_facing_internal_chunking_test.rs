@@ -482,7 +482,6 @@ async fn dispatch_chunks_to_driver_synchronous_commits_blob() {
             let chunk_bytes = Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
             Ok(PreparedChunk {
                 chunk_offset: (i * CHUNK) as u64,
-                chunk_sha256: sha256(&chunk_bytes),
                 chunk_bytes,
                 finish: i == N - 1,
             })
@@ -564,7 +563,6 @@ async fn dispatch_chunks_to_driver_async_commit_returns_promptly_then_drains() {
             let chunk_bytes = Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
             Ok(PreparedChunk {
                 chunk_offset: (i * CHUNK) as u64,
-                chunk_sha256: sha256(&chunk_bytes),
                 chunk_bytes,
                 finish: i == N - 1,
             })
@@ -674,7 +672,6 @@ async fn pin_budget_cap_rejects_admission_with_pinned_bytes_exhausted_signal() {
             let chunk_bytes = Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
             Ok(PreparedChunk {
                 chunk_offset: (i * CHUNK) as u64,
-                chunk_sha256: sha256(&chunk_bytes),
                 chunk_bytes,
                 finish: i == N - 1,
             })

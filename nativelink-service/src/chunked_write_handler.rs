@@ -60,7 +60,6 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -931,7 +930,6 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         Ok(PreparedChunk {
             chunk_offset,
             chunk_bytes: chunk_bytes_bytes,
-            chunk_sha256: chunk_sha256_arr,
             finish: finish_chunk,
         })
     }
@@ -1290,17 +1288,18 @@ pub async fn wait_for_no_in_flight(
 // Bazel-facing internal chunking.
 // =============================================================================
 
-/// A chunk that has already passed per-chunk SHA-256 verification and
-/// shape validation; ready for global-budget admission + per-blob mpsc
-/// `try_send`. Producer responsibility for the SHA-256: the
-/// `WriteChunked` RPC verifies the wire-supplied hash; the Bazel-facing
-/// internal-chunking path computes it on `spawn_blocking` (#213 NMA1)
-/// from the bytes itself.
+/// A chunk that has already passed per-chunk SHA-256 verification (on
+/// the `WriteChunked` RPC path) and shape validation; ready for
+/// global-budget admission + per-blob mpsc `try_send`. The
+/// Bazel-facing internal-chunking path skips per-chunk SHA-256 because
+/// it generates its own bytes (no wire-corruption surface) and the
+/// driver does not consume a per-chunk hash; end-to-end coverage comes
+/// from `commit_chunked_to_holding`'s full-blob verify against the
+/// `.holding` file before the canonical-path rename.
 #[derive(Debug)]
 pub struct PreparedChunk {
     pub chunk_offset: u64,
     pub chunk_bytes: Bytes,
-    pub chunk_sha256: [u8; 32],
     pub finish: bool,
 }
 
@@ -1369,10 +1368,6 @@ pub fn admit_prepared_chunk(
     let PreparedChunk {
         chunk_offset,
         chunk_bytes,
-        // #395: per-chunk SHA-256 was verified above (or computed by the
-        // bazel-facing chunker), and the driver does not re-verify, so
-        // the field is dropped here rather than carried on `ChunkWork`.
-        chunk_sha256: _,
         finish,
     } = chunk;
 
@@ -2966,30 +2961,20 @@ fn build_bazel_chunk_stream(
                 return None;
             }
             let final_bytes = buf.split().freeze();
-            // #239 instrumentation: sibling site for the EOF-final partial
-            // chunk; same call semantics as the per-chunk loop below.
-            record(SpawnSite::ChunkedShaAdmit);
-            // V2 falsification probe (audit:
-            // `.claude/audits/chunked-admission-p99-2026-05-11-V2.md`):
-            // measure wall-clock of `compute_sha256_blocking().await`. V1
-            // hypothesized `spawn_blocking` saturation (slow-window p99
-            // > seconds); V2 predicts sub-millisecond from empty blocking
-            // pool. Threshold 50 ms is a tunable noise floor.
-            const SHA_LOG_THRESHOLD_MS: u128 = 50;
-            let blob_size = final_bytes.len() as u64;
-            let t_sha = Instant::now();
-            let chunk_sha256 = match compute_sha256_blocking(final_bytes.clone()).await {
-                Ok(v) => v,
-                Err(err) => return Some((Err(err), State::Done)),
-            };
-            let sha_ms = t_sha.elapsed().as_millis() as u64;
-            if u128::from(sha_ms) >= SHA_LOG_THRESHOLD_MS {
-                info!(sha_ms, blob_size, "compute_sha256_blocking complete");
-            }
+            // #395 perf follow-up: per-chunk SHA-256 was previously
+            // computed here and stored on `PreparedChunk.chunk_sha256`.
+            // The driver does not consume that field (#395 dropped it
+            // from `ChunkWork`), so the computation was paying SHA-256
+            // CPU per chunk for a value that was destructured-and-
+            // discarded at `admit_prepared_chunk`. The end-to-end SHA
+            // verify in `commit_chunked_to_holding` (against `.holding`
+            // before the canonical-path rename) still defends against
+            // lying producers; the bazel-facing chunker generates its
+            // own bytes here so wire-corruption defense (the verify at
+            // `verify_and_prepare_chunk`) does not apply on this path.
             let item = PreparedChunk {
                 chunk_offset,
                 chunk_bytes: final_bytes,
-                chunk_sha256,
                 finish: true,
             };
             return Some((Ok(item), State::Done));
@@ -2999,30 +2984,11 @@ fn build_bazel_chunk_stream(
         let chunk_len = chunk_bytes.len() as u64;
         let new_consumed = bytes_consumed + chunk_len;
         let is_finish = new_consumed == total_bytes;
-        // #239 instrumentation: record spawn_blocking inter-arrival at the
-        // bazel-facing internal-chunking driver per-chunk SHA-256 (one
-        // call per re-chunked outbound chunk; highest-frequency site
-        // under sustained large-blob ingest). See `spawn_rate_probe`.
-        record(SpawnSite::ChunkedShaAdmit);
-        // V2 falsification probe (sibling of EOF-final site above): same
-        // 50 ms threshold + same falsifiable hypothesis. Co-firing >50 ms
-        // SHA samples within slow `data_stream_fut` windows = V1 alive;
-        // sub-50 ms across all slow admissions = V1 falsified.
-        const SHA_LOG_THRESHOLD_MS_PER_CHUNK: u128 = 50;
-        let chunk_blob_size = chunk_bytes.len() as u64;
-        let t_sha = Instant::now();
-        let chunk_sha256 = match compute_sha256_blocking(chunk_bytes.clone()).await {
-            Ok(v) => v,
-            Err(err) => return Some((Err(err), State::Done)),
-        };
-        let sha_ms = t_sha.elapsed().as_millis() as u64;
-        if u128::from(sha_ms) >= SHA_LOG_THRESHOLD_MS_PER_CHUNK {
-            info!(
-                sha_ms,
-                blob_size = chunk_blob_size,
-                "compute_sha256_blocking complete"
-            );
-        }
+        // #395 perf follow-up: see comment at the EOF-final site above —
+        // the per-chunk SHA-256 was discarded by the driver after #395
+        // removed `ChunkWork.chunk_sha256`. Removed here on the highest-
+        // frequency call site (one per re-chunked outbound chunk under
+        // sustained large-blob ingest).
         if is_finish {
             // Defensive: drain residual reader bytes; producing
             // anything past declared size is a protocol violation.
@@ -3047,7 +3013,6 @@ fn build_bazel_chunk_stream(
             let item = PreparedChunk {
                 chunk_offset,
                 chunk_bytes,
-                chunk_sha256,
                 finish: true,
             };
             return Some((Ok(item), State::Done));
@@ -3056,7 +3021,6 @@ fn build_bazel_chunk_stream(
         let item = PreparedChunk {
             chunk_offset,
             chunk_bytes,
-            chunk_sha256,
             finish: false,
         };
         let next_state = State::Active {
