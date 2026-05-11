@@ -355,6 +355,28 @@ pub struct AdminConfig {
     pub path: String,
 }
 
+/// Opt-in `/metrics` Prometheus exposition endpoint (#160).
+///
+/// Mounting `/metrics` is OFF by default. The endpoint is unauthenticated
+/// — it shares the listener's auth posture with the gRPC services hosted
+/// on the same socket — so exposing it on a public-facing listener (e.g.
+/// the Bazel-facing 50051) leaks operational counters (request rates,
+/// queue depths, store cardinalities, etc.) to anyone who can reach the
+/// port. Today's payload is a small fixed set (chunked-blob drop counters,
+/// worker-API state); future `MetricsComponent` additions inherit this
+/// exposure surface unconditionally if the gate is implicit.
+///
+/// The fix is precedent: every operator who wants `/metrics` must
+/// explicitly opt in per listener by adding `"metrics": {}` to the
+/// `services` block. Place the listener behind a network ACL or, ideally,
+/// only enable the flag on a dedicated internal listener.
+///
+/// Path is currently fixed at `/metrics` (de-facto Prometheus standard).
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct MetricsConfig {}
+
 #[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
@@ -498,6 +520,10 @@ pub struct ServicesConfig {
 
     /// This is the service for health status check.
     pub health: Option<HealthConfig>,
+
+    /// Opt-in `/metrics` Prometheus exposition (#160). Off by default.
+    /// See [`MetricsConfig`] for the security rationale.
+    pub metrics: Option<MetricsConfig>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]

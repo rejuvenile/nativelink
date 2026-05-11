@@ -450,6 +450,42 @@ async fn inner_main(
     // routes mount `/metrics` backed by this single registry so every
     // listener exposes the same view.
     let metrics_registry = nativelink_util::metrics_publisher::MetricsRegistry::new();
+
+    // Register the entire `StoreManager` as a single root. `StoreManager`
+    // derives `MetricsComponent` and exposes its `stores` HashMap via
+    // `#[metric]`, so this one registration walks every store the
+    // operator configured (cas_STORE, cas_FAST_SLOW_STORE, AC_STORE,
+    // AC_BACKEND_CACHED, etc.). The per-store metric tree (including
+    // `cas_FAST_SLOW_STORE.fast.memory.pinned_bytes` for #332
+    // falsifiability) is reachable under the `stores.<name>.…` path.
+    metrics_registry.register("nativelink", store_manager.clone());
+
+    // Register every scheduler that has been constructed. Schedulers
+    // implement `RootMetricsComponent` (which has `MetricsComponent` as
+    // a supertrait); we use `register_dyn` plus stable trait upcasting
+    // (Rust 1.86+) to register the trait object directly without
+    // demanding a concrete type per scheduler kind.
+    for (name, scheduler) in &action_schedulers {
+        metrics_registry.register_dyn(
+            format!("scheduler.{name}.action"),
+            scheduler.clone() as Arc<
+                dyn nativelink_util::metrics_publisher::MetricsComponentTrait
+                    + Send
+                    + Sync,
+            >,
+        );
+    }
+    for (name, scheduler) in &worker_schedulers {
+        metrics_registry.register_dyn(
+            format!("scheduler.{name}.worker"),
+            scheduler.clone() as Arc<
+                dyn nativelink_util::metrics_publisher::MetricsComponentTrait
+                    + Send
+                    + Sync,
+            >,
+        );
+    }
+
     // First-listener-wins guard: when more than one ServerConfig hosts
     // a worker_api block, the SECOND construction would register the
     // same metrics tree under the same prefix and double every line.
@@ -1492,14 +1528,25 @@ async fn inner_main(
         }
 
         // #160 Phase 1: mount the metrics publisher at `/metrics` on
-        // every HTTP listener that gets a `services` block. Each
-        // listener serves a snapshot of the SAME process-wide
+        // any HTTP listener whose `services` block opts in via
+        // `"metrics": {}` (security FIX-FIRST, see [`MetricsConfig`]).
+        // Each listener serves a snapshot of the SAME process-wide
         // registry (the registry holds Arc handles, so the per-listener
         // route receives a cheap clone). Cfg-gated on the `pprof`
         // feature because that gates `axum` in `nativelink-util`; the
         // production binary is always built with `--features pprof`.
+        // Operators must opt in PER LISTENER — typically only the
+        // internal-network listener should expose `/metrics`. The
+        // public-facing Bazel listener should leave `metrics` unset
+        // unless an upstream auth/ACL is in place.
+        // NOTE: HTTP/3 listeners do NOT mount `/metrics` even when
+        // `metrics` is set; the Http3 arm builds a `tonic_h3::H3Router`
+        // (not an axum `Router`), so axum-merge composition is not
+        // a one-line change. Operators wanting `/metrics` must
+        // configure at least one HTTP/1+2 listener with the opt-in
+        // flag set. Tracked as a follow-up to #160.
         #[cfg(feature = "pprof")]
-        {
+        if services.metrics.is_some() {
             svc = svc.merge(
                 nativelink_util::metrics_publisher::metrics_router(
                     metrics_registry.clone(),

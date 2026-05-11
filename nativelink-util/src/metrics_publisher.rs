@@ -38,6 +38,11 @@
 use std::sync::{Arc, Mutex};
 
 use nativelink_metric::{MetricFieldData, MetricKind, MetricsComponent};
+
+// Re-export for downstream callers (binary, tests) that need to upcast
+// `Arc<dyn SomeTrait: MetricsComponent>` for `register_dyn` without
+// having to add a direct `nativelink-metric` dependency.
+pub use nativelink_metric::MetricsComponent as MetricsComponentTrait;
 use tracing::span;
 use tracing::subscriber::with_default;
 use tracing_subscriber::Layer;
@@ -85,6 +90,21 @@ impl MetricsRegistry {
     where
         C: MetricsComponent + Send + Sync + 'static,
     {
+        self.register_dyn(prefix, component);
+    }
+
+    /// Register an already-erased `Arc<dyn MetricsComponent + Send + Sync>`.
+    ///
+    /// Use this when the component arrives as a trait object whose trait
+    /// has `MetricsComponent` as a supertrait (e.g. `Arc<dyn WorkerScheduler>`
+    /// where `WorkerScheduler: RootMetricsComponent: MetricsComponent`).
+    /// Rust trait upcasting (stable since 1.86) lets the caller cast to
+    /// `Arc<dyn MetricsComponent + Send + Sync>` at the call site.
+    pub fn register_dyn(
+        &self,
+        prefix: impl Into<String>,
+        component: Arc<dyn MetricsComponent + Send + Sync>,
+    ) {
         let prefix = prefix.into();
         // The Vec lock is held only for the push; rendering takes a
         // snapshot via `clone` of each Arc and drops the lock before
@@ -126,6 +146,14 @@ struct CapturedMetric {
 #[derive(Default)]
 struct CaptureLayer {
     events: Arc<Mutex<Vec<CapturedMetric>>>,
+    /// Counts events whose target is NOT `nativelink_metric` observed
+    /// during the scrape. The capture layer has the global dispatcher
+    /// for the scraping thread (see `with_default` in
+    /// [`render_prometheus`]); any such event is silently dropped from
+    /// the production tracing pipeline. We surface the count after
+    /// `with_default` returns so accidental drift (a `warn!` added to
+    /// a `publish()` body) is visible to operators rather than silent.
+    non_metric_event_count: Arc<core::sync::atomic::AtomicU64>,
 }
 
 /// Snapshot of a span's `__name` attribute, stored in the span's
@@ -161,6 +189,13 @@ where
 
     fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
         if event.metadata().target() != "nativelink_metric" {
+            // Drift detector for the `with_default` thread-local-swap
+            // documented on `render_prometheus`. Counted now, surfaced
+            // by the caller after `with_default` returns so the
+            // operator-visible warning lands on the production
+            // subscriber rather than this capture layer.
+            self.non_metric_event_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return;
         }
         let mut visitor = FieldGrabber::default();
@@ -278,13 +313,48 @@ impl tracing::field::Visit for FieldGrabber {
 /// `MetricsComponent` derive: `# HELP`, `# TYPE counter|gauge`, and
 /// the metric line. Strings are emitted as gauges with value `1` and
 /// the original text in a label, since Prometheus has no string type.
+///
+/// # Tracing isolation contract (DSR M2 / perf M1)
+///
+/// This function uses [`tracing::subscriber::with_default`] to install a
+/// fresh capture-only `Registry` on the *current thread* for the
+/// duration of `publish()`. While that capture is active, ANY
+/// `tracing` event the publish closure (or any code it transitively
+/// calls) emits is captured by this layer and **not** forwarded to
+/// the production subscriber installed by [`crate::telemetry`]. In
+/// particular, `warn!`/`error!` events emitted from inside a
+/// `MetricsComponent::publish` impl during a `/metrics` scrape are
+/// silently absorbed by the capture and never reach stdout, OTLP, or
+/// any other production sink.
+///
+/// We accept this trade-off because:
+/// - Existing `publish()` impls in this codebase emit ONLY
+///   `nativelink_metric` target events (the derived ones from
+///   `#[derive(MetricsComponent)]`); they do not log diagnostics from
+///   user code.
+/// - Composing the capture layer onto the existing global dispatcher
+///   (via `tracing-subscriber`'s `reload::Layer` or a custom
+///   `Dispatch::new` wrapper) requires structural changes to
+///   `crate::telemetry` initialization and is deferred to a future
+///   change.
+///
+/// **If you add a `warn!`/`error!`/`info!` to a `publish()` body for
+/// non-`nativelink_metric` diagnostics, those events will be lost
+/// during scrapes.** Emit such diagnostics from the construction or
+/// hot-path side instead.
+///
+/// In debug builds, accidental drift is surfaced via a counter event
+/// (`metrics_publisher_unexpected_events_total`) the layer emits if
+/// it observes any non-`nativelink_metric` event during a scrape.
 #[must_use]
 pub fn render_prometheus(registry: &MetricsRegistry) -> String {
     let snapshot = registry.snapshot();
     let captured = Arc::new(Mutex::new(Vec::<CapturedMetric>::new()));
+    let non_metric_event_count = Arc::new(core::sync::atomic::AtomicU64::new(0));
 
     let layer = CaptureLayer {
         events: captured.clone(),
+        non_metric_event_count: non_metric_event_count.clone(),
     };
     let subscriber = Registry::default().with(layer);
 
@@ -323,6 +393,22 @@ pub fn render_prometheus(registry: &MetricsRegistry) -> String {
             |arc| arc.lock().expect("capture mutex poisoned").clone(),
             |mutex| mutex.into_inner().expect("capture mutex poisoned"),
         );
+
+    // Drift surfacing: emitted on the production subscriber (the
+    // capture layer is no longer the default after `with_default`
+    // returns). Non-zero count means a `publish()` body — or
+    // something it called — emitted a non-`nativelink_metric` event
+    // that this scrape silently absorbed; this is almost certainly
+    // unintended (`warn!`/`error!` in `publish` is the typical
+    // mistake) and operators should investigate.
+    let dropped =
+        non_metric_event_count.load(core::sync::atomic::Ordering::Relaxed);
+    if dropped > 0 {
+        tracing::warn!(
+            dropped_events = dropped,
+            "metrics publisher absorbed non-nativelink_metric tracing events during scrape (silent drop) — see render_prometheus rustdoc"
+        );
+    }
 
     format_prometheus(&captured)
 }
