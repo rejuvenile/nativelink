@@ -1428,6 +1428,12 @@ impl FastSlowStore {
         let (mut fast_tx, fast_rx) = make_buf_channel_pair_with_size(128);
         let (mut chunk_tx, chunk_rx) = make_buf_channel_pair_with_size(128);
 
+        // Snapshot a Debug rendering of `key` for use inside the
+        // `async move` data-stream future without moving `key` itself
+        // (it is still borrowed below for `fast_store_fut`). Used only
+        // by the V2 step-tracepoint emitted on slow iterations.
+        let key_dbg_for_step = format!("{key:?}");
+
         let data_stream_fut = async move {
             // Writer-termination contract for `join3(data_stream_fut,
             // fast_store_fut, dispatch_fut)`: any `?` Err exit below
@@ -1454,10 +1460,31 @@ impl FastSlowStore {
             let mut fast_guard = WriteHalfGuard::new(&mut fast_tx);
             let mut chunk_guard = WriteHalfGuard::new(&mut chunk_tx);
             loop {
+                // V2 falsification probe (audit:
+                // `.claude/audits/chunked-admission-p99-2026-05-11-V2.md`).
+                // Per-iteration phase timings disambiguate which leg of the
+                // tee is the wall-clock bottleneck:
+                //   - `recv_ms` slow → upstream producer is rate-limited
+                //     (e.g. proxy-source ByteStream upload bound by client),
+                //     supports V2.
+                //   - `chunk_send_ms` slow → chunked dispatcher's downstream
+                //     pipeline (per-chunk SHA + pwrite + commit BLAKE3) is
+                //     back-pressuring, supports V1.
+                //   - `fast_send_ms` slow → fast tier consumer is the
+                //     bottleneck (not predicted by either V1/V2).
+                // Sample policy: emit only when ANY phase >= 50 ms. Production
+                // load is ~1142 chunked admissions/h × ~16 chunks each = ~18K
+                // iterations/h; an unconditional info! would flood the
+                // journal. The 50 ms threshold keeps slow events visible
+                // while keeping steady-state silent.
+                const STEP_LOG_THRESHOLD_MS: u128 = 50;
+
+                let t_recv_start = Instant::now();
                 let buffer = reader
                     .recv()
                     .await
                     .err_tip(|| "Failed to read buffer in fast_slow chunked dispatch")?;
+                let recv_ms = t_recv_start.elapsed().as_millis() as u64;
                 if buffer.is_empty() {
                     fast_guard
                         .commit_eof()
@@ -1467,7 +1494,9 @@ impl FastSlowStore {
                         .err_tip(|| "Failed to send eof to chunked dispatcher")?;
                     return Result::<(), Error>::Ok(());
                 }
+                let chunk_bytes = buffer.len() as u64;
                 let buf_for_chunk = buffer.clone();
+                let t_fast_send = Instant::now();
                 (*fast_guard).send(buffer).await.map_err(|e| {
                     make_err!(
                         Code::Internal,
@@ -1475,6 +1504,8 @@ impl FastSlowStore {
                         e
                     )
                 })?;
+                let fast_send_ms = t_fast_send.elapsed().as_millis() as u64;
+                let t_chunk_send = Instant::now();
                 (*chunk_guard).send(buf_for_chunk).await.map_err(|e| {
                     make_err!(
                         Code::Internal,
@@ -1482,6 +1513,18 @@ impl FastSlowStore {
                         e
                     )
                 })?;
+                let chunk_send_ms = t_chunk_send.elapsed().as_millis() as u64;
+                let max_phase_ms = recv_ms.max(fast_send_ms).max(chunk_send_ms);
+                if u128::from(max_phase_ms) >= STEP_LOG_THRESHOLD_MS {
+                    info!(
+                        key = %key_dbg_for_step,
+                        recv_ms,
+                        fast_send_ms,
+                        chunk_send_ms,
+                        chunk_bytes,
+                        "data_stream_fut step"
+                    );
+                }
             }
         };
 
@@ -1680,12 +1723,26 @@ impl FastSlowStore {
         // can compute `commit_elapsed_ms = elapsed_ms - admission_elapsed_ms`
         // by joining this log with the matching "admission accepted" log
         // emitted just before `join3.await`.
+        // V2 falsification-test field: effective end-to-end rate as seen
+        // at admission time. If `effective_rate_kbps` < 1024 (= 1 MB/s)
+        // for a fully-received blob, the bottleneck is upstream of this
+        // call (per V2 audit at
+        // `.claude/audits/chunked-admission-p99-2026-05-11-V2.md`):
+        // either the gRPC client itself, or the server's proxy-source
+        // upload chain when the server is fetching from a peer worker.
+        let data_elapsed_ms = data_elapsed.as_millis() as u64;
+        let effective_rate_kbps = if data_elapsed_ms > 0 {
+            (dispatch_committed_size * 1000 / 1024) / data_elapsed_ms
+        } else {
+            0
+        };
         info!(
             ?key,
-            elapsed_ms = data_elapsed.as_millis() as u64,
+            elapsed_ms = data_elapsed_ms,
             admission_elapsed_ms = admission_elapsed.as_millis() as u64,
             size_bytes = digest.size_bytes(),
             committed_size = dispatch_committed_size,
+            effective_rate_kbps,
             "FastSlowStore::update (chunked): commit complete (driver continues async β-commit)"
         );
 

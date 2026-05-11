@@ -60,6 +60,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -2966,10 +2967,23 @@ fn build_bazel_chunk_stream(
             // #239 instrumentation: sibling site for the EOF-final partial
             // chunk; same call semantics as the per-chunk loop below.
             record(SpawnSite::ChunkedShaAdmit);
+            // V2 falsification probe (audit:
+            // `.claude/audits/chunked-admission-p99-2026-05-11-V2.md`):
+            // measure wall-clock of `compute_sha256_blocking().await`. V1
+            // hypothesized `spawn_blocking` saturation (slow-window p99
+            // > seconds); V2 predicts sub-millisecond from empty blocking
+            // pool. Threshold 50 ms is a tunable noise floor.
+            const SHA_LOG_THRESHOLD_MS: u128 = 50;
+            let blob_size = final_bytes.len() as u64;
+            let t_sha = Instant::now();
             let chunk_sha256 = match compute_sha256_blocking(final_bytes.clone()).await {
                 Ok(v) => v,
                 Err(err) => return Some((Err(err), State::Done)),
             };
+            let sha_ms = t_sha.elapsed().as_millis() as u64;
+            if u128::from(sha_ms) >= SHA_LOG_THRESHOLD_MS {
+                info!(sha_ms, blob_size, "compute_sha256_blocking complete");
+            }
             let item = PreparedChunk {
                 chunk_offset,
                 chunk_bytes: final_bytes,
@@ -2988,10 +3002,25 @@ fn build_bazel_chunk_stream(
         // call per re-chunked outbound chunk; highest-frequency site
         // under sustained large-blob ingest). See `spawn_rate_probe`.
         record(SpawnSite::ChunkedShaAdmit);
+        // V2 falsification probe (sibling of EOF-final site above): same
+        // 50 ms threshold + same falsifiable hypothesis. Co-firing >50 ms
+        // SHA samples within slow `data_stream_fut` windows = V1 alive;
+        // sub-50 ms across all slow admissions = V1 falsified.
+        const SHA_LOG_THRESHOLD_MS_PER_CHUNK: u128 = 50;
+        let chunk_blob_size = chunk_bytes.len() as u64;
+        let t_sha = Instant::now();
         let chunk_sha256 = match compute_sha256_blocking(chunk_bytes.clone()).await {
             Ok(v) => v,
             Err(err) => return Some((Err(err), State::Done)),
         };
+        let sha_ms = t_sha.elapsed().as_millis() as u64;
+        if u128::from(sha_ms) >= SHA_LOG_THRESHOLD_MS_PER_CHUNK {
+            info!(
+                sha_ms,
+                blob_size = chunk_blob_size,
+                "compute_sha256_blocking complete"
+            );
+        }
         if is_finish {
             // Defensive: drain residual reader bytes; producing
             // anything past declared size is a protocol violation.
