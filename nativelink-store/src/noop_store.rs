@@ -135,6 +135,15 @@ impl StoreDriver for NoopStore {
         Ok(())
     }
 
+    /// `NoopStore` accepts callbacks but never fires them — by design,
+    /// it stores nothing. Returning `false` lets
+    /// `FastSlowStore::register_slow_eviction_stable_set_listener` (#367)
+    /// emit an operator-visible startup `warn!` if `cas_FAST_SLOW_STORE.slow
+    /// = NoopStore` is misconfigured into a durability-sensitive role.
+    fn supports_removal_callbacks(&self) -> bool {
+        false
+    }
+
     /// NoopStore is a leaf — no data is stored, no inner store contributes
     /// to the BIS chain.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {

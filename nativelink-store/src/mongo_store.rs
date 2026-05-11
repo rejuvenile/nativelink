@@ -586,6 +586,16 @@ impl StoreDriver for ExperimentalMongoStore {
         Ok(())
     }
 
+    /// `register_item_callback` is a silent no-op: MongoDB document
+    /// removals never fire `ItemCallback`s. Returning `false` lets
+    /// `FastSlowStore::register_slow_eviction_stable_set_listener` (#367)
+    /// emit an operator-visible startup `warn!` so a deployment with
+    /// `cas_FAST_SLOW_STORE.slow = MongoStore` doesn't silently keep
+    /// BIS-acking digests that have been removed from Mongo.
+    fn supports_removal_callbacks(&self) -> bool {
+        false
+    }
+
     /// MongoStore is a leaf — Mongo owns its own document lifecycle. No
     /// BIS or pin participation here.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {

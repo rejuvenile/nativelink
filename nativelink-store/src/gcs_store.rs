@@ -475,6 +475,16 @@ where
         Ok(())
     }
 
+    /// `register_item_callback` is a silent no-op: GCS-side lifecycle
+    /// evictions never fire `ItemCallback`s. Returning `false` lets
+    /// `FastSlowStore::register_slow_eviction_stable_set_listener` (#367)
+    /// emit an operator-visible startup `warn!` so a deployment with
+    /// `cas_FAST_SLOW_STORE.slow = GcsStore` doesn't silently keep
+    /// BIS-acking digests that GCS lifecycle has already deleted.
+    fn supports_removal_callbacks(&self) -> bool {
+        false
+    }
+
     /// GcsStore is a leaf — GCS owns object lifecycle. The BIS pipeline is
     /// owned by a wrapping FastSlowStore if any. Treat as Leaf.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {

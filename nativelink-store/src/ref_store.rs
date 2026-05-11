@@ -198,15 +198,20 @@ impl StoreDriver for RefStore {
         Ok(())
     }
 
-    /// Forward to the resolved inner if available; otherwise fall back
-    /// to the trait default (`true`). Wrappers that consult this flag
-    /// at registration time to warn about silent-no-op slow tiers
-    /// (e.g. `FastSlowStore`'s #367 listener over a Redis-backed AC
-    /// chain) call this AFTER `register_item_callback`, by which time
-    /// `get_store()` has typically been called at least once and the
-    /// inner is resolved. The `false` for unresolved is acceptable: a
-    /// store that never resolves never fires events either, so the
-    /// downstream warn is informationally correct.
+    /// Forward to the resolved inner if available; otherwise return
+    /// `false` so wrappers that consult this flag at registration time
+    /// emit an operator-visible warn for silent-no-op slow tiers.
+    ///
+    /// **Unresolved-cell behavior**: production wires `RefStore` for
+    /// late-binding (e.g. `AC_BACKEND_CACHED.slow = ref(REDIS_AC_STORE)`),
+    /// and the cell IS empty when `FastSlowStore::new` calls
+    /// `register_slow_eviction_stable_set_listener` (#367) at
+    /// construction. Returning `false` for the unresolved case
+    /// surfaces the warn at startup, alerting the operator that the
+    /// listener will be silent until the inner resolves AND supports
+    /// callbacks. Returning `true` here would silently suppress the
+    /// warn for the most common production composition (DSR M2 finding,
+    /// 2026-05-11).
     fn supports_removal_callbacks(&self) -> bool {
         let ref_store = self.inner.cell.0.get();
         unsafe {
@@ -214,8 +219,9 @@ impl StoreDriver for RefStore {
                 return store.supports_removal_callbacks();
             }
         }
-        // Inner not resolved yet; conservatively report the default.
-        true
+        // Inner not resolved yet; conservative `false` ensures the
+        // operator-visible warn fires for late-binding compositions.
+        false
     }
 
     /// RefStore resolves its inner store lazily. We cannot safely return a

@@ -799,6 +799,18 @@ where
         Ok(())
     }
 
+    /// `OntapS3Store::register_item_callback` accepts callbacks but they
+    /// fire ONLY on the local `consider_expired_after_s` TTL evaluated in
+    /// `has()` — NOT on actual ONTAP S3 lifecycle deletions, which happen
+    /// out-of-band. Returning `false` lets
+    /// `FastSlowStore::register_slow_eviction_stable_set_listener` (#367)
+    /// emit an operator-visible startup `warn!` so a deployment with
+    /// `cas_FAST_SLOW_STORE.slow = OntapS3Store` doesn't silently keep
+    /// BIS-acking digests that ONTAP has already deleted.
+    fn supports_removal_callbacks(&self) -> bool {
+        false
+    }
+
     /// OntapS3Store is a leaf — Ontap S3 owns object lifecycle. Treat as
     /// Leaf with empty drains.
     fn stable_delegation(&self) -> StableDigestDelegation<'_> {
