@@ -121,11 +121,9 @@ async fn chunked_commit_makes_blob_visible_to_has_immediately() {
         for i in 0..N {
             let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
             let permit = budget.try_acquire_chunk().expect("permit");
-            let chunk_sha = sha256(&bytes);
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: bytes,
-                chunk_sha256: chunk_sha,
                 finish: i == N - 1,
                 _permit: permit,
                 _pin_permit: None,
@@ -255,11 +253,9 @@ async fn chunked_commit_visible_through_existence_cache_store_247() {
         for i in 0..N {
             let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
             let permit = budget.try_acquire_chunk().expect("permit");
-            let chunk_sha = sha256(&bytes);
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: bytes,
-                chunk_sha256: chunk_sha,
                 finish: i == N - 1,
                 _permit: permit,
                 _pin_permit: None,

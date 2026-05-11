@@ -128,11 +128,9 @@ async fn run_one_chunked_commit(
         let hi = std::cmp::min(lo + chunk, blob.len());
         let bytes = Bytes::from(blob[lo..hi].to_vec());
         let permit = budget.try_acquire_chunk().expect("permit");
-        let chunk_sha = sha256(&bytes);
         tx.send(ChunkWork {
             chunk_offset: lo as u64,
             chunk_bytes: bytes,
-            chunk_sha256: chunk_sha,
             finish: i == n - 1,
             _permit: permit,
             _pin_permit: None,

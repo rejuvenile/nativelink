@@ -175,7 +175,6 @@ async fn pin_serves_request_under_verify_when_enabled() {
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec()),
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -285,7 +284,6 @@ async fn pin_skipped_when_kill_switch_off() {
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec()),
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -401,7 +399,6 @@ async fn pin_consulted_before_slow_store_when_enabled() {
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: Bytes::from(lying_blob[i * CHUNK..(i + 1) * CHUNK].to_vec()),
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -531,7 +528,6 @@ async fn pin_partial_coverage_waits_then_serves_from_pin_when_chunk_lands_254() 
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: Bytes::from(real_blob[i * CHUNK..(i + 1) * CHUNK].to_vec()),
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -563,7 +559,6 @@ async fn pin_partial_coverage_waits_then_serves_from_pin_when_chunk_lands_254() 
             .send(ChunkWork {
                 chunk_offset: CHUNK as u64,
                 chunk_bytes: Bytes::from(blob_for_send[CHUNK..2 * CHUNK].to_vec()),
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -664,7 +659,6 @@ async fn pin_partial_coverage_falls_through_on_timeout_254() {
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: Bytes::from(real_blob[i * CHUNK..(i + 1) * CHUNK].to_vec()),
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,

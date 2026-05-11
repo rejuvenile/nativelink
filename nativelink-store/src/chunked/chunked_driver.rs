@@ -228,7 +228,6 @@ pub const DISCARD_AFTER_FAILURE_TIMEOUT: core::time::Duration =
 pub struct ChunkWork {
     pub chunk_offset: u64,
     pub chunk_bytes: Bytes,
-    pub chunk_sha256: [u8; 32],
     /// True iff this is the LAST chunk of the blob. Triggers commit
     /// once all preceding chunks have landed.
     pub finish: bool,
@@ -729,7 +728,6 @@ async fn run_driver<Fe: FileEntry>(
         let ChunkWork {
             chunk_offset,
             chunk_bytes,
-            chunk_sha256,
             finish,
             _permit,
             _pin_permit,
@@ -747,10 +745,12 @@ async fn run_driver<Fe: FileEntry>(
 
         // Per design §8.3.1: per-chunk SHA-256 is verified at the RPC
         // handler (admission) on `spawn_blocking` per #213 perf-opt
-        // NMA1, so the driver does not re-verify. We DO carry
-        // `chunk_sha256` here for diagnostic correlation if a future
-        // phase wants to defer verification or re-verify after retry.
-        let _ = chunk_sha256;
+        // NMA1, so the driver does not re-verify and `ChunkWork` does
+        // not carry the per-chunk SHA-256 (#395). The end-to-end SHA-256
+        // verify in `commit_chunked_to_holding` (against `.holding`,
+        // BEFORE the canonical-path rename) covers the lying-producer
+        // case; the admission-side per-chunk verify covers wire
+        // corruption.
 
         // Write the chunk via the FilesystemStore adapter (which is
         // already on `spawn_blocking` internally — see
@@ -1393,11 +1393,9 @@ mod tests {
             for i in 0..N {
                 let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
                 let permit = budget.try_acquire_chunk().expect("permit");
-                let chunk_sha = sha256(&bytes);
                 tx.send(ChunkWork {
                     chunk_offset: (i * CHUNK) as u64,
                     chunk_bytes: bytes,
-                    chunk_sha256: chunk_sha,
                     finish: i == N - 1,
                     _permit: permit,
                     _pin_permit: None,
@@ -1461,11 +1459,9 @@ mod tests {
             for (idx, &i) in order.iter().enumerate() {
                 let bytes = Bytes::from(blob[i * CHUNK..(i + 1) * CHUNK].to_vec());
                 let permit = budget.try_acquire_chunk().expect("permit");
-                let chunk_sha = sha256(&bytes);
                 tx.send(ChunkWork {
                     chunk_offset: (i * CHUNK) as u64,
                     chunk_bytes: bytes,
-                    chunk_sha256: chunk_sha,
                     finish: idx == order.len() - 1,
                     _permit: permit,
                     _pin_permit: None,
@@ -1521,7 +1517,6 @@ mod tests {
                 tx.send(ChunkWork {
                     chunk_offset: (i * CHUNK) as u64,
                     chunk_bytes: bytes,
-                    chunk_sha256: [0u8; 32],
                     finish: i == N - 1,
                     _permit: permit,
                     _pin_permit: None,
@@ -1582,7 +1577,6 @@ mod tests {
             tx.send(ChunkWork {
                 chunk_offset: 0,
                 chunk_bytes: Bytes::from(vec![0xddu8; CHUNK]),
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -1639,7 +1633,6 @@ mod tests {
         tx.send(ChunkWork {
             chunk_offset: 0,
             chunk_bytes: Bytes::from(vec![0xeeu8; CHUNK]),
-            chunk_sha256: [0u8; 32],
             finish: false,
             _permit: permit,
             _pin_permit: None,
@@ -1699,7 +1692,6 @@ mod tests {
         let work_a = ChunkWork {
             chunk_offset: 0,
             chunk_bytes: Bytes::from_static(b""),
-            chunk_sha256: [0u8; 32],
             finish: false,
             _permit: permit_a,
             _pin_permit: None,
@@ -1712,7 +1704,6 @@ mod tests {
         let work_b = ChunkWork {
             chunk_offset: 4096,
             chunk_bytes: Bytes::from_static(b""),
-            chunk_sha256: [0u8; 32],
             finish: false,
             _permit: permit_b,
             _pin_permit: None,
@@ -1783,7 +1774,6 @@ mod tests {
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: bytes,
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -1859,7 +1849,6 @@ mod tests {
         tx.send(ChunkWork {
             chunk_offset: 0,
             chunk_bytes: Bytes::from(blob),
-            chunk_sha256: [0u8; 32],
             finish: true,
             _permit: permit,
             _pin_permit: None,
@@ -1925,7 +1914,6 @@ mod tests {
                 tx.send(ChunkWork {
                     chunk_offset: (i * CHUNK) as u64,
                     chunk_bytes: bytes,
-                    chunk_sha256: [0u8; 32],
                     finish: false,
                     _permit: permit,
                     _pin_permit: None,
@@ -2010,7 +1998,6 @@ mod tests {
                 tx.send(ChunkWork {
                     chunk_offset: (i * CHUNK) as u64,
                     chunk_bytes: bytes,
-                    chunk_sha256: [0u8; 32],
                     finish: false,
                     _permit: permit,
                     _pin_permit: None,
@@ -2082,7 +2069,6 @@ mod tests {
             tx.send(ChunkWork {
                 chunk_offset: 0,
                 chunk_bytes: Bytes::from(blob.clone()),
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -2136,7 +2122,6 @@ mod tests {
             tx.send(ChunkWork {
                 chunk_offset: 0,
                 chunk_bytes: Bytes::from(blob.clone()),
-                chunk_sha256: [0u8; 32],
                 finish: true,
                 _permit: permit,
                 _pin_permit: None,
@@ -2231,7 +2216,6 @@ mod tests {
             tx.send(ChunkWork {
                 chunk_offset: 0,
                 chunk_bytes: Bytes::from(blob.clone()),
-                chunk_sha256: [0u8; 32],
                 finish: true,
                 _permit: permit,
                 _pin_permit: None,
@@ -2297,7 +2281,6 @@ mod tests {
             tx.send(ChunkWork {
                 chunk_offset: (i * CHUNK) as u64,
                 chunk_bytes: bytes,
-                chunk_sha256: [0u8; 32],
                 finish: false,
                 _permit: permit,
                 _pin_permit: None,
@@ -2393,7 +2376,6 @@ mod tests {
         tx.send(ChunkWork {
             chunk_offset: 0,
             chunk_bytes: Bytes::from(vec![0xeeu8; CHUNK]),
-            chunk_sha256: [0u8; 32],
             finish: false,
             _permit: permit,
             _pin_permit: None,
@@ -2512,7 +2494,6 @@ mod tests {
             tx.send(ChunkWork {
                 chunk_offset: 0,
                 chunk_bytes: Bytes::from(blob.clone()),
-                chunk_sha256: [0u8; 32],
                 finish: true,
                 _permit: permit,
                 _pin_permit: None,
@@ -2613,7 +2594,6 @@ mod tests {
                 tx.send(ChunkWork {
                     chunk_offset: (i * CHUNK) as u64,
                     chunk_bytes: bytes,
-                    chunk_sha256: [0u8; 32],
                     finish: i == N - 1,
                     _permit: permit,
                     _pin_permit: None,

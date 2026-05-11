@@ -1369,7 +1369,10 @@ pub fn admit_prepared_chunk(
     let PreparedChunk {
         chunk_offset,
         chunk_bytes,
-        chunk_sha256,
+        // #395: per-chunk SHA-256 was verified above (or computed by the
+        // bazel-facing chunker), and the driver does not re-verify, so
+        // the field is dropped here rather than carried on `ChunkWork`.
+        chunk_sha256: _,
         finish,
     } = chunk;
 
@@ -1467,7 +1470,6 @@ pub fn admit_prepared_chunk(
     let work = ChunkWork {
         chunk_offset,
         chunk_bytes,
-        chunk_sha256,
         finish,
         _permit: permit,
         _pin_permit: pin_permit,
