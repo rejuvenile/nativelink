@@ -124,6 +124,31 @@ pub struct WorkerApiServer {
     /// disconnect-cleanup task — both of which operate inside this
     /// server, not the scheduler.
     endpoint_state: Arc<parking_lot::Mutex<HashMap<String, EndpointState>>>,
+    /// (#387) Per-endpoint flap-detection history. Held in a SEPARATE
+    /// `parking_lot::Mutex` from `endpoint_state` so it survives the
+    /// disconnect-cleanup `state.remove(&cas_endpoint)` at
+    /// `:1108-1166`. The OOM-loop pattern (process dies → kernel RST
+    /// → server's per-connection background task observes the stream
+    /// break in ms → disconnect-cleanup runs while no new connection
+    /// has arrived → `state.remove`) is the exact case the detector
+    /// is built to surface, and folding flap history into
+    /// `EndpointState` made the detector silent in that case — see
+    /// `.claude/reviews/387-first-pass/distributed-systems-reviewer.md`
+    /// BLOCK-FIX-FIRST.
+    ///
+    /// Lock-order rule: NEVER hold both `endpoint_state` and
+    /// `flap_history` at the same time. The connect path takes
+    /// `endpoint_state` first (for the #141 wipe), releases it, then
+    /// takes `flap_history` (for the flap check). The disconnect
+    /// path takes only `endpoint_state` and never touches
+    /// `flap_history`. No call site holds both — the linter for this
+    /// is "search the file for `endpoint_state.lock()` and check that
+    /// every `flap_history.lock()` is OUTSIDE that guard's scope."
+    // UNBOUNDED-OK: one entry per cas_endpoint; #216 build_sha
+    // allowlist gates the universe of connecting endpoints; not
+    // attacker-controlled. Per-entry deque also UNBOUNDED-OK (capped
+    // at FLAP_THRESHOLD by eviction-on-push, comment on field).
+    flap_history: Arc<parking_lot::Mutex<HashMap<String, FlapHistory>>>,
     /// (#216) Allowed worker build SHAs. `None` = validation disabled
     /// (every worker is accepted). `Some(set)` with `set` non-empty =
     /// reject any `ConnectWorkerRequest.build_sha` not present in the
@@ -264,29 +289,46 @@ struct EndpointState {
     /// connection has taken over and the cleanup must be suppressed
     /// to avoid wiping the new worker's just-registered entries.
     owner_worker_id: WorkerId,
-    /// (#387) Sliding window of timestamps at which this endpoint's
-    /// `boot_epoch_id` was observed to change (i.e. a fresh worker
-    /// process took over the endpoint). Bounded above by
+}
+
+/// (#387) Per-endpoint flap-detection state. Lives in
+/// `WorkerApiServer::flap_history` — a separate map from
+/// `endpoint_state` so disconnect-cleanup's `state.remove(&cas_endpoint)`
+/// at the bottom of `WorkerConnection`'s background task
+/// (`worker_api_server.rs:1108-1166`) does NOT wipe the deque /
+/// cooldown / last-seen-epoch values. Without this separation the
+/// OOM-loop pattern (process dies → kernel RST → server disconnect
+/// cleanup runs in ms → worker relaunches seconds later) wipes the
+/// deque between every connect, so the detector only fires on the
+/// rare race-flap where a new connection arrives BEFORE the old one's
+/// cleanup runs — exactly the opposite of the OOM-loop case the
+/// detector is built to surface.
+///
+/// `last_seen_epoch` replaces the previous `EndpointState`-sourced
+/// `prev.boot_epoch` lookup: it is the last `boot_epoch_id` we
+/// observed for this endpoint across ALL prior connects, regardless
+/// of whether `endpoint_state` still has an entry. An epoch change
+/// (or `new_boot_epoch == 0`, the legacy-worker "cannot tell new from
+/// old" path inherited from #141) triggers a flap push.
+#[derive(Debug, Default, Clone)]
+struct FlapHistory {
+    /// Last `boot_epoch_id` we observed on a connect for this endpoint.
+    /// `None` means we have never seen a connect for this endpoint.
+    /// Update at the end of every connect. SURVIVES disconnect cleanup
+    /// — that is the load-bearing property over the prior
+    /// `EndpointState.boot_epoch` lookup.
+    last_seen_epoch: Option<u64>,
+    /// Sliding window of timestamps at which this endpoint's
+    /// `boot_epoch_id` was observed to change. Bounded above by
     /// `FLAP_THRESHOLD` after each insert evicts entries older than
-    /// `FLAP_WINDOW` — for a steady-state non-flapping worker the
-    /// deque carries 0–1 entries, and a flapping worker is the case
-    /// we explicitly want to detect. Timestamps come from `now_fn` so
-    /// tests can drive the cooldown / window logic deterministically;
-    /// in production this is wall-clock (Duration since UNIX_EPOCH).
-    ///
-    /// Producer: the `needs_wipe == true` branch in
-    /// `inner_connect_worker`. Consumer: only the same branch (read
-    /// the count, compare to threshold + cooldown, emit the warn).
-    /// `parking_lot::Mutex` on `endpoint_state` already serializes
-    /// access; no separate lock.
+    /// `FLAP_WINDOW`. Timestamps come from `now_fn`.
     // UNBOUNDED-OK: capped at FLAP_THRESHOLD entries per endpoint after
     // each push (older entries dropped). One push per worker reconnect;
     // not attacker-controlled (#216 build_sha allowlist gates connects).
     epoch_changes: VecDeque<Duration>,
-    /// (#387) Last time the flap-warn fired for this endpoint, used to
-    /// suppress re-warn within `FLAP_COOLDOWN`. `None` if the warn has
-    /// not fired yet. Timestamps come from the same `now_fn` as
-    /// `epoch_changes`.
+    /// Last time the flap-warn fired for this endpoint, used to
+    /// suppress re-warn within `FLAP_COOLDOWN`. `None` if the warn
+    /// has not yet fired.
     last_flap_warn_at: Option<Duration>,
 }
 
@@ -409,6 +451,7 @@ impl WorkerApiServer {
             worker_proxy,
             small_blob_dispatcher,
             endpoint_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            flap_history: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             compatible_build_shas,
             metrics: Arc::new(WorkerApiMetrics::default()),
         })
@@ -419,6 +462,24 @@ impl WorkerApiServer {
     /// mark_stable / backfill counters directly.
     pub fn metrics(&self) -> Arc<WorkerApiMetrics> {
         self.metrics.clone()
+    }
+
+    /// (#387) Test-only: returns `true` if there is currently NO
+    /// `EndpointState` entry for `endpoint`. Used by the disconnect-
+    /// cleanup-to-completion test
+    /// (`worker_flap_detection_survives_disconnect_cleanup_test`) to
+    /// poll until the per-connection background task has run its
+    /// `state.remove(&cas_endpoint)` at `:1108-1166` before the next
+    /// connect. The new connection without this fence would race the
+    /// cleanup and exercise the same-endpoint-already-cloned-deque
+    /// path that pre-existed in `EndpointState` — defeating the
+    /// purpose of moving the deque into `flap_history`.
+    ///
+    /// Held lock window is the parking_lot `endpoint_state` mutex
+    /// (sync, no `.await`), so this is safe to call from any test
+    /// context.
+    pub fn endpoint_state_is_empty_for_testing(&self, endpoint: &str) -> bool {
+        !self.endpoint_state.lock().contains_key(endpoint)
     }
 
     pub fn into_service(self) -> Server<Self> {
@@ -576,9 +637,20 @@ impl WorkerApiServer {
         // the owner_worker_id update guarantees the OLD task cannot
         // observe a half-applied state where the old owner is still
         // recorded but the locality_map has already been mutated.
+        // (#387) `_prev_was_some` captures whether `endpoint_state`
+        // had an entry for this endpoint at the moment we took the
+        // lock. Live-but-unused-in-production by design: it is
+        // referenced only by the commented mutation-step block at
+        // `:768-770` that simulates the BLOCK-FIX-FIRST lifecycle
+        // defect WITHOUT re-taking the `endpoint_state` lock outside
+        // its critical section (which would violate the lock-order
+        // rule on `flap_history`). Leading underscore silences the
+        // `unused_variable` lint while preserving the seam.
+        let mut _prev_was_some = false;
         let needs_bis_buffer_clear = if !worker_cas_endpoint.is_empty() {
             let mut state = self.endpoint_state.lock();
             let prev = state.get(&worker_cas_endpoint).cloned();
+            _prev_was_some = prev.is_some();
             // Wipe whenever the new epoch differs from the prev epoch,
             // OR when the new epoch is 0 (legacy worker — we cannot
             // distinguish "transient reconnect" from "fresh process").
@@ -646,18 +718,65 @@ impl WorkerApiServer {
                     "wiped locality_map + dispatcher state on worker boot_epoch_id change"
                 );
             }
-            // (#387) Flap detection. Only fires on the
-            // `needs_wipe == true` branch — same-epoch reconnects are
-            // transient stream drops, not whole-process restarts, and
-            // would inflate the count past the threshold for a
-            // perfectly healthy worker. Carries the sliding window
-            // and cooldown timestamp across the `state.insert()` below
-            // so history survives the EndpointState replacement.
-            let (mut epoch_changes, mut last_flap_warn_at) = prev
-                .as_ref()
-                .map(|p| (p.epoch_changes.clone(), p.last_flap_warn_at))
-                .unwrap_or_default();
-            if needs_wipe {
+            state.insert(
+                worker_cas_endpoint.clone(),
+                EndpointState {
+                    boot_epoch: new_boot_epoch,
+                    owner_worker_id: worker_id.clone(),
+                },
+            );
+            // (#387) DROP the `endpoint_state` guard before touching
+            // `flap_history`. Lock-order rule: never hold both. See
+            // the doc-comment on `WorkerApiServer::flap_history`.
+            drop(state);
+            needs_wipe
+        } else {
+            false
+        };
+
+        // (#387) Flap detection. Sources `last_seen_epoch` from
+        // `flap_history` — a separate map that is NEVER cleared by
+        // disconnect cleanup. The OOM-loop pattern (disconnect
+        // cleanup wipes `endpoint_state` between every reconnect)
+        // would silently empty the deque if we read it from
+        // `EndpointState`; with `flap_history` separate, the deque
+        // accumulates across reconnects regardless of whether
+        // `endpoint_state` was cleared in between.
+        //
+        // Fires when the observed epoch differs from
+        // `last_seen_epoch` (a new worker process took over the
+        // endpoint) OR the new epoch is 0 (legacy worker — same
+        // "cannot tell new from old" path #141 inherits, so we treat
+        // every epoch-0 connect as a fresh process).
+        //
+        // First-ever connect: `last_seen_epoch.is_none()` → no flap
+        // push, but we record the epoch so the NEXT differing-epoch
+        // connect fires correctly.
+        if !worker_cas_endpoint.is_empty() {
+            // MUTATION-STEP (commented in production): uncommenting
+            // the wipe below simulates the BLOCK-FIX-FIRST defect
+            // (folding flap state back into `EndpointState` so it is
+            // wiped by disconnect-cleanup's `state.remove`). Gated on
+            // `!_prev_was_some` so it only wipes in the OOM-loop case
+            // (no prev `EndpointState` at connect time → the
+            // disconnect-cleanup task had already run); the
+            // race-flap case (prev still owned) keeps history,
+            // matching the original buggy semantics exactly. The
+            // BLOCK-FIX regression test
+            // `worker_flap_detection_survives_disconnect_cleanup_test`
+            // MUST red-fail with the "flap detector wiped by
+            // disconnect cleanup — operator-blind to OOM-loop
+            // pattern" assertion when this line is uncommented.
+            //
+            // if !_prev_was_some {
+            //     self.flap_history.lock().remove(&worker_cas_endpoint);
+            // }
+            let mut hist = self.flap_history.lock();
+            let entry = hist.entry(worker_cas_endpoint.clone()).or_default();
+            let is_epoch_change = entry
+                .last_seen_epoch
+                .is_some_and(|prev_epoch| prev_epoch != new_boot_epoch || new_boot_epoch == 0);
+            if is_epoch_change {
                 // Use `now_fn` (not `SystemTime::now()`) so tests can
                 // drive the window/cooldown logic deterministically;
                 // production wraps `SystemTime::now() - UNIX_EPOCH`.
@@ -666,23 +785,24 @@ impl WorkerApiServer {
                 // already sorted oldest-front because pushes are
                 // monotonic in `now_dur`, so a single front-pop loop
                 // suffices.
-                while let Some(front) = epoch_changes.front() {
+                while let Some(front) = entry.epoch_changes.front() {
                     if now_dur.saturating_sub(*front) > FLAP_WINDOW {
-                        epoch_changes.pop_front();
+                        entry.epoch_changes.pop_front();
                     } else {
                         break;
                     }
                 }
-                epoch_changes.push_back(now_dur);
-                if epoch_changes.len() >= FLAP_THRESHOLD {
-                    let cooldown_active = last_flap_warn_at
+                entry.epoch_changes.push_back(now_dur);
+                if entry.epoch_changes.len() >= FLAP_THRESHOLD {
+                    let cooldown_active = entry
+                        .last_flap_warn_at
                         .is_some_and(|prev_warn| {
                             now_dur.saturating_sub(prev_warn) < FLAP_COOLDOWN
                         });
                     if !cooldown_active {
                         warn!(
                             endpoint = %worker_cas_endpoint,
-                            flips_in_window = epoch_changes.len(),
+                            flips_in_window = entry.epoch_changes.len(),
                             window_secs = FLAP_WINDOW.as_secs(),
                             "worker reconnect storm — process restarting repeatedly \
                              (likely whole-process OOM, not just per-action SIGKILL)"
@@ -690,23 +810,12 @@ impl WorkerApiServer {
                         self.metrics
                             .worker_flap_warns_total
                             .fetch_add(1, Ordering::Relaxed);
-                        last_flap_warn_at = Some(now_dur);
+                        entry.last_flap_warn_at = Some(now_dur);
                     }
                 }
             }
-            state.insert(
-                worker_cas_endpoint.clone(),
-                EndpointState {
-                    boot_epoch: new_boot_epoch,
-                    owner_worker_id: worker_id.clone(),
-                    epoch_changes,
-                    last_flap_warn_at,
-                },
-            );
-            needs_wipe
-        } else {
-            false
-        };
+            entry.last_seen_epoch = Some(new_boot_epoch);
+        }
 
         // (#97) On boot_epoch change, clear the BIS resend buffer for
         // this endpoint BEFORE add_worker triggers replay. The new

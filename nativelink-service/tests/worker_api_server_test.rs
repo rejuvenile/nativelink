@@ -2816,9 +2816,16 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
 // epochs while the operator only sees per-action SIGKILL noise.
 //
 // #387 adds a sliding-window flap counter (3 epoch changes within
-// 5 min) co-located on `EndpointState` (no new lock — already
-// serialized by the same `endpoint_state` mutex the wipe takes) plus
-// a `worker_flap_warns_total` counter on `WorkerApiMetrics`. A
+// 5 min) held in a SEPARATE `flap_history` map keyed by
+// `cas_endpoint` (its own `parking_lot::Mutex`, distinct from
+// `endpoint_state`'s lock — the distributed-systems-reviewer
+// `.claude/reviews/387-first-pass/...` BLOCK-FIX-FIRST showed that
+// folding flap state into `EndpointState` made the detector silent
+// in the OOM-loop pattern because disconnect-cleanup wipes
+// `endpoint_state` between every reconnect). The `flap_history` map
+// is NEVER touched by disconnect cleanup, so the deque accumulates
+// across reconnects regardless of `endpoint_state` lifecycle.
+// Counter `worker_flap_warns_total` rides on `WorkerApiMetrics`; a
 // 60-second cooldown suppresses re-warn so a sustained 1-per-minute
 // flap doesn't drown the log.
 //
@@ -3087,5 +3094,132 @@ pub async fn worker_flap_same_epoch_reconnects_dont_count_test()
         "same-epoch reconnects must not count as flaps — those are transient \
          stream drops, not whole-process restarts"
     );
+    Ok(())
+}
+
+/// BLOCK-FIX regression for distributed-systems-reviewer's
+/// `.claude/reviews/387-first-pass/distributed-systems-reviewer.md`
+/// finding: the OOM-loop pattern wipes `endpoint_state` between every
+/// reconnect (worker dies → kernel RST → server disconnect-cleanup
+/// runs `state.remove(&cas_endpoint)` in ms while no new connection
+/// has arrived). If the flap deque lives inside `EndpointState`,
+/// every disconnect-cleanup wipes it and the detector is silent on
+/// the exact pattern it was built to surface.
+///
+/// This test FORCES the disconnect-cleanup task to completion between
+/// every connect (by polling `endpoint_state_is_empty_for_testing`
+/// inside a `tokio::time::timeout` deadlock-detector) before the next
+/// connect. After three such fully-cleaned-up flips with rising
+/// boot_epoch values, the flap detector MUST still observe the
+/// threshold crossing and fire exactly one warn — because the new
+/// `flap_history` map is held in a SEPARATE `Mutex` from
+/// `endpoint_state` and is NOT touched by disconnect cleanup.
+///
+/// Mutation step: in `worker_api_server.rs`, fold the
+/// `last_seen_epoch / epoch_changes / last_flap_warn_at` fields back
+/// into `EndpointState` and source them via `prev.as_ref().map(...)`
+/// in `inner_connect_worker`. This test MUST then panic with
+/// "flap detector wiped by disconnect cleanup — operator-blind to
+/// OOM-loop pattern".
+#[nativelink_test]
+pub async fn worker_flap_detection_survives_disconnect_cleanup_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    use core::sync::atomic::Ordering;
+
+    let cas_endpoint = "grpc://192.168.1.102:50081";
+    let clock = MockClock::new(4_000_000);
+    let (server, clock) = setup_multi_connect_with_clock(clock).await?;
+    let metrics = server.metrics();
+
+    // Flip helper that closes the stream and drives the per-connection
+    // background task's disconnect-cleanup to completion BEFORE
+    // returning. Production OOM-loop pattern: worker dies, kernel RST,
+    // disconnect cleanup runs, only THEN the worker relaunches. By
+    // polling `endpoint_state_is_empty_for_testing` we force this
+    // ordering deterministically — no `tokio::time::sleep` as
+    // synchronization (per CLAUDE.md). 5s timeout doubles as a
+    // deadlock detector if the background task never runs.
+    async fn flip_with_cleanup(
+        server: &WorkerApiServer,
+        cas_endpoint: &str,
+        epoch: u64,
+    ) -> Result<(), Error> {
+        let (tx, stream) = open_worker_connection(server, cas_endpoint, epoch).await?;
+        drop(tx);
+        drop(stream);
+        // Wait until the per-connection background task has run its
+        // `state.remove(&cas_endpoint)` at the bottom of
+        // `WorkerConnection::start`'s async block.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server.endpoint_state_is_empty_for_testing(cas_endpoint) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            make_err!(
+                tonic::Code::DeadlineExceeded,
+                "disconnect-cleanup background task did not run within 5s — \
+                 production OOM-loop pattern cannot be reproduced"
+            )
+        })?;
+        Ok(())
+    }
+
+    // First connect: establishes `last_seen_epoch` in `flap_history`.
+    // No flap push yet (first ever).
+    clock.set_now_secs(4_000_000);
+    flip_with_cleanup(&server, cas_endpoint, 1).await?;
+    assert!(
+        server.endpoint_state_is_empty_for_testing(cas_endpoint),
+        "endpoint_state must be empty after first cleanup — test invariant"
+    );
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        0,
+        "first connect must not fire (no prior epoch in flap_history yet)"
+    );
+
+    // Second connect: epoch flips 1 → 2. `flap_history.last_seen_epoch`
+    // sourced from the (separate) map, NOT from `endpoint_state`
+    // which was wiped by the cleanup above. Push #1.
+    clock.set_now_secs(4_000_010);
+    flip_with_cleanup(&server, cas_endpoint, 2).await?;
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        0,
+        "below threshold (1/3) — must not fire"
+    );
+
+    // Third connect: epoch 2 → 3. Push #2.
+    clock.set_now_secs(4_000_020);
+    flip_with_cleanup(&server, cas_endpoint, 3).await?;
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        0,
+        "below threshold (2/3) — must not fire"
+    );
+
+    // Fourth connect: epoch 3 → 4. Push #3 → threshold crossover.
+    // BEFORE the fix this would NOT fire: each prior connect's
+    // disconnect-cleanup wiped the deque, so the new connect sees
+    // `prev = None` → `needs_wipe = false` → push gated out.
+    clock.set_now_secs(4_000_030);
+    flip_with_cleanup(&server, cas_endpoint, 4).await?;
+    assert_eq!(
+        metrics.worker_flap_warns_total.load(Ordering::Relaxed),
+        1,
+        "flap detector wiped by disconnect cleanup — operator-blind to OOM-loop \
+         pattern (3 epoch flips with full disconnect-cleanup between each must \
+         still fire one warn at threshold crossover; the production OOM-loop \
+         pattern hits the disconnect-cleanup path BEFORE the next connect \
+         arrives, so flap state held in EndpointState — wiped by the cleanup's \
+         state.remove — leaves the detector silent in the exact scenario it \
+         was built to surface)"
+    );
+
     Ok(())
 }
