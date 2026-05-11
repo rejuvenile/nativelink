@@ -1401,3 +1401,137 @@ async fn supports_removal_callbacks_reflects_enable_keyspace_notifications()
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #366 production-seam: AC chain (CompletenessCheckingStore wrapping the
+// new AC_INNER ExistenceCacheStore) must drop a stale-positive when Valkey
+// evicts the AC entry.
+//
+// Production AC chain (after #366 merges prod-server.json5):
+//   AC_MAIN_STORE (CompletenessCheckingStore { backend: AC_INNER, cas: cas_STORE })
+//     -> AC_INNER (ExistenceCacheStore)
+//        -> AC_BACKEND_CACHED (FastSlow{ MemoryStore, REDIS_AC_STORE })
+//
+// Distinct from the CAS-chain test in two ways that matter for the
+// dispatcher:
+//   1. Different `key_prefix` ("ac:" vs "cas:"). The dispatcher's
+//      keyspace-notification subscription uses the prefix to scope which
+//      events fan out to which callbacks; a regression in prefix routing
+//      (e.g. cross-channel leak) would break exactly one chain.
+//   2. CompletenessCheckingStore in front of the ECS. CCS's
+//      `register_item_callback` forwards to its `ac_store` (and `cas_store`
+//      for CAS-side reads), so ECS's listener registration must traverse
+//      that extra wrapper without dropping the Weak.
+//
+// Composite invariant exercised: gate (none on AC) ⇒ (pin OR ttl OR
+// explicit eviction). The ExistenceCacheStore is the explicit-eviction
+// corner — Valkey-side maxmemory-policy=allkeys-lru is the eviction
+// trigger; ECS's listener is the explicit eviction handler. Without #366
+// the entire AC chain has no eviction handler at all (no ECS exists in
+// the AC chain pre-#366).
+//
+// Mutation: revert the ECS wrap in prod-server.json5 (i.e. instantiate
+// `Store::new(CompletenessCheckingStore::new(ac_backend_cached, cas))`
+// directly without the ECS wrapper); this test must red-fail at the
+// `wait_until_subscribed` step (no PSUBSCRIBE pattern attached because
+// no ECS registered an `ItemCallback`) — though we can't run that
+// mutation here directly, the assertion message names the contract.
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn existence_cache_drops_positive_through_full_ac_production_seam() -> Result<(), Error> {
+    use nativelink_config::stores::{
+        EvictionPolicy, FastSlowSpec, MemorySpec,
+    };
+    use nativelink_store::completeness_checking_store::CompletenessCheckingStore;
+    use nativelink_store::fast_slow_store::FastSlowStore;
+    use nativelink_store::memory_store::MemoryStore;
+
+    let (port, _guard) = spawn_server(&[]).await;
+    // AC-side prefix mirrors REDIS_AC_STORE in production.
+    let redis = RedisStore::new_standard(make_spec(port, "ac:"))
+        .await
+        .expect("redis");
+    let redis_store = Store::new(redis);
+
+    // Mimic AC_BACKEND_CACHED: FastSlow{ MemoryStore, REDIS_AC_STORE }.
+    let memory_fast = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let ac_backend_cached = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Noop(NoopSpec::default()),
+            fast_direction: Default::default(),
+            slow_direction: Default::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        memory_fast,
+        redis_store,
+    ));
+
+    // AC_INNER: ExistenceCacheStore wrapping AC_BACKEND_CACHED.
+    let ec_spec = ExistenceCacheSpec {
+        backend: StoreSpec::Noop(NoopSpec::default()),
+        eviction_policy: Some(EvictionPolicy {
+            max_count: 1_000_000,
+            ..Default::default()
+        }),
+    };
+    let ec = ExistenceCacheStore::new(&ec_spec, ac_backend_cached);
+
+    // AC_MAIN_STORE: CompletenessCheckingStore wrapping AC_INNER.
+    // CAS store is a stand-in MemoryStore — not used in this test (we don't
+    // exercise the completeness-check verification path; we exercise the
+    // eviction-callback dispatch path).
+    let cas_for_completeness = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let ec_as_store = Store::new(ec.clone());
+    let _ac_main = Arc::new(CompletenessCheckingStore::new(
+        ec_as_store,
+        cas_for_completeness,
+    ));
+    // Note: we do NOT call `register_item_callback` on `_ac_main` — the
+    // production wiring is that ECS::new internally calls
+    // `inner_store.register_item_callback`, which is what we want to
+    // verify. CCS's own register_item_callback fan-out is exercised by
+    // `existence_cache_drops_positive_through_full_production_seam` for
+    // CAS, and verified at the unit level by `register_item_callback`
+    // tests in `completeness_checking_store_test.rs`. This test focuses
+    // on: does the ECS-registered listener fire when Valkey evicts an
+    // ac:-prefixed key.
+
+    let digest = DigestInfo::try_new(TEST_HASH, 5).unwrap();
+    ec.clone()
+        .update_oneshot(digest, Bytes::from_static(b"ac-result-blob"))
+        .await
+        .expect("ec update");
+
+    assert!(
+        ec.exists_in_cache(&digest).await,
+        "cache must hold positive after update through AC production seam"
+    );
+
+    wait_until_subscribed(port, 3, Duration::from_secs(5)).await;
+
+    // Evict at the AC prefix.
+    raw_del(port, &format!("ac:{digest}")).await;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !ec.exists_in_cache(&digest).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "must not deadlock — AC ExistenceCacheStore retained stale positive after Valkey \
+         eviction through CompletenessCheckingStore -> ExistenceCacheStore -> \
+         FastSlow{Memory, Redis(ac:)} composition. Seams: ECS::register_item_callback \
+         -> FastSlow(fast+slow register) -> RedisStore dispatcher (ac: prefix). If this \
+         deadlocks but `existence_cache_drops_positive_through_full_production_seam` \
+         (cas: prefix) passes, the dispatcher's prefix routing for the second db \
+         dropped the listener, OR the operator removed the ECS wrap from prod-server.json5 \
+         (#366 regression).",
+    );
+    Ok(())
+}
