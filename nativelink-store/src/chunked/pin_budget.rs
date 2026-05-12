@@ -171,14 +171,38 @@ impl Default for PinBudget {
 /// reasons as `chunk_budget_singleton`: the budget is a process-global
 /// resource (4 GiB cap is per-process, not per-store), and Phase 2.7
 /// admission code wires from one site (the chunked dispatcher).
-static PIN_BUDGET_SINGLETON: OnceLock<PinBudget> = OnceLock::new();
+///
+/// Storage is `Arc<PinBudget>` (not bare `PinBudget`) so the same
+/// instance can be returned BOTH as a `&'static PinBudget` (for the
+/// admission hot path) AND as an `Arc<PinBudget>` (for
+/// `MetricsRegistry::register_dyn` at process start, which requires
+/// `Arc<dyn MetricsComponent + Send + Sync>`). Without this dual
+/// accessor the registry would either need a manual wrapper or end
+/// up tracking a *different* `PinBudget` instance than the one
+/// admissions consult — a silent measurement bug.
+static PIN_BUDGET_SINGLETON: OnceLock<Arc<PinBudget>> = OnceLock::new();
+
+fn pin_budget_arc_inner() -> &'static Arc<PinBudget> {
+    PIN_BUDGET_SINGLETON.get_or_init(|| Arc::new(PinBudget::default()))
+}
 
 /// Returns the process-wide `PinBudget` singleton, initializing it on
 /// first call with `DEFAULT_PIN_BUDGET_BYTES`. The cost is one
 /// `OnceLock::get_or_init` (atomic load + branch in the hot path after
 /// first call).
 pub fn pin_budget_singleton() -> &'static PinBudget {
-    PIN_BUDGET_SINGLETON.get_or_init(PinBudget::default)
+    pin_budget_arc_inner().as_ref()
+}
+
+/// Returns a clonable `Arc` to the same process-wide `PinBudget`
+/// singleton returned by `pin_budget_singleton()`. The clone is one
+/// atomic increment; use at process start to hand a clone to
+/// `MetricsRegistry::register` so the `pinned_bytes_used`,
+/// `pinned_bytes_capacity`, and `pin_budget_rejections_total` gauges
+/// are scraped by every `/metrics` listener.
+#[must_use]
+pub fn pin_budget_arc() -> Arc<PinBudget> {
+    Arc::clone(pin_budget_arc_inner())
 }
 
 /// Manual `MetricsComponent` impl: the metrics published are NOT
@@ -227,7 +251,7 @@ impl MetricsComponent for PinBudget {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_PIN_BUDGET_BYTES, PinBudget, pin_budget_singleton};
+    use super::{DEFAULT_PIN_BUDGET_BYTES, PinBudget, pin_budget_arc, pin_budget_singleton};
 
     /// Sanity: a fresh budget has the requested capacity and zero
     /// rejections.
@@ -288,6 +312,22 @@ mod tests {
             "OnceLock singleton must return the same reference",
         );
         assert_eq!(a.capacity_bytes(), DEFAULT_PIN_BUDGET_BYTES);
+    }
+
+    /// `pin_budget_arc()` returns an `Arc` pointing at the SAME
+    /// `PinBudget` instance the `&'static` accessor returns. Without
+    /// this property, `MetricsRegistry::register_dyn` would publish
+    /// gauges from a different `Semaphore` than the one admissions
+    /// consume from — a silent measurement bug.
+    #[test]
+    fn singleton_arc_and_ref_point_to_same_instance() {
+        let ref_ptr: *const PinBudget = pin_budget_singleton();
+        let arc = pin_budget_arc();
+        let arc_ptr: *const PinBudget = &*arc;
+        assert!(
+            core::ptr::eq(ref_ptr, arc_ptr),
+            "pin_budget_arc() and pin_budget_singleton() must alias the same PinBudget instance",
+        );
     }
 
     /// Zero-byte acquire is a no-op permit (zero bytes consumed).

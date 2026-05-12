@@ -52,6 +52,10 @@ use nativelink_service::chunked_write_handler::{
 use nativelink_store::chunked::CHUNK_SIZE;
 use nativelink_store::chunked::chunk_budget::{ChunkBudget, TOTAL_CHUNK_PERMITS};
 use nativelink_store::chunked::chunked_driver::PER_BLOB_MPSC_CAP;
+use nativelink_store::chunked::pin_budget::PinBudget;
+use nativelink_store::chunked_signal::{
+    encode_backpressure_signal_any, error_has_backpressure_reason, error_has_backpressure_signal,
+};
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_util::channel_body_for_tests::ChannelBody;
 use nativelink_util::common::{DigestInfo, encode_stream_proto};
@@ -1196,6 +1200,256 @@ async fn admit_prepared_chunk_returns_aborted_when_driver_mpsc_closed() {
         "ChunkBudget permit MUST be released on Closed admission (reverse-release per §13.1.1 step 2); \
          got available_chunks={}",
         budget.available_chunks(),
+    );
+}
+
+// -----------------------------------------------------------------------------
+// #436 measurement-first PinBudget seam coverage
+// -----------------------------------------------------------------------------
+
+/// **#436 seam test** — a `PinBudget` admission rejection MUST carry
+/// the wire shape that `chunked_client::classify_retryable` keys on so
+/// the Bazel-facing client retries the chunk rather than treating the
+/// rejection as a terminal failure. The pre-existing
+/// `pin_budget_cap_rejects_admission_with_pinned_bytes_exhausted_signal`
+/// test in `bazel_facing_internal_chunking_test.rs` asserts the proto
+/// fields at the producer (`dispatch_chunks_to_driver`) seam. This
+/// test adds the LOW-LEVEL admit-path seam (`admit_prepared_chunk`
+/// directly — the function `dispatch_chunks_to_driver` invokes on
+/// every chunk) AND asserts the EXACT predicate set that
+/// `classify_retryable` consults, so a future refactor that strips the
+/// `BackpressureSignal` discriminator from the PinBudget error path
+/// is forced through a red-fail with a specific message.
+///
+/// **Seams crossed end-to-end:**
+///   1. Producer: `admit_prepared_chunk` — the post-validation gate
+///      at `chunked_write_handler.rs:1649` that calls
+///      `PinBudget::try_acquire(chunk_bytes_len)`.
+///   2. Error constructor: `Error::resource_exhausted_backpressure` —
+///      packs `Code::ResourceExhausted` + the `BackpressureSignal`
+///      detail into the wire-format `Error` the client receives.
+///   3. Retry classifier predicates: `error_has_backpressure_signal`
+///      + `error_has_backpressure_reason([PinnedBytesExhausted])` —
+///      the exact pair `classify_retryable`
+///      (`chunked_client.rs:512-538`) consults to map the error to
+///      `RetryDecision::Retry { reason: ResourceExhausted, retry_after:
+///      Duration::from_millis(100) }`.
+///
+/// **Why this matters for #436.** The pivot is measurement-first: the
+/// 4 GiB cap stays in place; what changes is observability so we can
+/// SEE the cap being hit before deciding whether to raise it (#437).
+/// On the occasional residual exhaustion event today, the typed-signal
+/// retry is the only thing keeping Bazel from aborting an action. The
+/// gauge-publishing wiring landing alongside this test is meaningless
+/// if the rejection itself doesn't carry the discriminator the client
+/// needs to recognize it as transient — both the measurement AND the
+/// retry contract must hold.
+///
+/// **Mutation step:** comment out the `let detail = encode_…(
+/// PinnedBytesExhausted, PIN_BUDGET_RETRY_AFTER_MS);` block at
+/// `chunked_write_handler.rs:1657` and emit a bare
+/// `make_err!(Code::ResourceExhausted, ...)` instead. This test will
+/// then see `error_has_backpressure_signal == false` and the
+/// `error_has_backpressure_reason([PinnedBytesExhausted])` assertion
+/// fires with the specific message — which is exactly the failure
+/// mode that would make `classify_retryable` return `Abort` for what
+/// should be a transient retryable backpressure event.
+#[nativelink_test]
+async fn pin_budget_exhausted_rejection_carries_correct_signal_and_retries_via_client() {
+    use nativelink_service::chunked_write_handler::{
+        ChunkedWriteHandlerMetrics, PreparedChunk, admit_prepared_chunk,
+    };
+    use nativelink_store::chunked::chunked_driver::ChunkWork;
+
+    const CHUNK: usize = 4 * 1024;
+    // PinBudget cap: exactly ONE chunk. The first admission acquires
+    // CHUNK bytes; the second's try_acquire(CHUNK) MUST return None
+    // because the budget is empty. Box::leak yields the 'static
+    // reference matching `admit_prepared_chunk`'s signature.
+    let pin_budget: &'static PinBudget = Box::leak(Box::new(PinBudget::new(CHUNK)));
+    let chunk_budget = make_test_budget();
+
+    let blob_a = vec![0xa6u8; CHUNK];
+    let blob_b = vec![0xb6u8; CHUNK];
+    // Two distinct digests so the shape-validation in
+    // admit_prepared_chunk doesn't reject as "wrong digest". Both
+    // declared at exactly CHUNK bytes so the `finish=true` final-chunk
+    // size check passes.
+    let digest_a = DigestInfo::new(sha256(&blob_a), CHUNK as u64);
+    let digest_b = DigestInfo::new(sha256(&blob_b), CHUNK as u64);
+
+    // mpsc with a live (un-polled) receiver so the global ChunkBudget
+    // acquire + try_send Ok branch both succeed for the FIRST chunk.
+    // The receiver is held across both admissions so the second
+    // chunk's try_send would succeed if PinBudget didn't reject first
+    // (i.e. PinBudget is the EXCLUSIVE rejection source for the
+    // second chunk; this isolates the seam under test).
+    let (tx, _rx) = mpsc::channel::<ChunkWork>(16);
+    let metrics = ChunkedWriteHandlerMetrics::default();
+
+    // First admission: succeeds, consumes the PinBudget's entire
+    // capacity (CHUNK bytes).
+    let prepared_a = PreparedChunk {
+        chunk_offset: 0,
+        chunk_bytes: Bytes::from(blob_a.clone()),
+        finish: true,
+    };
+    admit_prepared_chunk(
+        prepared_a,
+        &tx,
+        chunk_budget,
+        Some(pin_budget),
+        CHUNK,
+        digest_a,
+        &metrics,
+        None,
+    )
+    .expect("first admission must succeed (PinBudget has exactly CHUNK bytes available)");
+
+    // Second admission: PinBudget is empty. MUST reject.
+    let prepared_b = PreparedChunk {
+        chunk_offset: 0,
+        chunk_bytes: Bytes::from(blob_b.clone()),
+        finish: true,
+    };
+    let err = tokio::time::timeout(Duration::from_secs(5), async {
+        admit_prepared_chunk(
+            prepared_b,
+            &tx,
+            chunk_budget,
+            Some(pin_budget),
+            CHUNK,
+            digest_b,
+            &metrics,
+            None,
+        )
+    })
+    .await
+    .expect(
+        "must not deadlock — second admit_prepared_chunk must reject promptly when PinBudget \
+         is exhausted (#436)",
+    )
+    .expect_err(
+        "second admission MUST reject with Err — PinBudget at zero cannot grant another permit; \
+         if this returns Ok, the composite invariant is broken: gate active without \
+         compensating eviction/pin/TTL (the PinBudget gate IS the pin corner; its failure to \
+         fire would let pinned-bytes grow unboundedly)",
+    );
+
+    // ── Assertion (a): code == ResourceExhausted ────────────────────────
+    assert_eq!(
+        err.code,
+        nativelink_error::Code::ResourceExhausted,
+        "PinBudget exhaustion MUST be Code::ResourceExhausted — classify_retryable's \
+         Code match arm at chunked_client.rs:529 keys on this exact code; got {err:?}"
+    );
+
+    // ── Assertion (b): the typed BackpressureSignal detail decodes to
+    //    Reason::PinnedBytesExhausted with retry_after_ms == 100 ──────────
+    let signal_any = err
+        .details
+        .iter()
+        .find(|any| any.type_url == BACKPRESSURE_SIGNAL_TYPE_URL)
+        .expect(
+            "PinBudget exhaustion MUST carry a BackpressureSignal detail at the wire-stable \
+             type_url — without this discriminator, classify_retryable returns Abort and Bazel \
+             never retries, breaking the composite invariant the measurement-first wiring \
+             depends on (#436)",
+        );
+    let signal = BackpressureSignal::decode(&*signal_any.value)
+        .expect("BackpressureSignal proto MUST decode (wire-format contract)");
+    assert_eq!(
+        signal.reason,
+        backpressure_signal::Reason::PinnedBytesExhausted as i32,
+        "rejection reason MUST be PinnedBytesExhausted (NOT GlobalChunkBudgetExhausted or \
+         PerBlobMpscFull) — operators distinguish these three gate types from the reason \
+         discriminator; got reason={}",
+        signal.reason,
+    );
+    assert_eq!(
+        signal.retry_after_ms, 100,
+        "PinBudget retry_after_ms MUST be PIN_BUDGET_RETRY_AFTER_MS (100) — the prompt's \
+         spec hint and the client's default backoff align around this value; got {}",
+        signal.retry_after_ms,
+    );
+
+    // ── Assertion (c): the predicate pair that classify_retryable
+    //    consults BOTH return true on this error. This proves the
+    //    end-to-end seam from `admit_prepared_chunk` →
+    //    `Error::resource_exhausted_backpressure` →
+    //    `error_has_backpressure_signal` (chunked_client.rs:523) →
+    //    `RetryDecision::Retry`. classify_retryable itself is private
+    //    to nativelink-store; we cross the exact same seam by
+    //    invoking the public predicates the classifier delegates to.
+    //    The classifier-internal test
+    //    `classify_resource_exhausted_with_backpressure_is_retry`
+    //    (chunked_client.rs:921) closes the loop for the
+    //    `RetryDecision::Retry` mapping itself. ──────────────────────────
+    assert!(
+        error_has_backpressure_signal(&err),
+        "error_has_backpressure_signal MUST return true — this is the gate \
+         classify_retryable (chunked_client.rs:523) uses to admit retryable errors; \
+         if it returns false, Bazel sees the PinBudget rejection as a terminal \
+         ResourceExhausted (Abort) and the composite invariant fails. \
+         Error was: {err:?}",
+    );
+    assert!(
+        error_has_backpressure_reason(
+            &err,
+            &[backpressure_signal::Reason::PinnedBytesExhausted],
+        ),
+        "error_has_backpressure_reason([PinnedBytesExhausted]) MUST return true — \
+         downstream classifiers (e.g. FastSlowStore::run_producer's cache_tee demotion \
+         at fast_slow_store.rs) use this exact predicate to dispatch on the typed \
+         reason. A future refactor that switches the encoded reason to \
+         MemoryStoreAtCapacity (wrong-but-similar discriminator) would silently \
+         demote unrelated rejections; this assertion guards the contract. Error \
+         was: {err:?}",
+    );
+
+    // Defensive: encode the same signal independently and confirm it
+    // matches bit-identically — pins the encoder's stability across
+    // refactors. encode_backpressure_signal_any is the one production
+    // producer of this Any; if its output diverges from what
+    // admit_prepared_chunk emitted, the test catches the drift.
+    let expected_any = encode_backpressure_signal_any(
+        backpressure_signal::Reason::PinnedBytesExhausted,
+        100,
+    );
+    assert_eq!(
+        signal_any.type_url, expected_any.type_url,
+        "wire-stable type_url drift: admit_prepared_chunk emitted {} but \
+         encode_backpressure_signal_any produced {}",
+        signal_any.type_url, expected_any.type_url,
+    );
+    assert_eq!(
+        signal_any.value, expected_any.value,
+        "wire-format byte drift: admit_prepared_chunk and encode_backpressure_signal_any \
+         must produce bit-identical bytes (else the classifier-side decode can mis-read)",
+    );
+
+    // ── Reverse-release check: the ChunkBudget permit acquired for the
+    //    rejected admission MUST be released so the budget gauge returns
+    //    to (TOTAL_CHUNK_PERMITS - 1) — only the SUCCESSFUL first
+    //    admission's permit is still held inside the ChunkWork queued
+    //    on `tx`. This pins the §13.1.1 step 2 reverse-release contract
+    //    for the PinBudget rejection arm specifically. ─────────────────
+    assert_eq!(
+        chunk_budget.available_chunks(),
+        TOTAL_CHUNK_PERMITS - 1,
+        "ChunkBudget permit MUST be released on PinBudget rejection (reverse-release \
+         per §13.1.1 step 2) — only the first admission's permit (held inside the \
+         queued ChunkWork) remains acquired; got available_chunks={}",
+        chunk_budget.available_chunks(),
+    );
+
+    // Metric ticked.
+    assert!(
+        metrics
+            .pin_budget_exhausted_rejections_total
+            .load(core::sync::atomic::Ordering::Relaxed)
+            >= 1,
+        "metric pin_budget_exhausted_rejections_total MUST tick on PinBudget rejection",
     );
 }
 

@@ -156,14 +156,38 @@ impl Default for ChunkBudget {
 /// `OnceLock::get_or_init` is lock-free after first init and
 /// thread-safe; the contract matches the per-process singleton
 /// semantics.
-static CHUNK_BUDGET_SINGLETON: OnceLock<ChunkBudget> = OnceLock::new();
+///
+/// Storage is `Arc<ChunkBudget>` (not bare `ChunkBudget`) so the
+/// same instance can be returned BOTH as a `&'static ChunkBudget`
+/// (admission hot path) AND as an `Arc<ChunkBudget>` (for
+/// `MetricsRegistry::register_dyn` at process start, which requires
+/// `Arc<dyn MetricsComponent + Send + Sync>`). Mirrors the
+/// `pin_budget.rs` dual-accessor pattern; without it the registry
+/// would either need a manual wrapper or track a *different*
+/// `ChunkBudget` instance than the one admissions consult.
+static CHUNK_BUDGET_SINGLETON: OnceLock<Arc<ChunkBudget>> = OnceLock::new();
+
+fn chunk_budget_arc_inner() -> &'static Arc<ChunkBudget> {
+    CHUNK_BUDGET_SINGLETON.get_or_init(|| Arc::new(ChunkBudget::new()))
+}
 
 /// Returns the process-wide `ChunkBudget` singleton, initializing it
 /// on first call. Phase 2 admission code calls this once per chunk
 /// arrival; the cost is one `OnceLock::get_or_init` (atomic load + a
 /// branch in the hot path after first call).
 pub fn chunk_budget_singleton() -> &'static ChunkBudget {
-    CHUNK_BUDGET_SINGLETON.get_or_init(ChunkBudget::new)
+    chunk_budget_arc_inner().as_ref()
+}
+
+/// Returns a clonable `Arc` to the same process-wide `ChunkBudget`
+/// singleton returned by `chunk_budget_singleton()`. Used once at
+/// process start to register the budget with `MetricsRegistry` so
+/// the `chunk_budget_used_bytes` and
+/// `chunk_resource_exhausted_rejections_total` gauges are scraped
+/// by every `/metrics` listener.
+#[must_use]
+pub fn chunk_budget_arc() -> Arc<ChunkBudget> {
+    Arc::clone(chunk_budget_arc_inner())
 }
 
 /// Manual `MetricsComponent` impl: the two metrics published are NOT
@@ -217,7 +241,9 @@ impl MetricsComponent for ChunkBudget {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_SIZE, ChunkBudget, TOTAL_CHUNK_PERMITS, chunk_budget_singleton};
+    use super::{
+        CHUNK_SIZE, ChunkBudget, TOTAL_CHUNK_PERMITS, chunk_budget_arc, chunk_budget_singleton,
+    };
 
     /// Sanity: the budget is 4096 permits at construction.
     #[test]
@@ -298,6 +324,21 @@ mod tests {
         // assume the count, only that the contract holds).
         let _hold = a.try_acquire_chunk();
         // Drop happens at end-of-test.
+    }
+
+    /// `chunk_budget_arc()` returns an `Arc` pointing at the SAME
+    /// `ChunkBudget` instance the `&'static` accessor returns. Without
+    /// this, `MetricsRegistry::register_dyn` would publish gauges from
+    /// a different `Semaphore` than the one admissions consume from.
+    #[test]
+    fn singleton_arc_and_ref_point_to_same_instance() {
+        let ref_ptr: *const ChunkBudget = chunk_budget_singleton();
+        let arc = chunk_budget_arc();
+        let arc_ptr: *const ChunkBudget = &*arc;
+        assert!(
+            core::ptr::eq(ref_ptr, arc_ptr),
+            "chunk_budget_arc() and chunk_budget_singleton() must alias the same ChunkBudget instance",
+        );
     }
 
     /// Smaller-scale variant of the above so the test file documents

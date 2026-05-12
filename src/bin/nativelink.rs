@@ -487,6 +487,44 @@ async fn inner_main(
         );
     }
 
+    // #436 measurement gate: register the global PinBudget and
+    // ChunkBudget singletons so every `/metrics` listener exposes
+    // `chunked_pin_budget.pinned_bytes_used`,
+    // `chunked_pin_budget.pinned_bytes_capacity`,
+    // `chunked_pin_budget.pin_budget_rejections_total`,
+    // `chunked_chunk_budget.chunk_budget_used_bytes`, and
+    // `chunked_chunk_budget.chunk_resource_exhausted_rejections_total`.
+    //
+    // The two `MetricsComponent` impls on `PinBudget`/`ChunkBudget`
+    // exist (`pin_budget.rs`, `chunk_budget.rs`) but were not reachable
+    // from the registry without an `Arc` accessor — admissions read
+    // from `pin_budget_singleton()` / `chunk_budget_singleton()`, which
+    // return `&'static`, while `register_dyn` demands
+    // `Arc<dyn MetricsComponent + Send + Sync>`. The `*_arc()`
+    // accessors return an `Arc` pointing at the SAME instance, so the
+    // gauges published here are the live values admissions consume
+    // from — not a separate copy.
+    //
+    // Registration happens ONCE here (not in the per-store
+    // `wire_bazel_chunked_dispatcher` loop) because the budgets are
+    // process-global; double-registration would publish duplicate
+    // lines.
+    //
+    // Cfg-gated on `chunked_fast_slow` because the `nativelink_store::
+    // chunked` module is only compiled in under that feature; the same
+    // gate is applied at every other call-site in this file.
+    #[cfg(feature = "chunked_fast_slow")]
+    {
+        metrics_registry.register(
+            "chunked_pin_budget",
+            nativelink_store::chunked::pin_budget::pin_budget_arc(),
+        );
+        metrics_registry.register(
+            "chunked_chunk_budget",
+            nativelink_store::chunked::chunk_budget::chunk_budget_arc(),
+        );
+    }
+
     // First-listener-wins guard: when more than one ServerConfig hosts
     // a worker_api block, the SECOND construction would register the
     // same metrics tree under the same prefix and double every line.
