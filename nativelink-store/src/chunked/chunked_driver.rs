@@ -68,11 +68,52 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::filesystem_store::{FileEntry, FilesystemStore};
 
-/// Per-blob mpsc capacity. Q4: 16 chunks-in-flight per blob is the
-/// upper bound on per-blob memory pressure (16 × 1 MiB = 16 MiB).
-/// Together with the global `ChunkBudget` cap this gives a 12-16 GiB
-/// worst-case server RSS bound (§13.2).
-pub const PER_BLOB_MPSC_CAP: usize = 16;
+/// Per-blob mpsc capacity: how many `ChunkWork` items the chunker can
+/// have in-flight to the per-blob driver before `try_send` returns
+/// `Full` (the admission gate then signals
+/// `BackpressureSignal::PerBlobMpscFull` and the unfold stream parks
+/// on its own `reader.recv`, transitively pushing back to h2). Bounds
+/// per-blob memory pressure at `PER_BLOB_MPSC_CAP * CHUNK_SIZE`
+/// (currently `64 * 1 MiB = 64 MiB`).
+///
+/// **Aggregate RSS is bounded by the GLOBAL `ChunkBudget` (4 GiB /
+/// 4096 permits at `chunk_budget.rs:52`) and per-blob `PinBudget`,
+/// NOT by `PER_BLOB_MPSC_CAP × concurrent-blobs`.** The per-blob cap
+/// only sets fan-out shape: a higher cap means fewer concurrent blobs
+/// can saturate the global budget (4 GiB / 64 MiB ≈ 64 max-saturated
+/// blobs at this cap; was 256 at the prior cap of 16). The §13.2
+/// 12-16 GiB worst-case server RSS bound holds unchanged because it
+/// is derived from the global budgets, not from any per-blob × N
+/// product.
+///
+/// **Why 64 (was 16, bumped 2026-05-11).** The original 16 was an
+/// arbitrary §4 Q4 placeholder, not a measured value. Audit
+/// `.claude/audits/chunked-admission-p99-2026-05-11.md` recorded
+/// **870 `buf_channel::send: channel backpressure (>1s wait)` events
+/// in 60 min, max `send_ms: 543434` (~9 min single-chunk wait)** — h2
+/// frames stalling because the per-blob mpsc was draining slower
+/// (commit-and-verify BLAKE3 + pwrite) than the network was filling
+/// it. Zero `mpsc_full_rejections` were observed (the gate did not
+/// actually reject any chunk), but the buf_channel upstream
+/// transitively absorbed the back-edge stall. Raising the cap to 64
+/// smoothes that back-edge: 64 × 1 MiB per blob lets a transient slow
+/// commit queue chunks rather than back-pressuring h2 mid-stream.
+/// This is still a CAP, not a target; steady-state occupancy is
+/// governed by the chunker → driver throughput ratio.
+///
+/// **Sibling cascade: Bazel-side Chunker NPE on retry race.** The
+/// patched Bazel binary now emits 2 MiB wire-chunks (was 16 KiB).
+/// At the prior cap of 16, the per-blob mpsc filled in 8 wire-chunks
+/// (= 16 MiB), making `chunked dispatch: per-blob mpsc full` events
+/// fire at ~666/hr; each cancel raced client-side retry → Bazel
+/// `Chunker.seek():165 data == null` NPE (a known Bazel issue, see
+/// upstream #28489 and prior fixes `9a823d9d` / `01d7f97d` /
+/// `397266d0` / `cfef67da`). The 64-slot cap structurally eliminates
+/// this cascade for blobs ≤64 MiB (the observed 50 MB blob class
+/// fits entirely). Larger blobs (200-540 MB RustcLink outputs) still
+/// stream through the bounded mpsc and may cascade at higher offsets
+/// — see #413 for sizing follow-up.
+pub const PER_BLOB_MPSC_CAP: usize = 64;
 
 /// Per-chunk wall-clock bound on the slow-tier `pwrite` step
 /// (#213 perf-opt NMA2 fixup for §6.7 trigger (b)). Bounds how long
@@ -306,7 +347,7 @@ struct SidecarState {
 struct ChunkPin {
     /// Map of byte-offset → chunk bytes. Memory cost = sum of chunk
     /// lengths held while the driver is in-flight. Bounded by the
-    /// per-blob mpsc cap (`PER_BLOB_MPSC_CAP * CHUNK_SIZE = 16 MiB`)
+    /// per-blob mpsc cap (`PER_BLOB_MPSC_CAP * CHUNK_SIZE = 64 MiB`)
     /// while the driver is consuming, AND further bounded after the
     /// driver consumed but before commit by the blob size itself —
     /// already counted toward the global ChunkBudget via the Q8
@@ -389,8 +430,8 @@ impl ChunkedDriver {
     /// and to pass to `commit_chunked` for length validation.
     /// `capacity` is the mpsc bound; admission code MUST pass
     /// `PER_BLOB_MPSC_CAP` in production — the argument is here so
-    /// tests can exercise smaller channels without a 16-`ChunkWork`
-    /// setup.
+    /// tests can exercise smaller channels without a `PER_BLOB_MPSC_CAP`-
+    /// sized `ChunkWork` setup.
     ///
     /// `chunk_size` is the contractual chunk size used to compute the
     /// expected chunk-count for the bitmap completeness check. Production
@@ -1322,10 +1363,16 @@ mod tests {
     use crate::filesystem_store::{FileEntryImpl, FilesystemStore};
 
     /// Capacity constant pin: any change is ARCHITECTURAL — re-read
-    /// design §4 Q4 before bumping.
+    /// design §4 Q4 + audit
+    /// `.claude/audits/chunked-admission-p99-2026-05-11.md` rec #4
+    /// before bumping further. 64 was chosen to smooth back-edge
+    /// stalls at the chunker → driver boundary (870 buf_channel
+    /// backpressure events / 60 min, max wait 543 s on the prior 16
+    /// cap) AND to absorb 2 MiB Bazel wire-chunks without cascade-cancel
+    /// storm (see `PER_BLOB_MPSC_CAP` doc comment).
     #[test]
-    fn per_blob_mpsc_cap_is_sixteen() {
-        assert_eq!(PER_BLOB_MPSC_CAP, 16);
+    fn per_blob_mpsc_cap_is_sixtyfour() {
+        assert_eq!(PER_BLOB_MPSC_CAP, 64);
     }
 
     fn sha256(bytes: &[u8]) -> [u8; 32] {
