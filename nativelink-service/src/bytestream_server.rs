@@ -372,6 +372,142 @@ impl Debug for InstanceInfo {
     }
 }
 
+/// RAII guard for the `in_flight_writes` map (the deduplication of
+/// concurrent ByteStream uploads for the same digest).
+///
+/// **#402 cancel-safety:** the previous code manually `insert`ed into
+/// `in_flight_writes` before `tokio::time::timeout(WRITE_TIMEOUT,
+/// write_fut).await` and manually `remove`d after. The await is a
+/// cancellation point: if the gRPC stream is cancelled (client
+/// disconnect, RST_STREAM, server shutdown, runtime drop), the future
+/// is dropped mid-await and the manual `remove` NEVER runs. Result:
+/// every cancelled upload leaks one `HashMap` entry + one watch
+/// channel, permanently. Subsequent RPCs for the same digest then
+/// coalesce onto the orphaned entry — but the `Sender` was also dropped
+/// by cancellation so they immediately observe `rx.changed() = Err`,
+/// translate to "in-flight write failed, retrying", and waste a
+/// coalescing round.
+///
+/// **Sibling of `InFlightChunkedGuard`** in `chunked_write_handler.rs`
+/// (#401, the bug found by the same DSR-pattern audit). Same shape,
+/// different in-flight tracker.
+///
+/// **Contract:**
+///   * `new(map, digest, tx, rx)` inserts `(digest, rx)` into `map` and
+///     takes ownership of `tx`. Returns the guard.
+///   * `set_result(bool)` publishes the outcome to coalesced waiters via
+///     the watch channel. Optional — if never called, Drop's `Sender`
+///     drop signals failure to waiters (via `rx.changed() = Err`).
+///   * `Drop` removes `(digest, _)` from `map` and drops the `Sender`
+///     (which signals failure to any waiter that didn't observe
+///     `set_result`'s value first). Drop runs on EVERY exit path
+///     including cancellation.
+///
+/// **Drop is cancellation-safe:** removal of an absent key is a no-op
+/// (`HashMap::remove` returns `None`), so spurious double-drops or
+/// races with sibling cleanup are tolerated.
+///
+/// **Fields are private** — construction goes through `new`, removal
+/// goes through Drop. There is no other API surface; the guard must
+/// remain trivially auditable.
+#[derive(Debug)]
+pub struct InFlightWritesGuard {
+    map: Arc<Mutex<HashMap<DigestInfo, tokio::sync::watch::Receiver<Option<bool>>>>>,
+    digest: DigestInfo,
+    /// Owned watch sender. `Option` so `set_result` can take it by
+    /// value to publish, leaving Drop with `None` (the publish already
+    /// dropped the sender by replacing it). `None` after a successful
+    /// `set_result`; `Some` on the cancellation path. Either way Drop
+    /// just drops whatever's left — no manual `send` required because
+    /// `Sender::drop` itself is the failure signal that the production
+    /// coalesced-waiter loop at `bytestream_server.rs:2349-2358`
+    /// already understands (`rx.changed() = Err` → return false).
+    tx: Option<tokio::sync::watch::Sender<Option<bool>>>,
+}
+
+impl InFlightWritesGuard {
+    /// Insert `(digest, rx)` into `map` and return a guard that will
+    /// remove it on Drop. Takes ownership of `tx` so the caller cannot
+    /// accidentally publish the outcome through a side channel that
+    /// bypasses the guard.
+    ///
+    /// Acquires the map lock once for the insert. Production callers
+    /// that need to perform the insert under a pre-existing
+    /// dedup lock (to avoid a race where two RPCs both become primary
+    /// writers between unlock + re-lock) should use
+    /// [`Self::from_inserted`] instead.
+    #[must_use]
+    pub fn new(
+        map: Arc<Mutex<HashMap<DigestInfo, tokio::sync::watch::Receiver<Option<bool>>>>>,
+        digest: DigestInfo,
+        tx: tokio::sync::watch::Sender<Option<bool>>,
+        rx: tokio::sync::watch::Receiver<Option<bool>>,
+    ) -> Self {
+        map.lock().insert(digest, rx);
+        Self {
+            map,
+            digest,
+            tx: Some(tx),
+        }
+    }
+
+    /// Construct a guard whose `(digest, rx)` was ALREADY inserted into
+    /// `map` by the caller (typically under a dedup lock the caller
+    /// holds for race-freedom). Skips the insert; takes ownership of
+    /// `tx` and is responsible for `Drop`-time removal.
+    ///
+    /// Use this when the caller needs to atomically check-then-insert
+    /// under a single lock acquisition (the production primary-writer
+    /// path). For the simpler "insert under our own lock" case, prefer
+    /// [`Self::new`].
+    #[must_use]
+    pub fn from_inserted(
+        map: Arc<Mutex<HashMap<DigestInfo, tokio::sync::watch::Receiver<Option<bool>>>>>,
+        digest: DigestInfo,
+        tx: tokio::sync::watch::Sender<Option<bool>>,
+    ) -> Self {
+        Self {
+            map,
+            digest,
+            tx: Some(tx),
+        }
+    }
+
+    /// Publish `succeeded` to coalesced waiters via the watch channel.
+    ///
+    /// The production code at `bytestream_server.rs:2501-2505` calls
+    /// this on both success (`Ok(_)`) and error (`Err(_)`) paths so
+    /// coalesced waiters learn the actual outcome rather than the
+    /// cancellation-shaped "sender dropped" failure signal.
+    ///
+    /// Idempotent: subsequent calls are a no-op (the `tx` was already
+    /// taken on the first call). The guard's Drop will still remove
+    /// the map entry regardless of whether `set_result` was called.
+    pub fn set_result(&mut self, succeeded: bool) {
+        if let Some(tx) = self.tx.take() {
+            // Send is best-effort; an Err just means no waiters subscribed,
+            // which is benign and equivalent to the prior `let _ = tx.send(...)`.
+            let _ = tx.send(Some(succeeded));
+        }
+    }
+}
+
+impl Drop for InFlightWritesGuard {
+    fn drop(&mut self) {
+        // Remove the map entry on every exit path. `HashMap::remove`
+        // tolerates an absent key (returns None), so this is safe even
+        // if some sibling path concurrently removed.
+        self.map.lock().remove(&self.digest);
+        // `self.tx` is dropped here as part of the struct drop. If
+        // `set_result` was never called (cancellation path), the
+        // dropped Sender causes any coalesced waiter's `rx.changed()`
+        // to return `Err` → the production loop at
+        // `bytestream_server.rs:2349-2358` translates to false (failure)
+        // → waiter falls through to the retry path. So waiters never
+        // hang on a cancelled writer's orphaned channel.
+    }
+}
+
 type ReadStream = Pin<Box<dyn Stream<Item = Result<ReadResponse, Status>> + Send + 'static>>;
 type StoreUpdateFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>;
 
@@ -2337,7 +2473,13 @@ impl ByteStreamServer {
 
         // Dedup in-flight writes: if another RPC is already writing this
         // exact digest, wait for it instead of writing again.
-        let in_flight_tx = {
+        //
+        // #402 cancel-safety: when this RPC is the primary writer, we
+        // create an `InFlightWritesGuard` that owns map removal +
+        // outcome publishing. The guard's Drop ensures cancellation
+        // mid-await still cleans up the map entry. See the type's
+        // doc-comment.
+        let in_flight_guard = {
             let mut guard = instance.in_flight_writes.lock();
             if let Some(rx) = guard.get(&digest) {
                 let mut rx = rx.clone();
@@ -2390,10 +2532,22 @@ impl ByteStreamServer {
                 );
                 None
             } else {
-                // We're the first writer — create a watch channel.
+                // We're the first writer — create a watch channel,
+                // insert (digest, rx) under the same lock that proved
+                // we are the primary (no race with a concurrent second
+                // arrival becoming a duplicate primary), then drop the
+                // lock and hand `tx` to the RAII guard. The guard's
+                // Drop removes the entry on every exit path including
+                // cancellation (#402). `from_inserted` skips the insert
+                // because we already did it under the dedup lock above.
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 guard.insert(digest, rx);
-                Some(tx)
+                drop(guard);
+                Some(InFlightWritesGuard::from_inserted(
+                    Arc::clone(&instance.in_flight_writes),
+                    digest,
+                    tx,
+                ))
             }
         };
 
@@ -2495,17 +2649,29 @@ impl ByteStreamServer {
             }
         };
 
-        // Write finished — signal the result to coalesced waiters BEFORE
-        // removing from the map, so new RPCs arriving in between can still
-        // find and subscribe to the existing entry.
-        if let Some(tx) = in_flight_tx {
-            // We were the primary writer — signal result to coalesced waiters
-            // and clean up the in-flight entry.
-            let _ = tx.send(Some(result.is_ok()));
-            instance.in_flight_writes.lock().remove(&digest);
+        // Write finished — publish the outcome to coalesced waiters via
+        // the guard's set_result. Map removal happens in the guard's
+        // Drop at end of scope (or earlier if cancellation strikes).
+        // Order matters: set_result publishes BEFORE Drop removes, so
+        // new RPCs arriving in between still find + subscribe to the
+        // existing entry, and `borrow_and_update()` returns the result
+        // immediately.
+        //
+        // #402 cancel-safety: if `tokio::time::timeout(WRITE_TIMEOUT,
+        // write_fut).await` is itself cancelled (the surrounding gRPC
+        // future is dropped), control never reaches here. The guard's
+        // Drop fires anyway, removing the map entry and dropping the
+        // watch Sender — coalesced waiters then observe rx.changed() =
+        // Err and translate to "failure" via the loop at
+        // bytestream_server.rs:2349-2358.
+        //
+        // Coalesced waiters that timed out and retried
+        // (in_flight_guard = None) must NOT touch the map — the primary
+        // writer's guard owns the entry's lifetime.
+        if let Some(mut guard) = in_flight_guard {
+            guard.set_result(result.is_ok());
+            // `guard` drops at end of this scope, removing the map entry.
         }
-        // Coalesced waiters that timed out and retried (in_flight_tx = None)
-        // must NOT remove the entry — the primary writer may still be running.
 
         // Track metrics
         #[allow(clippy::cast_possible_truncation)]
