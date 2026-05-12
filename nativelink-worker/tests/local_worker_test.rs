@@ -75,8 +75,12 @@ fn assert_default_connect_request(actual: ConnectWorkerRequest) {
         actual.boot_epoch_id, 0,
         "worker must populate boot_epoch_id (#141)"
     );
+    // `build_sha` is populated from the running binary's actual SHA (#216)
+    // and varies per build; strip it before comparing against
+    // `ConnectWorkerRequest::default()`. Mirrors the strip on line ~134.
     let stripped = ConnectWorkerRequest {
         boot_epoch_id: 0,
+        build_sha: String::new(),
         ..actual
     };
     assert_eq!(stripped, ConnectWorkerRequest::default());
@@ -1350,6 +1354,210 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
             )),
         }
     );
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// (#428 / #410) Cap input-fetch NotFound retries + bubble terminal
+// FailedPrecondition.
+//
+// Composite invariant: a worker input-fetch NotFound carrying a structural
+// `PreconditionFailure` MISSING detail MUST round-trip as
+// `Code::FailedPrecondition` so the scheduler's state-manager
+// `missing_inputs` gate (`simple_scheduler_state_manager.rs:836`) marks
+// the action terminal on attempt 1 instead of re-queueing it up to
+// `max_job_retries` (=3) times — which stalls the `Queued` tail beyond
+// the 60 s observability threshold (2026-05-11 20:10:34 PDT pid 2980804:
+// 51-deep stalled tail surviving every drain cycle).
+//
+// Seam being tested: producer (`hardlink_and_set_metadata_prefetched` at
+// `running_actions_manager.rs:1828` attaches the detail) → consumer
+// (`local_worker.rs:2499` re-tag predicate) → wire-side classifier
+// (`Error::from(tonic::Status)` round-trip). The detail-bearing predicate
+// guarantees translation fires even when the upstream error message
+// changes upstream (the original substring `"not found in"` predicate is
+// brittle to wording shifts in `fast_slow_store.rs` / `grpc_store.rs` /
+// REAPI-shaped server errors).
+//
+// Production observation motivating the test: audit
+// `.claude/audits/410-scheduler-stall-investigation-20260512.md` §3
+// shows a 50.2 MiB blob NotFound cascade where the action stays `Queued`
+// for >60 s. The fragile substring predicate is the failure surface most
+// likely to silently degrade if a maintainer rewrites a store-layer
+// NotFound message without "not found in".
+//
+// Mutation guidance:
+//   * Remove the `has_pf_detail` arm of the predicate in
+//     `local_worker.rs::is_cas_blob_miss`. The action with a message
+//     that lacks the `"not found in"` substring then falls through the
+//     InternalError branch — this test red-fails with the bespoke
+//     assertion message at the `assert_eq!` for `status.code`.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn not_found_with_precondition_detail_translates_without_substring() -> Result<(), Error> {
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_default_connect_request(props);
+    }
+
+    let expected_worker_id = "foobar".to_string();
+
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: String::new(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+                        missing_digests: Vec::new(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let running_action = Arc::new(MockRunningAction::new());
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+
+    // Build a NotFound whose message DOES NOT contain "not found in" but
+    // which DOES carry the structural PreconditionFailure detail (same
+    // shape attached by `running_actions_manager.rs:1828` /
+    // `:2735`). This is the audit's failure surface: any future wording
+    // change in `fast_slow_store.rs` / `grpc_store.rs` that drops the
+    // substring without dropping the detail would silently regress
+    // translation. Same proto types as the sibling tests.
+    #[derive(prost::Message)]
+    struct PfViolation {
+        #[prost(string, tag = "1")]
+        r#type: String,
+        #[prost(string, tag = "2")]
+        subject: String,
+        #[prost(string, tag = "3")]
+        description: String,
+    }
+    #[derive(prost::Message)]
+    struct PfFailure {
+        #[prost(message, repeated, tag = "1")]
+        violations: Vec<PfViolation>,
+    }
+
+    let missing_digest = DigestInfo::new([0x1E; 32], 52_680_784);
+    let detail = PfFailure {
+        violations: vec![PfViolation {
+            r#type: "MISSING".into(),
+            subject: format!(
+                "blobs/{}/{}",
+                missing_digest.packed_hash(),
+                missing_digest.size_bytes(),
+            ),
+            description: String::new(),
+        }],
+    };
+    let any = prost_types::Any {
+        type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+        value: detail.encode_to_vec(),
+    };
+
+    // Deliberately omit the "not found in" substring to exercise the
+    // detail-bearing arm of the predicate exclusively. Production traces
+    // matching this shape: any store wrapping `Error::not_found_with_detail`
+    // whose message differs from the canonical fast_slow message.
+    let mut source_err = make_err!(
+        Code::NotFound,
+        "blob 1ea493ea...-52680784 absent from CAS (REAPI v2 §2.2.4)"
+    );
+    source_err.details.push(any.clone());
+    running_action
+        .expect_prepare_action(Err(source_err))
+        .await?;
+    running_action.cleanup(Ok(())).await?;
+
+    let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+
+    // The composite expectation: detail-bearing NotFound MUST translate to
+    // FailedPrecondition (the scheduler state-manager terminal-no-retry
+    // gate keys exclusively on `Code::FailedPrecondition`). InternalError
+    // here would re-queue the action up to `max_job_retries` (=3) times,
+    // re-firing the same NotFound and stalling the `Queued` tail —
+    // exactly the production wedge the audit identifies.
+    let response = match execution_response.result {
+        Some(execute_result::Result::ExecuteResponse(resp)) => resp,
+        Some(execute_result::Result::InternalError(e)) => panic!(
+            "input-fetch NotFound with PreconditionFailure detail must translate to \
+             FailedPrecondition for the scheduler missing_inputs terminal gate; \
+             got InternalError={e:?} — action would re-queue and stall #410 \
+             scheduler-tail observed in production"
+        ),
+        other => panic!("expected ExecuteResponse, got {other:?}"),
+    };
+    let status = response
+        .status
+        .expect("translated ExecuteResponse must carry a status");
+    assert_eq!(
+        status.code,
+        Code::FailedPrecondition as i32,
+        "detail-bearing NotFound must round-trip as FailedPrecondition; got code={} \
+         message={} — the scheduler state-manager missing_inputs gate keys exclusively \
+         on FailedPrecondition (simple_scheduler_state_manager.rs:836); any other code \
+         re-queues and stalls the Queued tail (#410)",
+        status.code,
+        status.message,
+    );
+    assert_eq!(
+        status.details.len(),
+        1,
+        "PreconditionFailure detail must survive translation (REAPI v2 §2.2.4)",
+    );
+    assert_eq!(status.details[0].type_url, any.type_url);
+    assert_eq!(status.details[0].value, any.value);
 
     Ok(())
 }

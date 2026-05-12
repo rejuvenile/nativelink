@@ -470,6 +470,66 @@ pub fn build_cas_router(
     routes
 }
 
+/// `google.rpc.PreconditionFailure` type URL — the structural detail
+/// `running_actions_manager` attaches to input-fetch and command-fetch
+/// NotFound errors (`make_precondition_failure_any`). The presence of this
+/// detail is the load-bearing signal that the NotFound IS a CAS-blob-miss
+/// the client can fix by re-uploading (REAPI v2 §2.2.4); message
+/// substrings on the inner error chain are not.
+const PRECONDITION_FAILURE_TYPE_URL: &str =
+    "type.googleapis.com/google.rpc.PreconditionFailure";
+
+/// Decide whether a `prepare_action`/`execute`/`upload_results` error
+/// represents a CAS blob miss (missing input or command) eligible for
+/// REAPI v2 §2.2.4 `Code::NotFound` → `Code::FailedPrecondition`
+/// translation. Translation drives two downstream behaviours:
+///   1. Bazel re-uploads the missing blob (client-recovery path).
+///   2. `simple_scheduler_state_manager.rs:836` marks the action terminal
+///      on attempt 1 instead of re-queueing it up to `max_job_retries`
+///      (=3) times — closing the 51-deep `Queued`-tail stall observed in
+///      production at 2026-05-11 20:10:34 PDT (pid 2980804). See
+///      `.claude/audits/410-scheduler-stall-investigation-20260512.md`.
+///
+/// The predicate fires on EITHER of two signals:
+///   * **Structural (preferred):** the error carries a
+///     `google.rpc.PreconditionFailure` detail. The detail is attached
+///     ONLY at the two REAPI-mandated sites (input fetch at
+///     `running_actions_manager.rs:1828` and command fetch at `:2735`)
+///     so its presence is a positive identifier of "CAS blob missing
+///     for this action". Robust to upstream error-message wording
+///     changes — the audit's load-bearing wedge surface.
+///   * **Substring (legacy, retained for compat):** the chained error
+///     message contains `"not found in"`. Pre-#428 production behaviour;
+///     preserved so prepare_action callers that *don't* attach a detail
+///     yet still translate. The Chesterton's-Fence intent of the
+///     original commit `5b0cb9e8` was to AVOID translating non-CAS
+///     NotFounds (missing binary, missing output file); both alternatives
+///     here uphold that intent because neither attaches a PF detail and
+///     neither produces "not found in" in their message.
+///
+/// Falsification: remove the `has_pf_detail` arm and run
+/// `not_found_with_precondition_detail_translates_without_substring`
+/// in `local_worker_test.rs` — it must red-fail with the bespoke
+/// "input-fetch NotFound with PreconditionFailure detail must translate
+/// to FailedPrecondition" assertion message.
+fn is_cas_blob_miss(err: &Error) -> bool {
+    if err.code != Code::NotFound {
+        return false;
+    }
+    let has_pf_detail = err
+        .details
+        .iter()
+        .any(|d| d.type_url == PRECONDITION_FAILURE_TYPE_URL);
+    if has_pf_detail {
+        return true;
+    }
+    // Legacy substring fallback. Match against the joined message
+    // chain (`err_tip`-pushed tips are visible here) rather than the
+    // `{e:?}` Debug rendering used pre-#428, so we don't rely on Debug
+    // including a specific field.
+    err.message_string().contains("not found in")
+}
+
 /// Start a QUIC/H3 server for the worker CAS, alongside the TCP server.
 ///
 /// Generates a self-signed TLS certificate at startup (QUIC mandates TLS 1.3)
@@ -2585,10 +2645,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             // is a CAS blob miss (from FastSlowStore). Other
                                             // NotFound errors (e.g., command binary not found,
                                             // missing output files) should propagate as-is.
-                                            let err_msg = format!("{e:?}");
-                                            if e.code == Code::NotFound
-                                                && err_msg.contains("not found in")
-                                            {
+                                            // `is_cas_blob_miss` keys on the structural
+                                            // `PreconditionFailure` detail (preferred) AND
+                                            // the legacy `"not found in"` substring; see
+                                            // doc-comment for #428 / #410 rationale.
+                                            if is_cas_blob_miss(&e) {
                                                 // Per REAPI spec, missing inputs should return
                                                 // FAILED_PRECONDITION so the client re-uploads.
                                                 warn!(
