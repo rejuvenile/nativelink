@@ -588,7 +588,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                     detail,
                 ));
             }
-            // Spawn driver. Capacity = PER_BLOB_MPSC_CAP (64).
+            // Spawn driver. Capacity = PER_BLOB_MPSC_CAP.
             let (driver, sender) = ChunkedDriver::spawn_driver(
                 Arc::clone(&self.filesystem_store),
                 digest,

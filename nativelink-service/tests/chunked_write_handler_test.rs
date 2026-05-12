@@ -51,6 +51,7 @@ use nativelink_service::chunked_write_handler::{
 };
 use nativelink_store::chunked::CHUNK_SIZE;
 use nativelink_store::chunked::chunk_budget::{ChunkBudget, TOTAL_CHUNK_PERMITS};
+use nativelink_store::chunked::chunked_driver::PER_BLOB_MPSC_CAP;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_util::channel_body_for_tests::ChannelBody;
 use nativelink_util::common::{DigestInfo, encode_stream_proto};
@@ -523,11 +524,16 @@ async fn handler_global_chunk_budget_exhausted_returns_resource_exhausted_with_b
 }
 
 /// Per-blob mpsc full → ResourceExhausted with PER_BLOB_MPSC_FULL.
-/// We saturate the per-blob mpsc by sending 17 chunks rapidly with a
-/// driver that processes them slowly. To avoid actually depending on
-/// timing, we exercise the same admission path via a direct unit-style
-/// path: send PER_BLOB_MPSC_CAP+1 chunks back-to-back without yielding
-/// — at least one must trip the per-blob full path.
+/// We saturate the per-blob mpsc by sending PER_BLOB_MPSC_CAP+1 chunks
+/// rapidly with a driver that processes them slowly. To avoid actually
+/// depending on timing, we exercise the same admission path via a
+/// direct unit-style path: send PER_BLOB_MPSC_CAP+1 chunks back-to-back
+/// without yielding — at least one must trip the per-blob full path.
+///
+/// `N` MUST track `PER_BLOB_MPSC_CAP` symbolically (NOT a literal): the
+/// rejection branch only becomes reachable when N exceeds the cap, and
+/// past bumps (16 → 64 → 256) silently rendered the prior literal
+/// (32 / 65) toothless until the integration test was refreshed.
 ///
 /// Note: this is a probabilistic test in production conditions, but
 /// here we deliberately construct a scenario where the driver task
@@ -535,13 +541,21 @@ async fn handler_global_chunk_budget_exhausted_returns_resource_exhausted_with_b
 #[nativelink_test]
 async fn handler_per_blob_mpsc_full_returns_resource_exhausted_with_backpressure_signal() {
     const CHUNK: usize = 4 * 1024;
-    // Use a 32-chunk blob so we can attempt to admit 17+ before any
-    // drain (mpsc cap = PER_BLOB_MPSC_CAP = 16).
-    const N: usize = 32;
+    // N MUST be > PER_BLOB_MPSC_CAP — track the cap symbolically so a
+    // future PER_BLOB_MPSC_CAP bump cannot silently render this
+    // rejection branch unreachable (regression: at cap=16 the test
+    // hardcoded N=32; at cap=64 it was already toothless; at cap=256
+    // it was doubly so).
+    const N: usize = PER_BLOB_MPSC_CAP + 1;
     let total = (N * CHUNK) as u64;
     let mut blob = Vec::with_capacity(N * CHUNK);
     for i in 0..N {
-        blob.extend(std::iter::repeat(0x10u8 + i as u8).take(CHUNK));
+        // Wrapping arithmetic: with N = PER_BLOB_MPSC_CAP + 1 = 257
+        // a plain `0x10u8 + i as u8` would overflow at i = 240; use
+        // wrapping_add so the test stays correct under future cap
+        // bumps.
+        let byte = 0x10u8.wrapping_add((i & 0xff) as u8);
+        blob.extend(std::iter::repeat(byte).take(CHUNK));
     }
     let digest = DigestInfo::new(sha256(&blob), total);
 
@@ -562,19 +576,19 @@ async fn handler_per_blob_mpsc_full_returns_resource_exhausted_with_backpressure
                 i == N - 1,
             );
             // Send all chunks back-to-back with no yield. The first
-            // 16 ChunkWorks fit in the per-blob mpsc; subsequent
-            // admissions race the driver's drain. We expect at least
-            // ONE per-blob-full rejection for one of these admissions.
+            // PER_BLOB_MPSC_CAP ChunkWorks fit in the per-blob mpsc;
+            // subsequent admissions race the driver's drain. We expect
+            // at least ONE per-blob-full rejection for one of these
+            // admissions.
             //
-            // If all 32 happen to make it through (driver drained
-            // fast enough on this host), we still observe successful
-            // commit + don't fail the test — the test's CONTRACT is
-            // "either it commits OR the rejection is properly tagged"
-            // — we observe the rejection path via the
-            // assertion below ONLY when the rejection actually
-            // happens. To force-test the rejection path we use a
-            // direct-driver test in chunked_driver.rs (the unit
-            // tests).
+            // If all N happen to make it through (driver drained fast
+            // enough on this host), we still observe successful commit
+            // + don't fail the test — the test's CONTRACT is "either
+            // it commits OR the rejection is properly tagged" — we
+            // observe the rejection path via the assertion below ONLY
+            // when the rejection actually happens. To force-test the
+            // rejection path we use a direct-driver test in
+            // chunked_driver.rs (the unit tests).
             //
             // For THIS integration test we assert EITHER:
             //   - a rejection happens AND it is properly tagged
@@ -584,7 +598,7 @@ async fn handler_per_blob_mpsc_full_returns_resource_exhausted_with_backpressure
         drop(tx);
     })
     .await
-    .expect("must not deadlock — burst-send 32 chunks");
+    .expect("must not deadlock — burst-send PER_BLOB_MPSC_CAP+1 chunks");
 
     let result = tokio::time::timeout(Duration::from_secs(15), writer)
         .await
@@ -593,11 +607,14 @@ async fn handler_per_blob_mpsc_full_returns_resource_exhausted_with_backpressure
 
     match result {
         Ok(resp) => {
-            // Driver drained fast enough; ALL 32 chunks were admitted
+            // Driver drained fast enough; ALL N chunks were admitted
             // and committed. This is also a valid outcome on a fast
             // host — the contract test for the per-blob-full
-            // rejection path is in the unit test below
-            // (`handler_per_blob_mpsc_full_path_via_direct_admission`).
+            // rejection path is in the composite-invariant test
+            // `chunked_driver::tests::global_chunk_budget_remains_4_gib_bound_at_cap_256`
+            // (asserts the 17th saturated blob's first-chunk admission
+            // is rejected by the global ChunkBudget, the dominant gate
+            // at PER_BLOB_MPSC_CAP=256).
             assert_eq!(
                 resp.into_inner().committed_size,
                 total,

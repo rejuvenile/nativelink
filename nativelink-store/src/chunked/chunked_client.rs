@@ -61,7 +61,10 @@
 //!   feature-flag + size + kill-switch BEFORE calling into this
 //!   module. Once you're here, you've committed to chunked transport.
 //! - **No fan-out parallelism within a single blob** — the design Q4
-//!   per-blob-mpsc-cap (currently 64; bumped from 16 on 2026-05-11)
+//!   per-blob-mpsc-cap (currently 256; bumped from 64 on 2026-05-12;
+//!   was 16 before 2026-05-11; see #413 (200-540 MB blob cascade
+//!   after cap=64) audit
+//!   `.claude/audits/413-large-blob-cascade-design-20260511.md`)
 //!   lives on the SERVER side; this client sends
 //!   chunks in arrival order (the worker has them in offset order
 //!   from `DropCloserReadHalf::recv`). Phase 2.5+ may add parallel

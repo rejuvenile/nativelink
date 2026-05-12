@@ -74,46 +74,84 @@ use crate::filesystem_store::{FileEntry, FilesystemStore};
 /// `BackpressureSignal::PerBlobMpscFull` and the unfold stream parks
 /// on its own `reader.recv`, transitively pushing back to h2). Bounds
 /// per-blob memory pressure at `PER_BLOB_MPSC_CAP * CHUNK_SIZE`
-/// (currently `64 * 1 MiB = 64 MiB`).
+/// (currently `256 * 1 MiB = 256 MiB`).
 ///
 /// **Aggregate RSS is bounded by the GLOBAL `ChunkBudget` (4 GiB /
 /// 4096 permits at `chunk_budget.rs:52`) and per-blob `PinBudget`,
 /// NOT by `PER_BLOB_MPSC_CAP × concurrent-blobs`.** The per-blob cap
 /// only sets fan-out shape: a higher cap means fewer concurrent blobs
-/// can saturate the global budget (4 GiB / 64 MiB ≈ 64 max-saturated
-/// blobs at this cap; was 256 at the prior cap of 16). The §13.2
-/// 12-16 GiB worst-case server RSS bound holds unchanged because it
-/// is derived from the global budgets, not from any per-blob × N
-/// product.
+/// can saturate the global budget (4 GiB / 256 MiB = 16 max-saturated
+/// blobs at this cap; was 64 at the prior cap of 64 MiB-per-blob, and
+/// 256 at the original cap of 16 MiB-per-blob). The §13.2 12-16 GiB
+/// worst-case server RSS
+/// bound holds unchanged because it is derived from the global
+/// budgets, not from any per-blob × N product.
 ///
-/// **Why 64 (was 16, bumped 2026-05-11).** The original 16 was an
-/// arbitrary §4 Q4 placeholder, not a measured value. Audit
-/// `.claude/audits/chunked-admission-p99-2026-05-11.md` recorded
-/// **870 `buf_channel::send: channel backpressure (>1s wait)` events
-/// in 60 min, max `send_ms: 543434` (~9 min single-chunk wait)** — h2
-/// frames stalling because the per-blob mpsc was draining slower
-/// (commit-and-verify BLAKE3 + pwrite) than the network was filling
-/// it. Zero `mpsc_full_rejections` were observed (the gate did not
-/// actually reject any chunk), but the buf_channel upstream
-/// transitively absorbed the back-edge stall. Raising the cap to 64
-/// smoothes that back-edge: 64 × 1 MiB per blob lets a transient slow
-/// commit queue chunks rather than back-pressuring h2 mid-stream.
+/// **Why 256 (was 64, bumped 2026-05-12; was 16 before 2026-05-11).**
+/// Audit `.claude/audits/413-large-blob-cascade-design-20260511.md`
+/// observed 11 large-blob cascade events in a 17-min post-deploy
+/// window where the cap-of-64 (= 64 MiB per-blob in-flight) still
+/// rejected mid-stream because the chunker → driver back-edge was
+/// the bottleneck — NOT the chunker fill-rate. The cascade was
+/// back-edge bound (commit-and-verify BLAKE3 + per-chunk pwrite at
+/// an inferred ~25-50 MB/s drain ceiling), not chunker-fill bound.
+/// 9 of the 11 victim events were ≤256 MiB (audit §1.1 bucket
+/// distribution: 2 in 64-128 MiB + 7 in 128-256 MiB; only the
+/// 426 MB and 519 MB outliers fall outside)
+/// (= `MAX_CHUNKED_BLOB_SIZE`), so cap=256 covers the entire
+/// chunked-blob class for those — the per-blob mpsc can absorb the
+/// whole blob without a single mid-stream rejection. Residual
+/// 256-540 MB outliers (~7/hr observed) are tracked under #303
+/// (server-internal driver fan-out — Option D) as a follow-up:
+/// those still stream through and may cascade at high
+/// offsets; the structural fix for them is sizing (CHUNK_SIZE bump)
+/// or a true-streaming commit, not a further mpsc cap bump.
+///
+/// **Pre-bump observability gap.** The 25-50 MB/s drain rate cited
+/// above is INFERRED from "543 s max single-chunk wait at the
+/// chunker → driver boundary" plus rough back-of-envelope BLAKE3
+/// throughput; we have NEVER directly traced per-chunk back-edge
+/// wall-clock in production. The cap bump ships alongside an
+/// outlier-only `warn!` probe at the per-chunk back-edge site
+/// (fires only when the per-chunk back-edge exceeds 50 ms, so
+/// steady-state log volume is zero) so the next cap-tuning
+/// iteration has direct measurements. See the `back_edge_ms` field
+/// on `"per-chunk back-edge drain exceeded 50ms"` log lines.
+/// `debug!`-level was rejected because the workspace pins
+/// `tracing = features = ["release_max_level_info"]`
+/// (`Cargo.toml:101`), which compile-time eliminates `debug!` in
+/// release builds.
+///
+/// **Historical context (cap=16 → 64 on 2026-05-11).** The original
+/// 16 was an arbitrary §4 Q4 placeholder, not a measured value.
+/// Audit `.claude/audits/chunked-admission-p99-2026-05-11.md`
+/// recorded **870 `buf_channel::send: channel backpressure (>1s wait)`
+/// events in 60 min, max `send_ms: 543434` (~9 min single-chunk
+/// wait)** at the prior cap of 16 — h2 frames stalling because the
+/// per-blob mpsc was draining slower than the network was filling
+/// it. Zero `mpsc_full_rejections` were observed at that cap (the
+/// gate did not reject any chunk), but the buf_channel upstream
+/// transitively absorbed the back-edge stall. Bumping to 64 smoothed
+/// that back-edge for small/mid blobs but did NOT structurally cover
+/// the large-blob cascade class — hence this further bump to 256.
 /// This is still a CAP, not a target; steady-state occupancy is
 /// governed by the chunker → driver throughput ratio.
 ///
 /// **Sibling cascade: Bazel-side Chunker NPE on retry race.** The
-/// patched Bazel binary now emits 2 MiB wire-chunks (was 16 KiB).
-/// At the prior cap of 16, the per-blob mpsc filled in 8 wire-chunks
-/// (= 16 MiB), making `chunked dispatch: per-blob mpsc full` events
-/// fire at ~666/hr; each cancel raced client-side retry → Bazel
+/// patched Bazel binary emits 2 MiB wire-chunks (was 16 KiB at the
+/// time of the cap=16 → 64 bump). At cap=64 the per-blob mpsc filled
+/// in 32 wire-chunks (= 64 MiB), still allowing
+/// `chunked dispatch: per-blob mpsc full` cascades for blobs >64 MiB
+/// — each cancel raced client-side retry → Bazel
 /// `Chunker.seek():165 data == null` NPE (a known Bazel issue, see
 /// upstream #28489 and prior fixes `9a823d9d` / `01d7f97d` /
-/// `397266d0` / `cfef67da`). The 64-slot cap structurally eliminates
-/// this cascade for blobs ≤64 MiB (the observed 50 MB blob class
-/// fits entirely). Larger blobs (200-540 MB RustcLink outputs) still
-/// stream through the bounded mpsc and may cascade at higher offsets
-/// — see #413 for sizing follow-up.
-pub const PER_BLOB_MPSC_CAP: usize = 64;
+/// `397266d0` / `cfef67da`). The 256-slot cap structurally eliminates
+/// this cascade for blobs ≤256 MiB (the entire `MAX_CHUNKED_BLOB_SIZE`
+/// range). Larger 256-540 MB outliers still stream through the
+/// bounded mpsc and may cascade at higher offsets — tracked under
+/// #303 (server-internal driver fan-out — Option D) / #413
+/// (200-540 MB blob cascade after cap=64) sizing follow-up.
+pub const PER_BLOB_MPSC_CAP: usize = 256;
 
 /// Per-chunk wall-clock bound on the slow-tier `pwrite` step
 /// (#213 perf-opt NMA2 fixup for §6.7 trigger (b)). Bounds how long
@@ -347,7 +385,7 @@ struct SidecarState {
 struct ChunkPin {
     /// Map of byte-offset → chunk bytes. Memory cost = sum of chunk
     /// lengths held while the driver is in-flight. Bounded by the
-    /// per-blob mpsc cap (`PER_BLOB_MPSC_CAP * CHUNK_SIZE = 64 MiB`)
+    /// per-blob mpsc cap (`PER_BLOB_MPSC_CAP * CHUNK_SIZE = 256 MiB`)
     /// while the driver is consuming, AND further bounded after the
     /// driver consumed but before commit by the blob size itself —
     /// already counted toward the global ChunkBudget via the Q8
@@ -811,6 +849,17 @@ async fn run_driver<Fe: FileEntry>(
         // bound.
         let bytes_for_write = chunk_bytes.clone();
         let write_fut = filesystem_store.write_chunk_at_offset(&digest, chunk_offset, bytes_for_write);
+        // #413 (200-540 MB blob cascade after cap=64) pre-bump
+        // instrumentation: measure per-chunk back-edge wall-clock so the
+        // `PER_BLOB_MPSC_CAP` doc-comment's inferred "~25-50 MB/s back-
+        // edge drain" estimate can be replaced with a direct production
+        // trace. The probe spans the entire await of `write_fut`
+        // (spawn_blocking pool queue + per-blob async-mutex acquire in
+        // `chunked_filesystem::write_chunk_at_offset` + the actual pwrite
+        // syscall) — that's the wall-clock the chunker → driver back-edge
+        // actually pays, NOT just the syscall. The field is named
+        // `back_edge_ms` to reflect this.
+        let pwrite_started_at = std::time::Instant::now();
         let write_result = match tokio::time::timeout(per_chunk_timeout, write_fut).await {
             Ok(res) => res,
             Err(_elapsed) => {
@@ -903,6 +952,56 @@ async fn run_driver<Fe: FileEntry>(
             return Err(write_err);
         }
         chunks_committed.fetch_add(1, Ordering::Relaxed);
+
+        // #413 (200-540 MB blob cascade after cap=64) pre-bump
+        // observability: emit a `warn!` ONLY when the per-chunk back-edge
+        // exceeds the 50 ms threshold so production traces can replace
+        // the inferred ~25-50 MB/s drain ceiling cited in the
+        // `PER_BLOB_MPSC_CAP` doc comment with a direct measurement.
+        //
+        // Why `warn!` (not `debug!`): the workspace pins
+        // `tracing = { features = ["release_max_level_info"] }` (see
+        // `Cargo.toml:101`), which compile-time eliminates `debug!` /
+        // `trace!` calls in release builds — a `debug!` probe here would
+        // be dead code in production despite any `RUST_LOG` setting. A
+        // CLAUDE.md `warn!` ("performance anomalies — slow ops,
+        // contention, early evictions") preserves the tail signal in
+        // release with zero log-volume risk in steady state: at the
+        // ~25-50 MB/s drain ceiling and a 1 MiB chunk, the typical back-
+        // edge is 20-40 ms (no log); a >50 ms back-edge means one of:
+        // (a) per-blob async-mutex hold-time spike (acquire blocks
+        // BEFORE spawn_blocking, so the wall-clock includes mutex
+        // contention from concurrent same-digest writes — most likely
+        // attribution under load); (b) spawn_blocking pool queue depth
+        // (operator-visible via runtime metrics); (c) slow-tier pwrite
+        // contention (ZFS recordsize mismatch / arc pressure / disk
+        // write amplification). Each is operator-actionable.
+        //
+        // Why 50 ms threshold: chosen at the high end of the inferred
+        // healthy range (40 ms = 1 MiB / 25 MB/s) plus a 25 % cushion
+        // so a healthy production cluster emits zero-to-few of these,
+        // and the cap-tuning iteration sees a clean signal once the
+        // bottleneck is exercised. Adjust based on observed steady-
+        // state if this turns out to be too noisy or too quiet.
+        //
+        // Coverage caveat: this probe ONLY fires on the success path.
+        // The timeout arm (line ~859, `record_pwrite_timeout_and_maybe_warn`)
+        // and the write-error arm (line ~908) emit their own `warn!`s
+        // without `back_edge_ms`. That is acceptable for cap-tuning:
+        // failures already log loudly; outlier-on-success is the gap.
+        let back_edge_ms = pwrite_started_at.elapsed().as_millis() as u64;
+        if back_edge_ms > 50 {
+            warn!(
+                target: "nativelink_store::chunked",
+                back_edge_ms,
+                ?digest,
+                offset = chunk_offset,
+                chunk_bytes = chunk_len,
+                "per-chunk back-edge drain exceeded 50ms — investigate \
+                 ZFS / mutex / spawn_blocking queue split (#413 \
+                 (200-540 MB blob cascade after cap=64) Option A probe)",
+            );
+        }
 
         // Populate the in-memory pin (design §6.2 / §6.3 step 2).
         // Reachable from `ChunkedDriver::try_get_chunk_from_pin` — the
@@ -1358,21 +1457,141 @@ mod tests {
     use nativelink_util::common::DigestInfo;
     use sha2::{Digest as _, Sha256};
 
-    use super::super::chunk_budget::ChunkBudget;
+    use super::super::chunk_budget::{ChunkBudget, TOTAL_CHUNK_PERMITS};
     use super::{ChunkWork, ChunkedDriver, PER_BLOB_MPSC_CAP};
     use crate::filesystem_store::{FileEntryImpl, FilesystemStore};
 
     /// Capacity constant pin: any change is ARCHITECTURAL — re-read
     /// design §4 Q4 + audit
-    /// `.claude/audits/chunked-admission-p99-2026-05-11.md` rec #4
-    /// before bumping further. 64 was chosen to smooth back-edge
-    /// stalls at the chunker → driver boundary (870 buf_channel
-    /// backpressure events / 60 min, max wait 543 s on the prior 16
-    /// cap) AND to absorb 2 MiB Bazel wire-chunks without cascade-cancel
-    /// storm (see `PER_BLOB_MPSC_CAP` doc comment).
+    /// `.claude/audits/413-large-blob-cascade-design-20260511.md`
+    /// (Option A) before bumping further. 256 was chosen to
+    /// structurally cover the full `MAX_CHUNKED_BLOB_SIZE` (= 256 MiB)
+    /// range so the chunker → driver back-edge cannot reject a
+    /// mid-stream chunk for any blob ≤256 MiB; this eliminates 9 of 11
+    /// large-blob cascade events observed in the 17-min post-deploy
+    /// window at the prior cap of 64 (which itself was a 2026-05-11
+    /// bump from the original §4 Q4 placeholder of 16). See the
+    /// `PER_BLOB_MPSC_CAP` doc comment for the full historical
+    /// rationale.
     #[test]
-    fn per_blob_mpsc_cap_is_sixtyfour() {
-        assert_eq!(PER_BLOB_MPSC_CAP, 64);
+    fn per_blob_mpsc_cap_is_two_fifty_six() {
+        assert_eq!(PER_BLOB_MPSC_CAP, 256);
+    }
+
+    /// Composite invariant per CLAUDE.md "Admission/Eviction/Pin
+    /// Composability": the gate corner (per-blob mpsc full →
+    /// `BackpressureSignal::PerBlobMpscFull`) MUST never fire ahead
+    /// of the global ChunkBudget gate (→
+    /// `BackpressureSignal::GlobalChunkBudgetExhausted`) when the
+    /// system is under aggregate concurrent-blob pressure. Concretely:
+    /// with `PER_BLOB_MPSC_CAP=256` (= 256 MiB per-blob in-flight) and
+    /// `TOTAL_CHUNK_PERMITS=4096` (= 4 GiB global), the budget is
+    /// exhausted after `4096 / 256 = 16` saturated blobs. The 17th
+    /// concurrent saturated blob's first chunk admission MUST get
+    /// `None` from `try_acquire_chunk` (which the gate at
+    /// `chunked_write_handler.rs:1415-1432` translates to
+    /// `BackpressureSignal::GlobalChunkBudgetExhausted`).
+    ///
+    /// **Composite triangle for this gate.** The OTHER two corners:
+    /// - **Eviction:** the per-blob mpsc receiver inside the driver
+    ///   task drains a chunk → its `_permit: OwnedSemaphorePermit`
+    ///   drop releases one slot of the global ChunkBudget AND one
+    ///   slot of the per-blob mpsc. (See `chunked_driver.rs::run_driver`
+    ///   `recv()` arm + `ChunkWork`'s permit ownership in
+    ///   `chunked_driver.rs:347-350`.)
+    /// - **Pin:** the global ChunkBudget IS the pin — every in-flight
+    ///   chunk holds exactly one `OwnedSemaphorePermit` for the lifetime
+    ///   of the `ChunkWork` (`chunk_budget.rs:24-31`); no separate pin
+    ///   path exists for the back-edge. (Per-blob `PinBudget` is a
+    ///   distinct, complementary cap — see `pin_budget.rs`.)
+    ///
+    /// **Composite invariant:**
+    /// `gate-active ⇒ explicit-eviction-fires-before-gate`. With both
+    /// corners local to the budget, the gate firing is itself the
+    /// admission of the global cap; the eviction corner is the chunk
+    /// commit returning the permit. No TTL needed because the budget
+    /// is reactive (no time-based release).
+    ///
+    /// **Falsification mutation:** comment out either (a) the
+    /// `PER_BLOB_MPSC_CAP` constant being ≤ `TOTAL_CHUNK_PERMITS / 16`
+    /// or (b) the `_permit: OwnedSemaphorePermit` drop on `ChunkWork`
+    /// drop (release on permit-ownership return). Either mutation
+    /// flips the dominance order between the two gates and this test
+    /// red-fails with the specific message below.
+    ///
+    /// **Why test the budget primitive directly (not a 16-driver
+    /// composition):** the dominance-order property is a pure
+    /// ChunkBudget arithmetic invariant — `PER_BLOB_MPSC_CAP ×
+    /// max_concurrent_blobs ≤ TOTAL_CHUNK_PERMITS`. Spinning up 16
+    /// real drivers + 4096 real ChunkWorks wouldn't add coverage of
+    /// this invariant (each driver's per-blob mpsc would be
+    /// independent; the cross-blob interaction is mediated entirely
+    /// by the budget). A pure-budget test exercises the SAME seam as
+    /// production admission code: 16 saturated drivers on the wire
+    /// would drain exactly 4096 permits via the `_permit` field on
+    /// each ChunkWork — the same `try_acquire_chunk → None`
+    /// transition this test asserts.
+    #[test]
+    fn global_chunk_budget_remains_4_gib_bound_at_cap_256() {
+        // Sanity: the cap-of-256 × 16-blob invariant matches the
+        // global TOTAL_CHUNK_PERMITS (= 4096). If a future bump moves
+        // either constant without re-verifying this composite, this
+        // assertion forces the conversation.
+        assert_eq!(
+            PER_BLOB_MPSC_CAP * 16,
+            TOTAL_CHUNK_PERMITS,
+            "PER_BLOB_MPSC_CAP × 16 saturated blobs MUST equal \
+             TOTAL_CHUNK_PERMITS (4 GiB / 1 MiB chunk = 4096); \
+             composite invariant violated: gate dominance order shifted"
+        );
+
+        let budget = ChunkBudget::new();
+
+        // Saturate 16 blobs' worth (= 4096 permits = the entire budget).
+        // Hold them in a Vec so they don't release until end-of-test.
+        let mut held: Vec<tokio::sync::OwnedSemaphorePermit> =
+            Vec::with_capacity(TOTAL_CHUNK_PERMITS);
+        for blob in 0..16 {
+            for chunk in 0..PER_BLOB_MPSC_CAP {
+                let permit = budget.try_acquire_chunk().unwrap_or_else(|| {
+                    panic!(
+                        "composite invariant violated: gate fired before all 16 blobs \
+                         saturated their per-blob caps (failed at blob {blob} chunk {chunk}); \
+                         this proves PER_BLOB_MPSC_CAP × 16 > TOTAL_CHUNK_PERMITS — \
+                         the per-blob cap dominates the global cap, which would let \
+                         attacker-controlled per-blob saturation evade global pressure"
+                    );
+                });
+                held.push(permit);
+            }
+        }
+        assert_eq!(
+            budget.available_chunks(),
+            0,
+            "after 16 × PER_BLOB_MPSC_CAP saturating acquires, global budget MUST be \
+             empty; got {} permits available",
+            budget.available_chunks()
+        );
+
+        // 17th concurrent blob's first-chunk admission MUST get None
+        // (= GlobalChunkBudgetExhausted in the production gate at
+        // chunked_write_handler.rs:1415-1432). It MUST NOT see a
+        // per-blob mpsc full (which would only fire if the same blob's
+        // mpsc filled up — a 17th blob has an empty mpsc by definition).
+        assert!(
+            budget.try_acquire_chunk().is_none(),
+            "composite invariant violated: gate active without compensating \
+             eviction/pin/TTL — the 17th saturated blob's first-chunk admission \
+             must be rejected by the GLOBAL ChunkBudget (translated to \
+             BackpressureSignal::GlobalChunkBudgetExhausted), NOT by the per-blob \
+             mpsc (which is empty for a fresh blob); if this passes, \
+             PER_BLOB_MPSC_CAP × concurrent-blobs has decoupled from \
+             TOTAL_CHUNK_PERMITS"
+        );
+
+        // Drop all permits to release the budget for any subsequent
+        // tests in the same process.
+        held.clear();
     }
 
     fn sha256(bytes: &[u8]) -> [u8; 32] {
