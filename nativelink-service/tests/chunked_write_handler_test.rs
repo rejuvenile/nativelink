@@ -1163,7 +1163,7 @@ async fn admit_prepared_chunk_returns_aborted_when_driver_mpsc_closed() {
     };
 
     let result = tokio::time::timeout(Duration::from_secs(5), async {
-        admit_prepared_chunk(prepared, &tx, budget, None, CHUNK, digest, &metrics)
+        admit_prepared_chunk(prepared, &tx, budget, None, CHUNK, digest, &metrics, None)
     })
     .await
     .expect(
@@ -1614,5 +1614,201 @@ async fn handler_bounds_discard_partial_under_wedged_slow_tier() {
         status.code(),
         tonic::Code::InvalidArgument,
         "bad-digest second chunk must classify as InvalidArgument; got {status:?}"
+    );
+}
+
+/// #394/#413 Phase 1 falsification probe (pulse-burst hypothesis).
+///
+/// Drives 200 admission ATTEMPTS through `admit_prepared_chunk` on a
+/// fresh `ProducerArrivalProbe` within a single 100ms window and
+/// asserts the burst-detect `warn!` fired (`BURST_THRESHOLD_CHUNKS_
+/// PER_WINDOW = 50`).
+///
+/// **Why N=200, not 60** (red-team 20260512 / assumption-auditor CLAIM 4
+/// PARTIAL fix): on loaded CI a tight 60-call loop CAN cross 100ms
+/// mid-loop. If that happens the window rolls over and
+/// `attempts_in_window` resets to 1, then climbs back toward (but maybe
+/// not past) 50 in the next window — the warn never fires and the test
+/// flakes. With N=200, even a single mid-loop window rollover leaves the
+/// second window with >100 attempts (well past the 50 threshold), so the
+/// warn is guaranteed to fire on either side of any rollover.
+///
+/// **Production composition:** calls `admit_prepared_chunk` (the
+/// production helper used by both the worker WriteChunked RPC and the
+/// Bazel-facing dispatch path) with `Some(&mut probe)` — the same
+/// shape `dispatch_chunks_to_driver` uses on the cascade-prone path.
+/// The test covers the seam between probe state mutation and the
+/// `warn!` emission inside `admit_prepared_chunk`'s try_send Ok arm.
+///
+/// **Mutation step:** in `chunked_write_handler.rs::ProducerArrivalProbe::record_attempt`,
+/// comment out the line `if !self.warned_this_window && self.attempts_in_window
+/// > BURST_THRESHOLD_CHUNKS_PER_WINDOW`. The probe never emits the warn
+/// → `logs_contain` returns false → assertion fires the bespoke message
+/// "Phase 1 probe never warned — burst-detect gate stripped or threshold
+/// raised" (referring to 200 admissions, not 60).
+#[nativelink_test]
+async fn producer_arrival_probe_warns_on_burst_above_threshold() {
+    use nativelink_service::chunked_write_handler::{
+        ChunkedWriteHandlerMetrics, PreparedChunk, ProducerArrivalProbe,
+        admit_prepared_chunk,
+    };
+    use nativelink_store::chunked::chunked_driver::ChunkWork;
+
+    const CHUNK: usize = 4 * 1024;
+    // 200 admissions >> BURST_THRESHOLD_CHUNKS_PER_WINDOW (50); robust
+    // against one mid-loop window rollover on loaded CI (see fn-level
+    // doc). The declared digest size covers 200 chunks; FINAL chunk
+    // would carry `finish=true` but we keep `finish=false` on all 200
+    // (the probe doesn't care about finish — only the offset shape
+    // needs to be valid for `admit_prepared_chunk`'s shape gate).
+    const N: usize = 200;
+    let total = (N * CHUNK + 1) as u64; // +1 ensures non-final chunks
+    let blob_chunk = vec![0xc7u8; CHUNK];
+    let digest = DigestInfo::new(sha256(&blob_chunk), total);
+    let budget = make_test_budget();
+
+    // Live receiver, never polled — we want try_send to land Ok 200
+    // times without the receiver draining. The PER_BLOB_MPSC_CAP=256
+    // channel can hold all 200 ChunkWork values; if PER_BLOB_MPSC_CAP
+    // ever shrinks below N, the test will fail loudly at `expect`. Hold
+    // _rx alive to keep the channel open (Closed would be a different
+    // rejection arm).
+    let (tx, _rx) = mpsc::channel::<ChunkWork>(PER_BLOB_MPSC_CAP);
+
+    let metrics = ChunkedWriteHandlerMetrics::default();
+    let mut probe = ProducerArrivalProbe::default();
+
+    // Fire 200 admissions in tight succession. Each call is a few
+    // microseconds of validation + a non-blocking try_send, so even on
+    // a slow CI host the cumulative count crosses
+    // BURST_THRESHOLD_CHUNKS_PER_WINDOW=50 well inside a single window;
+    // and with N=200, even a window rollover mid-loop leaves the
+    // second window with enough attempts to cross the threshold again.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0..N {
+            let prepared = PreparedChunk {
+                chunk_offset: (i * CHUNK) as u64,
+                chunk_bytes: Bytes::from(blob_chunk.clone()),
+                finish: false,
+            };
+            admit_prepared_chunk(
+                prepared,
+                &tx,
+                budget,
+                None,
+                CHUNK,
+                digest,
+                &metrics,
+                Some(&mut probe),
+            )
+            .expect("each admission must succeed (cap=256, fresh budget)");
+        }
+    })
+    .await
+    .expect(
+        "must not deadlock — 200 non-blocking admissions on a 256-cap \
+         mpsc must complete promptly",
+    );
+
+    // The contract under test: ProducerArrivalProbe::record_attempt
+    // emits a `warn!` once per window when attempts_in_window crosses
+    // BURST_THRESHOLD_CHUNKS_PER_WINDOW=50. The bespoke marker
+    // "pulse-burst signature (#394/#413 Phase 1 probe)" is unique to
+    // the probe's burst-detect arm and not produced by any other
+    // log site.
+    assert!(
+        logs_contain("pulse-burst signature (#394/#413 Phase 1 probe)"),
+        "Phase 1 probe never warned — burst-detect gate stripped or \
+         threshold raised. Drove {N} admissions in <100ms (well above \
+         the 50-attempt threshold); the `record_attempt` warn arm in \
+         `chunked_write_handler.rs` must have fired."
+    );
+}
+
+/// #394/#413 Phase 1 falsification probe — asymmetric-contract
+/// coverage (red-team 20260512 + CLAUDE.md "Asymmetric contract
+/// coverage" discipline).
+///
+/// **Over-action guard:** the warn arm must NOT fire when
+/// `attempts_in_window` stays at or below
+/// `BURST_THRESHOLD_CHUNKS_PER_WINDOW = 50`. The under-action direction
+/// is tested by `producer_arrival_probe_warns_on_burst_above_threshold`
+/// (fires when above); this test asserts the over-action direction:
+/// if a healthy stream sends only ~40 chunks per 100ms window, the
+/// operator must NOT see a spurious "pulse-burst" warn that would
+/// trigger an investigation of a non-existent burst.
+///
+/// **Production composition:** identical to the under-action test —
+/// calls `admit_prepared_chunk` with `Some(&mut probe)` so the test
+/// crosses the same seam (probe state mutation → warn emission) as
+/// `dispatch_chunks_to_driver`.
+///
+/// **Mutation step:** in `chunked_write_handler.rs`, change
+/// `BURST_THRESHOLD_CHUNKS_PER_WINDOW: u32 = 50` to
+/// `BURST_THRESHOLD_CHUNKS_PER_WINDOW: u32 = 0` (always-fire). With
+/// the threshold at 0, even one admission crosses it → warn fires →
+/// `logs_contain` returns true → assertion fires the bespoke message
+/// "Phase 1 probe fired below threshold".
+#[nativelink_test]
+async fn producer_arrival_probe_quiet_below_threshold() {
+    use nativelink_service::chunked_write_handler::{
+        ChunkedWriteHandlerMetrics, PreparedChunk, ProducerArrivalProbe,
+        admit_prepared_chunk,
+    };
+    use nativelink_store::chunked::chunked_driver::ChunkWork;
+
+    const CHUNK: usize = 4 * 1024;
+    // 40 admissions < BURST_THRESHOLD_CHUNKS_PER_WINDOW (50). This is
+    // the healthy-stream regime: producer arrival comfortably below the
+    // pulse-burst threshold. The warn must stay silent.
+    const N: usize = 40;
+    let total = (N * CHUNK + 1) as u64; // non-final chunks throughout
+    let blob_chunk = vec![0xb1u8; CHUNK];
+    let digest = DigestInfo::new(sha256(&blob_chunk), total);
+    let budget = make_test_budget();
+
+    let (tx, _rx) = mpsc::channel::<ChunkWork>(PER_BLOB_MPSC_CAP);
+
+    let metrics = ChunkedWriteHandlerMetrics::default();
+    let mut probe = ProducerArrivalProbe::default();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0..N {
+            let prepared = PreparedChunk {
+                chunk_offset: (i * CHUNK) as u64,
+                chunk_bytes: Bytes::from(blob_chunk.clone()),
+                finish: false,
+            };
+            admit_prepared_chunk(
+                prepared,
+                &tx,
+                budget,
+                None,
+                CHUNK,
+                digest,
+                &metrics,
+                Some(&mut probe),
+            )
+            .expect("each admission must succeed (cap=256, fresh budget)");
+        }
+    })
+    .await
+    .expect(
+        "must not deadlock — 40 non-blocking admissions on a 256-cap \
+         mpsc must complete promptly",
+    );
+
+    // The contract under test: ProducerArrivalProbe::record_attempt
+    // does NOT emit the pulse-burst warn while attempts stay at or
+    // below BURST_THRESHOLD_CHUNKS_PER_WINDOW=50. If this fires it
+    // means the threshold was lowered or the gate stripped — false-
+    // alarm hazard for operators triaging healthy streams.
+    assert!(
+        !logs_contain("pulse-burst signature (#394/#413 Phase 1 probe)"),
+        "Phase 1 probe fired below threshold — the burst-detect arm \
+         emitted a `warn!` after only {N} admissions (BURST_THRESHOLD_\
+         CHUNKS_PER_WINDOW=50). Either the threshold was lowered or the \
+         gate was stripped; healthy streams must not produce pulse-burst \
+         warns."
     );
 }

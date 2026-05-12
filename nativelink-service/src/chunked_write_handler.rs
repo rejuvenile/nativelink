@@ -60,6 +60,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -114,6 +115,30 @@ const CONCURRENT_SAME_DIGEST_RETRY_AFTER_MS: u64 = 250;
 /// latency; 100 ms matches the global-budget hint as a reasonable
 /// lower bound.
 const PIN_BUDGET_RETRY_AFTER_MS: u64 = 100;
+
+/// #394/#413 Phase 1 falsification probe (pulse-burst hypothesis): rolling
+/// window over which producer admission attempts are counted on the
+/// Bazel-facing dispatch path. See
+/// `.claude/audits/394-413-saturation-class-plan-20260512.md` §8.
+///
+/// **Why 100 ms:** at the inferred ~25-50 MB/s per-blob drain ceiling
+/// (see `chunked_driver.rs` `PER_BLOB_MPSC_CAP` doc), a steady-state
+/// drain completes one chunk in ~20-40 ms. A 100 ms window therefore
+/// captures ~3-5 steady-state drains; a producer arriving faster than
+/// `BURST_THRESHOLD_CHUNKS_PER_WINDOW` admissions in that window is
+/// running >5x the drain rate — `H_pulse_burst` signature.
+const PRODUCER_ARRIVAL_WINDOW: core::time::Duration =
+    core::time::Duration::from_millis(100);
+
+/// #394/#413 Phase 1 falsification probe: minimum admission count per
+/// `PRODUCER_ARRIVAL_WINDOW` that promotes a window from "steady-state
+/// fill" to "pulse-burst". 50 = the cap=256 mpsc reaches 1/5 full from
+/// a single window; clean blobs are predicted to stay <20 (audit §8
+/// prediction). Operator-actionable warn — if dashboards see this fire
+/// on cascade-bound blobs but stay quiet on clean blobs, `H_pulse_burst`
+/// is confirmed and Phase 2 (Option C+A — unbounded mpsc + send().await)
+/// is justified.
+const BURST_THRESHOLD_CHUNKS_PER_WINDOW: u32 = 50;
 
 /// Per-recv timeout on the early-dedup gate's drain loop (`bounded_drain_*`).
 /// Mirrors the legacy chunked driver's `per_chunk_timeout` philosophy
@@ -831,6 +856,12 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             self.chunk_size,
             stream_digest,
             &self.metrics,
+            // #394/#413 Phase 1 probe: not wired on the worker path.
+            // The pulse-burst hypothesis targets the Bazel-facing
+            // chunker → driver back-edge; the worker-driven path has
+            // a different producer (worker reads its own slow tier)
+            // and is not the cascade-prone path.
+            None,
         )
     }
 
@@ -1339,6 +1370,180 @@ pub enum CommitMode {
     AsyncCommit,
 }
 
+/// #394/#413 Phase 1 falsification probe state (pulse-burst vs
+/// drain-stall discriminator).
+/// Per-blob, single-task ownership (the admit-loop in
+/// `dispatch_chunks_to_driver` calls `record_attempt` on each admission
+/// attempt; the loop is single-task per blob so non-atomic fields are
+/// safe). See `.claude/audits/394-413-saturation-class-plan-20260512.md`
+/// §8.
+///
+/// **Discriminator (red-team 20260512 Finding 1 fix):** the probe emits
+/// BOTH `chunks_in_window` (all admission ATTEMPTS, including those
+/// that rejected at the per-blob mpsc) AND `admitted_in_window` (the
+/// subset that landed Ok on the per-blob mpsc within the same window).
+/// The pair distinguishes the two hypotheses at the warn site:
+///   - `admitted_in_window ≈ chunks_in_window` → `H_pulse_burst`
+///     (producer outran a healthy drain; the queue accepted most of
+///     the burst until cap saturation).
+///   - `admitted_in_window << chunks_in_window` → `H_drain_stall`
+///     (the per-blob mpsc stayed full and the producer hammered
+///     try_send on a wedged drain; attempts rose while admissions
+///     barely moved). Without this delta the two hypotheses are
+///     observationally indistinguishable at this probe site.
+///
+/// **Relationship to `back_edge_ms` probe** (in
+/// `nativelink_store::chunked::chunked_driver`): shares this probe's
+/// `warn!` target / `?digest` / `offset` shape so dashboards can join
+/// them, but latches one-per-window to avoid log-flood on sustained
+/// bursts (the `back_edge_ms` probe fires per-chunk on the drain side;
+/// this one fires once-per-100ms-window on the admit side).
+///
+/// **Why this lives outside `admit_prepared_chunk` and is passed in as
+/// `&mut`:** the worker-driven `WriteChunked` RPC path (via
+/// `ChunkedWriteHandler::admit_chunk`) also calls `admit_prepared_chunk`
+/// but is NOT the cascade-prone path — the cascade hypothesis is
+/// specifically chunker → driver back-edge on the Bazel-facing path. The
+/// Bazel-facing call site in `dispatch_chunks_to_driver` (line 1928 area)
+/// passes `Some(&mut probe)`; the worker call site passes `None`. Keeps
+/// the probe scoped to the failing path without duplicating the helper.
+#[derive(Debug, Default)]
+pub struct ProducerArrivalProbe {
+    /// First admission attempt for this stream — used as the
+    /// `producer_arrival_us_since_admission` baseline on the
+    /// `Err(Full)` rejection log so we can see how long the producer
+    /// has been driving the saturated mpsc before the failure.
+    first_attempt_at: Option<Instant>,
+    /// Start of the current `PRODUCER_ARRIVAL_WINDOW`. `None` until the
+    /// first admission attempt.
+    window_start_at: Option<Instant>,
+    /// Admission attempts (successful `try_send` OR rejected at
+    /// sub-gate 3) within the current window. Counts ATTEMPTS, not
+    /// commits — we want the producer's arrival rate, regardless of
+    /// whether the admission was accepted at the per-blob mpsc gate.
+    attempts_in_window: u32,
+    /// Whether a high-burst `warn!` has already fired for the current
+    /// window. Latches so we emit at most one warn per pulse (avoids
+    /// log-flood on a sustained burst that spans multiple chunks
+    /// within a single 100 ms window).
+    warned_this_window: bool,
+    /// Cumulative successful `try_send` count for this stream.
+    /// Cross-references the `Err(Full)` rejection log so an operator
+    /// can see whether the rejection happened at chunk 20/200 (early-
+    /// saturation pulse — `H_pulse_burst` signature) or at chunk
+    /// 200/210 (drain-couldn't-quite-finish — `H_steady_state_drain`
+    /// signature).
+    chunks_admitted_total: u32,
+    /// Snapshot of `chunks_admitted_total` taken when the CURRENT
+    /// `PRODUCER_ARRIVAL_WINDOW` opened. Subtracting from
+    /// `chunks_admitted_total` at warn-emit time yields
+    /// `admitted_in_window = how many ATTEMPTS within this window
+    /// actually landed Ok on the per-blob mpsc`. This is the
+    /// `H_pulse_burst` vs `H_drain_stall` discriminator (red-team
+    /// 20260512 Finding 1 BLOCK):
+    ///   - `admitted_in_window ≈ attempts_in_window` → both racing
+    ///     fast; the queue ACCEPTED the burst → `H_pulse_burst`
+    ///     (producer outran a healthy drain).
+    ///   - `admitted_in_window << attempts_in_window` → queue stayed
+    ///     full so most attempts hit `Err(Full)` and the producer
+    ///     hammered the saturated channel → `H_drain_stall`
+    ///     (drain wedged, gate firing on rejections only).
+    /// Single-task ownership (admit-loop) means no atomicity needed —
+    /// `record_success` increments `chunks_admitted_total` on the same
+    /// task that called `record_attempt` immediately before it.
+    chunks_admitted_at_window_start: u32,
+}
+
+impl ProducerArrivalProbe {
+    /// Record an admission ATTEMPT (called BEFORE `admit_prepared_chunk`
+    /// resolves Ok/Err). Updates the rolling window counter and emits a
+    /// `warn!` if the window exceeds `BURST_THRESHOLD_CHUNKS_PER_WINDOW`.
+    ///
+    /// `mpsc_capacity_remaining` is `sender.capacity()` at the call
+    /// site — included in the warn so operators can correlate burst
+    /// rate with cap proximity (cap=256; a window with 60 attempts
+    /// driving capacity from 200 → 140 is a different signal from
+    /// 60 attempts driving 50 → -10/saturation).
+    fn record_attempt(
+        &mut self,
+        digest: DigestInfo,
+        chunk_offset: u64,
+        mpsc_capacity_remaining: usize,
+    ) {
+        let now = Instant::now();
+        if self.first_attempt_at.is_none() {
+            self.first_attempt_at = Some(now);
+        }
+        match self.window_start_at {
+            Some(start) if now.duration_since(start) < PRODUCER_ARRIVAL_WINDOW => {
+                self.attempts_in_window = self.attempts_in_window.saturating_add(1);
+            }
+            _ => {
+                self.window_start_at = Some(now);
+                self.attempts_in_window = 1;
+                self.warned_this_window = false;
+                // Snapshot the admitted-total at window open so that on
+                // warn emission we can compute `admitted_in_window =
+                // chunks_admitted_total - chunks_admitted_at_window_start`.
+                // Red-team 20260512 Finding 1 (BLOCK): without this
+                // delta, rejected-attempts-only spam (H_drain_stall)
+                // looks identical to admitted-attempts spam
+                // (H_pulse_burst) at this probe site.
+                self.chunks_admitted_at_window_start = self.chunks_admitted_total;
+            }
+        }
+        if !self.warned_this_window
+            && self.attempts_in_window > BURST_THRESHOLD_CHUNKS_PER_WINDOW
+        {
+            self.warned_this_window = true;
+            // Saturate u128 → u64: a 100 ms window can never exceed
+            // u64::MAX ms, but `as` is unconditional truncation, so
+            // `try_into().unwrap_or(u64::MAX)` is the lint-clean form.
+            let elapsed_ms = self.window_start_at.map_or(0, |s| {
+                u64::try_from(now.duration_since(s).as_millis())
+                    .unwrap_or(u64::MAX)
+            });
+            // Discriminator (red-team Finding 1 fix): how many of the
+            // attempts in this window actually LANDED on the mpsc.
+            //   admitted_in_window ≈ attempts_in_window → pulse-burst
+            //     (producer outran a healthy drain; queue accepted).
+            //   admitted_in_window << attempts_in_window → drain-stall
+            //     (queue was full, producer hammered rejections).
+            let admitted_in_window = self
+                .chunks_admitted_total
+                .saturating_sub(self.chunks_admitted_at_window_start);
+            warn!(
+                target: "nativelink_service::chunked_write_handler",
+                ?digest,
+                offset = chunk_offset,
+                chunks_in_window = self.attempts_in_window,
+                admitted_in_window,
+                elapsed_window_ms = elapsed_ms,
+                mpsc_capacity_remaining,
+                chunks_admitted_total = self.chunks_admitted_total,
+                "producer-arrival burst exceeded threshold — pulse-burst \
+                 signature (#394/#413 Phase 1 probe)",
+            );
+        }
+    }
+
+    /// Record a SUCCESSFUL `try_send` (called AFTER `Ok(())` from
+    /// `admit_prepared_chunk`). Used to compute the rejected-offset /
+    /// total-admitted ratio on the rejection log.
+    const fn record_success(&mut self) {
+        self.chunks_admitted_total = self.chunks_admitted_total.saturating_add(1);
+    }
+
+    /// Microseconds since first admission attempt, for the rejection
+    /// log. Returns 0 if no attempt has been recorded yet. Saturates
+    /// u128 → u64 (the elapsed window is always finite in practice).
+    fn micros_since_first_attempt(&self) -> u64 {
+        self.first_attempt_at.map_or(0, |t| {
+            u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX)
+        })
+    }
+}
+
 /// Admit a `PreparedChunk` (sha256 already checked) to the per-blob
 /// driver. Mirror of `ChunkedWriteHandler::admit_chunk` minus the
 /// per-chunk SHA-256 verify (the caller has already done it). All the
@@ -1364,6 +1569,11 @@ pub fn admit_prepared_chunk(
     chunk_size: usize,
     stream_digest: DigestInfo,
     metrics: &ChunkedWriteHandlerMetrics,
+    // #394/#413 Phase 1: optional producer-arrival probe. `Some` on the
+    // Bazel-facing dispatch path (the cascade-prone path); `None` on
+    // the worker WriteChunked RPC path (different producer, different
+    // failure mode). See `ProducerArrivalProbe` doc.
+    mut probe: Option<&mut ProducerArrivalProbe>,
 ) -> Result<(), Error> {
     let PreparedChunk {
         chunk_offset,
@@ -1461,6 +1671,16 @@ pub fn admit_prepared_chunk(
         None
     };
 
+    // #394/#413 Phase 1 probe: record the admission ATTEMPT (counts the
+    // producer's arrival, regardless of whether sub-gate 3 below
+    // accepts or rejects). Capacity-remaining is sampled BEFORE the
+    // try_send so the warn correlates with the cap proximity at the
+    // moment the producer arrived, not after the chunk landed.
+    let mpsc_capacity_remaining = sender.capacity();
+    if let Some(p) = probe.as_deref_mut() {
+        p.record_attempt(stream_digest, chunk_offset, mpsc_capacity_remaining);
+    }
+
     // try_send into the per-blob mpsc (per §13.1.1 step 2).
     let work = ChunkWork {
         chunk_offset,
@@ -1474,6 +1694,9 @@ pub fn admit_prepared_chunk(
             metrics
                 .chunks_admitted_total
                 .fetch_add(1, Ordering::Relaxed);
+            if let Some(p) = probe {
+                p.record_success();
+            }
             Ok(())
         }
         Err(mpsc::error::TrySendError::Full(returned)) => {
@@ -1482,6 +1705,35 @@ pub fn admit_prepared_chunk(
             metrics
                 .mpsc_full_rejections_total
                 .fetch_add(1, Ordering::Relaxed);
+            // #394/#413 Phase 1: enrich the rejection event with probe
+            // state so an operator can falsify `H_pulse_burst` at the
+            // failure event itself. The `admitted_in_window`
+            // discriminator (red-team 20260512 Finding 1 fix):
+            //   - `admitted_in_window` ≈ `chunks_in_window` and
+            //     `chunks_admitted_total` low (early in stream)
+            //     → pulse-burst (queue accepted the burst until cap).
+            //   - `admitted_in_window` << `chunks_in_window`
+            //     → drain-stall (queue stayed full; the producer kept
+            //     hammering try_send and these `Err(Full)` warns are
+            //     mostly rejected attempts, NOT admitted bytes).
+            if let Some(p) = probe {
+                let admitted_in_window = p
+                    .chunks_admitted_total
+                    .saturating_sub(p.chunks_admitted_at_window_start);
+                warn!(
+                    target: "nativelink_service::chunked_write_handler",
+                    ?stream_digest,
+                    offset = chunk_offset,
+                    chunks_in_window = p.attempts_in_window,
+                    admitted_in_window,
+                    chunks_admitted_total = p.chunks_admitted_total,
+                    producer_arrival_us_since_admission = p.micros_since_first_attempt(),
+                    mpsc_capacity_remaining,
+                    "per-blob mpsc full at producer-arrival probe — \
+                     pulse-burst vs drain-stall correlation (#394/#413 \
+                     Phase 1 probe)",
+                );
+            }
             let detail = encode_backpressure_signal_any(
                 backpressure_signal::Reason::PerBlobMpscFull,
                 PER_BLOB_MPSC_RETRY_AFTER_MS,
@@ -1921,6 +2173,26 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     // Pin the chunks stream so we can iterate it inline.
     let mut chunks = chunks;
 
+    // #394/#413 Phase 1 falsification probe: per-blob producer-arrival
+    // tracker. Lifetime = one stream's admit loop (single task per
+    // blob; no atomicity needed). See `ProducerArrivalProbe` doc for
+    // hypothesis + thresholds + interpretation.
+    let mut producer_arrival_probe = ProducerArrivalProbe::default();
+
+    // Probe-armed heartbeat (red-team 20260512 Finding 3 fix —
+    // silent-probe vs broken-probe distinguishability). Fires exactly
+    // once per Bazel-facing chunked stream BEFORE the admit loop so an
+    // operator can confirm "this digest was reached by the probe" even
+    // if no warn ever fires for the stream. Without this heartbeat a
+    // quiet log is ambiguous: probe disarmed, threshold never crossed,
+    // or this code path not reached at all? `info!` (not `debug!`)
+    // because the production deployment runs at info level.
+    info!(
+        target: "nativelink_service::chunked_write_handler",
+        ?digest,
+        "producer-arrival probe armed (#394/#413 Phase 1)",
+    );
+
     // Admit chunks one-by-one. The chunk stream itself is responsible
     // for shape (the WriteChunked RPC stream pulls from
     // `tonic::Streaming`; the Bazel-facing path pulls from a
@@ -1953,6 +2225,7 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             chunk_size,
             stream_digest,
             &metrics,
+            Some(&mut producer_arrival_probe),
         ) {
             // #213 d-s-r MAJOR-1 fixup: same eager-GC trigger as above.
             discard_partial_best_effort(&filesystem_store, &stream_digest).await;
