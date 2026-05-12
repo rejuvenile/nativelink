@@ -2788,6 +2788,9 @@ async fn recv_start_execute_with_hints(
                 // case a future test composition wires the loop in — they
                 // are not what this helper asserts on.
                 Some(chunked_message::Payload::BlobsInStableStorage(_)) => {}
+                // BlobsAvailable chunks share the same property — emitted by
+                // a production broadcast loop, not the scheduler-under-test.
+                Some(chunked_message::Payload::BlobsAvailable(_)) => {}
                 None => panic!("ChunkedMessage with empty payload"),
             },
             v => panic!("Expected StartAction or ChunkedMessage, got: {v:?}"),
@@ -4170,6 +4173,266 @@ async fn execution_complete_after_completed_does_not_evict_worker() -> Result<()
         keepalive_result.is_ok(),
         "Worker should still be in the pool after ExecutionComplete, got: {:?}",
         keepalive_result.unwrap_err()
+    );
+
+    Ok(())
+}
+
+/// Regression test for "Unknown platform property re-trying every poll" bug.
+///
+/// An action submitted with a platform property the scheduler does NOT know
+/// about (i.e. not in `supported_platform_properties`) used to:
+///   - cause `make_platform_properties` to return `Code::InvalidArgument`,
+///   - bubble that error out of `do_try_match`,
+///   - increment the `consecutive_match_errors` counter (intended for
+///     scheduler-state corruption, NOT input validation),
+///   - emit a misleading "scheduler data structure corruption — restart may
+///     be required" ERROR after 10 consecutive failures,
+///   - leave the action queued so it would re-trigger on every poll cycle.
+///
+/// In production this surfaced as 7,010 consecutive `do_try_match` failures
+/// in 10 min, all `InvalidArgument: Unknown platform property '…'`, on the
+/// same ~110 stalled actions.
+///
+/// The fix: the matcher catches the producer's `InvalidArgument` and
+/// rejects the action back to the originating client as a terminal
+/// `FailedPrecondition` (re-tagged so it routes through the state-manager's
+/// existing `missing_inputs` terminal-completion gate; no re-queue, no
+/// `consecutive_match_errors` bump, no corruption alert), and the matcher
+/// keeps draining the queue. The re-tag is deliberate: keeping the original
+/// `Code::InvalidArgument` would have required either a state-manager gate
+/// keyed on InvalidArgument (which would silently mute corruption-class
+/// InvalidArgument from sibling sources like `awaited_action_decode` serde
+/// failures, `ClientIdToOperationId::decode`, `WorkerId not in workers map`
+/// desync — all of which legitimately signal corruption and SHOULD
+/// retry/alert), or naked retry until max-retries exhaust.
+///
+/// This test asserts the **client-observable** outcome: the action's stage
+/// transitions to `Completed` with a `Code::FailedPrecondition` error whose
+/// message names the offending property — within a `tokio::time::timeout`
+/// deadlock detector. Form (real scheduler wired) AND substance (state
+/// transition observed via the same `ActionStateResult` subscription that
+/// production callers read).
+#[nativelink_test]
+async fn unknown_platform_property_rejects_action_without_corruption_counter()
+-> Result<(), Error> {
+    // Scheduler is configured with a single known property "prop"; the action
+    // we submit will require "persistentWorkerProtocol" which is NOT declared,
+    // mirroring the production wedge.
+    let mut prop_defs = HashMap::new();
+    prop_defs.insert("prop".to_string(), PropertyType::Exact);
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            supported_platform_properties: Some(prop_defs),
+            max_job_retries: 5,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    // Register a worker that DOES declare the known property, so the matcher
+    // has a candidate to consider. The mismatch fires on the action side
+    // (unknown key in action_info.platform_properties), not on the worker
+    // capabilities side.
+    let worker_id = WorkerId("worker_id".to_string());
+    let mut worker_props = PlatformProperties::default();
+    worker_props
+        .properties
+        .insert("prop".to_string(), PlatformPropertyValue::Exact("v".to_string()));
+    let _rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), worker_props).await?;
+
+    // Submit an action that requires an unknown property.
+    let action_digest = DigestInfo::new([42u8; 32], 256);
+    let mut bad_props = HashMap::new();
+    bad_props.insert(
+        "persistentWorkerProtocol".to_string(),
+        "json".to_string(),
+    );
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, bad_props, make_system_time(1)).await?;
+
+    // Run the matcher (no-op if the background task already drained it on
+    // task_change_notify; either way, the action is rejected exactly once).
+    // Before the fix this returns Err and would re-fire on every subsequent
+    // poll; after the fix it returns Ok because the unknown-property action
+    // is rejected to the client and the matcher continues draining work.
+    let match_result = scheduler.do_try_match_for_test().await;
+    assert!(
+        match_result.is_ok(),
+        "do_try_match must NOT propagate InvalidArgument as a matcher \
+         failure (would bump consecutive_match_errors and trigger \
+         'scheduler corruption' alert); got: {match_result:?}"
+    );
+
+    // The client should observe the action transitioning to a terminal
+    // Completed stage with an InvalidArgument error naming the offending
+    // property. The matcher runs on a background task, so the action may
+    // skip past Queued before we read; drain state changes until we either
+    // see Completed or time out.
+    //
+    // Wrap in a short timeout — if the action is silently re-queued (the
+    // bug), `changed()` may keep flapping between Queued ↔ Queued and we
+    // never reach Completed; Elapsed surfaces with a specific message.
+    let action_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (state, _origin) = action_listener.changed().await.unwrap();
+            match &state.stage {
+                ActionStage::Completed(result) => break result.clone(),
+                ActionStage::Queued | ActionStage::CacheCheck => continue,
+                other => panic!(
+                    "unexpected intermediate stage for unknown-platform-property \
+                     action: {other:?}"
+                ),
+            }
+        }
+    })
+    .await
+    .expect(
+        "action must reach terminal Completed within 5s — \
+         unknown platform property must reject action to client, \
+         not silently re-queue (the regression we are guarding against)",
+    );
+    let err = action_result
+        .error
+        .as_ref()
+        .expect("Completed stage must carry the rejection error");
+    assert_eq!(
+        err.code,
+        Code::FailedPrecondition,
+        "rejection error code must be FailedPrecondition (client \
+         precondition not met by scheduler config); we deliberately do NOT \
+         use Code::InvalidArgument here because the state-manager retry \
+         gate distinguishes the two, and InvalidArgument is also produced \
+         by genuine corruption-class errors (awaited_action serde decode) \
+         that MUST keep retrying. Got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("persistentWorkerProtocol"),
+        "rejection error message must name the offending property so the \
+         client can fix their request; got: {err}"
+    );
+
+    // The matcher MUST NOT have logged the scheduler-corruption alert that
+    // would page a human and (falsely) suggest a restart. The single
+    // rejection above already exercises the matcher's input-validation
+    // path; the corruption alert only fires after >=10 consecutive
+    // matcher-loop errors, which one rejection cannot trigger.
+    assert!(
+        !logs_contain("possible scheduler data structure corruption"),
+        "unknown platform property must NOT trigger the scheduler-corruption \
+         alert — that alert is reserved for actual data-structure damage \
+         and falsely suggests a server restart"
+    );
+
+    Ok(())
+}
+
+/// Sibling regression test: an action with a KNOWN platform property name
+/// but a malformed VALUE (e.g. `cpu_count = "not_a_number"`) is rejected
+/// terminally to the client, not silently re-queued.
+///
+/// Mirrors `unknown_platform_property_rejects_action_without_corruption_counter`
+/// but exercises the second `make_platform_properties` failure mode —
+/// `PropertyType::Minimum` parsing — to ensure both code paths through
+/// `make_platform_properties` route through the same FailedPrecondition
+/// rejection. Without this test, a future change that broke the malformed-
+/// value path (e.g. by returning a different code) could regress without
+/// the test suite catching it.
+#[nativelink_test]
+async fn malformed_minimum_value_rejects_action() -> Result<(), Error> {
+    // Scheduler declares "cpu_count" as a Minimum-typed property. A
+    // value of "not_a_number" is a parse failure inside
+    // `make_platform_properties` → `PropertyType::Minimum::try_from`.
+    let mut prop_defs = HashMap::new();
+    prop_defs.insert("cpu_count".to_string(), PropertyType::Minimum);
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec {
+            supported_platform_properties: Some(prop_defs),
+            max_job_retries: 5,
+            ..Default::default()
+        },
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+
+    // Register a worker advertising a valid "cpu_count" so the matcher
+    // is willing to consider the action; the failure fires on action-side
+    // value parsing.
+    let worker_id = WorkerId("worker_id".to_string());
+    let mut worker_props = PlatformProperties::default();
+    worker_props
+        .properties
+        .insert("cpu_count".to_string(), PlatformPropertyValue::Minimum(4.0));
+    let _rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), worker_props).await?;
+
+    // Action declares cpu_count with a non-numeric value.
+    let action_digest = DigestInfo::new([43u8; 32], 256);
+    let mut bad_props = HashMap::new();
+    bad_props.insert("cpu_count".to_string(), "not_a_number".to_string());
+    let mut action_listener =
+        setup_action(&scheduler, action_digest, bad_props, make_system_time(2)).await?;
+
+    let match_result = scheduler.do_try_match_for_test().await;
+    assert!(
+        match_result.is_ok(),
+        "do_try_match must NOT propagate malformed-value error as a matcher \
+         failure; got: {match_result:?}"
+    );
+
+    let action_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (state, _origin) = action_listener.changed().await.unwrap();
+            match &state.stage {
+                ActionStage::Completed(result) => break result.clone(),
+                ActionStage::Queued | ActionStage::CacheCheck => continue,
+                other => panic!(
+                    "unexpected intermediate stage for malformed-value action: \
+                     {other:?}"
+                ),
+            }
+        }
+    })
+    .await
+    .expect(
+        "action must reach terminal Completed within 5s — malformed property \
+         value must reject action to client, not silently re-queue",
+    );
+    let err = action_result
+        .error
+        .as_ref()
+        .expect("Completed stage must carry the rejection error");
+    assert_eq!(
+        err.code,
+        Code::FailedPrecondition,
+        "malformed property value rejection code must be FailedPrecondition \
+         (same as unknown property); got {err:?}"
     );
 
     Ok(())

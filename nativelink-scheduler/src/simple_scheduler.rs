@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use futures::{Future, StreamExt, future};
 use nativelink_config::schedulers::SimpleSpec;
 use nativelink_config::stores::ClientTlsConfig;
-use nativelink_error::{Code, Error, ResultExt};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use nativelink_proto::com::github::trace_machina::nativelink::events::OriginEvent;
 use nativelink_util::action_messages::{ActionInfo, ActionState, OperationId, WorkerId};
@@ -382,19 +382,125 @@ impl SimpleScheduler {
         cache_key.sort();
 
         // Look up or compute and cache the platform properties.
+        //
+        // `make_platform_properties` returns `Code::InvalidArgument` when the
+        // action declares a property the scheduler does not know about (i.e.
+        // not in `supported_platform_properties`). That is **client input
+        // error**, not scheduler-state corruption: bubbling it out of the
+        // matcher would (a) fail this entire `do_try_match` cycle, (b)
+        // increment `consecutive_match_errors` (intended for genuine state
+        // damage), (c) trigger the misleading "scheduler data structure
+        // corruption — restart may be required" alert after 10 cycles, and
+        // (d) leave the offending action queued so it re-fires on every
+        // poll. We instead reject the action back to its originating client
+        // as a terminal `Code::FailedPrecondition` and continue the matching
+        // loop. We deliberately re-tag the error as `FailedPrecondition` (not
+        // `InvalidArgument`) because the scheduler's state-manager retry gate
+        // already routes `FailedPrecondition` errors through the
+        // `missing_inputs` terminal-no-retry branch (see
+        // `simple_scheduler_state_manager.rs:819`). Routing through the
+        // existing terminal branch avoids a parallel "is_input_validation"
+        // gate that would also catch genuine corruption-class
+        // `Code::InvalidArgument` errors (e.g. `awaited_action_decode` serde
+        // failures, `ClientIdToOperationId::decode` failures) which MUST
+        // continue to bump `consecutive_match_errors` and the corruption
+        // alert. Cached entries are pre-validated, so this rejection only
+        // fires the first time a unique cache_key is seen.
         let platform_properties = {
-            let mut cache = props_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(cached) = cache.get(&cache_key) {
-                cached.clone()
+            let cached = {
+                let cache = props_cache.lock().unwrap_or_else(|e| e.into_inner());
+                cache.get(&cache_key).cloned()
+            };
+            if let Some(cached) = cached {
+                cached
             } else {
-                let computed = platform_property_manager
+                match platform_property_manager
                     .make_platform_properties(action_info.platform_properties.clone())
-                    .err_tip(|| {
-                        "Failed to make platform properties in SimpleScheduler::do_try_match"
-                    })?;
-                let arc = Arc::new(computed);
-                cache.insert(cache_key, arc.clone());
-                arc
+                {
+                    Ok(computed) => {
+                        let arc = Arc::new(computed);
+                        let mut cache =
+                            props_cache.lock().unwrap_or_else(|e| e.into_inner());
+                        cache.insert(cache_key, arc.clone());
+                        arc
+                    }
+                    Err(err) if err.code == Code::InvalidArgument => {
+                        // Reject to client. Need operation_id to do so.
+                        let operation_id = match action_state_result.as_state().await {
+                            Ok((action_state, _)) => action_state.client_operation_id.clone(),
+                            Err(state_err) => {
+                                // Couldn't even get the operation_id — undo
+                                // the per-client claim and surface the state
+                                // lookup error (this is a real failure, not
+                                // input validation).
+                                if claimed_slot {
+                                    undo_claim(per_client_matches, &client_name);
+                                }
+                                return Err(state_err.append(
+                                    "Failed to get state for unknown-platform-property \
+                                     rejection in SimpleScheduler::do_try_match",
+                                ));
+                            }
+                        };
+                        warn!(
+                            %operation_id,
+                            properties = ?action_info.platform_properties,
+                            ?err,
+                            "rejecting action to client: invalid platform property \
+                             (unknown name, malformed minimum value, or other \
+                             input-validation failure from make_platform_properties)"
+                        );
+                        // Re-tag as `FailedPrecondition` so the
+                        // state-manager's existing `missing_inputs` retry
+                        // gate (`simple_scheduler_state_manager.rs:819`)
+                        // routes the rejection straight to terminal
+                        // `Completed` without re-queueing. Keeping the
+                        // original `Code::InvalidArgument` would slip past
+                        // that gate and silently cap-out the retry counter
+                        // before reporting failure (and would conflict with
+                        // genuine corruption-class `InvalidArgument` errors
+                        // like `awaited_action_decode` serde failures, which
+                        // MUST continue to retry/alert). Tagged
+                        // `FailedPrecondition` is also REAPI-non-retryable
+                        // and semantically accurate ("scheduler does not
+                        // declare this platform property as a precondition").
+                        let reject_err = make_err!(
+                            Code::FailedPrecondition,
+                            "rejecting action: scheduler does not declare this \
+                             platform property in supported_platform_properties: \
+                             {err:?}"
+                        );
+                        if let Err(assign_err) = matching_engine_state_manager
+                            .assign_operation(&operation_id, Err(reject_err))
+                            .await
+                        {
+                            // Couldn't record the rejection. Undo the
+                            // per-client claim and propagate. Aborted is
+                            // benign (lost a version-conflict race); other
+                            // codes are real.
+                            if claimed_slot {
+                                undo_claim(per_client_matches, &client_name);
+                            }
+                            if assign_err.code == Code::Aborted {
+                                return Ok(());
+                            }
+                            return Err(assign_err.append(
+                                "Failed to record action rejection in \
+                                 SimpleScheduler::do_try_match",
+                            ));
+                        }
+                        // Successfully rejected. Undo the per-client claim
+                        // (rejected actions don't consume a worker slot) and
+                        // continue the matching loop.
+                        if claimed_slot {
+                            undo_claim(per_client_matches, &client_name);
+                        }
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err.append(
+                        "Failed to make platform properties in SimpleScheduler::do_try_match",
+                    )),
+                }
             }
         };
 
@@ -840,6 +946,19 @@ impl SimpleScheduler {
                         };
                         last_match_successful = result.is_ok();
                         if let Err(err) = &result {
+                            // The platform-property class of input-validation
+                            // failure is caught upstream inside
+                            // `match_action_to_worker_cached` (re-tagged
+                            // `Code::FailedPrecondition`, action terminally
+                            // rejected via `assign_operation`, matcher returns
+                            // `Ok`). Any error reaching THIS branch is from a
+                            // genuinely scheduler-internal source (missing
+                            // worker_id, awaited_action_decode serde failure,
+                            // pollee panic, etc.) — exactly the corruption
+                            // class the counter+restart-alert was designed
+                            // for. Don't filter by code here; that would mask
+                            // real corruption signals (CLAUDE.md "Fix root
+                            // causes, not symptoms"; #416 audit).
                             consecutive_match_errors += 1;
                             if consecutive_match_errors >= 10 {
                                 error!(

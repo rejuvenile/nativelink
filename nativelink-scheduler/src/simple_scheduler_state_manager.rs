@@ -815,13 +815,32 @@ where
                 UpdateOperationType::UpdateWithError(err) => {
                     // Don't count a backpressure failure as an attempt for an action.
                     let due_to_backpressure = err.code == Code::ResourceExhausted;
-                    // Missing inputs can only be fixed by the client re-uploading.
+                    // Missing inputs (and other client-precondition failures
+                    // re-tagged by the matcher — e.g. unknown platform property
+                    // rejection from `simple_scheduler.rs:do_try_match`) can
+                    // only be fixed by the client correcting the request.
+                    // Re-queueing such actions just re-fires the same failure
+                    // on every poll cycle and stalls the queue (see #404 /
+                    // 2026-05-11 wedge: 7,010 consecutive do_try_match
+                    // failures, all "Unknown platform property"). We
+                    // deliberately do NOT branch on `Code::InvalidArgument`
+                    // here, because that code is also produced by genuine
+                    // corruption-class errors (e.g. `awaited_action_decode`
+                    // serde failure at `store_awaited_action_db.rs:367`,
+                    // `ClientIdToOperationId::decode` failure) which MUST
+                    // continue to retry up to `max_job_retries` to ride out
+                    // transient store flakes. Routing the matcher's
+                    // unknown-property rejection through `FailedPrecondition`
+                    // gives us terminal-no-retry without broadening the
+                    // contract.
                     let missing_inputs = err.code == Code::FailedPrecondition;
                     if !due_to_backpressure {
                         awaited_action.attempts += 1;
                     }
 
-                    if missing_inputs || awaited_action.attempts > self.max_job_retries {
+                    if missing_inputs
+                        || awaited_action.attempts > self.max_job_retries
+                    {
                         ActionStage::Completed(ActionResult {
                             execution_metadata: ExecutionMetadata {
                                 worker: maybe_worker_id.map_or_else(String::default, ToString::to_string),
