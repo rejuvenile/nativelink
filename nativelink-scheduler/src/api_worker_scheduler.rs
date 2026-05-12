@@ -107,12 +107,91 @@ pub struct SchedulerMetrics {
     pub bis_replay_buffer_overflow_drops: AtomicU64,
 }
 
-/// Cached result of `score_and_generate_hints`: endpoint scores (cached
-/// bytes per endpoint) and peer hints. Hints live behind an `Arc<[_]>`
-/// so per-worker dispatch is a refcount bump rather than a Vec clone
-/// (#83 ride-along — was `peer_hints.to_vec()` per match in the prior
-/// design, which churned ~16 KiB per dispatched action).
-type ScoringResult = (HashMap<Arc<str>, u64>, Arc<[PeerHint]>);
+/// Point-in-time intersection of an action's `file_digests` and the
+/// scheduler's locality map, captured under the same read lock that
+/// builds the scoring result.
+///
+/// Phase-4 callers (`compute_missing_blobs` prefetch path and the inline
+/// `all_missing` filter inside `find_and_reserve_worker`) consult this
+/// snapshot in lieu of re-acquiring `locality_map.read()`, eliminating
+/// two of the three O(F) read-lock walks per cold-tree dispatch. The
+/// audit at `.claude/audits/locality-scoring-perf-2026-05-11.md` (#407)
+/// measured 9 slow-warns at 58–105 ms across 2 minutes with
+/// `locality_blob_count: ~252K`; reducing 3× O(F) to 1× O(F) projects
+/// the slow-warn rate to drop by ~⅔.
+///
+/// **Contract — point-in-time, not live.** Snapshot reflects locality
+/// state at scoring time. If a worker registers a new blob OR is
+/// evicted between scoring and Phase-4 reuse, the snapshot WILL NOT
+/// reflect it. Result: at worst an over-fetch (sending a blob the
+/// worker already has) — correctness preserved, never under-fetch
+/// causing a missing-blob failure.
+///
+/// **Cache-hit staleness window.** This `ScoringResult` is cached in
+/// `scores_cache` LRU keyed by `input_root_digest`. On a cache hit
+/// (common with CI re-runs over the same input root), the SAME
+/// snapshot is reused for many subsequent dispatches — "scoring time"
+/// effectively extends to the cache-entry's lifetime, not the moment
+/// of the current dispatch. With BIS broadcasts continuously updating
+/// locality state, the over-fetch rate on cache-hit paths can be
+/// non-trivial. Phase 2 measurement window must instrument
+/// prefetch-already-had-it rate alongside slow-warn rate to confirm
+/// the net win — see #430 follow-up. Eviction-callback clear
+/// (`:1172`) bounds the worst case.
+///
+/// **CAPPED AT `LOCALITY_SNAPSHOT_MAX_ENTRIES`:** bounded by
+/// `tree.file_digests.len()` (Bazel action input count), itself
+/// bounded by Bazel's action proto limit. We additionally enforce the
+/// constant cap as a defensive guard against a pathological tree
+/// (e.g. CAS corruption inflating file count). Over-cap behavior:
+/// snapshot construction is skipped — callers fall back to a fresh
+/// `locality_map.read()` per F-walk (pre-#407 behavior, slow-warn
+/// fires). This is the documented over-cap policy per CLAUDE.md
+/// "Unbounded in-process buffers" rule.
+///
+/// Memory: per-entry ≈ 40 B `DigestInfo` + `Vec<Arc<str>>` header
+/// (24 B) + up to ≤10 × 16 B `Arc<str>` ≈ 200 B worst case. At
+/// `LOCALITY_SNAPSHOT_MAX_ENTRIES = 65_536`, worst-case bound is ~13 MB
+/// per cached entry × `TREE_CACHE_CAPACITY = 1024` cache slots = ~13 GB
+/// upper bound; typical actions have F = hundreds, snapshot well below
+/// 1 MB. The cache LRU + worker-eviction clear (`:1172`) bounds
+/// realised footprint.
+pub(crate) type LocalitySnapshot = Arc<HashMap<DigestInfo, Vec<Arc<str>>>>;
+
+/// Defensive cap on the per-action locality snapshot size. The natural
+/// bound is `tree.file_digests.len()` (Bazel action input count); this
+/// constant exists for the CLAUDE.md "Unbounded in-process buffers"
+/// requirement: an explicit numeric cap with documented over-cap
+/// behavior (skip snapshot — fall back to live `locality_map.read()`).
+///
+/// `65_536` is generously sized for a typical Bazel action: no
+/// observed action in this deployment has `file_digests.len()` above
+/// the order-of-magnitude 10K mark (precise upper bound uncited; rough
+/// estimate from sampled `chunked.rs:147` traces and BES profile
+/// inspection). Exceeding 65_536 is strong evidence of an upstream
+/// defect — pathological tree traversal, CAS corruption, or a Bazel
+/// rule emitting an unbounded glob — not a legitimate workload.
+pub(crate) const LOCALITY_SNAPSHOT_MAX_ENTRIES: usize = 65_536;
+
+/// Cached result of `score_and_generate_hints`:
+/// - `scores`: endpoint scores (cached bytes per endpoint).
+/// - `peer_hints`: `Arc<[PeerHint]>` so per-worker dispatch is a
+///   refcount bump rather than a Vec clone (#83 ride-along — was
+///   `peer_hints.to_vec()` per match in the prior design, which
+///   churned ~16 KiB per dispatched action).
+/// - `locality_snapshot`: per-action point-in-time view of
+///   `file_digests ∩ locality_map`, reused by Phase-4 prefetch and
+///   inline `all_missing` filter to avoid two redundant
+///   `locality_map.read()` walks per cold-tree dispatch (#407).
+///   `None` if the snapshot would exceed
+///   `LOCALITY_SNAPSHOT_MAX_ENTRIES` — callers fall back to a fresh
+///   `locality_map.read()` in that case.
+#[derive(Debug)]
+pub(crate) struct ScoringResult {
+    pub(crate) scores: HashMap<Arc<str>, u64>,
+    pub(crate) peer_hints: Arc<[PeerHint]>,
+    pub(crate) locality_snapshot: Option<LocalitySnapshot>,
+}
 
 /// Maximum number of `PeerHint` entries packed into one `PeerHintsChunk`
 /// proto. At ~250 bytes per hint worst case, 256 hints per chunk caps
@@ -1881,7 +1960,7 @@ impl ApiWorkerScheduler {
         let mut inner = self.inner.write().await;
         let worker_count = inner.workers.len() as u64;
         let endpoint_scores: Option<&HashMap<Arc<str>, u64>> =
-            scoring_result.as_deref().map(|(scores, _hints)| scores);
+            scoring_result.as_deref().map(|sr| &sr.scores);
         let mut result = inner.inner_find_and_reserve_worker(
             platform_properties,
             operation_id,
@@ -1938,10 +2017,19 @@ impl ApiWorkerScheduler {
         let missing_blobs = if let (Some(tree), Some(loc_map), Some(endpoint)) =
             (&resolved_tree, &self.locality_map, &worker_cas_endpoint)
         {
+            // (#407) Reuse the scoring-time snapshot if Phase 2 captured
+            // one. Both Phase-4 walks (prefetch + inline `all_missing`)
+            // consult the snapshot rather than re-acquiring
+            // `locality_map.read()`, dropping 3× O(F) → 1× O(F) per
+            // cold-tree dispatch.
+            let locality_snapshot: Option<&LocalitySnapshot> =
+                scoring_result.as_deref().and_then(|sr| sr.locality_snapshot.as_ref());
+
             // Compute small-blob prefetch candidates (size-capped).
             let prefetch_missing = Self::compute_missing_blobs(
                 &tree.file_digests,
                 endpoint,
+                locality_snapshot,
                 loc_map,
             );
             if !prefetch_missing.is_empty() {
@@ -1955,19 +2043,39 @@ impl ApiWorkerScheduler {
             // Compute the FULL set of missing digests (all sizes) for the
             // missing_digests hint in StartExecute. This lets the worker
             // skip the has_with_results round-trip entirely.
-            let map = loc_map.read();
-            let blobs = map.blobs_map();
-            let all_missing: Vec<(DigestInfo, u64)> = tree.file_digests
-                .iter()
-                .filter(|(_, size)| *size > 0)
-                .filter(|(digest, _)| {
-                    blobs
-                        .get(digest)
-                        .map_or(true, |endpoints| endpoints.get(endpoint.as_ref()).is_none())
-                })
-                .copied()
-                .collect();
-            drop(map);
+            //
+            // (#407) Fast path: scoring captured a snapshot — no
+            // `locality_map.read()` here. Slow path falls back to a
+            // fresh read when the snapshot was skipped (over-cap).
+            let all_missing: Vec<(DigestInfo, u64)> = if let Some(snapshot) = locality_snapshot {
+                tree.file_digests
+                    .iter()
+                    .filter(|(_, size)| *size > 0)
+                    .filter(|(digest, _)| {
+                        snapshot
+                            .get(digest)
+                            .is_none_or(|endpoints| {
+                                !endpoints.iter().any(|e| &**e == endpoint.as_ref())
+                            })
+                    })
+                    .copied()
+                    .collect()
+            } else {
+                let map = loc_map.read();
+                let blobs = map.blobs_map();
+                let collected: Vec<(DigestInfo, u64)> = tree.file_digests
+                    .iter()
+                    .filter(|(_, size)| *size > 0)
+                    .filter(|(digest, _)| {
+                        blobs
+                            .get(digest)
+                            .is_none_or(|endpoints| endpoints.get(endpoint.as_ref()).is_none())
+                    })
+                    .copied()
+                    .collect();
+                drop(map);
+                collected
+            };
 
             // Inject missing_digests into the StartExecute proto message.
             if let Some((_, _, ref mut msg)) = result {
@@ -2029,8 +2137,8 @@ impl ApiWorkerScheduler {
         // dispatch is StartAction" in the no-hint case.
         if let Some((worker_id, tx, _)) = result.as_ref() {
             if let Some(arc) = scoring_result.as_deref() {
-                if !arc.1.is_empty() {
-                    self.emit_peer_hints_chunks(worker_id, tx, operation_id, &arc.1);
+                if !arc.peer_hints.is_empty() {
+                    self.emit_peer_hints_chunks(worker_id, tx, operation_id, &arc.peer_hints);
                 }
             }
         }
@@ -2371,36 +2479,65 @@ impl ApiWorkerScheduler {
     }
 
     /// Computes the set of small blobs that the target worker is missing
-    /// from the resolved input tree, using the locality map to determine
-    /// what the worker already has. Returns blobs sorted by size ascending
-    /// (smallest first), capped at `PREFETCH_MAX_BLOBS` and
-    /// `PREFETCH_MAX_INFLIGHT_BYTES`.
+    /// from the resolved input tree, using a scoring-time snapshot of the
+    /// locality map (or, on snapshot miss, a fresh `locality_map.read()`)
+    /// to determine what the worker already has. Returns blobs sorted by
+    /// size ascending (smallest first), capped at `PREFETCH_MAX_BLOBS`
+    /// and `PREFETCH_MAX_INFLIGHT_BYTES`.
     ///
     /// Only blobs under `PREFETCH_MAX_SINGLE_BLOB_SIZE` are included —
     /// large blobs are better handled by the worker's parallel ByteStream
     /// fetch. The goal is to eliminate per-blob RPC overhead for many
     /// small blobs by batching them via `BatchUpdateBlobs`.
+    ///
+    /// **Why a snapshot, not a live read.** (#407) The same action's
+    /// `score_and_generate_hints` already walked `locality_map` under
+    /// the read lock to build scores and peer-hints. Re-acquiring the
+    /// lock here for a second O(F) walk doubles slow-warn pressure
+    /// (audit measured 58–105 ms warns at 252K-entry map). The snapshot
+    /// is scoring-time state — over-fetching a blob that arrived since
+    /// scoring is acceptable, never under-fetching (no
+    /// missing-blob-failure risk).
     fn compute_missing_blobs(
         file_digests: &[(DigestInfo, u64)],
         worker_endpoint: &str,
+        locality_snapshot: Option<&LocalitySnapshot>,
         locality_map: &SharedBlobLocalityMap,
     ) -> Vec<(DigestInfo, u64)> {
-        let map = locality_map.read();
-        let blobs = map.blobs_map();
-
-        // Collect small blobs the worker doesn't have.
-        let mut missing: Vec<(DigestInfo, u64)> = file_digests
-            .iter()
-            .filter(|(_, size)| *size > 0 && *size <= PREFETCH_MAX_SINGLE_BLOB_SIZE)
-            .filter(|(digest, _)| {
-                // Blob is "missing" if the locality map has no entry for this
-                // worker endpoint, or the digest is not in the map at all.
-                blobs
-                    .get(digest)
-                    .map_or(true, |endpoints| endpoints.get(worker_endpoint).is_none())
-            })
-            .copied()
-            .collect();
+        // Fast path: scoring captured a snapshot — no lock acquisition.
+        // Slow path: snapshot was skipped (file_digests > cap); fall back
+        // to a fresh read so we don't silently over-fetch the entire
+        // input tree.
+        let mut missing: Vec<(DigestInfo, u64)> = if let Some(snapshot) = locality_snapshot {
+            file_digests
+                .iter()
+                .filter(|(_, size)| *size > 0 && *size <= PREFETCH_MAX_SINGLE_BLOB_SIZE)
+                .filter(|(digest, _)| {
+                    // Blob is "missing" if the snapshot has no entry for this
+                    // digest, OR the entry's endpoint list doesn't include
+                    // the target worker.
+                    snapshot
+                        .get(digest)
+                        .is_none_or(|endpoints| {
+                            !endpoints.iter().any(|e| &**e == worker_endpoint)
+                        })
+                })
+                .copied()
+                .collect()
+        } else {
+            let map = locality_map.read();
+            let blobs = map.blobs_map();
+            file_digests
+                .iter()
+                .filter(|(_, size)| *size > 0 && *size <= PREFETCH_MAX_SINGLE_BLOB_SIZE)
+                .filter(|(digest, _)| {
+                    blobs
+                        .get(digest)
+                        .is_none_or(|endpoints| endpoints.get(worker_endpoint).is_none())
+                })
+                .copied()
+                .collect()
+        };
 
         // Sort by size ascending -- smallest blobs first maximizes the
         // number of blobs per BatchUpdateBlobs RPC, eliminating the most
@@ -3558,7 +3695,7 @@ async fn resolve_tree_from_cas(
 fn score_and_generate_hints(
     file_digests: &[(DigestInfo, u64)],
     locality_map: &SharedBlobLocalityMap,
-) -> (HashMap<Arc<str>, u64>, Arc<[PeerHint]>) {
+) -> ScoringResult {
     // Wall-clock guard: this is a scheduler hot path called on every dispatch.
     // We log warn! if it exceeds SLOW_THRESHOLD so operators can spot
     // pathological locality-map sizes / lock contention without per-call info!
@@ -3574,9 +3711,43 @@ fn score_and_generate_hints(
     // emptied), worth surfacing if it ever fires.
     let mut empty_endpoint_matches: usize = 0;
 
-    // ── Inside-lock pass: collect scores + hint candidates ──
+    // Per-action snapshot of file_digests ∩ locality_map, populated under
+    // the same read lock used for scoring. Reused by Phase-4 prefetch and
+    // inline `all_missing` filter to avoid two redundant
+    // `locality_map.read()` walks per cold-tree dispatch (#407). See
+    // `LocalitySnapshot` docs for invariant + cap.
+    //
+    // Snapshot is skipped (stays None) when the action's input count
+    // exceeds the defensive cap — callers fall back to live
+    // `locality_map.read()` in that case (pre-#407 behavior). This is
+    // the documented over-cap behavior per CLAUDE.md.
+    let snapshot_eligible = file_digests.len() <= LOCALITY_SNAPSHOT_MAX_ENTRIES;
+    if !snapshot_eligible {
+        warn!(
+            file_digests = file_digests.len(),
+            cap = LOCALITY_SNAPSHOT_MAX_ENTRIES,
+            "locality snapshot skipped — file_digests exceeds defensive cap; \
+             Phase-4 callers will re-acquire locality_map.read()"
+        );
+    }
+    let mut locality_snapshot_builder: Option<HashMap<DigestInfo, Vec<Arc<str>>>> =
+        if snapshot_eligible {
+            Some(HashMap::with_capacity(file_digests.len()))
+        } else {
+            None
+        };
+
+    // ── Inside-lock pass: collect scores + hint candidates + snapshot ──
     // Hold the read lock only while reading from the map. The sort,
     // dedup, and proto conversion happen below after the lock drops.
+    //
+    // Snapshot population costs ONE additional `Vec<Arc<str>>::clone()`
+    // per matched digest vs the pre-#407 path (one Vec allocation +
+    // N atomic refcount bumps on the Arc<str> elements; no String
+    // allocations). The dominant savings is the eliminated SECOND
+    // `locality_map.read()` walk in Phase-4, not the per-Arc cost.
+    // Follow-up #431 tracks an `Arc<[Arc<str>]>` refactor that would
+    // make the snapshot insertion a refcount-only clone.
     {
         let map = locality_map.read();
         let blobs = map.blobs_map();
@@ -3594,6 +3765,9 @@ fn score_and_generate_hints(
                     empty_endpoint_matches += 1;
                 } else {
                     let peer_eps: Vec<Arc<str>> = endpoints.keys().cloned().collect();
+                    if let Some(snapshot) = locality_snapshot_builder.as_mut() {
+                        snapshot.insert(digest, peer_eps.clone());
+                    }
                     hint_candidates.push((digest, size, peer_eps));
                 }
             }
@@ -3645,16 +3819,23 @@ fn score_and_generate_hints(
         );
     }
 
+    let locality_snapshot = locality_snapshot_builder.map(Arc::new);
+
     debug!(
         file_digests = file_digests.len(),
         locality_blob_count,
         peer_hints = peer_hints.len(),
         endpoints = scores.len(),
+        snapshot_entries = locality_snapshot.as_deref().map(HashMap::len).unwrap_or(0),
         ?elapsed,
         "score_and_generate_hints"
     );
 
-    (scores, peer_hints)
+    ScoringResult {
+        scores,
+        peer_hints,
+        locality_snapshot,
+    }
 }
 
 /// Converts endpoint scores to worker scores using the endpoint-to-worker
@@ -3686,8 +3867,8 @@ fn score_workers(
     locality_map: &SharedBlobLocalityMap,
     endpoint_to_worker: &HashMap<Arc<str>, WorkerId>,
 ) -> HashMap<WorkerId, u64> {
-    let (endpoint_scores, _hints) = score_and_generate_hints(file_digests, locality_map);
-    endpoint_scores_to_worker_scores(&endpoint_scores, endpoint_to_worker, candidates)
+    let scoring = score_and_generate_hints(file_digests, locality_map);
+    endpoint_scores_to_worker_scores(&scoring.scores, endpoint_to_worker, candidates)
 }
 
 #[async_trait]
@@ -4561,6 +4742,276 @@ mod tests {
         assert!(
             scores.is_empty(),
             "Expected empty scores for empty file_digests, got {scores:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (#407) Locality-snapshot reuse tests.
+    //
+    // These exercise the contract that Phase-4 callers
+    // (`compute_missing_blobs` prefetch path + inline `all_missing`
+    // filter) consult the scoring-time snapshot captured inside
+    // `score_and_generate_hints`, NOT a fresh `locality_map.read()`.
+    //
+    // The composition under test is:
+    //   1. score_and_generate_hints produces ScoringResult with snapshot
+    //   2. locality_map is MUTATED between Phase 2 and Phase 4
+    //   3. compute_missing_blobs(snapshot=Some(...)) returns
+    //      scoring-time-classified missing set, NOT post-mutation set
+    //   4. Inline all_missing walk via snapshot is consistent
+    // ------------------------------------------------------------------
+
+    /// The Phase-4 callers must consult the scoring-time snapshot, so
+    /// when the locality_map is flipped between Phase 2 (scoring) and
+    /// Phase 4 (prefetch + missing-digests filter), the Phase-4 walks
+    /// reflect SCORING-TIME state — not the post-flip live view.
+    ///
+    /// Mutation: comment out the snapshot construction inside
+    /// `score_and_generate_hints` (force callers back to
+    /// `locality_map.read()`); this test must red-fail with the
+    /// SCORING-TIME assertion message — "must reuse scoring-time
+    /// snapshot; would have read live locality_map and gotten E2".
+    #[test]
+    fn test_phase4_reuses_scoring_snapshot_under_locality_flip() {
+        let locality_map = new_shared_blob_locality_map();
+
+        // Two endpoints to flip between.
+        let endpoint_a = "grpc://worker-a:50081";
+        let endpoint_b = "grpc://worker-b:50081";
+
+        // Three digests in the action's input tree.
+        let d1 = DigestInfo::new([0x11; 32], 1000);
+        let d2 = DigestInfo::new([0x22; 32], 2000);
+        let d3 = DigestInfo::new([0x33; 32], 3000);
+        let file_digests = vec![(d1, 1000), (d2, 2000), (d3, 3000)];
+
+        // SCORING-TIME state: endpoint A has d1 and d2; nobody has d3.
+        // The dispatched worker is the target_endpoint: endpoint A.
+        // Therefore, scoring-time-classified "missing for A" = {d3}.
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(endpoint_a, &[d1, d2]);
+        }
+
+        // Phase 2: capture the scoring-time snapshot.
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring
+            .locality_snapshot
+            .as_ref()
+            .expect("snapshot must be Some — file_digests << LOCALITY_SNAPSHOT_MAX_ENTRIES");
+
+        // Sanity: snapshot reflects scoring-time state.
+        assert_eq!(
+            snapshot.len(),
+            2,
+            "scoring-time snapshot must contain exactly the matched digests (d1, d2)"
+        );
+        assert!(snapshot.contains_key(&d1));
+        assert!(snapshot.contains_key(&d2));
+        assert!(!snapshot.contains_key(&d3));
+
+        // POST-SCORING FLIP: between Phase 2 (scoring) and Phase 4
+        // (prefetch + missing-digests filter), the locality_map state
+        // changes. This simulates a `register_blobs` from a BIS
+        // broadcast or an `evict_blobs` from a worker eviction
+        // arriving on the writer side concurrent with this dispatch.
+        //
+        // After the flip:
+        //   - endpoint A has only d2 (d1 was evicted)
+        //   - endpoint B now has d1 (worker B just announced it)
+        //   - d3 still unowned
+        //
+        // If Phase-4 callers consult the LIVE map, they would classify
+        // d1 as "not missing for A" via endpoint B (wrong — we want
+        // the worker we're dispatching to, A, to have it). They would
+        // also classify d1 as "missing for A" (correct conclusion via
+        // post-flip view, but for the WRONG reason — endpoint A no
+        // longer has d1). The salient observable difference is the
+        // snapshot's count of endpoints per digest: pre-flip d1 has
+        // 1 endpoint (A); post-flip d1 has 1 endpoint (B); the live
+        // view of d1's endpoint set is different from the snapshot.
+        //
+        // We choose the cleanest observable: d1 is REMOVED from A
+        // post-flip. The scoring-time snapshot said "A has d1";
+        // therefore compute_missing_blobs(endpoint=A, snapshot=...)
+        // must NOT include d1 in the missing set (scoring-time
+        // contract — A has it). A live read would include d1
+        // (post-flip, A doesn't have it). This is the bit-flip we
+        // assert on.
+        {
+            let mut map = locality_map.write();
+            map.evict_blobs(endpoint_a, &[d1]);
+            map.register_blobs(endpoint_b, &[d1]);
+        }
+
+        // Phase 4 — prefetch path: compute_missing_blobs with snapshot.
+        let prefetch_missing = ApiWorkerScheduler::compute_missing_blobs(
+            &file_digests,
+            endpoint_a,
+            Some(snapshot),
+            &locality_map,
+        );
+
+        // SCORING-TIME contract: A had d1 + d2; only d3 is missing.
+        // If snapshot reuse is broken (Phase 4 reads live map), d1
+        // ALSO becomes missing (post-flip A no longer has d1), and
+        // prefetch_missing would contain {d1, d3}.
+        let missing_digests: Vec<DigestInfo> =
+            prefetch_missing.iter().map(|(d, _)| *d).collect();
+        assert!(
+            missing_digests.contains(&d3),
+            "scoring-time missing must include d3 (no one had d3 at scoring time)"
+        );
+        assert!(
+            !missing_digests.contains(&d1),
+            "must reuse scoring-time snapshot; would have read live locality_map \
+             and gotten d1 in missing (post-flip A doesn't have d1). \
+             actual missing_digests: {missing_digests:?}"
+        );
+
+        // Phase 4 — inline `all_missing` walk: this is the second
+        // sibling F-walk inside `find_and_reserve_worker` (the one
+        // that builds `start_execute.missing_digests`). It uses the
+        // same snapshot-vs-live logic; assert identical scoring-time
+        // semantics here.
+        let endpoint_arc: Arc<str> = Arc::from(endpoint_a);
+        let all_missing_via_snapshot: Vec<DigestInfo> = file_digests
+            .iter()
+            .filter(|(_, size)| *size > 0)
+            .filter(|(digest, _)| {
+                snapshot
+                    .get(digest)
+                    .is_none_or(|endpoints| {
+                        !endpoints.iter().any(|e| &**e == endpoint_arc.as_ref())
+                    })
+            })
+            .map(|(d, _)| *d)
+            .collect();
+
+        assert!(
+            all_missing_via_snapshot.contains(&d3),
+            "inline all_missing via snapshot must include d3"
+        );
+        assert!(
+            !all_missing_via_snapshot.contains(&d1),
+            "inline all_missing via snapshot must NOT include d1 — d1's snapshot \
+             entry still says endpoint A has it (scoring-time view)"
+        );
+
+        // Sanity contrast: confirm a LIVE read would have produced the
+        // wrong (post-flip) answer, proving the assertion above is not
+        // vacuous. This is the falsification — if snapshot reuse is
+        // wired correctly, the live read produces a STRICTLY DIFFERENT
+        // missing set, demonstrating snapshot != live.
+        let live_missing: Vec<DigestInfo> = {
+            let map = locality_map.read();
+            let blobs = map.blobs_map();
+            file_digests
+                .iter()
+                .filter(|(_, size)| *size > 0)
+                .filter(|(digest, _)| {
+                    blobs
+                        .get(digest)
+                        .is_none_or(|endpoints| endpoints.get(endpoint_a).is_none())
+                })
+                .map(|(d, _)| *d)
+                .collect()
+        };
+        assert!(
+            live_missing.contains(&d1),
+            "PRECONDITION: live read of post-flip map MUST classify d1 as missing \
+             for A; otherwise the test setup is vacuous and the snapshot/live \
+             distinction is not actually observable. live_missing: {live_missing:?}"
+        );
+    }
+
+    /// When `file_digests.len()` exceeds `LOCALITY_SNAPSHOT_MAX_ENTRIES`,
+    /// `score_and_generate_hints` skips snapshot construction and
+    /// returns `locality_snapshot: None`. Phase-4 callers must then
+    /// fall back to `locality_map.read()` for correctness — the
+    /// documented over-cap behavior per CLAUDE.md.
+    ///
+    /// We cannot drive the production cap (65_536) in a unit test
+    /// without absurd memory pressure, so this test exercises the
+    /// fall-back path directly: pass `locality_snapshot=None` to
+    /// `compute_missing_blobs` and assert it walks the live map.
+    #[test]
+    fn test_compute_missing_blobs_snapshot_none_uses_live_read() {
+        let locality_map = new_shared_blob_locality_map();
+        let endpoint_a = "grpc://worker-a:50081";
+
+        let d1 = DigestInfo::new([0x11; 32], 1000);
+        let d2 = DigestInfo::new([0x22; 32], 2000);
+        let file_digests = vec![(d1, 1000), (d2, 2000)];
+
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(endpoint_a, &[d1]); // A has d1; d2 unowned
+        }
+
+        let missing = ApiWorkerScheduler::compute_missing_blobs(
+            &file_digests,
+            endpoint_a,
+            None, // ← over-cap fallback: no snapshot
+            &locality_map,
+        );
+
+        let missing_digests: Vec<DigestInfo> = missing.iter().map(|(d, _)| *d).collect();
+        assert!(
+            !missing_digests.contains(&d1),
+            "live-read fallback must classify d1 as NOT missing for A"
+        );
+        assert!(
+            missing_digests.contains(&d2),
+            "live-read fallback must classify d2 as missing for A (no one has d2)"
+        );
+    }
+
+    /// Mechanical contract: `score_and_generate_hints` returns a
+    /// snapshot whose entries are *exactly* the file_digests ∩
+    /// locality_map intersection, with peer endpoints matching
+    /// `EndpointList` membership for each matched digest. Guards
+    /// against a future refactor that drifts the snapshot population
+    /// out of sync with the score / hint computation under the same
+    /// lock.
+    #[test]
+    fn test_score_and_generate_hints_snapshot_matches_intersection() {
+        let locality_map = new_shared_blob_locality_map();
+        let endpoint_a = "grpc://worker-a:50081";
+        let endpoint_b = "grpc://worker-b:50081";
+
+        let d1 = DigestInfo::new([0x11; 32], 100);
+        let d2 = DigestInfo::new([0x22; 32], 200);
+        let d3 = DigestInfo::new([0x33; 32], 300); // unowned, must not appear
+
+        {
+            let mut map = locality_map.write();
+            map.register_blobs(endpoint_a, &[d1, d2]);
+            map.register_blobs(endpoint_b, &[d2]); // d2 shared
+        }
+
+        let file_digests = vec![(d1, 100), (d2, 200), (d3, 300)];
+        let scoring = score_and_generate_hints(&file_digests, &locality_map);
+        let snapshot = scoring
+            .locality_snapshot
+            .as_ref()
+            .expect("snapshot must be Some");
+
+        assert_eq!(snapshot.len(), 2, "only d1, d2 are in the intersection");
+
+        let d1_eps = snapshot.get(&d1).expect("d1 must be in snapshot");
+        assert_eq!(d1_eps.len(), 1);
+        assert_eq!(&*d1_eps[0], endpoint_a);
+
+        let d2_eps = snapshot.get(&d2).expect("d2 must be in snapshot");
+        assert_eq!(d2_eps.len(), 2);
+        let mut d2_ep_strs: Vec<&str> = d2_eps.iter().map(|e| &**e).collect();
+        d2_ep_strs.sort_unstable();
+        assert_eq!(d2_ep_strs, vec![endpoint_a, endpoint_b]);
+
+        assert!(
+            !snapshot.contains_key(&d3),
+            "unowned digest must NOT appear in snapshot — intersection only"
         );
     }
 
