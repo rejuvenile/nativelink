@@ -3203,3 +3203,361 @@ pub async fn chunked_exact_size_is_accepted_by_bytestream_server()
     let _ = SECOND_CHUNK_LEN; // referenced for documentation; bound check above is the assertion.
     Ok(())
 }
+
+// --------------------------------------------------------------------
+// #418: ActiveStreamGuard::drop must NOT recycle a corrupt StreamState
+// into IdleStream.
+//
+// Background (production observation 2026-05-12):
+//   1. A 218 MB upload (digest bff125c2...-218429440) entered the chunked
+//      write path.
+//   2. Cascade-cancel fired (`ResourceExhausted: chunked dispatch:
+//      per-blob mpsc full`); `inner_write`'s `try_join!` returned Err.
+//   3. `process_client_stream` was cancelled mid-await; the inner
+//      `store_update_fut` had already returned Err — its body completed
+//      and dropped its captured `rx` half.
+//   4. `write_result?;` early-returned at `bytestream_server.rs:2108`,
+//      so `graceful_finish()` never ran.
+//   5. `ActiveStreamGuard::drop` (line 633) recycled the StreamState
+//      into an `IdleStream` even though `rx` was already gone.
+//   6. Bazel client's `QueryWriteStatus` returned the partial offset.
+//      The client retried with the same UUID + same write_offset.
+//   7. The retry hit `into_active_stream` → resumed the corrupt state
+//      → `tx.send(data).await` → `buf_channel.rs:185` → `Code::Internal:
+//      "Tried to send while stream is closed"`.
+//   8. Sweeper TTL = 60s wedged retries for the full window; the upload
+//      was abandoned without commit.
+//
+// The fix: when `Drop` runs WITHOUT `graceful_finish()` AND the state is
+// known-corrupt (store_update_fut errored, OR tx pipe is broken), the
+// entry MUST be REMOVED from `active_uploads` instead of being recycled
+// into an IdleStream. The next retry then either (a) starts fresh at
+// offset 0 with a clean state, or (b) sees its non-zero write_offset
+// rejected with `Code::Unavailable` ("Partial upload state was lost") —
+// the well-defined "lost state" path that already exists at
+// `bytestream_server.rs:1697-1709`.
+//
+// What this test asserts (mandatory CLAUDE.md "specific message" /
+// "deadlock-detector timeout" pattern):
+//   - The retry attempt resolves within 5 seconds (deadlock detector).
+//   - The retry response is NEVER `Code::Internal: "Tried to send while
+//     stream is closed"` (the bug shape).
+//   - The retry response is EITHER:
+//       * `Code::Unavailable` containing "Partial upload state was lost"
+//         — the documented restart-required path; OR
+//       * `Ok` (started fresh from offset 0; only valid when client
+//         resends from offset 0); OR
+//       * Any non-Internal Err that the client treats as "restart" (e.g.
+//         InvalidArgument with a size-mismatch message reflecting the
+//         fact that the client sent at offset N but the server is at 0
+//         — Bazel will retry from QueryWriteStatus).
+//
+// Mutation step (verifies the test guards the fix, not noise): comment
+// out the corrupt-state arm in `ActiveStreamGuard::drop`. The test must
+// red-fail with the bespoke `STREAM_CLOSED_BUG_MSG` message so the
+// failure points at the recycled-corrupt-state regression.
+// --------------------------------------------------------------------
+
+const STREAM_CLOSED_BUG_MSG: &str = "#418 regression: ActiveStreamGuard::drop \
+    recycled a corrupt StreamState into IdleStream — the retry hit a closed tx \
+    (`Tried to send while stream is closed`). Drop must DISCARD the entry \
+    when store_update_fut errored or the tx pipe is broken.";
+
+/// Inner store whose `update()` reads N bytes and then returns Err. This
+/// simulates the cascade-cancel mechanism: `store.update()` body runs to
+/// completion-with-error, dropping its captured `rx`. The outer
+/// `try_join!(process_client_stream, store_update_fut)` returns Err while
+/// the client is still mid-stream — exactly the production sequence.
+#[derive(Debug)]
+struct FailAfterNBytesStore {
+    /// Drain at most this many bytes from the reader before returning Err.
+    fail_after: u64,
+}
+
+impl FailAfterNBytesStore {
+    fn new(fail_after: u64) -> Arc<Self> {
+        Arc::new(Self { fail_after })
+    }
+}
+
+impl nativelink_metric::MetricsComponent for FailAfterNBytesStore {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreDriver for FailAfterNBytesStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        keys: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        // Report not-found so QueryWriteStatus on a discarded entry falls
+        // through to the "stream needs to start over" path
+        // (bytestream_server.rs:2390) instead of looking like a completed
+        // upload.
+        for i in 0..keys.len() {
+            results[i] = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Drain up to `fail_after` bytes, then return Err. This mirrors
+        // the production path where `FastSlowStore::update`'s chunked
+        // driver returns `Code::ResourceExhausted` mid-stream: the body
+        // runs to completion-with-error, dropping `reader` (`rx`) at
+        // end-of-scope.
+        let mut total = 0u64;
+        while total < self.fail_after {
+            let chunk = reader
+                .recv()
+                .await
+                .err_tip(|| "FailAfterNBytesStore::update reader recv")?;
+            if chunk.is_empty() {
+                // Unexpected EOF before reaching the failure threshold;
+                // still surface as Err so the test path is exercised.
+                break;
+            }
+            total += chunk.len() as u64;
+        }
+        Err(nativelink_error::make_err!(
+            Code::ResourceExhausted,
+            "FailAfterNBytesStore: simulated chunked dispatch cascade-cancel \
+             after {total} bytes drained"
+        ))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(nativelink_error::make_err!(
+            Code::Unimplemented,
+            "FailAfterNBytesStore::get_part not implemented"
+        ))
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+default_health_status_indicator!(FailAfterNBytesStore);
+
+#[nativelink_test]
+pub async fn cancelled_chunked_write_replaced_not_recycled_on_retry()
+-> Result<(), Box<dyn core::error::Error>> {
+    // 64 byte "blob"; store fails after consuming 16 bytes — so the first
+    // connection sends 32 bytes (fits in one chunk), the store drains 16
+    // and returns Err, `try_join!` errors, `process_client_stream` is
+    // cancelled, and `Drop` runs on `ActiveStreamGuard`.
+    const TOTAL_LEN: usize = 64;
+    const FIRST_CHUNK_LEN: usize = 32;
+    const STORE_FAIL_AFTER: u64 = 16;
+
+    let store_manager = Arc::new(StoreManager::new());
+    store_manager.add_store(
+        "main_cas",
+        Store::new(FailAfterNBytesStore::new(STORE_FAIL_AFTER)),
+    );
+
+    // persist_stream_on_disconnect_timeout=10 so the sweeper never fires
+    // in the test budget — any "the entry vanished" outcome must come
+    // from the FIX (Drop discards), not from sweeper TTL.
+    let config = vec![WithInstanceName {
+        instance_name: INSTANCE_NAME.to_string(),
+        config: ByteStreamConfig {
+            cas_store: "main_cas".to_string(),
+            persist_stream_on_disconnect_timeout: 10,
+            max_bytes_per_stream: 1024,
+            ..Default::default()
+        },
+    }];
+    let bs_server = Arc::new(
+        ByteStreamServer::new(&config, store_manager.as_ref(), None)
+            .expect("Failed to make server"),
+    );
+
+    let uuid = "11111111-2222-3333-4444-555555555555";
+    let resource_name = format!(
+        "{}/uploads/{}/blobs/{}/{}",
+        INSTANCE_NAME, uuid, HASH1, TOTAL_LEN,
+    );
+    let payload = vec![0u8; TOTAL_LEN];
+
+    // First connection: send chunk 1 (32 bytes), expect server to
+    // error because the inner store fails after 16 bytes. The connection
+    // tx remains open so we can observe the server's error response
+    // (cascade-cancel does not need the client to disconnect).
+    let first_attempt_err = {
+        let (tx, body) = ChannelBody::new();
+        let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+        let stream = Streaming::new_request(
+            codec.decoder(),
+            body,
+            Some(CompressionEncoding::Gzip),
+            None,
+        );
+        let bs = bs_server.clone();
+        let handle = spawn!("write_first", async move { bs.write(Request::new(stream)).await });
+
+        let req = WriteRequest {
+            resource_name: resource_name.clone(),
+            write_offset: 0,
+            finish_write: false,
+            data: payload[..FIRST_CHUNK_LEN].to_vec().into(),
+        };
+        tx.send(Frame::data(encode_stream_proto(&req)?)).await?;
+
+        // The store's update() will return Err after draining 16 bytes;
+        // try_join! propagates the err and the write task completes Err.
+        // Bound the wait so a deadlock surfaces as a timeout (NOT silent
+        // hang) — but use a long enough budget that a slow CI scheduler
+        // doesn't false-fail.
+        let res = tokio::time::timeout(core::time::Duration::from_secs(5), handle)
+            .await
+            .expect("first write attempt MUST resolve within 5s — \
+                     test setup deadlock or store hung")
+            .expect("first write join handle panicked");
+        // tx still alive; drop it so we don't leak the channel.
+        drop(tx);
+        res
+    };
+    assert!(
+        first_attempt_err.is_err(),
+        "first attempt MUST fail (store errored mid-write); got Ok={first_attempt_err:?}",
+    );
+
+    // Yield to ensure Drop has run and any background task has completed.
+    yield_now().await;
+    yield_now().await;
+
+    // Second connection: client believes it sent 32 bytes (or 16 — the
+    // exact partial count from QueryWriteStatus is irrelevant to the
+    // bug). Retry from a non-zero offset with the SAME UUID. The bug
+    // path: server resumes the corrupt IdleStream, tries `tx.send`,
+    // hits `Code::Internal: "Tried to send while stream is closed"`.
+    // The fix path: server discards the corrupt entry, the retry sees
+    // tx.get_bytes_written()=0, the offset mismatch trips the
+    // documented `Code::Unavailable` "Partial upload state was lost"
+    // path at bytestream_server.rs:1697-1709.
+    let second_attempt_err = {
+        let (tx, body) = ChannelBody::new();
+        let mut codec = ProstCodec::<WriteRequest, WriteRequest>::default();
+        let stream = Streaming::new_request(
+            codec.decoder(),
+            body,
+            Some(CompressionEncoding::Gzip),
+            None,
+        );
+        let bs = bs_server.clone();
+        let handle = spawn!("write_retry", async move { bs.write(Request::new(stream)).await });
+
+        // Retry from offset 16 (the post-cascade committed_size that
+        // QueryWriteStatus would have reported via `bytes_received`).
+        // The bug repro doesn't depend on the exact offset — any
+        // non-zero offset triggers the recycled-corrupt-tx send.
+        let req = WriteRequest {
+            resource_name: resource_name.clone(),
+            write_offset: STORE_FAIL_AFTER as i64,
+            finish_write: true,
+            data: payload[STORE_FAIL_AFTER as usize..].to_vec().into(),
+        };
+        // The server may either accept this frame and return an Err
+        // status, or reject the underlying RPC; either way the join
+        // handle resolves once the server-side write task ends. Use
+        // `try_send` semantics by ignoring the send result — the
+        // server-side error may close the stream before we send the
+        // frame, which is itself a valid bug-free outcome.
+        let _ignored = tx.send(Frame::data(encode_stream_proto(&req)?)).await;
+        drop(tx);
+
+        // 5s deadlock detector. The fix path resolves in milliseconds;
+        // the BUG path also resolves quickly (the recycled stream errors
+        // immediately on send) — a long timeout would mask either bug
+        // class.
+        let res = tokio::time::timeout(core::time::Duration::from_secs(5), handle)
+            .await
+            .expect("retry attempt MUST resolve within 5s — possible deadlock; \
+                     `Drop` may have left the entry pinned without a path forward")
+            .expect("retry write join handle panicked");
+        res
+    };
+
+    // The retry MUST NOT surface as `Code::Internal` containing the
+    // buf_channel "stream is closed" string. THAT is the bug shape.
+    // ANY other outcome — Ok, Unavailable, InvalidArgument — is
+    // acceptable: the server may either restart cleanly or surface a
+    // typed restart-required error, both of which Bazel handles.
+    match &second_attempt_err {
+        Ok(resp) => {
+            // Restart-from-zero would only succeed if the client had
+            // resent from offset 0. We're sending from offset 16, so
+            // this branch is unexpected — but if some future fix
+            // chooses to surface success here, the assertion still
+            // holds (no Internal "stream is closed").
+            let _ = resp; // explicitly tolerate Ok.
+        }
+        Err(status) => {
+            let code = status.code();
+            let message = status.message();
+            assert_ne!(
+                code,
+                tonic::Code::Internal,
+                "{STREAM_CLOSED_BUG_MSG} got code={code:?} message={message:?}",
+            );
+            assert!(
+                !message.contains("Tried to send while stream is closed"),
+                "{STREAM_CLOSED_BUG_MSG} got code={code:?} message={message:?}",
+            );
+            assert!(
+                !message.contains("Failed to write to data, receiver disconnected"),
+                "{STREAM_CLOSED_BUG_MSG} (rx-disconnected variant) \
+                 got code={code:?} message={message:?}",
+            );
+        }
+    }
+
+    Ok(())
+}

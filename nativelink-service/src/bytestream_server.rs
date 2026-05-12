@@ -15,7 +15,7 @@
 use core::convert::Into;
 use core::fmt::{Debug, Formatter};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::collections::HashMap;
@@ -597,6 +597,35 @@ struct StreamState {
     digest: DigestInfo,
     tx: DropCloserWriteHalf,
     store_update_fut: StoreUpdateFuture,
+    /// #418: lifecycle invariant — a `StreamState` is resumable iff its
+    /// `store_update_fut` is paused mid-await AND its `tx` is still
+    /// connected to a live `rx`. This flag distinguishes the two
+    /// possible end-states of `store_update_fut` when an
+    /// `ActiveStreamGuard` is dropped:
+    ///
+    /// - **Paused (resumable):** the outer `try_join!` was cancelled
+    ///   before `store.update()` returned. The future is dropped at its
+    ///   current await point — `result =` never assigns, this flag
+    ///   stays `false`, and the captured `rx` survives inside the
+    ///   future's frame. The stashed `IdleStream` is safe to resume on
+    ///   the next QueryWriteStatus-driven retry (legitimate Bazel
+    ///   TCP-flap recovery — see `resume_write_*` test family).
+    /// - **Completed-with-Err (unrecoverable):** `store.update()`
+    ///   returned `Err`. The wrapped future's body runs to completion;
+    ///   the captured `rx` is dropped at end-of-scope. `tx` is now
+    ///   pointing at a dead receiver and any subsequent `tx.send` from
+    ///   a resumed stream would dead-end inside `buf_channel.rs` with
+    ///   `Code::Internal: "Tried to send while stream is closed"`
+    ///   (production observation 2026-05-12 — 218 MB upload abandoned
+    ///   when chunked driver returned `ResourceExhausted` mid-stream).
+    ///
+    /// `ActiveStreamGuard::drop` reads this flag (alongside a
+    /// belt-and-suspenders `tx.is_pipe_broken()` check; see drop-site
+    /// comment) and REMOVES the entry from `active_uploads` in the
+    /// completed-with-Err case so the next retry hits
+    /// `into_active_stream`'s `Vacant` branch. Cancellation does NOT
+    /// set this flag — that is the load-bearing distinction.
+    store_errored: Arc<AtomicBool>,
 }
 
 impl Debug for StreamState {
@@ -644,6 +673,72 @@ impl Drop for ActiveStreamGuard {
             );
             return;
         };
+
+        // #418: corrupt-state arm. Lifecycle invariant: a StreamState
+        // is resumable iff its `store_update_fut` is paused mid-await
+        // AND its `tx` is connected to a live `rx`. This branch fires
+        // when EITHER half of that conjunct fails:
+        //
+        // - `store_errored == true` ⇒ the future ran to
+        //   completion-with-Err (NOT cancelled — see field doc); the
+        //   captured `rx` was dropped at end-of-scope, so `tx` is now
+        //   pointing at a dead receiver. THIS is the load-bearing
+        //   discriminator for the production class (chunked driver
+        //   returning `ResourceExhausted` mid-stream).
+        // - `tx.is_pipe_broken() == true` ⇒ belt-and-suspenders for
+        //   any future failure mode that breaks the channel without
+        //   touching the wrapped future's Err path. Not known to fire
+        //   in the present codebase; kept as future-regression
+        //   defense.
+        //
+        // Without this arm, recycling into `IdleStream` would leave a
+        // dead-channel landmine for the next QueryWriteStatus-driven
+        // retry — `process_client_stream`'s `tx.send` would dead-end
+        // inside `buf_channel.rs` with `Code::Internal: "Tried to
+        // send while stream is closed"` (production observation
+        // 2026-05-12 — 218 MB upload abandoned). Sweeper TTL = 60s,
+        // so the wedge spans the full retry budget.
+        //
+        // Composite invariant (per CLAUDE.md "Admission/Eviction/Pin
+        // Composability"): the active_uploads triangle is
+        //   (gate=IdleStream resume, eviction=60s sweeper,
+        //    pin=active_uploads entry while in-use).
+        // Pre-fix the gate was always active even when state was
+        // unrecoverable, with no compensating eviction firing within
+        // the retry budget. This branch CLOSES the gate by REMOVING
+        // the entry from `active_uploads` so the next retry hits
+        // `into_active_stream`'s `Vacant` branch and either (a)
+        // restarts cleanly from offset 0, or (b) sees its non-zero
+        // write_offset rejected with the documented `Code::Unavailable
+        // (Partial upload state was lost; retry from committed
+        // offset)` at `bytestream_server.rs:1697-1709` — the Bazel
+        // client's QueryWriteStatus → committed_size=0 → restart loop.
+        let store_errored = stream_state.store_errored.load(Ordering::Acquire);
+        let tx_pipe_broken = stream_state.tx.is_pipe_broken();
+        if store_errored || tx_pipe_broken {
+            // Mirror `graceful_finish`'s active_uploads accounting:
+            // the upload is no longer active, so decrement the
+            // counter. Do NOT add bytes to `partial_write_bytes`
+            // (no IdleStream is created so there's nothing to
+            // memory-pressure-evict). Drop `stream_state` here at
+            // end-of-block so the `tx` Sender goes away alongside
+            // the (possibly already-dead) `rx`.
+            let drop_reason = if store_errored {
+                "store_update_fut errored"
+            } else {
+                "tx pipe broken"
+            };
+            warn!(
+                uuid = format!("{:032x}", uuid),
+                bytes_received = self.bytes_received.load(Ordering::Acquire),
+                drop_reason,
+                "#418: discarding corrupt StreamState — \
+                 next retry will restart fresh (or surface Unavailable on offset mismatch)"
+            );
+            active_uploads.remove(&uuid);
+            self.metrics.active_uploads.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
 
         // Track the bytes this stream holds as partial write memory.
         let stream_bytes = self.bytes_received.load(Ordering::Acquire);
@@ -1140,13 +1235,45 @@ impl ByteStreamServer {
         // high-throughput streaming at 10Gbps+ without backpressure stalls.
         let (tx, rx) = make_buf_channel_pair_with_size(256);
         let store = instance.store.clone();
+        // #418: paused-vs-completed discriminator for the wrapped
+        // `store.update()` future. `StreamState` is resumable iff its
+        // future is paused mid-await AND its `tx` is connected to a
+        // live `rx`. The two end-states this flag distinguishes:
+        //
+        // - **Paused (cancelled before completion).** `try_join!`
+        //   dropped the future at its current await point — neither
+        //   the assignment to `result` nor the `if` below runs, so
+        //   `store_errored` stays `false`. The captured `rx` lives on
+        //   inside the future's frame; the stashed `IdleStream` is
+        //   safe to resume. This is the legitimate Bazel TCP-flap
+        //   recovery path.
+        // - **Completed-with-Err.** `store.update()` returned `Err`;
+        //   the body runs to the `if` and flips the flag. `rx` is
+        //   dropped at end-of-scope, so `tx` now points at a dead
+        //   receiver. `Drop` reads the flag and DISCARDS the entry
+        //   instead of recycling a corrupt StreamState.
+        //
+        // The `tx.is_pipe_broken()` check at the drop site is a
+        // belt-and-suspenders guard for any future failure mode that
+        // breaks the channel without going through this future's Err
+        // path; it is NOT load-bearing for the present
+        // completed-with-Err class.
+        let store_errored = Arc::new(AtomicBool::new(false));
+        let store_errored_for_fut = Arc::clone(&store_errored);
         let store_update_fut = Box::pin(async move {
             // We need to wrap `Store::update()` in a another future because we need to capture
             // `store` to ensure its lifetime follows the future and not the caller.
-            store
+            let result = store
                 // Bytestream always uses digest size as the actual byte size.
                 .update(digest, rx, UploadSizeInfo::ExactSize(digest.size_bytes()))
-                .await
+                .await;
+            // #418: only set on the completed-with-Err transition.
+            // Cancellation (try_join! dropping this future before
+            // `store.update()` returns) never reaches this line.
+            if result.is_err() {
+                store_errored_for_fut.store(true, Ordering::Release);
+            }
+            result
         });
         ActiveStreamGuard {
             stream_state: Some(StreamState {
@@ -1154,6 +1281,7 @@ impl ByteStreamServer {
                 digest,
                 tx,
                 store_update_fut,
+                store_errored,
             }),
             bytes_received,
             active_uploads: instance.active_uploads.clone(),
