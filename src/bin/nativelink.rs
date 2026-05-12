@@ -25,6 +25,7 @@ use clap::Parser;
 use futures::FutureExt;
 use futures::future::{BoxFuture, OptionFuture, TryFutureExt, try_join_all};
 use hyper::StatusCode;
+use hyper_util::rt::TokioTimer;
 use hyper_util::rt::tokio::TokioIo;
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -1660,6 +1661,18 @@ async fn inner_main(
             })?;
         let tcp_listener = TcpListener::bind(&socket_addr).await?;
         let mut http = auto::Builder::new(TaskExecutor::default());
+        // hyper 1.x requires a Timer on the http2 builder; the keepalive
+        // PingPong, header-read, and stream-idle paths panic with
+        // "You must supply a timer." on the first poll otherwise. The
+        // panic fires regardless of whether keep_alive_interval is set
+        // because http2's idle-stream tracker also schedules timer
+        // events. Always install TokioTimer; the cost is one allocation
+        // per connection and the panic surface is total: every gRPC
+        // request fails with ClosedChannelException at the client.
+        // (Production outage 2026-05-12: panic on every connection at
+        // port 50051/50061 after infra commit db1ac5bf enabled
+        // http2_keep_alive_interval=30 in prod-server.json5.)
+        http.http2().timer(TokioTimer::new());
 
         let http_config = &http_config.advanced_http;
         if let Some(value) = http_config.http2_keep_alive_interval {
