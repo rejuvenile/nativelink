@@ -508,49 +508,57 @@ pub(crate) async fn write_chunk_at_offset(
     // contention). Returned alongside pwrite_us via the closure's
     // success tuple — no Arc<AtomicU64> allocation per chunk.
     let dispatch_submitted = Instant::now();
-    let result = tokio::task::spawn_blocking(move || -> Result<(u64, u64), std::io::Error> {
-        // First statement: dispatch latency (submit → first poll).
-        let dispatch_us = dispatch_submitted.elapsed().as_micros() as u64;
-        #[cfg(target_family = "unix")]
-        {
-            use std::os::unix::fs::FileExt;
-            // `write_at` performs a `pwrite(2)`. A short write returns
-            // `Ok(written < bytes.len())`; loop until the full buffer
-            // is consumed. Per pwrite(2) man page: "If the file
-            // offset is past the end of the file, the file shall be
-            // extended" — sparse semantics on the gap.
-            let pwrite_started = Instant::now();
-            let mut written = 0usize;
-            let bytes_slice = bytes_for_blocking.as_ref();
-            while written < bytes_slice.len() {
-                let n = file_clone.write_at(
-                    &bytes_slice[written..],
-                    chunk_offset + written as u64,
-                )?;
-                if n == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "pwrite returned 0 bytes — disk full or ENOSPC?",
-                    ));
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<(u64, u64, Instant), std::io::Error> {
+            // First statement: dispatch latency (submit → first poll).
+            let dispatch_us = dispatch_submitted.elapsed().as_micros() as u64;
+            #[cfg(target_family = "unix")]
+            {
+                use std::os::unix::fs::FileExt;
+                // `write_at` performs a `pwrite(2)`. A short write returns
+                // `Ok(written < bytes.len())`; loop until the full buffer
+                // is consumed. Per pwrite(2) man page: "If the file
+                // offset is past the end of the file, the file shall be
+                // extended" — sparse semantics on the gap.
+                let pwrite_started = Instant::now();
+                let mut written = 0usize;
+                let bytes_slice = bytes_for_blocking.as_ref();
+                while written < bytes_slice.len() {
+                    let n = file_clone.write_at(
+                        &bytes_slice[written..],
+                        chunk_offset + written as u64,
+                    )?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "pwrite returned 0 bytes — disk full or ENOSPC?",
+                        ));
+                    }
+                    written += n;
                 }
-                written += n;
+                let pwrite_us = pwrite_started.elapsed().as_micros() as u64;
+                // #449b: capture closure-completion timestamp as the LAST
+                // statement before return. Outside the .await, the elapsed
+                // since this Instant measures the gap between
+                // closure-return and the caller's task being re-polled
+                // (the JoinHandle resume cost). Discriminates spawn-pool
+                // dispatch contention (Hypothesis B) from upstream worker
+                // starvation (caller too busy to re-poll the JoinHandle).
+                Ok((dispatch_us, pwrite_us, Instant::now()))
             }
-            let pwrite_us = pwrite_started.elapsed().as_micros() as u64;
-            Ok((dispatch_us, pwrite_us))
-        }
-        #[cfg(not(target_family = "unix"))]
-        {
-            // No portable `pwrite` on non-unix; the chunked-fast-slow
-            // feature is currently only built for unix targets. Phase
-            // 2.x will revisit if Windows support becomes a goal.
-            let _ = (file_clone, bytes_for_blocking, chunk_offset, dispatch_us);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "chunked pwrite-at-offset not supported on non-unix targets",
-            ))
-        }
-    })
-    .await;
+            #[cfg(not(target_family = "unix"))]
+            {
+                // No portable `pwrite` on non-unix; the chunked-fast-slow
+                // feature is currently only built for unix targets. Phase
+                // 2.x will revisit if Windows support becomes a goal.
+                let _ = (file_clone, bytes_for_blocking, chunk_offset, dispatch_us);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "chunked pwrite-at-offset not supported on non-unix targets",
+                ))
+            }
+        })
+        .await;
 
     drop(file_guard);
 
@@ -558,35 +566,41 @@ pub(crate) async fn write_chunk_at_offset(
         make_err!(Code::Internal, "spawn_blocking join error in chunked pwrite: {join_err:?}")
     })?;
 
-    let (dispatch_us, pwrite_us) = blocking_result.map_err(|io_err| {
+    let (dispatch_us, pwrite_us, closure_complete_at) = blocking_result.map_err(|io_err| {
         make_err!(
             Code::Internal,
             "chunked pwrite at offset {chunk_offset} ({len} bytes) failed: {io_err:?}"
         )
     })?;
+    // #449b: closure-to-resume gap = wall-clock between closure return
+    // and caller resume. High when blocking-pool dispatch is fast but
+    // the caller's task is starved (post-investigation 2026-05-12: this
+    // is the missing measurement that discriminates pool-internal
+    // contention from upstream worker starvation per
+    // `.claude/audits/blocking-pool-saturation-investigation-20260512.md`).
+    let closure_to_resume_us = closure_complete_at.elapsed().as_micros() as u64;
 
     // #449 inline split: emit a decomposition warn when the sum of the
-    // three sub-stages exceeds the same 50 ms threshold the driver's
+    // four sub-stages exceeds the same 50 ms threshold the driver's
     // `back_edge_ms` warn (chunked_driver.rs:993) uses. Operator
     // correlates the two warns by `digest` + `offset` and reads which
     // sub-stage(s) dominated. Threshold matches so this fires on the
     // same chunks the driver flags — gives the decomposition without
     // changing the operator's existing alert volume baseline.
     //
-    // Silence-is-diagnostic: `total_inner_us` measures only mutex +
-    // dispatch + pwrite, which excludes four spans the driver's
-    // `back_edge_ms` includes: `open_or_create_partial.await` at
-    // `:458`, `try_clone()` at `:495`, the JoinHandle re-poll between
-    // closure return and `.await` resuming, and `drop(file_guard)` at
-    // `:555`. If the driver warn fires WITHOUT this decomposition warn,
-    // the cost lives in one of those four — that absence IS the
+    // Silence-is-diagnostic: `total_inner_us` measures mutex + dispatch
+    // + pwrite + closure-to-resume, which excludes three spans the
+    // driver's `back_edge_ms` includes: `open_or_create_partial.await`
+    // at `:458`, `try_clone()` at `:495`, and `drop(file_guard)` at
+    // `:563`. If the driver warn fires WITHOUT this decomposition warn,
+    // the cost lives in one of those three — that absence IS the
     // operator-actionable signal pointing at FS overhead, dup syscall
-    // contention, scheduler resume latency, or mutex teardown.
+    // contention, or mutex teardown.
     //
-    // Cost: 3 extra `Instant::now()` calls per chunk (~30 ns) + one
-    // `as_micros()` × 3 (~10 ns) + one warn at high threshold (only on
-    // the slow tail). Negligible vs the 1 MiB pwrite cost itself.
-    let total_inner_us = mutex_acquire_us + dispatch_us + pwrite_us;
+    // Cost: 4 extra `Instant::now()` calls per chunk (~40 ns) + four
+    // `as_micros()` (~15 ns) + one warn at high threshold (only on the
+    // slow tail). Negligible vs the 1 MiB pwrite cost itself.
+    let total_inner_us = mutex_acquire_us + dispatch_us + pwrite_us + closure_to_resume_us;
     if total_inner_us > 50_000 {
         warn!(
             target: "nativelink_store::chunked",
@@ -596,6 +610,7 @@ pub(crate) async fn write_chunk_at_offset(
             mutex_acquire_ms = mutex_acquire_us / 1000,
             dispatch_ms = dispatch_us / 1000,
             pwrite_ms = pwrite_us / 1000,
+            closure_to_resume_ms = closure_to_resume_us / 1000,
             total_inner_ms = total_inner_us / 1000,
             "per-chunk back-edge decomposed (#449 inline-split): mutex/dispatch/pwrite",
         );
