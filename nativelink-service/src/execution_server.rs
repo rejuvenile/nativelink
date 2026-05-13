@@ -360,16 +360,37 @@ impl ExecutionServer {
             "execute request accepted"
         );
 
-        // AC-poisoning fix BUG-2: install the stream-drop cancel
-        // guard ONLY on the streaming Execute path. Other entrypoints
-        // (`get_operation`, `wait_operation`, `WaitExecution`) reach
-        // `to_execute_stream` via `inner_wait_execution` and
-        // intentionally pass `cancel_guard=None` — their stream-drop
-        // happens on every legitimate poll/timeout.
+        // EMERGENCY HOT-FIX 2026-05-13: stream-drop cancel guard
+        // DISABLED. The guard fires kill_operation on Execute stream
+        // drop with `completed=false`, but Bazel's REAPI client is
+        // ALLOWED to disconnect from Execute and resume via
+        // WaitExecution — that legitimate transition was being treated
+        // as a cancel signal, killing actions that were still running.
+        // Production observation: ~125 cancels/min steady-state, 545/min
+        // burst, all attributed to "Action killed by SIGKILL (OOM?)" —
+        // worker jetsam logs confirmed ZERO OS-level OOMs. The proximate
+        // cause was the new guard, not memory pressure.
+        //
+        // Until a proper subscriber-count or wait-and-see design ships,
+        // we rely on the explicit `Operations::CancelOperation` RPC for
+        // cancel intent. The cancel routing chain
+        // (`ClientStateManager::cancel_operation` → `SimpleScheduler` →
+        // `ApiWorkerScheduler::cancel_operation_internal` →
+        // worker.tx.send(KillOperationRequest)), the OperationId
+        // translation, and the worker-side `cancelled` AtomicBool with
+        // its `is_cancelled()`-gated AC publish — ALL remain installed
+        // and functional. Only the stream-drop fast-path is disabled.
+        //
+        // Risk: if Bazel cancels via stream-drop WITHOUT a follow-up
+        // `Operations::CancelOperation` RPC, the original AC-poisoning
+        // bug PARTIALLY returns. Bazel's actual cancel-signal behavior
+        // (stream-drop alone vs explicit CancelOperation) is the open
+        // question that the proper fix needs to answer; see follow-up
+        // tracker.
         Ok(Box::pin(Self::to_execute_stream(
             &NativelinkOperationId::new(instance_name, client_operation_id),
             action_listener,
-            Some(instance_info.scheduler.clone()),
+            None,
         )))
     }
 
