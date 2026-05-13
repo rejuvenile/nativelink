@@ -357,4 +357,53 @@ mod tests {
         drop(p2);
         assert_eq!(b.available_chunks(), initial);
     }
+
+    /// #463-sibling-B (memory at-capacity diagnosis) under-action gate:
+    /// `ChunkBudget::publish` must emit `chunk_budget_used_bytes` and
+    /// `chunk_resource_exhausted_rejections_total` END-TO-END through
+    /// the same `MetricsRegistry` + `render_prometheus` path the
+    /// production `/metrics` listener uses.
+    ///
+    /// Why this test, given the unit-level acquire/reject tests above:
+    /// they cover the budget's INTERNAL state (acquire/release, cap
+    /// exhaustion, rejection counter). They do NOT cover the
+    /// `publish()` -> registry -> Prometheus exposition seam. Per
+    /// CLAUDE.md asymmetric-contract discipline, the under-action gap is
+    /// "publish silently emits nothing" — invisible to in-process
+    /// callers, fatal for operator scrapes. This test crosses the same
+    /// seam an operator scrapes.
+    ///
+    /// We use the SHARED singleton via `chunk_budget_arc()` because that
+    /// is the production wiring (`src/bin/nativelink.rs:524`) — testing
+    /// a fresh budget would not validate the singleton -> Arc -> publish
+    /// chain. The singleton's state is shared across test runs in the
+    /// same process; the assertions only check substring presence
+    /// (NOT exact gauge values) so they remain robust.
+    ///
+    /// Mutation step: comment out the `nativelink_metric::publish!` for
+    /// `chunk_budget_used_bytes` in the `MetricsComponent for ChunkBudget`
+    /// impl (~`chunk_budget.rs:220`). This test must red-fail with the
+    /// bespoke "#463-sibling-B" message so a future regression triage
+    /// points straight at the contract.
+    #[test]
+    fn publish_emits_gauges_via_render_prometheus() {
+        use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let registry = MetricsRegistry::new();
+        registry.register("chunked_chunk_budget", chunk_budget_arc());
+        let body = render_prometheus(&registry);
+
+        assert!(
+            body.contains("chunked_chunk_budget_chunk_budget_used_bytes"),
+            "#463-sibling-B: ChunkBudget::publish must emit chunk_budget_used_bytes \
+             so the memory at-capacity diagnosis can verify in-flight chunked-byte \
+             usage end-to-end via /metrics. body=\n{body}"
+        );
+        assert!(
+            body.contains("chunked_chunk_budget_chunk_resource_exhausted_rejections_total"),
+            "#463-sibling-B: ChunkBudget::publish must emit \
+             chunk_resource_exhausted_rejections_total so the memory at-capacity \
+             diagnosis can verify rejection-pressure end-to-end via /metrics. body=\n{body}"
+        );
+    }
 }

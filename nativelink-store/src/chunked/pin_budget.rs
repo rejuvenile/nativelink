@@ -349,4 +349,74 @@ mod tests {
         assert_eq!(b.capacity_bytes(), DEFAULT_PIN_BUDGET_BYTES);
         assert_eq!(b.available_bytes(), DEFAULT_PIN_BUDGET_BYTES);
     }
+
+    /// #463-sibling-B (memory at-capacity diagnosis) under-action gate:
+    /// `PinBudget::publish` must emit `pinned_bytes_used`,
+    /// `pinned_bytes_capacity`, and `pin_budget_rejections_total`
+    /// END-TO-END through the same `MetricsRegistry` + `render_prometheus`
+    /// path the production `/metrics` listener uses.
+    ///
+    /// Why this test, given the unit-level publish coverage above:
+    /// the existing tests cover the budget's INTERNAL state transitions
+    /// (acquire/release, cap exhaustion, rejection counter). They do NOT
+    /// cover the `publish()` -> registry -> Prometheus exposition seam.
+    /// Per CLAUDE.md asymmetric-contract discipline, the under-action
+    /// gap is "publish silently emits nothing" — invisible to in-process
+    /// callers, fatal for operator scrapes. This test crosses the same
+    /// seam an operator scrapes.
+    ///
+    /// Mutation step: comment out the `nativelink_metric::publish!` for
+    /// `pinned_bytes_used` in the `MetricsComponent for PinBudget` impl
+    /// (~`pin_budget.rs:230`). This test must red-fail with the bespoke
+    /// "#463-sibling-B" message so a future regression triage points
+    /// straight at the contract.
+    #[test]
+    fn publish_emits_gauges_via_render_prometheus() {
+        use std::sync::Arc;
+
+        use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        let budget = Arc::new(PinBudget::new(1024));
+        // Consume some bytes so `pinned_bytes_used` has a non-zero value
+        // we can assert on (separates "publish emitted nothing" from
+        // "publish emitted zero").
+        let _hold = budget.try_acquire(256).expect("256-byte permit");
+
+        let registry = MetricsRegistry::new();
+        registry.register("chunked_pin_budget", budget.clone());
+        let body = render_prometheus(&registry);
+
+        assert!(
+            body.contains("chunked_pin_budget_pinned_bytes_used"),
+            "#463-sibling-B: PinBudget::publish must emit pinned_bytes_used \
+             so the memory at-capacity diagnosis can verify the global pinned-bytes \
+             gauge end-to-end via /metrics. body=\n{body}"
+        );
+        assert!(
+            body.contains("chunked_pin_budget_pinned_bytes_capacity"),
+            "#463-sibling-B: PinBudget::publish must emit pinned_bytes_capacity \
+             so the memory at-capacity diagnosis can verify the cap end-to-end \
+             via /metrics. body=\n{body}"
+        );
+        assert!(
+            body.contains("chunked_pin_budget_pin_budget_rejections_total"),
+            "#463-sibling-B: PinBudget::publish must emit pin_budget_rejections_total \
+             so the memory at-capacity diagnosis can verify rejection-pressure \
+             end-to-end via /metrics. body=\n{body}"
+        );
+
+        // Belt-and-braces: the gauge value reflects live state, not a
+        // snapshot taken at registration. 256 was acquired above; the
+        // capacity is 1024.
+        assert!(
+            body.contains("\nchunked_pin_budget_pinned_bytes_used 256\n"),
+            "#463-sibling-B: pinned_bytes_used gauge must reflect live used state \
+             (expected 256 of 1024). body=\n{body}"
+        );
+        assert!(
+            body.contains("\nchunked_pin_budget_pinned_bytes_capacity 1024\n"),
+            "#463-sibling-B: pinned_bytes_capacity gauge must reflect configured cap \
+             (expected 1024). body=\n{body}"
+        );
+    }
 }
