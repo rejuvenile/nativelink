@@ -4278,8 +4278,28 @@ impl StoreDriver for FastSlowStore {
             // are identical so either order is correct, but the divergence
             // is non-obvious and worth flagging.
             self.fast_store.has_with_results(key, results).await?;
+            // Lock instrumentation per closure-to-resume-blocking-call
+            // investigation 2026-05-13: 53/54 lock_slow waiters in stall
+            // dump 1778651451946 share this call site. Mirror the
+            // EvictingMap pattern from filesystem_store.rs (2026-03-25):
+            // measure acquire wait, warn at >5ms, structured fields for
+            // grep correlation. Net cost per acquire is ~10-50ns
+            // (Instant::now) + 1 elapsed() + 1 if; warn fires only on
+            // contention.
+            let key_count = key.len();
             {
+                let lock_start = Instant::now();
                 let in_flight = self.in_flight_slow_writes.lock();
+                let lock_acquire_ms = lock_start.elapsed().as_millis();
+                if lock_acquire_ms > 5 {
+                    warn!(
+                        lock_name = "in_flight_slow_writes",
+                        lock_acquire_ms,
+                        key_count,
+                        caller = "has_with_results.local_only_reads",
+                        "slow lock acquire"
+                    );
+                }
                 for (k, result) in key.iter().zip(results.iter_mut()) {
                     if result.is_none() {
                         let owned = k.borrow().into_owned();
@@ -4294,7 +4314,18 @@ impl StoreDriver for FastSlowStore {
             // because the actual bytes are tracked via the chunked-driver
             // pin, not stored in this set.
             {
+                let lock_start = Instant::now();
                 let chunked = self.chunked_in_flight_digests.lock();
+                let lock_acquire_ms = lock_start.elapsed().as_millis();
+                if lock_acquire_ms > 5 {
+                    warn!(
+                        lock_name = "chunked_in_flight_digests",
+                        lock_acquire_ms,
+                        key_count,
+                        caller = "has_with_results.local_only_reads",
+                        "slow lock acquire"
+                    );
+                }
                 if !chunked.is_empty() {
                     for (k, result) in key.iter().zip(results.iter_mut()) {
                         if result.is_none() {
@@ -4307,7 +4338,18 @@ impl StoreDriver for FastSlowStore {
                 }
             }
             {
+                let lock_start = Instant::now();
                 let mirror = self.mirror_blobs.lock();
+                let lock_acquire_ms = lock_start.elapsed().as_millis();
+                if lock_acquire_ms > 5 {
+                    warn!(
+                        lock_name = "mirror_blobs",
+                        lock_acquire_ms,
+                        key_count,
+                        caller = "has_with_results.local_only_reads",
+                        "slow lock acquire"
+                    );
+                }
                 for (k, result) in key.iter().zip(results.iter_mut()) {
                     if result.is_none() {
                         let digest = k.borrow().into_digest();
@@ -4324,10 +4366,25 @@ impl StoreDriver for FastSlowStore {
         // workers as they only use get() and a CAS can use an
         // ExistenceCacheStore to avoid the bottleneck.
         self.slow_store.has_with_results(key, results).await?;
+        // Lock instrumentation per closure-to-resume-blocking-call
+        // investigation 2026-05-13 (see local_only_reads branch above
+        // for full rationale).
+        let key_count = key.len();
         // Fill in any blobs that are in-flight (written to fast store but
         // background slow write not yet complete).
         {
+            let lock_start = Instant::now();
             let in_flight = self.in_flight_slow_writes.lock();
+            let lock_acquire_ms = lock_start.elapsed().as_millis();
+            if lock_acquire_ms > 5 {
+                warn!(
+                    lock_name = "in_flight_slow_writes",
+                    lock_acquire_ms,
+                    key_count,
+                    caller = "has_with_results.server",
+                    "slow lock acquire"
+                );
+            }
             if !in_flight.is_empty() {
                 for (k, result) in key.iter().zip(results.iter_mut()) {
                     if result.is_none() {
@@ -4353,7 +4410,18 @@ impl StoreDriver for FastSlowStore {
         // digest.size_bytes() since the digest fully specifies the
         // expected payload size.
         {
+            let lock_start = Instant::now();
             let chunked = self.chunked_in_flight_digests.lock();
+            let lock_acquire_ms = lock_start.elapsed().as_millis();
+            if lock_acquire_ms > 5 {
+                warn!(
+                    lock_name = "chunked_in_flight_digests",
+                    lock_acquire_ms,
+                    key_count,
+                    caller = "has_with_results.server",
+                    "slow lock acquire"
+                );
+            }
             if !chunked.is_empty() {
                 for (k, result) in key.iter().zip(results.iter_mut()) {
                     if result.is_none() {
@@ -4372,7 +4440,18 @@ impl StoreDriver for FastSlowStore {
         }
         // Check mirror blobs for any still-missing digests.
         {
+            let lock_start = Instant::now();
             let mirror = self.mirror_blobs.lock();
+            let lock_acquire_ms = lock_start.elapsed().as_millis();
+            if lock_acquire_ms > 5 {
+                warn!(
+                    lock_name = "mirror_blobs",
+                    lock_acquire_ms,
+                    key_count,
+                    caller = "has_with_results.server",
+                    "slow lock acquire"
+                );
+            }
             if !mirror.is_empty() {
                 for (k, result) in key.iter().zip(results.iter_mut()) {
                     if result.is_none() {
