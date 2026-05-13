@@ -54,8 +54,9 @@ use nativelink_util::proto_stream_utils::{
 use nativelink_util::resource_info::ResourceInfo;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{
-    IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
-    StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations, UploadSizeInfo,
+    IS_AC_PEER_FETCH, IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation,
+    PinDelegation, StableDigestDelegation, StoreDriver, StoreKey, StoreOptimizations,
+    UploadSizeInfo,
 };
 use nativelink_util::{default_health_status_indicator, tls_utils};
 use opentelemetry::context::Context;
@@ -1449,7 +1450,27 @@ impl GrpcStore {
     ) -> Result<Response<ActionResult>, Error> {
         let mut request = grpc_request.into_inner();
         request.instance_name.clone_from(&self.instance_name);
+        // #463 fix-up (perf-optimizer BLOCK): when the call originates
+        // from `AcProxyStore::try_read_from_peer`, attach
+        // `x-nativelink-peer-fetch: 1` so the receiving worker's
+        // `AcServer` can recognise the peer-fetch hop and refuse to
+        // re-shortcut into a worker-side `GrpcStore`. Without this
+        // marker, a worker whose configured AC store is itself a bare
+        // `GrpcStore` pointing back at the central server (the
+        // in-tree `deployment-examples/.../worker.json5` shape) would
+        // loop server → worker → server until h2 keepalive (`60s`).
+        // Mirrors the established `IS_MIRROR_REQUEST` /
+        // `x-nativelink-mirror` write-side pattern at
+        // `update_action_result` below.
+        let is_peer_fetch = IS_AC_PEER_FETCH.try_with(|v| *v).unwrap_or(false);
         self.perform_request(request, |request| async move {
+            let mut grpc_request = Request::new(request);
+            if is_peer_fetch {
+                grpc_request.metadata_mut().insert(
+                    "x-nativelink-peer-fetch",
+                    tonic::metadata::MetadataValue::from_static("1"),
+                );
+            }
             match &self.transport {
                 Transport::Tcp(cm) => {
                     let channel = cm
@@ -1457,21 +1478,21 @@ impl GrpcStore {
                         .await
                         .err_tip(|| "in get_action_result")?;
                     self.ac_client(channel)
-                        .get_action_result(Request::new(request))
+                        .get_action_result(grpc_request)
                         .await
                         .err_tip(|| "in GrpcStore::get_action_result")
                 }
                 #[cfg(feature = "quic")]
                 Transport::Quic(ch) => self
                     .ac_client(ch.clone())
-                    .get_action_result(Request::new(request))
+                    .get_action_result(grpc_request)
                     .await
                     .err_tip(|| "in GrpcStore::get_action_result (quic)"),
                 #[cfg(feature = "quic")]
                 Transport::Dual { quic, .. } => {
                     // AC lookup: prefer QUIC
                     self.ac_client(quic.clone())
-                        .get_action_result(Request::new(request))
+                        .get_action_result(grpc_request)
                         .await
                         .err_tip(|| "in GrpcStore::get_action_result (dual/quic)")
                 }

@@ -46,6 +46,21 @@ tokio::task_local! {
     /// the blob in memory only (skip disk and server upload), avoiding
     /// disk I/O for data that is already persisted on the server.
     pub static IS_MIRROR_REQUEST: bool;
+
+    /// Set to `true` when the current AC `GetActionResult` is the
+    /// server-side `AcProxyStore::try_read_from_peer` reaching out to a
+    /// worker for AC peer-fetch. `GrpcStore::get_action_result` reads
+    /// this and attaches the `x-nativelink-peer-fetch: 1` request
+    /// metadata so the worker's `AcServer` can recognise the peer-fetch
+    /// hop. The worker's `AcServer::inner_get_action_result` REFUSES
+    /// the `GrpcStore` shortcut when the metadata is set (otherwise a
+    /// worker whose configured AC store is itself a bare `GrpcStore`
+    /// pointing back at the central server — exactly the example
+    /// `deployment-examples/docker-compose/worker.json5` shape — would
+    /// loop server → worker → server until h2 keepalive (`60s`).
+    /// #463 fix-up: perf-optimizer BLOCK; see also `IS_MIRROR_REQUEST`
+    /// above for the established write-side pattern.
+    pub static IS_AC_PEER_FETCH: bool;
 }
 
 /// Prefix for redirect errors returned by `WorkerProxyStore` to worker callers.

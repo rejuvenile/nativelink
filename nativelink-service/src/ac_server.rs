@@ -32,7 +32,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::make_ctx_for_hash_func;
 use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::stall_detector::StallGuard;
-use nativelink_util::store_trait::{IS_MIRROR_REQUEST, Store, StoreLike};
+use nativelink_util::store_trait::{IS_AC_PEER_FETCH, IS_MIRROR_REQUEST, Store, StoreLike};
 use opentelemetry::context::FutureExt;
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -84,6 +84,7 @@ impl AcServer {
     async fn inner_get_action_result(
         &self,
         request: GetActionResultRequest,
+        is_peer_fetch: bool,
     ) -> Result<Response<ActionResult>, Error> {
         let instance_name = &request.instance_name;
         let store_info = self
@@ -98,16 +99,38 @@ impl AcServer {
             .err_tip(|| "Action digest was not set in message")?
             .try_into()?;
 
-        // If we are a GrpcStore we shortcut here, as this is a special store.
-        if let Some(grpc_store) = store_info
-            .store
-            .downcast_ref::<GrpcStore>(Some(digest.into()))
+        // If we are a GrpcStore we shortcut here, as this is a special
+        // store — UNLESS this RPC is itself a server-side AC peer-fetch
+        // hop (`x-nativelink-peer-fetch: 1`). In that case, taking the
+        // GrpcStore shortcut would dial the next hop with the same
+        // store_info (e.g. central server), and `AcProxyStore` upstream
+        // would re-fan-out to the same worker, producing
+        // server → worker → server recursion until h2 keepalive
+        // (`60s`). Refusing the shortcut routes the read through the
+        // wrapping composition; the inner `get_and_decode_digest` call
+        // below is scoped under `IS_AC_PEER_FETCH=true` so that the
+        // wrapping `AcProxyStore` (if any) skips its own fan-out and
+        // any wrapped `GrpcStore` re-attaches the
+        // `x-nativelink-peer-fetch` header outbound. The recursion
+        // terminates at the first wrapper that does not need to ask
+        // someone else — typically returning a clean NotFound.
+        // (#463 fix-up: perf-optimizer BLOCK; mirrors the
+        // `IS_MIRROR_REQUEST` write-side pattern.)
+        if !is_peer_fetch
+            && let Some(grpc_store) = store_info
+                .store
+                .downcast_ref::<GrpcStore>(Some(digest.into()))
         {
             return grpc_store.get_action_result(Request::new(request)).await;
         }
 
         let get_start = std::time::Instant::now();
-        let res = get_and_decode_digest::<ActionResult>(&store_info.store, digest.into()).await;
+        let res = IS_AC_PEER_FETCH
+            .scope(
+                is_peer_fetch,
+                get_and_decode_digest::<ActionResult>(&store_info.store, digest.into()),
+            )
+            .await;
         match res {
             Ok(action_result) => {
                 let elapsed = get_start.elapsed();
@@ -234,6 +257,17 @@ impl ActionCache for AcServer {
         &self,
         grpc_request: Request<GetActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
+        // #463 fix-up (perf-optimizer BLOCK): peer-fetch hops are
+        // marked with `x-nativelink-peer-fetch: 1` by
+        // `AcProxyStore::try_read_from_peer` (via `GrpcStore::
+        // get_action_result`). When set, the inner handler refuses
+        // the `GrpcStore` shortcut so a worker whose AC store is
+        // itself a bare `GrpcStore` cannot loop the read back at
+        // the central server. Mirrors the `x-nativelink-mirror`
+        // metadata propagation in `update_action_result` below.
+        let is_peer_fetch = grpc_request
+            .metadata()
+            .contains_key("x-nativelink-peer-fetch");
         let request = grpc_request.into_inner();
         let digest_function = request.digest_function;
         let _stall_guard = StallGuard::new(
@@ -241,7 +275,7 @@ impl ActionCache for AcServer {
             "AC::get_action_result",
         );
         let result = self
-            .inner_get_action_result(request)
+            .inner_get_action_result(request, is_peer_fetch)
             .instrument(error_span!("ac_server_get_action_result"))
             .with_context(
                 make_ctx_for_hash_func(digest_function)

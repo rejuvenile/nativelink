@@ -72,8 +72,8 @@ use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
 use nativelink_util::store_trait::{
-    ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store, StoreDriver,
-    StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+    IS_AC_PEER_FETCH, ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation,
+    Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
 };
 
 use crate::grpc_store::GrpcStore;
@@ -313,8 +313,20 @@ impl AcProxyStore {
             };
 
             let bytes_before_this_peer = writer.get_bytes_written();
-            let peer_result = store
-                .get_part(key.borrow(), &mut *writer, offset, length)
+            // Scope `IS_AC_PEER_FETCH=true` for the duration of the
+            // outbound peer read. `GrpcStore::get_action_result` reads
+            // the task-local and attaches the `x-nativelink-peer-fetch`
+            // metadata, so the worker's `AcServer` recognises the
+            // peer-fetch hop and refuses the in-handler `GrpcStore`
+            // shortcut. The worker's `AcServer` ALSO re-scopes the
+            // task-local around its own inner-store call, so if the
+            // worker's AC store re-dials this server the marker
+            // re-propagates outbound. The cycle terminates at
+            // `AcProxyStore::get_part` (this file, below) which checks
+            // the task-local and skips fan-out when set
+            // (recursion-defense; #463 fix-up).
+            let peer_result = IS_AC_PEER_FETCH
+                .scope(true, store.get_part(key.borrow(), &mut *writer, offset, length))
                 .await;
             match peer_result {
                 Ok(()) => {
@@ -421,6 +433,25 @@ impl StoreDriver for AcProxyStore {
         offset: u64,
         length: Option<u64>,
     ) -> Result<(), Error> {
+        // #463 fix-up (perf-optimizer BLOCK): if THIS get_part is
+        // itself running inside an AC peer-fetch context (the
+        // `IS_AC_PEER_FETCH` task-local is set because the receiving
+        // `AcServer::inner_get_action_result` propagated it), DO NOT
+        // fan out to peers again. The originating AcProxyStore is
+        // upstream of this hop — fanning out here would re-dial the
+        // same (or a sibling) worker, producing
+        // server → worker → server → worker recursion until h2
+        // keepalive (`60s`). Return the inner store's result
+        // straight through. Mirrors the established
+        // `IS_MIRROR_REQUEST` write-side cycle-breaker pattern.
+        if IS_AC_PEER_FETCH.try_with(|v| *v).unwrap_or(false) {
+            trace!(
+                digest = ?key.borrow().into_digest(),
+                "AcProxyStore::get_part: in peer-fetch context — skipping fan-out"
+            );
+            return self.inner.get_part(key, writer, offset, length).await;
+        }
+
         // Capture the writer's byte position so we can detect
         // mid-stream failures from the inner store and refuse to
         // peer-fetch (peer would write the full blob again, producing
