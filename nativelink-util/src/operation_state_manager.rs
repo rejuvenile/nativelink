@@ -113,6 +113,62 @@ pub trait ClientStateManager: Sync + Send + Unpin + MetricsComponent + 'static {
         filter: OperationFilter,
     ) -> Result<ActionStateResultStream, Error>;
 
+    /// Routes a cancellation request for `operation_id` to the worker
+    /// running it (if any). Called from two arrival points:
+    /// - explicit `cancel_operation` RPC (`execution_server.rs`)
+    /// - stream-drop guard on the Execute / `WaitExecution` response
+    ///   stream (`ExecuteStreamCancelGuard`)
+    ///
+    /// Idempotent: an unknown / already-finished operation returns
+    /// `Ok(())`. Concrete schedulers that own the worker pool override
+    /// to dispatch `KillOperationRequest`. Pure-proxy wrappers
+    /// (`PropertyModifierScheduler`, `CacheLookupScheduler`,
+    /// `GrpcScheduler`) forward to their inner scheduler. The default
+    /// no-op is the safe fallback for any future implementor.
+    ///
+    /// `operation_id` may be either a CLIENT operation_id (the value
+    /// surfaced as `Operation.name` to Bazel) or an INTERNAL
+    /// operation_id (the matching engine's id used to key worker
+    /// `running_action_infos`). `SimpleScheduler::cancel_operation`
+    /// uses `client_operation_id_to_operation_id` to translate the
+    /// former to the latter and falls through to the latter
+    /// unchanged. This is what makes the AC-poisoning fix's
+    /// `ExecuteStreamCancelGuard` (which captures the client form,
+    /// because that's what the streaming RPC handler has) reach the
+    /// worker.
+    ///
+    /// AC-poisoning fix (composite invariant): a cancel signal
+    /// arriving via this path before the worker's
+    /// `cache_action_result` issues `update_action_result` MUST
+    /// suppress the AC write. See base design Phase D for the full
+    /// invariant statement.
+    async fn cancel_operation(&self, _operation_id: &OperationId) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Translate a CLIENT operation_id (the value surfaced as
+    /// `Operation.name` to Bazel) into the INTERNAL operation_id
+    /// (the matching engine's id used to key worker `running_action_infos`).
+    /// Returns `Ok(None)` if no action with this client_operation_id
+    /// is known to this scheduler. The default returns `Ok(None)` so
+    /// proxy wrappers without action-db access can rely on the
+    /// trait's default. `SimpleSchedulerStateManager` overrides to
+    /// query its inner `AwaitedActionDb`.
+    ///
+    /// Used by `SimpleScheduler::cancel_operation` to resolve
+    /// Bazel-issued cancellations (which carry the client form). If
+    /// translation succeeds, the internal id is forwarded to
+    /// `worker_scheduler.cancel_operation_internal`; if it returns
+    /// `None`, the caller's `operation_id` is forwarded as-is (the
+    /// caller may have passed an internal id directly, e.g.
+    /// `cancel_operation_routing_test`).
+    async fn client_operation_id_to_operation_id(
+        &self,
+        _client_operation_id: &OperationId,
+    ) -> Result<Option<OperationId>, Error> {
+        Ok(None)
+    }
+
     /// Returns the known platform property provider for the given instance
     /// if this implementation supports it.
     // TODO(https://github.com/rust-lang/rust/issues/65991) When this lands we can

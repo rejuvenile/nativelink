@@ -378,6 +378,26 @@ impl ClientStateManager for CacheLookupScheduler {
         self.inner_filter_operations(filter).await
     }
 
+    /// Pure-proxy: forward to inner scheduler. AC-poisoning fix
+    /// composite invariant requires the cancel signal to traverse
+    /// every wrapper to reach the worker pool.
+    async fn cancel_operation(&self, operation_id: &OperationId) -> Result<(), Error> {
+        self.action_scheduler.cancel_operation(operation_id).await
+    }
+
+    /// Pure-proxy: forward client→internal translation to inner.
+    /// CacheLookupScheduler holds an in-flight cache for
+    /// `find_action_in_cache` results, NOT the action state map.
+    /// Translation must reach the inner SimpleScheduler.
+    async fn client_operation_id_to_operation_id(
+        &self,
+        client_operation_id: &OperationId,
+    ) -> Result<Option<OperationId>, Error> {
+        self.action_scheduler
+            .client_operation_id_to_operation_id(client_operation_id)
+            .await
+    }
+
     fn as_known_platform_property_provider(&self) -> Option<&dyn KnownPlatformPropertyProvider> {
         self.action_scheduler.as_known_platform_property_provider()
     }

@@ -33,6 +33,7 @@ enum ActionSchedulerCalls {
     GetGetKnownProperties(String),
     AddAction((OperationId, ActionInfo)),
     FilterOperations(OperationFilter),
+    CancelOperation(OperationId),
 }
 
 #[allow(dead_code, reason = "https://github.com/rust-lang/rust/issues/46379")]
@@ -40,6 +41,7 @@ enum ActionSchedulerReturns {
     GetGetKnownProperties(Result<Vec<String>, Error>),
     AddAction(Result<Box<dyn ActionStateResult>, Error>),
     FilterOperations(Result<ActionStateResultStream<'static>, Error>),
+    CancelOperation(Result<(), Error>),
 }
 
 #[derive(MetricsComponent, Debug)]
@@ -125,6 +127,23 @@ impl MockActionScheduler {
             .unwrap();
         req
     }
+
+    #[allow(dead_code, reason = "https://github.com/rust-lang/rust/issues/46379")]
+    pub async fn expect_cancel_operation(&self, result: Result<(), Error>) -> OperationId {
+        let mut rx_call_lock = self.rx_call.lock().await;
+        let ActionSchedulerCalls::CancelOperation(req) = rx_call_lock
+            .recv()
+            .await
+            .expect("Could not receive msg in mpsc")
+        else {
+            panic!("Got incorrect call waiting for cancel_operation")
+        };
+        self.tx_resp
+            .send(ActionSchedulerReturns::CancelOperation(result))
+            .map_err(|_| make_input_err!("Could not send request to mpsc"))
+            .unwrap();
+        req
+    }
 }
 
 #[async_trait]
@@ -186,6 +205,21 @@ impl ClientStateManager for MockActionScheduler {
         {
             ActionSchedulerReturns::FilterOperations(result) => result,
             _ => panic!("Expected find_by_client_operation_id return value"),
+        }
+    }
+
+    async fn cancel_operation(&self, operation_id: &OperationId) -> Result<(), Error> {
+        self.tx_call
+            .send(ActionSchedulerCalls::CancelOperation(operation_id.clone()))
+            .expect("Could not send request to mpsc");
+        let mut rx_resp_lock = self.rx_resp.lock().await;
+        match rx_resp_lock
+            .recv()
+            .await
+            .expect("Could not receive msg in mpsc")
+        {
+            ActionSchedulerReturns::CancelOperation(result) => result,
+            _ => panic!("Expected cancel_operation return value"),
         }
     }
 

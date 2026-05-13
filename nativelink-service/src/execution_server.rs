@@ -14,6 +14,7 @@
 
 use core::convert::Into;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::collections::HashMap;
 use std::fmt;
@@ -40,6 +41,7 @@ use nativelink_store::store_manager::StoreManager;
 use nativelink_util::action_messages::{
     ActionInfo, ActionUniqueKey, ActionUniqueQualifier, DEFAULT_EXECUTION_PRIORITY, OperationId,
 };
+use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::{DigestHasherFunc, make_ctx_for_hash_func};
 use nativelink_util::operation_state_manager::{
@@ -48,7 +50,7 @@ use nativelink_util::operation_state_manager::{
 use nativelink_util::store_trait::Store;
 use opentelemetry::context::FutureExt;
 use tonic::{Request, Response, Status};
-use tracing::{Instrument, Level, debug, error, error_span, info, instrument};
+use tracing::{Instrument, Level, debug, error, error_span, info, instrument, warn};
 
 type InstanceInfoName = String;
 
@@ -213,36 +215,87 @@ impl ExecutionServer {
         OperationsServer::new(self)
     }
 
+    /// Build the response stream for an Execute / `WaitExecution` /
+    /// `get_operation` / `wait_operation` request.
+    ///
+    /// AC-poisoning fix BUG-2: the `cancel_guard` parameter controls
+    /// whether stream-drop fires `cancel_operation`. ONLY the
+    /// streaming Execute path (`inner_execute`) passes
+    /// `Some(scheduler)`. Callers of `inner_wait_execution` (the
+    /// unary `get_operation` / `wait_operation` Operations RPCs AND
+    /// the `WaitExecution` Tonic method) pass `None` so dropping the
+    /// stream as their natural exit path does NOT trigger a cancel
+    /// routing. (Treating `wait_operation` timeout / `get_operation`
+    /// return as cancel would mean every Bazel status poll cancels
+    /// the action it polls — see
+    /// `get_operation_unfinished_does_not_cancel` and
+    /// `wait_operation_timeout_does_not_cancel` regression tests.)
+    ///
+    /// AC-poisoning fix BUG-1: when the guard is installed, its
+    /// `operation_id` is the BARE `OperationId` value
+    /// (`nl_client_operation_id.client_operation_id.clone()`),
+    /// matching the shape of the keys in
+    /// `ApiWorkerScheduler::cancel_operation_internal`'s
+    /// `running_action_infos` HashMap. Earlier code mistakenly
+    /// constructed `OperationId::from(nl_client_operation_id.to_string())`
+    /// which produced `OperationId::String("instance/uuid")` and
+    /// missed the HashMap lookup keyed by `OperationId::Uuid(uuid)` —
+    /// silent no-op for the dominant Bazel cancel path. See
+    /// `cancel_routing_e2e_test`'s
+    /// `stream_drop_routes_kill_to_assigned_worker_via_real_apiworkerscheduler`
+    /// regression test.
     fn to_execute_stream(
         nl_client_operation_id: &NativelinkOperationId,
         action_listener: Box<dyn ActionStateResult>,
+        cancel_guard: Option<Arc<dyn ClientStateManager>>,
     ) -> impl Stream<Item = Result<Operation, Status>> + Send + use<> {
+        // Wire-side name surfaced to the Bazel client (Display form
+        // "instance_name/uuid"). NOT the OperationId used for worker
+        // routing — see `cancel_guard` doc above for the bare form.
         let client_operation_id = OperationId::from(nl_client_operation_id.to_string());
-        unfold(Some(action_listener), move |maybe_action_listener| {
-            let client_operation_id = client_operation_id.clone();
-            async move {
-                let mut action_listener = maybe_action_listener?;
-                match action_listener.changed().await {
-                    Ok((action_update, _maybe_origin_metadata)) => {
-                        let is_finished = action_update.stage.is_finished();
-                        debug!(
-                            %client_operation_id,
-                            stage=%action_update.stage.name(),
-                            is_finished,
-                            "execute response stream update"
-                        );
-                        Some((
-                            Ok(action_update.as_operation(client_operation_id)),
-                            (!is_finished).then_some(action_listener),
-                        ))
-                    }
-                    Err(err) => {
-                        error!(%client_operation_id, ?err, "error in action_listener stream");
-                        Some((Err(err.into()), None))
+        let completed = Arc::new(AtomicBool::new(false));
+        // BUG-1: bare OperationId for cancel routing. Only present
+        // when the caller opted into stream-drop cancellation.
+        let guard = cancel_guard.map(|scheduler| ExecuteStreamCancelGuard {
+            scheduler,
+            operation_id: nl_client_operation_id.client_operation_id.clone(),
+            completed: completed.clone(),
+        });
+        unfold(
+            Some((action_listener, guard)),
+            move |maybe_state| {
+                let client_operation_id = client_operation_id.clone();
+                let completed = completed.clone();
+                async move {
+                    let (mut action_listener, guard) = maybe_state?;
+                    match action_listener.changed().await {
+                        Ok((action_update, _maybe_origin_metadata)) => {
+                            let is_finished = action_update.stage.is_finished();
+                            debug!(
+                                %client_operation_id,
+                                stage=%action_update.stage.name(),
+                                is_finished,
+                                "execute response stream update"
+                            );
+                            if is_finished {
+                                // Mark complete BEFORE returning so the
+                                // guard's Drop sees `true` and skips
+                                // cancel routing.
+                                completed.store(true, Ordering::Release);
+                            }
+                            Some((
+                                Ok(action_update.as_operation(client_operation_id)),
+                                (!is_finished).then_some((action_listener, guard)),
+                            ))
+                        }
+                        Err(err) => {
+                            error!(%client_operation_id, ?err, "error in action_listener stream");
+                            Some((Err(err.into()), None))
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 
     async fn inner_execute(
@@ -307,9 +360,16 @@ impl ExecutionServer {
             "execute request accepted"
         );
 
+        // AC-poisoning fix BUG-2: install the stream-drop cancel
+        // guard ONLY on the streaming Execute path. Other entrypoints
+        // (`get_operation`, `wait_operation`, `WaitExecution`) reach
+        // `to_execute_stream` via `inner_wait_execution` and
+        // intentionally pass `cancel_guard=None` — their stream-drop
+        // happens on every legitimate poll/timeout.
         Ok(Box::pin(Self::to_execute_stream(
             &NativelinkOperationId::new(instance_name, client_operation_id),
             action_listener,
+            Some(instance_info.scheduler.clone()),
         )))
     }
 
@@ -338,7 +398,48 @@ impl ExecutionServer {
         else {
             return Err(Status::not_found("Failed to find existing task"));
         };
-        Ok(Self::to_execute_stream(&nl_operation_id, rx))
+        // AC-poisoning fix BUG-2: NO cancel guard on the
+        // `inner_wait_execution` path. `WaitExecution` /
+        // `get_operation` / `wait_operation` callers all funnel
+        // through here; treating their natural stream-drop as a
+        // cancel would cancel the action on every Bazel status poll.
+        Ok(Self::to_execute_stream(&nl_operation_id, rx, None))
+    }
+}
+
+/// RAII guard that fires `cancel_operation` on the wrapping
+/// scheduler when the outer Execute / `WaitExecution` response
+/// stream is dropped without `completed` having been set. AC-poisoning
+/// fix: closes the dominant Bazel cancel path (client closes stream
+/// without calling `Operations::CancelOperation` RPC).
+///
+/// Side-effect symmetry (CLAUDE.md "Asymmetric contract coverage"):
+/// fires `cancel_operation` when stream-drop AND not completed;
+/// callers above this layer rely on it NOT firing when the stream
+/// completed naturally (`completed=true`). C.4b regression test
+/// (over-action positive control) asserts the latter.
+struct ExecuteStreamCancelGuard {
+    scheduler: Arc<dyn ClientStateManager>,
+    operation_id: OperationId,
+    completed: Arc<AtomicBool>,
+}
+
+impl Drop for ExecuteStreamCancelGuard {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::Acquire) {
+            return; // Stream finished naturally; not a cancel.
+        }
+        let scheduler = self.scheduler.clone();
+        let op_id = self.operation_id.clone();
+        // Drop is sync; cancel_operation is async. Use background_spawn!
+        // (NOT bare tokio::spawn) per project convention. Fire-and-forget
+        // — the kill side-effect is best-effort observability, not
+        // load-bearing on the response path (which is already gone).
+        background_spawn!("execute_stream_cancel_guard", async move {
+            if let Err(e) = scheduler.cancel_operation(&op_id).await {
+                warn!(operation_id = %op_id, ?e, "stream-drop cancel routing failed");
+            }
+        });
     }
 }
 
@@ -418,9 +519,28 @@ impl Operations for ExecutionServer {
 
     async fn cancel_operation(
         &self,
-        _request: Request<CancelOperationRequest>,
+        request: Request<CancelOperationRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("cancel_operation not implemented"))
+        let inner = request.into_inner();
+        let nl_op_id = NativelinkOperationId::from_name(&inner.name)
+            .err_tip(|| "Invalid operation name in cancel_operation")?;
+        let Some(instance_info) = self.instance_infos.get(&nl_op_id.instance_name) else {
+            return Err(Status::not_found(format!(
+                "No scheduler with the instance name {}",
+                nl_op_id.instance_name
+            )));
+        };
+        info!(
+            instance_name = %nl_op_id.instance_name,
+            operation_id = %nl_op_id.client_operation_id,
+            "cancel_operation RPC received"
+        );
+        instance_info
+            .scheduler
+            .cancel_operation(&nl_op_id.client_operation_id)
+            .await
+            .err_tip(|| "Failed to route cancel_operation")?;
+        Ok(Response::new(()))
     }
 
     async fn get_operation(

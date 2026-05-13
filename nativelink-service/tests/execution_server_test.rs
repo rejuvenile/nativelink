@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -139,18 +140,55 @@ async fn operations_delete_operation_unimplemented() -> Result<(), Box<dyn core:
     Ok(())
 }
 
+/// AC-poisoning fix C.2 (RPC path): the explicit `cancel_operation`
+/// RPC now routes via `ClientStateManager::cancel_operation` (was
+/// `Status::unimplemented`). Mutation: revert the
+/// `cancel_operation` body to `Err(Status::unimplemented(...))` —
+/// this test must red-fail because the mock's
+/// `expect_cancel_operation` will never receive its call.
 #[nativelink_test]
-async fn operations_cancel_operation_unimplemented() -> Result<(), Box<dyn core::error::Error>> {
+async fn operations_cancel_operation_routes_to_scheduler()
+-> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let (execution_server, mock_scheduler) = make_execution_server(&store_manager)?;
+
+    let operation_name = format!("{INSTANCE_NAME}/some_operation_id");
+    let request_fut = execution_server
+        .cancel_operation(Request::new(CancelOperationRequest {
+            name: operation_name.clone(),
+        }));
+
+    let (request_res, observed_op_id) = tokio::join!(
+        request_fut,
+        mock_scheduler.expect_cancel_operation(Ok(())),
+    );
+
+    request_res
+        .expect("cancel_operation MUST succeed when routed to scheduler — got Err");
+    assert_eq!(
+        observed_op_id,
+        OperationId::from("some_operation_id"),
+        "cancel_operation must forward the parsed operation_id to the scheduler"
+    );
+    Ok(())
+}
+
+/// AC-poisoning fix C.2 (RPC path): unknown instance returns NotFound,
+/// not Unimplemented. Validates routing-side error mapping.
+#[nativelink_test]
+async fn operations_cancel_operation_unknown_instance_returns_not_found()
+-> Result<(), Box<dyn core::error::Error>> {
     let store_manager = make_store_manager().await?;
     let (execution_server, _) = make_execution_server(&store_manager)?;
 
     let err = execution_server
-        .cancel_operation(Request::new(CancelOperationRequest::default()))
+        .cancel_operation(Request::new(CancelOperationRequest {
+            name: "nonexistent_instance/some_op".to_string(),
+        }))
         .await
         .unwrap_err();
 
-    assert_eq!(err.code(), Code::Unimplemented);
-    assert_eq!(err.message(), "cancel_operation not implemented");
+    assert_eq!(err.code(), Code::NotFound);
     Ok(())
 }
 
@@ -329,6 +367,192 @@ impl ActionStateResult for TimeoutActionStateResult {
     }
 }
 
+/// AC-poisoning fix C.2: stream-drop on the streaming `Execute` RPC
+/// fires `cancel_operation` on the wrapping scheduler. After BUG-2
+/// hoist (the `cancel_guard` is installed ONLY by `inner_execute` —
+/// see `cancel_routing_e2e_test`), the only path that should
+/// cancel-on-drop is the streaming Execute. `inner_wait_execution`
+/// (used by `get_operation`/`wait_operation`/`WaitExecution`) is
+/// guard-free.
+///
+/// This test drives `execute()` end-to-end through the mock
+/// scheduler, reads the first state, drops the response stream,
+/// and asserts `cancel_operation` was forwarded. The BARE
+/// OperationId form (BUG-1 fix) is asserted via
+/// `cancel_routing_e2e_test`'s production-seam test (real
+/// SimpleScheduler + real Worker map), which observes the kill at
+/// the worker rx; this test asserts the guard fires AT ALL with the
+/// MockActionScheduler.
+///
+/// Mutation: comment out the `background_spawn!` in
+/// `ExecuteStreamCancelGuard::drop` — this test must red-fail with
+/// "must observe ExecuteStreamCancelGuard::drop fire".
+#[nativelink_test]
+async fn stream_drop_calls_cancel_operation() -> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_proto::build::bazel::remote::execution::v2::{
+        Action, Command, Directory, ExecuteRequest, digest_function,
+    };
+    use nativelink_proto::build::bazel::remote::execution::v2::execution_server::Execution;
+    use nativelink_store::ac_utils::serialize_and_upload_message;
+    use nativelink_util::digest_hasher::DigestHasherFunc;
+    use nativelink_util::store_trait::StoreLike;
+
+    let store_manager = make_store_manager().await?;
+    let (execution_server, mock_scheduler) = make_execution_server(&store_manager)?;
+
+    // execute() requires a real Action proto in the CAS store
+    // (decoded via get_and_decode_digest). Upload Command, Directory,
+    // and Action.
+    let cas_store = store_manager
+        .get_store("main_cas")
+        .expect("main_cas registered");
+    let command_digest = serialize_and_upload_message(
+        &Command {
+            arguments: vec!["true".to_string()],
+            output_paths: vec![],
+            working_directory: ".".to_string(),
+            environment_variables: vec![],
+            ..Default::default()
+        },
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await?;
+    let input_root_digest = serialize_and_upload_message(
+        &Directory::default(),
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await?;
+    let action = Action {
+        command_digest: Some(command_digest.into()),
+        input_root_digest: Some(input_root_digest.into()),
+        ..Default::default()
+    };
+    let action_digest = serialize_and_upload_message(
+        &action,
+        cas_store.as_pin(),
+        &mut DigestHasherFunc::Sha256.hasher(),
+    )
+    .await?;
+
+    // Single Queued state — execute reads it, then is_finished=false
+    // means more is expected. Dropping the response triggers the
+    // guard.
+    let action_state = Arc::new(ActionState {
+        client_operation_id: OperationId::from("some_operation_id"),
+        stage: ActionStage::Queued,
+        action_digest: DigestInfo::new([0u8; 32], 0),
+        last_transition_timestamp: SystemTime::UNIX_EPOCH,
+    });
+    let mock_action_state_result = MockActionStateResult {
+        states: vec![action_state.clone()],
+    };
+
+    // Drive execute(). Mock will receive add_action and return the
+    // action_state_result; we then drop the response stream.
+    let request_fut = execution_server.execute(Request::new(ExecuteRequest {
+        instance_name: INSTANCE_NAME.to_string(),
+        digest_function: digest_function::Value::Sha256.into(),
+        skip_cache_lookup: true,
+        action_digest: Some(action_digest.into()),
+        execution_policy: None,
+        results_cache_policy: None,
+    }));
+
+    let (response, _add_action_call) = tokio::join!(
+        request_fut,
+        mock_scheduler.expect_add_action(Ok(Box::new(mock_action_state_result))),
+    );
+    let response = response.expect("execute must succeed");
+
+    // Drop the response stream — this triggers the guard's Drop
+    // (with `completed=false` because the Queued state is not
+    // finished).
+    drop(response);
+
+    // The guard's Drop spawns the cancel via background_spawn!. Wait
+    // for the mock to receive it within the deadlock-detector timeout.
+    let _observed_op_id = tokio::time::timeout(
+        Duration::from_secs(5),
+        mock_scheduler.expect_cancel_operation(Ok(())),
+    )
+    .await
+    .expect(
+        "must observe ExecuteStreamCancelGuard::drop fire — Tonic stream-drop not propagating",
+    );
+    // The exact OperationId shape forwarded to cancel is asserted
+    // end-to-end by `cancel_routing_e2e_test`; here we only assert the
+    // guard fires.
+    Ok(())
+}
+
+/// C.2 (over-action positive control): wait_operation that drives
+/// the stream to a finished state must NOT trigger the cancel guard.
+/// `completed=true` short-circuits Drop. Mutation: remove the
+/// `completed.store(true, Ordering::Release)` write at the
+/// `is_finished` branch in `to_execute_stream` — this test must
+/// red-fail because cancel_operation will be observed on the mock.
+#[nativelink_test]
+async fn stream_natural_completion_does_not_call_cancel_operation()
+-> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let (execution_server, mock_scheduler) = make_execution_server(&store_manager)?;
+
+    let operation_name = format!("{INSTANCE_NAME}/some_operation_id");
+
+    // Two states; the second is Completed → is_finished()=true →
+    // completed.store(true) → guard's Drop is a no-op.
+    let state1 = Arc::new(ActionState {
+        client_operation_id: OperationId::from("some_operation_id"),
+        stage: ActionStage::Queued,
+        action_digest: DigestInfo::new([0u8; 32], 0),
+        last_transition_timestamp: SystemTime::UNIX_EPOCH,
+    });
+    let state2 = Arc::new(ActionState {
+        client_operation_id: OperationId::from("some_operation_id"),
+        stage: ActionStage::Completed(ActionResult::default()),
+        action_digest: DigestInfo::new([0u8; 32], 0),
+        last_transition_timestamp: SystemTime::UNIX_EPOCH,
+    });
+    let mock_action_state_result = MockActionStateResult {
+        states: vec![state1.clone(), state2.clone()],
+    };
+    let stream: ActionStateResultStream = Box::pin(stream::once(async move {
+        let result: Box<dyn ActionStateResult> = Box::new(mock_action_state_result);
+        result
+    }));
+
+    let request_fut = execution_server.wait_operation(Request::new(WaitOperationRequest {
+        name: operation_name.clone(),
+        timeout: None,
+    }));
+
+    let (request_res, _) = tokio::join!(
+        request_fut,
+        mock_scheduler.expect_filter_operations(Ok(stream)),
+    );
+    let operation = request_res?.into_inner();
+    assert!(operation.done, "operation must be done");
+
+    // The mock should NOT receive a cancel_operation call. Use a
+    // short timeout — if cancel WAS called, the mock would have
+    // received it by now (the background_spawn fires immediately
+    // on Drop).
+    let cancel_observed = tokio::time::timeout(
+        Duration::from_millis(200),
+        mock_scheduler.expect_cancel_operation(Ok(())),
+    )
+    .await;
+    assert!(
+        cancel_observed.is_err(),
+        "must complete normally — cancel guard fired against non-cancelled action; \
+         expected NO cancel_operation call when stream completes naturally, but got one"
+    );
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn operations_wait_operation_timeout() -> Result<(), Box<dyn core::error::Error>> {
     let store_manager = make_store_manager().await?;
@@ -369,6 +593,136 @@ async fn operations_wait_operation_timeout() -> Result<(), Box<dyn core::error::
     let operation = request_res?.into_inner();
     assert_eq!(operation.name, operation_name);
     assert!(!operation.done);
+
+    Ok(())
+}
+
+/// AC-poisoning fix BUG-2 over-action positive control: status-poll RPCs
+/// (`get_operation`) MUST NOT trigger the cancel guard when the
+/// underlying action is still running. `get_operation` reads ONE state
+/// from the stream and returns; dropping the stream is its NORMAL exit
+/// path, NOT a cancel signal. If the guard fires here, every Bazel
+/// status poll cancels the action it is polling.
+///
+/// Mutation: revert the BUG-2 hoist (re-add `ExecuteStreamCancelGuard`
+/// to `to_execute_stream` so `get_operation`/`wait_operation`/`WaitExecution`
+/// callers all get the guard). This test MUST red-fail with the
+/// bespoke message because cancel WILL be observed on the mock.
+#[nativelink_test]
+async fn get_operation_unfinished_does_not_cancel() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let (execution_server, mock_scheduler) = make_execution_server(&store_manager)?;
+
+    let operation_name = format!("{INSTANCE_NAME}/some_operation_id");
+
+    // Single Queued state — action is still running. get_operation
+    // reads it, returns. Dropping the stream MUST NOT cancel.
+    let action_state = Arc::new(ActionState {
+        client_operation_id: OperationId::from("some_operation_id"),
+        stage: ActionStage::Queued,
+        action_digest: DigestInfo::new([0u8; 32], 0),
+        last_transition_timestamp: SystemTime::UNIX_EPOCH,
+    });
+    let mock_action_state_result = MockActionStateResult {
+        states: vec![action_state.clone()],
+    };
+    let stream: ActionStateResultStream = Box::pin(stream::once(async move {
+        let result: Box<dyn ActionStateResult> = Box::new(mock_action_state_result);
+        result
+    }));
+
+    let request_fut = execution_server.get_operation(Request::new(GetOperationRequest {
+        name: operation_name.clone(),
+    }));
+
+    let (request_res, _filter) = tokio::join!(
+        request_fut,
+        mock_scheduler.expect_filter_operations(Ok(stream)),
+    );
+    let operation = request_res?.into_inner();
+    assert_eq!(operation.name, operation_name);
+    assert!(!operation.done, "Queued action is not done");
+
+    // After get_operation returns, the stream is dropped. If the
+    // guard fired (BUG-2), the mock receives a cancel within the
+    // background_spawn timing window. Wait long enough that a
+    // legitimately-fired cancel would have arrived; assert mock did
+    // NOT see one.
+    let cancel_observed = tokio::time::timeout(
+        Duration::from_millis(200),
+        mock_scheduler.expect_cancel_operation(Ok(())),
+    )
+    .await;
+    assert!(
+        cancel_observed.is_err(),
+        "must NOT cancel on get_operation poll — \
+         guard fired despite unary RPC; see distributed-systems R2 BLOCK"
+    );
+
+    Ok(())
+}
+
+/// AC-poisoning fix BUG-2 over-action positive control: `wait_operation`
+/// with a short client timeout that elapses before `is_done` becomes
+/// true MUST NOT trigger the cancel guard. Bazel `wait_operation` polls
+/// in a loop with client-supplied timeouts; expiring the timeout is
+/// natural return, not cancel.
+///
+/// Mutation: revert the BUG-2 hoist. This test MUST red-fail because
+/// cancel WILL be observed on the mock.
+#[nativelink_test]
+async fn wait_operation_timeout_does_not_cancel() -> Result<(), Box<dyn core::error::Error>> {
+    let store_manager = make_store_manager().await?;
+    let (execution_server, mock_scheduler) = make_execution_server(&store_manager)?;
+
+    let operation_name = format!("{INSTANCE_NAME}/some_operation_id");
+
+    let state1 = Arc::new(ActionState {
+        client_operation_id: OperationId::from("some_operation_id"),
+        stage: ActionStage::Queued,
+        action_digest: DigestInfo::new([0u8; 32], 0),
+        last_transition_timestamp: SystemTime::UNIX_EPOCH,
+    });
+
+    // TimeoutActionStateResult yields the same Queued state on the
+    // first call, then sleeps 1s on subsequent calls — wait_operation
+    // with 10ms client-timeout will hit the timeout branch and return
+    // an unfinished operation. Dropping the stream MUST NOT cancel.
+    let mock_action_state_result = TimeoutActionStateResult {
+        state: state1.clone(),
+        first_called: false,
+    };
+    let stream: ActionStateResultStream = Box::pin(stream::once(async move {
+        let result: Box<dyn ActionStateResult> = Box::new(mock_action_state_result);
+        result
+    }));
+
+    let request_fut = execution_server.wait_operation(Request::new(WaitOperationRequest {
+        name: operation_name.clone(),
+        timeout: Some(prost_types::Duration {
+            seconds: 0,
+            nanos: 10_000_000, // 10ms
+        }),
+    }));
+
+    let (request_res, _) = tokio::join!(
+        request_fut,
+        mock_scheduler.expect_filter_operations(Ok(stream)),
+    );
+    let operation = request_res?.into_inner();
+    assert_eq!(operation.name, operation_name);
+    assert!(!operation.done, "must time out before is_done");
+
+    let cancel_observed = tokio::time::timeout(
+        Duration::from_millis(200),
+        mock_scheduler.expect_cancel_operation(Ok(())),
+    )
+    .await;
+    assert!(
+        cancel_observed.is_err(),
+        "must NOT cancel on wait_operation timeout — \
+         guard fires on legitimate poll-then-drop"
+    );
 
     Ok(())
 }

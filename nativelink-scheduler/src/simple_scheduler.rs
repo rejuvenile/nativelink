@@ -1028,6 +1028,35 @@ impl ClientStateManager for SimpleScheduler {
         self.inner_filter_operations(filter).await
     }
 
+    /// Routes cancel through `ApiWorkerScheduler::cancel_operation_internal`,
+    /// which resolves the operation→worker assignment and dispatches a
+    /// `KillOperationRequest`. Part of the AC-poisoning fix composite
+    /// invariant (Phase D base design): cancel arrives via this path
+    /// → worker sets `RunningActionImpl::cancelled` → AC write
+    /// suppressed at `local_worker.rs` publish closure.
+    ///
+    /// Bazel-facing callers pass a CLIENT operation_id (what Bazel
+    /// knows from `Operation.name`); the worker map is keyed by the
+    /// matching engine's INTERNAL operation_id. This method
+    /// translates client→internal via
+    /// `client_state_manager.client_operation_id_to_operation_id`. If
+    /// translation returns `None` (the input may already be an
+    /// internal id, e.g. test callers passing `start.operation_id`),
+    /// the caller's value is forwarded as-is to
+    /// `cancel_operation_internal`, which is itself idempotent on
+    /// unknown ids.
+    async fn cancel_operation(&self, operation_id: &OperationId) -> Result<(), Error> {
+        let target = self
+            .client_state_manager
+            .client_operation_id_to_operation_id(operation_id)
+            .await
+            .err_tip(|| "In SimpleScheduler::cancel_operation translating client→internal")?
+            .unwrap_or_else(|| operation_id.clone());
+        self.worker_scheduler
+            .cancel_operation_internal(&target)
+            .await
+    }
+
     fn as_known_platform_property_provider(&self) -> Option<&dyn KnownPlatformPropertyProvider> {
         Some(self)
     }

@@ -165,6 +165,27 @@ impl ClientStateManager for PropertyModifierScheduler {
         self.inner_filter_operations(filter).await
     }
 
+    /// Pure-proxy: forward to inner scheduler. AC-poisoning fix
+    /// composite invariant requires the cancel signal to traverse
+    /// every wrapper to reach the worker pool.
+    async fn cancel_operation(&self, operation_id: &OperationId) -> Result<(), Error> {
+        self.scheduler.cancel_operation(operation_id).await
+    }
+
+    /// Pure-proxy: forward client→internal translation to inner.
+    /// PropertyModifierScheduler does not own action state, so it
+    /// cannot translate locally. The inner SimpleScheduler (or
+    /// equivalent) performs the translation; pure-proxy wrappers
+    /// must forward so cancel routing reaches the worker.
+    async fn client_operation_id_to_operation_id(
+        &self,
+        client_operation_id: &OperationId,
+    ) -> Result<Option<OperationId>, Error> {
+        self.scheduler
+            .client_operation_id_to_operation_id(client_operation_id)
+            .await
+    }
+
     fn as_known_platform_property_provider(&self) -> Option<&dyn KnownPlatformPropertyProvider> {
         Some(self)
     }

@@ -32,7 +32,8 @@ use nativelink_metric::{
 };
 use nativelink_proto::build::bazel::remote::execution::v2::{Digest, Directory};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    BlobsInStableStorage, PeerHint, StartExecute, UpdateForWorker, update_for_worker,
+    BlobsInStableStorage, KillOperationRequest, PeerHint, StartExecute, UpdateForWorker,
+    update_for_worker,
 };
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::fast_slow_store::FastSlowStore;
@@ -2983,6 +2984,84 @@ impl ApiWorkerScheduler {
                 "broadcast blobs_in_stable_storage"
             );
         }
+    }
+
+    /// AC-poisoning fix routing primitive: locate the worker running
+    /// `operation_id` and dispatch a `KillOperationRequest`. Both
+    /// arrival paths (explicit `cancel_operation` RPC and
+    /// `ExecuteStreamCancelGuard` stream-drop) converge here.
+    ///
+    /// Lock discipline: brief read-lock to scan workers and clone the
+    /// matching `tx` handle; the actual `tx.send` is outside the lock.
+    /// Mirrors `broadcast_blobs_in_stable_storage` above.
+    ///
+    /// Idempotency: an unknown / already-finished operation returns
+    /// `Ok(())`. Two cancels in flight (e.g. RPC + stream-drop) both
+    /// deliver `KillOperationRequest`; the worker's `kill_operation`
+    /// handler at `running_actions_manager.rs:5184-5201` `.take()`s
+    /// the `kill_channel_tx`, so only the first send wins. The
+    /// `cancelled` AtomicBool also set by `kill_operation` is
+    /// idempotent (false→true monotonic).
+    ///
+    /// Increments `metrics::CANCEL.cancel_kill_delivery_failed` if the
+    /// worker disconnected between snapshot and send (benign;
+    /// worker-disconnect closure deferred to the AC-server-side
+    /// intercept tracker, requires proto change).
+    pub async fn cancel_operation_internal(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<(), Error> {
+        // Phase 1: scan workers under a brief read lock; clone the
+        // matching tx so the actual send happens outside the lock.
+        let target = {
+            let inner = self.inner.read().await;
+            inner
+                .workers
+                .iter()
+                .find(|(_, w)| w.running_action_infos.contains_key(operation_id))
+                .map(|(wid, w)| (wid.clone(), w.tx.clone()))
+        };
+
+        let Some((worker_id, tx)) = target else {
+            // Operation already finished, never started, OR a routing
+            // bug failed the lookup (BUG-1: wrong OperationId shape).
+            // Operators distinguish via `execution.cancel.no_target_worker`
+            // counter — alarm during active builds when this counter
+            // accrues; benign when all builds are quiescent.
+            nativelink_util::metrics::CANCEL.no_target_worker.add(1, &[]);
+            info!(
+                %operation_id,
+                "cancel: operation not found on any worker (already-finished, never-started, or routing-bug)"
+            );
+            return Ok(());
+        };
+
+        let msg = UpdateForWorker {
+            update: Some(update_for_worker::Update::KillOperationRequest(
+                KillOperationRequest {
+                    operation_id: operation_id.to_string(),
+                },
+            )),
+        };
+        info!(
+            %operation_id,
+            %worker_id,
+            "cancel: sending KillOperationRequest to worker"
+        );
+        if tx.send(msg).is_err() {
+            // Worker disconnected between snapshot and send; benign.
+            // Increment safety-net counter so operators can observe
+            // disconnect-residual frequency.
+            nativelink_util::metrics::CANCEL
+                .cancel_kill_delivery_failed
+                .add(1, &[]);
+            warn!(
+                %operation_id,
+                %worker_id,
+                "cancel: worker disconnected before kill delivered"
+            );
+        }
+        Ok(())
     }
 
     /// (#97) Chunked variant of `broadcast_blobs_in_stable_storage`: splits

@@ -2600,6 +2600,16 @@ pub trait RunningAction: Sync + Send + Sized + Unpin + 'static {
 
     /// Returns the work directory of the action.
     fn get_work_directory(&self) -> &String;
+
+    /// Returns whether this action has been cancelled. AC-poisoning fix
+    /// residual-window guard: the publish closure at
+    /// `local_worker.rs:~2474` reads this via a captured `Arc<Self>`
+    /// to suppress AC writes after `kill_operation` arrives in the
+    /// gap between child-exit and `cache_action_result`. Default
+    /// returns `false` so test stubs don't have to implement it.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -2641,6 +2651,19 @@ pub struct RunningActionImpl {
     state: Mutex<RunningActionImplState>,
     has_manager_entry: AtomicBool,
     did_cleanup: AtomicBool,
+    /// AC-poisoning fix residual-window guard. Set by `kill_operation`
+    /// to suppress AC writes after a kill arrives in the residual
+    /// window between child-exit and `cache_action_result`. Composes
+    /// with the existing `kill_channel_tx` (which wakes the
+    /// `tokio::select!` arm during child-process wait): the channel
+    /// covers the window during execute; this flag covers the gap
+    /// after that arm has returned. Only ever transitions false →
+    /// true; once set, stays set for the action's lifetime. The
+    /// publish closure at `local_worker.rs:~2474` reads this via a
+    /// captured `Arc<RunningActionImpl>` (Arc-capture refactor — IC1
+    /// in v3-final design) so cleanup removing the `running_actions`
+    /// map entry cannot race with the read.
+    pub(crate) cancelled: AtomicBool,
     /// Pre-resolved directory tree from the scheduler (if provided in
     /// StartExecute). Used once during prepare_action to skip the GetTree
     /// RPC, then taken (dropped) to free memory.
@@ -2685,6 +2708,8 @@ impl RunningActionImpl {
             has_manager_entry: AtomicBool::new(true),
             // Only needs to be cleaned up after a prepare_action call, set there.
             did_cleanup: AtomicBool::new(true),
+            // AC-poisoning fix: residual-window guard, set by kill_operation.
+            cancelled: AtomicBool::new(false),
             pre_resolved_tree: Mutex::new(pre_resolved_tree),
             server_missing_digests: Mutex::new(server_missing_digests),
         }
@@ -4007,6 +4032,13 @@ impl RunningAction for RunningActionImpl {
     fn get_work_directory(&self) -> &String {
         &self.work_directory
     }
+
+    /// Returns true once `kill_operation` has set the cancelled flag.
+    /// AC-poisoning fix residual-window guard. The publish closure at
+    /// `local_worker.rs:~2474` reads this via a captured Arc.
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 pub trait RunningActionsManager: Sync + Send + Sized + Unpin + 'static {
@@ -5186,6 +5218,16 @@ impl RunningActionsManagerImpl {
             operation_id = ?action.operation_id,
             "Sending kill to running operation",
         );
+        // AC-poisoning fix: set cancelled BEFORE the oneshot send.
+        // Order matters: a racing publish-closure check at
+        // `local_worker.rs:~2474` must see `cancelled=true` even if
+        // the oneshot send-loses to the `tokio::select!` returning
+        // (e.g. child already exited). Release ordering pairs with
+        // the publish closure's Acquire load. Composes with the
+        // existing kill_channel_tx (which wakes the select! arm
+        // during child-process wait); this flag covers the gap
+        // after that arm has returned.
+        action.cancelled.store(true, Ordering::Release);
         let kill_channel_tx = {
             let mut action_state = action.state.lock();
             action_state.kill_channel_tx.take()

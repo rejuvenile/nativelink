@@ -1183,6 +1183,52 @@ where
         .await
     }
 
+    /// Explicit no-op: `SimpleSchedulerStateManager` is the action-DB
+    /// side of the scheduler; it does NOT route to workers. The
+    /// AC-poisoning fix's cancel routing flows through the wrapping
+    /// `SimpleScheduler`, which delegates to
+    /// `ApiWorkerScheduler::cancel_operation_internal`. This explicit
+    /// override (instead of relying on the trait default) documents
+    /// the design decision and prevents future implementors from
+    /// silently inheriting a no-op while assuming routing.
+    async fn cancel_operation(&self, _operation_id: &OperationId) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Translate the CLIENT operation_id (the value Bazel sees in
+    /// `Operation.name`) to the INTERNAL operation_id (the matching
+    /// engine's id used to key worker `running_action_infos`). Looks
+    /// up via `AwaitedActionDb::get_awaited_action_by_id` and reads
+    /// the `AwaitedAction::operation_id()` field, which is the
+    /// internal id (NOT subject to the subscriber-level
+    /// `set_client_operation_id` rewrite that affects
+    /// `state.client_operation_id`).
+    ///
+    /// Used by `SimpleScheduler::cancel_operation` to route
+    /// Bazel-issued cancellations (which arrive carrying the client
+    /// id) to the worker, whose map is keyed by the internal id. See
+    /// `cancel_routing_e2e_test::stream_drop_routes_kill_to_assigned_worker_via_real_apiworkerscheduler`
+    /// for the regression test.
+    async fn client_operation_id_to_operation_id(
+        &self,
+        client_operation_id: &OperationId,
+    ) -> Result<Option<OperationId>, Error> {
+        let Some(subscriber) = self
+            .action_db
+            .get_awaited_action_by_id(client_operation_id)
+            .await
+            .err_tip(|| {
+                "In SimpleSchedulerStateManager::client_operation_id_to_operation_id"
+            })?
+        else {
+            return Ok(None);
+        };
+        let awaited_action = subscriber.borrow().await.err_tip(|| {
+            "In SimpleSchedulerStateManager::client_operation_id_to_operation_id"
+        })?;
+        Ok(Some(awaited_action.operation_id().clone()))
+    }
+
     fn as_known_platform_property_provider(&self) -> Option<&dyn KnownPlatformPropertyProvider> {
         None
     }

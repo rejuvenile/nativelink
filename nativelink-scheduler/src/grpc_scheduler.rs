@@ -28,7 +28,8 @@ use nativelink_proto::build::bazel::remote::execution::v2::execution_client::Exe
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ExecuteRequest, ExecutionPolicy, GetCapabilitiesRequest, WaitExecutionRequest,
 };
-use nativelink_proto::google::longrunning::Operation;
+use nativelink_proto::google::longrunning::operations_client::OperationsClient;
+use nativelink_proto::google::longrunning::{CancelOperationRequest, Operation};
 use nativelink_util::action_messages::{
     ActionInfo, ActionState, ActionUniqueQualifier, DEFAULT_EXECUTION_PRIORITY, OperationId,
 };
@@ -349,6 +350,30 @@ impl ClientStateManager for GrpcScheduler {
         filter: OperationFilter,
     ) -> Result<ActionStateResultStream<'a>, Error> {
         self.inner_filter_operations(filter).await
+    }
+
+    /// Forwards the cancel via the upstream gRPC scheduler's
+    /// `Operations::CancelOperation` RPC. Per AC-poisoning fix
+    /// composite invariant, every wrapper must propagate the cancel
+    /// signal so the assigned worker (managed by the upstream
+    /// scheduler) can suppress the AC write.
+    async fn cancel_operation(&self, operation_id: &OperationId) -> Result<(), Error> {
+        let request = CancelOperationRequest {
+            name: operation_id.to_string(),
+        };
+        self.perform_request(request, |request| async move {
+            let channel = self
+                .connection_manager
+                .connection(format!("cancel_operation: {}", request.name))
+                .await
+                .err_tip(|| "in cancel_operation()")?;
+            OperationsClient::new(channel)
+                .cancel_operation(Request::new(request))
+                .await
+                .err_tip(|| "Sending cancel to upstream scheduler")
+                .map(|_| ())
+        })
+        .await
     }
 
     fn as_known_platform_property_provider(&self) -> Option<&dyn KnownPlatformPropertyProvider> {

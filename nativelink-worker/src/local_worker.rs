@@ -2300,6 +2300,19 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             operation_id = %action.get_operation_id(),
                                             "Received request to run action"
                                         );
+                                        // LOAD-BEARING: this `action.clone()` is what closes
+                                        // the AC-poisoning lifecycle race between
+                                        // `cleanup_action()` removing the running_actions
+                                        // map entry and the publish closure reading
+                                        // `cancelled`. See §A3.3 regression test
+                                        // (`cancel_then_cleanup_race_does_not_poison_ac`).
+                                        // DO NOT remove this clone-into-publish-future
+                                        // even if it appears unused; the load is what
+                                        // reads the AtomicBool. The Arc keeps
+                                        // RunningActionImpl alive across the publish
+                                        // closure's lifetime regardless of whether
+                                        // cleanup has run.
+                                        let action_for_publish = action.clone();
                                         // Box each phase to heap-allocate its future state
                                         // separately. Without this, the compiler generates a
                                         // single monolithic state machine for the entire
@@ -2322,7 +2335,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                         error!(?e, "Background cleanup failed");
                                                     }
                                                 });
-                                                result
+                                                // Reshape: (ActionResult, Arc<RunningActionImpl>)
+                                                // so the publish closure can read `cancelled`
+                                                // from the captured Arc per AC-poisoning fix
+                                                // IC1 in v3-final design.
+                                                result.map(|action_result| (action_result, action_for_publish))
                                             })
                                     }).await
                                 })
@@ -2336,7 +2353,15 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     .unwrap_or_default();
 
                                 let running_actions_manager = self.running_actions_manager.clone();
-                                move |res: Result<ActionResult, Error>| async move {
+                                // AC-poisoning fix IC1: signature reshaped to accept
+                                // (ActionResult, Arc<U::RunningAction>) so the
+                                // captured Arc closes the lifecycle race with
+                                // cleanup. The error path doesn't carry the Arc
+                                // because there's no AC write to suppress on error.
+                                // `is_cancelled()` is a default-`false` method on
+                                // the `RunningAction` trait so test stubs don't
+                                // have to implement it.
+                                move |res: Result<(ActionResult, Arc<U::RunningAction>), Error>| async move {
                                     // Sample CPU at completion time, not action start time.
                                     let exec_load = get_cpu_load_pct();
                                     let exec_p_load = get_p_core_load_pct();
@@ -2351,7 +2376,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     let instance_name = maybe_instance_name
                                         .err_tip(|| "`instance_name` could not be resolved; this is likely an internal error in local_worker.")?;
                                     match res {
-                                        Ok(mut action_result) => {
+                                        Ok((mut action_result, action_for_publish)) => {
                                             // External-consistency invariant (#129): every
                                             // blob the action produced MUST be observable
                                             // from the server (in CAS or via locality_map
@@ -2471,19 +2496,48 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             //    runs after the tree expansion (which
                                             //    borrows immutably) and after the
                                             //    locality-critical sends.
-                                            if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) {
-                                                if let Err(err) = running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher).await {
-                                                    error!(
-                                                        ?err,
-                                                        ?action_digest,
-                                                        "Error saving action in store",
-                                                    );
+                                            //
+                                            //    AC-poisoning fix residual-window guard
+                                            //    (composite invariant Phase D of base
+                                            //    design): a cancel signal arriving via
+                                            //    KillOperationRequest BEFORE this AC
+                                            //    write fires must suppress the write.
+                                            //    `RunningAction::is_cancelled()` is an
+                                            //    Acquire load on the AtomicBool set by
+                                            //    `RunningActionsManagerImpl::kill_operation`
+                                            //    (Release store, paired). The Arc was
+                                            //    captured BEFORE the
+                                            //    `.then(spawn(cleanup))` chain so
+                                            //    cleanup removing the running_actions
+                                            //    map entry cannot race with this read.
+                                            let cancelled = action_for_publish.is_cancelled();
+                                            if !cancelled {
+                                                if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) {
+                                                    if let Err(err) = running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher).await {
+                                                        error!(
+                                                            ?err,
+                                                            ?action_digest,
+                                                            "Error saving action in store",
+                                                        );
+                                                    }
                                                 }
+                                            } else {
+                                                nativelink_util::metrics::CANCEL
+                                                    .ac_writes_suppressed_due_to_cancel
+                                                    .add(1, &[]);
+                                                warn!(
+                                                    operation_id = %action_for_publish.get_operation_id(),
+                                                    "AC write suppressed: action was cancelled in residual window"
+                                                );
                                             }
 
                                             // 5. Upload output blobs from local CAS to remote
                                             //    CAS in the background. This is fire-and-forget;
                                             //    peers can already serve the blobs directly.
+                                            //    Per v2 §A1.2: AC-only suppression — CAS
+                                            //    upload remains UNCONDITIONAL because
+                                            //    CAS is content-addressed and uploaded
+                                            //    blobs cannot poison.
                                             running_actions_manager.spawn_upload_to_remote(&action_result);
                                         },
                                         Err(e) => {

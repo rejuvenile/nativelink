@@ -626,6 +626,61 @@ pub struct ExecutionMetrics {
     pub execution_retry_count: metrics::Counter<u64>,
 }
 
+/// Global cancel-routing metrics. Part of the AC-poisoning fix
+/// composite invariant (cancel ⇒ AC write suppressed before
+/// `update_action_result`). Two counters give operators a clear
+/// picture:
+/// - `ac_writes_suppressed_due_to_cancel`: in-band fix is doing work.
+/// - `cancel_kill_delivery_failed`: safety net exercised; the
+///   worker-disconnect residual case requires the AC-server-side
+///   intercept tracker (separate, requires proto change).
+pub static CANCEL: LazyLock<CancelMetrics> = LazyLock::new(|| {
+    let meter = global::meter_with_scope(InstrumentationScope::builder("nativelink").build());
+
+    CancelMetrics {
+        ac_writes_suppressed_due_to_cancel: meter
+            .u64_counter("execution.cancel.ac_writes_suppressed")
+            .with_description(
+                "AC writes suppressed because the operation was cancelled in the residual window between child-exit and cache_action_result",
+            )
+            .build(),
+        cancel_kill_delivery_failed: meter
+            .u64_counter("execution.cancel.kill_delivery_failed")
+            .with_description(
+                "Cancel routing failed to reach a worker (worker disconnected before kill delivered)",
+            )
+            .build(),
+        no_target_worker: meter
+            .u64_counter("execution.cancel.no_target_worker")
+            .with_description(
+                "Cancel arrived but the operation was not present in any worker's running_action_infos (already-finished, never-started, OR routing-bug failed lookup — distinguish via paired observation of execute timing)",
+            )
+            .build(),
+    }
+});
+
+/// OpenTelemetry counters for cancel routing. See `CANCEL` LazyLock
+/// for placement rationale and operator semantics.
+#[derive(Debug)]
+pub struct CancelMetrics {
+    /// AC writes suppressed because the operation was cancelled in
+    /// the residual window between child-exit and cache_action_result.
+    pub ac_writes_suppressed_due_to_cancel: metrics::Counter<u64>,
+    /// Cancel routing failed to reach a worker (worker disconnected
+    /// before kill delivered).
+    pub cancel_kill_delivery_failed: metrics::Counter<u64>,
+    /// Cancel arrived but the operation was not present in any worker's
+    /// running_action_infos. Three causes — operationally
+    /// indistinguishable without a paired metric: (a) the action genuinely
+    /// finished before the cancel arrived (benign), (b) the action was
+    /// never assigned to any worker (queue-side cancel, benign), or
+    /// (c) the cancel routing translated the wrong OperationId shape
+    /// (BUG-1 regression). Operators alarm on a non-zero rate during
+    /// active builds, then triage via `cancel_routing_e2e_test` and
+    /// the ac_writes_suppressed counter.
+    pub no_target_worker: metrics::Counter<u64>,
+}
+
 /// Helper function to create attributes for execution metrics
 #[must_use]
 pub fn make_execution_attributes(
