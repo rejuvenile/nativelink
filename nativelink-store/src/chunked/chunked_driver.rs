@@ -57,6 +57,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
 use nativelink_util::common::DigestInfo;
+use nativelink_util::cpu_pool::cpu_pool;
 use nativelink_util::spawn;
 use nativelink_util::task::JoinHandleDropGuard;
 use parking_lot::Mutex;
@@ -1240,26 +1241,43 @@ async fn commit_and_verify<Fe: FileEntry>(
     }
 
     // Step 2: end-to-end SHA-256 over the holding file.
+    //
+    // Hypothesis-B fix (2026-05-12): formerly dispatched via
+    // `tokio::task::spawn_blocking`, which serializes submission on a
+    // single `parking_lot::Mutex<Shared>` inside tokio's blocking-pool
+    // spawner. Production `ChunkedShaCommit` rate ≈ ~470/s × ~30 ms
+    // each (1 MiB hash chunks); each submit was one extra acquire of
+    // that mutex while the per-chunk admit-side SHA + chunked pwrite
+    // sites all fanned in to the SAME mutex — the dominant
+    // `dispatch_ms` source identified in
+    // `.claude/audits/blocking-pool-saturation-investigation-20260512.md`.
+    // Routing CPU-bound stream-hash via `cpu_pool()` (a separate rayon
+    // work-stealing pool with its own per-worker deque) eliminates the
+    // submission contention. The work itself is still serialized on a
+    // single rayon worker (we only need 1 thread per blob); the win is
+    // OFF the spawn_blocking spawner mutex, not parallelism.
     let holding_path_pb = filesystem_store.holding_content_path(digest);
-    let computed = tokio::task::spawn_blocking({
-        let path = holding_path_pb.clone();
-        move || -> Result<[u8; 32], std::io::Error> {
-            // Stream via `std::io::Read` + `DigestHasher::update` to keep
-            // peak memory at the read-buffer size only (a 100 MiB blob
-            // would otherwise need 100 MiB of allocation up front).
-            //
-            // Buffer = 1 MiB to match ZFS recordsize=1M on
-            // `fast/nativelink/work` (perf-optimizer MINOR-1 fixup);
-            // avoids 16× syscalls per record vs the previous 64 KiB.
-            //
-            // #228 fix: use the process-wide default digest hasher
-            // (`blake3` in production per `default_digest_hash_function`
-            // in buildcache-native.json5 / worker.json5). The previous
-            // hardcoded Sha256 mismatched every BLAKE3-named declared
-            // digest at the e2e check, rejecting 100% of >=1 MiB writes
-            // in production.
+    let (sha_tx, sha_rx) =
+        oneshot::channel::<Result<[u8; 32], std::io::Error>>();
+    let path_for_pool = holding_path_pb.clone();
+    cpu_pool().spawn(move || {
+        // Stream via `std::io::Read` + `DigestHasher::update` to keep
+        // peak memory at the read-buffer size only (a 100 MiB blob
+        // would otherwise need 100 MiB of allocation up front).
+        //
+        // Buffer = 1 MiB to match ZFS recordsize=1M on
+        // `fast/nativelink/work` (perf-optimizer MINOR-1 fixup);
+        // avoids 16× syscalls per record vs the previous 64 KiB.
+        //
+        // #228 fix: use the process-wide default digest hasher
+        // (`blake3` in production per `default_digest_hash_function`
+        // in buildcache-native.json5 / worker.json5). The previous
+        // hardcoded Sha256 mismatched every BLAKE3-named declared
+        // digest at the e2e check, rejecting 100% of >=1 MiB writes
+        // in production.
+        let result = (|| -> Result<[u8; 32], std::io::Error> {
             use std::io::Read;
-            let mut file = std::fs::File::open(&path)?;
+            let mut file = std::fs::File::open(&path_for_pool)?;
             let mut hasher = default_digest_hasher_func().hasher();
             let mut buf = vec![0u8; 1024 * 1024];
             loop {
@@ -1271,21 +1289,23 @@ async fn commit_and_verify<Fe: FileEntry>(
             }
             let info = hasher.finalize_digest();
             Ok(**info.packed_hash())
-        }
-    })
-    .await
-    .map_err(|join_err| {
-        make_err!(
-            Code::Internal,
-            "spawn_blocking join error in commit-time SHA-256: {join_err:?}"
-        )
-    })?
-    .map_err(|io_err| {
-        make_err!(
-            Code::Internal,
-            "failed to re-read holding file for SHA-256 verification: {io_err:?}"
-        )
-    })?;
+        })();
+        let _ = sha_tx.send(result);
+    });
+    let computed = sha_rx
+        .await
+        .map_err(|_| {
+            make_err!(
+                Code::Internal,
+                "cpu_pool worker dropped before sending commit-time SHA-256"
+            )
+        })?
+        .map_err(|io_err| {
+            make_err!(
+                Code::Internal,
+                "failed to re-read holding file for SHA-256 verification: {io_err:?}"
+            )
+        })?;
 
     // `packed_hash()` returns `&PackedHash`, which derefs to `&[u8; 32]`.
     // The double-deref + Copy gives an owned `[u8; 32]` for comparison.

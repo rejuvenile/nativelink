@@ -66,6 +66,7 @@ use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt as _;
 use parking_lot::Mutex;
+use nativelink_util::cpu_pool::cpu_pool;
 use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
@@ -3430,25 +3431,39 @@ fn build_bazel_chunk_stream(
     Box::pin(stream)
 }
 
-/// Hash a single chunk on `spawn_blocking` using the process-wide
+/// Hash a single chunk on the dedicated CPU pool using the process-wide
 /// default digest hasher (BLAKE3 in production, SHA-256 in tests).
+///
 /// #228 fix: name preserved (`compute_sha256_blocking`) to avoid a
 /// large rename diff, but the function now dispatches via
 /// `DigestHasher` and produces a hash matching whatever
 /// `default_digest_hasher_func()` returns. Per-blob override per REAPI
 /// v2 `digest_function` can be threaded later.
+///
+/// Hypothesis-B fix (2026-05-12): the per-chunk SHA used to dispatch via
+/// `tokio::task::spawn_blocking`, which acquires a process-wide
+/// `parking_lot::Mutex<Shared>` inside the tokio blocking-pool spawner.
+/// At ~986 spawn_blocking/s production load that mutex became the
+/// dominant `dispatch_ms` contributor (`back_edge_ms` p99 = 1216 ms; see
+/// `.claude/audits/blocking-pool-saturation-investigation-20260512.md`).
+/// Routing CPU-bound SHA via `cpu_pool()` (a separate rayon work-stealing
+/// pool with its own queue) removes this submission contention entirely
+/// — the rayon pool's lock-free per-worker deque scales with the worker
+/// count rather than serializing on a single mutex.
 async fn compute_sha256_blocking(bytes: Bytes) -> Result<[u8; 32], Error> {
-    tokio::task::spawn_blocking(move || -> [u8; 32] {
+    let (tx, rx) = oneshot::channel();
+    cpu_pool().spawn(move || {
         let mut h = default_digest_hasher_func().hasher();
         h.update(&bytes);
         let info = h.finalize_digest();
-        **info.packed_hash()
-    })
-    .await
-    .map_err(|join_err| {
+        // tx.send returns the value back if the receiver was dropped; we
+        // don't care since the rx.await below will see Err in that case.
+        let _ = tx.send(**info.packed_hash());
+    });
+    rx.await.map_err(|_| {
         make_err!(
             Code::Internal,
-            "spawn_blocking join error in bazel-facing per-chunk hash: {join_err:?}"
+            "cpu_pool worker dropped before sending bazel-facing per-chunk hash"
         )
     })
 }

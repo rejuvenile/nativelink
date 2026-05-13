@@ -24,6 +24,7 @@ pub mod chunked_stream;
 pub mod coalesce;
 pub mod common;
 pub mod connection_manager;
+pub mod cpu_pool;
 pub mod digest_hasher;
 pub mod evicting_map;
 pub mod moka_evicting_map;
