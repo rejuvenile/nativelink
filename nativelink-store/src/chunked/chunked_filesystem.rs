@@ -752,8 +752,11 @@ pub(crate) async fn commit_chunked_to_holding(
     // so we don't block a tokio worker on the rename syscall.
     let from_path = entry.path.clone();
     let to_path_for_blocking = holding_path.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
-        std::fs::rename(&from_path, &to_path_for_blocking)
+    let rename_start = Instant::now();
+    let syscall_ms = tokio::task::spawn_blocking(move || -> Result<u128, std::io::Error> {
+        let syscall_start = Instant::now();
+        std::fs::rename(&from_path, &to_path_for_blocking)?;
+        Ok(syscall_start.elapsed().as_millis())
     })
     .await
     .map_err(|join_err| {
@@ -767,6 +770,18 @@ pub(crate) async fn commit_chunked_to_holding(
             holding_path.display()
         )
     })?;
+    let total_ms = rename_start.elapsed().as_millis();
+    if total_ms > 50 || syscall_ms > 50 {
+        tracing::warn!(
+            target: "nativelink_store::chunked",
+            ?digest,
+            rename_total_ms = total_ms,
+            rename_syscall_ms = syscall_ms,
+            dispatch_ms = total_ms.saturating_sub(syscall_ms),
+            stage = "commit_to_holding",
+            "chunked rename slow (>50ms)"
+        );
+    }
 
     // DO NOT remove from the in-flight map here — `finalize_holding`
     // does that after the SHA-256 verify (M-perf-3 + B1 coupling).
@@ -791,17 +806,24 @@ pub(crate) async fn finalize_holding(
 ) -> Result<(), Error> {
     let from_path = holding_path.clone();
     let to_path = final_path.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+    let total_start = Instant::now();
+    let (syscall_ms, chmod_ms) = tokio::task::spawn_blocking(move || -> Result<(u128, u128), std::io::Error> {
+        let syscall_start = Instant::now();
         std::fs::rename(&from_path, &to_path)?;
+        let s_ms = syscall_start.elapsed().as_millis();
         #[cfg(target_family = "unix")]
-        {
+        let c_ms = {
             use std::os::unix::fs::PermissionsExt;
+            let chmod_start = Instant::now();
             let perms = std::fs::Permissions::from_mode(0o555);
             if let Err(err) = std::fs::set_permissions(&to_path, perms) {
                 tracing::warn!(?err, path = ?to_path, "Failed to set CAS file permissions to 0o555 after chunked commit (stage 2)");
             }
-        }
-        Ok(())
+            chmod_start.elapsed().as_millis()
+        };
+        #[cfg(not(target_family = "unix"))]
+        let c_ms = 0u128;
+        Ok((s_ms, c_ms))
     })
     .await
     .map_err(|join_err| {
@@ -815,6 +837,19 @@ pub(crate) async fn finalize_holding(
             final_path.display()
         )
     })?;
+    let total_ms = total_start.elapsed().as_millis();
+    if total_ms > 50 || syscall_ms > 50 {
+        tracing::warn!(
+            target: "nativelink_store::chunked",
+            ?digest,
+            rename_total_ms = total_ms,
+            rename_syscall_ms = syscall_ms,
+            chmod_ms,
+            dispatch_ms = total_ms.saturating_sub(syscall_ms + chmod_ms),
+            stage = "finalize_holding",
+            "chunked rename slow (>50ms)"
+        );
+    }
 
     // Remove from the in-flight map AFTER the final rename succeeds.
     // Drop the Arc<ChunkInProgress> after the lock is released to keep
