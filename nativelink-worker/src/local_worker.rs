@@ -3016,6 +3016,13 @@ pub async fn new_local_worker(
             _ => None,
         };
 
+    // Keep a handle on the AC store and its registered name so the worker
+    // CAS listener (below) can mount an `AcServer` against the same store.
+    // The server-side `AcProxyStore` dials this listener for AC peer-fetch;
+    // without a mounted handler, tonic synthesizes `Unimplemented` for every
+    // `ActionCache/GetActionResult` call (#463: 1503 warns/day since #277).
+    let ac_store_for_listener = ac_store.clone();
+    let ac_store_name_for_listener = ac_store_name.clone();
     let running_actions_manager =
         Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
             root_action_directory: config.work_directory.clone(),
@@ -3140,6 +3147,55 @@ pub async fn new_local_worker(
             },
         }];
 
+        // If an AC store is plumbed (upload_action_result.ac_store), mount it
+        // under "worker_ac" so the AcServer below can resolve it. The
+        // server-side `AcProxyStore::create_worker_connection` uses
+        // `instance_name: String::new()`, so the AcServer instance map keys
+        // on `""` for AC peer-fetch RPCs to land. Without this branch, the
+        // tonic Router synthesizes `Unimplemented` on every
+        // `ActionCache/GetActionResult` against port `cas_server_port`.
+        let ac_svc_opt = if let (Some(ac_store), Some(ac_name)) = (
+            ac_store_for_listener.as_ref(),
+            ac_store_name_for_listener.as_ref(),
+        ) {
+            store_manager.add_store("worker_ac", ac_store.clone());
+            let ac_configs = vec![nativelink_config::cas_server::WithInstanceName {
+                instance_name: String::new(),
+                config: nativelink_config::cas_server::AcStoreConfig {
+                    ac_store: "worker_ac".to_string(),
+                    // Reads from peer-AC are the dominant production path;
+                    // server-side `AcProxyStore` only calls
+                    // `get_action_result`. UpdateActionResult is still
+                    // accepted so a future writer (e.g. cross-worker AC
+                    // mirror) doesn't get PermissionDenied. The worker's
+                    // own action results flow through
+                    // `upload_action_result` writing to the same store
+                    // server-side, not through this listener.
+                    read_only: false,
+                },
+            }];
+            let ac_server =
+                nativelink_service::ac_server::AcServer::new(&ac_configs, &store_manager)
+                    .err_tip(|| "Failed to create worker AC server")?;
+            info!(
+                ac_store_name = %ac_name,
+                "worker AC server mounted on cas_server_port for peer AC fetch"
+            );
+            Some(ac_server.into_service())
+        } else {
+            // Either no AC store configured on the worker, or AC store name
+            // missing. Without this the server's AcProxyStore peer-fetch
+            // will continue receiving Unimplemented for AC RPCs on this
+            // worker's endpoint.
+            debug!(
+                ac_store_present = ac_store_for_listener.is_some(),
+                ac_store_name_present = ac_store_name_for_listener.is_some(),
+                "worker AC server NOT mounted on cas_server_port — \
+                 AcProxyStore peer-fetch will see Unimplemented for this worker"
+            );
+            None
+        };
+
         // Workers do NOT participate in the SmallBlobDispatcher producer
         // path — workers RECEIVE dispatched bytes; they never push to
         // other workers. Pass `None` here so the dispatcher hook is
@@ -3176,10 +3232,15 @@ pub async fn new_local_worker(
             .into_service()
             .max_decoding_message_size(WORKER_CAS_MAX_DECODING_MESSAGE_SIZE)
             .max_encoding_message_size(WORKER_CAS_MAX_ENCODING_MESSAGE_SIZE);
+        let ac_svc_opt = ac_svc_opt.map(|svc| {
+            svc.max_decoding_message_size(WORKER_CAS_MAX_DECODING_MESSAGE_SIZE)
+                .max_encoding_message_size(WORKER_CAS_MAX_ENCODING_MESSAGE_SIZE)
+        });
 
         // Start TCP server (with TLS if cas_server_tls is configured).
         let tcp_cas_svc = cas_svc.clone();
         let tcp_bs_svc = bs_svc.clone();
+        let tcp_ac_svc = ac_svc_opt.clone();
         let tcp_worker_name = worker_name.clone();
         let tls_server_config = if let Some(ref tls_cfg) = config.cas_server_tls {
             let cert = std::fs::read_to_string(&tls_cfg.cert_file)
@@ -3216,9 +3277,11 @@ pub async fn new_local_worker(
                     make_err!(Code::Internal, "Worker CAS TCP TLS config failed: {e:?}")
                 })?;
             }
-            let result = builder
-                .add_service(tcp_cas_svc)
-                .add_service(tcp_bs_svc)
+            let mut router = builder.add_service(tcp_cas_svc).add_service(tcp_bs_svc);
+            if let Some(ac_svc) = tcp_ac_svc {
+                router = router.add_service(ac_svc);
+            }
+            let result = router
                 .serve_with_shutdown(addr, async move {
                     let _ = tcp_shutdown_rx.changed().await;
                     info!(%addr, "worker CAS server shutting down gracefully");
@@ -3234,7 +3297,10 @@ pub async fn new_local_worker(
         // Start QUIC/H3 server on the same port (UDP) for peer blob sharing.
         #[cfg(feature = "quic")]
         let _quic_guard = {
-            let quic_routes = tonic::service::Routes::new(cas_svc).add_service(bs_svc);
+            let mut quic_routes = tonic::service::Routes::new(cas_svc).add_service(bs_svc);
+            if let Some(ac_svc) = ac_svc_opt {
+                quic_routes = quic_routes.add_service(ac_svc);
+            }
             match start_worker_quic_server(cas_port, &worker_name, quic_routes) {
                 Ok(guard) => Some(guard),
                 Err(e) => {
