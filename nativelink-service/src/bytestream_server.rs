@@ -1755,6 +1755,11 @@ impl ByteStreamServer {
         stream: WriteRequestStreamWrapper<impl Stream<Item = Result<WriteRequest, Status>> + Unpin>,
         is_worker: bool,
         is_mirror: bool,
+        // Slow-producer immunity: bumped after each successful chunk
+        // recv so the StallGuard can suppress dumps when the server is
+        // correctly waiting on a paused client. See
+        // `.claude/audits/stall-cluster-2026-05-13-1941-1945.md`.
+        progress_handle: Arc<AtomicU64>,
     ) -> Result<Response<WriteResponse>, Error> {
         async fn process_client_stream(
             mut stream: WriteRequestStreamWrapper<
@@ -1777,6 +1782,10 @@ impl ByteStreamServer {
             // both classes look identical in the existing warn.
             finish_write_seen: &mut bool,
             expected_size: u64,
+            // Slow-producer immunity: bumped on each successful chunk
+            // recv to mark forward server-side progress; the
+            // StallGuard's dump trigger checks recency before firing.
+            progress_handle: &Arc<AtomicU64>,
         ) -> Result<(), Error> {
             loop {
                 let write_request = match stream.next().await {
@@ -1796,6 +1805,12 @@ impl ByteStreamServer {
                     // Code path for received chunk of data.
                     Some(Ok(write_request)) => write_request,
                 };
+                // Mark forward server-side progress: a chunk arrived and
+                // we're about to process it. The StallGuard observes this
+                // to suppress stack dumps when the only "stall" is a
+                // paused client (see
+                // `.claude/audits/stall-cluster-2026-05-13-1941-1945.md`).
+                nativelink_util::stall_detector::bump_progress_handle(progress_handle);
 
                 if write_request.write_offset < 0 {
                     return Err(make_input_err!(
@@ -2032,7 +2047,8 @@ impl ByteStreamServer {
                 &streaming_blob_writer,
                 &active_stream_guard.bytes_received,
                 &mut finish_write_seen,
-                expected_size
+                expected_size,
+                &progress_handle,
             ),
             (&mut active_stream.store_update_fut)
                 .map_err(|err| { err.append("Error updating inner store") })
@@ -2277,6 +2293,11 @@ impl ByteStreamServer {
         >,
         is_worker: bool,
         is_mirror: bool,
+        // Slow-producer immunity: bumped after each successful chunk
+        // recv so the StallGuard can suppress dumps when the server is
+        // correctly waiting on a paused client. See
+        // `.claude/audits/stall-cluster-2026-05-13-1941-1945.md`.
+        progress_handle: Arc<AtomicU64>,
     ) -> Result<Response<WriteResponse>, Error> {
         let expected_size = stream.resource_info.expected_size as u64;
 
@@ -2298,6 +2319,11 @@ impl ByteStreamServer {
                 Some(Err(err)) => return Err(err),
                 Some(Ok(write_request)) => write_request,
             };
+            // Mark forward server-side progress: a chunk arrived. The
+            // StallGuard observes this to suppress stack dumps when the
+            // only "stall" is a paused client (see
+            // `.claude/audits/stall-cluster-2026-05-13-1941-1945.md`).
+            nativelink_util::stall_detector::bump_progress_handle(&progress_handle);
 
             if write_request.write_offset < 0 {
                 return Err(make_input_err!(
@@ -2740,6 +2766,12 @@ impl ByteStreamServer {
             nativelink_util::stall_detector::DEFAULT_STALL_THRESHOLD,
             stall_label,
         );
+        // Slow-producer immunity (#stall-cluster-2026-05-13): the
+        // recv-loop bumps this handle on each chunk so the
+        // stall_detector can distinguish "server wedged" from "Bazel
+        // client paused 80s between chunks". See
+        // `.claude/audits/stall-cluster-2026-05-13-1941-1945.md`.
+        let progress_handle = _stall_guard.progress_handle();
         // Server-side write timeout: abort writes that hang longer than
         // 5 minutes. Prevents stuck operations from holding resources
         // indefinitely (e.g., when a QUIC stream wedges during cache
@@ -2747,17 +2779,31 @@ impl ByteStreamServer {
         const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
         let write_fut = IS_MIRROR_REQUEST.scope(is_mirror, async {
             if use_oneshot {
-                self.inner_write_oneshot(instance, digest, stream, is_worker, is_mirror)
-                    .instrument(error_span!("bytestream_write_oneshot", %zero_copy))
-                    .with_context(make_ctx_for_hash_func(digest_function).err_tip(|| tip_label)?)
-                    .await
-                    .err_tip(|| tip_oneshot_label)
+                self.inner_write_oneshot(
+                    instance,
+                    digest,
+                    stream,
+                    is_worker,
+                    is_mirror,
+                    progress_handle.clone(),
+                )
+                .instrument(error_span!("bytestream_write_oneshot", %zero_copy))
+                .with_context(make_ctx_for_hash_func(digest_function).err_tip(|| tip_label)?)
+                .await
+                .err_tip(|| tip_oneshot_label)
             } else {
-                self.inner_write(instance, digest, stream, is_worker, is_mirror)
-                    .instrument(error_span!("bytestream_write", %zero_copy))
-                    .with_context(make_ctx_for_hash_func(digest_function).err_tip(|| tip_label)?)
-                    .await
-                    .err_tip(|| tip_label)
+                self.inner_write(
+                    instance,
+                    digest,
+                    stream,
+                    is_worker,
+                    is_mirror,
+                    progress_handle.clone(),
+                )
+                .instrument(error_span!("bytestream_write", %zero_copy))
+                .with_context(make_ctx_for_hash_func(digest_function).err_tip(|| tip_label)?)
+                .await
+                .err_tip(|| tip_label)
             }
         });
         let result = match tokio::time::timeout(WRITE_TIMEOUT, write_fut).await {

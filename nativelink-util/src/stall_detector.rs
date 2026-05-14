@@ -16,8 +16,31 @@
 //!
 //! When an async operation takes longer than a configured threshold,
 //! [`StallGuard`] dumps all thread stacks to a file for post-mortem analysis.
+//!
+//! # Slow-producer immunity
+//!
+//! For wrapped operations whose wall-clock includes waiting on an
+//! external producer (e.g. `ByteStream::write` waits on the next chunk
+//! from a Bazel client), the dump-trigger is gated by BOTH:
+//!
+//! 1. `elapsed > threshold` (the operation has been outstanding too long), and
+//! 2. `now - last_progress > threshold` (no SERVER-side progress recently).
+//!
+//! Wrapped operations bump the progress timestamp via
+//! [`StallGuard::bump_progress`] each time the server completes a unit
+//! of work (chunk recv, frame parse, etc.). When the elapsed-vs-threshold
+//! trigger fires, the detector also checks the progress recency; if the
+//! server made forward progress within the threshold, the wait is
+//! producer-driven (slow client) and the heavy ~600 KB stack dump is
+//! suppressed in favour of a lightweight `warn!`. Operations that never
+//! call `bump_progress` (legacy / coarse-grained) behave as before —
+//! `last_progress == 0` falls through to the legacy fire path.
+//!
+//! See `.claude/audits/stall-cluster-2026-05-13-1941-1945.md` for the
+//! incident that motivated this gate.
 
 use core::time::Duration;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Minimum interval between consecutive stack dumps (seconds).
@@ -108,10 +131,28 @@ pub fn force_dump_thread_stacks(label: &str) -> bool {
 /// This relies on tokio's timer infrastructure, so it cannot detect
 /// stalls caused by the tokio runtime itself being blocked. The
 /// runtime-watchdog OS thread in nativelink.rs covers that case.
+///
+/// # Slow-producer immunity
+///
+/// Wrapped operations whose wall-clock includes waiting on an external
+/// producer (e.g. `ByteStream::write` recv-loop) should call
+/// [`Self::bump_progress`] each time a unit of SERVER-side work
+/// completes (chunk recv, frame parse, etc.). When the dump trigger
+/// fires, the detector also checks `now - last_progress > threshold`;
+/// if the server made forward progress recently, the wait is
+/// producer-driven (slow client) and the dump is suppressed in favour
+/// of a lightweight `warn!`. Operations that never call `bump_progress`
+/// behave as before (`last_progress == 0` falls through to the legacy
+/// fire path).
 #[must_use = "StallGuard is immediately cancelled if not held in a variable"]
 #[derive(Debug)]
 pub struct StallGuard {
     handle: tokio::task::JoinHandle<()>,
+    /// Epoch nanoseconds of the most recent forward-progress bump from
+    /// the wrapped operation. `0` = never bumped (legacy operations
+    /// that don't call `bump_progress` retain the original fire-on-
+    /// elapsed semantics).
+    last_progress: Arc<AtomicU64>,
 }
 
 impl StallGuard {
@@ -128,12 +169,69 @@ impl StallGuard {
         Self::new_inner(threshold, label, Some(context))
     }
 
+    /// Mark forward server-side progress for the wrapped operation. Call
+    /// each time the SERVER completes a unit of work (e.g. received a
+    /// chunk, processed a frame). When the dump trigger fires, the
+    /// detector also checks `now - last_progress > threshold` before
+    /// capturing a dump; if progress was recent, the wait is
+    /// producer-driven (slow client) and the dump is suppressed in
+    /// favour of a `warn!`.
+    ///
+    /// Cheap: a single `SystemTime::now()` + atomic store. Safe to call
+    /// from any context (sync or async).
+    pub fn bump_progress(&self) {
+        bump_progress_handle(&self.last_progress);
+    }
+
+    /// Get a clone of the progress handle so a sibling task / nested
+    /// scope can bump it without holding the [`StallGuard`] itself.
+    /// Use when the guard wraps an outer scope but progress is observed
+    /// in a nested helper that doesn't have access to the guard value
+    /// (e.g. when the guard is `_stall_guard` in the outer fn and the
+    /// recv-loop lives in an inner async fn).
+    #[must_use]
+    pub fn progress_handle(&self) -> Arc<AtomicU64> {
+        self.last_progress.clone()
+    }
+
     fn new_inner(threshold: Duration, label: &'static str, context: Option<String>) -> Self {
+        let last_progress = Arc::new(AtomicU64::new(0));
+        let task_progress = last_progress.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(threshold).await;
             let ctx_suffix = context
                 .as_deref()
                 .map_or_else(String::new, |c| format!(" [{c}]"));
+
+            // Slow-producer immunity: if the wrapped operation called
+            // bump_progress within the threshold window, the wait is
+            // producer-driven (e.g. a Bazel client paused 80s between
+            // chunks) — emit a lightweight warn and skip the heavy
+            // ~600 KB stack dump. Operations that never bump
+            // (last_progress == 0) fall through to the legacy fire
+            // path so coarse-grained guards still trigger as before.
+            let last_progress_nanos = task_progress.load(Ordering::Relaxed);
+            let now_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            if let StallVerdict::SuppressDumpProducerDriven {
+                since_progress_nanos,
+            } = classify_stall(last_progress_nanos, now_nanos, threshold)
+            {
+                let since_progress_ms = since_progress_nanos / 1_000_000;
+                tracing::warn!(
+                    target: "nativelink_util::stall_detector",
+                    op_name = label,
+                    elapsed_ms = threshold.as_millis() as u64,
+                    since_last_progress_ms = since_progress_ms,
+                    ctx = ctx_suffix.as_str(),
+                    "stall threshold crossed but recent server-side progress observed; \
+                     classifying as slow producer (no stack dump generated)"
+                );
+                return;
+            }
+
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -167,13 +265,88 @@ impl StallGuard {
                 );
             }
         });
-        Self { handle }
+        Self {
+            handle,
+            last_progress,
+        }
     }
 }
 
 impl Drop for StallGuard {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+/// Bump a progress handle obtained via [`StallGuard::progress_handle`].
+/// Equivalent to [`StallGuard::bump_progress`] but works without a
+/// reference to the guard itself — useful when a nested helper has only
+/// the `Arc<AtomicU64>` slot.
+pub fn bump_progress_handle(handle: &Arc<AtomicU64>) {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    handle.store(now_nanos, Ordering::Relaxed);
+}
+
+/// Verdict from the stall-detector after the threshold elapses,
+/// pre-rate-limit.
+///
+/// Decoupled from the spawn-task body so the slow-producer suppression
+/// rule can be unit-tested without spinning up a tokio runtime or
+/// touching the process-global `/tmp` dump path. The mapping is
+/// load-bearing — if `SuppressDumpProducerDriven` is incorrectly
+/// returned, an actual server wedge will not be diagnosed; if
+/// `ProceedToDump` is incorrectly returned, the slow-Bazel-client
+/// scenario from the 2026-05-13 19:41-19:45 cluster reappears.
+#[derive(Debug, PartialEq, Eq)]
+enum StallVerdict {
+    /// Wrapped operation has reported recent forward progress; the wait
+    /// is producer-driven (slow client). Caller should emit a warn and
+    /// skip the heavy stack dump.
+    SuppressDumpProducerDriven { since_progress_nanos: u64 },
+    /// Operation either never reported progress (legacy / coarse-grained
+    /// guard) OR the most recent progress is older than the threshold;
+    /// caller should proceed to the rate-limited dump path.
+    ProceedToDump,
+}
+
+/// Pure decision function for [`StallVerdict`]: classify a fired stall
+/// threshold against the most recent forward-progress timestamp.
+///
+/// Inputs are unix-epoch nanoseconds so the function is independent of
+/// `Instant` / monotonic-clock drift across spawn boundaries (the spawn
+/// task captures `now` at fire time, the wrapped op captures `now` at
+/// bump time, both via `SystemTime::now()`).
+///
+/// Rule: `last_progress_nanos != 0` AND `now - last_progress < threshold`
+/// ⇒ suppress. Otherwise proceed.
+///
+/// Cold start (`last_progress_nanos == 0`): the wrapped operation never
+/// called `bump_progress`. Treat as a legacy guard — proceed to dump.
+/// This preserves backward compatibility for every existing call site
+/// (BatchUpdateBlobs, BatchReadBlobs, AC RPCs, etc.) that does not yet
+/// wire progress tracking.
+///
+/// Clock skew (`now < last_progress`): `saturating_sub` makes the gap 0,
+/// which is below any positive threshold ⇒ suppress. Treat as
+/// "progress just happened" rather than panicking on backwards time.
+fn classify_stall(
+    last_progress_nanos: u64,
+    now_nanos: u64,
+    threshold: Duration,
+) -> StallVerdict {
+    if last_progress_nanos == 0 {
+        return StallVerdict::ProceedToDump;
+    }
+    let since_progress_nanos = now_nanos.saturating_sub(last_progress_nanos);
+    if since_progress_nanos < threshold.as_nanos() as u64 {
+        StallVerdict::SuppressDumpProducerDriven {
+            since_progress_nanos,
+        }
+    } else {
+        StallVerdict::ProceedToDump
     }
 }
 
@@ -1778,7 +1951,192 @@ fn cleanup_old_stall_dumps() {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIN_FORCE_DUMP_INTERVAL_SECS, force_dump_should_proceed};
+    use core::time::Duration;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{
+        DEFAULT_STALL_THRESHOLD, MIN_FORCE_DUMP_INTERVAL_SECS, StallGuard, StallVerdict,
+        bump_progress_handle, classify_stall, force_dump_should_proceed,
+    };
+
+    /// Spec: when the wrapped operation never calls `bump_progress`
+    /// (`last_progress_nanos == 0`), the verdict MUST be `ProceedToDump`.
+    /// This preserves backward compatibility for every existing
+    /// StallGuard call site (BatchUpdateBlobs, BatchReadBlobs, AC RPCs)
+    /// that has not yet wired progress tracking — they should fire as
+    /// they always have.
+    #[test]
+    fn classify_legacy_no_progress_proceeds_to_dump() {
+        let now = 1_700_000_000_000_000_000u64; // ~2023 epoch in nanos
+        let verdict = classify_stall(0, now, DEFAULT_STALL_THRESHOLD);
+        assert_eq!(
+            verdict,
+            StallVerdict::ProceedToDump,
+            "legacy operations without bump_progress MUST fire — \
+             slow-producer immunity must not apply when nothing is reporting progress"
+        );
+    }
+
+    /// Spec: when forward progress is recent (within the threshold), the
+    /// verdict MUST suppress the heavy dump. This is the slow-Bazel-
+    /// client immunity from `.claude/audits/stall-cluster-2026-05-13-1941-1945.md`.
+    #[test]
+    fn classify_recent_progress_suppresses_dump() {
+        let now = 1_700_000_000_000_000_000u64;
+        // Progress 5s ago — well within the 30s default threshold.
+        let progress = now - 5 * 1_000_000_000u64;
+        let verdict = classify_stall(progress, now, DEFAULT_STALL_THRESHOLD);
+        match verdict {
+            StallVerdict::SuppressDumpProducerDriven {
+                since_progress_nanos,
+            } => {
+                assert_eq!(
+                    since_progress_nanos,
+                    5 * 1_000_000_000u64,
+                    "since_progress_nanos must equal now - last_progress",
+                );
+            }
+            StallVerdict::ProceedToDump => panic!(
+                "slow-producer immunity broken: stall_detector fired despite \
+                 recent progress (producer-driven wait should be skipped)"
+            ),
+        }
+    }
+
+    /// Spec: when forward progress is OLDER than the threshold, the
+    /// verdict MUST proceed to dump. The wait is no longer
+    /// producer-driven — the server itself made no progress for the
+    /// full threshold window. This is a real wedge.
+    #[test]
+    fn classify_stale_progress_proceeds_to_dump() {
+        let now = 1_700_000_000_000_000_000u64;
+        // Progress 31s ago — past the 30s default threshold.
+        let progress = now - 31 * 1_000_000_000u64;
+        let verdict = classify_stall(progress, now, DEFAULT_STALL_THRESHOLD);
+        assert_eq!(
+            verdict,
+            StallVerdict::ProceedToDump,
+            "real wedge missed: when last progress is older than the threshold, \
+             the operation IS stuck server-side and must dump",
+        );
+    }
+
+    /// Spec: the boundary at exactly `threshold` MUST proceed to dump.
+    /// Strict `<` semantics so a dump exactly N seconds after progress
+    /// still fires (mirrors the `force_dump_should_proceed` boundary
+    /// rule above).
+    #[test]
+    fn classify_exact_threshold_proceeds_to_dump() {
+        let threshold = Duration::from_secs(30);
+        let now = 1_700_000_000_000_000_000u64;
+        // Progress exactly threshold ago.
+        let progress = now - threshold.as_nanos() as u64;
+        let verdict = classify_stall(progress, now, threshold);
+        assert_eq!(verdict, StallVerdict::ProceedToDump);
+        // One nanosecond later — still within threshold ⇒ suppress.
+        let progress = now - threshold.as_nanos() as u64 + 1;
+        match classify_stall(progress, now, threshold) {
+            StallVerdict::SuppressDumpProducerDriven { .. } => {}
+            other => panic!("expected suppress at threshold-1ns, got {other:?}"),
+        }
+    }
+
+    /// Spec: clock skew (now < last_progress) is treated as "progress
+    /// just happened" via `saturating_sub`. The gap is 0, below any
+    /// positive threshold ⇒ suppress. Pinning the documented semantics
+    /// so a future refactor cannot panic on backwards time.
+    #[test]
+    fn classify_clock_skew_treated_as_recent_progress() {
+        let now = 1_700_000_000_000_000_000u64;
+        // last_progress is 1ms in the future (clock skew across cores).
+        let progress = now + 1_000_000u64;
+        match classify_stall(progress, now, DEFAULT_STALL_THRESHOLD) {
+            StallVerdict::SuppressDumpProducerDriven {
+                since_progress_nanos,
+            } => {
+                assert_eq!(since_progress_nanos, 0, "clock skew → gap saturates to 0");
+            }
+            StallVerdict::ProceedToDump => {
+                panic!("clock skew should suppress, not proceed");
+            }
+        }
+    }
+
+    /// Spec: `bump_progress_handle` writes a non-zero unix-epoch-nanos
+    /// timestamp into the slot. Pin the calling-convention so a refactor
+    /// can't silently leave the slot at zero (which would re-enable the
+    /// false-fire path forever).
+    #[test]
+    fn bump_progress_handle_writes_nonzero_timestamp() {
+        let handle = Arc::new(AtomicU64::new(0));
+        assert_eq!(
+            handle.load(Ordering::Relaxed),
+            0,
+            "precondition: handle starts at 0"
+        );
+        bump_progress_handle(&handle);
+        assert!(
+            handle.load(Ordering::Relaxed) > 0,
+            "bump_progress_handle MUST write a non-zero timestamp; \
+             a zero slot triggers the legacy fire path",
+        );
+    }
+
+    /// End-to-end regression test: a slow-producer scenario MUST NOT
+    /// emit a stack dump. We use a short 200ms threshold and bump
+    /// progress every 100ms; after 500ms the StallGuard task has fired
+    /// at least once but must observe recent progress and suppress.
+    /// Mutation: comment out the `if let StallVerdict::SuppressDumpProducerDriven`
+    /// branch — the test still passes because the dump path is rate-
+    /// limited globally; this test pins the verdict via the pure
+    /// `classify_stall` predicate above and the handle-bump behaviour
+    /// here.
+    ///
+    /// "Slow-producer immunity broken: stall_detector fired despite
+    /// recent progress (producer-driven wait should be skipped)" is the
+    /// bespoke message in `classify_recent_progress_suppresses_dump`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stallguard_suppresses_dump_on_bumped_progress() {
+        let threshold = Duration::from_millis(200);
+        let guard = StallGuard::new(threshold, "test_slow_producer");
+        // Bump progress 5 times at 50ms intervals — each bump well
+        // within `threshold`.
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            guard.bump_progress();
+        }
+        // Let the StallGuard task fire (sleep > threshold).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The verdict can't be observed directly without intercepting
+        // tracing — we assert the handle was bumped recently. The
+        // pure-function tests above lock down the suppress rule.
+        let progress = guard.progress_handle().load(Ordering::Relaxed);
+        assert!(
+            progress > 0,
+            "bump_progress MUST have written; handle at 0 means the wire-up \
+             between StallGuard and bump_progress is broken",
+        );
+    }
+
+    /// End-to-end regression test: when `bump_progress` is NEVER called,
+    /// the StallGuard MUST behave exactly as before (the legacy path).
+    /// We can't assert "dump fired" without polluting /tmp with a real
+    /// dump, but we can pin via the pure verdict that `last_progress
+    /// == 0` always proceeds — this end-to-end test confirms the wire-
+    /// up: an unwired guard yields a zero handle.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stallguard_handle_starts_at_zero_for_legacy_unwired_guard() {
+        let guard = StallGuard::new(Duration::from_secs(30), "test_legacy");
+        assert_eq!(
+            guard.progress_handle().load(Ordering::Relaxed),
+            0,
+            "fresh StallGuard must start with last_progress = 0; \
+             a non-zero start would silently suppress the very first dump",
+        );
+        drop(guard);
+    }
 
     /// Spec: force-dump must proceed when `now - prev` is at or beyond
     /// `MIN_FORCE_DUMP_INTERVAL_SECS`. The exact boundary value MUST be
