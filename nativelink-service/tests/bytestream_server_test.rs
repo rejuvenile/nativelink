@@ -593,11 +593,26 @@ pub async fn ensure_write_is_not_done_until_write_request_is_set()
 
 #[nativelink_test]
 pub async fn out_of_order_data_fails() -> Result<(), Box<dyn core::error::Error>> {
+    // Two-chunk upload that is short by one byte: 8 bytes + 10 bytes
+    // overlapping at offset 7 = 8 + (10-1) = 17 effective bytes, but the
+    // resource_name declares 18. With `finish_write = true` on the last
+    // chunk, the server validates the byte count and returns Err.
+    //
+    // Historically this test wrote 8 + (12-1) = 19 effective bytes
+    // matching declared 19 (exact-fit on overlap), did NOT set
+    // `finish_write`, and relied on the server's 300s `WRITE_TIMEOUT`
+    // to eventually kill the upload — which masquerades as "out of
+    // order data fails" but actually proves "server times out when no
+    // FIN arrives." The wall-clock kill is gone (timeouts paper over
+    // problems), so the test now drives the failure synchronously by
+    // (a) declaring 18 bytes while sending an overlap that yields 17,
+    // and (b) flagging `finish_write` so the size check fires
+    // immediately.
     const WRITE_DATA: &str = "12456789abcdefghijk";
-
-    // Chunk our data into two chunks to simulate something a client
-    // might do.
     const BYTE_SPLIT_OFFSET: usize = 8;
+    // Declare one fewer byte than chunk1 (8) plus chunk2 net contribution
+    // (10-1=9) = 17, so the size check must fire as 17 != 18.
+    const DECLARED_SIZE: usize = (BYTE_SPLIT_OFFSET) + (10 - 1) + 1;
 
     let store_manager = make_store_manager().await?;
     let bs_server = Arc::new(
@@ -607,7 +622,7 @@ pub async fn out_of_order_data_fails() -> Result<(), Box<dyn core::error::Error>
     let (tx, join_handle) =
         make_stream_and_writer_spawn(bs_server, Some(CompressionEncoding::Gzip));
 
-    let resource_name = make_resource_name(WRITE_DATA.len());
+    let resource_name = make_resource_name(DECLARED_SIZE);
     let mut write_request = WriteRequest {
         resource_name,
         write_offset: 0,
@@ -622,9 +637,13 @@ pub async fn out_of_order_data_fails() -> Result<(), Box<dyn core::error::Error>
             .await?;
     }
     {
-        // Write data it already has.
+        // Write 10 bytes overlapping at offset 7 (1 duplicate, 9 new) =
+        // 8 + 9 = 17 effective bytes, against declared 18. With
+        // finish_write the size check fires.
         write_request.write_offset = (BYTE_SPLIT_OFFSET - 1) as i64;
-        write_request.data = WRITE_DATA[(BYTE_SPLIT_OFFSET - 1)..].into();
+        let chunk_end = BYTE_SPLIT_OFFSET - 1 + 10; // 7 + 10 = 17
+        write_request.data = WRITE_DATA[(BYTE_SPLIT_OFFSET - 1)..chunk_end].into();
+        write_request.finish_write = true;
         tx.send(Frame::data(encode_stream_proto(&write_request)?))
             .await?;
     }

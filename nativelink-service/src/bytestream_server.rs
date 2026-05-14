@@ -334,6 +334,14 @@ pub struct InstanceInfo {
     /// the same digest concurrently, only the first performs the actual
     /// write; the rest subscribe to the watch channel and get the result.
     /// `None` = in progress, `Some(true)` = succeeded, `Some(false)` = failed.
+    // UNBOUNDED-OK: digest-keyed dedup map. Each value is
+    // `watch::Receiver<Option<bool>>` (~64 B). h2 stream concurrency is
+    // NOT capped in production (no `experimental_http2_max_concurrent_streams`
+    // set in `prod-server.json5`; tonic 0.14 default is `usize::MAX`). The
+    // byte-budget makes this acceptable: at 10K concurrent in-flight
+    // writes, total cost is ~640 KB. RAII `InFlightWritesGuard` at
+    // `:495-509` removes entries on grpc-future-drop (cancel-safe per
+    // #402: cancel-safe RAII guard for in_flight_writes).
     in_flight_writes: Arc<Mutex<HashMap<DigestInfo, tokio::sync::watch::Receiver<Option<bool>>>>>,
     /// Registry of in-flight streaming blobs.  Readers can discover and
     /// stream from uploads that have not yet committed to the store.
@@ -376,9 +384,9 @@ impl Debug for InstanceInfo {
 /// concurrent ByteStream uploads for the same digest).
 ///
 /// **#402 cancel-safety:** the previous code manually `insert`ed into
-/// `in_flight_writes` before `tokio::time::timeout(WRITE_TIMEOUT,
-/// write_fut).await` and manually `remove`d after. The await is a
-/// cancellation point: if the gRPC stream is cancelled (client
+/// `in_flight_writes` before `write_fut.await` and manually `remove`d
+/// after. The await is a cancellation point: if the gRPC stream is
+/// cancelled (client
 /// disconnect, RST_STREAM, server shutdown, runtime drop), the future
 /// is dropped mid-await and the manual `remove` NEVER runs. Result:
 /// every cancelled upload leaks one `HashMap` entry + one watch
@@ -1788,6 +1796,16 @@ impl ByteStreamServer {
             progress_handle: &Arc<AtomicU64>,
         ) -> Result<(), Error> {
             loop {
+                // No app-layer recv timer. No-progress detection is layered
+                // on the transport: h2 keepalive (30s/20s configured), TCP
+                // keepalive (OS-level), QUIC keepalive (5s configured). When
+                // those fire, `stream.next()` resolves to `Ok(Some(Err(...)))`
+                // or `Ok(None)` and the loop exits. Sender-drop on connection
+                // close is observed by `buf_channel`. See the lifecycle
+                // doc-comment near `_stall_guard` in `write` for the full
+                // no-progress story and the rationale for not adding an
+                // app-layer timer (CLAUDE.md "Fix root causes, not symptoms";
+                // "Falsify before fixing").
                 let write_request = match stream.next().await {
                     // Code path for when client tries to gracefully close the stream.
                     // If this happens it means there's a problem with the data sent,
@@ -2310,6 +2328,11 @@ impl ByteStreamServer {
 
         // Collect all data from client stream
         loop {
+            // No app-layer recv timer (oneshot path). Mirrors the
+            // multi-chunk path in `inner_write`. Transport keepalive
+            // (h2/QUIC/TCP) covers dead connections; sender-drop on
+            // close surfaces as `None`/`Err` from `stream.next()`. See
+            // the lifecycle doc-comment near `_stall_guard` in `write`.
             let write_request = match stream.next().await {
                 None => {
                     return Err(make_input_err!(
@@ -2638,30 +2661,29 @@ impl ByteStreamServer {
             if let Some(rx) = guard.get(&digest) {
                 let mut rx = rx.clone();
                 drop(guard);
-                // Another write is in progress — wait for the result.
-                // Apply WRITE_TIMEOUT so coalesced waiters don't hang forever
-                // if the primary writer stalls.
-                const COALESCE_TIMEOUT: Duration = Duration::from_secs(300);
-                let wait_fut = async {
-                    loop {
-                        if let Some(ok) = *rx.borrow_and_update() {
-                            return ok;
-                        }
-                        if rx.changed().await.is_err() {
-                            return false; // sender dropped = failure
-                        }
+                // Another write is in progress — wait for its outcome.
+                //
+                // No wall-clock timeout here. The primary writer's
+                // `InFlightWritesGuard` (`:495-509`) drops the watch
+                // `Sender` on every primary exit path including
+                // cancellation/disconnect (#402: cancel-safe RAII guard
+                // for in_flight_writes). When the Sender drops, this
+                // waiter's `rx.changed().await` returns `Err`, the loop
+                // returns `false` (failure), and we fall through to do
+                // our own write.
+                //
+                // Removed: 300s `COALESCE_TIMEOUT` which papered over
+                // the same shape that motivated removing
+                // `WRITE_TIMEOUT` — it killed legitimately slow primary
+                // writers (e.g. CGNAT clients) AND any waiter coalesced
+                // onto them. The watch-Sender-drop signal is precisely
+                // the right wakeup; the wall-clock added nothing.
+                let succeeded = loop {
+                    if let Some(ok) = *rx.borrow_and_update() {
+                        break ok;
                     }
-                };
-                let succeeded = match tokio::time::timeout(COALESCE_TIMEOUT, wait_fut).await {
-                    Ok(ok) => ok,
-                    Err(_) => {
-                        warn!(
-                            %digest,
-                            expected_size,
-                            timeout_secs = COALESCE_TIMEOUT.as_secs(),
-                            "ByteStream::write: coalesced waiter timed out"
-                        );
-                        false
+                    if rx.changed().await.is_err() {
+                        break false; // sender dropped = failure
                     }
                 };
                 if succeeded {
@@ -2772,11 +2794,50 @@ impl ByteStreamServer {
         // client paused 80s between chunks". See
         // `.claude/audits/stall-cluster-2026-05-13-1941-1945.md`.
         let progress_handle = _stall_guard.progress_handle();
-        // Server-side write timeout: abort writes that hang longer than
-        // 5 minutes. Prevents stuck operations from holding resources
-        // indefinitely (e.g., when a QUIC stream wedges during cache
-        // warming bursts).
-        const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
+        // No server-side timer on the bytestream Write RPC. No-progress
+        // detection is fully layered on the transport + RAII cleanup:
+        //   * h2 keepalive (30s/20s configured in `prod-server.json5`) closes
+        //     DEAD connections when the client stops ACKing PINGs. The
+        //     stream's `Streaming::next()` then resolves to `None` /
+        //     `Some(Err(_))` and the recv-loop in `inner_write` /
+        //     `inner_write_oneshot` returns Err, ending the RPC.
+        //   * QUIC keepalive (5s) covers HTTP/3 transport with the same
+        //     dead-connection signal class.
+        //   * TCP keepalive at the OS level (enabled in `src/bin/nativelink.rs`)
+        //     catches network drops independent of h2/QUIC.
+        //   * Sender-drop on connection close → `buf_channel` observer:
+        //     when the gRPC future is dropped (client RST_STREAM, server
+        //     shutdown, runtime drop), the watch sender that the writer
+        //     holds drops and any coalesced waiters observe
+        //     `rx.changed() == Err(_)` and exit cleanly.
+        //   * `InFlightWritesGuard` RAII (#402: cancel-safe RAII guard
+        //     for in_flight_writes) cleans up the dedup map on
+        //     grpc-future-drop.
+        //   * Per-chunk store-side timeouts (e.g.
+        //     `nativelink_store::chunked::chunked_driver::PER_CHUNK_WRITE_TIMEOUT`)
+        //     bound store-write progress for paths that go through the
+        //     SEPARATE `WriteChunked` RPC handled by
+        //     `ChunkedWriteHandler`. They do NOT apply to this Write RPC
+        //     path — `inner_write` / `inner_write_oneshot` write directly
+        //     via `StoreLike::update`, never through `ChunkedDriver`.
+        //
+        // No app-layer per-recv timer is added. Per CLAUDE.md "Falsify
+        // before fixing": no production incident has surfaced an
+        // app-stuck-but-TCP-alive client shape that the transport
+        // mechanisms above wouldn't catch. The 2026-05-14 TSAN RCA (244
+        // WRITE_TIMEOUT firings on 122 distinct digests / ~15 GB in 24
+        // min surfacing as Bazel-visible FAILED_PRECONDITION cascades)
+        // and the 2026-05-14 stall investigation (2 firings on ci-mac-2 at
+        // 09:58:57 and 10:03:33 PDT) were ALL slow-but-progressing
+        // CGNAT clients — the wall-clock kill was unjustified. This
+        // restores the design from `fa6cdf43` (2026-04-23: drop 300s
+        // outer write/coalesce deadlines).
+        //
+        // If a future production incident reveals a hypothetical
+        // "app-stuck client holding a healthy TCP/h2 connection while
+        // not sending bytes" failure mode, instrument-first per
+        // CLAUDE.md "instrument first, theorize second" and add a timer
+        // with real evidence — not on speculation.
         let write_fut = IS_MIRROR_REQUEST.scope(is_mirror, async {
             if use_oneshot {
                 self.inner_write_oneshot(
@@ -2806,22 +2867,7 @@ impl ByteStreamServer {
                 .err_tip(|| tip_label)
             }
         });
-        let result = match tokio::time::timeout(WRITE_TIMEOUT, write_fut).await {
-            Ok(r) => r,
-            Err(_) => {
-                warn!(
-                    %digest,
-                    expected_size,
-                    timeout_secs = WRITE_TIMEOUT.as_secs(),
-                    "ByteStream::write: timed out",
-                );
-                Err(make_err!(
-                    Code::DeadlineExceeded,
-                    "ByteStream write timed out after {}s for {digest}",
-                    WRITE_TIMEOUT.as_secs()
-                ))
-            }
-        };
+        let result = write_fut.await;
 
         // Write finished — publish the outcome to coalesced waiters via
         // the guard's set_result. Map removal happens in the guard's
@@ -2831,17 +2877,17 @@ impl ByteStreamServer {
         // existing entry, and `borrow_and_update()` returns the result
         // immediately.
         //
-        // #402 cancel-safety: if `tokio::time::timeout(WRITE_TIMEOUT,
-        // write_fut).await` is itself cancelled (the surrounding gRPC
-        // future is dropped), control never reaches here. The guard's
-        // Drop fires anyway, removing the map entry and dropping the
-        // watch Sender — coalesced waiters then observe rx.changed() =
-        // Err and translate to "failure" via the loop at
-        // bytestream_server.rs:2349-2358.
+        // #402 cancel-safety: if the surrounding gRPC future is dropped
+        // (client disconnect, RST_STREAM, server shutdown, runtime drop),
+        // control never reaches here. The guard's Drop fires anyway,
+        // removing the map entry and dropping the watch Sender —
+        // coalesced waiters then observe rx.changed() = Err and translate
+        // to "failure" via the loop at bytestream_server.rs:2349-2358.
         //
-        // Coalesced waiters that timed out and retried
-        // (in_flight_guard = None) must NOT touch the map — the primary
-        // writer's guard owns the entry's lifetime.
+        // in_flight_guard = None means we coalesced onto a primary that
+        // FAILED (loop returned `false`) and are now retrying as our own
+        // non-primary writer; the original primary's guard already cleaned
+        // up the map entry. Don't touch the map here.
         if let Some(mut guard) = in_flight_guard {
             guard.set_result(result.is_ok());
             // `guard` drops at end of this scope, removing the map entry.

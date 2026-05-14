@@ -18,9 +18,8 @@
 //! Bug shape (sibling of #401, same source-file region): between
 //! `in_flight_writes.lock().insert(digest, rx)` at
 //! `bytestream_server.rs:2395` and the matched `remove(&digest)` at
-//! `bytestream_server.rs:2505`, the wrapped future under
-//! `tokio::time::timeout(WRITE_TIMEOUT=300s, write_fut).await` is a
-//! cancellation point. If the gRPC stream is cancelled (client
+//! `bytestream_server.rs:2505`, the wrapped future at `write_fut.await`
+//! is a cancellation point. If the gRPC stream is cancelled (client
 //! disconnect, gRPC stream RST, server shutdown, runtime drop), the
 //! future is dropped mid-await and the `remove` NEVER runs. Production
 //! impact: every cancelled ByteStream upload leaks one `HashMap` entry +
