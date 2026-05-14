@@ -16,6 +16,7 @@ use core::fmt::Debug;
 use core::future::Future;
 use core::mem;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
@@ -27,8 +28,86 @@ use nativelink_proto::google::bytestream::{ReadResponse, WriteRequest};
 use parking_lot::Mutex;
 use tokio::time::Sleep;
 use tonic::{Status, Streaming};
+use tracing::warn;
 
 use crate::resource_info::ResourceInfo;
+
+/// Process-wide counter of "no progress within `progress_timeout`"
+/// observations on `WriteStateWrapper::poll_next`. Each increment
+/// corresponds to a `warn!` line (rate-limited via
+/// [`record_grpc_write_slow_chunk_and_maybe_warn`]) describing a single
+/// gap exceeded; if a stream stays stuck for N×`progress_timeout`, the
+/// counter advances by N.
+///
+/// **Diagnostic-only** (per user direction 2026-05-14, supersedes the
+/// 2026-04-23 abort-and-retry semantics). The timer never aborts the
+/// stream; dead-connection detection belongs to the transport layer
+/// (h2 keepalive 30s/20s, TCP keepalive, QUIC keepalive 5s).
+///
+/// Counter is `pub` for downstream metrics surfaces and integration
+/// tests; this is the same pattern as
+/// `chunked::chunked_driver::CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL`.
+pub static GRPC_WRITE_SLOW_CHUNK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Sliding-window threshold for the loud `warn!`. Below this we still
+/// emit one `warn!` per slow-chunk event (so SREs can grep for the
+/// instance name + total at any rate); the rate-limited line surfaces
+/// when many gaps land inside the same window.
+const SLOW_CHUNK_WARN_THRESHOLD: u64 = 10;
+
+/// Sliding window for the rate-warn trigger. 60 s matches typical
+/// scrape intervals; if more than [`SLOW_CHUNK_WARN_THRESHOLD`] slow
+/// chunks land in this window the SRE sees the louder warn alongside
+/// the next scrape. Same shape as the chunked-driver counterpart for
+/// operator familiarity.
+const SLOW_CHUNK_WARN_WINDOW: Duration = Duration::from_secs(60);
+
+/// Last-warn timestamp + count baseline (paired). Single-writer (the
+/// `poll_next` Pending arm under the per-state mutex), but the counter
+/// is process-wide so the warn-rate state must be too.
+static SLOW_CHUNK_WARN_STATE: parking_lot::Mutex<Option<(std::time::Instant, u64)>> =
+    parking_lot::Mutex::new(None);
+
+/// Bump [`GRPC_WRITE_SLOW_CHUNK_TOTAL`] and emit a per-event `warn!`,
+/// plus a louder rate-limited `warn!` when more than
+/// [`SLOW_CHUNK_WARN_THRESHOLD`] events land in the same
+/// [`SLOW_CHUNK_WARN_WINDOW`]. Diagnostic-only — the caller continues
+/// awaiting the inner stream after this returns.
+fn record_grpc_write_slow_chunk_and_maybe_warn(instance_name: &str, progress_timeout_s: u64) {
+    let new_total = GRPC_WRITE_SLOW_CHUNK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    warn!(
+        target: "nativelink_util::proto_stream",
+        instance_name,
+        progress_timeout_s,
+        total_slow_chunks = new_total,
+        "GrpcStore::write made no progress for >={progress_timeout_s}s; \
+         continuing per diagnostic-only design (2026-05-14)",
+    );
+    let now = std::time::Instant::now();
+    let mut guard = SLOW_CHUNK_WARN_STATE.lock();
+    let baseline = guard.unwrap_or((now, new_total.saturating_sub(1)));
+    let (last_at, count_at_last) = baseline;
+    let delta = new_total.saturating_sub(count_at_last);
+    let elapsed = now.duration_since(last_at);
+    if delta >= SLOW_CHUNK_WARN_THRESHOLD && elapsed <= SLOW_CHUNK_WARN_WINDOW {
+        warn!(
+            target: "nativelink_util::proto_stream",
+            instance_name,
+            total_slow_chunks = new_total,
+            slow_chunks_in_window = delta,
+            window_secs = SLOW_CHUNK_WARN_WINDOW.as_secs(),
+            "GrpcStore::write: slow-chunk events exceeding {SLOW_CHUNK_WARN_THRESHOLD}/window — \
+             transport may be wedged; correlate with h2/TCP keepalive state",
+        );
+        *guard = Some((now, new_total));
+    } else if elapsed > SLOW_CHUNK_WARN_WINDOW {
+        // Reset baseline; healthy rate.
+        *guard = Some((now, new_total));
+    } else if guard.is_none() {
+        // First-call seed.
+        *guard = Some(baseline);
+    }
+}
 
 pub struct WriteRequestStreamWrapper<T> {
     pub resource_info: ResourceInfo<'static>,
@@ -246,10 +325,15 @@ where
     resume_queue: [Option<WriteRequest>; 2],
     // An optimisation to avoid having to manage resume_queue when it's empty.
     is_resumed: bool,
-    // Per-chunk no-progress timeout. Zero disables the timer. Reset to
-    // `Instant::now() + duration` on each successful chunk; if it elapses
-    // while waiting on the inner stream, `read_stream_error` is set to
-    // DeadlineExceeded and the wrapper ends, aborting the gRPC RPC.
+    // Per-chunk no-progress timeout (DIAGNOSTIC-ONLY since 2026-05-14).
+    // Zero disables the timer entirely. Reset to `Instant::now() +
+    // duration` on each successful chunk; if it elapses while waiting on
+    // the inner stream we emit a `warn!` (rate-limited) + bump
+    // [`GRPC_WRITE_SLOW_CHUNK_TOTAL`] + re-arm the deadline for another
+    // window. The wrapper does NOT terminate, does NOT set
+    // `read_stream_error`, and does NOT abort the gRPC RPC. Dead-
+    // connection detection belongs to the transport layer (h2/TCP/QUIC
+    // keepalive); per-chunk timers are observability only.
     //
     // Lives here (not in `WriteStateWrapper`) so it survives across the
     // retry loop's repeated wrapper construction and is uncontended under
@@ -263,14 +347,32 @@ where
     T: Stream<Item = Result<WriteRequest, E>> + Unpin + Send + 'static,
     E: Into<Error> + 'static,
 {
-    /// Construct a `WriteState` with a per-chunk no-progress timeout.
+    /// Construct a `WriteState` with a per-chunk no-progress
+    /// **diagnostic** timer.
+    ///
+    /// **Diagnostic-only** (per user direction 2026-05-14). When the
+    /// configured `progress_timeout` elapses without an inbound chunk,
+    /// the wrapper emits a `warn!` line, increments the process-wide
+    /// [`GRPC_WRITE_SLOW_CHUNK_TOTAL`] counter, and re-arms the timer
+    /// for another window — it does NOT terminate the stream, set
+    /// `read_stream_error`, or return `DeadlineExceeded`. A long-stalled
+    /// stream therefore produces one `warn!` per `progress_timeout`
+    /// window, giving operators ongoing visibility into hours-long
+    /// stuck streams. Real dead-connection detection is left to the
+    /// transport layer (h2 keepalive 30s/20s, TCP keepalive, QUIC
+    /// keepalive 5s) — application-layer timers were masking real bugs
+    /// (chunked-write retry-rejection cascade #476, ci-mac-2 Tailscale
+    /// slowness, `>=2-replica` durability invariant breakage on the
+    /// 641 mirror_stream events on 2026-04-23).
     ///
     /// `progress_timeout = Duration::ZERO` disables the timer entirely
-    /// (the inner stream is then bounded only by transport-level
-    /// keepalives). Every caller must make a deliberate choice — there
-    /// is no convenience `new` constructor — because the right answer
-    /// depends on whether the upstream producer can legitimately stall
-    /// (e.g. a slow Bazel client mirroring through the server) or not.
+    /// (no warns, no counter bumps). Every caller must make a deliberate
+    /// choice — there is no convenience `new` constructor — because the
+    /// observability budget should be tuned to the upstream's expected
+    /// pace. A typical Bazel uploader stretches a 50 MB blob over tens
+    /// of seconds; setting `progress_timeout` near the per-chunk
+    /// inter-arrival upper bound (rather than the whole-RPC ceiling)
+    /// surfaces meaningful slow-chunk events without spamming.
     pub const fn with_progress_timeout(
         instance_name: String,
         read_stream: WriteRequestStreamWrapper<T>,
@@ -324,15 +426,16 @@ where
 
     /// Take any `read_stream_error` recorded by the wrapper.
     ///
-    /// **Retry semantics.** A `DeadlineExceeded` set by the per-chunk
-    /// progress timer is intentionally non-resumable: `can_resume()`
-    /// returns false because the error is recorded *here*, not on the
-    /// inner stream. Retrying a stuck transport with the same WriteState
-    /// is unlikely to succeed — the upstream caller should issue a
-    /// fresh `write()` if it wants to try again. This is a behaviour
-    /// change from the pre-2026-04-23 whole-RPC `tokio::time::timeout`
-    /// path, which left `read_stream_error == None` and let the retrier
-    /// loop in GrpcStore::write replay against the same channel.
+    /// **Set sites (since the 2026-05-14 diagnostic-only conversion).**
+    /// The per-chunk progress timer no longer sets this — it now emits
+    /// `warn!` + bumps [`GRPC_WRITE_SLOW_CHUNK_TOTAL`] and continues
+    /// awaiting the inner stream. The remaining set site is the
+    /// resource-name parse error path in `WriteStateWrapper::poll_next`
+    /// (a malformed first-chunk URI). That error is structurally
+    /// non-resumable (the stream's first message is corrupt), so
+    /// `can_resume()` correctly returns false when it fires — the
+    /// retry loop in `GrpcStore::write` will surface it as `Err` rather
+    /// than retrying the same broken chunk.
     pub const fn take_read_stream_error(&mut self) -> Option<Error> {
         self.read_stream_error.take()
     }
@@ -437,9 +540,24 @@ where
             }
             Poll::Pending => {
                 // Inner stream not ready — check the per-chunk no-progress
-                // timer if enabled. We treat each Pending->Ready transition
-                // as the moment we "made progress"; while still Pending we
-                // race the configured timeout against further pollings.
+                // **diagnostic** timer if enabled. We treat each
+                // Pending->Ready transition as the moment we "made
+                // progress"; while still Pending we race the configured
+                // timeout against further pollings.
+                //
+                // **Diagnostic-only since 2026-05-14.** When the deadline
+                // fires we (a) emit a `warn!` line + bump
+                // [`GRPC_WRITE_SLOW_CHUNK_TOTAL`] so SREs see the slow
+                // chunk, (b) re-arm the deadline for another
+                // `progress_timeout` window so a stream that stays stuck
+                // for hours produces one warn per window (not just one),
+                // and (c) return `Poll::Pending` so the inner stream
+                // keeps awaiting. We do NOT terminate, do NOT set
+                // `read_stream_error`, do NOT abort the gRPC RPC.
+                // Dead-connection detection is the transport's job
+                // (h2/TCP/QUIC keepalive); per the user direction
+                // 2026-05-14, application-layer timers are observability
+                // only. They mask real bugs when used as kill-switches.
                 if local_state.progress_timeout.is_zero() {
                     return Poll::Pending;
                 }
@@ -448,7 +566,6 @@ where
                     local_state.progress_deadline =
                         Some(Box::pin(tokio::time::sleep(timeout)));
                 }
-                let secs = timeout.as_secs();
                 let deadline = local_state
                     .progress_deadline
                     .as_mut()
@@ -456,11 +573,46 @@ where
                 match deadline.as_mut().poll(cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(()) => {
-                        local_state.read_stream_error = Some(make_err!(
-                            Code::DeadlineExceeded,
-                            "GrpcStore::write made no progress for {secs}s",
-                        ));
-                        Poll::Ready(None)
+                        // Diagnostic-only since 2026-05-14: emit a warn,
+                        // bump the process-wide counter, RE-ARM the
+                        // deadline for another `progress_timeout` window,
+                        // and return `Poll::Pending` so the inner stream
+                        // keeps awaiting. NOT an abort: do not set
+                        // `read_stream_error`, do not return
+                        // `Poll::Ready(None)`. Mutation point — restoring
+                        // the pre-2026-05-14 abort-on-elapse here is what
+                        // the bespoke "must NOT abort the stream" tests
+                        // detect.
+                        record_grpc_write_slow_chunk_and_maybe_warn(
+                            &local_state.instance_name,
+                            timeout.as_secs(),
+                        );
+                        // Re-arm: a stream that stays stuck for hours
+                        // produces one warn per `progress_timeout`
+                        // window, not just one. Reuse the existing Sleep
+                        // allocation per the same idiom as the
+                        // Pending->Ready arm above.
+                        let new_deadline = tokio::time::Instant::now() + timeout;
+                        local_state
+                            .progress_deadline
+                            .as_mut()
+                            .expect("initialized above")
+                            .as_mut()
+                            .reset(new_deadline);
+                        // Register interest in the new deadline so the
+                        // task wakes on the next window boundary even if
+                        // the inner stream never produces. Without this
+                        // poll, a permanently-silent stream would never
+                        // re-poll (Pending was already returned by the
+                        // inner stream above) and we'd lose ongoing
+                        // diagnostics.
+                        let _ = local_state
+                            .progress_deadline
+                            .as_mut()
+                            .expect("initialized above")
+                            .as_mut()
+                            .poll(cx);
+                        Poll::Pending
                     }
                 }
             }

@@ -1151,17 +1151,26 @@ impl GrpcStore {
         // dispatcher fan-out on worker-originated bytestream uploads.
         let is_worker = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
 
-        // Per-chunk no-progress timeout. Configured via `rpc_timeout_s`
-        // but applied per-chunk: each WriteRequest delivered from the
-        // upstream stream resets the timer. If no chunk arrives for
-        // `rpc_timeout`, the wrapper aborts the RPC with DeadlineExceeded.
+        // Per-chunk no-progress **diagnostic** timer (not a kill switch).
+        // Configured via `rpc_timeout_s` but applied per-chunk: each
+        // WriteRequest delivered from the upstream stream resets the
+        // timer. When no chunk arrives for `rpc_timeout`, the wrapper
+        // emits a `warn!` + bumps `proto_stream_utils::
+        // GRPC_WRITE_SLOW_CHUNK_TOTAL` and re-arms the timer for another
+        // window (so a stream stuck for hours produces one warn per
+        // window, not just one). It does NOT abort the RPC, does NOT
+        // return `DeadlineExceeded`, does NOT set `read_stream_error`.
         //
-        // The previous whole-RPC `tokio::time::timeout` killed legitimate
-        // slow-but-progressing mirror writes (a 50 MB blob through a slow
-        // Bazel client at 2 MB/s legitimately takes 25s end-to-end). Each
-        // such kill broke the >=2-replica durability invariant for the
-        // affected blob (641 events on 2026-04-23). Per-chunk progress
-        // detects stuck transports without aborting in-flight work.
+        // The pre-2026-05-14 abort-on-elapse and the older whole-RPC
+        // `tokio::time::timeout` both killed legitimate slow-but-
+        // progressing mirror writes (a 50 MB blob through a slow Bazel
+        // client at 2 MB/s legitimately takes 25s end-to-end), each kill
+        // breaking the >=2-replica durability invariant (641 events on
+        // 2026-04-23). Dead-connection detection is now the transport's
+        // job (h2 keepalive 30s/20s, TCP keepalive, QUIC keepalive 5s);
+        // per-chunk timers are observability only (user direction
+        // 2026-05-14, sibling to chunked_driver's PER_CHUNK_WRITE_TIMEOUT
+        // diagnostic-only conversion).
         let rpc_timeout = self.rpc_timeout;
         let local_state = Arc::new(Mutex::new(WriteState::with_progress_timeout(
             self.instance_name.clone(),
@@ -1317,13 +1326,18 @@ impl GrpcStore {
                         }
                     };
 
-                    // Per-chunk progress timeout is enforced inside
+                    // Per-chunk progress diagnostic is observed inside
                     // WriteStateWrapper::poll_next via WriteState's
-                    // progress_deadline; it aborts the RPC by ending the
-                    // stream with `read_stream_error` set. No outer
-                    // whole-RPC deadline here — that was killing
-                    // slow-but-progressing mirror writes and breaking the
-                    // >=2-replica durability invariant.
+                    // progress_deadline; it emits warns + bumps the
+                    // process-wide counter but does NOT abort the RPC
+                    // (diagnostic-only since 2026-05-14). The remaining
+                    // `read_stream_error` set site is the structurally
+                    // non-resumable resource_name parse error path. No
+                    // outer whole-RPC deadline either — both the older
+                    // tokio::time::timeout and the recent abort-on-
+                    // elapse were killing slow-but-progressing mirror
+                    // writes and breaking the >=2-replica durability
+                    // invariant.
                     let result = rpc_fut.await;
 
                     // Get the state back from StateWrapper, this should be

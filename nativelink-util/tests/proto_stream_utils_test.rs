@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use nativelink_macro::nativelink_test;
 use nativelink_proto::google::bytestream::WriteRequest;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::proto_stream_utils::{
-    WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
+    GRPC_WRITE_SLOW_CHUNK_TOTAL, WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
 };
 use parking_lot::Mutex;
 use pretty_assertions::assert_eq;
@@ -284,19 +285,33 @@ async fn write_state_progress_timeout_allows_slow_but_progressing_producer()
     Ok(())
 }
 
-/// Stuck producer: emits chunks then stops sending for >15s. The per-chunk
-/// progress timer must fire, the wrapper must end the stream (signalling
-/// EOF to the gRPC client), and `take_read_stream_error` must return the
-/// DeadlineExceeded error so the retry loop sees the right cause.
+/// Stuck producer: emits chunks then stops sending for >3× the timer
+/// budget. Per the **2026-05-14 diagnostic-only conversion**, the
+/// per-chunk progress timer must (a) emit `warn!` lines + bump the
+/// process-wide [`GRPC_WRITE_SLOW_CHUNK_TOTAL`] counter at each
+/// `progress_timeout` boundary, and (b) NOT terminate the stream, NOT
+/// set `read_stream_error`, NOT abort the gRPC RPC. Once the producer
+/// resumes, the upload must complete cleanly.
+///
+/// **Mutation step:** restoring the abort-on-elapse behaviour
+/// (`local_state.read_stream_error = Some(...); Poll::Ready(None)`)
+/// must red-fail this test with the bespoke
+/// "WriteState progress timer must NOT abort the stream" message.
 #[nativelink_test(flavor = "current_thread", start_paused = true)]
-async fn write_state_progress_timeout_fires_when_producer_stalls() -> Result<(), Error> {
-    // 2 chunks delivered + 1 stuck = expected 12 bytes; the stall fires
-    // before the third chunk arrives, so the wrapper never reaches EOF
-    // and the size check never runs (it only triggers on write_finished).
+async fn write_state_progress_timer_warns_but_does_not_abort_on_threshold()
+-> Result<(), Error> {
+    let baseline = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+
+    // 4-chunk × 4-byte upload, total 16 bytes.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
-    tx.send(Ok(chunk(0, b"data", false, Some(12)))).unwrap();
+    tx.send(Ok(chunk(0, b"data", false, Some(16)))).unwrap();
     tx.send(Ok(chunk(4, b"data", false, None))).unwrap();
-    let state = make_state(rx, Duration::from_secs(15)).await?;
+
+    // 10-second progress budget; producer goes silent for ~33 s
+    // (3.3× the budget) before delivering the rest. Old behaviour:
+    // wrapper terminates with DeadlineExceeded after 10 s. New
+    // behaviour: 3 warns emitted, stream stays alive, upload finishes.
+    let state = make_state(rx, Duration::from_secs(10)).await?;
     let mut wrapper = WriteStateWrapper::new(state.clone());
 
     // Drain the two pre-sent chunks.
@@ -305,23 +320,57 @@ async fn write_state_progress_timeout_fires_when_producer_stalls() -> Result<(),
     let second = wrapper.next().await.expect("second chunk");
     assert_eq!(second.write_offset, 4);
 
-    // tx is held by the channel (never closed) — only the timer can end
-    // the stream. Wrapper should yield None after 15s of silence.
-    let next = wrapper.next().await;
-    assert_eq!(next, None, "wrapper must end on no-progress timeout");
+    // Producer sleeps 33s then sends the final two chunks.
+    let producer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(33)).await;
+        tx.send(Ok(chunk(8, b"data", false, None))).unwrap();
+        tx.send(Ok(chunk(12, b"data", true, None))).unwrap();
+        drop(tx);
+    });
 
-    let err = state
-        .lock()
-        .take_read_stream_error()
-        .expect("DeadlineExceeded must be recorded");
-    assert_eq!(err.code, Code::DeadlineExceeded, "wrong code: {err:?}");
+    // Drain the final two chunks. With the OLD abort-on-elapse
+    // behaviour, the wrapper would have returned None after ~10s and
+    // these `expect` calls would panic — that is the mutation
+    // signature the bespoke message documents.
+    let third = wrapper
+        .next()
+        .await
+        .expect(
+            "WriteState progress timer must NOT abort the stream — \
+             diagnostic-only per 2026-05-14",
+        );
+    assert_eq!(third.write_offset, 8, "third chunk offset wrong");
+    let fourth = wrapper.next().await.expect("fourth chunk");
+    assert_eq!(fourth.write_offset, 12, "fourth chunk offset wrong");
+    assert!(fourth.finish_write, "fourth chunk should carry finish_write");
+
+    // Drain EOF.
+    assert_eq!(wrapper.next().await, None);
+    producer.await.unwrap();
+
+    // Diagnostic-only side effects:
+    //   1. `read_stream_error` must NEVER be set by the diagnostic
+    //      timer (only the resource_name parse error path sets it).
     assert!(
-        err.messages.iter().any(|m| m.contains("no progress")),
-        "expected 'no progress' wording, got: {:?}",
-        err.messages
+        state.lock().take_read_stream_error().is_none(),
+        "diagnostic-only timer must NOT record read_stream_error",
     );
-
-    drop(tx);
+    //   2. The process-wide counter must have advanced. With a 10 s
+    //      budget and ~33 s gap we expect ≥3 increments (one per
+    //      window boundary crossed).
+    let after = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    let delta = after.saturating_sub(baseline);
+    assert!(
+        delta >= 3,
+        "expected ≥3 slow-chunk counter increments (one per window), got {delta} \
+         (baseline={baseline}, after={after})",
+    );
+    //   3. The per-event warn must have fired — captured by
+    //      `tracing_test::traced_test` wired by `#[nativelink_test]`.
+    assert!(
+        logs_contain("GrpcStore::write made no progress"),
+        "expected per-event diagnostic warn line",
+    );
     Ok(())
 }
 
@@ -440,16 +489,18 @@ async fn write_state_progress_timeout_disabled_when_zero() -> Result<(), Error> 
     Ok(())
 }
 
-/// After a transport error and `WriteState::resume`, the per-chunk timer
-/// must re-arm correctly: drain the resume_queue (cached chunks replayed
-/// without consulting the inner stream), then a stall on the inner stream
-/// must trip DeadlineExceeded just as it would on the first attempt.
+/// After a transport error and `WriteState::resume`, the per-chunk
+/// timer must re-arm correctly. Drain the resume_queue (cached chunks
+/// replayed without consulting the inner stream) — the diagnostic
+/// timer must NOT fire spuriously during the cached replay (no warn,
+/// no counter bump). Then a stall on the inner stream must produce a
+/// diagnostic warn + counter bump, but the wrapper must NOT terminate.
 ///
 /// Guards against (a) a stale `Sleep` from the previous attempt firing
-/// spuriously during the cached replay, and (b) the timer never re-arming
-/// once the resume_queue drains.
+/// spuriously during the cached replay, and (b) the timer never
+/// re-arming once the resume_queue drains.
 #[nativelink_test(flavor = "current_thread", start_paused = true)]
-async fn write_state_progress_timeout_survives_resume() -> Result<(), Error> {
+async fn write_state_progress_diagnostic_survives_resume() -> Result<(), Error> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
     tx.send(Ok(chunk(0, b"data", false, Some(20)))).unwrap();
     tx.send(Ok(chunk(4, b"data", false, None))).unwrap();
@@ -468,34 +519,67 @@ async fn write_state_progress_timeout_survives_resume() -> Result<(), Error> {
     // calling `local_state_locked.resume()` after a transport-level error.
     state.lock().resume();
 
+    let after_resume = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+
     let mut wrapper = WriteStateWrapper::new(state.clone());
     // resume_queue replays the two cached chunks without polling the
-    // inner stream, so the per-chunk timer must NOT fire on these even if
-    // a stale `Sleep` was carried over from the previous attempt.
+    // inner stream, so the per-chunk timer must NOT fire on these even
+    // if a stale `Sleep` was carried over from the previous attempt.
     tokio::time::advance(Duration::from_secs(20)).await;
     let r0 = wrapper.next().await.expect("replayed chunk 0");
     assert_eq!(r0.write_offset, 0);
     let r1 = wrapper.next().await.expect("replayed chunk 1");
     assert_eq!(r1.write_offset, 4);
-
-    // Now the resume_queue is drained — the next poll falls through to
-    // the inner stream, and the producer (`tx` still alive but silent)
-    // never sends another chunk. The timer must re-arm and fire.
-    let next = wrapper.next().await;
-    assert_eq!(next, None, "wrapper must end on no-progress timeout post-resume");
-
-    let err = state
-        .lock()
-        .take_read_stream_error()
-        .expect("DeadlineExceeded must be recorded after resume");
-    assert_eq!(err.code, Code::DeadlineExceeded, "wrong code: {err:?}");
-    assert!(
-        err.messages.iter().any(|m| m.contains("no progress")),
-        "expected 'no progress' wording, got: {:?}",
-        err.messages
+    // After the cached replay, no slow-chunk events should have
+    // accrued (the resumed_message branch returns before the timer
+    // logic).
+    assert_eq!(
+        GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed),
+        after_resume,
+        "diagnostic timer must NOT fire during cached replay",
     );
 
+    // Now race the next poll (which will be Pending — tx is alive but
+    // silent) against a long time advance and verify that:
+    //   - the wrapper stays alive (does NOT return None)
+    //   - the counter advances (diagnostic warn + bump)
+    //   - read_stream_error stays unset
+    let next_fut = wrapper.next();
+    tokio::pin!(next_fut);
+    tokio::select! {
+        biased;
+        () = async {
+            // Walk forward 50s — 3+ windows of the 15s budget.
+            for _ in 0..50 {
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+        } => {}
+        msg = &mut next_fut => panic!(
+            "WriteState progress timer must NOT abort the stream — \
+             diagnostic-only per 2026-05-14 (post-resume); got msg={msg:?}",
+        ),
+    }
+
+    let after_stall = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    assert!(
+        after_stall.saturating_sub(after_resume) >= 3,
+        "expected ≥3 diagnostic increments after 50s of silence with 15s window; \
+         baseline={after_resume} after={after_stall}",
+    );
+    assert!(
+        state.lock().take_read_stream_error().is_none(),
+        "diagnostic-only timer must NOT record read_stream_error post-resume",
+    );
+
+    // Drop tx so the future can resolve cleanly without further data;
+    // `next_fut` will see channel-EOF (a Cancelled error per #357).
     drop(tx);
+    let resolved = (&mut next_fut).await;
+    // Some(Err) (Cancelled — no finish_write) or Some(Ok) is permitted;
+    // None is permitted iff write_finished was set. The crucial check
+    // above already proved the diagnostic timer didn't kill us; here we
+    // just keep the test deterministic so it doesn't hang.
+    drop(resolved);
     Ok(())
 }
 

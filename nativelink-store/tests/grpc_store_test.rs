@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use nativelink_config::stores::{GrpcEndpoint, GrpcSpec, Retry, StoreType};
-use nativelink_error::{Code, Error};
+use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::action_cache_server::{
     ActionCache, ActionCacheServer,
@@ -129,18 +129,25 @@ async fn grpc_store_without_zstd_compression() -> Result<(), Error> {
     Ok(())
 }
 
-// --- Per-chunk progress timeout integration test (item 7) ---
+// --- Per-chunk progress diagnostic integration test ---
 //
 // End-to-end coverage that the per-chunk no-progress timer in
-// `WriteState::with_progress_timeout` actually surfaces as a
-// `DeadlineExceeded` from `GrpcStore::write` when the producer stalls
-// against a real ByteStream gRPC server (in-process tonic).
+// `WriteState::with_progress_timeout` is **diagnostic-only** since
+// 2026-05-14: it emits `warn!` + bumps
+// `GRPC_WRITE_SLOW_CHUNK_TOTAL` when the producer stalls against a
+// real ByteStream gRPC server (in-process tonic), but does NOT abort
+// the call with `DeadlineExceeded`. The previous abort-on-elapse
+// behaviour was masking real bugs (chunked-write retry-rejection
+// cascade #476, ci-mac-2 Tailscale slowness misattributed to server
+// WRITE_TIMEOUT) — see
+// `.claude/audits/timeout-removal-2026-05-14/`.
 
 /// Minimal `ByteStream` server that accepts `write` requests but never
 /// reads any chunk from the inbound stream — the connection stays open,
 /// no acknowledgement is ever sent, and `committed_size` is never
-/// returned. This forces the client-side per-chunk timer to be the only
-/// thing that can terminate the call.
+/// returned. The client-side timer must observe the stall but NOT kill
+/// the call (the test outer `timeout` confirms the wrapper hangs
+/// instead of returning DeadlineExceeded).
 struct StallingByteStream;
 
 #[tonic::async_trait]
@@ -159,21 +166,12 @@ impl ByteStream for StallingByteStream {
         request: tonic::Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
         // Drain the inbound stream silently — never send a WriteResponse.
-        // While the client is still streaming, the server polls but does
-        // not commit; the client side sees no progress acknowledgement.
-        // When the client tears the stream down (which is what the
-        // per-chunk timer in WriteStateWrapper triggers — it ends the
-        // outbound stream with `Ready(None)` after setting
-        // `read_stream_error`), the inbound stream EOFs here and we
-        // return a Cancelled status so the test doesn't wedge waiting
-        // for a response. The TEST asserts on the client-side error
-        // (DeadlineExceeded with "no progress"), which is the
-        // `read_stream_error` propagated by GrpcStore::write — NOT this
-        // server-side Cancelled, which is just to unblock the gRPC
-        // client's wait for a server response.
+        // The client will keep streaming forever (diagnostic-only timer
+        // does not tear down). The test aborts the server task to
+        // unblock cleanup.
         let mut inbound = request.into_inner();
         while let Ok(Some(_chunk)) = inbound.message().await {
-            // Discard. The client will time out per-chunk and tear down.
+            // Discard.
         }
         Err(tonic::Status::cancelled("client aborted stream"))
     }
@@ -189,16 +187,27 @@ impl ByteStream for StallingByteStream {
 }
 
 /// `GrpcStore::write` against a server that accepts but stalls must
-/// return `DeadlineExceeded` carrying the "no progress" wording from the
-/// per-chunk timer (set by `WriteStateWrapper::poll_next` and surfaced
-/// via `take_read_stream_error`).
+/// (a) not return any error within the test budget — the diagnostic
+/// timer does NOT abort — and (b) bump
+/// `GRPC_WRITE_SLOW_CHUNK_TOTAL` plus emit the diagnostic `warn!`
+/// line so SREs see the slow chunk.
 ///
-/// This guards the full path: per-chunk timer fires → wrapper ends
-/// stream with `read_stream_error` set → retry loop sees the recorded
-/// error → `can_resume()` is false → propagates as `Err`.
+/// This is the integration counterpart to
+/// `write_state_progress_timer_warns_but_does_not_abort_on_threshold`
+/// in `nativelink-util/tests/proto_stream_utils_test.rs`.
+///
+/// **Mutation step:** restoring the abort-on-elapse behaviour
+/// (`local_state.read_stream_error = Some(make_err!(...));
+/// Poll::Ready(None)`) flips the `timeout(...).await` result from
+/// `Err(Elapsed)` to `Ok(Err(DeadlineExceeded))` and red-fails the
+/// `.expect_err("...")` line below with the bespoke message.
 #[nativelink_test]
-async fn grpc_store_write_returns_deadline_exceeded_when_transport_stalls()
+async fn grpc_store_write_diagnostic_timer_does_not_abort_when_transport_stalls()
 -> Result<(), Error> {
+    use nativelink_util::proto_stream_utils::GRPC_WRITE_SLOW_CHUNK_TOTAL;
+
+    let baseline = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+
     // Bind on a free port and hand a TcpListenerStream to a tonic Server.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -214,9 +223,7 @@ async fn grpc_store_write_returns_deadline_exceeded_when_transport_stalls()
     });
 
     // Construct a GrpcStore pointing at the in-process server, with a
-    // 1-second per-chunk progress timeout and zero retries (the per-chunk
-    // DeadlineExceeded is intentionally non-resumable; disable retries
-    // to keep the test cheap and the assertion stable).
+    // 1-second per-chunk progress *diagnostic* and zero retries.
     let mut spec = make_test_spec();
     spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
     spec.rpc_timeout_s = 1;
@@ -229,9 +236,10 @@ async fn grpc_store_write_returns_deadline_exceeded_when_transport_stalls()
     let store = GrpcStore::new(&spec).await?;
 
     // Producer: send a single resource-name-bearing chunk, then go silent.
-    // The per-chunk timer is armed on the first chunk's delivery; with
-    // no follow-up chunk and a 1s progress budget, the timer must fire
-    // well within the 5s outer test timeout.
+    // The per-chunk diagnostic timer arms on the first chunk's delivery;
+    // with no follow-up and a 1s budget, the diagnostic must fire several
+    // times within the 4s outer test timeout. The wrapper must NOT
+    // terminate.
     let (tx, rx) =
         tokio::sync::mpsc::unbounded_channel::<Result<WriteRequest, Error>>();
     let resource_name = format!(
@@ -256,22 +264,31 @@ async fn grpc_store_write_returns_deadline_exceeded_when_transport_stalls()
 
     let stream = WriteRequestStreamWrapper::from(UnboundedReceiverStream::new(rx)).await?;
 
-    let result = timeout(Duration::from_secs(5), store.write(stream)).await;
+    // 4 s budget × 1 s diagnostic window = expect ≥3 increments.
+    let result = timeout(Duration::from_secs(4), store.write(stream)).await;
 
     server_handle.abort();
     tx_holder.abort();
 
-    let inner = result.expect("test outer timeout — per-chunk timer didn't fire in 5s");
-    let err = inner.expect_err("expected DeadlineExceeded, got success");
-    assert_eq!(
-        err.code,
-        Code::DeadlineExceeded,
-        "expected DeadlineExceeded, got {err:?}",
+    // The OUTER timeout MUST fire — that's how we know the diagnostic
+    // timer did NOT abort the in-flight RPC. Mutation: restoring the
+    // pre-2026-05-14 abort-on-elapse converts `result` from
+    // `Err(Elapsed)` into `Ok(Err(DeadlineExceeded))` and this
+    // `.expect_err(...)` panics with the bespoke message.
+    let _elapsed = result.expect_err(
+        "WriteState progress timer must NOT abort the stream — \
+         diagnostic-only per 2026-05-14",
     );
+
+    // Diagnostic counter must have advanced: with a 1s budget and ≥4s
+    // of silence we expect ≥3 increments (one per window boundary
+    // crossed). Use a generous lower bound to absorb scheduler jitter.
+    let after = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    let delta = after.saturating_sub(baseline);
     assert!(
-        err.messages.iter().any(|m| m.contains("no progress")),
-        "expected 'no progress' wording, got: {:?}",
-        err.messages,
+        delta >= 1,
+        "expected ≥1 diagnostic counter increment, got {delta} \
+         (baseline={baseline}, after={after})",
     );
     Ok(())
 }
