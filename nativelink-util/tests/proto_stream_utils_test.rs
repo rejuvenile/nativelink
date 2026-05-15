@@ -931,7 +931,7 @@ async fn read_observer_warns_and_increments_counter_but_does_not_abort_on_thresh
          got {delta} (baseline={baseline}, after={after})",
     );
     assert!(
-        logs_contain("GrpcStore::read made no progress"),
+        logs_contain("read path made no progress"),
         "expected per-event diagnostic warn line",
     );
     Ok(())

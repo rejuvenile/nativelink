@@ -179,7 +179,7 @@ fn record_grpc_read_slow_chunk_and_maybe_warn(label: &str, threshold_s: u64) {
         label,
         threshold_s,
         total_slow_chunks = new_total,
-        "GrpcStore::read made no progress for >={threshold_s}s; \
+        "read path made no progress for >={threshold_s}s; \
          continuing per diagnostic-only design (#479)",
     );
     let now = std::time::Instant::now();
@@ -195,7 +195,7 @@ fn record_grpc_read_slow_chunk_and_maybe_warn(label: &str, threshold_s: u64) {
             total_slow_chunks = new_total,
             slow_chunks_in_window = delta,
             window_secs = SLOW_CHUNK_WARN_WINDOW.as_secs(),
-            "GrpcStore::read: slow-chunk events exceeding {SLOW_CHUNK_WARN_THRESHOLD}/window — \
+            "read path: slow-chunk events exceeding {SLOW_CHUNK_WARN_THRESHOLD}/window — \
              transport may be wedged; correlate with h2/TCP keepalive state",
         );
         *guard = Some((now, new_total));
