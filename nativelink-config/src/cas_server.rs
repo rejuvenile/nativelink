@@ -1267,20 +1267,34 @@ pub struct GlobalConfig {
     /// `ChunkedWriteHandler` whose `write_chunked_v2` returns
     /// `Code::Unimplemented`.
     ///
-    /// Default OFF until production data justifies the multi-writer
-    /// race-state code path. The v2 handler itself is feature-gated
-    /// behind the `chunked_fast_slow` Cargo feature, so flipping this
-    /// flag has no effect when that feature is compiled out.
+    /// **Default ON** since 2026-05-15 (#497 cross-version coordination
+    /// landed: Bazel ByteStream v1 + worker WriteChunked v1 + worker
+    /// WriteChunkedV2 all coordinate through a single `single_stream_owner`
+    /// gate on the per-digest race-state, so the v2 path is safe to
+    /// enable concurrently with v1 paths). The v2 handler itself is
+    /// feature-gated behind the `chunked_fast_slow` Cargo feature, so
+    /// flipping this flag has no effect when that feature is compiled out.
     ///
-    /// **Operator guidance:** before flipping, verify that the
-    /// production wiring includes the v2 BIS / failed-commit sinks
-    /// (`ChunkedWriteHandler::with_v2_stable_digests_sink` /
-    /// `with_v2_failed_commit_sink`). Without those, successful v2
-    /// commits never push to BIS and worker `mirror_blobs` accumulate.
+    /// **Operator guidance:** production wiring at
+    /// `bin/nativelink.rs:893-894` already installs the v2 BIS /
+    /// failed-commit sinks via `with_v2_stable_digests_sink` /
+    /// `with_v2_failed_commit_sink`. Operators may set
+    /// `chunked_v2_enabled = false` to roll back to v2-disabled if
+    /// production data surfaces a regression; the v1 paths continue to
+    /// work unchanged.
     ///
-    /// Default: false
-    #[serde(default)]
+    /// Default: true
+    #[serde(default = "default_chunked_v2_enabled")]
     pub chunked_v2_enabled: bool,
+}
+
+/// #494-v3 Phase 2 + #497 Option 1: default for
+/// `GlobalConfig.chunked_v2_enabled`. Returns `true` since 2026-05-15
+/// after the cross-version coordination gate landed (Bazel/v1
+/// WriteChunked/v2 all coordinate through `single_stream_owner` on
+/// the per-digest race-state).
+fn default_chunked_v2_enabled() -> bool {
+    true
 }
 
 fn default_disable_otlp() -> bool {

@@ -2572,7 +2572,11 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             worker_proxy_tls_key_file: None,
             bazel_facing_internal_chunking_enabled: false,
             small_blob_mirror_enabled: false,
-            chunked_v2_enabled: false,
+            // #494-v3 Phase 2 + #497 Option 1: chunked_v2_enabled
+            // defaults true since 2026-05-15 (cross-version coordination
+            // gate landed). Operators may set false in JSON5 config to
+            // roll back. See `nativelink_config::cas_server::default_chunked_v2_enabled`.
+            chunked_v2_enabled: true,
         }
     };
 

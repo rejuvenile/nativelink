@@ -723,6 +723,68 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             });
         }
 
+        // #497 Option 1: cross-version coordination gate. Try to attach
+        // as the single-stream owner of this digest's race-state. v1
+        // worker WriteChunked is a single-stream writer (one logical
+        // stream covering the whole blob); the gate ensures concurrent
+        // v2 multi-chunk writers transition to AwaitCommit (their
+        // `try_admit_chunk` returns AlreadyHave when the owner is held)
+        // and concurrent v1 single-stream writers (Bazel ByteStream OR
+        // another v1 worker WriteChunked session) transition to
+        // AwaitCommit on this race-state.
+        //
+        // **Asymmetric contract note:** the existing
+        // `if guard.contains_key(&digest)` check below ALREADY rejected
+        // two concurrent v1 worker WriteChunked sessions for the same
+        // digest (returning Aborted + BackpressureSignal). The
+        // single-stream gate ADDS coordination with the v2 path that
+        // the in_flight check missed. The order matters: if we observe
+        // SingleStreamAttachOutcome::AwaitCommit (because v2 is
+        // mid-stream), drain our reader — but `write_chunked_inner`
+        // doesn't have a `DropCloserReadHalf`-style reader; it has the
+        // worker's `Streaming<WriteChunk>` already on `stream`. We
+        // surface `Code::Aborted` + retry hint instead so the worker
+        // retries (its v1 client classifier handles Aborted → retry).
+        let writer_id = next_v1_writer_id();
+        let chunk_size_u32 = u32::try_from(self.chunk_size).unwrap_or(u32::MAX);
+        let (race_state, attach_outcome) = self
+            .filesystem_store
+            .race_state_for_digest_and_attach_single_stream(
+                &digest,
+                chunk_size_u32,
+                writer_id,
+            );
+        let single_stream_owner_guard = match attach_outcome {
+            nativelink_store::chunked::chunked_race_state::SingleStreamAttachOutcome::Owner => {
+                Some(nativelink_store::chunked::chunked_race_state::SingleStreamOwnerGuard::new(
+                    Arc::clone(&race_state),
+                    writer_id,
+                ))
+            }
+            nativelink_store::chunked::chunked_race_state::SingleStreamAttachOutcome::AwaitCommit { reason } => {
+                self.metrics
+                    .concurrent_same_digest_rejections_total
+                    .fetch_add(1, Ordering::Relaxed);
+                let detail = encode_backpressure_signal_any(
+                    backpressure_signal::Reason::PerBlobMpscFull,
+                    CONCURRENT_SAME_DIGEST_RETRY_AFTER_MS,
+                );
+                debug!(
+                    ?stream_digest,
+                    ?reason,
+                    "WriteChunked: yielding to in-flight writer (#497 Option 1 cross-version coordination)"
+                );
+                return Err(Error::aborted_with_detail(
+                    format!(
+                        "WriteChunked: another writer is currently active on digest {digest} \
+                         (cross-version coordination — #497 Option 1 reason={reason:?}); \
+                         retry after a backoff"
+                    ),
+                    detail,
+                ));
+            }
+        };
+
         // Look up or create the per-blob driver. Today: one driver per
         // digest at a time; concurrent streams for the same digest are
         // rejected with `Code::Aborted` + a retry hint (M-code-2 fixup).
@@ -917,6 +979,26 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         let removed_entry = self.in_flight.inner.lock().remove(&stream_digest);
         drop(removed_entry);
         core::mem::forget(cleanup_guard);
+
+        // #497 Option 1: publish commit outcome on the race-state so any
+        // sibling v2 writers that joined AwaitCommit observe the result
+        // (Ok or Err). Mirrors the BazelChunkedDispatcher impl above.
+        let race_publish = match &commit_result {
+            Ok(r) => Ok(nativelink_store::chunked::chunked_race_state::RaceCommitResult {
+                committed_size: r.committed_size,
+            }),
+            Err(err) => Err(err.clone()),
+        };
+        race_state.publish_commit_result(race_publish);
+        // Release the single-stream owner gate. Drop is idempotent.
+        if let Some(g) = single_stream_owner_guard {
+            g.relinquish();
+        }
+        // Best-effort registry cleanup.
+        let _ = self
+            .filesystem_store
+            .chunked_race_registry()
+            .try_remove_if_unused(&stream_digest);
 
         let commit_result = match commit_result {
             Ok(r) => r,
@@ -2939,6 +3021,18 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
         }
     }
 
+    /// #497 Option 1: builder method to override the chunk size used by
+    /// the dispatcher. Tests use this so the v1 path uses the same
+    /// `TEST_CHUNK_SIZE` (4 KiB) the v2 path uses, ensuring per-chunk
+    /// admission shape parity in cross-version race tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_chunk_size_for_test(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
+    }
+
     /// Read-only accessor on the in-flight tracker. Tests use this to
     /// observe driver lifecycle (e.g. assert the entry persists during
     /// async-commit and drains after).
@@ -3072,6 +3166,21 @@ impl Drop for InFlightChunkedGuard {
     }
 }
 
+/// #497 Option 1: process-wide counter for minting writer IDs on v1
+/// single-stream paths (Bazel ByteStream chunked dispatcher AND worker
+/// WriteChunked v1). Mirrors the v2 path's `WRITER_ID_COUNTER` with a
+/// disjoint range to ease debug attribution. Per-process is fine — the
+/// race-state's `single_stream_owner` slot is keyed by digest; the
+/// WriterId only identifies whose claim the gate is holding.
+static V1_WRITER_ID_COUNTER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1_000_000_000);
+
+fn next_v1_writer_id() -> nativelink_store::chunked::chunked_race_state::WriterId {
+    nativelink_store::chunked::chunked_race_state::WriterId(
+        V1_WRITER_ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 #[async_trait::async_trait]
 impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
     for BazelChunkedDispatcherImpl<Fe>
@@ -3079,91 +3188,167 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
     async fn dispatch(
         &self,
         digest: DigestInfo,
-        reader: DropCloserReadHalf,
+        mut reader: DropCloserReadHalf,
     ) -> Result<u64, Error> {
-        // #212 fixup B2 + #401 cancel-safety: register the digest in the
-        // FastSlowStore's chunked_in_flight_digests set BEFORE dispatch
-        // via an RAII guard. Preserves these contracts for chunked-path
-        // blobs:
-        //   - has_with_results: chunked check returns Some(size_bytes).
-        //   - flush_slow_writes (#210 graceful drain): waits for the
-        //     digest set to drain before returning.
-        // The chunked digest set is intentionally separate from the
-        // legacy `in_flight_slow_writes` (`Vec<Bytes>` shape) because
-        // chunked-path bytes are tracked via the chunked-driver pin
-        // (registered through ChunkedReadRegistry for cascade step 2).
-        //
-        // RAII (vs the prior manual insert/remove): the inner await
-        // below is a cancellation point. A `try_join!`/`select!` upstream
-        // can drop this future mid-await; manual `remove(&digest)` would
-        // never run, leaking the digest forever. Drop runs on every exit
-        // path including cancellation. See InFlightChunkedGuard above.
-        let inflight_guard = self.chunked_in_flight_digests.as_ref().map(|set| {
-            InFlightChunkedGuard::new(
-                Arc::clone(set),
-                digest,
-                self.in_flight_empty_notify.clone(),
-            )
-        });
-        let dispatch_res = dispatch_bazel_facing_internal_chunking(
-            Arc::clone(&self.filesystem_store),
-            Arc::clone(&self.in_flight),
-            self.chunk_budget,
-            Some(self.pin_budget),
-            self.chunked_read_registry.clone(),
-            self.stable_digests_sink.clone(),
-            self.failed_commit_sink.clone(),
-            Arc::clone(&self.metrics),
-            self.chunk_size,
-            digest,
-            reader,
-        )
-        .await;
+        use nativelink_store::chunked::chunked_race_state::{
+            RaceCommitResult, SingleStreamAttachOutcome, SingleStreamOwnerGuard,
+        };
 
-        // Note: the chunked-driver reaper (CommitMode::AsyncCommit)
-        // completes ASYNCHRONOUSLY after this returns. We need the
-        // chunked_in_flight_digests entry to survive until commit
-        // drains (otherwise B2's #210 graceful-drain contract is
-        // violated: the drainer would return as soon as dispatch
-        // returns Ok, before commit lands). Solution: disarm the RAII
-        // guard and spawn a small reaper that waits on the chunked-
-        // driver's in_flight tracker emptying for THIS digest, then
-        // removes the digest from the set + notifies the empty-notify.
+        // #497 Option 1: cross-version coordination gate. Try to attach
+        // as the single-stream owner of this digest's race-state. The
+        // race-state is the SAME registry the v2 `WriteChunkedV2` path
+        // uses, so a single-stream owner blocks v2 admissions
+        // (`try_admit_chunk` returns AlreadyHave when the owner is
+        // held), and v2 chunks-in-flight cause this attempt to yield
+        // (return AwaitCommit).
         //
-        // On dispatch error (admission rejected before any chunk):
-        // do NOT disarm — the guard's Drop performs the removal +
-        // notify (no chunked driver was created or it was torn down by
-        // the cleanup_guard).
-        match (dispatch_res, inflight_guard) {
-            (Ok(outcome), Some(guard)) => {
-                let (set, dig, notify) = guard.disarm();
-                let in_flight_for_reaper = Arc::clone(&self.in_flight);
-                tokio::spawn(async move {
-                    loop {
-                        if !in_flight_for_reaper.contains_digest(&dig) {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                    let mut guard = set.lock();
-                    guard.remove(&dig);
-                    let became_empty = guard.is_empty();
-                    drop(guard);
-                    if became_empty {
-                        if let Some(n) = notify.as_ref() {
-                            n.notify_waiters();
-                        }
-                    }
-                });
-                Ok(outcome.committed_size)
+        // This closes the original #494 cross-version race: previously
+        // the v1 path used `chunked_partials` and v2 used
+        // `chunked_race_registry` independently — both could pwrite the
+        // same `<digest>.partial` and both could call commit-rename,
+        // landing the second writer's bytes on an orphaned inode →
+        // sparse-zero corruption. Now both paths coordinate through a
+        // single registry.
+        let writer_id = next_v1_writer_id();
+        let chunk_size_u32 = u32::try_from(self.chunk_size).unwrap_or(u32::MAX);
+        let (race_state, attach_outcome) = self
+            .filesystem_store
+            .race_state_for_digest_and_attach_single_stream(
+                &digest,
+                chunk_size_u32,
+                writer_id,
+            );
+
+        match attach_outcome {
+            SingleStreamAttachOutcome::AwaitCommit { reason } => {
+                // Another writer (single-stream owner OR v2 multi-chunk
+                // writers) is active. Drain our reader to EOF (so the
+                // upstream Bazel client's stream finishes cleanly) and
+                // then await `commit_done`, propagating that result.
+                debug!(
+                    ?digest,
+                    ?reason,
+                    "BazelChunkedDispatcher: yielding to in-flight writer; \
+                     draining reader and awaiting commit_done (#497 Option 1)"
+                );
+                if let Err(err) = bounded_drain_reader(&mut reader, digest.size_bytes()).await {
+                    return Err(err.append(
+                        "#497 Option 1: bounded-drain failed while yielding to \
+                         in-flight writer (cross-version coordination path)",
+                    ));
+                }
+                // Subscribe BEFORE peeking to avoid the missed-wakeup
+                // race. Use the same 60s watchdog the v2 AwaitCommit
+                // branch uses (matches `COMMIT_WAIT_WATCHDOG`).
+                let notified = race_state.subscribe_commit_done();
+                if let Some(result) = race_state.peek_commit_result() {
+                    return result.map(|r| r.committed_size);
+                }
+                let watchdog = core::time::Duration::from_secs(60);
+                match tokio::time::timeout(watchdog, notified).await {
+                    Ok(()) => race_state
+                        .peek_commit_result()
+                        .unwrap_or_else(|| {
+                            Err(make_err!(
+                                Code::Internal,
+                                "#497 Option 1 AwaitCommit: commit_done fired but \
+                                 commit_result missing (programmer bug)"
+                            ))
+                        })
+                        .map(|r| r.committed_size),
+                    Err(_) => Err(make_err!(
+                        Code::DeadlineExceeded,
+                        "#497 Option 1 AwaitCommit: in-flight writer's commit \
+                         exceeded {}s watchdog for digest {}",
+                        watchdog.as_secs(),
+                        digest
+                    )),
+                }
             }
-            (Ok(outcome), None) => Ok(outcome.committed_size),
-            (Err(err), _guard) => {
-                // _guard (if any) drops here, removing the digest +
-                // notifying. On Err the dispatch never produced a
-                // chunked driver to drain, so immediate removal is
-                // correct.
-                Err(err)
+            SingleStreamAttachOutcome::Owner => {
+                // We are the sole single-stream writer. Construct the
+                // owner-guard so any panic / cancellation between here
+                // and the explicit relinquish below releases the gate.
+                let owner_guard =
+                    SingleStreamOwnerGuard::new(Arc::clone(&race_state), writer_id);
+
+                // #212 fixup B2 + #401 cancel-safety: register the digest
+                // in the FastSlowStore's chunked_in_flight_digests set
+                // BEFORE dispatch via an RAII guard. (Same shape as the
+                // pre-#497 dispatch.)
+                let inflight_guard = self.chunked_in_flight_digests.as_ref().map(|set| {
+                    InFlightChunkedGuard::new(
+                        Arc::clone(set),
+                        digest,
+                        self.in_flight_empty_notify.clone(),
+                    )
+                });
+                let dispatch_res = dispatch_bazel_facing_internal_chunking(
+                    Arc::clone(&self.filesystem_store),
+                    Arc::clone(&self.in_flight),
+                    self.chunk_budget,
+                    Some(self.pin_budget),
+                    self.chunked_read_registry.clone(),
+                    self.stable_digests_sink.clone(),
+                    self.failed_commit_sink.clone(),
+                    Arc::clone(&self.metrics),
+                    self.chunk_size,
+                    digest,
+                    reader,
+                )
+                .await;
+
+                // #497 Option 1: publish the v1 commit outcome on the
+                // race-state so any sibling v2 writers (or another v1
+                // writer that arrived after we attached) wakes from
+                // `commit_done` with the same result.
+                let race_publish = match &dispatch_res {
+                    Ok(outcome) => Ok(RaceCommitResult {
+                        committed_size: outcome.committed_size,
+                    }),
+                    Err(err) => Err(err.clone()),
+                };
+                race_state.publish_commit_result(race_publish);
+
+                // Release the single-stream owner gate. Drop is
+                // idempotent — the guard's Drop also clears, but
+                // explicit relinquish documents intent.
+                owner_guard.relinquish();
+
+                // Best-effort cleanup of the registry entry (only
+                // removes if no writers attached; v2 writers that joined
+                // AwaitCommit may still be reading commit_result).
+                let _ = self
+                    .filesystem_store
+                    .chunked_race_registry()
+                    .try_remove_if_unused(&digest);
+
+                match (dispatch_res, inflight_guard) {
+                    (Ok(outcome), Some(guard)) => {
+                        let (set, dig, notify) = guard.disarm();
+                        let in_flight_for_reaper = Arc::clone(&self.in_flight);
+                        tokio::spawn(async move {
+                            loop {
+                                if !in_flight_for_reaper.contains_digest(&dig) {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                            let mut guard = set.lock();
+                            guard.remove(&dig);
+                            let became_empty = guard.is_empty();
+                            drop(guard);
+                            if became_empty {
+                                if let Some(n) = notify.as_ref() {
+                                    n.notify_waiters();
+                                }
+                            }
+                        });
+                        Ok(outcome.committed_size)
+                    }
+                    (Ok(outcome), None) => Ok(outcome.committed_size),
+                    (Err(err), _guard) => Err(err),
+                }
             }
         }
     }

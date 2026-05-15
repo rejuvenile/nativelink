@@ -1524,6 +1524,42 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             })
     }
 
+    /// #497 Option 1: atomic get-or-create + try-attach as single-stream
+    /// owner. Used by v1 paths (Bazel ByteStream chunked dispatcher,
+    /// worker WriteChunked v1) to claim exclusive write authority on a
+    /// digest so concurrent v2 writers transition to AwaitCommit.
+    ///
+    /// Returns the race-state Arc plus the attachment outcome:
+    ///   - `Owner`: caller proceeds with the v1 write path. Caller MUST
+    ///     construct a `SingleStreamOwnerGuard` (NOT returned by this
+    ///     function — the guard's lifetime is tied to the caller's commit
+    ///     pipeline, not to this function's scope).
+    ///   - `AwaitCommit`: another writer (single-stream owner OR v2
+    ///     multi-chunk writers) is active. Caller MUST drain its inbound
+    ///     reader to EOF and then await `commit_done`.
+    pub fn race_state_for_digest_and_attach_single_stream(
+        &self,
+        digest: &DigestInfo,
+        chunk_size: u32,
+        writer_id: crate::chunked::chunked_race_state::WriterId,
+    ) -> (
+        Arc<crate::chunked::chunked_race_state::ChunkRaceState>,
+        crate::chunked::chunked_race_state::SingleStreamAttachOutcome,
+    ) {
+        let partial_path = crate::chunked::chunked_filesystem::partial_temp_path(
+            &self.shared_context.temp_path,
+            digest,
+        );
+        self.chunked_race_registry
+            .get_or_create_and_attach_single_stream(*digest, writer_id, || {
+                crate::chunked::chunked_race_state::ChunkRaceState::new(
+                    *digest,
+                    chunk_size,
+                    partial_path,
+                )
+            })
+    }
+
     /// #494-v3 Phase 2: drop the race-state for `digest` if no writers
     /// are still attached. Returns the removed Arc on success. Used by
     /// the commit-runner after `publish_commit_result`.

@@ -218,6 +218,15 @@ struct RaceMutableState {
     /// all_set return AwaitCommit; the result is in `commit_result`).
     /// Sticky: never resets.
     commit_done_flag: bool,
+    /// #497 Option 1: identity of the single-stream writer that holds
+    /// exclusive write authority for this digest, if any. Set by
+    /// `try_attach_single_stream_writer` when no other writer is active.
+    /// Cleared by `clear_single_stream_owner_if_owned` (called from
+    /// `SingleStreamOwnerGuard::Drop`). Multi-chunk (v2) writers consult
+    /// this in `try_admit_chunk` and return AlreadyHave if held — driving
+    /// them straight into the AwaitCommit branch.
+    /// CAPPED AT 1: by definition exclusive (one slot, one owner).
+    single_stream_owner: Option<WriterId>,
 }
 
 /// Word-addressable bitmap. Internal helper, no external deps.
@@ -341,6 +350,7 @@ impl ChunkRaceState {
                 chunks_in_flight: HashMap::new(),
                 commit_running: false,
                 commit_done_flag: false,
+                single_stream_owner: None,
             }),
             commit_done: Notify::new(),
             commit_result: Mutex::new(None),
@@ -465,6 +475,19 @@ impl ChunkRaceState {
     ) -> AdmitOutcome {
         let chunk_idx = (offset / self.chunk_size as u64) as usize;
         let mut state = self.state.lock();
+        // #497 Option 1: if a single-stream writer owns the digest AND
+        // it is NOT this writer, treat the offset as AlreadyHave so the
+        // multi-chunk writer transitions to AwaitCommit and waits for
+        // the single-stream owner's commit. The single-stream owner
+        // (v1 path) writes the entire blob through one rename pipeline
+        // — multi-chunk writers must NOT pwrite into the same `.partial`
+        // file or both paths' chunks land on the same / orphaned inode
+        // (the original #494 cross-version race).
+        if let Some(owner) = state.single_stream_owner
+            && owner != writer_id
+        {
+            return AdmitOutcome::AlreadyHave;
+        }
         if state.chunks_present.get(chunk_idx) {
             return AdmitOutcome::AlreadyHave;
         }
@@ -477,6 +500,59 @@ impl ChunkRaceState {
         }
         entry.push(writer_id);
         AdmitOutcome::Accept
+    }
+
+    /// #497 Option 1: try to attach as the single-stream owner for this
+    /// digest. Used by v1 paths (Bazel ByteStream chunked dispatcher,
+    /// worker WriteChunked v1) to claim exclusive write authority.
+    ///
+    /// Outcome:
+    ///   - `Owner` if no other writer is active. The single_stream_owner
+    ///     slot is set to `writer_id`. Caller MUST proceed with the
+    ///     write path AND call `clear_single_stream_owner_if_owned` on
+    ///     exit (typically via `SingleStreamOwnerGuard::Drop`).
+    ///   - `AwaitCommit` if another writer (single-stream owner OR v2
+    ///     multi-chunk writers with chunks in-flight) is active. Caller
+    ///     MUST drain its inbound reader to EOF (so producers can
+    ///     finish their stream cleanly) and then await `commit_done`.
+    ///
+    /// Lock discipline: parking_lot::Mutex held only for the
+    /// `single_stream_owner` set + the `chunks_in_flight` non-empty
+    /// check. Caller proceeds OUTSIDE the lock.
+    pub fn try_attach_single_stream_writer(
+        &self,
+        writer_id: WriterId,
+    ) -> SingleStreamAttachOutcome {
+        let mut state = self.state.lock();
+        if state.single_stream_owner.is_some() {
+            return SingleStreamAttachOutcome::AwaitCommit {
+                reason: AwaitCommitReason::AnotherSingleStreamOwner,
+            };
+        }
+        if !state.chunks_in_flight.is_empty() {
+            return SingleStreamAttachOutcome::AwaitCommit {
+                reason: AwaitCommitReason::V2WritersInFlight,
+            };
+        }
+        // No competing writer; claim ownership.
+        state.single_stream_owner = Some(writer_id);
+        SingleStreamAttachOutcome::Owner
+    }
+
+    /// #497 Option 1: release the single-stream owner slot iff `writer_id`
+    /// currently holds it. Idempotent. Used by `SingleStreamOwnerGuard::Drop`
+    /// so a cancelled / panicked single-stream writer does not block
+    /// future writers.
+    pub fn clear_single_stream_owner_if_owned(&self, writer_id: WriterId) {
+        let mut state = self.state.lock();
+        if state.single_stream_owner == Some(writer_id) {
+            state.single_stream_owner = None;
+        }
+    }
+
+    /// Snapshot of the single-stream owner identity for tests / debug.
+    pub fn single_stream_owner(&self) -> Option<WriterId> {
+        self.state.lock().single_stream_owner
     }
 
     /// Mark a chunk as committed: set the bit in `chunks_present`,
@@ -705,6 +781,52 @@ pub enum CommitResponsibility {
     AwaitCommit,
 }
 
+/// #497 Option 1: outcome of `try_attach_single_stream_writer`. A
+/// "single-stream writer" is a v1 path that writes the entire blob
+/// through one `<digest>.partial` rename pipeline (Bazel
+/// `bytestream_server::write` going through `BazelChunkedDispatcherImpl`,
+/// or worker `WriteChunked` v1). Multi-chunk writers (`WriteChunkedV2`)
+/// use the per-chunk admission API instead.
+///
+/// **Why two attachment shapes:** the v1 path streams bytes in-order
+/// through one logical writer; the v2 path admits per-chunk from many
+/// concurrent writers. Both share the same on-disk `.partial` file. Without
+/// a coordination point, two paths can race on the same file (the
+/// original #494 sparse-zero corruption mechanism). The single-stream
+/// owner gate ensures at most ONE v1 writer is active per digest at any
+/// time; v2 writers attaching while a v1 owner is held observe
+/// `AlreadyHave` on every admission and transition through their existing
+/// AwaitCommit branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleStreamAttachOutcome {
+    /// Caller is now the sole single-stream writer for this digest.
+    /// Caller MUST proceed with the v1 write path (open `.partial`,
+    /// pwrite chunks, commit-rename, publish_commit_result). Caller
+    /// MUST eventually call `clear_single_stream_owner_if_owned` (via
+    /// the `SingleStreamOwnerGuard` Drop) to release the gate.
+    Owner,
+    /// Another writer already holds the single-stream owner gate, OR
+    /// at least one v2 multi-chunk writer has admitted chunks for this
+    /// digest. Caller MUST drain its inbound reader to EOF (so the
+    /// upstream producer can finish its stream cleanly) and then await
+    /// `commit_done`. The other writer's commit publishes the result;
+    /// caller propagates that result to its own client.
+    AwaitCommit {
+        /// Reason for AwaitCommit: another single-stream owner is held,
+        /// OR v2 multi-chunk writers are mid-stream.
+        reason: AwaitCommitReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwaitCommitReason {
+    /// Another v1 writer is already the single-stream owner.
+    AnotherSingleStreamOwner,
+    /// v2 multi-chunk writers are admitting chunks; v1 must yield to
+    /// the v2 race-state coordination.
+    V2WritersInFlight,
+}
+
 /// RAII guard for a writer's attachment to a `ChunkRaceState`. Drops
 /// purge the writer's in-flight slots so a cancelled / panicked writer
 /// doesn't deadlock the digest's progress.
@@ -791,6 +913,118 @@ impl Drop for RaceWriterGuard {
             remaining_writers = remaining,
             "RaceWriterGuard::drop detached writer",
         );
+    }
+}
+
+/// #497 Option 1: RAII guard for the single-stream-owner slot held by
+/// a v1 writer (Bazel ByteStream chunked dispatcher OR worker
+/// WriteChunked v1). Drops clear `single_stream_owner` so a cancelled /
+/// panicked writer does not wedge the digest's gate.
+///
+/// Per CLAUDE.md "Asymmetric contract coverage": the guard's `Drop`
+/// fires the side effect (clear_single_stream_owner_if_owned) EXACTLY
+/// when the writer disengages — over-firing (calling Drop twice) is
+/// impossible because std consumes the value, under-firing (forgetting
+/// to call Drop) is the documented bug.
+///
+/// **Both directions of the contract:** the guard MUST clear the slot
+/// when the writer is done (under-action: stale ownership wedges future
+/// writers). The guard MUST NOT clear the slot if a different writer
+/// has somehow taken ownership in the interim (over-action: clears
+/// someone else's claim — `clear_single_stream_owner_if_owned` checks
+/// the writer_id matches before clearing).
+#[must_use = "SingleStreamOwnerGuard must outlive the v1 writer's commit path; \
+              dropping early releases the gate and a v2 writer may then race the \
+              same .partial file"]
+pub struct SingleStreamOwnerGuard {
+    state: Arc<ChunkRaceState>,
+    writer_id: WriterId,
+    /// `true` once the writer has explicitly relinquished. If false at
+    /// drop, this is a cancellation / panic and we still clear the slot.
+    /// (Symmetric to `RaceWriterGuard::relinquished`; in this case the
+    /// behavior is identical regardless — the gate must be cleared.)
+    relinquished: bool,
+}
+
+impl Debug for SingleStreamOwnerGuard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SingleStreamOwnerGuard")
+            .field("digest", &self.state.digest)
+            .field("writer_id", &self.writer_id)
+            .field("relinquished", &self.relinquished)
+            .finish()
+    }
+}
+
+impl SingleStreamOwnerGuard {
+    /// Construct from an `Arc<ChunkRaceState>` after a successful
+    /// `try_attach_single_stream_writer` returning `Owner`. Caller
+    /// MUST keep the guard alive across the v1 write path.
+    pub fn new(state: Arc<ChunkRaceState>, writer_id: WriterId) -> Self {
+        Self {
+            state,
+            writer_id,
+            relinquished: false,
+        }
+    }
+
+    /// Identity of the writer this guard tracks.
+    pub fn writer_id(&self) -> WriterId {
+        self.writer_id
+    }
+
+    /// Borrow the inner `ChunkRaceState` Arc.
+    pub fn state(&self) -> &Arc<ChunkRaceState> {
+        &self.state
+    }
+
+    /// Mark the guard as cleanly relinquished. Drop still fires the
+    /// clear (idempotent). Provided for symmetry with `RaceWriterGuard`.
+    pub fn relinquish(mut self) {
+        self.relinquished = true;
+        drop(self);
+    }
+}
+
+impl Drop for SingleStreamOwnerGuard {
+    fn drop(&mut self) {
+        // Always clear: under-action (stale ownership) is the worst
+        // failure mode. Idempotency guaranteed by
+        // `clear_single_stream_owner_if_owned`'s writer_id check.
+        self.state.clear_single_stream_owner_if_owned(self.writer_id);
+
+        // #497 Option 1: if we drop WITHOUT having published a commit
+        // result AND we were not cleanly relinquished, publish a
+        // synthetic Cancelled so any sibling v2 writer awaiting
+        // commit_done wakes immediately rather than wedging the 60s
+        // watchdog. Mirrors the CommitRunnerGuard::Drop pattern.
+        // (`relinquish` is the explicit Ok path — caller already
+        // published the real commit result before relinquishing.)
+        if !self.relinquished && !self.state.commit_done() {
+            let synthetic_err = make_err!(
+                Code::Cancelled,
+                "#497 Option 1: single-stream owner dropped without publishing a \
+                 commit result for digest {} — sibling writers receive this \
+                 synthetic Cancelled to avoid 60s wedge",
+                self.state.digest
+            );
+            warn!(
+                target: "nativelink_store::chunked",
+                digest = ?self.state.digest,
+                writer_id = ?self.writer_id,
+                "SingleStreamOwnerGuard::drop publishing synthetic Cancelled — \
+                 single-stream owner exited without publishing a real result",
+            );
+            self.state.publish_commit_result(Err(synthetic_err));
+        } else if !self.relinquished {
+            trace!(
+                target: "nativelink_store::chunked",
+                digest = ?self.state.digest,
+                writer_id = ?self.writer_id,
+                "SingleStreamOwnerGuard::drop cleared single_stream_owner on cancel/panic \
+                 (commit_done already published; no synthetic publish needed)",
+            );
+        }
     }
 }
 
@@ -965,6 +1199,47 @@ impl ChunkRaceRegistry {
             relinquished: false,
         };
         (state, race_guard)
+    }
+
+    /// #497 Option 1: atomic get-or-create + try-attach-single-stream-writer.
+    /// Holds the registry mutex across both steps (analogous to FIX-4's
+    /// `get_or_create_and_attach`) so a concurrent `try_remove_if_unused`
+    /// cannot split concurrent writers across two distinct race-states.
+    /// Returns the race-state Arc + the attachment outcome.
+    ///
+    /// Caller-side contract:
+    ///   - On `SingleStreamAttachOutcome::Owner`, caller MUST construct
+    ///     a `SingleStreamOwnerGuard` and keep it alive across the v1
+    ///     write path. The guard's Drop releases the gate.
+    ///   - On `SingleStreamAttachOutcome::AwaitCommit`, caller MUST
+    ///     drain its inbound reader to EOF (so producers can finish
+    ///     their stream cleanly) and then await `commit_done` via
+    ///     `subscribe_commit_done` + `peek_commit_result`.
+    pub fn get_or_create_and_attach_single_stream<F>(
+        &self,
+        digest: DigestInfo,
+        writer_id: WriterId,
+        make: F,
+    ) -> (Arc<ChunkRaceState>, SingleStreamAttachOutcome)
+    where
+        F: FnOnce() -> ChunkRaceState,
+    {
+        let mut guard = self.inner.lock();
+        let state = if let Some(existing) = guard.get(&digest) {
+            Arc::clone(existing)
+        } else {
+            let new_state = Arc::new(make());
+            guard.insert(digest, Arc::clone(&new_state));
+            new_state
+        };
+        // try_attach_single_stream_writer takes the per-state lock
+        // (separate from the registry mutex). Safe because the per-state
+        // lock is a parking_lot::Mutex that does NOT re-enter the
+        // registry, and we drop the registry lock BEFORE returning the
+        // guard (Drop of the guard never re-enters the registry).
+        let outcome = state.try_attach_single_stream_writer(writer_id);
+        drop(guard);
+        (state, outcome)
     }
 
     /// Look up the race-state for `digest` without creating one.
@@ -1332,6 +1607,160 @@ mod tests {
             registry.get(&digest).is_none(),
             "entry must be absent after force_remove"
         );
+    }
+
+    #[test]
+    fn single_stream_owner_first_attach_returns_owner_then_blocks_others() {
+        // #497 Option 1: first v1 writer attaches as Owner; second v1
+        // writer arriving while the first is active observes
+        // AwaitCommit (reason: AnotherSingleStreamOwner).
+        let chunk_size: u32 = 1024;
+        let state = make_state(chunk_size as u64, chunk_size);
+        let writer_a = WriterId(1);
+        let writer_b = WriterId(2);
+
+        let outcome_a = state.try_attach_single_stream_writer(writer_a);
+        assert!(
+            matches!(outcome_a, SingleStreamAttachOutcome::Owner),
+            "first single-stream attacher must observe Owner (got {outcome_a:?})"
+        );
+        assert_eq!(state.single_stream_owner(), Some(writer_a));
+
+        let outcome_b = state.try_attach_single_stream_writer(writer_b);
+        assert!(
+            matches!(
+                outcome_b,
+                SingleStreamAttachOutcome::AwaitCommit {
+                    reason: AwaitCommitReason::AnotherSingleStreamOwner,
+                }
+            ),
+            "second single-stream attacher must observe AwaitCommit with reason \
+             AnotherSingleStreamOwner (got {outcome_b:?})"
+        );
+    }
+
+    #[test]
+    fn single_stream_owner_yields_to_v2_writers_in_flight() {
+        // #497 Option 1: when v2 multi-chunk writers have admitted
+        // chunks (chunks_in_flight non-empty), a v1 single-stream
+        // attempt MUST observe AwaitCommit (reason: V2WritersInFlight)
+        // rather than claiming Owner — otherwise the v1 writer's commit
+        // races the v2 path's pwrites.
+        let chunk_size: u32 = 1024;
+        let state = make_state(2 * chunk_size as u64, chunk_size);
+        let v2_writer = WriterId(50);
+        let v1_writer = WriterId(60);
+
+        // v2 admits a chunk; in-flight is populated.
+        let _guard = RaceWriterGuard::attach(Arc::clone(&state), v2_writer);
+        assert_eq!(
+            state.try_admit_chunk(v2_writer, 0),
+            AdmitOutcome::Accept,
+            "v2 admit must accept"
+        );
+
+        // v1 attempts to attach as single-stream owner.
+        let outcome_v1 = state.try_attach_single_stream_writer(v1_writer);
+        assert!(
+            matches!(
+                outcome_v1,
+                SingleStreamAttachOutcome::AwaitCommit {
+                    reason: AwaitCommitReason::V2WritersInFlight,
+                }
+            ),
+            "v1 attaching while v2 chunks in-flight must observe AwaitCommit with reason \
+             V2WritersInFlight (got {outcome_v1:?})"
+        );
+        assert_eq!(
+            state.single_stream_owner(),
+            None,
+            "single_stream_owner slot must remain empty when v1 yields"
+        );
+    }
+
+    #[test]
+    fn v2_admit_blocked_when_single_stream_owner_held() {
+        // #497 Option 1: v2 try_admit_chunk MUST return AlreadyHave
+        // when single_stream_owner is held by a different writer. This
+        // drives v2 directly through its AwaitCommit branch.
+        let chunk_size: u32 = 1024;
+        let state = make_state(2 * chunk_size as u64, chunk_size);
+        let v1_writer = WriterId(70);
+        let v2_writer = WriterId(80);
+
+        // v1 attaches as single-stream owner.
+        let outcome_v1 = state.try_attach_single_stream_writer(v1_writer);
+        assert!(matches!(outcome_v1, SingleStreamAttachOutcome::Owner));
+
+        // v2 attaches via the standard path.
+        let _v2_guard = RaceWriterGuard::attach(Arc::clone(&state), v2_writer);
+        // v2 tries to admit chunk 0 — MUST be AlreadyHave because v1
+        // holds single_stream_owner.
+        let v2_admit = state.try_admit_chunk(v2_writer, 0);
+        assert!(
+            matches!(v2_admit, AdmitOutcome::AlreadyHave),
+            "v2 admit while single_stream_owner held by v1 must return AlreadyHave \
+             (got {v2_admit:?}); without this v1+v2 race the same .partial file → \
+             sparse-zero corruption (the #494 mechanism)"
+        );
+    }
+
+    #[test]
+    fn single_stream_owner_guard_drop_clears_slot() {
+        // #497 Option 1: SingleStreamOwnerGuard's Drop MUST clear
+        // the slot so a future writer can claim. Idempotency check:
+        // dropping a guard whose slot was already cleared (by a
+        // different writer somehow) is a no-op.
+        let chunk_size: u32 = 1024;
+        let state = make_state(chunk_size as u64, chunk_size);
+        let writer = WriterId(90);
+        {
+            let outcome = state.try_attach_single_stream_writer(writer);
+            assert!(matches!(outcome, SingleStreamAttachOutcome::Owner));
+            let _guard = SingleStreamOwnerGuard::new(Arc::clone(&state), writer);
+            assert_eq!(state.single_stream_owner(), Some(writer));
+        } // _guard drops here
+        assert_eq!(
+            state.single_stream_owner(),
+            None,
+            "SingleStreamOwnerGuard::Drop MUST clear single_stream_owner"
+        );
+
+        // Now another writer can attach.
+        let writer2 = WriterId(91);
+        let outcome2 = state.try_attach_single_stream_writer(writer2);
+        assert!(
+            matches!(outcome2, SingleStreamAttachOutcome::Owner),
+            "post-drop, a new single-stream writer must be able to attach as Owner"
+        );
+    }
+
+    #[test]
+    fn clear_single_stream_owner_only_clears_matching_writer() {
+        // #497 Option 1 over-action contract: clearing with a different
+        // writer_id MUST be a no-op. Prevents "writer A times out and
+        // drops its guard but writer B is now the owner — A's drop must
+        // not silently steal B's gate."
+        let chunk_size: u32 = 1024;
+        let state = make_state(chunk_size as u64, chunk_size);
+        let writer_a = WriterId(100);
+        let writer_b = WriterId(101);
+
+        let outcome_a = state.try_attach_single_stream_writer(writer_a);
+        assert!(matches!(outcome_a, SingleStreamAttachOutcome::Owner));
+
+        // Try to clear with writer_b — must be a no-op.
+        state.clear_single_stream_owner_if_owned(writer_b);
+        assert_eq!(
+            state.single_stream_owner(),
+            Some(writer_a),
+            "clear_single_stream_owner_if_owned with non-matching writer_id MUST NOT \
+             clear the slot (over-action protection)"
+        );
+
+        // Clear with the actual owner — succeeds.
+        state.clear_single_stream_owner_if_owned(writer_a);
+        assert_eq!(state.single_stream_owner(), None);
     }
 
     #[test]

@@ -1139,3 +1139,505 @@ async fn commit_runner_drop_without_publish_publishes_synthetic_cancelled() {
         "synthetic publish must use Code::Cancelled per FIX-1 contract"
     );
 }
+
+// -----------------------------------------------------------------------------
+// #497 Option 1: cross-version (Bazel ByteStream v1 + worker WriteChunkedV2)
+// race coordination tests.
+//
+// Today (pre-fix): `BazelChunkedDispatcherImpl::dispatch` (the Bazel
+// ByteStream chunked path) writes to `<digest>.partial` via the
+// `chunked_partials` registry; `WriteChunkedV2::run_v2_session` writes to
+// the SAME `.partial` via the `chunked_race_registry`. The two registries
+// don't see each other → both can pwrite simultaneously, both call
+// commit-rename, second writer's pwrites land on the orphaned inode →
+// sparse-zero corruption (the original #494 bug). These tests demand a
+// single coordination point: a single-stream owner attaches to the
+// race-registry; v2 attaches sees the owner and goes to AwaitCommit.
+// -----------------------------------------------------------------------------
+
+/// Simulate the production v1 Bazel ByteStream path's call into
+/// `BazelChunkedDispatcherImpl::dispatch` by streaming the payload bytes
+/// into a buf channel and feeding the read half to the dispatcher trait
+/// method. Returns the dispatcher's result. The dispatcher writes to
+/// `filesystem_store`'s `chunked_partials` AND (post-fix) to its
+/// `chunked_race_registry` as a single-stream owner.
+async fn run_v1_bazel_dispatch_simulating_bytestream_write(
+    filesystem_store: Arc<FilesystemStore<FileEntryImpl>>,
+    digest: DigestInfo,
+    payload: Vec<u8>,
+) -> Result<u64, nativelink_error::Error> {
+    use nativelink_service::chunked_write_handler::BazelChunkedDispatcherImpl;
+    use nativelink_store::chunked::BazelChunkedDispatcher;
+
+    let dispatcher = BazelChunkedDispatcherImpl::new(filesystem_store)
+        .with_chunk_size_for_test(TEST_CHUNK_SIZE);
+
+    // Pump bytes through a buf channel so the dispatcher sees a real
+    // `DropCloserReadHalf` (matching the production shape).
+    let (mut tx, rx) = nativelink_util::buf_channel::make_buf_channel_pair();
+    let payload_clone = payload.clone();
+    let producer = tokio::spawn(async move {
+        tx.send(Bytes::copy_from_slice(&payload_clone))
+            .await
+            .expect("v1-bazel test producer send must succeed");
+        tx.send_eof().expect("v1-bazel test producer eof must succeed");
+    });
+    let result = dispatcher.dispatch(digest, rx).await;
+    let _ = producer.await;
+    result
+}
+
+// -----------------------------------------------------------------------------
+// #497 REGRESSION TEST: cross-version Bazel ByteStream + v2 race must
+// produce a bit-identical canonical CAS file with NO sparse-zero corruption.
+// -----------------------------------------------------------------------------
+
+/// Bazel ByteStream::write (v1 chunked dispatcher path) and a worker
+/// WriteChunkedV2 RPC concurrently upload the SAME digest. Payload is
+/// crafted to contain NO zero bytes — sparse-zero corruption (the
+/// original #494 mechanism) manifests as zero runs at chunk boundaries.
+///
+/// Pre-fix: both writers race on `<digest>.partial`, second writer's
+/// pwrites land on an orphaned inode after first writer commits + renames,
+/// canonical file contains sparse zeros at the offsets the second writer
+/// "wrote" → end-to-end SHA-256 mismatch + Bazel-visible
+/// FAILED_PRECONDITION on read.
+///
+/// Post-fix: a single-stream owner gate on the race-state arbitrates;
+/// only one path commits, the other awaits via `commit_done`.
+#[nativelink_test]
+async fn cross_version_bazel_v1_plus_v2_no_sparse_zero_corruption_497_option_1() {
+    // Payload constructed specifically to expose the bug: no zero bytes
+    // anywhere, multiple chunks (so a race-overlap on ANY chunk shows
+    // up as a non-trivial divergence), payload length is a multiple of
+    // TEST_CHUNK_SIZE so the chunker emits whole chunks.
+    let payload: Vec<u8> = (0..(4 * TEST_CHUNK_SIZE))
+        .map(|i| 0x77u8.wrapping_add((i & 0x5F) as u8)) // [0x77, 0xD6], non-zero
+        .collect();
+    assert!(
+        !payload.iter().any(|&b| b == 0),
+        "test payload was crafted with NO zero bytes; reformulate if this trips"
+    );
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, content_path) = make_store().await;
+    let budget = make_test_budget();
+    let handler = make_handler(Arc::clone(&store), budget);
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    // Spawn the v1 Bazel ByteStream path AND a v2 RPC simultaneously.
+    // Both target the same digest.
+    let store_for_v1 = Arc::clone(&store);
+    let payload_for_v1 = payload.clone();
+    let v1_handle = tokio::spawn(async move {
+        run_v1_bazel_dispatch_simulating_bytestream_write(store_for_v1, digest, payload_for_v1)
+            .await
+    });
+
+    let chunks_v2 = build_chunks(digest, &payload);
+    let mut c_v2 = client.clone();
+    let v2_handle = tokio::spawn(async move {
+        let stream = tokio_stream::iter(chunks_v2);
+        let response = c_v2.write_chunked_v2(stream).await?;
+        let (final_res, _) = drain_v2_response(response.into_inner()).await;
+        Ok::<_, tonic::Status>(final_res)
+    });
+
+    // Both paths must complete within the deadlock-detector window.
+    let v1_result = tokio::time::timeout(Duration::from_secs(15), v1_handle)
+        .await
+        .expect(
+            "#497 Option 1: v1 Bazel dispatcher must complete within 15s — \
+             cross-version coordination required",
+        )
+        .expect("v1 dispatcher task must not panic");
+    let v2_result = tokio::time::timeout(Duration::from_secs(15), v2_handle)
+        .await
+        .expect(
+            "#497 Option 1: v2 RPC must complete within 15s — \
+             cross-version coordination required",
+        )
+        .expect("v2 RPC task must not panic");
+
+    let v1_size = v1_result.expect("v1 dispatcher must return Ok (cross-version coordinated)");
+    assert_eq!(
+        v1_size,
+        payload.len() as u64,
+        "v1 committed_size must equal payload length"
+    );
+
+    let v2_status_or_size = v2_result.expect("v2 RPC must return tonic::Status::Ok");
+    let v2_size = v2_status_or_size
+        .expect("v2 RPC must observe a final frame")
+        .expect("v2 commit must succeed (cross-version coordinated)");
+    assert_eq!(
+        v2_size,
+        payload.len() as u64,
+        "v2 committed_size must equal payload length"
+    );
+
+    // Canonical CAS file: bit-identical to declared content; NO
+    // sparse-zero corruption.
+    let final_path = format!(
+        "{}/d/{:02x}/{}",
+        content_path,
+        digest.packed_hash()[0],
+        digest
+    );
+    let on_disk = tokio::fs::read(&final_path).await.expect(
+        "#497 Option 1: Bazel ByteStream + WriteChunkedV2 cross-version race must \
+         converge on a bit-identical canonical, no sparse-zero corruption \
+         (canonical CAS file must exist after coordinated commit)",
+    );
+    assert_eq!(
+        on_disk.len(),
+        payload.len(),
+        "#497 Option 1: canonical length mismatch — sparse-zero corruption may have \
+         truncated or extended the canonical file"
+    );
+    assert_eq!(
+        sha256(&on_disk),
+        sha256(&payload),
+        "#497 Option 1: Bazel ByteStream + WriteChunkedV2 cross-version race must \
+         converge on bit-identical canonical, no sparse-zero corruption \
+         (declared SHA != on-disk SHA → race produced corrupted bytes; \
+         this is the original #494 bug)"
+    );
+    let zero_bytes = on_disk.iter().filter(|&&b| b == 0).count();
+    assert_eq!(
+        zero_bytes, 0,
+        "#497 Option 1: canonical CAS file must NOT contain sparse-zero holes \
+         (payload was crafted with NO zero bytes; if this fails, the cross-version \
+         race re-introduced the sparse-zero corruption window)"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// #497 CONVERGENCE TEST: 1 Bazel + 3 v2 writers all return Ok; BIS fires
+// EXACTLY ONCE.
+// -----------------------------------------------------------------------------
+
+#[nativelink_test]
+async fn cross_version_bazel_v1_plus_three_v2_bis_fires_exactly_once_497() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
+        .map(|i| 0x21u8.wrapping_add((i & 0x3F) as u8))
+        .collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let in_flight = nativelink_service::chunked_write_handler::ChunkedWriteInFlight::new();
+
+    let bis_count = Arc::new(AtomicU64::new(0));
+    let bis_count_clone = Arc::clone(&bis_count);
+
+    let handler = Arc::new(
+        ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
+            Arc::clone(&store),
+            in_flight,
+            budget,
+            TEST_CHUNK_SIZE,
+        )
+        .with_v2_stable_digests_sink(Arc::new(move |_d| {
+            bis_count_clone.fetch_add(1, Ordering::Relaxed);
+        })),
+    );
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    // 1 v1 Bazel dispatcher + 3 v2 RPCs.
+    let store_for_v1 = Arc::clone(&store);
+    let payload_for_v1 = payload.clone();
+    let v1_handle = tokio::spawn(async move {
+        run_v1_bazel_dispatch_simulating_bytestream_write(store_for_v1, digest, payload_for_v1)
+            .await
+    });
+
+    let mut v2_handles = Vec::new();
+    for _ in 0..3 {
+        let chunks = build_chunks(digest, &payload);
+        let mut c = client.clone();
+        v2_handles.push(tokio::spawn(async move {
+            let stream = tokio_stream::iter(chunks);
+            let response = c.write_chunked_v2(stream).await?;
+            let (final_res, _) = drain_v2_response(response.into_inner()).await;
+            Ok::<_, tonic::Status>(final_res)
+        }));
+    }
+
+    let v1_size = tokio::time::timeout(Duration::from_secs(15), v1_handle)
+        .await
+        .expect("v1 dispatcher must complete < 15s")
+        .expect("v1 task must not panic")
+        .expect("v1 commit must succeed");
+    assert_eq!(v1_size, payload.len() as u64);
+
+    for h in v2_handles {
+        let r = tokio::time::timeout(Duration::from_secs(15), h)
+            .await
+            .expect("v2 RPC must complete < 15s")
+            .expect("v2 task must not panic")
+            .expect("v2 RPC must return Ok status");
+        let final_res = r.expect("v2 must observe a final frame");
+        let size = final_res.expect("v2 commit must succeed");
+        assert_eq!(size, payload.len() as u64);
+    }
+
+    // BIS sink fires when v1 OR v2 commits. Per #497 Option 1: exactly
+    // ONE writer (across all four) is the commit-runner; the others
+    // observe via commit_done. Exactly one BIS push.
+    assert_eq!(
+        bis_count.load(Ordering::Relaxed),
+        1,
+        "#497 Option 1 convergence: BIS sink must fire EXACTLY ONCE per blob \
+         regardless of whether the commit-runner is v1 or v2 (got {} pushes; \
+         if 0 → no path fired BIS; if >1 → sibling writers re-fired the sink \
+         which would double-count mirror clears)",
+        bis_count.load(Ordering::Relaxed)
+    );
+}
+
+// -----------------------------------------------------------------------------
+// #497 PRIORITY TEST: v2 attaches first → v1 arriving later goes to AwaitCommit
+// (and vice versa).
+//
+// Tests use the underlying race-state APIs directly (rather than through the
+// network stack) to deterministically control attach ordering. Production
+// callers go through `race_state_for_digest_and_attach` (v2) and (post-fix)
+// `race_state_for_digest_and_attach_single_stream` (v1).
+// -----------------------------------------------------------------------------
+
+#[nativelink_test]
+async fn cross_version_priority_v1_first_then_v2_v2_goes_to_await_commit_497() {
+    use nativelink_store::chunked::chunked_race_state::{
+        AdmitOutcome, RaceWriterGuard, SingleStreamAttachOutcome, WriterId,
+    };
+
+    let (store, _content_path) = make_store().await;
+    let mut hash = [0u8; 32];
+    hash[0] = 0xAA;
+    let digest = DigestInfo::new(hash, 4 * TEST_CHUNK_SIZE as u64);
+
+    // v1 attaches as single_stream_owner first.
+    let v1_writer_id = WriterId(101);
+    let (race_state, v1_outcome) = store
+        .race_state_for_digest_and_attach_single_stream(&digest, TEST_CHUNK_SIZE as u32, v1_writer_id);
+    assert!(
+        matches!(v1_outcome, SingleStreamAttachOutcome::Owner),
+        "#497 Option 1 priority: v1 attaching first must observe SingleStreamAttachOutcome::Owner \
+         (got {v1_outcome:?})"
+    );
+
+    // v2 arrives later; attaches via the race-state's attach_writer.
+    let v2_writer_id = WriterId(202);
+    let _v2_guard = RaceWriterGuard::attach(Arc::clone(&race_state), v2_writer_id);
+
+    // v2 tries to admit chunk 0. With single_stream_owner held by v1,
+    // v2's try_admit_chunk MUST return AlreadyHave (driving v2 directly
+    // through the AwaitCommit branch in run_v2_session) — otherwise the
+    // two writers race on the same offset.
+    let v2_admit = race_state.try_admit_chunk(v2_writer_id, 0);
+    assert!(
+        matches!(v2_admit, AdmitOutcome::AlreadyHave),
+        "#497 Option 1 priority: v2 admit while single_stream_owner held by v1 must \
+         return AlreadyHave so v2 transitions to AwaitCommit (got {v2_admit:?})"
+    );
+}
+
+#[nativelink_test]
+async fn cross_version_priority_v2_first_then_v1_v1_goes_to_await_commit_497() {
+    use nativelink_store::chunked::chunked_race_state::{
+        AdmitOutcome, RaceWriterGuard, SingleStreamAttachOutcome, WriterId,
+    };
+
+    let (store, _content_path) = make_store().await;
+    let mut hash = [0u8; 32];
+    hash[0] = 0xBB;
+    let digest = DigestInfo::new(hash, 4 * TEST_CHUNK_SIZE as u64);
+
+    // v2 attaches first via the standard race-state API.
+    let v2_writer_id = WriterId(303);
+    let (race_state, _v2_guard) = store
+        .race_state_for_digest_and_attach(&digest, TEST_CHUNK_SIZE as u32, v2_writer_id);
+    // v2 admits + commits a chunk so the in-flight tracker is populated.
+    let admit_v2 = race_state.try_admit_chunk(v2_writer_id, 0);
+    assert!(
+        matches!(admit_v2, AdmitOutcome::Accept),
+        "v2 (first attacher) must accept its first chunk admission (got {admit_v2:?})"
+    );
+
+    // v1 attaches as single_stream_owner. With v2 already pwriting,
+    // v1 must observe AwaitCommit (NOT Owner) — otherwise both paths
+    // would race the commit.
+    let v1_writer_id = WriterId(404);
+    let (race_state2, v1_outcome) = store
+        .race_state_for_digest_and_attach_single_stream(&digest, TEST_CHUNK_SIZE as u32, v1_writer_id);
+    assert!(
+        Arc::ptr_eq(&race_state, &race_state2),
+        "race-state lookup must return the same Arc (registry is keyed by digest)"
+    );
+    assert!(
+        matches!(v1_outcome, SingleStreamAttachOutcome::AwaitCommit { .. }),
+        "#497 Option 1 priority: v1 attaching after v2 has chunks in-flight must observe \
+         AwaitCommit, NOT Owner (got {v1_outcome:?})"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// testing-czar Gap M: multi-thread race-test for FIX-4 lock-across-attach.
+// The original FIX-4 unit test only asserts post-condition. This test runs
+// many concurrent get-or-create-and-attach AND try_remove_if_unused threads
+// and asserts no thread observes a state with an entry already removed.
+// -----------------------------------------------------------------------------
+
+#[nativelink_test(flavor = "multi_thread", worker_threads = 4)]
+async fn fix_4_concurrent_get_or_create_and_attach_vs_try_remove_no_window() {
+    use nativelink_store::chunked::chunked_race_state::{
+        ChunkRaceRegistry, ChunkRaceState, WriterId,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let registry = Arc::new(ChunkRaceRegistry::new());
+    let mut hash = [0u8; 32];
+    hash[0] = 0xCC;
+    let digest = DigestInfo::new(hash, 1024);
+
+    // Counter of "registry observed missing while we expected presence".
+    let race_violations = Arc::new(AtomicU64::new(0));
+
+    // Spawn 8 attacher threads each doing 1000 get_or_create_and_attach
+    // calls; each attach holds for a brief moment, then releases. A
+    // concurrent remover thread spins try_remove_if_unused.
+    let mut attachers = Vec::new();
+    for i in 0..8 {
+        let r = Arc::clone(&registry);
+        let v = Arc::clone(&race_violations);
+        attachers.push(tokio::spawn(async move {
+            for _ in 0..200 {
+                let writer_id = WriterId(((i + 1) * 1000) as u64);
+                let (state, guard) = r.get_or_create_and_attach(digest, writer_id, || {
+                    ChunkRaceState::new(digest, 1024, PathBuf::from("/tmp/r.partial"))
+                });
+                // The post-condition: while we hold the guard, the
+                // registry MUST have this digest.
+                if r.get(&digest).is_none() {
+                    v.fetch_add(1, Ordering::Relaxed);
+                }
+                // Release.
+                drop(guard);
+                let _ = state;
+            }
+        }));
+    }
+    let r_remover = Arc::clone(&registry);
+    let remover = tokio::spawn(async move {
+        for _ in 0..2000 {
+            let _ = r_remover.try_remove_if_unused(&digest);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    for h in attachers {
+        tokio::time::timeout(Duration::from_secs(15), h)
+            .await
+            .expect("attacher must finish < 15s")
+            .expect("attacher must not panic");
+    }
+    let _ = remover.await;
+
+    assert_eq!(
+        race_violations.load(Ordering::Relaxed),
+        0,
+        "FIX-4 multi-thread: registry must NEVER observe a missing entry while a guard \
+         is alive — atomicity of get-or-create + attach holds across the registry mutex"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// testing-czar Gap N: regression test for FIX-1b — when ack-send fails on
+// the RunCommit path, the commit MUST still run (and BIS sink MUST still fire).
+// -----------------------------------------------------------------------------
+
+/// Construct a single-writer v2 session that hangs up the gRPC client
+/// BEFORE consuming the per-chunk ACCEPTED ack. With FIX-1b in place,
+/// the commit-runner observes `send_err = true` on the final ack, logs,
+/// and proceeds to commit. BIS sink fires once.
+///
+/// Mutation contract (per CLAUDE.md TDD): commenting out FIX-1b's
+/// proceed-on-RunCommit branch (revert to bare `if send_err { return; }`)
+/// must red-fail this test with `bis_count == 0`.
+#[nativelink_test]
+async fn fix_1b_ack_send_failure_on_runcommit_still_fires_bis_sink() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let payload: Vec<u8> = (0..TEST_CHUNK_SIZE).map(|i| (i as u8).wrapping_add(0x88)).collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let in_flight = nativelink_service::chunked_write_handler::ChunkedWriteInFlight::new();
+
+    let bis_count = Arc::new(AtomicU64::new(0));
+    let bis_count_clone = Arc::clone(&bis_count);
+
+    let handler = Arc::new(
+        ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
+            Arc::clone(&store),
+            in_flight,
+            budget,
+            TEST_CHUNK_SIZE,
+        )
+        .with_v2_stable_digests_sink(Arc::new(move |_d| {
+            bis_count_clone.fetch_add(1, Ordering::Relaxed);
+        })),
+    );
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    // Single-chunk blob; one writer; chunk_iter sends and then drops the
+    // client (the response stream's consumer hangs up). The handler's
+    // RunCommit path sees `send_err = true` on the final ack and (per
+    // FIX-1b) still runs the commit, which fires the BIS sink.
+    let chunks = build_chunks(digest, &payload);
+    let mut c = client.clone();
+    let _ = tokio::time::timeout(Duration::from_secs(15), async move {
+        let stream = tokio_stream::iter(chunks);
+        let response = c.write_chunked_v2(stream).await.expect("RPC must reach server");
+        // IMPORTANT: drop the response stream BEFORE consuming any acks.
+        // The server-side commit-runner will then see ack-send Err on
+        // the per-chunk ACCEPTED ack. Per FIX-1b, the commit STILL runs.
+        let mut s = response.into_inner();
+        drop(s.next().await); // discard the first frame to ensure stream is established
+    })
+    .await
+    .expect("must not deadlock");
+
+    // Wait briefly for the server-side commit task to complete.
+    // Use a short polling loop on bis_count; bounded by a 15s timeout.
+    let bis_count_for_wait = Arc::clone(&bis_count);
+    let waiter = async move {
+        loop {
+            if bis_count_for_wait.load(Ordering::Relaxed) >= 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(15), waiter)
+        .await
+        .expect(
+            "FIX-1b: BIS sink MUST fire even when client hangs up before consuming \
+             the final ACCEPTED ack on the RunCommit path. If this trips, the \
+             handler bailed on `send_err && RunCommit` and the commit was never \
+             executed — re-introduces the wedge mode the FIX closed.",
+        );
+
+    assert_eq!(
+        bis_count.load(Ordering::Relaxed),
+        1,
+        "FIX-1b: BIS sink must fire EXACTLY ONCE on the RunCommit path even with \
+         ack-send failure (got {})",
+        bis_count.load(Ordering::Relaxed)
+    );
+}
