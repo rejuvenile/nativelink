@@ -1258,6 +1258,29 @@ pub struct GlobalConfig {
     /// Default: false
     #[serde(default)]
     pub small_blob_mirror_enabled: bool,
+
+    /// #494-v3 Phase 2 master feature flag for the bidi
+    /// `WriteChunkedV2` multi-writer race path. When `true`, the
+    /// per-listener `CasExtensionsServer` is registered with
+    /// `ChunkedCasExtensionsAdapter` (which routes both v1 and v2
+    /// RPCs); when `false`, the adapter is replaced by the bare
+    /// `ChunkedWriteHandler` whose `write_chunked_v2` returns
+    /// `Code::Unimplemented`.
+    ///
+    /// Default OFF until production data justifies the multi-writer
+    /// race-state code path. The v2 handler itself is feature-gated
+    /// behind the `chunked_fast_slow` Cargo feature, so flipping this
+    /// flag has no effect when that feature is compiled out.
+    ///
+    /// **Operator guidance:** before flipping, verify that the
+    /// production wiring includes the v2 BIS / failed-commit sinks
+    /// (`ChunkedWriteHandler::with_v2_stable_digests_sink` /
+    /// `with_v2_failed_commit_sink`). Without those, successful v2
+    /// commits never push to BIS and worker `mirror_blobs` accumulate.
+    ///
+    /// Default: false
+    #[serde(default)]
+    pub chunked_v2_enabled: bool,
 }
 
 fn default_disable_otlp() -> bool {

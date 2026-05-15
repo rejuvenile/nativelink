@@ -402,6 +402,19 @@ pub struct ChunkedWriteHandlerMetrics {
     /// "writers that benefited from another writer's work."
     #[metric(help = "WriteChunkedV2: chunks rejected as ALREADY_HAVE (deduped pre-pwrite)")]
     pub chunked_chunks_already_have_total: AtomicU64,
+    /// #494-v3 Phase 2 fixup (FIX-2 GC): count of race-state registry
+    /// entries force-removed via the watchdog path. Non-zero means a
+    /// commit-runner cancelled / panicked OR a slow-tier wedge tripped
+    /// the watchdog; the alert threshold for this metric should be
+    /// "> 0 in any rolling 5-minute window" because every fire is a
+    /// session that took ≥60 s. Operationally this is the canary for
+    /// the FIX-1 / FIX-2 wedge mode — a healthy production cluster
+    /// should see this stay at 0.
+    #[metric(
+        help = "WriteChunkedV2: race-state registry entries force-removed via the commit watchdog \
+                (commit-runner cancellation/panic OR slow-tier wedge; ≥60s session)"
+    )]
+    pub chunked_race_state_force_removed_total: AtomicU64,
 }
 
 /// Server-side handler for the `WriteChunked` RPC. Holds the
@@ -428,6 +441,20 @@ pub struct ChunkedWriteHandler<Fe: FileEntry = FileEntryImpl> {
     chunk_size: usize,
     #[metric(group = "totals")]
     metrics: Arc<ChunkedWriteHandlerMetrics>,
+    /// #494-v3 Phase 2 (FIX-3 BIS integration): closure invoked on v2
+    /// commit success to push the digest into `stable_digests` so the
+    /// BIS broadcast loop drains worker mirrors. Mirrors the v1 reaper
+    /// at `:2089-2107` exactly. `None` = tests / un-wired production
+    /// (callers see no BIS push; for v2 production this MUST be
+    /// installed via `with_v2_stable_digests_sink`).
+    v2_stable_digests_sink:
+        Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
+    /// #494-v3 Phase 2 (FIX-3 failed_writes integration): closure invoked
+    /// on v2 commit failure to insert the digest into `failed_slow_writes`
+    /// so the worker reconnect-retry surfaces the missing slow-tier
+    /// write. Mirrors the v1 reaper at `:2110-2125`.
+    v2_failed_commit_sink:
+        Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
 }
 
 impl<Fe: FileEntry> core::fmt::Debug for ChunkedWriteHandler<Fe> {
@@ -454,7 +481,67 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             chunk_budget: nativelink_store::chunked::chunk_budget::chunk_budget_singleton(),
             chunk_size: CHUNK_SIZE,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
+            v2_stable_digests_sink: None,
+            v2_failed_commit_sink: None,
         }
+    }
+
+    /// #494-v3 Phase 2 (FIX-3): builder method to wire the v2 commit
+    /// path's success-side BIS push. Production wiring in
+    /// `bin/nativelink.rs` (when `chunked_v2_enabled` is true) MUST
+    /// install this closure (typically obtained from
+    /// `FastSlowStore::stable_digests_pusher()`); without it,
+    /// successful v2 commits skip BIS notification and worker
+    /// `mirror_blobs` accumulate.
+    #[must_use]
+    pub fn with_v2_stable_digests_sink(
+        mut self,
+        sink: Arc<dyn Fn(DigestInfo) + Send + Sync>,
+    ) -> Self {
+        self.v2_stable_digests_sink = Some(sink);
+        self
+    }
+
+    /// #494-v3 Phase 2 (FIX-3): builder method to wire the v2 commit
+    /// path's failure-side `failed_slow_writes` insert. Production
+    /// wiring (when `chunked_v2_enabled` is true) MUST install this
+    /// (typically obtained from `FastSlowStore::failed_writes_inserter()`);
+    /// without it, v2 commit failures don't surface to the worker
+    /// reconnect-retry path.
+    #[must_use]
+    pub fn with_v2_failed_commit_sink(
+        mut self,
+        sink: Arc<dyn Fn(DigestInfo) + Send + Sync>,
+    ) -> Self {
+        self.v2_failed_commit_sink = Some(sink);
+        self
+    }
+
+    /// #494-v3 Phase 2: pub-in-crate accessor for the v2 stable-digests
+    /// sink. The v2 handler uses this on commit success; `None` is a
+    /// no-op (BIS never notified for v2 commits — wiring gap).
+    pub(crate) fn v2_stable_digests_sink_for_v2(
+        &self,
+    ) -> Option<&Arc<dyn Fn(DigestInfo) + Send + Sync>> {
+        self.v2_stable_digests_sink.as_ref()
+    }
+
+    /// Test-only accessor for the metrics Arc. Returns the same Arc the
+    /// handler bumps internally; tests assert on counter values via
+    /// this. Gated on test/test-utils so production cannot accidentally
+    /// rely on it.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn v2_metrics_for_test(&self) -> Arc<ChunkedWriteHandlerMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// #494-v3 Phase 2: pub-in-crate accessor for the v2 failed-commit
+    /// sink. The v2 handler uses this on commit failure.
+    pub(crate) fn v2_failed_commit_sink_for_v2(
+        &self,
+    ) -> Option<&Arc<dyn Fn(DigestInfo) + Send + Sync>> {
+        self.v2_failed_commit_sink.as_ref()
     }
 
     /// Construct a handler with externally-provided in-flight tracker
@@ -475,6 +562,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             chunk_budget,
             chunk_size: CHUNK_SIZE,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
+            v2_stable_digests_sink: None,
+            v2_failed_commit_sink: None,
         }
     }
 
@@ -500,6 +589,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             chunk_budget,
             chunk_size,
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
+            v2_stable_digests_sink: None,
+            v2_failed_commit_sink: None,
         }
     }
 
@@ -1239,21 +1330,46 @@ impl<Fe: FileEntry>
 /// trivially delegated. The bare-handler trait impl above stays so the
 /// in-tree integration tests that pass a bare `ChunkedWriteHandler`
 /// keep compiling.
+///
+/// **v2_enabled gate:** when `false`, `write_chunked_v2` returns
+/// `Code::Unimplemented` so an old-server-effective behavior is
+/// preserved even when the adapter is wired (FIX-7 production-wiring
+/// gate). Production toggles this via the `chunked_v2_enabled`
+/// `GlobalConfig` flag (default OFF). Tests construct with
+/// `new_with_v2_enabled(true)` to exercise the v2 path.
 #[derive(Debug, Clone)]
 pub struct ChunkedCasExtensionsAdapter<Fe: FileEntry = FileEntryImpl> {
     inner: Arc<ChunkedWriteHandler<Fe>>,
+    v2_enabled: bool,
 }
 
 impl<Fe: FileEntry> ChunkedCasExtensionsAdapter<Fe> {
     /// Wrap an existing `Arc<ChunkedWriteHandler>` for trait-based
-    /// gRPC server registration.
+    /// gRPC server registration. v2 enabled by default — tests use
+    /// this; production callers SHOULD use `new_with_v2_enabled(false)`
+    /// unless `chunked_v2_enabled=true` in `GlobalConfig`.
     pub fn new(inner: Arc<ChunkedWriteHandler<Fe>>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            v2_enabled: true,
+        }
+    }
+
+    /// Wrap an existing `Arc<ChunkedWriteHandler>` with explicit
+    /// v2-enabled gate. Used by production wiring in `bin/nativelink.rs`
+    /// to honor the `GlobalConfig.chunked_v2_enabled` flag.
+    pub fn new_with_v2_enabled(inner: Arc<ChunkedWriteHandler<Fe>>, v2_enabled: bool) -> Self {
+        Self { inner, v2_enabled }
     }
 
     /// Borrow the wrapped handler.
     pub fn inner(&self) -> &Arc<ChunkedWriteHandler<Fe>> {
         &self.inner
+    }
+
+    /// Whether the v2 RPC route is enabled (false → Unimplemented).
+    pub fn v2_enabled(&self) -> bool {
+        self.v2_enabled
     }
 }
 
@@ -1275,6 +1391,12 @@ impl<Fe: FileEntry>
         &self,
         request: Request<Streaming<WriteChunk>>,
     ) -> Result<Response<Self::WriteChunkedV2Stream>, Status> {
+        if !self.v2_enabled {
+            return Err(Status::unimplemented(
+                "WriteChunkedV2: disabled via GlobalConfig.chunked_v2_enabled=false; \
+                 operator must opt in (default OFF until production data justifies)",
+            ));
+        }
         ChunkedWriteHandler::write_chunked_v2(Arc::clone(&self.inner), request).await
     }
 }

@@ -876,13 +876,25 @@ async fn inner_main(
             // outbound chunked stream lands on a Routes builder that
             // has no CasExtensions service and gets Code::Unimplemented
             // — the production bug this commit fixes.
+            // FIX-3 + FIX-7: wire the v2 BIS push + failed-commit
+            // sinks into the ChunkedWriteHandler. Same closures the v1
+            // BazelChunkedDispatcher uses (above), so v2 commits get
+            // identical post-commit bookkeeping.
+            //
+            // The handler is constructed unconditionally — bin-side
+            // routing decides whether to wrap it with
+            // ChunkedCasExtensionsAdapter (v2 enabled) or register it
+            // directly (v2 disabled, returns Code::Unimplemented).
+            // Sinks are still safe to install when v2 is disabled
+            // because v2's RPC handler itself is gated.
+            let handler = nativelink_service::chunked_write_handler::ChunkedWriteHandler::<FileEntryImpl>::new(
+                fs_arc,
+            )
+            .with_v2_stable_digests_sink(fss.stable_digests_pusher())
+            .with_v2_failed_commit_sink(fss.failed_writes_inserter());
             chunked_write_handlers.insert(
                 store_name.clone(),
-                Arc::new(
-                    nativelink_service::chunked_write_handler::ChunkedWriteHandler::<FileEntryImpl>::new(
-                        fs_arc,
-                    ),
-                ),
+                Arc::new(handler),
             );
             info!(
                 store_name,
@@ -1296,20 +1308,41 @@ async fn inner_main(
                     .find_map(|c| chunked_write_handlers.get(&c.config.cas_store).cloned())
             });
 
-        // Builder helper for the CasExtensions service (#212 v4.5).
+        // Builder helper for the CasExtensions service (#212 v4.5,
+        // FIX-7: now uses ChunkedCasExtensionsAdapter unconditionally).
         // Returns Some(service) only when the feature is on AND a
         // handler exists for this listener; otherwise None so the
         // Routes builder skips it cleanly.
+        //
+        // The v2 RPC behavior depends on `GlobalConfig.chunked_v2_enabled`:
+        //   - true:  WriteChunkedV2 routes to the bidi v2 handler;
+        //   - false: WriteChunkedV2 returns Code::Unimplemented (default).
+        // v1 (`WriteChunked`) ALWAYS routes to the v1 handler regardless;
+        // the adapter trivially delegates `write_chunked` to the inner
+        // ChunkedWriteHandler.
+        //
+        // `cfg` is the parent CasConfig — we read the optional `global`
+        // section the same way other call sites in this file do (e.g.
+        // line 245 worker_proxy_tls and lines 660-664 small_blob_mirror).
+        #[cfg(feature = "chunked_fast_slow")]
+        let chunked_v2_enabled = cfg
+            .global
+            .as_ref()
+            .is_some_and(|g| g.chunked_v2_enabled);
         #[cfg(feature = "chunked_fast_slow")]
         let make_cas_extensions_service = |handler: Option<Arc<nativelink_service::chunked_write_handler::ChunkedWriteHandler<nativelink_store::filesystem_store::FileEntryImpl>>>| -> Option<
             nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_server::CasExtensionsServer<
-                nativelink_service::chunked_write_handler::ChunkedWriteHandler<
+                nativelink_service::chunked_write_handler::ChunkedCasExtensionsAdapter<
                     nativelink_store::filesystem_store::FileEntryImpl,
                 >,
             >,
         > {
             let handler = handler?;
-            let mut service = nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_server::CasExtensionsServer::from_arc(handler);
+            let adapter = nativelink_service::chunked_write_handler::ChunkedCasExtensionsAdapter::new_with_v2_enabled(
+                handler,
+                chunked_v2_enabled,
+            );
+            let mut service = nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_server::CasExtensionsServer::new(adapter);
             service = service.max_decoding_message_size(max_decoding);
             service = service.max_encoding_message_size(max_encoding);
             if let ListenerConfig::Http(ref http_config) = server_cfg.listener {
@@ -2539,6 +2572,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             worker_proxy_tls_key_file: None,
             bazel_facing_internal_chunking_enabled: false,
             small_blob_mirror_enabled: false,
+            chunked_v2_enabled: false,
         }
     };
 

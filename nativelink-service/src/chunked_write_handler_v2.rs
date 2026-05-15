@@ -34,16 +34,29 @@
 //!    writer's `WriterId` from every `chunks_in_flight[*]` slot;
 //!    chunks_present bits stay set; surviving writers can finish
 //!    the blob.
-//! 3. Failed-commit-sink fires EXACTLY ONCE per failed commit (the
-//!    commit-runner produces; siblings observe + propagate via the
-//!    notify).
-//! 4. PinBudget / ChunkBudget: only ACCEPTED chunks consume a permit
-//!    (admission gates on `try_admit_chunk`); RACING_LOSER /
-//!    ALREADY_HAVE never installed permits.
+//! 3. Commit-runner panic-safety: `CommitRunnerGuard::drop` publishes a
+//!    synthetic `Code::Cancelled` Err if the commit-runner exited
+//!    without publishing a real result (FIX-1 / FIX-2). Sibling writers
+//!    waiting on `commit_done` wake immediately rather than the 60 s
+//!    watchdog. The watchdog AwaitCommit branch additionally calls
+//!    `force_remove(&digest)` so a fresh writer arriving after a wedge
+//!    gets a clean state.
+//! 4. BIS / failed_commit sinks (FIX-3, OPTIONAL): when wired via
+//!    `with_v2_stable_digests_sink` / `with_v2_failed_commit_sink`, the
+//!    commit-runner pushes the digest into BIS on success or into
+//!    `failed_slow_writes` on failure. Mirrors the v1 reaper at
+//!    `chunked_write_handler.rs:2089-2125`. Tests verify these fire
+//!    EXACTLY ONCE per commit (`v2_bis_stable_digests_sink_fires_exactly_once_on_success`).
+//!    PinBudget / ChunkBudget integration is NOT wired in this PR
+//!    (followup tracker — v2 currently bypasses the existing
+//!    admission-budget triangle; integration will require a sibling
+//!    of FIX-3 across `try_admit_chunk` to reserve permits).
 //!
 //! **Backwards compatibility:** clients that don't speak v2 keep using
 //! the unary `WriteChunked` RPC; servers that don't support v2 return
-//! `Code::Unimplemented` (default trait impl) and clients fall back.
+//! `Code::Unimplemented` (the bare-handler trait impl AND the
+//! `ChunkedCasExtensionsAdapter` honor the `chunked_v2_enabled` config
+//! flag — default OFF — so production v2 wiring is opt-in).
 
 #![cfg(feature = "chunked_fast_slow")]
 
@@ -52,7 +65,7 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
@@ -62,14 +75,13 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     write_chunked_frame,
 };
 use nativelink_store::chunked::chunked_race_state::{
-    AdmitOutcome, ChunkRaceState, CommitResponsibility, RaceCommitResult, RaceWriterGuard,
+    AdmitOutcome, ChunkRaceState, CommitResponsibility, CommitRunnerGuard, RaceCommitResult,
     WriterId,
 };
 use nativelink_store::filesystem_store::FileEntry;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::cpu_pool::cpu_pool;
 use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
-use tokio::sync::oneshot;
 
 use crate::chunked_write_handler::{ChunkedWriteHandler, ChunkedWriteHandlerMetrics};
 
@@ -183,18 +195,18 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             return;
         }
 
-        // Get-or-create the race-state for this digest.
-        let race_state = self
-            .filesystem_store_for_v2()
-            .race_state_for_digest(&digest, chunk_size_u32);
-
-        // Attach this writer; mints a fresh WriterId and bumps the
-        // attached count. The guard's Drop fires on every exit path
-        // (panic, early return, normal completion) and (a) purges
-        // any in-flight slot still owned by this writer-id, (b)
-        // decrements the attached counter.
+        // FIX-4: Atomic get-or-create + attach via the registry. The
+        // previous pattern (separate get_or_create + RaceWriterGuard::attach)
+        // had an 8-line TOCTOU window where a concurrent
+        // `try_remove_if_unused` could remove the entry between the
+        // two calls, splitting concurrent writers across two distinct
+        // race-states for the same digest. The combined call holds
+        // the registry mutex across both steps.
         let writer_id = next_writer_id();
-        let mut race_guard = Some(RaceWriterGuard::attach(Arc::clone(&race_state), writer_id));
+        let (race_state, race_guard) = self
+            .filesystem_store_for_v2()
+            .race_state_for_digest_and_attach(&digest, chunk_size_u32, writer_id);
+        let mut race_guard = Some(race_guard);
 
         // Update the `chunked_writers_per_digest_max` metric.
         let attached = race_state.attached_writer_count();
@@ -304,17 +316,12 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                         return;
                     }
                     // For the final chunk, transition to AwaitCommit
-                    // unconditionally. Even if the bitmap isn't yet
-                    // complete (some other writer is still mid-flight
-                    // on a chunk we lost), our send queue is exhausted
-                    // and we must wait for the commit to fire so our
-                    // client gets a response.
+                    // unconditionally. A writer that lost its final
+                    // chunk to ALREADY_HAVE didn't pwrite the last
+                    // bit, so it cannot be the commit-runner; await
+                    // whoever did flip the last bit to publish.
                     if finish {
-                        commit_responsibility = Some(if race_state.is_complete() {
-                            CommitResponsibility::AwaitCommit
-                        } else {
-                            CommitResponsibility::AwaitCommit
-                        });
+                        commit_responsibility = Some(CommitResponsibility::AwaitCommit);
                         break;
                     }
                     continue;
@@ -409,7 +416,14 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             // observe).
             let resp = race_state.mark_chunk_committed(writer_id, chunk_offset);
 
-            // Send ACCEPTED ack back to client.
+            // Send ACCEPTED ack back to client. If `resp == RunCommit`,
+            // ignore the send error (client hung up between pwrite and
+            // ack): we MUST still run the commit-runner path because
+            // sibling writers depend on a published result. Stripping
+            // the early-return here closes the wedge mode where a
+            // client disconnect after the last bit-flip leaves
+            // `commit_running=true` and no published result, which
+            // would force every sibling to wait the full watchdog.
             metrics.chunks_admitted_total.fetch_add(1, Ordering::Relaxed);
             let frame = WriteChunkedFrame {
                 payload: Some(write_chunked_frame::Payload::Ack(WriteChunkedAck {
@@ -418,26 +432,42 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                     already_have_max_offset: 0,
                 })),
             };
-            if frame_tx.send(Ok(frame)).await.is_err() {
-                // Client hung up; abort. Race-state guard's Drop will
-                // purge any in-flight markers, but `chunks_present` bit
-                // for this offset stays set — surviving writers can
-                // still complete the blob.
+            let send_err = frame_tx.send(Ok(frame)).await.is_err();
+            if send_err && !matches!(resp, CommitResponsibility::RunCommit) {
+                // Client hung up AND we're not the commit-runner. Abort
+                // — race-state guard's Drop purges in-flight markers
+                // (chunks_present bit for this offset stays set;
+                // surviving writers can still complete the blob).
                 return;
+            }
+            if send_err {
+                // RunCommit + send error: log so operators can correlate
+                // server-side commit progress with client-disconnect
+                // events; do NOT return.
+                debug!(
+                    target: "nativelink_service::chunked_write_handler_v2",
+                    ?digest,
+                    ?writer_id,
+                    chunk_offset,
+                    "WriteChunkedV2: ack-send failed on RunCommit path; \
+                     proceeding to commit so siblings observe a result",
+                );
             }
 
             match resp {
                 CommitResponsibility::ContinueSending => {
                     if finish {
-                        // Producer protocol violation? The producer sent
-                        // finish_chunk=true but the bitmap is not full.
-                        // Wait for it to fill (other writers may still
-                        // be sending). We treat this as "we're done
-                        // sending; await commit triggered by some
-                        // writer." Note: in well-formed multi-writer
-                        // races, finish=true on a non-final-bit-flip is
-                        // a legitimate signal — this writer is done,
-                        // others are still racing.
+                        // Producer sent finish_chunk=true but the
+                        // bitmap is not full. Wait for it to fill
+                        // (other writers may still be sending). In
+                        // well-formed multi-writer races, finish=true
+                        // on a non-final-bit-flip is a legitimate
+                        // signal — this writer is done, others are
+                        // still racing. (Reference: design doc
+                        // "race-loser flow" §multi-writer; ContinueSending
+                        // fires when a writer's pwrite completed but the
+                        // bitmap is not yet fully covered, which is the
+                        // expected mid-race state.)
                         commit_responsibility = Some(CommitResponsibility::AwaitCommit);
                         break;
                     }
@@ -458,7 +488,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         //  - exhausted the request stream (Ok(None)): commit_responsibility
         //    may be None (writer didn't send finish), or Some(_) (writer
         //    observed the trigger).
-        //  - sent a finish chunk: commit_responsibility is set.
+        //  - sent a finish chunk: commit_responsibility is Some(_).
         //
         // Multi-writer case: a writer that lost EVERY chunk to RACING_LOSER
         // / ALREADY_HAVE may finish its send loop with the bitmap not yet
@@ -467,26 +497,17 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // commit will fire imminently, and the writer's client wants the
         // final response. Surfacing Aborted here would needlessly wedge
         // the client even though the blob WILL be committed.
-        let writer_sent_finish = commit_responsibility.is_some();
         let resp = match commit_responsibility {
             Some(r) => r,
             None => {
                 // Writer didn't observe a commit trigger during its send
-                // loop. Three sub-cases:
+                // loop. Two sub-cases:
                 //  (a) bitmap already complete (some other writer flipped
                 //      the last bit during our loop) → AwaitCommit.
-                //  (b) bitmap not complete BUT writer sent finish_chunk
-                //      somewhere (so all chunks are accounted-for from
-                //      our side) → AwaitCommit, trusting other writers
-                //      to fill the missing bits.
-                //  (c) writer truly aborted (didn't send finish, bitmap
+                //  (b) writer truly aborted (didn't send finish, bitmap
                 //      not complete) → relinquish to other writers,
                 //      surface Aborted.
                 if race_state.is_complete() {
-                    CommitResponsibility::AwaitCommit
-                } else if writer_sent_finish {
-                    // Defensive — `commit_responsibility` should be Some
-                    // when finish was sent. Belt-and-suspenders.
                     CommitResponsibility::AwaitCommit
                 } else {
                     debug!(
@@ -509,7 +530,13 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
 
         match resp {
             CommitResponsibility::RunCommit => {
-                // We're the commit-runner. Run the full commit path
+                // We're the commit-runner. Construct the runner-guard
+                // FIRST so any panic / cancellation between here and
+                // mark_complete() publishes a synthetic Cancelled Err
+                // instead of leaving siblings to wedge on the watchdog.
+                let runner_guard = CommitRunnerGuard::from_state(Arc::clone(&race_state));
+
+                // Run the full commit path
                 // (commit_to_holding → blake3 verify → finalize_holding)
                 // and publish the result for sibling writers.
                 let commit_result = self
@@ -520,6 +547,27 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 // we want siblings to wake immediately. Race state's
                 // Notify::notify_waiters fires synchronously.
                 race_state.publish_commit_result(commit_result.clone());
+                // Now mark the runner-guard complete; subsequent Drop
+                // is a no-op. Order matters: publish FIRST, then
+                // mark_complete; if the order were reversed, a panic
+                // between them would leave commit_done unpublished AND
+                // the guard would skip the synthetic Cancelled Err.
+                runner_guard.mark_complete();
+
+                // FIX-3 BIS / failed_writes integration. On commit
+                // success: push to stable_digests_sink so the BIS
+                // broadcast loop drains worker mirror_blobs. On commit
+                // failure: insert into failed_slow_writes via
+                // failed_commit_sink so the worker reconnect-retry
+                // picks up the digest. Mirrors the v1 reaper at
+                // chunked_write_handler.rs:2089-2125.
+                self.v2_fire_post_commit_sinks(&digest, &commit_result);
+
+                // FIX-5 cross-writer metric: pull the per-state
+                // counter into the exported total so operators see a
+                // non-zero `chunked_chunks_accepted_from_cross_writer_total`
+                // when a cross-writer race actually completed a chunk.
+                v2_pump_cross_writer_metric(&race_state, &metrics);
 
                 // Drop the race_guard EXPLICITLY before trying to remove
                 // the registry entry — try_remove_if_unused only removes
@@ -543,6 +591,34 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 // Some other writer is the commit-runner. Wait for the
                 // result via the race-state's Notify.
                 let result = v2_await_commit_result(&race_state).await;
+
+                // FIX-2 watchdog → force_remove. If the watchdog fired
+                // (DeadlineExceeded), the registry entry is wedged
+                // (commit_running=true, no published result). Force-
+                // remove it so a fresh writer arriving after this wedge
+                // gets a clean state. Bump the wedge-event metric so
+                // operators can alert on it.
+                let watchdog_fired = matches!(
+                    &result,
+                    Err(e) if e.code == Code::DeadlineExceeded
+                );
+                if watchdog_fired {
+                    metrics
+                        .chunked_race_state_force_removed_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        target: "nativelink_service::chunked_write_handler_v2",
+                        ?digest,
+                        ?writer_id,
+                        "WriteChunkedV2: commit-watchdog fired; force-removing \
+                         wedged race-state entry from registry",
+                    );
+                    let _ = self
+                        .filesystem_store_for_v2()
+                        .chunked_race_registry()
+                        .force_remove(&digest);
+                }
+
                 if let Some(guard) = race_guard.take() {
                     guard.relinquish();
                 }
@@ -640,6 +716,78 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             committed_size: expected_size,
         })
     }
+
+    /// FIX-3 BIS / failed_writes integration. Mirrors the v1 reaper at
+    /// `chunked_write_handler.rs:2089-2125` exactly:
+    ///   - Ok(_): push the digest into `stable_digests_sink` so the BIS
+    ///     broadcast loop drains worker `mirror_blobs` for this digest.
+    ///   - Err(_): insert the digest into `failed_slow_writes` via
+    ///     `failed_commit_sink` so the worker reconnect-retry can
+    ///     re-attempt the slow-tier write.
+    ///
+    /// Wires NOT installed in this PR for production (sinks gated to
+    /// only fire when `with_v2_*_sink` was called in the constructor
+    /// chain). Production wiring lives in `bin/nativelink.rs` behind a
+    /// `chunked_v2_enabled` config flag (default OFF).
+    fn v2_fire_post_commit_sinks(
+        self: &Arc<Self>,
+        digest: &DigestInfo,
+        commit_result: &Result<RaceCommitResult, Error>,
+    ) {
+        match commit_result {
+            Ok(_) => {
+                if let Some(sink) = self.v2_stable_digests_sink_for_v2() {
+                    sink(*digest);
+                    debug!(
+                        target: "nativelink_service::chunked_write_handler_v2",
+                        ?digest,
+                        "WriteChunkedV2: pushed to stable_digests on commit success",
+                    );
+                }
+            }
+            Err(_) => {
+                if let Some(sink) = self.v2_failed_commit_sink_for_v2() {
+                    sink(*digest);
+                    debug!(
+                        target: "nativelink_service::chunked_write_handler_v2",
+                        ?digest,
+                        "WriteChunkedV2: inserted into failed_slow_writes on commit failure",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// FIX-5: pump the per-state `cross_writer_committed_chunks` counter
+/// into the exported `chunked_chunks_accepted_from_cross_writer_total`
+/// metric. Called at commit-runner exit so the metric reflects the
+/// total cross-writer dedup work this race produced. Race state's
+/// counter is monotone within its lifetime (Arc dropped at end of race),
+/// so we read once at end + add to the global.
+fn v2_pump_cross_writer_metric(
+    race_state: &Arc<ChunkRaceState>,
+    metrics: &Arc<ChunkedWriteHandlerMetrics>,
+) {
+    let n = race_state.cross_writer_committed_count();
+    if n > 0 {
+        metrics
+            .chunked_chunks_accepted_from_cross_writer_total
+            .fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Test-only re-export of `v2_pump_cross_writer_metric` for the FIX-5
+/// integration test. The function is module-private; tests in
+/// `tests/chunked_write_handler_v2_test.rs` are in a separate compilation
+/// unit and need this entry point.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn v2_pump_cross_writer_metric_for_test(
+    race_state: &Arc<ChunkRaceState>,
+    metrics: &Arc<ChunkedWriteHandlerMetrics>,
+) {
+    v2_pump_cross_writer_metric(race_state, metrics);
 }
 
 /// Atomic max-store helper. Reads current, updates iff new is greater.

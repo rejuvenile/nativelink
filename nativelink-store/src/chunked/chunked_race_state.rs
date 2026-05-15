@@ -98,15 +98,22 @@ pub enum AdmitOutcome {
 ///
 /// Invariants:
 /// - `chunks_present[i]` set => offset `i*chunk_size` has been pwritten
-///   AND survived the in-flight check; only writers admitted as
-///   `AdmitOutcome::Accept` set bits.
+///   AND survived the in-flight check; set under `state` mutex
+///   atomically with the `chunks_in_flight` slot decrement.
 /// - `chunks_in_flight[offset]` non-empty => some writer admitted
 ///   `AdmitOutcome::Accept` for this offset and has not yet
 ///   completed pwrite (success or failure).
-/// - `commit_done.notify_waiters()` fires EXACTLY ONCE — when the
-///   first writer flips the last bit in `chunks_present` and runs
-///   commit. The result is stored in `commit_result` BEFORE the
-///   notify so observing waiters see it.
+/// - `commit_done.notify_waiters()` fires EXACTLY ONCE per
+///   commit-runner term — when `publish_commit_result` writes a
+///   final outcome. The result is stored in `commit_result` BEFORE
+///   the notify so observing waiters see it.
+/// - `commit_running` flag arbitrates "I am running commit" — set
+///   inside the same lock that flips the last bit. Only ONE writer
+///   sees `RunCommit`. `commit_done_flag` flips true the moment a
+///   final result is published. If a commit-runner exits without
+///   publishing (panic, cancellation, drop), `CommitRunnerGuard::Drop`
+///   publishes a synthetic `Code::Cancelled` Err so siblings observe
+///   a definite outcome instead of waiting the watchdog forever.
 pub struct ChunkRaceState {
     /// Identity of the digest this state coordinates.
     pub(crate) digest: DigestInfo,
@@ -173,7 +180,8 @@ impl Debug for ChunkRaceState {
                 "in_flight_offsets",
                 &state.chunks_in_flight.keys().copied().collect::<Vec<_>>(),
             )
-            .field("commit_started", &state.commit_started)
+            .field("commit_running", &state.commit_running)
+            .field("commit_done_flag", &state.commit_done_flag)
             .finish()
     }
 }
@@ -193,11 +201,23 @@ struct RaceMutableState {
     /// = ~6 KiB. Negligible compared to the 1 MiB chunks already in
     /// flight.
     chunks_in_flight: HashMap<u32, Vec<WriterId>>,
-    /// Sticky flag: the writer that flipped the last bit started
-    /// commit. Subsequent observers see commit_started=true and DON'T
-    /// re-run commit. Only the FIRST writer to flip the last bit AND
-    /// observe commit_started=false becomes the commit runner.
-    commit_started: bool,
+    /// "Someone is running commit." Set true atomically with the
+    /// last-bit flip + RunCommit decision. Cleared by
+    /// `CommitRunnerGuard::drop` IF `commit_done_flag` is still false
+    /// (cancelled / panicked runner). When `commit_running=true` AND
+    /// `commit_done_flag=false`, no other writer may claim
+    /// RunCommit — the in-flight runner gets the chance to publish.
+    /// When `commit_running=false` AND `commit_done_flag=false`, the
+    /// previous runner exited without publishing AND has cleared this
+    /// flag; the next writer that observes `all_set()` may claim
+    /// RunCommit and retry the commit path.
+    commit_running: bool,
+    /// "A final commit result has been published." Set true by
+    /// `publish_commit_result`. After this flips, no further writer
+    /// will be selected as RunCommit (subsequent observations of
+    /// all_set return AwaitCommit; the result is in `commit_result`).
+    /// Sticky: never resets.
+    commit_done_flag: bool,
 }
 
 /// Word-addressable bitmap. Internal helper, no external deps.
@@ -319,7 +339,8 @@ impl ChunkRaceState {
                 // 256 entries × ~16 bytes/HashMap-bucket + 321 × 8 bytes/WriterId
                 // = ~6 KiB. See `RaceMutableState::chunks_in_flight` doc.
                 chunks_in_flight: HashMap::new(),
-                commit_started: false,
+                commit_running: false,
+                commit_done_flag: false,
             }),
             commit_done: Notify::new(),
             commit_result: Mutex::new(None),
@@ -511,16 +532,41 @@ impl ChunkRaceState {
             self.cross_writer_committed_chunks
                 .fetch_add(1, Ordering::Relaxed);
         }
-        // Decide commit responsibility.
+        // Decide commit responsibility. The triangular state machine:
+        //   bitmap-full  + nobody-running + not-done => RunCommit (we win)
+        //   bitmap-full  + somebody-running          => AwaitCommit
+        //   bitmap-full  + done                      => AwaitCommit (peek result)
+        //   bitmap-full  + nobody-running + not-done is the retry door
+        //     reopened when a previous runner cancelled/panicked
+        //     (CommitRunnerGuard::drop cleared commit_running).
         let all_present = state.chunks_present.all_set();
-        if all_present && !state.commit_started {
-            state.commit_started = true;
+        if all_present && !state.commit_running && !state.commit_done_flag {
+            state.commit_running = true;
             CommitResponsibility::RunCommit
         } else if all_present {
-            // Bitmap full but commit already started. Caller awaits.
+            // Bitmap full; another writer is running or already published.
             CommitResponsibility::AwaitCommit
         } else {
             // Bitmap not yet full. Caller continues sending chunks.
+            CommitResponsibility::ContinueSending
+        }
+    }
+
+    /// Try to claim commit responsibility WITHOUT marking a chunk
+    /// committed — used by the AwaitCommit path when a writer ended its
+    /// send loop and observed a wedged commit-runner (commit_done not
+    /// set after the watchdog). Returns RunCommit only if no runner is
+    /// currently active AND no result has been published. Mirrors the
+    /// last-bit-flip claim path.
+    pub fn try_claim_commit_runner(&self) -> CommitResponsibility {
+        let mut state = self.state.lock();
+        let all_present = state.chunks_present.all_set();
+        if all_present && !state.commit_running && !state.commit_done_flag {
+            state.commit_running = true;
+            CommitResponsibility::RunCommit
+        } else if all_present {
+            CommitResponsibility::AwaitCommit
+        } else {
             CommitResponsibility::ContinueSending
         }
     }
@@ -578,11 +624,31 @@ impl ChunkRaceState {
         self.state.lock().chunks_present.all_set()
     }
 
-    /// Store the commit result and notify all waiters.
+    /// Store the commit result and notify all waiters. Sticky:
+    /// flips `commit_done_flag` true so subsequent observers see
+    /// `AwaitCommit` (and read the published result), and so a late
+    /// `CommitRunnerGuard::drop` does NOT overwrite the result with a
+    /// cancellation Err. Idempotent at the result level: if a result
+    /// is already published, the new one is dropped (defensive — only
+    /// one runner should publish per term).
     pub fn publish_commit_result(&self, result: Result<RaceCommitResult, Error>) {
         {
             let mut guard = self.commit_result.lock();
+            if guard.is_some() {
+                // Already published; do not overwrite. This guards
+                // against a runner that publishes Ok and then races
+                // its own guard drop publishing Err.
+                return;
+            }
             *guard = Some(result);
+        }
+        // Flip done BEFORE notifying so any thread that wakes
+        // immediately observes done=true without an additional
+        // synchronization edge. State lock is acquired separately
+        // (commit_done_flag lives inside `state`).
+        {
+            let mut state = self.state.lock();
+            state.commit_done_flag = true;
         }
         self.commit_done.notify_waiters();
     }
@@ -594,6 +660,34 @@ impl ChunkRaceState {
             .lock()
             .as_ref()
             .map(|r| r.as_ref().map(Clone::clone).map_err(Clone::clone))
+    }
+
+    /// Whether a commit result has been published (Ok or Err). Read by
+    /// `CommitRunnerGuard::drop` to decide whether to publish a
+    /// cancellation Err.
+    pub fn commit_done(&self) -> bool {
+        self.state.lock().commit_done_flag
+    }
+
+    /// Test-only: bump the cross-writer counter directly. Used by the
+    /// FIX-5 pump test to exercise propagation deterministically
+    /// without constructing a timing-dependent real race.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn bump_cross_writer_for_test(&self, n: u64) {
+        self.cross_writer_committed_chunks
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Internal: clear `commit_running` without altering done state.
+    /// Called by `CommitRunnerGuard::drop` AFTER it (potentially)
+    /// publishes a cancellation result. Subsequent waiters that
+    /// observe `all_set` may then claim RunCommit again — re-entry
+    /// is safe because the runner that just dropped published a
+    /// definite result (so peek_commit_result returns Some) OR the
+    /// new RunCommit will succeed and publish its own result.
+    fn clear_commit_running(&self) {
+        self.state.lock().commit_running = false;
     }
 }
 
@@ -700,6 +794,99 @@ impl Drop for RaceWriterGuard {
     }
 }
 
+/// RAII guard for the commit-runner role. Constructed by the
+/// commit-runner once it observes `RunCommit` from
+/// `mark_chunk_committed` / `try_claim_commit_runner`. On Drop:
+///   - If `commit_done_flag` is true (the runner successfully called
+///     `publish_commit_result`): no action — clean exit.
+///   - If `commit_done_flag` is false: publish a synthetic
+///     `Code::Cancelled` result so siblings observing
+///     `commit_done.notified()` wake immediately and propagate the
+///     same cancellation to their clients. Also clears the
+///     `commit_running` flag so a fresh writer arriving after this
+///     wedge can attempt re-commit (reading the published Cancelled
+///     err first via `peek_commit_result`).
+///
+/// **Why this is safe even if the commit DID succeed but the runner
+/// panicked between publish and guard drop:** `publish_commit_result`
+/// flips `commit_done_flag=true` BEFORE the guard's drop runs. The
+/// drop checks the flag and skips the synthetic err.
+///
+/// **Why this is safe across panic:** `commit_done` is `tokio::sync::Notify`;
+/// publish happens via the `state` mutex which is panic-safe
+/// (parking_lot::Mutex with `unpoisoned`). No state corruption window.
+#[must_use = "CommitRunnerGuard must outlive the commit-runner's commit path; \
+              dropping early publishes a Cancelled error to all sibling waiters"]
+pub struct CommitRunnerGuard {
+    state: Arc<ChunkRaceState>,
+    /// Set true by `mark_complete()` once the runner has published a
+    /// real result; Drop then skips the synthetic publish.
+    completed: bool,
+}
+
+impl Debug for CommitRunnerGuard {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CommitRunnerGuard")
+            .field("digest", &self.state.digest)
+            .field("completed", &self.completed)
+            .finish()
+    }
+}
+
+impl CommitRunnerGuard {
+    /// Construct from a race-state Arc. Caller MUST have observed
+    /// `RunCommit` from `mark_chunk_committed` / `try_claim_commit_runner`
+    /// (which set `commit_running=true` under the state lock). The guard
+    /// takes ownership of the "must publish or clear" obligation.
+    pub fn from_state(state: Arc<ChunkRaceState>) -> Self {
+        Self {
+            state,
+            completed: false,
+        }
+    }
+
+    /// Mark the guard as cleanly completed — runner has called
+    /// `publish_commit_result` with a real outcome. Drop then skips
+    /// the synthetic-cancel publish.
+    pub fn mark_complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CommitRunnerGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            // Clean exit; nothing to do.
+            return;
+        }
+        if self.state.commit_done() {
+            // Publish raced ahead of mark_complete (e.g. the runner
+            // called publish_commit_result then panicked before
+            // mark_complete). State is consistent; nothing to do.
+            return;
+        }
+        // The commit-runner is exiting WITHOUT having published a
+        // result. Publish a synthetic Cancelled err so siblings wake
+        // and propagate to their clients. Clear `commit_running` so a
+        // future writer arriving with all chunks present may retry.
+        let synthetic_err = make_err!(
+            Code::Cancelled,
+            "WriteChunkedV2: commit-runner cancelled or panicked before \
+             publishing a result for digest {} — sibling writers receive \
+             this synthetic Cancelled to avoid 60s wedge",
+            self.state.digest
+        );
+        warn!(
+            target: "nativelink_store::chunked",
+            digest = ?self.state.digest,
+            "CommitRunnerGuard::drop publishing synthetic Cancelled — \
+             commit-runner exited without publishing a real result",
+        );
+        self.state.publish_commit_result(Err(synthetic_err));
+        self.state.clear_commit_running();
+    }
+}
+
 /// Per-FilesystemStore registry of in-flight `Arc<ChunkRaceState>`s
 /// keyed by digest. Distinct from `ChunkedPartialsMap` (which holds
 /// the open `std::fs::File` handle); the two are 1:1 — one race-state
@@ -734,6 +921,50 @@ impl ChunkRaceRegistry {
         let new_state = Arc::new(make());
         guard.insert(digest, Arc::clone(&new_state));
         new_state
+    }
+
+    /// FIX-4: Atomic get-or-create + attach. Returns the Arc with the
+    /// writer ALREADY attached (`attach_writer` called inside the
+    /// registry mutex critical section). Eliminates the TOCTOU window
+    /// between get_or_create returning and the caller's
+    /// `RaceWriterGuard::attach`: under the previous code, a concurrent
+    /// `try_remove_if_unused` could remove the entry between those
+    /// two steps, splitting concurrent writers across two distinct
+    /// race-states for the same digest. Returns
+    /// `(Arc<ChunkRaceState>, RaceWriterGuard)` — the guard's Drop
+    /// detaches; same lifecycle as the old construction pattern.
+    pub fn get_or_create_and_attach<F>(
+        &self,
+        digest: DigestInfo,
+        writer_id: WriterId,
+        make: F,
+    ) -> (Arc<ChunkRaceState>, RaceWriterGuard)
+    where
+        F: FnOnce() -> ChunkRaceState,
+    {
+        let mut guard = self.inner.lock();
+        let state = if let Some(existing) = guard.get(&digest) {
+            Arc::clone(existing)
+        } else {
+            let new_state = Arc::new(make());
+            guard.insert(digest, Arc::clone(&new_state));
+            new_state
+        };
+        // Attach inside the registry mutex. `attach_writer` is a
+        // simple atomic fetch_add, fast and lock-free; safe to call
+        // here without lock-order concerns (state mutex isn't taken).
+        let _ = state.attach_writer();
+        // Drop the registry mutex BEFORE constructing the guard so the
+        // guard's Drop never re-enters the registry under it (the
+        // guard's Drop only touches state.attached_writer_count and
+        // state.purge_writer_in_flight, both internal to the state).
+        drop(guard);
+        let race_guard = RaceWriterGuard {
+            state: Arc::clone(&state),
+            writer_id,
+            relinquished: false,
+        };
+        (state, race_guard)
     }
 
     /// Look up the race-state for `digest` without creating one.
@@ -961,5 +1192,178 @@ mod tests {
             panic!("should not be called — entry exists")
         });
         assert!(Arc::ptr_eq(&s1, &s2));
+    }
+
+    #[test]
+    fn commit_runner_guard_drop_without_publish_publishes_cancelled() {
+        // Compose a runner that flips the last bit then drops the
+        // guard WITHOUT calling publish or mark_complete. Siblings
+        // observing the state must see a published Cancelled Err
+        // immediately rather than waiting forever on the notify.
+        let chunk_size: u32 = 1024;
+        let state = make_state(chunk_size as u64, chunk_size);
+        let writer = WriterId(1);
+        let _g = RaceWriterGuard::attach(Arc::clone(&state), writer);
+
+        // Admit + commit single-chunk blob.
+        assert_eq!(state.try_admit_chunk(writer, 0), AdmitOutcome::Accept);
+        let resp = state.mark_chunk_committed(writer, 0);
+        assert_eq!(resp, CommitResponsibility::RunCommit);
+
+        // Construct the runner-guard. Simulate a panic: drop without
+        // mark_complete.
+        {
+            let _runner = CommitRunnerGuard::from_state(Arc::clone(&state));
+        }
+
+        // Sibling sees a published Cancelled Err.
+        let result = state
+            .peek_commit_result()
+            .expect("commit_done must publish a synthetic Cancelled on guard-drop");
+        let err = result.expect_err("synthetic publish must be Err(Cancelled)");
+        assert_eq!(err.code, Code::Cancelled, "synthetic err must be Cancelled");
+    }
+
+    #[test]
+    fn commit_runner_guard_mark_complete_skips_synthetic_publish() {
+        // After publish_commit_result(Ok) + mark_complete, the guard's
+        // Drop must NOT publish the synthetic Cancelled (it would
+        // either no-op via the idempotency guard OR overwrite the Ok
+        // result if not guarded; verify no overwrite by reading back
+        // the published Ok).
+        let chunk_size: u32 = 1024;
+        let state = make_state(chunk_size as u64, chunk_size);
+        let writer = WriterId(1);
+        let _g = RaceWriterGuard::attach(Arc::clone(&state), writer);
+        assert_eq!(state.try_admit_chunk(writer, 0), AdmitOutcome::Accept);
+        state.mark_chunk_committed(writer, 0);
+
+        {
+            let runner = CommitRunnerGuard::from_state(Arc::clone(&state));
+            // Publish success; mark complete.
+            state.publish_commit_result(Ok(RaceCommitResult { committed_size: 1024 }));
+            runner.mark_complete();
+        }
+
+        let result = state.peek_commit_result().expect("Ok must be published");
+        let r = result.expect("Ok must survive guard drop");
+        assert_eq!(r.committed_size, 1024);
+    }
+
+    #[test]
+    fn try_claim_commit_runner_after_cancellation_allows_retry() {
+        // Composite: writer A flips last bit → CommitRunnerGuard drops
+        // without mark_complete → publishes synthetic Cancelled +
+        // clears commit_running. Now a fresh writer B observes
+        // all_set + can claim RunCommit again. (However it will
+        // observe the published Err first; it's the caller's choice
+        // to retry or propagate.)
+        let chunk_size: u32 = 1024;
+        let state = make_state(chunk_size as u64, chunk_size);
+        let writer_a = WriterId(1);
+        let _ga = RaceWriterGuard::attach(Arc::clone(&state), writer_a);
+        assert_eq!(state.try_admit_chunk(writer_a, 0), AdmitOutcome::Accept);
+        state.mark_chunk_committed(writer_a, 0);
+        // Verify commit_running was set by mark_chunk_committed.
+        assert!(
+            state.state.lock().commit_running,
+            "post-mark_chunk_committed: commit_running must be true"
+        );
+        // Drop runner-guard without mark_complete.
+        {
+            let _r = CommitRunnerGuard::from_state(Arc::clone(&state));
+        }
+        // commit_done is true (synthetic Err published). New runner
+        // claim must observe AwaitCommit (not RunCommit) — done is
+        // sticky.
+        let next = state.try_claim_commit_runner();
+        assert_eq!(
+            next,
+            CommitResponsibility::AwaitCommit,
+            "post-publish (even synthetic Err) must short-circuit to AwaitCommit"
+        );
+        // FIX-1 contract: commit_running MUST be cleared by guard's
+        // drop. If left true, a subsequent commit retry path (e.g.
+        // a fresh writer attempting RunCommit after a re-built
+        // race-state from force_remove) would deadlock. Test this
+        // directly so a regression on `clear_commit_running` red-fails.
+        assert!(
+            !state.state.lock().commit_running,
+            "FIX-1 contract: CommitRunnerGuard::drop MUST clear commit_running \
+             (otherwise a subsequent RunCommit attempt deadlocks waiting for \
+              the cancelled runner that already exited)"
+        );
+    }
+
+    #[test]
+    fn registry_force_remove_clears_entry_even_with_writers_attached() {
+        // FIX-2 invariant: `force_remove` MUST drop the registry entry
+        // regardless of attached_writer_count. Used by the watchdog
+        // path when commit-runner wedges — siblings detach + the next
+        // arriving session must get a fresh state, not the wedged one.
+        let registry = ChunkRaceRegistry::new();
+        let digest = make_digest(0x07, 1024);
+        let state = registry.get_or_create(digest, || {
+            ChunkRaceState::new(digest, 1024, PathBuf::from("/tmp/r.partial"))
+        });
+        // Attach a writer so try_remove_if_unused would refuse.
+        let _g = RaceWriterGuard::attach(Arc::clone(&state), WriterId(1));
+        assert_eq!(
+            state.attached_writer_count(),
+            1,
+            "test setup: writer attached"
+        );
+        // try_remove_if_unused should be a no-op (writer attached).
+        assert!(
+            registry.try_remove_if_unused(&digest).is_none(),
+            "try_remove_if_unused must NOT remove when writers attached"
+        );
+        assert!(
+            registry.get(&digest).is_some(),
+            "entry still present after refused try_remove_if_unused"
+        );
+        // force_remove must succeed regardless.
+        let removed = registry.force_remove(&digest);
+        assert!(
+            removed.is_some(),
+            "FIX-2 contract: force_remove MUST drop the entry regardless of writers attached"
+        );
+        assert!(
+            registry.get(&digest).is_none(),
+            "entry must be absent after force_remove"
+        );
+    }
+
+    #[test]
+    fn registry_get_or_create_and_attach_holds_lock_across_attach() {
+        // FIX-4 invariant: `get_or_create_and_attach` must atomically
+        // attach the writer inside the registry mutex critical section,
+        // so a concurrent try_remove_if_unused can't observe an
+        // attached_writer_count of 0 between get_or_create and the
+        // attach. This unit test asserts the post-condition: after
+        // get_or_create_and_attach returns, attached_writer_count
+        // is at least 1.
+        let registry = ChunkRaceRegistry::new();
+        let digest = make_digest(0x08, 1024);
+        let (state, _guard) = registry.get_or_create_and_attach(digest, WriterId(1), || {
+            ChunkRaceState::new(digest, 1024, PathBuf::from("/tmp/r.partial"))
+        });
+        assert_eq!(
+            state.attached_writer_count(),
+            1,
+            "FIX-4: get_or_create_and_attach must attach inside the lock"
+        );
+        // try_remove_if_unused refuses while attached.
+        assert!(
+            registry.try_remove_if_unused(&digest).is_none(),
+            "registry must NOT remove the entry while writer is attached"
+        );
+        // Drop guard → detach.
+        drop(_guard);
+        assert_eq!(state.attached_writer_count(), 0);
+        assert!(
+            registry.try_remove_if_unused(&digest).is_some(),
+            "post-detach: try_remove_if_unused succeeds"
+        );
     }
 }

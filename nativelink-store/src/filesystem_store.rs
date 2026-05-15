@@ -1496,6 +1496,34 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         })
     }
 
+    /// #494-v3 Phase 2 (FIX-4): atomic get-or-create + attach. Holds the
+    /// registry mutex across both steps so a concurrent
+    /// `try_remove_if_unused` can't split concurrent writers across
+    /// two distinct race-states. Returns `(Arc<ChunkRaceState>, RaceWriterGuard)`
+    /// — guard's Drop detaches.
+    pub fn race_state_for_digest_and_attach(
+        &self,
+        digest: &DigestInfo,
+        chunk_size: u32,
+        writer_id: crate::chunked::chunked_race_state::WriterId,
+    ) -> (
+        Arc<crate::chunked::chunked_race_state::ChunkRaceState>,
+        crate::chunked::chunked_race_state::RaceWriterGuard,
+    ) {
+        let partial_path = crate::chunked::chunked_filesystem::partial_temp_path(
+            &self.shared_context.temp_path,
+            digest,
+        );
+        self.chunked_race_registry
+            .get_or_create_and_attach(*digest, writer_id, || {
+                crate::chunked::chunked_race_state::ChunkRaceState::new(
+                    *digest,
+                    chunk_size,
+                    partial_path,
+                )
+            })
+    }
+
     /// #494-v3 Phase 2: drop the race-state for `digest` if no writers
     /// are still attached. Returns the removed Arc on success. Used by
     /// the commit-runner after `publish_commit_result`.
