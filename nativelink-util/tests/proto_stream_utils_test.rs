@@ -20,10 +20,12 @@ use bytes::Bytes;
 use futures::StreamExt;
 use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
-use nativelink_proto::google::bytestream::WriteRequest;
+use nativelink_proto::google::bytestream::{ReadResponse, WriteRequest};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::proto_stream_utils::{
-    GRPC_WRITE_SLOW_CHUNK_TOTAL, WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
+    GRPC_READ_SLOW_CHUNK_TOTAL, GRPC_READ_SLOW_CHUNK_THRESHOLD, GRPC_WRITE_SLOW_CHUNK_TOTAL,
+    ReadProgressObserver, WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
+    grpc_stream_counters_arc,
 };
 use parking_lot::Mutex;
 use pretty_assertions::assert_eq;
@@ -763,4 +765,280 @@ async fn client_finish_write_true_with_byte_mismatch_returns_invalid_argument()
     );
 
     Ok(())
+}
+
+// --------------------------------------------------------------------
+// #479: per-chunk progress observability on gRPC READ paths.
+//
+// `ReadProgressObserver` wraps any READ stream
+// (bytestream::ReadResponse, GetTreeResponse, etc.) and bumps
+// `GRPC_READ_SLOW_CHUNK_TOTAL` + emits a `warn!` whenever no chunk
+// arrives for `GRPC_READ_SLOW_CHUNK_THRESHOLD`. **Diagnostic-only**:
+// the observer never aborts the stream; mirrors the WRITE-side
+// behaviour after the 2026-05-14 kill-switch removal.
+//
+// These tests exercise the asymmetric contract pair:
+//   - Under-action: stuck producer must bump the counter (counter
+//     fires when stream stuck).
+//   - Over-action: progressing producer must NOT bump the counter
+//     (no spurious fires when stream healthy).
+//
+// Both halves matter — without the over-action gate, a future
+// re-arm-bug could fire on every chunk and pollute the counter.
+// --------------------------------------------------------------------
+
+/// Build a producer-driven stream of `ReadResponse` that lets the test
+/// drive chunk arrivals via the returned `tokio::sync::mpsc::Sender`.
+fn make_read_stream() -> (
+    tokio::sync::mpsc::UnboundedSender<Result<ReadResponse, Error>>,
+    UnboundedReceiverStream<Result<ReadResponse, Error>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<ReadResponse, Error>>();
+    (tx, UnboundedReceiverStream::new(rx))
+}
+
+/// Slow-but-progressing producer: chunks every 5 s for 30 s, threshold
+/// 15 s. The observer must NOT bump its counter — the inner stream is
+/// making forward progress, just slowly. Mutation: drop the
+/// `Sleep::reset` in the Pending->Ready arm; the timer would never
+/// re-arm and this test would red-fail because the counter advances
+/// once the cumulative wall-clock crosses 15 s.
+///
+/// Serialised via `#[serial(grpc_read_counter)]` because the counter
+/// is a process-wide static and the over-action assertion compares
+/// against a baseline taken at test start; a parallel test bumping
+/// the counter would race the assertion.
+#[serial_test::serial(grpc_read_counter)]
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn read_observer_does_not_fire_on_slow_but_progressing_stream() -> Result<(), Error> {
+    let baseline = GRPC_READ_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+
+    let (tx, rx) = make_read_stream();
+    // 6 chunks total. Pre-send one synchronously so the observer's
+    // first arm-the-deadline branch fires before time advances.
+    tx.send(Ok(ReadResponse {
+        data: Bytes::from_static(b"data"),
+    }))
+    .unwrap();
+    let observer = ReadProgressObserver::with_threshold(
+        "test::read_observer_progressing",
+        rx,
+        Duration::from_secs(15),
+    );
+    tokio::pin!(observer);
+
+    // Producer pushes one chunk every 5 s for 25 more seconds (5 chunks).
+    let producer = tokio::spawn(async move {
+        for _ in 1..6 {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            tx.send(Ok(ReadResponse {
+                data: Bytes::from_static(b"data"),
+            }))
+            .unwrap();
+        }
+        drop(tx);
+    });
+
+    let mut received = 0;
+    while let Some(item) = observer.next().await {
+        item?;
+        received += 1;
+    }
+    producer.await.unwrap();
+    assert_eq!(received, 6, "expected 6 chunks delivered");
+
+    // No spurious fires: the per-chunk gap is 5 s, the threshold is
+    // 15 s, so the deadline must never elapse.
+    let after = GRPC_READ_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    assert_eq!(
+        after,
+        baseline,
+        "ReadProgressObserver MUST NOT fire on slow-but-progressing streams \
+         (5s chunk gap × 15s threshold) — over-action gate (#479)",
+    );
+    Ok(())
+}
+
+/// Stuck producer: emits one chunk, then stops. The observer MUST
+/// bump the counter at each `threshold` boundary while the inner
+/// stream stays Pending, MUST emit `warn!`, and MUST NOT terminate
+/// the wrapped stream (the next poll after the producer resumes
+/// continues the stream). Mutation: removing the
+/// `record_grpc_read_slow_chunk_and_maybe_warn` call OR returning
+/// `Poll::Ready(None)` instead of `Poll::Pending` red-fails this
+/// test with the bespoke message.
+///
+/// Serialised via `#[serial(grpc_read_counter)]` because the counter
+/// is a process-wide static and the under-action assertion compares
+/// the post-test value against a baseline; a parallel test bumping
+/// the counter would race the assertion.
+#[serial_test::serial(grpc_read_counter)]
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn read_observer_warns_and_increments_counter_but_does_not_abort_on_threshold()
+-> Result<(), Error> {
+    let baseline = GRPC_READ_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+
+    let (tx, rx) = make_read_stream();
+    // Pre-send one chunk so the observer arms its first deadline.
+    tx.send(Ok(ReadResponse {
+        data: Bytes::from_static(b"data"),
+    }))
+    .unwrap();
+    let observer = ReadProgressObserver::with_threshold(
+        "test::read_observer_stuck",
+        rx,
+        Duration::from_secs(15),
+    );
+    tokio::pin!(observer);
+    let first = observer.next().await.expect("first chunk");
+    first?;
+
+    // Producer goes silent for ~50 s. With a 15 s threshold we expect
+    // at least 3 counter bumps (one per window crossed). After the
+    // stall, producer resumes and delivers the final two chunks.
+    let producer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        tx.send(Ok(ReadResponse {
+            data: Bytes::from_static(b"data"),
+        }))
+        .unwrap();
+        tx.send(Ok(ReadResponse {
+            data: Bytes::from_static(b"done"),
+        }))
+        .unwrap();
+        drop(tx);
+    });
+
+    let second = observer
+        .next()
+        .await
+        .expect(
+            "ReadProgressObserver must NOT abort the stream — \
+             diagnostic-only per #479 (mirroring WRITE-side 2026-05-14)",
+        );
+    second?;
+    let third = observer.next().await.expect("third chunk");
+    third?;
+    assert!(observer.next().await.is_none(), "observer must drain to EOF");
+
+    producer.await.unwrap();
+
+    let after = GRPC_READ_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    let delta = after.saturating_sub(baseline);
+    assert!(
+        delta >= 3,
+        "expected >=3 slow-chunk counter increments (one per 15s window in 50s of silence), \
+         got {delta} (baseline={baseline}, after={after})",
+    );
+    assert!(
+        logs_contain("GrpcStore::read made no progress"),
+        "expected per-event diagnostic warn line",
+    );
+    Ok(())
+}
+
+/// Production constant verification (CLAUDE.md "Reviewer prompt for any
+/// diff that claims to change a numeric constant" gate): the threshold
+/// is hardcoded to 15 s. Doc comments and field declarations can drift;
+/// this test asserts the literal expression at the declaration site.
+#[test]
+fn grpc_read_slow_chunk_threshold_is_15_seconds() {
+    assert_eq!(
+        GRPC_READ_SLOW_CHUNK_THRESHOLD,
+        Duration::from_secs(15),
+        "#479 hardcoded constant — change requires updating the test AND the field",
+    );
+}
+
+/// Production-composition gate (CLAUDE.md "Test in production
+/// composition, not in isolation" + #160 publisher-body gate): both
+/// `grpc_read_slow_chunks_total` and `grpc_write_slow_chunks_total`
+/// MUST appear in the body produced by `render_prometheus`. Without
+/// this, the counter exists on the struct but is invisible to
+/// operators — the exact #485 mistake we're explicitly avoiding here.
+///
+/// Mutation step: comment out the
+/// `nativelink_metric::publish!("grpc_read_slow_chunks_total", ...)`
+/// call inside `GrpcStreamCounters::publish`. This test must red-fail
+/// with the bespoke `#479 fix gate: ...` message so a future
+/// regression triage points straight at the contract.
+///
+/// Serialised via `#[serial(grpc_read_counter)]` to avoid racing the
+/// over/under-action tests above which assert exact counter deltas.
+#[serial_test::serial(grpc_read_counter)]
+#[test]
+fn grpc_stream_counters_publish_emits_both_via_render_prometheus() {
+    use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+    // Bump the counters so we can also assert the values flow through
+    // (separates "publish emitted nothing" from "publish emitted
+    // garbage"). We add a known delta — not the absolute value —
+    // because other tests in the same process may have bumped them.
+    let read_baseline = GRPC_READ_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    let write_baseline = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    GRPC_READ_SLOW_CHUNK_TOTAL.fetch_add(7, Ordering::Relaxed);
+    GRPC_WRITE_SLOW_CHUNK_TOTAL.fetch_add(11, Ordering::Relaxed);
+
+    let registry = MetricsRegistry::new();
+    registry.register("grpc_stream", grpc_stream_counters_arc());
+    let body = render_prometheus(&registry);
+
+    assert!(
+        body.contains("grpc_stream_grpc_read_slow_chunks_total"),
+        "#479 fix gate: GrpcStreamCounters::publish must emit \
+         grpc_read_slow_chunks_total so SREs can scrape per-chunk \
+         READ-side observability via /metrics. body=\n{body}",
+    );
+    assert!(
+        body.contains("grpc_stream_grpc_write_slow_chunks_total"),
+        "#479 fix gate (#485 cleanup): GrpcStreamCounters::publish must \
+         emit grpc_write_slow_chunks_total — the WRITE-side counter \
+         existed since 2026-05-14 but was never exposed to /metrics; \
+         this registration closes that gap. body=\n{body}",
+    );
+
+    // Belt-and-suspenders: the values reflect live state, not zero.
+    let read_now = GRPC_READ_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    let write_now = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+    assert!(
+        read_now >= read_baseline + 7,
+        "GRPC_READ_SLOW_CHUNK_TOTAL should reflect our +7 bump; \
+         baseline={read_baseline}, now={read_now}",
+    );
+    assert!(
+        write_now >= write_baseline + 11,
+        "GRPC_WRITE_SLOW_CHUNK_TOTAL should reflect our +11 bump; \
+         baseline={write_baseline}, now={write_now}",
+    );
+    // The body lines should contain the live values; we substring-
+    // match on the numbers to catch a publish that emits the field
+    // name but always-zero value.
+    let read_line = body
+        .lines()
+        .find(|l| l.starts_with("grpc_stream_grpc_read_slow_chunks_total "))
+        .expect("read line must exist");
+    let write_line = body
+        .lines()
+        .find(|l| l.starts_with("grpc_stream_grpc_write_slow_chunks_total "))
+        .expect("write line must exist");
+    let read_val: u64 = read_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("parseable u64");
+    let write_val: u64 = write_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("parseable u64");
+    assert_eq!(
+        read_val, read_now,
+        "scraped read value must equal the live atomic — publish() \
+         must read at scrape time, not at registration time"
+    );
+    assert_eq!(
+        write_val, write_now,
+        "scraped write value must equal the live atomic — publish() \
+         must read at scrape time, not at registration time"
+    );
 }

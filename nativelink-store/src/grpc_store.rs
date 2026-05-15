@@ -49,7 +49,7 @@ use nativelink_util::connection_manager::ConnectionManager;
 use nativelink_util::digest_hasher::{DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::health_utils::HealthStatusIndicator;
 use nativelink_util::proto_stream_utils::{
-    FirstStream, WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
+    FirstStream, ReadProgressObserver, WriteRequestStreamWrapper, WriteState, WriteStateWrapper,
 };
 use nativelink_util::resource_info::ResourceInfo;
 use nativelink_util::retry::{Retrier, RetryResult};
@@ -925,7 +925,16 @@ impl GrpcStore {
         let mut request = grpc_request.into_inner();
         request.instance_name.clone_from(&self.instance_name);
         let is_worker = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
-        self.perform_request(request, |request| async move {
+        // #479: batch_read_blobs is a unary RPC, so per-chunk
+        // observability collapses to wall-clock RPC time — capture it
+        // and emit one INFO per call so SREs can grep
+        // `GrpcStore::batch_read_blobs` to see every batch's latency
+        // without a debug filter. The slow-call warn fires when the
+        // RPC takes >5 s.
+        let digest_count = request.digests.len();
+        let call_start = std::time::Instant::now();
+        let instance_name_for_log = self.instance_name.clone();
+        let result = self.perform_request(request, |request| async move {
             let mut grpc_request = Request::new(request);
             if is_worker {
                 grpc_request.metadata_mut().insert(
@@ -960,7 +969,26 @@ impl GrpcStore {
                 }
             }
         })
-        .await
+        .await;
+        let elapsed_ms = call_start.elapsed().as_millis() as u64;
+        if elapsed_ms > 5000 {
+            warn!(
+                instance_name = %instance_name_for_log,
+                digest_count,
+                elapsed_ms,
+                ok = result.is_ok(),
+                "GrpcStore::batch_read_blobs slow call (>5s) — \
+                 confirm transport health (h2/TCP/QUIC keepalive, slow-tier hiccup)",
+            );
+        }
+        info!(
+            instance_name = %instance_name_for_log,
+            digest_count,
+            elapsed_ms,
+            ok = result.is_ok(),
+            "GrpcStore::batch_read_blobs call completed (#479)",
+        );
+        result
     }
 
     pub async fn get_tree(
@@ -974,7 +1002,18 @@ impl GrpcStore {
 
         let mut request = grpc_request.into_inner();
         request.instance_name.clone_from(&self.instance_name);
-        self.perform_request(request, |request| async move {
+        // Capture the call start so we can warn on slow get_tree
+        // completions (#479): a get_tree that takes >5 s is a typical
+        // sign of slow-tier hiccup or remote scheduler latency. Per-
+        // chunk progress is harder to wire here because callers use
+        // tonic's Streaming::message() (sync envelope, not the
+        // Stream poll path); the per-chunk observer wraps READ-side
+        // streaming reads instead. The wall-clock log on completion
+        // closes the silence gap by giving SREs at least one INFO
+        // line per get_tree call.
+        let call_start = std::time::Instant::now();
+        let instance_name_for_log = self.instance_name.clone();
+        let result = self.perform_request(request, |request| async move {
             match &self.transport {
                 Transport::Tcp(cm) => {
                     let channel = cm
@@ -1002,7 +1041,29 @@ impl GrpcStore {
                 }
             }
         })
-        .await
+        .await;
+        // Diagnostic log: every call (success or failure) gets one
+        // INFO so a journal grep `GrpcStore::get_tree` always shows
+        // wall-clock time. The slow-call warn surfaces above the
+        // INFO when wall-clock exceeds 5 s — operationally the same
+        // shape as the bytestream_server slow-completion warn.
+        let elapsed_ms = call_start.elapsed().as_millis() as u64;
+        if elapsed_ms > 5000 {
+            warn!(
+                instance_name = %instance_name_for_log,
+                elapsed_ms,
+                ok = result.is_ok(),
+                "GrpcStore::get_tree slow call (>5s) — \
+                 confirm transport health (h2/TCP/QUIC keepalive, slow-tier hiccup)",
+            );
+        }
+        info!(
+            instance_name = %instance_name_for_log,
+            elapsed_ms,
+            ok = result.is_ok(),
+            "GrpcStore::get_tree call completed (#479)",
+        );
+        result
     }
 
     fn get_read_request(&self, mut request: ReadRequest) -> Result<ReadRequest, Error> {
@@ -1107,7 +1168,17 @@ impl GrpcStore {
             .message()
             .await
             .err_tip(|| "Fetching first chunk in GrpcStore::read()")?;
-        Ok(FirstStream::new(first_response, response))
+        // #479: wrap the response stream so SREs can observe per-chunk
+        // arrival pacing (process-wide GRPC_READ_SLOW_CHUNK_TOTAL counter
+        // + rate-limited warn) on EVERY single-stream read. The
+        // observer is structurally transparent — diagnostic-only —
+        // and never aborts the stream. The label disambiguates this
+        // path from `get_part_parallel`'s parallel chunk reads in
+        // journal greps.
+        Ok(ReadProgressObserver::new(
+            "GrpcStore::read_internal",
+            FirstStream::new(first_response, response),
+        ))
     }
 
     pub async fn read<R>(

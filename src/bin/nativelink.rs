@@ -525,6 +525,28 @@ async fn inner_main(
         );
     }
 
+    // #479 / #485 fix-up: register the global GrpcStreamCounters
+    // singleton so every `/metrics` listener exposes
+    // `grpc_stream.grpc_read_slow_chunks_total` (#479 — new per-chunk
+    // observer on bytestream + grpc_store READ paths) and
+    // `grpc_stream.grpc_write_slow_chunks_total` (#485 — diagnostic
+    // counter added 2026-05-14 but never wired to MetricsRegistry).
+    //
+    // Both counters are process-wide statics in
+    // `nativelink_util::proto_stream_utils`. The
+    // `GrpcStreamCounters::publish` impl reads them at scrape time so
+    // a single registration covers both directions — no risk of one
+    // being silently un-published like #485 was for 1 day.
+    //
+    // Registration is ONCE here (not per-store / per-server) because
+    // the counters are process-global; double-registration would
+    // publish duplicate lines. Same shape as the
+    // pin_budget/chunk_budget singletons above.
+    metrics_registry.register(
+        "grpc_stream",
+        nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),
+    );
+
     // First-listener-wins guard: when more than one ServerConfig hosts
     // a worker_api block, the SECOND construction would register the
     // same metrics tree under the same prefix and double every line.

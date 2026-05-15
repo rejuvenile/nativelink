@@ -20,12 +20,16 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use futures::{Stream, StreamExt};
 use nativelink_error::{Code, Error, ResultExt, error_if, make_err, make_input_err};
+use nativelink_metric::{
+    MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+};
 use nativelink_proto::google::bytestream::{ReadResponse, WriteRequest};
 use parking_lot::Mutex;
+use pin_project_lite::pin_project;
 use tokio::time::Sleep;
 use tonic::{Status, Streaming};
 use tracing::warn;
@@ -107,6 +111,326 @@ fn record_grpc_write_slow_chunk_and_maybe_warn(instance_name: &str, progress_tim
         // First-call seed.
         *guard = Some(baseline);
     }
+}
+
+// ---------------------------------------------------------------------
+// READ-side per-chunk progress observability (#479).
+//
+// Mirrors the WRITE-side machinery above. Every gRPC READ path
+// (`bytestream_server::read`, `bytestream_server::zero_copy_read`,
+// `grpc_store::read_internal`, `grpc_store::get_tree`) wraps its
+// response stream with [`ReadProgressObserver`] so SREs can
+// `journalctl -g GrpcStore::read` to see chunk-arrival cadence on every
+// in-flight stream. Without this, READ paths emit zero per-stream INFO
+// logs in production — three sub-agent investigations of slow downloads
+// were misdirected because the silence looked like an inactive
+// connection. Per `feedback_no_log_no_proof_of_silence.md`.
+//
+// **Diagnostic-only**, same contract as the WRITE side: bump the
+// counter, emit `warn!`, re-arm the deadline, return Pending. Do NOT
+// abort, do NOT terminate, do NOT translate to `DeadlineExceeded`.
+// Dead-connection detection is the transport's job (h2/TCP/QUIC
+// keepalive); per-chunk timers are observability only.
+// ---------------------------------------------------------------------
+
+/// Process-wide counter of per-chunk no-progress observations on READ
+/// streams. Each increment corresponds to a `warn!` line (rate-limited
+/// via [`record_grpc_read_slow_chunk_and_maybe_warn`]) describing one
+/// gap exceeded; if a stream stays stuck for N×[`GRPC_READ_SLOW_CHUNK_THRESHOLD`],
+/// the counter advances by N.
+///
+/// Counter is `pub` for downstream metrics surfaces and integration
+/// tests; mirrors the WRITE-side [`GRPC_WRITE_SLOW_CHUNK_TOTAL`].
+pub static GRPC_READ_SLOW_CHUNK_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Hardcoded observability threshold for the READ-side per-chunk
+/// progress observer. This is **not** a configurable timeout — gRPC
+/// READ paths have no notion of a per-chunk deadline today, and
+/// introducing one would invite the same kill-switch regressions the
+/// 2026-05-14 WRITE-side conversion eliminated. 15 s is large enough
+/// to absorb realistic slow-but-progressing reads (a 50 MB blob over a
+/// degraded link, ZFS L2ARC warmup, or a server-side `ExistenceCache`
+/// negative-result re-check) without spamming, and small enough that
+/// a true wedge surfaces well before any operator-noticed slowness.
+pub const GRPC_READ_SLOW_CHUNK_THRESHOLD: Duration = Duration::from_secs(15);
+
+/// Last-warn timestamp + count baseline for the READ-side rate-limited
+/// loud `warn!`. Same shape as [`SLOW_CHUNK_WARN_STATE`] for the WRITE
+/// side — process-wide single-writer state under its own mutex so the
+/// two paths don't share a baseline (cross-talk would mask one path's
+/// burst behind the other's quiet period).
+static READ_SLOW_CHUNK_WARN_STATE: parking_lot::Mutex<Option<(std::time::Instant, u64)>> =
+    parking_lot::Mutex::new(None);
+
+/// Bump [`GRPC_READ_SLOW_CHUNK_TOTAL`] and emit a per-event `warn!`,
+/// plus a louder rate-limited `warn!` when more than
+/// [`SLOW_CHUNK_WARN_THRESHOLD`] events land in the same
+/// [`SLOW_CHUNK_WARN_WINDOW`]. Diagnostic-only — the caller continues
+/// polling the inner stream after this returns.
+///
+/// `label` identifies the READ site (e.g. `"GrpcStore::read"`,
+/// `"GrpcStore::get_tree"`, `"bytestream_server::read"`) so SREs can
+/// disambiguate which path is slow. `threshold_s` is informational and
+/// always [`GRPC_READ_SLOW_CHUNK_THRESHOLD`] in production callers.
+fn record_grpc_read_slow_chunk_and_maybe_warn(label: &str, threshold_s: u64) {
+    let new_total = GRPC_READ_SLOW_CHUNK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    warn!(
+        target: "nativelink_util::proto_stream",
+        label,
+        threshold_s,
+        total_slow_chunks = new_total,
+        "GrpcStore::read made no progress for >={threshold_s}s; \
+         continuing per diagnostic-only design (#479)",
+    );
+    let now = std::time::Instant::now();
+    let mut guard = READ_SLOW_CHUNK_WARN_STATE.lock();
+    let baseline = guard.unwrap_or((now, new_total.saturating_sub(1)));
+    let (last_at, count_at_last) = baseline;
+    let delta = new_total.saturating_sub(count_at_last);
+    let elapsed = now.duration_since(last_at);
+    if delta >= SLOW_CHUNK_WARN_THRESHOLD && elapsed <= SLOW_CHUNK_WARN_WINDOW {
+        warn!(
+            target: "nativelink_util::proto_stream",
+            label,
+            total_slow_chunks = new_total,
+            slow_chunks_in_window = delta,
+            window_secs = SLOW_CHUNK_WARN_WINDOW.as_secs(),
+            "GrpcStore::read: slow-chunk events exceeding {SLOW_CHUNK_WARN_THRESHOLD}/window — \
+             transport may be wedged; correlate with h2/TCP keepalive state",
+        );
+        *guard = Some((now, new_total));
+    } else if elapsed > SLOW_CHUNK_WARN_WINDOW {
+        // Reset baseline; healthy rate.
+        *guard = Some((now, new_total));
+    } else if guard.is_none() {
+        // First-call seed.
+        *guard = Some(baseline);
+    }
+}
+
+pin_project! {
+    /// Stream wrapper that observes per-chunk arrival pacing on any
+    /// inner `Stream<Item = T>` and bumps
+    /// [`GRPC_READ_SLOW_CHUNK_TOTAL`] + emits a `warn!` whenever no
+    /// chunk arrives for [`GRPC_READ_SLOW_CHUNK_THRESHOLD`]. Generic
+    /// over the item type so it covers `ReadResponse` (bytestream),
+    /// `GetTreeResponse` (CAS), and any other tonic streaming
+    /// response.
+    ///
+    /// **Diagnostic-only.** This wrapper does NOT abort the stream,
+    /// does NOT translate the chunk gap into an error variant, and
+    /// does NOT poke the inner stream — it only re-arms its own
+    /// deadline and returns `Poll::Pending`. The wrapper's only side
+    /// effects are counter bump + `warn!` line. Mirrors the
+    /// 2026-05-14 WRITE-side conversion (see
+    /// [`WriteStateWrapper::poll_next`] Pending arm).
+    ///
+    /// Typical usage:
+    ///
+    /// ```ignore
+    /// let observed = ReadProgressObserver::new("GrpcStore::read", inner_stream);
+    /// // Treat `observed` as a `Stream<Item = T>` — the observer is
+    /// // structurally transparent.
+    /// ```
+    #[derive(Debug)]
+    pub struct ReadProgressObserver<S> {
+        // Inner stream being observed. We do NOT control its
+        // lifecycle — dropping it (caller cancellation) drops us
+        // first; the deadline `Sleep` allocated below is dropped with
+        // us.
+        #[pin]
+        inner: S,
+        // Static label identifying the READ site (e.g. "GrpcStore::read").
+        // `&'static str` because the labels are constants — no
+        // allocation in the hot path.
+        label: &'static str,
+        // Per-chunk no-progress threshold. Effectively constant
+        // ([`GRPC_READ_SLOW_CHUNK_THRESHOLD`]) for production callers;
+        // kept as a field so tests can shrink it without
+        // `tokio::time::pause`.
+        threshold: Duration,
+        // Re-armable deadline for the next chunk. `None` until the
+        // first poll arms it; reused via `Sleep::reset` thereafter to
+        // avoid a fresh `Box::pin` per chunk (same idiom as
+        // `WriteStateWrapper`).
+        deadline: Option<Pin<Box<Sleep>>>,
+    }
+}
+
+impl<S> ReadProgressObserver<S> {
+    /// Construct an observer with the production threshold
+    /// ([`GRPC_READ_SLOW_CHUNK_THRESHOLD`]).
+    pub fn new(label: &'static str, inner: S) -> Self {
+        Self::with_threshold(label, inner, GRPC_READ_SLOW_CHUNK_THRESHOLD)
+    }
+
+    /// Construct an observer with a caller-supplied threshold. Used by
+    /// tests to shrink the budget for paused-time scenarios. Production
+    /// callers MUST use [`Self::new`].
+    pub fn with_threshold(label: &'static str, inner: S, threshold: Duration) -> Self {
+        Self {
+            inner,
+            label,
+            threshold,
+            deadline: None,
+        }
+    }
+}
+
+impl<S, T> Stream for ReadProgressObserver<S>
+where
+    S: Stream<Item = T>,
+{
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        match this.inner.poll_next(cx) {
+            Poll::Ready(maybe_item) => {
+                // Made progress: rearm the deadline for the NEXT chunk.
+                // We reset (rather than carry a partially-elapsed
+                // deadline) on the same theory as the WRITE-side
+                // wrapper — the just-observed arrival is the moment we
+                // made progress.
+                let new_deadline = tokio::time::Instant::now() + *this.threshold;
+                match this.deadline.as_mut() {
+                    Some(d) => d.as_mut().reset(new_deadline),
+                    None => {
+                        *this.deadline = Some(Box::pin(tokio::time::sleep(*this.threshold)));
+                    }
+                }
+                Poll::Ready(maybe_item)
+            }
+            Poll::Pending => {
+                // Inner stream not ready — check the diagnostic timer.
+                // Same rule as the WRITE wrapper: bump counter + warn +
+                // re-arm + return Pending. No abort.
+                if this.deadline.is_none() {
+                    *this.deadline = Some(Box::pin(tokio::time::sleep(*this.threshold)));
+                }
+                let deadline = this
+                    .deadline
+                    .as_mut()
+                    .expect("initialized above");
+                match deadline.as_mut().poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(()) => {
+                        // Diagnostic-only since #479: bump the counter,
+                        // emit a warn, re-arm the deadline for another
+                        // window, and return `Poll::Pending` so the
+                        // inner stream keeps awaiting. Mutation point
+                        // — restoring an abort-on-elapse here is what
+                        // the bespoke "must NOT abort the stream"
+                        // tests detect.
+                        record_grpc_read_slow_chunk_and_maybe_warn(
+                            this.label,
+                            this.threshold.as_secs(),
+                        );
+                        // Re-arm so a stream that stays stuck for hours
+                        // produces one warn per window (not just one).
+                        let new_deadline = tokio::time::Instant::now() + *this.threshold;
+                        this.deadline
+                            .as_mut()
+                            .expect("initialized above")
+                            .as_mut()
+                            .reset(new_deadline);
+                        // Register interest in the new deadline so the
+                        // task wakes on the next window boundary even
+                        // if the inner stream never produces. Without
+                        // this poll, a permanently-silent stream would
+                        // never re-poll (Pending was already returned
+                        // above) and we'd lose ongoing diagnostics.
+                        let _ = this
+                            .deadline
+                            .as_mut()
+                            .expect("initialized above")
+                            .as_mut()
+                            .poll(cx);
+                        Poll::Pending
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// MetricsRegistry surface for both READ and WRITE counters (#479 +
+// #485 fix-up).
+//
+// Background: `GRPC_WRITE_SLOW_CHUNK_TOTAL` (added 2026-05-14) is a
+// process-wide static. It was visible to `tracing` consumers and
+// integration tests but NOT to `/metrics` scrapes — `MetricsRegistry`
+// expects `Arc<dyn MetricsComponent + Send + Sync>` registrations, and
+// a bare static cannot be wrapped in an Arc without a host struct.
+// `GrpcStreamCounters` is that host: a zero-state singleton whose
+// `MetricsComponent::publish` reads both atomics and emits them as
+// counters under the registered prefix (e.g. `grpc_stream`).
+//
+// Singleton pattern mirrors `pin_budget_singleton` /
+// `chunk_budget_singleton` in `nativelink-store/src/chunked/`: a
+// `OnceLock<Arc<GrpcStreamCounters>>` initialised on first access. The
+// `Arc` accessor is what `bin/nativelink.rs` hands to
+// `MetricsRegistry::register_dyn`; the static counters themselves are
+// what hot-path code mutates.
+// ---------------------------------------------------------------------
+
+/// Zero-state singleton hosting [`MetricsComponent`] for the READ and
+/// WRITE per-chunk slow-chunk counters. Has no own state — the atomics
+/// live as process-wide statics so the hot path is one Relaxed
+/// `fetch_add` rather than an `Arc::clone` + atomic dereference.
+#[derive(Debug, Default)]
+pub struct GrpcStreamCounters {
+    // No fields. Both counters are process-wide statics
+    // ([`GRPC_READ_SLOW_CHUNK_TOTAL`], [`GRPC_WRITE_SLOW_CHUNK_TOTAL`])
+    // — this struct exists solely to host the `MetricsComponent` impl.
+}
+
+impl MetricsComponent for GrpcStreamCounters {
+    fn publish(
+        &self,
+        _kind: MetricKind,
+        _field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        let read_total = GRPC_READ_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+        let write_total = GRPC_WRITE_SLOW_CHUNK_TOTAL.load(Ordering::Relaxed);
+        nativelink_metric::publish!(
+            "grpc_read_slow_chunks_total",
+            &read_total,
+            nativelink_metric::MetricKind::Counter,
+            "Cumulative count of READ-stream chunks (bytestream / get_tree / batch_read_blobs streaming) that arrived more than GRPC_READ_SLOW_CHUNK_THRESHOLD apart. Diagnostic-only (#479); does NOT abort the stream."
+        );
+        nativelink_metric::publish!(
+            "grpc_write_slow_chunks_total",
+            &write_total,
+            nativelink_metric::MetricKind::Counter,
+            "Cumulative count of WRITE-stream chunks (bytestream upload via GrpcStore::write) that arrived more than the configured rpc_timeout apart. Diagnostic-only since 2026-05-14 (#485); does NOT abort the stream."
+        );
+        Ok(MetricPublishKnownKindData::Component)
+    }
+}
+
+/// Process-wide singleton holder. `OnceLock` chosen for the same
+/// reasons as `pin_budget_singleton`: the counters are process-global
+/// resources and the registry needs an `Arc<dyn MetricsComponent +
+/// Send + Sync>` while admissions read directly from the statics.
+static GRPC_STREAM_COUNTERS_SINGLETON: OnceLock<Arc<GrpcStreamCounters>> = OnceLock::new();
+
+/// Returns a clonable `Arc` to the process-wide [`GrpcStreamCounters`]
+/// singleton. Use at process start to hand a clone to
+/// `MetricsRegistry::register` so `grpc_read_slow_chunks_total` and
+/// `grpc_write_slow_chunks_total` appear in every `/metrics` scrape.
+///
+/// The `GrpcStreamCounters` host is stateless; the `Arc` is here only
+/// because `register_dyn` demands an `Arc`. The actual counter values
+/// are read at `publish()` time straight from the process-wide
+/// statics, so the registered Arc and the hot-path bumps cannot
+/// diverge (unlike `PinBudget` where the Arc IS the live state).
+#[must_use]
+pub fn grpc_stream_counters_arc() -> Arc<GrpcStreamCounters> {
+    GRPC_STREAM_COUNTERS_SINGLETON
+        .get_or_init(|| Arc::new(GrpcStreamCounters::default()))
+        .clone()
 }
 
 pub struct WriteRequestStreamWrapper<T> {

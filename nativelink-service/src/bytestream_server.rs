@@ -51,7 +51,7 @@ use nativelink_util::digest_hasher::{
     DigestHasherFunc, default_digest_hasher_func, make_ctx_for_hash_func,
 };
 use nativelink_util::log_utils::throughput_mbps;
-use nativelink_util::proto_stream_utils::WriteRequestStreamWrapper;
+use nativelink_util::proto_stream_utils::{ReadProgressObserver, WriteRequestStreamWrapper};
 use nativelink_util::resource_info::ResourceInfo;
 use nativelink_util::spawn;
 use nativelink_util::stall_detector::StallGuard;
@@ -519,39 +519,113 @@ impl Drop for InFlightWritesGuard {
 type ReadStream = Pin<Box<dyn Stream<Item = Result<ReadResponse, Status>> + Send + 'static>>;
 type StoreUpdateFuture = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'static>>;
 
-/// Wrapper around a `ReadStream` that logs total bytes and elapsed time when
-/// the stream completes (yields `None`) or is dropped before completion.
+/// Wrapper around a `ReadStream` that:
+/// - bumps the process-wide
+///   [`nativelink_util::proto_stream_utils::GRPC_READ_SLOW_CHUNK_TOTAL`]
+///   counter + emits a `warn!` whenever no chunk arrives for
+///   [`nativelink_util::proto_stream_utils::GRPC_READ_SLOW_CHUNK_THRESHOLD`]
+///   (per-chunk progress observer),
+/// - logs total bytes and elapsed time at `info!` level when the stream
+///   completes (yields `None`) or is dropped before completion (#479).
+///
+/// **Diagnostic-only.** The per-chunk observer never aborts the stream;
+/// it only bumps the counter and logs. Mirrors the WRITE-side
+/// `WriteState::with_progress_timeout` behaviour after the 2026-05-14
+/// kill-switch removal.
+///
+/// Why `info!` not `debug!` for the completion log: tracker #479
+/// observed that READ paths emitted ZERO per-stream INFO lines in
+/// production, misleading three sub-agent investigations of slow
+/// downloads. Per `feedback_no_log_no_proof_of_silence.md`. Bumping
+/// the per-stream completion line to `info!` lets SREs grep journal
+/// for `ByteStream::read: CAS read completed` to see every download's
+/// throughput + duration without redeploying with a debug filter.
 struct LoggingReadStream {
-    inner: ReadStream,
+    inner: ReadProgressObserver<ReadStream>,
     start_time: Instant,
     digest: DigestInfo,
     expected_size: u64,
     bytes_sent: u64,
     completed: bool,
+    /// Static label for the LoggingReadStream's call-site (e.g.
+    /// `"bytestream_server::read"`). Surfaced in completion logs so
+    /// the journal entry self-identifies the seam — without this, the
+    /// completion line is ambiguous between the chunked `read` path
+    /// and the `zero_copy_read` fast path.
+    label: &'static str,
 }
 
 impl LoggingReadStream {
-    fn new(inner: ReadStream, start_time: Instant, digest: DigestInfo, expected_size: u64) -> Self {
+    fn new(
+        inner: ReadStream,
+        start_time: Instant,
+        digest: DigestInfo,
+        expected_size: u64,
+        label: &'static str,
+    ) -> Self {
+        // Wrap with the per-chunk progress observer BEFORE storing.
+        // The observer is a thin Stream<Item=T> wrapper that pulls
+        // from `inner` directly — its only side effect on the chunk
+        // path is rearming a `Sleep` deadline. No allocation per
+        // chunk; only on the first chunk arrival.
+        let observed = ReadProgressObserver::new(label, inner);
         Self {
-            inner,
+            inner: observed,
             start_time,
             digest,
             expected_size,
             bytes_sent: 0,
             completed: false,
+            label,
         }
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn log_completion(&mut self, status: &'static str, err: Option<&Status>) {
         let elapsed = self.start_time.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
-
-        debug!(
+        let mbps = throughput_mbps(self.bytes_sent, elapsed);
+        // effective_rate_kbps surfaces a kbps integer alongside the
+        // mbps string so the warn-threshold check below and external
+        // grep-on-bytes/elapsed don't have to re-parse the formatted
+        // mbps value. Saturating to u64 keeps a single zero-byte
+        // 0-ms drop from blowing up.
+        let elapsed_secs = elapsed.as_secs_f64();
+        let effective_rate_kbps = if elapsed_secs > 0.0 {
+            ((self.bytes_sent as f64 / 1024.0) / elapsed_secs) as u64
+        } else {
+            0
+        };
+        // Slow-and-completed-read warn: surfaced when an operator-
+        // visible download takes >5s AND was below 1 MB/s. Mirrors the
+        // inbound write-side slow-stream warn shape so SREs can grep
+        // `ByteStream::read.*slow_completion` and get one line per
+        // affected download.
+        let slow_completion = elapsed_ms > 5000 && effective_rate_kbps < 1000 && status == "ok";
+        if slow_completion {
+            warn!(
+                target: "nativelink_service::bytestream",
+                label = self.label,
+                digest = %self.digest,
+                expected_size = self.expected_size,
+                bytes_sent = self.bytes_sent,
+                elapsed_ms,
+                effective_rate_kbps,
+                throughput_mbps = %mbps,
+                status,
+                "ByteStream::read: slow read completion (>=5s, <1MB/s) — \
+                 confirm transport health (h2/TCP/QUIC keepalive, slow-tier hiccup)",
+            );
+        }
+        info!(
+            target: "nativelink_service::bytestream",
+            label = self.label,
             digest = %self.digest,
             expected_size = self.expected_size,
             bytes_sent = self.bytes_sent,
             elapsed_ms,
-            throughput_mbps = %throughput_mbps(self.bytes_sent, elapsed),
+            effective_rate_kbps,
+            throughput_mbps = %mbps,
             status,
             code = ?err.map(tonic::Status::code),
             msg = err.map(tonic::Status::message).unwrap_or(""),
@@ -564,19 +638,15 @@ impl Stream for LoggingReadStream {
     type Item = Result<ReadResponse, Status>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = self.inner.as_mut().poll_next(cx);
+        // The per-chunk observer is structurally pinned via
+        // `pin_project!`; project the field via `Pin::new`. Inner is
+        // `ReadProgressObserver<ReadStream>` and `ReadStream` is
+        // `Pin<Box<...>>` (Unpin), so `inner` is Unpin so we can take
+        // `&mut self` then `Pin::new(&mut self.inner)`.
+        let result = Pin::new(&mut self.inner).poll_next(cx);
         match &result {
             Poll::Ready(Some(Ok(response))) => {
                 self.bytes_sent += response.data.len() as u64;
-                let elapsed_ms = self.start_time.elapsed().as_millis() as u64;
-                let chunk_len = response.data.len();
-                debug!(
-                    digest = %self.digest,
-                    outcome = "ok_chunk",
-                    chunk_len,
-                    elapsed_ms,
-                    "logging_read_stream poll yielded chunk",
-                );
             }
             Poll::Ready(None) => {
                 self.completed = true;
@@ -3082,8 +3152,18 @@ impl ByteStreamServer {
                     .bytes_read_total
                     .fetch_add(expected_size, Ordering::Relaxed);
 
-                // Wrap in LoggingReadStream to track throughput and log on completion.
-                let logging = LoggingReadStream::new(stream, start_time, digest, expected_size);
+                // Wrap in LoggingReadStream to track throughput, emit
+                // per-chunk progress diagnostics (#479), and log
+                // completion at INFO. The label disambiguates this
+                // from the chunked `read` call site below in journal
+                // greps.
+                let logging = LoggingReadStream::new(
+                    stream,
+                    start_time,
+                    digest,
+                    expected_size,
+                    "bytestream_server::zero_copy_read",
+                );
 
                 let body = ZeroCopyReadBody::new(logging);
                 let mut http_response = http::Response::new(tonic::body::Body::new(body));
@@ -3186,9 +3266,19 @@ impl ByteStream for ByteStreamServer {
             .await
             .err_tip(|| "In ByteStreamServer::read")
             .map(|stream| -> Response<Self::ReadStream> {
-                // Wrap in LoggingReadStream to log when the client finishes
-                // consuming all data (or drops the stream early).
-                let logging = LoggingReadStream::new(stream, start_time, digest, expected_size);
+                // Wrap in LoggingReadStream to log when the client
+                // finishes consuming all data (or drops the stream
+                // early), bump the per-chunk progress observer
+                // (#479), and elevate completion to INFO. The label
+                // disambiguates this from `zero_copy_read` in journal
+                // greps.
+                let logging = LoggingReadStream::new(
+                    stream,
+                    start_time,
+                    digest,
+                    expected_size,
+                    "bytestream_server::read",
+                );
                 // Falsifies whether the response stream produced its yield
                 // BEFORE handing it to tonic/h3. If items appear here but
                 // the worker never sees them, the wedge is downstream
