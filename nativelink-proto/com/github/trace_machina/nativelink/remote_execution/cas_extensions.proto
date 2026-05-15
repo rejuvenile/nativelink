@@ -43,5 +43,38 @@ service CasExtensions {
     /// Behind `chunked_fast_slow` feature flag (default OFF). The server
     /// returns `Code::Unimplemented` if the feature is off; clients must
     /// gate calls on a capability discovery mechanism (Phase 2.6).
+    ///
+    /// **Single-writer-per-digest:** if another stream is concurrently
+    /// writing the SAME digest, this RPC rejects with `Code::Aborted`
+    /// + a `BackpressureSignal` retry hint. For multi-writer chunk-race
+    /// semantics (cross-writer chunk dedup, out-of-order commit) use
+    /// `WriteChunkedV2` instead.
     rpc WriteChunked(stream WriteChunk) returns (WriteChunkedResponse);
+
+    /// #494-v3 Phase 2: bidi-streaming chunked-write RPC with per-digest
+    /// multi-writer chunk-race semantics. Up to N writers may concurrently
+    /// upload the SAME digest; the server admits chunks per-offset and
+    /// emits per-chunk acks back through the response stream. Bit-identical
+    /// chunks (per the position-based `chunked_client::collect_and_hash_chunks`
+    /// chunker invariant) make per-chunk dedup safe — any chunk at offset
+    /// O for digest D has exactly one valid byte-sequence, so the writer
+    /// that lands first wins; concurrent writers' duplicate-offset
+    /// chunks are discarded as `RACING_LOSER`.
+    ///
+    /// Wire shape:
+    /// - Request stream: same `WriteChunk` schema as v1; server learns
+    ///   the digest from the first frame.
+    /// - Response stream: zero or more `WriteChunkedAck` frames followed
+    ///   by exactly ONE `WriteChunkedResponse` final frame on success.
+    ///   On error, the server returns the gRPC `Status` and may have
+    ///   emitted zero or more acks before tearing down.
+    ///
+    /// Wasted bandwidth bound: up to ~256 MiB/writer/digest (one full
+    /// blob worth of `RACING_LOSER` acks if a slow writer races a fast
+    /// writer to every chunk). Acceptable per #494-v3 design 2026-05-15.
+    ///
+    /// Backwards compatibility: clients that don't speak v2 keep using
+    /// the unary `WriteChunked` RPC; servers that don't support v2 return
+    /// `Code::Unimplemented` and clients fall back.
+    rpc WriteChunkedV2(stream WriteChunk) returns (stream WriteChunkedFrame);
 }

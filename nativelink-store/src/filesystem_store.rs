@@ -914,6 +914,22 @@ pub struct FilesystemStore<Fe: FileEntry = FileEntryImpl> {
     /// build).
     #[cfg(feature = "chunked_fast_slow")]
     chunked_partials: Arc<ChunkedPartialsMap>,
+    /// #494-v3 Phase 2: per-digest multi-writer race-state registry for
+    /// the `WriteChunkedV2` bidi RPC. Distinct from `chunked_partials`
+    /// (which holds the `std::fs::File` handle); the two are 1:1 — one
+    /// race-state per partial. Wrapping them separately keeps the v1
+    /// path's open-file lifecycle independent of the v2 multi-writer
+    /// state, so the v1 fall-back (old clients) keeps working without
+    /// touching the new field.
+    ///
+    /// CAPPED AT N: bounded by the number of in-flight digests with at
+    /// least one v2 writer attached; same operational ceiling as
+    /// `chunked_partials` (one entry per concurrent chunked upload).
+    /// Per-entry memory: `ChunkRaceState` ≈ 200 bytes header +
+    /// `chunks_present` (32 bytes max for 256 chunks) + worst-case
+    /// `chunks_in_flight` HashMap (~6 KiB at 256 entries × 321 writers).
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_race_registry: Arc<crate::chunked::chunked_race_state::ChunkRaceRegistry>,
 }
 
 impl<Fe: FileEntry> FilesystemStore<Fe> {
@@ -1030,6 +1046,10 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             large_read_threshold: spec.large_read_threshold_bytes,
             #[cfg(feature = "chunked_fast_slow")]
             chunked_partials: Arc::new(ChunkedPartialsMap::new()),
+            #[cfg(feature = "chunked_fast_slow")]
+            chunked_race_registry: Arc::new(
+                crate::chunked::chunked_race_state::ChunkRaceRegistry::new(),
+            ),
         }))
     }
 
@@ -1440,6 +1460,50 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// otherwise.
     pub fn content_path_for_chunked(&self) -> &str {
         &self.shared_context.content_path
+    }
+
+    /// #494-v3 Phase 2: accessor for the per-store
+    /// `ChunkRaceRegistry`. Used by the `WriteChunkedV2` handler to
+    /// admit chunks from concurrent writers via the per-digest
+    /// race-state.
+    pub fn chunked_race_registry(
+        &self,
+    ) -> &Arc<crate::chunked::chunked_race_state::ChunkRaceRegistry> {
+        &self.chunked_race_registry
+    }
+
+    /// #494-v3 Phase 2: get-or-create the race-state for `digest`,
+    /// using the FilesystemStore's `chunked_partials` to mint the
+    /// underlying `.partial` file. The first caller for a digest opens
+    /// the file (via `write_chunk_at_offset` → `open_or_create_partial`
+    /// indirectly); the race-state itself is constructed lazily on
+    /// first call here.
+    pub fn race_state_for_digest(
+        &self,
+        digest: &DigestInfo,
+        chunk_size: u32,
+    ) -> Arc<crate::chunked::chunked_race_state::ChunkRaceState> {
+        let partial_path = crate::chunked::chunked_filesystem::partial_temp_path(
+            &self.shared_context.temp_path,
+            digest,
+        );
+        self.chunked_race_registry.get_or_create(*digest, || {
+            crate::chunked::chunked_race_state::ChunkRaceState::new(
+                *digest,
+                chunk_size,
+                partial_path,
+            )
+        })
+    }
+
+    /// #494-v3 Phase 2: drop the race-state for `digest` if no writers
+    /// are still attached. Returns the removed Arc on success. Used by
+    /// the commit-runner after `publish_commit_result`.
+    pub fn try_drop_race_state(
+        &self,
+        digest: &DigestInfo,
+    ) -> Option<Arc<crate::chunked::chunked_race_state::ChunkRaceState>> {
+        self.chunked_race_registry.try_remove_if_unused(digest)
     }
 
     /// Read-only accessor for the temp_path the store is rooted at.

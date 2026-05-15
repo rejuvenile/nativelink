@@ -998,6 +998,67 @@ pub struct WriteChunkedResponse {
     #[prost(uint64, tag = "2")]
     pub committed_size: u64,
 }
+/// / #494-v3 Phase 2: per-chunk acknowledgement emitted by `WriteChunkedV2`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriteChunkedAck {
+    #[prost(uint64, tag = "1")]
+    pub chunk_offset: u64,
+    #[prost(enumeration = "write_chunked_ack::Outcome", tag = "2")]
+    pub outcome: i32,
+    #[prost(uint64, tag = "3")]
+    pub already_have_max_offset: u64,
+}
+/// Nested message and enum types in `WriteChunkedAck`.
+pub mod write_chunked_ack {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Outcome {
+        Unspecified = 0,
+        Accepted = 1,
+        AlreadyHave = 2,
+        RacingLoser = 3,
+        AdmittedSkipTo = 4,
+    }
+    impl Outcome {
+        #[must_use]
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "OUTCOME_UNSPECIFIED",
+                Self::Accepted => "ACCEPTED",
+                Self::AlreadyHave => "ALREADY_HAVE",
+                Self::RacingLoser => "RACING_LOSER",
+                Self::AdmittedSkipTo => "ADMITTED_SKIP_TO",
+            }
+        }
+        #[must_use]
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
+                "ACCEPTED" => Some(Self::Accepted),
+                "ALREADY_HAVE" => Some(Self::AlreadyHave),
+                "RACING_LOSER" => Some(Self::RacingLoser),
+                "ADMITTED_SKIP_TO" => Some(Self::AdmittedSkipTo),
+                _ => None,
+            }
+        }
+    }
+}
+/// / #494-v3 Phase 2: a single frame on the WriteChunkedV2 response stream.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriteChunkedFrame {
+    #[prost(oneof = "write_chunked_frame::Payload", tags = "1, 2")]
+    pub payload: ::core::option::Option<write_chunked_frame::Payload>,
+}
+/// Nested message and enum types in `WriteChunkedFrame`.
+pub mod write_chunked_frame {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "1")]
+        Ack(super::WriteChunkedAck),
+        #[prost(message, tag = "2")]
+        FinalResponse(super::WriteChunkedResponse),
+    }
+}
 /// Generated client implementations.
 pub mod worker_api_client {
     #![allow(
@@ -1415,6 +1476,28 @@ pub mod cas_extensions_client {
             ));
             self.inner.client_streaming(req, path, codec).await
         }
+        /// / #494-v3 Phase 2: bidi-streaming chunked write with per-chunk acks.
+        pub async fn write_chunked_v2(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::WriteChunk>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::WriteChunkedFrame>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/com.github.trace_machina.nativelink.remote_execution.CasExtensions/WriteChunkedV2",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "com.github.trace_machina.nativelink.remote_execution.CasExtensions",
+                "WriteChunkedV2",
+            ));
+            self.inner.streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1430,6 +1513,12 @@ pub mod cas_extensions_server {
     /// Generated trait containing gRPC methods that should be implemented for use with CasExtensionsServer.
     #[async_trait]
     pub trait CasExtensions: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the WriteChunkedV2 method.
+        type WriteChunkedV2Stream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::WriteChunkedFrame, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
         /// / #212 Phase 2.2: chunked client-streaming write of a single
         /// / CAS blob. Default impl returns `Code::Unimplemented` so a
         /// / server built without the `chunked_fast_slow` feature-flag
@@ -1444,6 +1533,11 @@ pub mod cas_extensions_server {
                 "WriteChunked is not enabled on this server (chunked_fast_slow feature is OFF)",
             ))
         }
+        /// / #494-v3 Phase 2: bidi WriteChunkedV2.
+        async fn write_chunked_v2(
+            &self,
+            _request: tonic::Request<tonic::Streaming<super::WriteChunk>>,
+        ) -> std::result::Result<tonic::Response<Self::WriteChunkedV2Stream>, tonic::Status>;
     }
     /// / NativeLink-owned extensions to the standard REAPI CAS-side
     /// / surface.
@@ -1558,6 +1652,49 @@ pub mod cas_extensions_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.client_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/com.github.trace_machina.nativelink.remote_execution.CasExtensions/WriteChunkedV2" =>
+                {
+                    #[allow(non_camel_case_types)]
+                    struct WriteChunkedV2Svc<T: CasExtensions>(pub Arc<T>);
+                    impl<T: CasExtensions> tonic::server::StreamingService<super::WriteChunk>
+                        for WriteChunkedV2Svc<T>
+                    {
+                        type Response = super::WriteChunkedFrame;
+                        type ResponseStream = T::WriteChunkedV2Stream;
+                        type Future = BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<tonic::Streaming<super::WriteChunk>>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as CasExtensions>::write_chunked_v2(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = WriteChunkedV2Svc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

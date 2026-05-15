@@ -221,6 +221,112 @@ where
     }
 }
 
+/// #494-v3 Phase 2: v2 dispatcher using the bidi `WriteChunkedV2`
+/// RPC. Sends every chunk and consumes the per-chunk ack stream,
+/// returning the final `WriteChunkedResponse` once received.
+///
+/// **Why a separate dispatcher type:** the v1 dispatcher returns a
+/// unary `WriteChunkedResponse`; the v2 dispatcher operates on the
+/// bidi (server-streaming response) shape. Both implement the same
+/// `WriteChunkedDispatcher` trait so callers can swap them
+/// transparently — `WriteChunkedDispatcher::dispatch` flattens the v2
+/// response stream into a single `WriteChunkedResponse` (i.e., the
+/// final frame).
+///
+/// **Reactivity (passive):** this dispatcher does NOT skip chunks on
+/// `ALREADY_HAVE` / `RACING_LOSER` acks. The server already handles
+/// dedup transparently, so passive sending is correctness-equivalent
+/// to active skipping; the only cost is wasted bandwidth (~256 MiB/
+/// writer/digest worst case, accepted per the #494-v3 design). A
+/// future optimization can split the send loop and the recv loop into
+/// two tasks for active skipping.
+pub struct WorkerApiWriteChunkedV2Dispatcher<T> {
+    acquire_channel:
+        Arc<dyn Fn() -> ChannelAcquireFuture<T> + Send + Sync + 'static>,
+}
+
+impl<T> core::fmt::Debug for WorkerApiWriteChunkedV2Dispatcher<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WorkerApiWriteChunkedV2Dispatcher")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> WorkerApiWriteChunkedV2Dispatcher<T> {
+    /// Construct a v2 dispatcher with a custom channel-acquisition
+    /// factory. Mirrors the v1 ctor.
+    pub fn with_factory<F>(acquire_channel: F) -> Self
+    where
+        F: Fn() -> ChannelAcquireFuture<T> + Send + Sync + 'static,
+    {
+        Self {
+            acquire_channel: Arc::new(acquire_channel),
+        }
+    }
+}
+
+impl<T> WriteChunkedDispatcher for WorkerApiWriteChunkedV2Dispatcher<T>
+where
+    T: tonic::client::GrpcService<tonic::body::Body> + Send + 'static,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+    T::Future: Send,
+{
+    fn dispatch(&self, chunks: Vec<WriteChunk>) -> DispatchFuture {
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::write_chunked_frame;
+        use tokio_stream::StreamExt as _;
+        let factory = Arc::clone(&self.acquire_channel);
+        Box::pin(async move {
+            let channel = factory().await?;
+            let stream = tokio_stream::iter(chunks);
+            let mut client = CasExtensionsClient::new(channel);
+            let response = client
+                .write_chunked_v2(stream)
+                .await
+                .map_err(|status| {
+                    let err: Error = status.into();
+                    err.append("CasExtensions/WriteChunkedV2 RPC failed".to_string())
+                })?;
+            let mut frame_stream = response.into_inner();
+            let mut final_response: Option<WriteChunkedResponse> = None;
+            // Drain the response stream. Per-chunk acks are observed
+            // (and could be acted on for chunk-skip optimization in a
+            // future patch); the FinalResponse terminates.
+            while let Some(frame_result) = frame_stream.next().await {
+                let frame = frame_result.map_err(|status| {
+                    let err: Error = status.into();
+                    err.append("CasExtensions/WriteChunkedV2 stream errored".to_string())
+                })?;
+                match frame.payload {
+                    Some(write_chunked_frame::Payload::Ack(_ack)) => {
+                        // Passive consumption — server handles dedup
+                        // transparently. Future optimization: drive a
+                        // chunk-skip queue here.
+                        continue;
+                    }
+                    Some(write_chunked_frame::Payload::FinalResponse(resp)) => {
+                        final_response = Some(resp);
+                        break;
+                    }
+                    None => {
+                        return Err(make_err!(
+                            Code::Internal,
+                            "WriteChunkedV2 frame had no payload"
+                        ));
+                    }
+                }
+            }
+            final_response.ok_or_else(|| {
+                make_err!(
+                    Code::Internal,
+                    "WriteChunkedV2 stream ended without FinalResponse"
+                )
+            })
+        })
+    }
+}
+
 /// Default ceiling on retry attempts per blob. The server's
 /// admission can reject with `Code::Aborted` (concurrent same-digest
 /// stream) OR `Code::ResourceExhausted` + `BackpressureSignal`

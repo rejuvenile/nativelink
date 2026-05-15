@@ -982,3 +982,59 @@ message WriteChunkedResponse {
     build.bazel.remote.execution.v2.Digest committed_digest = 1;
     uint64 committed_size = 2;
 }
+
+/// #494-v3 Phase 2: per-chunk acknowledgement emitted by the
+/// `WriteChunkedV2` bidi RPC. The server emits one `WriteChunkedAck`
+/// per `WriteChunk` it processes (in any order — the writer must
+/// match-by-`chunk_offset`, NOT by frame position).
+///
+/// Outcomes:
+/// - `ACCEPTED` — server pwrote the chunk; writer can free its buffer.
+/// - `ALREADY_HAVE` — another writer's chunk for this offset has
+///   already landed; writer's bytes were discarded BEFORE pwrite.
+/// - `RACING_LOSER` — writer's chunk arrived after another writer's
+///   chunk for this offset committed; bytes were discarded.
+/// - `ADMITTED_SKIP_TO` — sent ONCE before per-chunk acks at session
+///   open. `already_have_max_offset` carries the highest offset the
+///   server already has on disk for this digest; the writer should
+///   skip every offset ≤ `already_have_max_offset` (best-effort hint;
+///   writer may still send and get `ALREADY_HAVE` per chunk).
+message WriteChunkedAck {
+    /// Byte offset of the chunk this ack refers to. For
+    /// `ADMITTED_SKIP_TO` this field is unused; readers should consult
+    /// `already_have_max_offset` instead.
+    uint64 chunk_offset = 1;
+
+    enum Outcome {
+        OUTCOME_UNSPECIFIED = 0;
+        /// Server pwrote your chunk to the partial file.
+        ACCEPTED = 1;
+        /// Another writer's chunk at this offset already committed
+        /// before yours arrived; your bytes were discarded.
+        ALREADY_HAVE = 2;
+        /// Your chunk arrived in time but another writer's chunk
+        /// committed first (concurrent-pwrite race). Bytes discarded.
+        RACING_LOSER = 3;
+        /// Session-open hint: server already has chunks 0..=N on disk
+        /// for this digest. Writer should skip ahead.
+        ADMITTED_SKIP_TO = 4;
+    }
+    Outcome outcome = 2;
+
+    /// Set on `ADMITTED_SKIP_TO`: the highest byte offset the server
+    /// already has committed on disk. Writer should skip every chunk
+    /// with offset <= this value. Unused (zero) for other outcomes.
+    uint64 already_have_max_offset = 3;
+}
+
+/// #494-v3 Phase 2: a single frame on the `WriteChunkedV2` response
+/// stream. Carries either a per-chunk `WriteChunkedAck` (zero or more
+/// per session) OR the final `WriteChunkedResponse` (exactly one,
+/// emitted on commit success). On commit failure the server returns
+/// the gRPC `Status` and may have emitted zero or more acks first.
+message WriteChunkedFrame {
+    oneof payload {
+        WriteChunkedAck ack = 1;
+        WriteChunkedResponse final_response = 2;
+    }
+}

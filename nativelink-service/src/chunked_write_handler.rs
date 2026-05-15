@@ -374,6 +374,34 @@ pub struct ChunkedWriteHandlerMetrics {
         help = "WriteChunked: commit watchdog timeouts (CHUNKED_COMMIT_WATCHDOG_SECS exceeded; subset of commit_failures_total)"
     )]
     pub commit_watchdog_fires_total: AtomicU64,
+    /// #494-v3 Phase 2: max concurrent writers per digest seen since
+    /// process start. Falsification metric for the multi-writer
+    /// hypothesis — if production p99 stays at 1 we know the
+    /// race-state code path is not actually exercised. Sampled in
+    /// `WriteChunkedV2`'s admission loop (compares + max-stores).
+    #[metric(help = "WriteChunkedV2: max concurrent writers per digest observed (process lifetime)")]
+    pub chunked_writers_per_digest_max: AtomicU64,
+    /// #494-v3 Phase 2: cumulative count of `RACING_LOSER` admissions.
+    /// Wasted-bandwidth observability: each loser corresponds to one
+    /// chunk's worth of bytes (~1 MiB) sent over the network and
+    /// discarded. Operators correlate with `chunked_writers_per_digest_max`
+    /// to estimate the cost of the multi-writer race.
+    #[metric(help = "WriteChunkedV2: chunks rejected as RACING_LOSER (wasted bandwidth)")]
+    pub chunked_chunks_racing_loser_total: AtomicU64,
+    /// #494-v3 Phase 2: count of cross-writer-committed chunks: chunk
+    /// N committed by writer B while writer A was still in-flight on
+    /// chunk N. This is the design's whole point — non-zero =
+    /// multi-writer chunk-race actually completed a chunk that the
+    /// single-writer path would have rejected as a duplicate.
+    #[metric(
+        help = "WriteChunkedV2: chunks committed via cross-writer race (writer B finished while writer A was in-flight)"
+    )]
+    pub chunked_chunks_accepted_from_cross_writer_total: AtomicU64,
+    /// #494-v3 Phase 2: count of v2 sessions that observed
+    /// `ALREADY_HAVE` for at least one chunk. Operators read this as
+    /// "writers that benefited from another writer's work."
+    #[metric(help = "WriteChunkedV2: chunks rejected as ALREADY_HAVE (deduped pre-pwrite)")]
+    pub chunked_chunks_already_have_total: AtomicU64,
 }
 
 /// Server-side handler for the `WriteChunked` RPC. Holds the
@@ -482,6 +510,24 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     #[must_use]
     pub fn in_flight(&self) -> &Arc<ChunkedWriteInFlight> {
         &self.in_flight
+    }
+
+    /// #494-v3 Phase 2: pub-in-crate accessor for the FilesystemStore
+    /// Arc. Used by `chunked_write_handler_v2` so the v2 handler can
+    /// call `write_chunk_at_offset`/`commit_chunked`/`finalize_holding`
+    /// without importing the private field.
+    pub(crate) fn filesystem_store_for_v2(&self) -> &Arc<FilesystemStore<Fe>> {
+        &self.filesystem_store
+    }
+
+    /// #494-v3 Phase 2: pub-in-crate accessor for the metrics Arc.
+    pub(crate) fn metrics_for_v2(&self) -> Arc<ChunkedWriteHandlerMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// #494-v3 Phase 2: pub-in-crate accessor for `chunk_size`.
+    pub(crate) fn chunk_size_for_v2(&self) -> usize {
+        self.chunk_size
     }
 
     /// The actual RPC handler. Called from the WorkerApi trait method
@@ -1147,16 +1193,89 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
 /// as `cas` / `bytestream` (port 50071) — see `bin/nativelink.rs` for
 /// registration. The implementation just delegates to the inherent
 /// `write_chunked` method to keep the call-site shape unchanged.
+/// #212 v4.5: `CasExtensions` trait impl on the bare handler type
+/// (registers v1 `WriteChunked`). The v2 RPC requires `Arc<Self>` for
+/// per-session task spawning, so the trait impl exists on the dedicated
+/// `ChunkedCasExtensionsAdapter` newtype below; both wire to the same
+/// underlying `ChunkedWriteHandler`.
 #[async_trait::async_trait]
 impl<Fe: FileEntry>
     nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_server::CasExtensions
     for ChunkedWriteHandler<Fe>
 {
+    type WriteChunkedV2Stream = crate::chunked_write_handler_v2::WriteChunkedV2Stream;
+
     async fn write_chunked(
         &self,
         request: Request<Streaming<WriteChunk>>,
     ) -> Result<Response<WriteChunkedResponse>, Status> {
         ChunkedWriteHandler::write_chunked(self, request).await
+    }
+
+    /// #494-v3 Phase 2: bidi write-chunked-v2 stub on the bare type.
+    /// The bare-type impl returns Unimplemented — production wiring
+    /// uses `ChunkedCasExtensionsAdapter` which owns an `Arc<Self>`.
+    /// This stub exists because the trait requires the method on every
+    /// implementor, but the bare type doesn't have an `Arc<Self>` to
+    /// hand to the v2 driver task.
+    async fn write_chunked_v2(
+        &self,
+        _request: Request<Streaming<WriteChunk>>,
+    ) -> Result<Response<Self::WriteChunkedV2Stream>, Status> {
+        Err(Status::unimplemented(
+            "WriteChunkedV2 must be invoked via ChunkedCasExtensionsAdapter \
+             (bare ChunkedWriteHandler doesn't own Arc<Self>); \
+             register the adapter in your gRPC server wiring",
+        ))
+    }
+}
+
+/// #494-v3 Phase 2: trait-impl wrapper that owns `Arc<ChunkedWriteHandler>`
+/// so the bidi `WriteChunkedV2` RPC can spawn per-session tasks that
+/// outlive the trait method invocation. Production wiring registers
+/// THIS adapter on the gRPC server (instead of the bare handler).
+///
+/// Existing v1 callers can also use this adapter — `write_chunked` is
+/// trivially delegated. The bare-handler trait impl above stays so the
+/// in-tree integration tests that pass a bare `ChunkedWriteHandler`
+/// keep compiling.
+#[derive(Debug, Clone)]
+pub struct ChunkedCasExtensionsAdapter<Fe: FileEntry = FileEntryImpl> {
+    inner: Arc<ChunkedWriteHandler<Fe>>,
+}
+
+impl<Fe: FileEntry> ChunkedCasExtensionsAdapter<Fe> {
+    /// Wrap an existing `Arc<ChunkedWriteHandler>` for trait-based
+    /// gRPC server registration.
+    pub fn new(inner: Arc<ChunkedWriteHandler<Fe>>) -> Self {
+        Self { inner }
+    }
+
+    /// Borrow the wrapped handler.
+    pub fn inner(&self) -> &Arc<ChunkedWriteHandler<Fe>> {
+        &self.inner
+    }
+}
+
+#[async_trait::async_trait]
+impl<Fe: FileEntry>
+    nativelink_proto::com::github::trace_machina::nativelink::remote_execution::cas_extensions_server::CasExtensions
+    for ChunkedCasExtensionsAdapter<Fe>
+{
+    type WriteChunkedV2Stream = crate::chunked_write_handler_v2::WriteChunkedV2Stream;
+
+    async fn write_chunked(
+        &self,
+        request: Request<Streaming<WriteChunk>>,
+    ) -> Result<Response<WriteChunkedResponse>, Status> {
+        ChunkedWriteHandler::write_chunked(self.inner.as_ref(), request).await
+    }
+
+    async fn write_chunked_v2(
+        &self,
+        request: Request<Streaming<WriteChunk>>,
+    ) -> Result<Response<Self::WriteChunkedV2Stream>, Status> {
+        ChunkedWriteHandler::write_chunked_v2(Arc::clone(&self.inner), request).await
     }
 }
 
