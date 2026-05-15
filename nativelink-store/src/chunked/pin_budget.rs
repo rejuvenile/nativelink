@@ -33,10 +33,10 @@
 //! the chunked driver's commit completes (success OR failure → pin
 //! cleared in `run_driver`'s post-loop block).
 //!
-//! Wire-format: a permit is one byte. Default cap = 4 GiB
-//! (`DEFAULT_PIN_BUDGET_BYTES`) matching the chunk-budget cap. Operators
-//! can override at process start; the cap is process-global, not
-//! per-store.
+//! Wire-format: a permit is one byte. Default cap = 8 GiB
+//! (`DEFAULT_PIN_BUDGET_BYTES`); see the constant's doc-comment for the
+//! 4→8 GiB bump rationale (#493). Operators can override at process
+//! start; the cap is process-global, not per-store.
 //!
 //! Why a Semaphore not a counter+CAS:
 //! - We need ATOMIC reservation: if the cap is N and two concurrent
@@ -57,13 +57,22 @@ use nativelink_metric::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Default global pin-budget cap: 4 GiB of pinned bytes.
+/// Default global pin-budget cap: 8 GiB of pinned bytes.
 ///
-/// Matches the `ChunkBudget` 4 GiB cap from Q4. The two budgets cover
-/// disjoint phases of a chunk's lifecycle (in-flight arrival vs
-/// post-arrival pin), so the worst-case combined memory budget for the
-/// chunked path is ~8 GiB plus the per-driver fast-tier MemoryStore pin.
-pub const DEFAULT_PIN_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// Bumped from 4 GiB → 8 GiB per #493 after production hit the prior cap
+/// (16 distinct digests rejected with `Code::ResourceExhausted: global
+/// PinBudget exhausted` in a 2h window, surfacing as ByteStream::write
+/// upload failures to Bazel). The pin budget covers the post-arrival
+/// (waiting-for-slow-tier-commit) phase, which under slow-tier pauses
+/// grows at upload-rate × pause-duration; the prior 4 GiB matched the
+/// `ChunkBudget` arrival-side cap from Q4 but turned out too tight for
+/// observed slow-tier hiccups under sustained line-rate ingest.
+///
+/// The two budgets still cover disjoint phases of a chunk's lifecycle
+/// (in-flight arrival vs post-arrival pin), so the worst-case combined
+/// memory budget for the chunked path is now ~12 GiB (4 GiB chunk + 8
+/// GiB pin) plus the per-driver fast-tier MemoryStore pin.
+pub const DEFAULT_PIN_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// `tokio::sync::Semaphore::MAX_PERMITS` is `usize::MAX >> 3`, giving
 /// us plenty of headroom even for 256 MiB blobs (one byte = one permit).
@@ -169,8 +178,8 @@ impl Default for PinBudget {
 
 /// Process-wide singleton holder. `OnceLock` chosen for the same
 /// reasons as `chunk_budget_singleton`: the budget is a process-global
-/// resource (4 GiB cap is per-process, not per-store), and Phase 2.7
-/// admission code wires from one site (the chunked dispatcher).
+/// resource (8 GiB cap per #493 is per-process, not per-store), and
+/// Phase 2.7 admission code wires from one site (the chunked dispatcher).
 ///
 /// Storage is `Arc<PinBudget>` (not bare `PinBudget`) so the same
 /// instance can be returned BOTH as a `&'static PinBudget` (for the
@@ -231,13 +240,13 @@ impl MetricsComponent for PinBudget {
             "pinned_bytes_used",
             &used,
             nativelink_metric::MetricKind::Default,
-            "Bytes currently held by chunked-driver pins (gauge derived from the global PinBudget Semaphore; cap = DEFAULT_PIN_BUDGET_BYTES, default 4 GiB)"
+            "Bytes currently held by chunked-driver pins (gauge derived from the global PinBudget Semaphore; cap = DEFAULT_PIN_BUDGET_BYTES, default 8 GiB)"
         );
         nativelink_metric::publish!(
             "pinned_bytes_capacity",
             &cap,
             nativelink_metric::MetricKind::Default,
-            "Total pinned-bytes cap (constant after process start; default DEFAULT_PIN_BUDGET_BYTES = 4 GiB)"
+            "Total pinned-bytes cap (constant after process start; default DEFAULT_PIN_BUDGET_BYTES = 8 GiB)"
         );
         nativelink_metric::publish!(
             "pin_budget_rejections_total",
@@ -348,6 +357,21 @@ mod tests {
         let b = PinBudget::default();
         assert_eq!(b.capacity_bytes(), DEFAULT_PIN_BUDGET_BYTES);
         assert_eq!(b.available_bytes(), DEFAULT_PIN_BUDGET_BYTES);
+    }
+
+    /// Regression: `DEFAULT_PIN_BUDGET_BYTES` MUST be 8 GiB per #493 (the
+    /// 2026-05-12 attempt at this same bump silently failed because only
+    /// doc-comments were updated, not the actual constant; reviewers
+    /// trusted the rewritten doc and missed it). This test pins the
+    /// LITERAL EXPRESSION at the declaration site so doc-only drift can
+    /// no longer mask a stale constant.
+    #[test]
+    fn default_cap_is_8_gib() {
+        assert_eq!(
+            DEFAULT_PIN_BUDGET_BYTES,
+            8 * 1024 * 1024 * 1024,
+            "DEFAULT_PIN_BUDGET_BYTES regression: must remain 8 GiB per #493 (2026-05-12 incident: prior bump landed in doc-comments only, not constant)"
+        );
     }
 
     /// #463-sibling-B (memory at-capacity diagnosis) under-action gate:
