@@ -66,6 +66,42 @@ const SLOW_NOTIFY_THRESHOLD: Duration = Duration::from_secs(5);
 /// substring is preserved on every change to that error message.
 pub const SLIDING_WINDOW_EVICTION_MARKER: &str = "reader fell behind sliding window";
 
+/// Substring marker emitted into the `Code::Internal` error message produced
+/// by `StreamingBlobReader::next_chunk` when the writer set terminal=Ok but
+/// `bytes_written < digest.size_bytes()` — i.e. a silent-short EOF.
+///
+/// Sibling of `SLIDING_WINDOW_EVICTION_MARKER`. Stable substring contract so
+/// production journal greps (`grep streaming_blob_silent_short`) and any
+/// downstream predicate that wants to classify this error class trips on the
+/// same byte sequence on every release. See #502 for the bug shape: a
+/// producer that calls `send_eof` (or a fast/slow populate that completes
+/// without erroring) after writing fewer bytes than the CAS digest declares
+/// → previously surfaced as `Ok(Bytes::new())` to readers → Bazel saw a
+/// clean stream with `bytes_sent < expected_size` and reported digest
+/// mismatch as build failure. Sibling of the #500 inner_read fix
+/// (`consume_ok_eof_with_get_part_err`), which guarded the same wire-shape
+/// at a different consumer seam.
+///
+/// Classification rationale (see
+/// `.claude/audits/502-distribution-investigation-2026-05-16.md`): production
+/// data over a 48 h window shows 73.5 % of silent-shorted digests ALSO
+/// completed successfully in the same window (median per-digest success rate
+/// 25 %), 99.2 % of events truncate at a clean 1/N fraction of the blob, and
+/// 38.3 % of events share a `bytes_sent` value with at least one other
+/// distinct digest. Together those four findings rule out deterministic
+/// per-blob corruption and identify a transport-layer chunker race. The
+/// correct gRPC classification is therefore `Code::Internal` (TRANSIENT_FAILURE
+/// in Bazel's `RemoteRetrier`, retried up to 10× with exponential backoff,
+/// ~94 % effective recovery), not `Code::DataLoss` (PERMANENT_FAILURE, no
+/// retry, action fails on first hit). `worker_proxy_store.rs:1018` uses
+/// `Code::DataLoss` for a digest-mismatch-after-hash case — a different
+/// seam with different information (post-hash evidence that the bytes are
+/// wrong); `next_chunk` does NOT have that information and must not
+/// pre-commit to PERMANENT_FAILURE. On the residual cases where retries
+/// can't help, Bazel still fails the action after exhausting its 10
+/// attempts — same end-state as `DataLoss`, just slower.
+pub const STREAMING_BLOB_SILENT_SHORT_MARKER: &str = "streaming_blob_silent_short";
+
 /// Inner shared state for a streaming blob.
 ///
 /// The writer appends `Bytes` chunks to the deque and notifies
@@ -672,7 +708,115 @@ impl StreamingBlobReader {
                         "streaming blob reader observed terminal"
                     );
                     return match result {
-                        Ok(()) => Ok(Bytes::new()),
+                        Ok(()) => {
+                            // #502: defense-in-depth at the API boundary.
+                            // A producer that calls `send_eof` (terminal=Ok)
+                            // after writing fewer bytes than the digest
+                            // declares previously surfaced as `Ok(Bytes::new())`
+                            // — readers reported clean EOF with
+                            // `bytes_sent < digest.size_bytes()`, and Bazel
+                            // saw a clean stream with truncated bytes and
+                            // reported digest mismatch as build failure.
+                            //
+                            // Production observation (buildcache 2026-05-15):
+                            // `LoggingReadStream` logs show events of the
+                            // shape `expected_size: 47291739, bytes_sent:
+                            // 7881957, status: "ok"` on the
+                            // `bytestream_server::zero_copy_read` label
+                            // (which composes inner_read →
+                            // `streaming_read_while_write`-style unfold for
+                            // in-flight blobs).
+                            //
+                            // The check is symmetric with the #500 fix at
+                            // `bytestream_server.rs:1754` (consume_ok_eof
+                            // branch in `inner_read`): there the producer
+                            // dropped `tx` after a `get_part_fut` Err and
+                            // the receive side reported `Ok(empty)`; the
+                            // fix gated on the stashed `Err` slot in
+                            // `state.maybe_get_part_result`. Here the
+                            // producer terminated with `Ok` (no Err slot
+                            // to consult) but `bytes_written <
+                            // digest.size_bytes()` — same Bazel-visible
+                            // wire shape, different producer-side trigger.
+                            //
+                            // Closing this at the API boundary (rather
+                            // than at each consumer's unfold seam) means
+                            // every current AND future
+                            // `StreamingBlobReader` consumer inherits the
+                            // contract: `Ok(Bytes::new())` is returned IFF
+                            // the writer's bytes_written equals
+                            // `digest.size_bytes()`. Anything else is
+                            // converted to `Code::Internal` carrying the
+                            // `STREAMING_BLOB_SILENT_SHORT_MARKER`
+                            // substring for journal grep.
+                            //
+                            // **Why `Code::Internal`, not `Code::DataLoss`.**
+                            // The 48 h distribution analysis at
+                            // `.claude/audits/502-distribution-investigation-2026-05-16.md`
+                            // shows the silent-short class is overwhelmingly
+                            // a transient transport-layer chunker race, not
+                            // deterministic blob corruption: 73.5 % of
+                            // shorted digests also completed successfully in
+                            // the same window (median per-digest success
+                            // 25 %), 99.2 % of truncations land at a clean
+                            // 1/N fraction of `expected_size`, and 38.3 %
+                            // of events share `bytes_sent` with another
+                            // distinct digest. Bazel's `RemoteRetrier`
+                            // classifies `Code::Internal` as
+                            // TRANSIENT_FAILURE and retries it up to 10×
+                            // with exponential backoff; with the observed
+                            // 25 % per-attempt success rate that converges
+                            // to ~94 % recovery. `Code::DataLoss` would
+                            // map to PERMANENT_FAILURE — no retry — and
+                            // fail the action on the first hit, which is
+                            // exactly the wrong behavior given the data.
+                            // Truly deterministic-corruption cases still
+                            // fail the action after Bazel exhausts the
+                            // retry budget — same end-state, just slower.
+                            //
+                            // The DataLoss usage at
+                            // `worker_proxy_store.rs:1018` is a different
+                            // seam: that site has post-hash evidence that
+                            // the delivered bytes don't match the declared
+                            // digest, so no amount of retrying will help
+                            // reconcile a SHA-256 mismatch — DataLoss is
+                            // correct there. `next_chunk` does not have
+                            // that information and must not pre-commit to
+                            // PERMANENT_FAILURE.
+                            //
+                            // `DigestInfo::size_bytes()` is already `u64`.
+                            // For zero-byte digests (expected=0,
+                            // written=0), the check is a no-op (0 < 0 is
+                            // false) and the original clean-EOF path is
+                            // preserved.
+                            let bytes_written =
+                                self.inner.bytes_written.load(Ordering::Acquire);
+                            let expected_size = self.inner.digest.size_bytes();
+                            if bytes_written < expected_size {
+                                error!(
+                                    digest = %self.inner.digest,
+                                    bytes_written,
+                                    expected_size,
+                                    chunks_consumed = self.chunks_consumed,
+                                    age_ms = self.inner.age_ms(),
+                                    "{}: producer terminated with Ok but wrote \
+                                     fewer bytes than the digest declares — \
+                                     surfacing as Code::Internal (transient, \
+                                     Bazel-retryable) to prevent silent \
+                                     short-stream corruption (#502)",
+                                    STREAMING_BLOB_SILENT_SHORT_MARKER,
+                                );
+                                return Err(make_err!(
+                                    Code::Internal,
+                                    "{}: terminal=Ok but bytes_written={} < expected_size={} for digest {}",
+                                    STREAMING_BLOB_SILENT_SHORT_MARKER,
+                                    bytes_written,
+                                    expected_size,
+                                    self.inner.digest,
+                                ));
+                            }
+                            Ok(Bytes::new())
+                        }
                         Err(e) => Err(e.clone()),
                     };
                 }
@@ -931,10 +1075,25 @@ mod tests {
     use super::*;
 
     /// Helper: create a DigestInfo from a u8 seed (for test variety).
+    ///
+    /// The default size of 1024 is a vestige from before the #502
+    /// silent-short defense in `next_chunk`. Tests that send fewer
+    /// than 1024 bytes and then call `send_eof` will now trip the
+    /// partial-bytes check (terminal=Ok with bytes_written < expected).
+    /// Use [`test_digest_with_size`] when the test asserts on
+    /// terminal-Ok and writes a known small payload, so the digest's
+    /// declared size matches the bytes actually written.
     fn test_digest(seed: u8) -> DigestInfo {
+        test_digest_with_size(seed, 1024)
+    }
+
+    /// Helper: explicit-size DigestInfo, for tests that need the
+    /// declared size to match `bytes_written` so the #502 partial-bytes
+    /// check in `next_chunk` does not trip.
+    fn test_digest_with_size(seed: u8, size: u64) -> DigestInfo {
         let mut hash = [0u8; 32];
         hash[0] = seed;
-        DigestInfo::new(hash, 1024)
+        DigestInfo::new(hash, size)
     }
 
     // ---------------------------------------------------------------
@@ -942,7 +1101,10 @@ mod tests {
     // ---------------------------------------------------------------
     #[tokio::test]
     async fn single_writer_single_reader() {
-        let (writer, mut reader) = StreamingBlob::new(test_digest(1), 1024 * 1024);
+        // Digest size matches the 11 bytes actually written so the
+        // #502 partial-bytes check (terminal=Ok with bytes_written <
+        // expected_size) does not trip on this happy-path test.
+        let (writer, mut reader) = StreamingBlob::new(test_digest_with_size(1, 11), 1024 * 1024);
 
         let data1 = Bytes::from_static(b"hello ");
         let data2 = Bytes::from_static(b"world");
@@ -974,7 +1136,11 @@ mod tests {
     // ---------------------------------------------------------------
     #[tokio::test]
     async fn multiple_readers_see_same_data() {
-        let (mut writer, mut reader1) = StreamingBlob::new(test_digest(2), 1024 * 1024);
+        // 5 chunks of "chunk-N" (7 bytes each) = 35 bytes total.
+        // Match the digest size so the #502 partial-bytes check does
+        // not trip on this happy-path test.
+        let (mut writer, mut reader1) =
+            StreamingBlob::new(test_digest_with_size(2, 5 * 7), 1024 * 1024);
 
         // Create a second reader from the inner.
         let inner = Arc::clone(&reader1.inner);
@@ -1131,7 +1297,10 @@ mod tests {
     // ---------------------------------------------------------------
     #[tokio::test]
     async fn eof_only_after_terminal_success() {
-        let (mut writer, mut reader) = StreamingBlob::new(test_digest(7), 1024 * 1024);
+        // 2 bytes total ("a" + "b"); match digest size so the #502
+        // partial-bytes check does not trip.
+        let (mut writer, mut reader) =
+            StreamingBlob::new(test_digest_with_size(7, 2), 1024 * 1024);
 
         writer.send(Bytes::from_static(b"a")).await.unwrap();
         writer.send(Bytes::from_static(b"b")).await.unwrap();
@@ -1248,8 +1417,12 @@ mod tests {
     // ---------------------------------------------------------------
     #[tokio::test]
     async fn concurrent_readers_different_speeds() {
+        // 10 chunks of "data-NNNN" (9 bytes each) = 90 bytes total.
+        // Match the digest size so the #502 partial-bytes check does
+        // not trip on this happy-path test.
         // Large buffer so no eviction happens.
-        let (mut writer, mut fast_reader) = StreamingBlob::new(test_digest(12), 1024 * 1024);
+        let (mut writer, mut fast_reader) =
+            StreamingBlob::new(test_digest_with_size(12, 10 * 9), 1024 * 1024);
 
         let inner = Arc::clone(&fast_reader.inner);
         let mut slow_reader = StreamingBlob::new_reader(&inner);
@@ -1298,8 +1471,13 @@ mod tests {
     // ---------------------------------------------------------------
     #[tokio::test]
     async fn window_eviction_slow_reader_fast_reader() {
+        // 5 chunks of 10 bytes = 50 bytes total. Match digest size so
+        // the #502 partial-bytes check does not trip on the fast-reader
+        // EOF assertion (the slow reader trips the unrelated sliding-
+        // window-eviction Err first).
         // Buffer limited to 30 bytes. Each chunk is 10 bytes.
-        let (writer, mut slow_reader) = StreamingBlob::new(test_digest(13), 30);
+        let (writer, mut slow_reader) =
+            StreamingBlob::new(test_digest_with_size(13, 5 * 10), 30);
 
         let inner = Arc::clone(&slow_reader.inner);
         let mut fast_reader = StreamingBlob::new_reader(&inner);
@@ -1348,7 +1526,9 @@ mod tests {
     #[tokio::test]
     async fn in_flight_blob_map_remove_after_write_completes() {
         let map = InFlightBlobMap::new();
-        let digest = test_digest(14);
+        // 7 bytes ("payload"); match digest size so the #502 partial-
+        // bytes check does not trip on this happy-path test.
+        let digest = test_digest_with_size(14, 7);
 
         let (mut writer, mut reader) = map.register(digest, 1024 * 1024).unwrap();
         assert_eq!(map.len(), 1);
@@ -1612,7 +1792,11 @@ mod tests {
     /// completes quickly MUST NOT increment it.
     #[tokio::test(start_paused = true)]
     async fn slow_notify_wait_increments_counter() {
-        let (mut writer, mut reader) = StreamingBlob::new(test_digest(100), 1024 * 1024);
+        // 0-byte digest: writer EOFs without sending any chunks.
+        // Match digest size so the #502 partial-bytes check does not
+        // trip on the clean-EOF assertion below.
+        let (mut writer, mut reader) =
+            StreamingBlob::new(test_digest_with_size(100, 0), 1024 * 1024);
         let inner = Arc::clone(&reader.inner);
         assert_eq!(inner.notify_waits_over_5s_total(), 0);
 
@@ -1927,7 +2111,12 @@ mod tests {
     /// reader's `changed().await` parks until the 30 s deadline.
     #[tokio::test]
     async fn parked_reader_wakeup_on_writer_eof_completes_promptly() {
-        let (mut writer, mut reader) = StreamingBlob::new(test_digest(205), 1024 * 1024);
+        // 0-byte digest: writer EOFs without sending any chunks; this
+        // test asserts the reader's terminal-EOF wakeup, not byte
+        // delivery. Match digest size so the #502 partial-bytes check
+        // does not trip on the clean-EOF assertion below.
+        let (mut writer, mut reader) =
+            StreamingBlob::new(test_digest_with_size(205, 0), 1024 * 1024);
 
         // Park the reader in the wait branch — no chunks, no terminal.
         let reader_task = tokio::spawn(async move {
@@ -2019,5 +2208,291 @@ mod tests {
         assert_eq!(inner3.notify_waiters_calls_total(), 0);
         drop(writer3);
         assert_eq!(inner3.notify_waiters_calls_total(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // #502: silent-short EOF — defense-in-depth at the API boundary.
+    //
+    // A producer that calls `send_eof` after writing fewer bytes than
+    // `digest.size_bytes()` MUST surface to readers as
+    // `Code::Internal` carrying the `STREAMING_BLOB_SILENT_SHORT_MARKER`
+    // substring, NOT as a silent `Ok(Bytes::new())`. Bazel reads a
+    // gRPC stream that ends with status=ok and treats it as a complete
+    // blob; if `bytes_sent < expected_size`, the hash check fires as
+    // a build-failing digest mismatch — the production wire-shape
+    // observed on buildcache 2026-05-15 at
+    // `bytestream_server::zero_copy_read` (expected_size: 47291739,
+    // bytes_sent: 7881957, status: "ok").
+    //
+    // `Code::Internal` (not `Code::DataLoss`) because the 48 h
+    // distribution analysis at
+    // `.claude/audits/502-distribution-investigation-2026-05-16.md`
+    // identifies this class as transport-layer transient (73.5 %
+    // co-survival, median 25 % per-attempt success, 99.2 % clean-1/N
+    // truncation signature). Bazel's `RemoteRetrier` maps `Internal`
+    // to TRANSIENT_FAILURE → retried up to 10× → ~94 % effective
+    // recovery; `DataLoss` would map to PERMANENT_FAILURE and fail the
+    // action on the first hit, which is wrong given the data.
+    //
+    // Sibling of the #500 fix (consume_ok_eof branch in `inner_read`,
+    // `bytestream_server.rs:1754`) — same Bazel-visible wire-shape,
+    // different producer-side trigger (#500 fires on tx-drop + Err;
+    // #502 fires on send_eof + partial bytes).
+    //
+    // Per CLAUDE.md "Asymmetric contract coverage": both directions
+    // are part of the contract. Under-action = producer's bug must
+    // surface as Err (this is the new behavior). Over-action = a
+    // producer that wrote the FULL bytes MUST still observe clean
+    // EOF — no spurious Internal-error.
+    // ---------------------------------------------------------------
+
+    /// Under-action: a writer that calls `send_eof` after writing
+    /// fewer bytes than the digest declares MUST surface as
+    /// `Code::Internal` (transient, Bazel-retryable) to the reader,
+    /// not silent `Ok(Bytes::new())`. This is the #502 production
+    /// wire-shape.
+    ///
+    /// Mutation test: comment out the new partial-bytes check in
+    /// `next_chunk`'s terminal=Ok branch — the test MUST red-fail with
+    /// the bespoke `.expect_err` message naming #502.
+    #[tokio::test]
+    async fn silent_short_eof_surfaces_as_internal() {
+        // Digest declares 1024 bytes; writer sends only 4.
+        let digest = DigestInfo::new([0x42u8; 32], 1024);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 1024 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let mut reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+        writer
+            .send(Bytes::from_static(b"part"))
+            .await
+            .expect("writer.send must succeed");
+        writer
+            .send_eof()
+            .expect("writer.send_eof must succeed");
+
+        // First chunk reads normally.
+        let chunk = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk for partial chunk must not deadlock")
+            .expect("first chunk must read as Ok");
+        assert_eq!(&chunk[..], b"part");
+
+        // Second poll: would historically return `Ok(Bytes::new())` (silent
+        // EOF). The #502 fix converts to `Code::Internal` (TRANSIENT_FAILURE
+        // in Bazel's RemoteRetrier — retried up to 10×) with the marker
+        // substring so Bazel + downstream classifiers can detect it.
+        let err = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk on terminal-Ok must not deadlock")
+            .expect_err(
+                "#502: writer terminated with Ok after writing 4 of 1024 \
+                 bytes — reader MUST observe Err(Internal) (transient, \
+                 Bazel-retryable), not silent EOF, to prevent Bazel-visible \
+                 digest mismatches",
+            );
+        assert_eq!(
+            err.code,
+            Code::Internal,
+            "#502: silent-short EOF must surface as Code::Internal \
+             (transient/retryable per the 2026-05-16 distribution audit), \
+             got {err:?}",
+        );
+        // Stable substring contract for production journal grep and any
+        // downstream predicate that wants to classify this error class.
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains(STREAMING_BLOB_SILENT_SHORT_MARKER),
+            "#502: Err message must include STREAMING_BLOB_SILENT_SHORT_MARKER \
+             for production grep predicates; got {msg}",
+        );
+    }
+
+    /// Over-action: a writer that completes the full declared bytes
+    /// followed by `send_eof` MUST observe clean EOF (`Ok(Bytes::new())`)
+    /// at the reader. The #502 fix MUST NOT trip on the legitimate
+    /// happy path.
+    ///
+    /// Without this assertion, a too-aggressive partial-bytes check
+    /// (e.g. one that compares against `chunks_consumed` instead of
+    /// `bytes_written`, or off-by-one on the inequality) would
+    /// silently break every CAS read in production.
+    #[tokio::test]
+    async fn full_byte_eof_observes_clean_terminal() {
+        // Digest declares 8 bytes; writer sends exactly 8.
+        let digest = DigestInfo::new([0x21u8; 32], 8);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 1024 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let mut reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+        writer
+            .send(Bytes::from_static(b"abcd"))
+            .await
+            .expect("writer.send must succeed (1/2)");
+        writer
+            .send(Bytes::from_static(b"efgh"))
+            .await
+            .expect("writer.send must succeed (2/2)");
+        writer
+            .send_eof()
+            .expect("writer.send_eof must succeed");
+
+        // Drain both chunks.
+        let c1 = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk must not deadlock (chunk 1)")
+            .expect("chunk 1 must be Ok");
+        assert_eq!(&c1[..], b"abcd");
+        let c2 = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk must not deadlock (chunk 2)")
+            .expect("chunk 2 must be Ok");
+        assert_eq!(&c2[..], b"efgh");
+
+        // Terminal=Ok with bytes_written == expected_size MUST be
+        // clean EOF, not a spurious Internal error.
+        let eof = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk on terminal-Ok must not deadlock")
+            .expect(
+                "#502 over-action: writer wrote the full 8 bytes then \
+                 send_eof'd — reader MUST observe clean EOF (Ok empty), \
+                 NOT a spurious Internal-error. A check that fires on \
+                 the happy path would silently break every CAS read.",
+            );
+        assert!(
+            eof.is_empty(),
+            "#502 over-action: post-EOF next_chunk MUST return empty Bytes \
+             on the full-byte happy path, got {} bytes",
+            eof.len(),
+        );
+    }
+
+    /// Edge case: a zero-byte digest (`expected_size = 0`) with no
+    /// chunks sent + `send_eof` MUST still observe clean EOF, NOT a
+    /// spurious Internal error. `0 < 0` is false, so the check is a
+    /// no-op on this path; this test guards against a future refactor
+    /// that changes the inequality to `<=` and breaks zero-byte CAS
+    /// reads.
+    #[tokio::test]
+    async fn zero_byte_digest_eof_observes_clean_terminal() {
+        let digest = DigestInfo::new([0x00u8; 32], 0);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 1024 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let mut reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+        writer
+            .send_eof()
+            .expect("writer.send_eof must succeed on zero-byte digest");
+
+        let eof = tokio::time::timeout(Duration::from_secs(1), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk on zero-byte terminal-Ok must not deadlock")
+            .expect(
+                "#502: zero-byte digest with no chunks + send_eof MUST \
+                 observe clean EOF — bytes_written=0, expected=0, 0<0 is \
+                 false so the partial-bytes check is a no-op",
+            );
+        assert!(
+            eof.is_empty(),
+            "#502: zero-byte CAS read MUST return empty Bytes, got {} bytes",
+            eof.len(),
+        );
+    }
+
+    /// Production-composition seam: `fast_slow_store::spawn_populate_producer`
+    /// is the ONLY production caller of `StreamingBlobWriter::send_eof`
+    /// (audited 2026-05-16). The bug fires when its `slow_store.get`
+    /// silently truncates (returns Ok with bytes_written <
+    /// expected_size) — the populator's merged terminal is Ok and
+    /// `send_eof` is called.
+    ///
+    /// Simulate that producer-side wire-shape directly on the
+    /// `StreamingBlobWriter` API: send a partial slice, then `send_eof`.
+    /// The reader composed in production
+    /// (`bytestream_server::inner_read::streaming_read_while_write` and
+    /// `fast_slow_store::populate_*` consumers using
+    /// `StreamingBlobReader::next_chunk`) MUST observe Err(Internal),
+    /// so the upstream unfold yields `Some((Err, _))` instead of
+    /// `None` — the same seam the #500 fix closed for the inner_read
+    /// path. `Code::Internal` is the retryable classification
+    /// (TRANSIENT_FAILURE in Bazel's RemoteRetrier, ~94 % recovery via
+    /// the 10-retry budget) — see the marker constant's doc-comment
+    /// for the underlying distribution data.
+    ///
+    /// This test does NOT spin up a real FastSlowStore (would force a
+    /// 5-wrapper integration setup); it asserts the API-boundary
+    /// contract at the StreamingBlob primitive that EVERY consumer
+    /// (current and future) inherits. The 1-second `tokio::time::timeout`
+    /// is the deadlock detector per CLAUDE.md "Test in production
+    /// composition" — `tokio::time::Elapsed` passes `is_err()` but
+    /// would fail the bespoke `.expect_err` message.
+    #[tokio::test]
+    async fn populate_path_silent_short_propagates_to_reader_as_err() {
+        // Production-shape: a 47 MiB-class CAS blob, but the slow tier
+        // delivers only the first 8 MiB before silently truncating.
+        // Scaled down for test speed; the invariant is the inequality,
+        // not the absolute sizes.
+        const EXPECTED_BYTES: u64 = 47_291_739;
+        const TRUNCATED_BYTES: u64 = 7_881_957;
+        let digest = DigestInfo::new([0x5au8; 32], EXPECTED_BYTES);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 64 * 1024 * 1024));
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let mut reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+        // Simulate the producer: ship the truncated chunks the fast/slow
+        // populate would have forwarded from `slow_rx`.
+        let chunk = Bytes::from(vec![0xa5u8; TRUNCATED_BYTES as usize]);
+        writer
+            .send(chunk)
+            .await
+            .expect("producer.send must succeed for the truncated chunk");
+        // Populator's `streaming_terminal` resolves to Ok because the
+        // inner pipeline (data_stream, slow_store.get, fast_store.update)
+        // all returned Ok despite the truncated payload — this is the
+        // #502 producer-side wire-shape.
+        writer
+            .send_eof()
+            .expect("producer.send_eof must succeed (the bug)");
+
+        // Reader drains the truncated chunk.
+        let c = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk must not deadlock on the truncated chunk")
+            .expect("truncated chunk must be Ok");
+        assert_eq!(c.len(), TRUNCATED_BYTES as usize);
+
+        // Next poll: API-boundary defense MUST surface as
+        // Code::Internal. The unfold in
+        // `bytestream_server::streaming_read_while_write` matches on
+        // `Err(e)` → yields `Some((Err(e.into()), state))` (line 1606
+        // and 1565) — Bazel receives status=error (Internal =
+        // TRANSIENT_FAILURE) and retries via RemoteRetrier instead of
+        // accepting a clean-short stream as canonical bytes.
+        let err = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk on terminal-Ok must not deadlock")
+            .expect_err(
+                "#502: populate path that silent-truncates and calls \
+                 send_eof MUST surface as Err(Internal) to the reader — \
+                 the bytestream_server streaming_read_while_write unfold \
+                 yields Some((Err, _)) and Bazel retries (transient \
+                 classification); without this check, the unfold yields \
+                 None (clean EOF) and Bazel reports digest mismatch as \
+                 build failure",
+            );
+        assert_eq!(
+            err.code,
+            Code::Internal,
+            "#502: silent-short EOF at the populate seam must be \
+             Code::Internal (transient/retryable per the 2026-05-16 \
+             distribution audit), got {err:?}",
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains(STREAMING_BLOB_SILENT_SHORT_MARKER),
+            "#502: production-composition err message must include the \
+             stable marker substring; got {msg}",
+        );
     }
 }
