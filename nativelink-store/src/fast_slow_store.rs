@@ -117,6 +117,22 @@ const LOCAL_ONLY_READS_BATCH_CONCURRENCY: usize = 16;
 /// secondary safety net for hangs longer than 120s.
 const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
 
+/// #247/#477 observability: slow-wait threshold at which the BLOCK-B
+/// per-digest `Notify` wait in [`FastSlowStore::get_part`] escalates
+/// its exit log from `info!` to `warn!`. The wait itself is unbounded
+/// (writer-side `CHUNKED_COMMIT_WATCHDOG_SECS = 60 s` + RAII
+/// synthetic-Cancelled-on-drop bound it); this threshold only controls
+/// log severity so operators can grep `WARN` for genuine BLOCK-B
+/// anomalies without losing the entry/exit pairing for healthy waits.
+///
+/// 1 s pick: healthy chunked commits for small-to-medium blobs land
+/// well under a second per the chunked-commit budget. A wait that
+/// reaches a full second means commit-side is contending — slow-tier
+/// hiccup, multi-MiB rename, or commit-watchdog approaching — and
+/// deserves operator attention before the 30 s soft-warn
+/// (`CHUNKED_COMMIT_SOFT_WARN_SECS`) covers the deeper anomaly.
+const BLOCK_B_SLOW_WAIT_THRESHOLD: Duration = Duration::from_secs(1);
+
 /// #334 Fix B: client-suggested backoff hint when the
 /// `slow_writes_in_flight_max_bytes` cap rejects an admission. Slow-tier
 /// wedges (txg pause, transient gRPC unreachability) typically resolve in
@@ -6173,7 +6189,25 @@ impl StoreDriver for FastSlowStore {
                 guard.get(&digest).map(|(_count, n)| Arc::clone(n))
             };
             if let Some(notify) = notify_handle {
-                debug!(
+                // #247/#477 observability: promoted `debug!` → `info!` so
+                // the BLOCK-B entry survives `release_max_level_info`
+                // (workspace `Cargo.toml:101` strips `debug!`/`trace!` in
+                // release builds). Without an `info!` here, production
+                // journals cannot answer "is BLOCK-B firing today?" — a
+                // load-bearing input to the Option-C run_producer wait
+                // design (mirrors this Notify wait in update path). Three
+                // log lines max per BLOCK-B wait (entry / Ok exit /
+                // slow-wait warn) — no per-poll hot-loop logging. Volume
+                // is bounded by chunked-commit fan-in (single-digit
+                // concurrent commits in production); if entry/exit pair
+                // ever exceeds 100/s under load, demote to a per-site
+                // SoftWarnSet (#501 pattern). Field set: digest (Debug
+                // for hash-prefix grep), expected size if knowable
+                // (`expected_size` not in scope here; see exit-time
+                // field set on Notified::await for actual wait
+                // duration).
+                let wait_started = Instant::now();
+                info!(
                     ?digest,
                     "fast_slow get_part: digest is in chunked_in_flight_digests; \
                      blocking reader on per-digest Notify until v2/v1 commit \
@@ -6195,13 +6229,47 @@ impl StoreDriver for FastSlowStore {
                     .contains_key(&digest);
                 if still_in_flight {
                     notified.await;
-                    debug!(
-                        ?digest,
-                        "fast_slow get_part: per-digest Notify fired \
-                         (chunked_in_flight_digests drained for this digest); \
-                         proceeding to slow-tier read",
-                    );
+                    let waited = wait_started.elapsed();
+                    // 1s slow-wait threshold: healthy chunked commits
+                    // for small-to-medium blobs land in tens of ms (per
+                    // chunked_write_handler.rs commit-path budget); >1s
+                    // means commit is contending (slow tier hiccup,
+                    // commit-watchdog approaching, or a multi-MiB blob
+                    // mid-rename) and operators should be able to see
+                    // it without `debug!`. Below threshold stays
+                    // `info!` — entry/exit pairing is the load-bearing
+                    // observability for "is BLOCK-B firing?" The 1 s
+                    // pick (vs `CHUNKED_COMMIT_SOFT_WARN_SECS / 2 = 15
+                    // s`) trades broader warn-coverage for earlier
+                    // operator signal; the soft-warn at 30 s already
+                    // covers the deeper anomaly.
+                    if waited >= BLOCK_B_SLOW_WAIT_THRESHOLD {
+                        warn!(
+                            ?digest,
+                            waited_ms = waited.as_millis() as u64,
+                            "fast_slow get_part: BLOCK-B per-digest Notify wait \
+                             exceeded slow-wait threshold; commit-side may be \
+                             contending (slow tier hiccup, large blob rename, \
+                             or commit-watchdog approaching) — proceeding to \
+                             slow-tier read",
+                        );
+                    } else {
+                        info!(
+                            ?digest,
+                            waited_ms = waited.as_millis() as u64,
+                            "fast_slow get_part: BLOCK-B per-digest Notify fired \
+                             (chunked_in_flight_digests drained for this digest); \
+                             proceeding to slow-tier read",
+                        );
+                    }
                 } else {
+                    // No `.await` taken on this branch — drained between
+                    // lock-drop and `Notified::enable()`. Stays `debug!`
+                    // because (a) no wait was observed; (b) the entry
+                    // `info!` already provides the journalable BLOCK-B
+                    // signal; (c) this branch fires whenever the
+                    // commit-side races ahead, which is the common
+                    // healthy outcome and would flood at line rate.
                     debug!(
                         ?digest,
                         "fast_slow get_part: chunked_in_flight_digests drained \
