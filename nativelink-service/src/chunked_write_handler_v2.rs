@@ -157,6 +157,20 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         self: Arc<Self>,
         request: Request<Streaming<WriteChunk>>,
     ) -> Result<Response<WriteChunkedV2Stream>, Status> {
+        // #247+#477 DS-reviewer disambiguation: emit one info! per v2
+        // server-side RPC entry so a journal scan can attribute every
+        // worker→server WriteChunkedV2 invocation to this wire shape.
+        let peer_addr = request
+            .remote_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        info!(
+            target: "nativelink_service::chunked_write_handler_v2",
+            writer_path = "server_v2_rpc",
+            wire_shape = "v2",
+            %peer_addr,
+            "WriteChunkedV2 RPC entry",
+        );
         let mut stream = request.into_inner();
 
         // Receive the first chunk so we learn the digest BEFORE
@@ -250,10 +264,11 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         let _v2_inflight_guard = self
             .chunked_in_flight_digests_for_v2()
             .map(|set| {
-                crate::chunked_write_handler::InFlightChunkedGuard::new(
+                crate::chunked_write_handler::InFlightChunkedGuard::new_with_caller(
                     Arc::clone(set),
                     digest,
                     self.in_flight_empty_notify_for_v2().cloned(),
+                    "server_v2_session",
                 )
             });
 

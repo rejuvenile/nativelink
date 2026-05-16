@@ -200,6 +200,23 @@ where
 {
     fn dispatch(&self, chunks: Vec<WriteChunk>) -> DispatchFuture {
         let factory = Arc::clone(&self.acquire_channel);
+        // #247+#477 DS-reviewer disambiguation: identify the wire shape
+        // of this dispatch attempt + the digest extracted from the
+        // first chunk. Worker-side log; emits once per attempt.
+        let digest_str = chunks
+            .first()
+            .and_then(|c| c.digest.as_ref())
+            .map(|d| format!("{}-{}", d.hash, d.size_bytes))
+            .unwrap_or_else(|| "<no-first-chunk>".to_string());
+        let chunk_count = chunks.len();
+        info!(
+            target: "nativelink_store::chunked::chunked_client",
+            writer_path = "worker_dispatch_v1",
+            wire_shape = "v1",
+            digest = %digest_str,
+            chunk_count,
+            "WriteChunked dispatch attempt",
+        );
         Box::pin(async move {
             let channel = factory().await?;
             let stream = tokio_stream::iter(chunks);
@@ -277,6 +294,23 @@ where
         use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::write_chunked_frame;
         use tokio_stream::StreamExt as _;
         let factory = Arc::clone(&self.acquire_channel);
+        // #247+#477 DS-reviewer disambiguation: identify the wire shape
+        // of this dispatch attempt + the digest extracted from the
+        // first chunk. Worker-side log; emits once per attempt.
+        let digest_str = chunks
+            .first()
+            .and_then(|c| c.digest.as_ref())
+            .map(|d| format!("{}-{}", d.hash, d.size_bytes))
+            .unwrap_or_else(|| "<no-first-chunk>".to_string());
+        let chunk_count = chunks.len();
+        info!(
+            target: "nativelink_store::chunked::chunked_client",
+            writer_path = "worker_dispatch_v2",
+            wire_shape = "v2",
+            digest = %digest_str,
+            chunk_count,
+            "WriteChunkedV2 dispatch attempt",
+        );
         Box::pin(async move {
             let channel = factory().await?;
             let stream = tokio_stream::iter(chunks);
@@ -437,6 +471,24 @@ pub async fn write_chunked_stream(
     metrics: Arc<ChunkedClientMetrics>,
 ) -> Result<u64, Error> {
     metrics.attempted_total.fetch_add(1, Ordering::Relaxed);
+    // #247+#477 DS-reviewer disambiguation: emit one info! per
+    // worker-side WriteChunked dispatch entry so a worker-log scan can
+    // attribute every worker→server chunked-write attempt to the
+    // worker dispatcher. NOTE: worker logs route to
+    // `~/Library/Logs/nativelink-worker.log` (macOS launchd) — they do
+    // NOT reach the server's journal. Cross-host correlation requires
+    // pulling both. The exact wire shape (v1 vs v2) is logged separately
+    // inside each dispatcher impl (`WorkerApiWriteChunkedDispatcher::dispatch`
+    // / `WorkerApiWriteChunkedV2Dispatcher::dispatch`).
+    info!(
+        target: "nativelink_store::chunked::chunked_client",
+        writer_path = "worker_chunked_client",
+        %digest,
+        expected_size = digest.size_bytes(),
+        max_attempts = options.max_attempts,
+        chunk_size = options.chunk_size,
+        "write_chunked_stream entry",
+    );
 
     if options.chunk_size == 0 {
         return Err(make_err!(

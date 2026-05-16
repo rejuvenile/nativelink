@@ -876,6 +876,22 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         &self,
         request: Request<Streaming<WriteChunk>>,
     ) -> Result<Response<WriteChunkedResponse>, Status> {
+        // #247+#477 DS-reviewer disambiguation: emit one info! per v1
+        // server-side RPC entry so a journal scan can attribute every
+        // worker→server WriteChunked invocation to this wire shape.
+        // peer_addr is on the request extensions; pull it best-effort
+        // (Some only when the tonic transport populates it).
+        let peer_addr = request
+            .remote_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        info!(
+            target: "nativelink_service::chunked_write_handler",
+            writer_path = "server_v1_rpc",
+            wire_shape = "v1",
+            %peer_addr,
+            "WriteChunked RPC entry",
+        );
         match self.write_chunked_inner(request).await {
             Ok(resp) => Ok(Response::new(resp)),
             Err(err) => Err(err_to_status(err)),
@@ -1139,6 +1155,21 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             );
             (sender, driver_arc)
         };
+        // #247+#477 DS-reviewer disambiguation: the handler-local
+        // `in_flight` map is a DIFFERENT registry from the FSS-level
+        // `chunked_in_flight_digests` (which `write_chunked_inner` does
+        // NOT register in — the v1 worker→server RPC path is invisible
+        // to Option C reader-waits as a result). Tag with
+        // `registry = "handler_local_in_flight"` so a journal scan
+        // distinguishes the two registries.
+        info!(
+            target: "nativelink_service::chunked_write_handler",
+            writer_path = "server_v1_handler_local",
+            registry = "handler_local_in_flight",
+            digest = %stream_digest,
+            expected_size = stream_digest.size_bytes(),
+            "in_flight handler-local entry inserted (write_chunked_inner)",
+        );
 
         // The driver is in the in-flight map; from this point on a
         // panic in our request loop must remove the entry (the Arc
@@ -2862,6 +2893,22 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
         );
         (sender, driver_arc)
     };
+    // #247+#477 DS-reviewer disambiguation: the shared
+    // `dispatch_chunks_to_driver` is reached by BOTH the v1
+    // BazelChunkedDispatcher AND the v1 `write_chunked_inner` paths
+    // (and any other future producer). Tag with
+    // `registry = "handler_local_in_flight"` to mark it as the
+    // handler-local map (NOT the FSS-level chunked_in_flight_digests).
+    // Caller identity is logged separately at the dispatcher entry; this
+    // event flags the shared-fn insertion that follows.
+    info!(
+        target: "nativelink_service::chunked_write_handler",
+        writer_path = "shared_dispatch_chunks_to_driver",
+        registry = "handler_local_in_flight",
+        %digest,
+        expected_size = digest.size_bytes(),
+        "in_flight handler-local entry inserted (dispatch_chunks_to_driver)",
+    );
 
     // #212 fixup S1: register the per-blob driver with the read-cascade
     // registry (if one is wired). Phase 2.5's `FastSlowStore::get_part`
@@ -3504,6 +3551,17 @@ pub struct InFlightChunkedGuard {
     /// Required so the success path can hand removal to the spawned
     /// reaper without double-removing.
     armed: bool,
+    /// Static label identifying which writer path constructed this
+    /// guard. Forms the `writer_path` field in the paired
+    /// insertion/removal `info!` logs that disambiguate which writer
+    /// path actually registers in the FSS-level `chunked_in_flight_digests`
+    /// set (vs. only inserts in the handler-local `in_flight` map).
+    /// Observability-only; not load-bearing for correctness.
+    caller: &'static str,
+    /// Wall-clock instant the guard was constructed. Drop emits the
+    /// elapsed milliseconds to bound the FSS-registration lifetime
+    /// for each writer path. Observability-only.
+    inserted_at: Instant,
 }
 
 impl InFlightChunkedGuard {
@@ -3542,7 +3600,24 @@ impl InFlightChunkedGuard {
         digest: DigestInfo,
         notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Self {
-        {
+        Self::new_with_caller(set, digest, notify, "unspecified")
+    }
+
+    /// Like [`Self::new`] but tags the guard with a static `caller`
+    /// label so the paired insertion / removal `info!` events
+    /// disambiguate WHICH writer path registered in the FSS-level
+    /// `chunked_in_flight_digests` set. Plain `new()` retains the
+    /// pre-existing call shape used by tests; production sites pass
+    /// their identity here (e.g. `"bazel_facing_v1_dispatcher"`,
+    /// `"server_v2_session"`).
+    #[must_use]
+    pub fn new_with_caller(
+        set: ChunkedInFlightMap,
+        digest: DigestInfo,
+        notify: Option<Arc<tokio::sync::Notify>>,
+        caller: &'static str,
+    ) -> Self {
+        let new_refcount: u32 = {
             let mut guard = set.lock();
             // Bump the refcount; on first insert, create the per-digest
             // Notify. Subsequent inserts saturate to prevent overflow at
@@ -3557,7 +3632,7 @@ impl InFlightChunkedGuard {
             // fires → BLOCK-B reader blocks forever (no timeout post
             // round-2 fix). `saturating_add` is the true symmetric
             // counterpart of the `saturating_sub` in `Drop`.
-            guard
+            let entry = guard
                 .entry(digest)
                 .and_modify(|(c, _n)| {
                     *c = c.saturating_add(1);
@@ -3568,12 +3643,32 @@ impl InFlightChunkedGuard {
                         Arc::new(tokio::sync::Notify::new()),
                     )
                 });
-        }
+            entry.0.get()
+        };
+        // #247+#477 DS-reviewer disambiguation: emit one info! per
+        // FSS-level registration so a journal scan can attribute every
+        // chunked_in_flight_digests insertion to a specific writer
+        // path. Paired with the `chunked_in_flight removed` event in
+        // `Drop` (search marker: `chunked_in_flight registered`).
+        // Fires at chunked-blob admission cadence (~1142/h in production
+        // at the time of writing); safely below the 1073-lines/sec OOM
+        // threshold flagged in #253.
+        info!(
+            target: "nativelink_service::chunked_write_handler",
+            writer_path = caller,
+            registry = "fss_chunked_in_flight_digests",
+            %digest,
+            expected_size = digest.size_bytes(),
+            refcount_after = new_refcount,
+            "chunked_in_flight registered",
+        );
         Self {
             set,
             digest,
             notify,
             armed: true,
+            caller,
+            inserted_at: Instant::now(),
         }
     }
 
@@ -3608,8 +3703,22 @@ impl InFlightChunkedGuard {
 
 impl Drop for InFlightChunkedGuard {
     fn drop(&mut self) {
+        let digest = self.digest;
         if !self.armed {
             // Disarmed: success-path reaper owns removal. No-op here.
+            // Still emit one diagnostic line so a journal scan can
+            // confirm the hand-off occurred (paired with the
+            // `chunked_in_flight registered` info!). `outcome="disarm"`
+            // distinguishes from refcount-drop removals.
+            info!(
+                target: "nativelink_service::chunked_write_handler",
+                writer_path = self.caller,
+                registry = "fss_chunked_in_flight_digests",
+                %digest,
+                outcome = "disarm",
+                duration_ms = self.inserted_at.elapsed().as_millis() as u64,
+                "chunked_in_flight guard disarmed (success-path reaper owns removal)",
+            );
             return;
         }
         // MAJOR-G + BLOCK-2: decrement refcount; remove entry only when
@@ -3622,7 +3731,7 @@ impl Drop for InFlightChunkedGuard {
         // drained state. If the whole map becomes empty, also fire the
         // FSS-wide drain notify.
         let mut guard = self.set.lock();
-        let (now_empty, per_digest_notify) = match guard.get_mut(&self.digest) {
+        let (now_empty, per_digest_notify, refcount_after) = match guard.get_mut(&self.digest) {
             Some((count, per_digest_notify)) => {
                 // Saturating-sub: if `count` is saturated at u32::MAX
                 // we still decrement, but we cannot detect the "true"
@@ -3630,7 +3739,7 @@ impl Drop for InFlightChunkedGuard {
                 // saturating-add in `new()` (code-reviewer M1).
                 if let Some(new_count) = NonZeroU32::new(count.get().saturating_sub(1)) {
                     *count = new_count;
-                    (false, None)
+                    (false, None, new_count.get())
                 } else {
                     // Refcount → 0: clone the per-digest Arc<Notify>
                     // out of the map slot, remove the entry, drop the
@@ -3642,17 +3751,33 @@ impl Drop for InFlightChunkedGuard {
                     // drained state.
                     let per_digest = Arc::clone(per_digest_notify);
                     guard.remove(&self.digest);
-                    (guard.is_empty(), Some(per_digest))
+                    (guard.is_empty(), Some(per_digest), 0)
                 }
             }
             None => {
                 // No entry to decrement — should not happen given the
                 // RAII shape (new() inserts; we're the only path that
                 // decrements). Defensive: treat as no-op.
-                (false, None)
+                (false, None, 0)
             }
         };
         drop(guard);
+        // #247+#477 DS-reviewer disambiguation: paired removal log for
+        // the `chunked_in_flight registered` event in `new_with_caller`.
+        // Search marker: `chunked_in_flight removed`. `outcome` field
+        // distinguishes refcount-drop from disarm; `duration_ms`
+        // bounds how long this writer kept the digest in the FSS set.
+        info!(
+            target: "nativelink_service::chunked_write_handler",
+            writer_path = self.caller,
+            registry = "fss_chunked_in_flight_digests",
+            %digest,
+            outcome = "drop",
+            refcount_after,
+            duration_ms = self.inserted_at.elapsed().as_millis() as u64,
+            now_empty,
+            "chunked_in_flight removed",
+        );
         // Per-digest wakeup (BLOCK-B reader-cascade). Even though
         // `notify_waiters()` is fine to call while the entry still
         // exists, we order it AFTER removal so that any reader that
@@ -3852,10 +3977,11 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                 // BEFORE dispatch via an RAII guard. (Same shape as the
                 // pre-#497 dispatch.)
                 let inflight_guard = self.chunked_in_flight_digests.as_ref().map(|set| {
-                    InFlightChunkedGuard::new(
+                    InFlightChunkedGuard::new_with_caller(
                         Arc::clone(set),
                         digest,
                         self.in_flight_empty_notify.clone(),
+                        "bazel_facing_v1_dispatcher",
                     )
                 });
                 // MAJOR-F + MAJOR-H (#499 followup): replace the
@@ -3975,8 +4101,8 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                             // disarm path transferred removal ownership
                             // to this site.
                             if let Some((set, dig, notify)) = inflight_set_for_reaper {
-                                let mut guard = set.lock();
-                                let (now_empty, per_digest_notify) =
+                                let (now_empty, per_digest_notify, refcount_after) = {
+                                    let mut guard = set.lock();
                                     match guard.get_mut(&dig) {
                                         Some((count, per_digest_notify)) => {
                                             // Saturating-sub: symmetric with the
@@ -3986,19 +4112,34 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                                                 NonZeroU32::new(count.get().saturating_sub(1))
                                             {
                                                 *count = new_count;
-                                                (false, None)
+                                                (false, None, new_count.get())
                                             } else {
                                                 // Refcount → 0: clone the per-digest
                                                 // notify out so we can fire it after
                                                 // releasing the map lock.
                                                 let per_digest = Arc::clone(per_digest_notify);
                                                 guard.remove(&dig);
-                                                (guard.is_empty(), Some(per_digest))
+                                                (guard.is_empty(), Some(per_digest), 0u32)
                                             }
                                         }
-                                        None => (false, None),
-                                    };
-                                drop(guard);
+                                        None => (false, None, 0u32),
+                                    }
+                                };
+                                // #247+#477 DS-reviewer disambiguation: pair
+                                // the `chunked_in_flight registered`
+                                // (bazel_facing_v1_dispatcher) event with a
+                                // removal event when the disarm-path reaper
+                                // performs the inline decrement.
+                                info!(
+                                    target: "nativelink_service::chunked_write_handler",
+                                    writer_path = "bazel_facing_v1_dispatcher",
+                                    registry = "fss_chunked_in_flight_digests",
+                                    digest = %dig,
+                                    outcome = "reaper_decrement",
+                                    refcount_after,
+                                    now_empty,
+                                    "chunked_in_flight removed",
+                                );
                                 // BLOCK-2: per-digest wakeup for BLOCK-B readers.
                                 if let Some(n) = per_digest_notify {
                                     n.notify_waiters();
