@@ -41,7 +41,13 @@ use crate::metrics_utils::{Counter, CounterWithTime};
 /// Maximum fraction of max_bytes that can be pinned (25%).
 const PIN_CAP_FRACTION: f64 = 0.25;
 /// Seconds before a pin automatically expires.
-const PIN_TIMEOUT_SECS: u64 = 120;
+///
+/// `pub` so downstream crates (e.g. `nativelink-service`'s chunked
+/// commit-watchdog soft-warn layer) can derive ordering constants
+/// parametrically against the pin TTL ceiling without duplicating the
+/// literal. See `chunked_write_handler::CHUNKED_COMMIT_SOFT_WARN_SECS`
+/// for the derived value (`PIN_TIMEOUT_SECS / 4 = 30`).
+pub const PIN_TIMEOUT_SECS: u64 = 120;
 // Eviction channel is unbounded (mpsc::unbounded_channel). Each EvictionEvent
 // is ~64 bytes (Arc<K> + T). At 1M entries that's ~64MB, well within budget.
 // Unbounded avoids blocking moka's internal lock during burst eviction

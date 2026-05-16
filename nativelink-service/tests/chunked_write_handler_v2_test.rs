@@ -2659,6 +2659,7 @@ async fn v2_watchdog_err_carries_discriminator_so_classifier_retries() {
     use core::time::Duration;
     use std::path::PathBuf;
     use nativelink_error::Code;
+    use nativelink_service::chunked_write_handler::ChunkedWriteHandlerMetrics;
     use nativelink_service::chunked_write_handler_v2::v2_await_commit_result_for_test;
     use nativelink_store::chunked::chunked_race_state::ChunkRaceState;
     use nativelink_store::chunked_signal::error_has_watchdog_timeout_signal;
@@ -2679,8 +2680,10 @@ async fn v2_watchdog_err_carries_discriminator_so_classifier_retries() {
     // virtual time past the deadline so the timeout future fires WITHOUT
     // wall-clock cost.
     let race_state_for_awaiter = Arc::clone(&race_state);
+    let metrics_for_awaiter = Arc::new(ChunkedWriteHandlerMetrics::default());
     let awaiter = tokio::spawn(async move {
-        v2_await_commit_result_for_test(&race_state_for_awaiter).await
+        v2_await_commit_result_for_test(&race_state_for_awaiter, digest, &metrics_for_awaiter)
+            .await
     });
 
     // Yield + advance virtual time past the 60s watchdog deadline so the
@@ -2744,6 +2747,7 @@ async fn v2_watchdog_err_carries_discriminator_so_classifier_retries() {
 async fn v2_await_commit_result_success_path_carries_no_discriminator() {
     use core::time::Duration;
     use std::path::PathBuf;
+    use nativelink_service::chunked_write_handler::ChunkedWriteHandlerMetrics;
     use nativelink_service::chunked_write_handler_v2::v2_await_commit_result_for_test;
     use nativelink_store::chunked::chunked_race_state::{ChunkRaceState, RaceCommitResult};
     use nativelink_store::chunked_signal::error_has_watchdog_timeout_signal;
@@ -2761,8 +2765,10 @@ async fn v2_await_commit_result_success_path_carries_no_discriminator() {
 
     // Awaiter parks on the notify; publisher fires BEFORE watchdog.
     let race_state_for_awaiter = Arc::clone(&race_state);
+    let metrics_for_awaiter = Arc::new(ChunkedWriteHandlerMetrics::default());
     let awaiter = tokio::spawn(async move {
-        v2_await_commit_result_for_test(&race_state_for_awaiter).await
+        v2_await_commit_result_for_test(&race_state_for_awaiter, digest, &metrics_for_awaiter)
+            .await
     });
 
     // Let the awaiter run through subscribe + pin + enable before the

@@ -250,6 +250,160 @@ const EARLY_DEDUP_DRAIN_SIZE_SLACK: u64 = 4 * 1024 * 1024;
 /// identical to the legacy arm.
 pub const CHUNKED_COMMIT_WATCHDOG_SECS: u64 = 60;
 
+/// #501 (narrow scope): soft-warn deadline for chunked-commit observability.
+///
+/// **What:** at every commit-watchdog site (v1 reaper, v2 sibling,
+/// BazelChunkedDispatcher AwaitCommit) we install an early `warn!` +
+/// counter-bump that fires ~half-way between commit start and the
+/// destructive `CHUNKED_COMMIT_WATCHDOG_SECS=60` deadline. The
+/// infra-integrity watchdog is byte-identical to today — soft-warn is
+/// PURELY OBSERVABILITY (no behavior change on the await, no aborts,
+/// no synthesized errors).
+///
+/// **Why parametric vs literal:** derived as `PIN_TIMEOUT_SECS / 4`
+/// (`120 / 4 = 30`). The pin-TTL ceiling (`PIN_TIMEOUT_SECS`) is the
+/// outer time budget any chunked commit operates within — after that
+/// expires, the in-memory replica's pin lapses and admission gates may
+/// fire. Soft-warn at 1/4 of that gives operators 30 s advance notice
+/// before infra-integrity fires at 1/2 of it, and infra-integrity
+/// itself has 60 s of headroom before the pin TTL. The compile-time
+/// assertion `_ASSERT_WATCHDOG_ORDERING` below pins the
+/// 30 < 60 < 120 ordering so any future change to PIN_TIMEOUT_SECS
+/// or CHUNKED_COMMIT_WATCHDOG_SECS that violates the ordering
+/// red-fails at compile time.
+///
+/// **Motivation:** the previous full Option A redesign (soft-warn +
+/// post-mortem) was rejected by all reviewers — the post-mortem layer
+/// called `force_dump_thread_stacks` inside `tokio::spawn`, blocking
+/// tokio workers (CLAUDE.md HARD RULE violation; amplified the failure
+/// it was diagnosing). This narrow scope drops the post-mortem and
+/// ships only the observability layer. 0 production firings of the
+/// 60 s infra-integrity watchdog were recorded in the 48 h preceding
+/// the scope reduction — operator demand for the early signal is
+/// weaker than feared.
+pub const CHUNKED_COMMIT_SOFT_WARN_SECS: u64 =
+    nativelink_util::moka_evicting_map::PIN_TIMEOUT_SECS / 4;
+
+/// Compile-time guard on the ordering
+/// `soft_warn < infra_integrity < pin_TTL_ceiling`. If a future commit
+/// to either constant inverts the ordering, this `const _` evaluation
+/// red-fails at build time with a bespoke message naming the rule.
+const _ASSERT_WATCHDOG_ORDERING: () = {
+    assert!(
+        CHUNKED_COMMIT_SOFT_WARN_SECS < CHUNKED_COMMIT_WATCHDOG_SECS,
+        "#501 narrow-scope invariant: CHUNKED_COMMIT_SOFT_WARN_SECS must be \
+         strictly less than CHUNKED_COMMIT_WATCHDOG_SECS so the soft-warn \
+         observability layer fires BEFORE the destructive infra-integrity \
+         watchdog",
+    );
+    assert!(
+        (CHUNKED_COMMIT_WATCHDOG_SECS as u128)
+            < (nativelink_util::moka_evicting_map::PIN_TIMEOUT_SECS as u128),
+        "#501 narrow-scope invariant: CHUNKED_COMMIT_WATCHDOG_SECS must be \
+         strictly less than PIN_TIMEOUT_SECS so the chunked-commit watchdog \
+         fires WHILE the pin is still live",
+    );
+};
+
+/// #501 (narrow scope): per-site one-shot soft-warn dedup set.
+///
+/// Each commit-watchdog site (v1 reaper, v2 sibling, BazelChunkedDispatcher
+/// AwaitCommit) owns its OWN `SoftWarnSet` via a dedicated module-level
+/// static. Cross-site sharing was rejected by red-team review on the
+/// prior full-Option-A attempt — production wiring did not thread a
+/// shared set across crates, so the test that exercised cross-site
+/// dedup ran in a topology production never reaches. Per-site statics
+/// keep the dedup local to the call site that fired the warn.
+///
+/// **Cap behavior:** at 10_000 entries, `insert_one_shot` returns
+/// `false` for any further digest — the `warn!` log line is SKIPPED
+/// for the over-cap digest, but the counter is still bumped on
+/// commit-watchdog soft-warn fires (counter is the load-bearing
+/// operator-visible signal; per-digest log lines are convenience).
+/// Entries are removed when the digest's commit completes (Ok or Err,
+/// or infra-integrity fires) so steady-state size is bounded by
+/// concurrent in-flight commits — production concurrency is well
+/// below 10_000.
+///
+/// // CAPPED AT 10_000: per-digest one-shot soft-warn tracking. Bounded by
+/// // the number of concurrent chunked commits in flight. 10× expected
+/// // steady-state of ~1000 concurrent commits gives slack for traffic
+/// // spikes; over-cap behavior is "skip the log line" — counter is the
+/// // load-bearing operator-visible signal. Entries removed when the
+/// // digest's commit completes (Ok or Err) OR when infra-integrity
+/// // 60 s fires. Memory footprint at cap: ~10_000 × sizeof(DigestInfo)
+/// // (~40 bytes) ≈ 400 KiB per site (well under any RSS concern).
+#[derive(Debug, Default)]
+pub struct SoftWarnSet {
+    seen: Mutex<std::collections::HashSet<DigestInfo>>,
+}
+
+/// Module-level constant cap on `SoftWarnSet`. See struct doc-comment
+/// for the rationale + over-cap behavior.
+const SOFT_WARN_SET_CAP: usize = 10_000;
+
+impl SoftWarnSet {
+    /// Returns `true` if `digest` was newly inserted (caller should
+    /// emit the warn log line); `false` if the digest was already
+    /// present (suppress the duplicate log) OR if the set is at cap
+    /// (suppress to bound memory; counter is bumped regardless by the
+    /// caller).
+    ///
+    /// Lock held only across one HashSet op; never crosses `.await`.
+    /// `parking_lot::Mutex` is correct (sync, per CLAUDE.md style).
+    pub fn insert_one_shot(&self, digest: DigestInfo) -> bool {
+        let mut guard = self.seen.lock();
+        if guard.len() >= SOFT_WARN_SET_CAP {
+            return false;
+        }
+        guard.insert(digest)
+    }
+
+    /// Removes `digest` after the commit settles (success, failure, or
+    /// infra-integrity watchdog fire). Safe to call even if the digest
+    /// never tripped the soft-warn — HashSet::remove on a missing key
+    /// is a no-op.
+    pub fn remove(&self, digest: &DigestInfo) {
+        self.seen.lock().remove(digest);
+    }
+
+    /// Test-only accessor for the current set size. Used to verify
+    /// remove-on-completion behavior keeps the set bounded across
+    /// rounds of the test.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
+        self.seen.lock().len()
+    }
+
+    /// Test-only reset hook. Statics persist across tests in the same
+    /// process; tests that exercise a soft-warn site clear the set at
+    /// start so prior tests' digests don't leak in.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn clear(&self) {
+        self.seen.lock().clear();
+    }
+}
+
+/// v1-reaper site soft-warn dedup. Used by `run_async_commit_reaper`.
+/// `pub` so integration tests can `clear()` between rounds.
+pub static V1_REAPER_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
+    std::sync::LazyLock::new(|| Arc::new(SoftWarnSet::default()));
+
+/// BazelChunkedDispatcher AwaitCommit site soft-warn dedup. Used by
+/// `BazelChunkedDispatcherImpl::dispatch`'s AwaitCommit branch.
+/// `pub` so integration tests can `clear()` between rounds.
+pub static BAZEL_AWAIT_COMMIT_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
+    std::sync::LazyLock::new(|| Arc::new(SoftWarnSet::default()));
+
+/// v2 sibling-awaiter site soft-warn dedup. Used by
+/// `chunked_write_handler_v2::v2_await_commit_result`.
+/// `pub` so the v2 file (sibling module) and integration tests can
+/// reference it.
+pub static V2_AWAITER_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
+    std::sync::LazyLock::new(|| Arc::new(SoftWarnSet::default()));
+
 /// In-flight map: `DigestInfo` → live driver + sender. The sender is
 /// held here (not by the spawned driver) so multiple concurrent stream
 /// admissions for the SAME digest can re-use the same driver task and
@@ -376,6 +530,22 @@ pub struct ChunkedWriteHandlerMetrics {
         help = "WriteChunked: commit watchdog timeouts (CHUNKED_COMMIT_WATCHDOG_SECS exceeded; subset of commit_failures_total)"
     )]
     pub commit_watchdog_fires_total: AtomicU64,
+    /// #501 (narrow scope): operator-visible early signal that a chunked
+    /// commit has crossed the 30 s soft-warn deadline (half of the 60 s
+    /// destructive infra-integrity watchdog). Bumped once per digest per
+    /// site via the per-site `SoftWarnSet` dedup. STRICTLY ADDITIVE on
+    /// top of `commit_watchdog_fires_total` — a digest that crosses
+    /// soft-warn AND infra-integrity bumps BOTH counters; a digest that
+    /// crosses soft-warn but commits before infra-integrity bumps only
+    /// this counter. Operators correlate a non-zero
+    /// `commit_watchdog_soft_warn_total` with a zero
+    /// `commit_watchdog_fires_total` as the "slow tier is slow but
+    /// recovering" signal that does NOT degrade durability (no
+    /// failed_slow_writes inserts, no synthetic Err to clients).
+    #[metric(
+        help = "Chunked commit slow: digests that crossed CHUNKED_COMMIT_SOFT_WARN_SECS (30s) but may still complete before CHUNKED_COMMIT_WATCHDOG_SECS (60s); aggregated across v1 reaper + v2 sibling + BazelChunkedDispatcher AwaitCommit sites; per-site dedup ensures one bump per digest per site"
+    )]
+    pub commit_watchdog_soft_warn_total: AtomicU64,
     /// #494-v3 Phase 2: max concurrent writers per digest seen since
     /// process start. Falsification metric for the multi-writer
     /// hypothesis — if production p99 stays at 1 we know the
@@ -2351,7 +2521,58 @@ pub async fn run_async_commit_reaper<Fe: FileEntry>(
     // in-flight removal completes (legacy parallel:
     // `fast_slow_store.rs:3491-3510`).
     let watchdog = core::time::Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
-    let commit_result = match tokio::time::timeout(watchdog, driver.await_completion()).await {
+    // #501 (narrow scope) soft-warn observability: fire an early
+    // `warn!` + counter bump when the commit crosses 30 s, without
+    // changing the destructive 60 s infra-integrity watchdog's
+    // behavior. The select! biases toward `infra_integrity_fut` so
+    // ties resolve in favor of the existing path (no behavior change
+    // when both deadlines elapse in the same poll). On soft-warn fire
+    // the loop continues to await infra-integrity — soft-warn does
+    // NOT abort, does NOT synthesize an Err, does NOT touch any of
+    // the 4 load-bearing side effects of infra-integrity
+    // (discard_partial_best_effort, failed_commit_sink,
+    // in_flight removal, JoinHandleDropGuard abort).
+    let infra_integrity_fut = tokio::time::timeout(watchdog, driver.await_completion());
+    tokio::pin!(infra_integrity_fut);
+    let soft_warn_at = tokio::time::sleep(core::time::Duration::from_secs(
+        CHUNKED_COMMIT_SOFT_WARN_SECS,
+    ));
+    tokio::pin!(soft_warn_at);
+    let mut soft_warned = false;
+    let commit_result = loop {
+        tokio::select! {
+            biased;
+            r = &mut infra_integrity_fut => break match r {
+                Ok(r) => Ok(r),
+                Err(elapsed) => Err(elapsed),
+            },
+            () = &mut soft_warn_at, if !soft_warned => {
+                soft_warned = true;
+                // Always bump the counter (the load-bearing
+                // operator-visible signal). Suppress the per-digest log
+                // line if the dedup set is at cap OR the digest already
+                // fired soft-warn on this site (defensive — the watchdog
+                // path is per-spawn, so under normal lifecycle each
+                // digest can only be seen once per fire).
+                metrics
+                    .commit_watchdog_soft_warn_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if V1_REAPER_SOFT_WARN_SEEN.insert_one_shot(stream_digest) {
+                    warn!(
+                        ?stream_digest,
+                        soft_warn_secs = CHUNKED_COMMIT_SOFT_WARN_SECS,
+                        infra_integrity_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
+                        mode = mode_label,
+                        site = "v1_reaper",
+                        "#501: chunked commit slow — crossed soft-warn \
+                         threshold; infra-integrity watchdog will fire if no \
+                         progress before destructive deadline"
+                    );
+                }
+            }
+        }
+    };
+    let commit_result = match commit_result {
         Ok(r) => r,
         Err(_elapsed) => {
             warn!(
@@ -2511,6 +2732,15 @@ pub async fn run_async_commit_reaper<Fe: FileEntry>(
     // continue burning a blocking-pool slot after the watchdog has
     // already fired the failed-commit sink and treated the blob as
     // failed.
+
+    // #501 (narrow scope): drain the per-digest entry from the v1
+    // soft-warn dedup set. Safe to call unconditionally — `remove` on
+    // a missing key is a no-op. Without this, a long-running process
+    // with many distinct slow-but-eventually-succeeding commits would
+    // accumulate entries up to SOFT_WARN_SET_CAP (suppressing future
+    // log lines, NOT bumping the counter incorrectly — the counter
+    // is bumped before the dedup check).
+    V1_REAPER_SOFT_WARN_SEEN.remove(&stream_digest);
 }
 
 /// Shared dispatch helper for both the WriteChunked RPC and the Bazel-
@@ -3517,8 +3747,67 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                 if let Some(result) = race_state.peek_commit_result() {
                     return result.map(|r| r.committed_size);
                 }
-                let watchdog = core::time::Duration::from_secs(60);
-                match tokio::time::timeout(watchdog, notified).await {
+                // #509 fold-in: replace hardcoded `Duration::from_secs(60)`
+                // literal with the named constant. Same numeric value
+                // (60 s), now grep-able + parametric against any future
+                // change to CHUNKED_COMMIT_WATCHDOG_SECS. This is the
+                // BazelChunkedDispatcher AwaitCommit infra-integrity
+                // watchdog; mirrors v1 reaper (`run_async_commit_reaper`)
+                // and v2 sibling (`v2_await_commit_result`) deadlines.
+                let watchdog = core::time::Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
+                // #501 (narrow scope) soft-warn observability: emit a
+                // `warn!` + counter bump at the 30 s mark so operators
+                // see an early signal of a slow commit before the 60 s
+                // infra-integrity watchdog fires destructively. The
+                // select! is biased toward the watchdog branch so a
+                // simultaneous-poll tie resolves in favor of the
+                // existing behavior — soft-warn does NOT change the
+                // notified→peek_commit_result sequencing.
+                let soft_warn_at = tokio::time::sleep(core::time::Duration::from_secs(
+                    CHUNKED_COMMIT_SOFT_WARN_SECS,
+                ));
+                tokio::pin!(soft_warn_at);
+                let mut soft_warned = false;
+                let watchdog_result = {
+                    let wd_fut = tokio::time::timeout(watchdog, notified);
+                    tokio::pin!(wd_fut);
+                    let res = loop {
+                        tokio::select! {
+                            biased;
+                            r = &mut wd_fut => break r,
+                            () = &mut soft_warn_at, if !soft_warned => {
+                                soft_warned = true;
+                                self.metrics
+                                    .commit_watchdog_soft_warn_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                                if BAZEL_AWAIT_COMMIT_SOFT_WARN_SEEN
+                                    .insert_one_shot(digest)
+                                {
+                                    warn!(
+                                        ?digest,
+                                        soft_warn_secs = CHUNKED_COMMIT_SOFT_WARN_SECS,
+                                        infra_integrity_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
+                                        site = "bazel_dispatch_await_commit",
+                                        "#501: chunked commit slow — \
+                                         BazelChunkedDispatcher AwaitCommit \
+                                         crossed soft-warn threshold; \
+                                         infra-integrity watchdog will fire \
+                                         if no progress before destructive \
+                                         deadline"
+                                    );
+                                }
+                            }
+                        }
+                    };
+                    // Drain the soft-warn entry on completion (Ok or Err
+                    // from the watchdog future, ANY outcome). Mirrors
+                    // the v1 reaper's remove-on-completion semantics so
+                    // long-running processes don't accumulate entries
+                    // up to SOFT_WARN_SET_CAP.
+                    BAZEL_AWAIT_COMMIT_SOFT_WARN_SEEN.remove(&digest);
+                    res
+                };
+                match watchdog_result {
                     Ok(()) => race_state
                         .peek_commit_result()
                         .unwrap_or_else(|| {

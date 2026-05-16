@@ -84,7 +84,10 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::cpu_pool::cpu_pool;
 use nativelink_util::digest_hasher::{DigestHasher, default_digest_hasher_func};
 
-use crate::chunked_write_handler::{ChunkedWriteHandler, ChunkedWriteHandlerMetrics};
+use crate::chunked_write_handler::{
+    CHUNKED_COMMIT_SOFT_WARN_SECS, CHUNKED_COMMIT_WATCHDOG_SECS, ChunkedWriteHandler,
+    ChunkedWriteHandlerMetrics, V2_AWAITER_SOFT_WARN_SEEN,
+};
 
 /// Process-wide monotonic counter for minting `WriterId`s. Each v2
 /// session at admission grabs a fresh id. The id is per-process (not
@@ -610,7 +613,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             CommitResponsibility::AwaitCommit => {
                 // Some other writer is the commit-runner. Wait for the
                 // result via the race-state's Notify.
-                let result = v2_await_commit_result(&race_state).await;
+                let result = v2_await_commit_result(&race_state, digest, &metrics).await;
 
                 // FIX-2 watchdog → force_remove. If the watchdog fired
                 // (DeadlineExceeded), the registry entry is wedged
@@ -936,8 +939,20 @@ async fn v2_verify_e2e_hash(
 /// Wait for the race-state's commit_done notify, with a watchdog. On
 /// timeout, returns Err(DeadlineExceeded). The commit-runner is the
 /// only producer of `commit_result`; siblings here read it.
+///
+/// **#501 (narrow scope):** at 30 s (half of the 60 s infra-integrity
+/// watchdog), emit a `warn!` + bump
+/// `metrics.commit_watchdog_soft_warn_total` once per digest (per the
+/// process-wide `V2_AWAITER_SOFT_WARN_SEEN` dedup set). Soft-warn does
+/// NOT change the infra-integrity behavior — the existing
+/// `tokio::time::timeout(COMMIT_WAIT_WATCHDOG, notified)` path is
+/// byte-identical to today, including the `WatchdogTimeoutSignal`
+/// discriminator attachment on watchdog-fire (#508 contract preserved).
+/// `digest` is required so the dedup set can key on the failing blob.
 async fn v2_await_commit_result(
     race_state: &Arc<ChunkRaceState>,
+    digest: DigestInfo,
+    metrics: &Arc<ChunkedWriteHandlerMetrics>,
 ) -> Result<RaceCommitResult, Error> {
     // BLOCK-E (#499 followup): defense-in-depth against missed-wakeup.
     // Tokio 1.49's `Notify::notified()` captures `notify_waiters_calls`
@@ -968,7 +983,48 @@ async fn v2_await_commit_result(
     if let Some(result) = race_state.peek_commit_result() {
         return result;
     }
-    match tokio::time::timeout(COMMIT_WAIT_WATCHDOG, notified).await {
+    // #501 (narrow scope) soft-warn observability layer. Same
+    // `tokio::time::timeout(...)` future as before — soft-warn is a
+    // PARALLEL select! arm that only logs + bumps a counter on the
+    // 30 s tick; the watchdog Err arm below is byte-identical to
+    // pre-#501 (including #508 discriminator attachment). Biased
+    // select prefers the watchdog branch so simultaneous-poll ties
+    // resolve in favor of the existing path.
+    let watchdog_fut = tokio::time::timeout(COMMIT_WAIT_WATCHDOG, notified);
+    tokio::pin!(watchdog_fut);
+    let soft_warn_at =
+        tokio::time::sleep(Duration::from_secs(CHUNKED_COMMIT_SOFT_WARN_SECS));
+    tokio::pin!(soft_warn_at);
+    let mut soft_warned = false;
+    let watchdog_result = loop {
+        tokio::select! {
+            biased;
+            r = &mut watchdog_fut => break r,
+            () = &mut soft_warn_at, if !soft_warned => {
+                soft_warned = true;
+                metrics
+                    .commit_watchdog_soft_warn_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if V2_AWAITER_SOFT_WARN_SEEN.insert_one_shot(digest) {
+                    warn!(
+                        ?digest,
+                        soft_warn_secs = CHUNKED_COMMIT_SOFT_WARN_SECS,
+                        infra_integrity_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
+                        site = "v2_awaiter",
+                        "#501: chunked commit slow — WriteChunkedV2 sibling \
+                         crossed soft-warn threshold; infra-integrity \
+                         watchdog will fire if no progress before destructive \
+                         deadline"
+                    );
+                }
+            }
+        }
+    };
+    // Drain the per-digest entry from the v2 soft-warn dedup set on
+    // ANY outcome of the watchdog (success or fire). Safe to call
+    // unconditionally; `remove` on a missing key is a no-op.
+    V2_AWAITER_SOFT_WARN_SEEN.remove(&digest);
+    match watchdog_result {
         Ok(()) => race_state.peek_commit_result().unwrap_or_else(|| {
             Err(make_err!(
                 Code::Internal,
@@ -1010,12 +1066,19 @@ async fn v2_await_commit_result(
 /// carries the `WatchdogTimeoutSignal` discriminator so that
 /// `chunked_client.rs::classify_retryable` returns `Retry { WatchdogDeadline }`
 /// rather than `Abort` for sibling writers seeing the wedge.
+///
+/// **#501 (narrow scope):** signature now carries `digest` + `metrics`
+/// so the soft-warn observability layer (30 s deadline; one-shot
+/// per-digest via `V2_AWAITER_SOFT_WARN_SEEN`) can dedup correctly
+/// and bump the per-handler `commit_watchdog_soft_warn_total` counter.
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub async fn v2_await_commit_result_for_test(
     race_state: &Arc<ChunkRaceState>,
+    digest: DigestInfo,
+    metrics: &Arc<ChunkedWriteHandlerMetrics>,
 ) -> Result<RaceCommitResult, Error> {
-    v2_await_commit_result(race_state).await
+    v2_await_commit_result(race_state, digest, metrics).await
 }
 
 /// Send the final `WriteChunkedFrame` to the client based on the
