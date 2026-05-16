@@ -834,57 +834,108 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 ))
             }
             nativelink_store::chunked::chunked_race_state::SingleStreamAttachOutcome::AwaitCommit { reason } => {
-                // _race_writer_guard drops at end of fn scope (Aborted
-                // path); the reaped count covers the entire RPC lifetime.
+                // #447 architectural fix: yield to the in-flight writer
+                // by attaching to the SAME per-digest Notify primitive
+                // the `BazelChunkedDispatcher::dispatch` AwaitCommit
+                // branch (`:3431+`) already uses. The previous shape
+                // returned `Code::Aborted + BackpressureSignal {
+                // retry_after_ms = 250 }` and forced the client into
+                // polling-retry; under multi-MiB blob contention, the
+                // client's fixed retry budget exhausted before the
+                // in-flight commit landed (production symptom: "give
+                // up after N attempts (last reason: Aborted)" in
+                // 2026-05-16). Notify-wait closes that gap:
+                //
+                //   - the contender's RPC blocks on `commit_done` (≤60s)
+                //   - on wakeup, propagate the winner's outcome (Ok
+                //     with committed_size, or Err with the winner's
+                //     commit error)
+                //   - on watchdog elapse, return DeadlineExceeded
+                //   - on RPC drop mid-wait, the Notified subscription
+                //     drops cleanly (Tokio Notify Drop deregisters)
+                //
+                // Composite invariant (#447): "contender on per-digest
+                // single-flight slot ⇒ either (a) Notify-wakeup-then-Ok
+                // within 60s OR (b) DeadlineExceeded at 60s OR (c) RPC
+                // drop with clean registry cleanup."
+                //
+                // Mirrors BazelChunkedDispatcher::dispatch (`:3442-3481`):
+                // drain the inbound stream to EOF so the producer's
+                // client-streaming RPC finishes cleanly (the producer
+                // is committed to sending the whole blob — terminating
+                // the stream early would force IT to surface a
+                // BROKEN_PIPE / partial-stream error), then await the
+                // commit, then return the winner's result.
                 self.metrics
                     .concurrent_same_digest_rejections_total
                     .fetch_add(1, Ordering::Relaxed);
-                let detail = encode_backpressure_signal_any(
-                    backpressure_signal::Reason::PerBlobMpscFull,
-                    CONCURRENT_SAME_DIGEST_RETRY_AFTER_MS,
-                );
                 debug!(
                     ?stream_digest,
                     ?reason,
-                    "WriteChunked: yielding to in-flight writer (#497 Option 1 cross-version coordination)"
+                    "WriteChunked: yielding to in-flight writer; draining \
+                     stream and awaiting commit_done (#447 Notify-wait, \
+                     #497 Option 1 cross-version coordination)"
                 );
-                return Err(Error::aborted_with_detail(
-                    format!(
-                        "WriteChunked: another writer is currently active on digest {digest} \
-                         (cross-version coordination — #497 Option 1 reason={reason:?}); \
-                         retry after a backoff"
-                    ),
-                    detail,
-                ));
+                // Hold race_state Arc alive across the drain + await.
+                // `_race_writer_guard` drops at end-of-fn scope and pins
+                // attached_writer_count for the whole RPC, so the
+                // race-state entry cannot be reaped by a sibling
+                // try_remove_if_unused while we wait.
+                if let Err(err) = bounded_drain_grpc_stream(
+                    &mut stream,
+                    first_chunk,
+                    stream_digest.size_bytes(),
+                )
+                .await
+                {
+                    return Err(err.append(
+                        "#447 WriteChunked AwaitCommit: bounded-drain failed while \
+                         yielding to in-flight writer (cross-version coordination)",
+                    ));
+                }
+                let committed_size = await_inflight_commit_with_watchdog(
+                    &race_state,
+                    stream_digest,
+                )
+                .await?;
+                let committed_digest_proto =
+                    nativelink_proto::build::bazel::remote::execution::v2::Digest::from(
+                        stream_digest,
+                    );
+                return Ok(WriteChunkedResponse {
+                    committed_digest: Some(committed_digest_proto),
+                    committed_size,
+                });
             }
         };
 
-        // Look up or create the per-blob driver. Today: one driver per
-        // digest at a time; concurrent streams for the same digest are
-        // rejected with `Code::Aborted` + a retry hint (M-code-2 fixup).
-        // The historical `AlreadyExists` was misleading on the wire —
-        // gRPC convention treats `AlreadyExists` as "the resource is
-        // durably committed," which a worker-side BIS-style auto-unpinner
-        // could read as a license to drop its mirror pin (losing the
-        // only durable copy if the OTHER stream then errors). `Aborted`
-        // means "transaction failed, retry" and carries the wire-stable
-        // BackpressureSignal detail with retry-after.
+        // Look up or create the per-blob driver. Defense-in-depth:
+        // after Site A's `SingleStreamOwnerGuard` is taken, no other v1
+        // worker `WriteChunked` arrival can pass attach as `Owner` (it
+        // observes `AwaitCommit`), and BazelChunkedDispatcher's dispatch
+        // goes through the SAME single-stream gate (`:3422+`), so this
+        // in_flight check should be structurally unreachable.
+        //
+        // #447: pre-fix, this branch returned `Code::Aborted +
+        // BackpressureSignal { retry_after_ms = 250 }` and Site A above
+        // returned the same. The Site A → Notify-wait conversion makes
+        // Site B defensive-only; firing here would be a logic-invariant
+        // violation (a race between attach and the in_flight insert
+        // below that no current caller can produce). Use `Code::Internal`
+        // (NOT Aborted+BackpressureSignal) so the client does NOT retry
+        // a programmer-bug condition — retry would just re-fire the
+        // bug instead of surfacing it.
         let (sender, driver) = {
             let mut guard = self.in_flight.inner.lock();
             if guard.contains_key(&digest) {
                 self.metrics
                     .concurrent_same_digest_rejections_total
                     .fetch_add(1, Ordering::Relaxed);
-                let detail = encode_backpressure_signal_any(
-                    backpressure_signal::Reason::PerBlobMpscFull,
-                    CONCURRENT_SAME_DIGEST_RETRY_AFTER_MS,
-                );
-                return Err(Error::aborted_with_detail(
-                    format!(
-                        "WriteChunked: another stream is already writing digest {digest}; \
-                         retry after a backoff (concurrent-stream rejection, NOT durable commit)"
-                    ),
-                    detail,
+                return Err(make_err!(
+                    Code::Internal,
+                    "WriteChunked: invariant violation — single_stream_owner held \
+                     for digest {digest} but in_flight map already contains an \
+                     entry (programmer bug; Site A's gate should have caught this)"
                 ));
             }
             // Spawn driver. Capacity = PER_BLOB_MPSC_CAP.
@@ -3886,6 +3937,116 @@ async fn bounded_drain_grpc_stream(
         }
     }
     Ok(())
+}
+
+/// Wait on the per-digest race-state's `commit_done` Notify, with a
+/// `CHUNKED_COMMIT_WATCHDOG_SECS`-second deadline. Returns the
+/// committed size on success, or `Code::DeadlineExceeded` if the
+/// in-flight writer's commit exceeded the watchdog.
+///
+/// #447 Notify-wait conversion: this is the architectural replacement
+/// for the previous worker-mirror upload retry-on-Aborted shape. When a
+/// v1 worker `WriteChunked` (or any single-stream writer) arrives and
+/// observes another writer mid-commit, it MUST NOT return
+/// `Code::Aborted + BackpressureSignal { retry_after_ms = 250 }` and
+/// force the client into polling-retry: that path racks up a fixed
+/// retry budget against an in-flight writer whose commit window can
+/// exceed the budget for any multi-MiB blob (the original #447
+/// production symptom — 750 ms budget vs multi-second slow-tier
+/// commit). Instead, attach to the SAME per-digest Notify primitive
+/// the `BazelChunkedDispatcher::dispatch` AwaitCommit branch
+/// (`chunked_write_handler.rs:3431+`) and v2's `v2_await_commit_result`
+/// (`chunked_write_handler_v2.rs:938+`) already use. The loser's RPC
+/// blocks until the winner's commit publishes, then returns
+/// success/failure based on the winner's outcome.
+///
+/// **Cancel-safety:** the returned `Notified<'_>` future borrows the
+/// race-state via `&self`. The race-state's lifetime is bounded by the
+/// `Arc<ChunkRaceState>` the caller holds. If the client drops the
+/// gRPC RPC mid-wait, dropping this future drops the `Notified`
+/// subscription cleanly (Tokio's `Notify` deregisters waiters on
+/// `Notified::Drop` — no leaked registry entries, no leaked
+/// subscribers).
+///
+/// **Missed-wakeup defense:** Tokio 1.49's `Notify::notified()`
+/// captures `notify_waiters_calls` at FUTURE-CREATION time and
+/// `Notified::poll` resolves immediately if the counter advanced
+/// (`notify.rs:1148`). So `subscribe_commit_done() → ... → notified.await`
+/// is race-free against `publish_commit_result` between subscribe and
+/// poll IN THIS TOKIO VERSION. The pin + `enable()` is
+/// belt-and-suspenders against future tokio API drift (mirrors the
+/// same comment block in v2's awaiter).
+///
+/// **Watchdog discriminator (#447 fix-up addressing red-team
+/// RECONSIDER + mirroring #508):** the returned `Code::DeadlineExceeded`
+/// at watchdog timeout MUST carry a `WatchdogTimeoutSignal` detail so
+/// `chunked_client.rs::classify_retryable` (`:618-628`) returns
+/// `Retry { WatchdogDeadline }` rather than `Abort`. Bare
+/// `DeadlineExceeded` would map to `Abort` at the classifier, making
+/// this path 80× WORSE than the pre-#447 Aborted+BackpressureSignal
+/// shape (same Bazel-visible outcome — RetryDecision::Abort — but at
+/// 60s wall-clock vs the original ~750ms, and holding an RPC slot the
+/// entire time). Mirrors v1's commit-runner arm at
+/// `chunked_write_handler.rs:2354-2358` and the v2 awaiter's
+/// `v2_await_commit_result` post-#508. The v1 commit-runner reaper
+/// (`run_async_commit_reaper:2347`) is the originating wedge-detector;
+/// siblings observing the missed wakeup must ALSO carry the
+/// discriminator so the client treats the sibling's symptom as the
+/// SAME retry class as the runner-side wedge — anything else
+/// silently degrades to Abort.
+async fn await_inflight_commit_with_watchdog(
+    race_state: &std::sync::Arc<
+        nativelink_store::chunked::chunked_race_state::ChunkRaceState,
+    >,
+    digest: DigestInfo,
+) -> Result<u64, Error> {
+    let notified = race_state.subscribe_commit_done();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    // Belt-and-suspenders for the missed-wakeup race: if a commit
+    // already published BEFORE we subscribed, peek returns Some and we
+    // skip the wait entirely.
+    if let Some(result) = race_state.peek_commit_result() {
+        return result.map(|r| r.committed_size);
+    }
+    let watchdog = core::time::Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
+    match tokio::time::timeout(watchdog, notified).await {
+        Ok(()) => race_state
+            .peek_commit_result()
+            .unwrap_or_else(|| {
+                Err(make_err!(
+                    Code::Internal,
+                    "#447 WriteChunked AwaitCommit: commit_done fired but \
+                     commit_result missing for digest {digest} (programmer bug)"
+                ))
+            })
+            .map(|r| r.committed_size),
+        Err(_elapsed) => {
+            // #447 fix-up (closes red-team RECONSIDER + mirrors #508):
+            // attach the `WatchdogTimeoutSignal` discriminator so the
+            // chunked client's `classify_retryable` predicate
+            // (`chunked_client.rs::classify_retryable` `:618-628`)
+            // returns `Retry { WatchdogDeadline }` instead of `Abort`.
+            // Without this, bare `DeadlineExceeded` maps to `Abort` at
+            // the classifier — making this path 80× worse than the
+            // pre-#447 Aborted+BackpressureSignal shape it replaced
+            // (60s wedge vs ~750ms, same Bazel-visible outcome,
+            // holding an RPC slot the entire time). Mirrors v1 at
+            // `chunked_write_handler.rs:2354-2358` and the v2 awaiter
+            // post-#508 at `chunked_write_handler_v2.rs`.
+            let detail = encode_watchdog_timeout_signal_any(
+                watchdog_timeout_signal::Reason::ChunkedCommitWatchdog,
+                CHUNKED_COMMIT_WATCHDOG_SECS,
+            );
+            Err(Error::deadline_exceeded_with_detail(
+                format!(
+                    "#447 WriteChunked AwaitCommit: in-flight writer's commit \
+                     exceeded {CHUNKED_COMMIT_WATCHDOG_SECS}s watchdog for digest {digest}"
+                ),
+                detail,
+            ))
+        }
+    }
 }
 
 pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
