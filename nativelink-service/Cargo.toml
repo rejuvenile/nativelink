@@ -194,3 +194,25 @@ required-features = ["chunked_fast_slow", "test-utils"]
 [[test]]
 name = "cas_extensions_routing_test"
 required-features = ["chunked_fast_slow", "test-utils"]
+
+# #494-v3 Phase 2 bidi `WriteChunkedV2` multi-writer race-state tests.
+# Uses `_for_test` constructors / counter accessors gated behind
+# `test-utils` and v2-feature behaviour gated behind `chunked_fast_slow`.
+# Without these features the file body is `#![cfg(feature = "chunked_fast_slow")]`
+# so cargo would silently skip on missing features (DS reviewer MAJOR-2,
+# #499 follow-up). Run with:
+#   `cargo test -p nativelink-service --features chunked_fast_slow,test-utils \
+#       --test chunked_write_handler_v2_test`
+[[test]]
+name = "chunked_write_handler_v2_test"
+required-features = ["chunked_fast_slow", "test-utils"]
+
+# #401 cancel-safety regression test for InFlightChunkedGuard + #499
+# BLOCK-2 per-digest Notify wakeup tests. File-level
+# `#![cfg(feature = "chunked_fast_slow")]` would silently skip the file
+# on missing features; the `required-features` declaration makes cargo
+# surface that with the standard "test skipped (missing required
+# features)" message.
+[[test]]
+name = "chunked_inflight_cancel_safety_test"
+required-features = ["chunked_fast_slow"]

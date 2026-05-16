@@ -2684,8 +2684,23 @@ impl ByteStreamServer {
         // exists at `bytestream_write` (`:2742`) — guarded since 9d8a66a9.
         // See `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md`
         // H2 + ds-reviewer.md BLOCK-1.
-        let is_chunked_in_flight = store_clone
-            .downcast_ref::<nativelink_store::fast_slow_store::FastSlowStore>(Some(digest.into()))
+        //
+        // BLOCK-1 (DS-reviewer, #499 v3 follow-up): in production
+        // `cas_STORE` is `WPS → VerifyStore → ExistenceCacheStore →
+        // SizePartitioningStore → FastSlowStore`. `Store::downcast_ref`
+        // walks via `inner_store(maybe_digest)`; `VerifyStore::inner_store`
+        // returns `self`, so an inline `downcast_ref::<FastSlowStore>`
+        // terminates at VerifyStore and returns `None`. The guard then
+        // never fires in production. Use the canonical
+        // `wrapper_walker::find_fast_slow_via_chain` walker (already
+        // consumed by `bin/nativelink.rs`, `store_manager.rs`, and
+        // `failed_writes_drain.rs`) — it special-cases
+        // ExistenceCacheStore + VerifyStore via downcast+recurse and
+        // descends `SizePartitioningStore` via `synthetic_large_key()`.
+        let is_chunked_in_flight =
+            nativelink_store::wrapper_walker::find_fast_slow_via_chain(
+                store_clone.as_store_driver(),
+            )
             .is_some_and(|fss| fss.is_chunked_in_flight(&digest));
         let Some(item_size) = item_size_or_none else {
             // We lie here and say that the stream needs to start over, even though
@@ -2803,8 +2818,20 @@ impl ByteStreamServer {
         // same digest still coalesce on `in_flight_writes` (the original
         // dedup contract).
         let has_result = store.has(digest).await.unwrap_or(None);
-        let is_chunked_in_flight = store
-            .downcast_ref::<nativelink_store::fast_slow_store::FastSlowStore>(Some(digest.into()))
+        // BLOCK-1 (DS-reviewer, #499 v3 follow-up): production cas_STORE
+        // is `WPS → VerifyStore → ExistenceCacheStore → SizePartitioningStore
+        // → FastSlowStore`. Inline `downcast_ref::<FastSlowStore>` walks
+        // via `inner_store(maybe_digest)` which terminates at VerifyStore
+        // (`inner_store` shadowed to return `self`), so the downcast
+        // returns `None` and this H2 guard becomes dead code in
+        // production. Use the canonical
+        // `wrapper_walker::find_fast_slow_via_chain` walker (consumed
+        // also by `bin/nativelink.rs`, `store_manager.rs`,
+        // `failed_writes_drain.rs`).
+        let is_chunked_in_flight =
+            nativelink_store::wrapper_walker::find_fast_slow_via_chain(
+                store.as_store_driver(),
+            )
             .is_some_and(|fss| fss.is_chunked_in_flight(&digest));
         if has_result.is_some() && !is_chunked_in_flight {
             debug!(

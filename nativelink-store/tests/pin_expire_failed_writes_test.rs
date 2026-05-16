@@ -701,7 +701,13 @@ async fn pin_expire_listener_observes_chunked_in_flight_digests() -> Result<(), 
     h.fss
         .chunked_in_flight_digests_handle()
         .lock()
-        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
+        .insert(
+            digest,
+            (
+                core::num::NonZeroU32::new(1).unwrap(),
+                Arc::new(Notify::new()),
+            ),
+        );
 
     // Sanity: the pin landed and is observable as expired-eligible by
     // the test helper.

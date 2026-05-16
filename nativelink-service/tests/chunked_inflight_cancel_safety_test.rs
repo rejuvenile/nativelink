@@ -51,12 +51,12 @@
 
 #![cfg(feature = "chunked_fast_slow")]
 
-use core::num::NonZeroU32;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use nativelink_macro::nativelink_test;
 use nativelink_service::chunked_write_handler::InFlightChunkedGuard;
+use nativelink_store::fast_slow_store::ChunkedInFlightMap;
 use nativelink_util::common::DigestInfo;
 use parking_lot::Mutex;
 use pretty_assertions::assert_eq;
@@ -78,8 +78,7 @@ use tokio::sync::Notify;
 // `"MAJOR-G: refcount removed digest while second guard still in-flight"`.
 #[nativelink_test]
 async fn major_g_refcount_keeps_digest_visible_until_both_guards_drop() {
-    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0x42);
 
@@ -91,7 +90,7 @@ async fn major_g_refcount_keeps_digest_visible_until_both_guards_drop() {
             Some(Arc::clone(&notify)),
         );
         assert_eq!(
-            set.lock().get(&digest).map(|c| c.get()),
+            set.lock().get(&digest).map(|(c, _n)| c.get()),
             Some(1),
             "MAJOR-G: first guard MUST bump refcount to 1"
         );
@@ -104,7 +103,7 @@ async fn major_g_refcount_keeps_digest_visible_until_both_guards_drop() {
                 Some(Arc::clone(&notify)),
             );
             assert_eq!(
-                set.lock().get(&digest).map(|c| c.get()),
+                set.lock().get(&digest).map(|(c, _n)| c.get()),
                 Some(2),
                 "MAJOR-G: second guard MUST bump refcount to 2 (NOT \
                  idempotent set-insert); pre-fix HashSet treated this as \
@@ -114,7 +113,7 @@ async fn major_g_refcount_keeps_digest_visible_until_both_guards_drop() {
         }
 
         assert_eq!(
-            set.lock().get(&digest).map(|c| c.get()),
+            set.lock().get(&digest).map(|(c, _n)| c.get()),
             Some(1),
             "MAJOR-G: refcount removed digest while second guard still \
              in-flight — first guard drop must decrement, NOT remove, \
@@ -139,8 +138,7 @@ fn make_digest(byte: u8) -> DigestInfo {
 
 #[nativelink_test]
 async fn guard_drop_removes_digest() {
-    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xA1);
 
@@ -166,8 +164,7 @@ async fn guard_drop_notifies_when_set_becomes_empty() {
     // graceful-drain wakes. The RAII guard preserves this on the cancel
     // path (where the manual code path never gets a chance to call
     // notify_waiters).
-    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xB2);
 
@@ -220,8 +217,7 @@ async fn guard_drop_notifies_when_set_becomes_empty() {
 /// the behavior and is theatre.
 #[nativelink_test]
 async fn cancel_mid_await_removes_digest() {
-    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xC3);
 
@@ -280,8 +276,7 @@ async fn disarm_prevents_drop_removal() {
     // that removes only after the chunked-driver in-flight tracker
     // drains. Disarm MUST make Drop a no-op so the digest stays in the
     // set during async-commit (preserving #210 graceful-drain).
-    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xD4);
 
@@ -316,4 +311,147 @@ async fn disarm_prevents_drop_removal() {
         set.lock().is_empty(),
         "after disarm + manual reaper removal, set must be empty"
     );
+}
+
+/// BLOCK-2 (DS-reviewer, #499 v3 follow-up): each map entry carries its
+/// own `Arc<Notify>` so a reader holding the cloned Arc wakes when the
+/// last `InFlightChunkedGuard` drops. Under-action coverage: with two
+/// concurrent guards, the per-digest Notify must NOT fire until BOTH
+/// drop (refcount → 0); a single drop must NOT prematurely wake
+/// readers (the readers' digest is still in flight via the second
+/// guard).
+///
+/// Mutation: change `InFlightChunkedGuard::Drop` to fire the per-digest
+/// notify on every drop (regardless of refcount). Test MUST red-fail
+/// because the reader would wake after the first drop while the
+/// second guard still holds the digest in-flight.
+#[nativelink_test]
+async fn block_2_per_digest_notify_fires_only_on_refcount_zero() {
+    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
+    let drain_notify = Arc::new(Notify::new());
+    let digest = make_digest(0xE5);
+
+    // Create both guards, then grab the per-digest Notify out of the map.
+    let g1 = InFlightChunkedGuard::new(
+        Arc::clone(&set),
+        digest,
+        Some(Arc::clone(&drain_notify)),
+    );
+    let g2 = InFlightChunkedGuard::new(
+        Arc::clone(&set),
+        digest,
+        Some(Arc::clone(&drain_notify)),
+    );
+
+    // Reader-side: clone the per-digest Notify out of the map slot.
+    let per_digest_notify = set
+        .lock()
+        .get(&digest)
+        .map(|(_c, n)| Arc::clone(n))
+        .expect("entry exists with per-digest Notify");
+
+    // Subscribe BEFORE any drop fires.
+    let waker = tokio::spawn({
+        let n = Arc::clone(&per_digest_notify);
+        async move {
+            n.notified().await;
+        }
+    });
+
+    // Yield so the waker is parked.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Drop g1 — refcount 2 → 1. Per-digest Notify MUST NOT fire because
+    // g2 still holds the entry in-flight.
+    drop(g1);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        set.lock().get(&digest).map(|(c, _)| c.get()),
+        Some(1),
+        "BLOCK-2: refcount must be 1 after g1.drop while g2 still alive"
+    );
+    assert!(
+        !waker.is_finished(),
+        "BLOCK-2: per-digest Notify fired prematurely while g2 still holds \
+         the digest in-flight — readers would wake and falsely observe the \
+         digest as drained. Mutation: change Drop to fire notify on every \
+         drop regardless of refcount — this assertion must red-fail."
+    );
+
+    // Drop g2 — refcount 1 → 0. Per-digest Notify MUST fire now.
+    drop(g2);
+
+    // The waker must complete within bounded wall-clock (deadlock-detector
+    // 2s; the actual Notify fires immediately on drop).
+    tokio::time::timeout(core::time::Duration::from_secs(2), waker)
+        .await
+        .expect(
+            "BLOCK-2: per-digest Notify MUST fire on refcount → 0 \
+             (InFlightChunkedGuard::Drop), waking any reader holding the \
+             cloned Arc<Notify>. Mutation: comment out the \
+             `n.notify_waiters()` call in InFlightChunkedGuard::Drop \
+             where refcount transitions to zero — this assertion must \
+             red-fail with `Elapsed`.",
+        )
+        .expect("waker task panicked");
+
+    assert!(set.lock().is_empty(), "set must be empty after both drops");
+}
+
+/// BLOCK-2 (DS-reviewer, #499 v3 follow-up): the per-digest Notify
+/// must fire BEFORE the entry is removed from the map. A reader that
+/// re-checks `chunked_in_flight_digests.contains_key(...)` after
+/// waking must observe the drained state. This test pins the
+/// notify-then-remove ordering by:
+///  1. subscribing the reader to the per-digest Notify,
+///  2. dropping the guard,
+///  3. asserting the reader wakes,
+///  4. asserting the entry is gone from the map AFTER the reader wakes.
+#[nativelink_test]
+async fn block_2_per_digest_notify_fires_before_entry_removed() {
+    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
+    let drain_notify = Arc::new(Notify::new());
+    let digest = make_digest(0xE6);
+
+    let g = InFlightChunkedGuard::new(
+        Arc::clone(&set),
+        digest,
+        Some(Arc::clone(&drain_notify)),
+    );
+
+    let per_digest_notify = set
+        .lock()
+        .get(&digest)
+        .map(|(_c, n)| Arc::clone(n))
+        .expect("entry exists with per-digest Notify");
+
+    let set_for_reader = Arc::clone(&set);
+    let reader = tokio::spawn(async move {
+        per_digest_notify.notified().await;
+        // After waking, the entry must be absent — the writer's Drop
+        // calls notify_waiters BEFORE map.remove, so the per-digest
+        // Notify only fires once the map state has been mutated past
+        // the in-flight assertion.
+        let still_present = set_for_reader.lock().contains_key(&digest);
+        assert!(
+            !still_present,
+            "BLOCK-2 ordering: reader woke but entry still present in map. \
+             InFlightChunkedGuard::Drop must call notify_waiters AFTER \
+             guard.remove(&self.digest). Mutation: swap the order so \
+             notify_waiters fires BEFORE remove — this assertion must \
+             red-fail."
+        );
+    });
+
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    drop(g);
+
+    tokio::time::timeout(core::time::Duration::from_secs(2), reader)
+        .await
+        .expect("reader must complete within 2s")
+        .expect("reader task panicked");
 }

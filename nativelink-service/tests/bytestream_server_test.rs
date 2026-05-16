@@ -3582,41 +3582,119 @@ pub async fn cancelled_chunked_write_replaced_not_recycled_on_retry()
 }
 
 // =============================================================================
-// BLOCK-A + BLOCK-D (#499 followup): H2 phantom-success guard tests
+// BLOCK-A + BLOCK-D (#499 followup; DS-reviewer BLOCK-1 + MAJOR-1 close-out):
+// H2 phantom-success guard tests, composed in PRODUCTION wrapper composition.
 //
-// Composes: ByteStreamServer + FastSlowStore + chunked_in_flight_digests set
-// + (QueryWriteStatus / ByteStream::write seams).
+// Production cas_STORE (per `~/fl/bld/infra/nativelink/prod-server.json5`):
+//   WorkerProxyStore → VerifyStore (cas_STORE) → ExistenceCacheStore
+//   (cas_INNER) → SizePartitioningStore → cas_FAST_SLOW_STORE (FSS)
 //
-// Seams crossed:
-//   - producer: chunked_in_flight_digests insertion (simulates v2 admission)
-//   - FastSlowStore::has_with_results consults the set (lies Some)
-//   - FastSlowStore::is_chunked_in_flight (the H2 probe)
-//   - ByteStreamServer::query_write_status seam (BLOCK-A)
-//   - ByteStreamServer::write fast-path seam (BLOCK-D)
-//   - downstream is the gRPC return value the Bazel client classifies
+// The downcast walk via `Store::downcast_ref::<FastSlowStore>` terminates
+// at VerifyStore (which shadows `inner_store` to return `self`), so the
+// pre-fix inline downcast returned `None` and both H2 + BLOCK-A guards
+// were dead code in production. The fix replaces both inline downcasts
+// at `bytestream_server.rs:2659` and `:2778` with
+// `nativelink_store::wrapper_walker::find_fast_slow_via_chain`, which
+// special-cases VerifyStore + ExistenceCacheStore via downcast+recurse
+// and descends `SizePartitioningStore` via `synthetic_large_key()`.
+//
+// Seams crossed (CLAUDE.md "Identify-the-seam discipline"):
+//   1. chunked_in_flight_digests producer (simulates v2 admission)
+//   2. FastSlowStore::has_with_results consults the set (lies Some(size))
+//   3. SizePartitioningStore: routes the synthetic-large-key into the
+//      upper-arm FSS
+//   4. ExistenceCacheStore: `inner_store()` accessor descent
+//   5. VerifyStore: `inner_store()` accessor descent (the seam that
+//      broke pre-fix)
+//   6. bytestream_server::inner_query_write_status (BLOCK-A) — uses the
+//      wrapper-walker downcast to identify FSS
+//   7. bytestream_server::bytestream_write fast-path (BLOCK-D) — same
+//
+// Mutation falsification: revert `bytestream_server.rs:2659` and `:2778`
+// to inline `store.downcast_ref::<FastSlowStore>(...)`. Both tests MUST
+// red-fail with the bespoke "BLOCK-1: chunked-in-flight guard couldn't
+// reach FSS through production wrappers" panic.
 // =============================================================================
 
-/// BLOCK-A (#499 followup): construct an FSS-backed bytestream server,
-/// register a digest into the FSS's `chunked_in_flight_digests` set
-/// (simulating a v2 chunked write mid-commit), and assert that
-/// `QueryWriteStatus` for that digest returns `complete: false` —
-/// NOT `complete: true`. Without the BLOCK-A guard at
-/// `bytestream_server.rs:2635`, the QueryWriteStatus path would
-/// short-circuit on `store.has() = Some` and tell Bazel the upload is
-/// durable while the chunked commit may still fail.
+/// Construct a production-composition CAS chain wrapping the supplied
+/// `FastSlowStore` in `SizePartitioningStore → ExistenceCacheStore →
+/// VerifyStore`. Returns the wrapped chain as a `Store<dyn StoreDriver>`
+/// suitable for `StoreManager::add_store(...)`. The size-partition
+/// threshold matches production (`16384` per prod-server.json5).
+fn wrap_in_production_cas_chain(
+    fss: Arc<nativelink_store::fast_slow_store::FastSlowStore>,
+) -> Store {
+    use nativelink_config::stores::{
+        ExistenceCacheSpec, MemorySpec, SizePartitioningSpec, StoreSpec, VerifySpec,
+    };
+    use nativelink_store::existence_cache_store::ExistenceCacheStore;
+    use nativelink_store::size_partitioning_store::SizePartitioningStore;
+    use nativelink_store::verify_store::VerifyStore;
+
+    // Lower arm of size-partition: a Memory leaf (matches production
+    // small-blob lower-arm shape; chunked-in-flight is by definition
+    // for blobs ≥ chunk size, so any upper-arm-routed digest will end
+    // up at the FSS).
+    let lower_leaf = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss_as_driver: Arc<dyn nativelink_util::store_trait::StoreDriver> =
+        Arc::clone(&fss) as Arc<dyn nativelink_util::store_trait::StoreDriver>;
+    let upper_fss = Store::new(fss_as_driver);
+    let sp = Store::new(SizePartitioningStore::new(
+        &SizePartitioningSpec {
+            size: 16_384,
+            lower_store: StoreSpec::Memory(MemorySpec::default()),
+            upper_store: StoreSpec::Memory(MemorySpec::default()),
+        },
+        lower_leaf,
+        upper_fss,
+    ));
+    let ecs = Store::new(ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            eviction_policy: None,
+        },
+        sp,
+    ));
+    Store::new(VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            // verify_size = false here so the test's 19-byte payload
+            // (digest declared 19, actual short writes) doesn't fail
+            // size verification before the H2 guard is exercised.
+            verify_size: false,
+            verify_hash: false,
+        },
+        ecs,
+    ))
+}
+
+/// BLOCK-A (#499 followup; DS-reviewer BLOCK-1 + MAJOR-1 close-out):
+/// PRODUCTION-COMPOSITION test for the H2 phantom-success guard at
+/// `bytestream_server.rs:2659`. Wraps a `FastSlowStore` in the full
+/// production CAS chain (`SizePartitioningStore → ExistenceCacheStore
+/// → VerifyStore`) and registers the chain as `main_cas` in
+/// `StoreManager`. The QueryWriteStatus call must reach
+/// `FSS::is_chunked_in_flight` through the wrapper chain via
+/// `wrapper_walker::find_fast_slow_via_chain`.
 ///
-/// Mutation: comment out the `if is_chunked_in_flight { ... }` early
-/// return in `inner_query_write_status`. Test MUST red-fail with the
-/// bespoke message
+/// Mutation step 1: comment out the
+/// `if is_chunked_in_flight { ... return ... }` block in
+/// `inner_query_write_status` → test MUST red-fail with
 /// `"BLOCK-A: QueryWriteStatus phantom-acked in-flight chunked digest"`.
+///
+/// Mutation step 2 (BLOCK-1 falsification): revert the wrapper walker
+/// at `bytestream_server.rs:2659` to inline `store_clone.downcast_ref::<
+/// FastSlowStore>(...)`. Test MUST red-fail with the bespoke
+/// `"BLOCK-1: chunked-in-flight guard couldn't reach FSS through
+/// production wrappers"` message — the wrapper-walker absence means the
+/// guard is dead code and the QueryWriteStatus phantom-acks.
 #[nativelink_test]
-pub async fn block_a_query_write_status_does_not_phantom_ack_for_chunked_in_flight()
+pub async fn block_a_query_write_status_does_not_phantom_ack_for_chunked_in_flight_production_composition()
 -> Result<(), Box<dyn core::error::Error>> {
     use nativelink_config::stores::{FastSlowSpec, StoreDirection};
     use nativelink_store::fast_slow_store::FastSlowStore;
 
-    // Stand up a real FSS (Memory/Memory) and wire it into a
-    // StoreManager + ByteStreamServer.
+    // Stand up a real FSS, then wrap in the production CAS chain.
     let store_manager = Arc::new(StoreManager::new());
     let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
@@ -3632,36 +3710,58 @@ pub async fn block_a_query_write_status_does_not_phantom_ack_for_chunked_in_flig
         fast_store,
         slow_store,
     );
-    // `FastSlowStore::new` returns `Arc<FastSlowStore>`; it auto-coerces
-    // to `Arc<dyn StoreDriver>` only at function-argument sites. Cloning
-    // first preserves the strong type — explicit unsizing keeps both
-    // the typed handle (for is_chunked_in_flight + handle accessors)
-    // AND the trait-object form for `Store::new`.
-    let fss_for_store: Arc<dyn nativelink_util::store_trait::StoreDriver> =
-        Arc::clone(&fss) as Arc<dyn nativelink_util::store_trait::StoreDriver>;
-    store_manager.add_store("main_cas", Store::new(fss_for_store));
+
+    // Wrap in production composition: SP → ECS → VerifyStore wrapping
+    // the FSS. The H2 guard now MUST descend wrappers via wrapper_walker.
+    let cas_chain = wrap_in_production_cas_chain(Arc::clone(&fss));
+    store_manager.add_store("main_cas", cas_chain);
 
     let bs_server = Arc::new(
         make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
     );
 
-    // Construct the digest used in the test.
-    let digest_size: u64 = 19;
+    // Use a digest size > 16_384 so the size-partition routes to the
+    // upper-arm FSS (matching production multi-MiB chunked-write
+    // workload). The byte payload itself is irrelevant — we only need
+    // chunked_in_flight_digests to be consulted.
+    let digest_size: u64 = 20_000;
     let digest = DigestInfo::try_new(HASH1, digest_size)?;
+
+    // Sanity: the wrapper walker actually finds the FSS through the
+    // production composition. If this assertion fails, the bundle's
+    // BLOCK-1 fix is not wired correctly and every downstream test is
+    // testing dead code.
+    let store_for_walk = store_manager
+        .get_store("main_cas")
+        .expect("main_cas registered above");
+    use nativelink_util::store_trait::StoreLike;
+    let walked = nativelink_store::wrapper_walker::find_fast_slow_via_chain(
+        store_for_walk.as_store_driver(),
+    );
+    assert!(
+        walked.is_some(),
+        "BLOCK-1: chunked-in-flight guard couldn't reach FSS through \
+         production wrappers (SP → ECS → VerifyStore → FSS); \
+         wrapper_walker::find_fast_slow_via_chain returned None. \
+         The H2 + BLOCK-A guards are dead code in production. \
+         Revert mutation: replace inline downcast at \
+         bytestream_server.rs:2659/:2778 with \
+         wrapper_walker::find_fast_slow_via_chain."
+    );
 
     // Register the digest in the FSS's chunked_in_flight_digests set
     // (simulating what `InFlightChunkedGuard::new` does at v2 admission).
-    // MAJOR-G refactor: chunked_in_flight_digests is now a refcount
-    // HashMap; tests insert with refcount = 1 to simulate
-    // InFlightChunkedGuard::new.
+    // BLOCK-2 refactor: entries are (NonZeroU32, Arc<Notify>) tuples.
     fss.chunked_in_flight_digests_handle()
         .lock()
-        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
+        .insert(
+            digest,
+            (
+                core::num::NonZeroU32::new(1).unwrap(),
+                Arc::new(tokio::sync::Notify::new()),
+            ),
+        );
 
-    // Sanity: FSS::has should now return Some(declared_size) — this is
-    // the H2 cascade. Use the FSS-level convenience accessor because we
-    // hold an `Arc<FastSlowStore>` (not a `Store`) and want to verify
-    // the load-bearing predicate directly.
     assert!(
         fss.is_chunked_in_flight(&digest),
         "FSS::is_chunked_in_flight must return true when the digest is in \
@@ -3684,9 +3784,12 @@ pub async fn block_a_query_write_status_does_not_phantom_ack_for_chunked_in_flig
         "BLOCK-A: QueryWriteStatus phantom-acked in-flight chunked digest \
          (returned complete=true while the chunked commit is still in flight; \
          Bazel would treat the upload as durable and silently lose data on \
-         commit failure). Got committed_size={}, complete=true. Mutation: \
-         comment out the `if is_chunked_in_flight {{ ... return ... }}` block \
-         in inner_query_write_status — this assertion must red-fail.",
+         commit failure). Got committed_size={}, complete=true. The wrapper \
+         walker must reach FSS through the production composition, AND the \
+         `if is_chunked_in_flight {{ ... return ... }}` block must fire. \
+         Mutation step 1: comment out the early return — this red-fails. \
+         Mutation step 2 (BLOCK-1): revert inline downcast — this also \
+         red-fails because the walker is the only path through wrappers.",
         inner.committed_size
     );
     assert_eq!(
@@ -3699,27 +3802,27 @@ pub async fn block_a_query_write_status_does_not_phantom_ack_for_chunked_in_flig
     Ok(())
 }
 
-/// BLOCK-D (#499 followup): production-composition test for the H2
-/// phantom-success guard at `bytestream_server.rs:2724`. Stand up an
-/// FSS-backed ByteStreamServer; register a digest into
-/// `chunked_in_flight_digests` (simulating a v2 chunked write
-/// mid-commit); issue a NEW `ByteStream::write` for the same digest
-/// from a fresh UUID; assert the second writer does NOT phantom-ack
-/// (does NOT immediately return WriteResponse with the declared size
-/// before sending any bytes).
+/// BLOCK-D (#499 followup; DS-reviewer BLOCK-1 + MAJOR-1 close-out):
+/// PRODUCTION-COMPOSITION test for the H2 phantom-success guard at
+/// `bytestream_server.rs:2778`. Wraps a `FastSlowStore` in the full
+/// production CAS chain (`SizePartitioningStore → ExistenceCacheStore
+/// → VerifyStore`) so the bytestream_write fast-path's
+/// `wrapper_walker::find_fast_slow_via_chain` descent is exercised.
 ///
-/// Seams: chunked_in_flight_digests producer → FastSlowStore::has →
-/// FastSlowStore::is_chunked_in_flight → bytestream_server fast-path
-/// seam → in_flight_writes dedup fall-through → second writer becomes
-/// the primary (its own write proceeds).
+/// Mutation step 1: change the `is_chunked_in_flight` check at
+/// `bytestream_server.rs:2778` so it always returns false (e.g.
+/// remove the `&& !is_chunked_in_flight` clause). Test MUST red-fail
+/// with `"BLOCK-D: ByteStream::write phantom-acked second concurrent
+/// writer while chunked commit was still in-flight"`.
 ///
-/// Mutation: change `is_chunked_in_flight` to `false` (or remove the
-/// `&& !is_chunked_in_flight` clause). Test MUST red-fail with the
-/// bespoke message
-/// `"BLOCK-D: ByteStream::write phantom-acked second concurrent writer
-/// while chunked commit was still in-flight"`.
+/// Mutation step 2 (BLOCK-1 falsification): revert the wrapper walker
+/// at `:2778` to inline `store.downcast_ref::<FastSlowStore>(...)`.
+/// Test MUST red-fail with the bespoke `"BLOCK-1: chunked-in-flight
+/// guard couldn't reach FSS through production wrappers"` message — the
+/// wrapper walker is the only path through VerifyStore, so absence
+/// means the guard is dead code in production.
 #[nativelink_test]
-pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_flight()
+pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_flight_production_composition()
 -> Result<(), Box<dyn core::error::Error>> {
     use core::time::Duration;
     use nativelink_config::stores::{FastSlowSpec, StoreDirection};
@@ -3740,47 +3843,57 @@ pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_fl
         fast_store,
         slow_store,
     );
-    // `FastSlowStore::new` returns `Arc<FastSlowStore>`; it auto-coerces
-    // to `Arc<dyn StoreDriver>` only at function-argument sites. Cloning
-    // first preserves the strong type — explicit unsizing keeps both
-    // the typed handle (for is_chunked_in_flight + handle accessors)
-    // AND the trait-object form for `Store::new`.
-    let fss_for_store: Arc<dyn nativelink_util::store_trait::StoreDriver> =
-        Arc::clone(&fss) as Arc<dyn nativelink_util::store_trait::StoreDriver>;
-    store_manager.add_store("main_cas", Store::new(fss_for_store));
+
+    // Wrap in production CAS composition.
+    let cas_chain = wrap_in_production_cas_chain(Arc::clone(&fss));
+    store_manager.add_store("main_cas", cas_chain);
 
     let bs_server = Arc::new(
         make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
     );
 
-    let digest_size: u64 = 19;
+    // Use a digest size > 16_384 so size-partition routes to the
+    // upper-arm FSS.
+    let digest_size: u64 = 20_000;
     let digest = DigestInfo::try_new(HASH1, digest_size)?;
 
+    // Sanity-walk: confirm wrapper walker reaches FSS via production
+    // composition. Skipping the walk inline causes silent phantom-ack
+    // (BLOCK-1 dead-code regression).
+    let store_for_walk = store_manager
+        .get_store("main_cas")
+        .expect("main_cas registered above");
+    use nativelink_util::store_trait::StoreLike;
+    let walked = nativelink_store::wrapper_walker::find_fast_slow_via_chain(
+        store_for_walk.as_store_driver(),
+    );
+    assert!(
+        walked.is_some(),
+        "BLOCK-1: chunked-in-flight guard couldn't reach FSS through \
+         production wrappers (SP → ECS → VerifyStore → FSS); \
+         wrapper_walker::find_fast_slow_via_chain returned None. \
+         The H2 + BLOCK-A guards are dead code in production."
+    );
+
     // Register the digest in chunked_in_flight_digests BEFORE the second
-    // writer arrives. Simulates v2 admission; the actual chunked write
-    // is NOT happening (we just want the FSS to lie via its has cascade).
-    // MAJOR-G refactor: chunked_in_flight_digests is now a refcount
-    // HashMap; tests insert with refcount = 1 to simulate
-    // InFlightChunkedGuard::new.
+    // writer arrives. Simulates v2 admission.
     fss.chunked_in_flight_digests_handle()
         .lock()
-        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
+        .insert(
+            digest,
+            (
+                core::num::NonZeroU32::new(1).unwrap(),
+                Arc::new(tokio::sync::Notify::new()),
+            ),
+        );
 
     // Issue a NEW ByteStream::write for the same digest. The H2 guard
     // SHOULD prevent the fast-path short-circuit. The write request
     // never sends `finish_write=true`, so a true short-circuit would
-    // return Ok with committed_size=declared BEFORE any bytes flow. A
-    // properly-guarded fall-through would block until the producer
-    // either sends or the deadlock-detector fires.
+    // return Ok with committed_size=declared BEFORE any bytes flow.
     let (tx, join_handle) =
         make_stream_and_writer_spawn(bs_server.clone(), Some(CompressionEncoding::Gzip));
 
-    // Send a single short chunk (incomplete, no finish_write) and then
-    // close the producer side. Without the H2 guard, the server would
-    // have already returned a phantom WriteResponse before the producer
-    // sends anything — the join_handle would resolve with Ok almost
-    // immediately. With the guard, the server falls through to the
-    // standard write path and processes the (incomplete) data.
     let resource_name = make_resource_name(digest_size);
     let mut write_request = WriteRequest {
         resource_name: resource_name.clone(),
@@ -3791,8 +3904,7 @@ pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_fl
     tx.send(Frame::data(encode_stream_proto(&write_request)?))
         .await?;
 
-    // Yield so the server can process the first chunk. If the server
-    // phantom-acks, the join_handle would resolve here with Ok.
+    // Yield so the server can process the first chunk.
     yield_now().await;
     yield_now().await;
 
@@ -3804,17 +3916,17 @@ pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_fl
     match poll_result {
         Poll::Ready(Ok(Ok(response))) => {
             let resp = response.into_inner();
-            // If we see a WriteResponse with `committed_size=declared_size`
-            // here, the H2 guard FAILED — the server phantom-acked the
-            // second writer.
             panic!(
                 "BLOCK-D: ByteStream::write phantom-acked second concurrent \
                  writer while chunked commit was still in-flight (returned \
                  WriteResponse with committed_size={} for declared_size={} \
                  BEFORE the producer signaled finish_write=true). The H2 \
-                 guard at bytestream_server.rs:2724 must consult \
-                 FSS::is_chunked_in_flight and skip the short-circuit when \
-                 the digest is in the chunked-in-flight set.",
+                 guard at bytestream_server.rs:2778 must consult \
+                 FSS::is_chunked_in_flight (via wrapper_walker::find_fast_slow_via_chain) \
+                 and skip the short-circuit when the digest is in the \
+                 chunked-in-flight set. Mutation steps: (1) flip \
+                 is_chunked_in_flight to false; (2) revert wrapper walker \
+                 to inline downcast — either should red-fail this test.",
                 resp.committed_size, digest_size
             );
         }
@@ -3827,17 +3939,12 @@ pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_fl
             panic!("BLOCK-D: server task panicked unexpectedly");
         }
         Poll::Pending => {
-            // Expected post-fix: the server is still processing the
-            // write and waiting for `finish_write=true` (or for the
-            // producer to disconnect). This proves the H2 guard fired
-            // and prevented the phantom-ack.
+            // Expected post-fix: server still processing the write,
+            // proves the H2 guard fired and prevented the phantom-ack.
         }
     }
 
     // Cleanup: drop the producer to let the write task terminate.
-    // Closing tx makes the recv side observe end-of-stream; depending
-    // on path, the server may return Ok or Err — either is acceptable
-    // (the assertion above is the load-bearing check).
     write_request.write_offset = 6;
     write_request.data = b"".to_vec().into();
     write_request.finish_write = true;

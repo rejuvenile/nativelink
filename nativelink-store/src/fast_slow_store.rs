@@ -65,6 +65,28 @@ use crate::chunked_signal::{encode_backpressure_signal_any, error_has_backpressu
 // spawn-detach refactor removed `OnceCell::get_or_try_init`).
 type Loader = Arc<()>;
 
+/// BLOCK-2 (DS-reviewer, #499 v3 follow-up): each entry in the
+/// chunked-in-flight map carries a per-digest `Notify` alongside the
+/// refcount. Readers in [`FastSlowStore::get_part`]'s BLOCK-B wait clone
+/// the `Arc<Notify>` while still under the lock, drop the lock, and
+/// `await` the `notified` future. The last [`crate::wrapper_walker`]-free
+/// path is the `InFlightChunkedGuard::Drop` (mirrored by the spawned
+/// reaper after `disarm`) — when the refcount transitions to zero, it
+/// fires `notify_waiters()` *before* removing the entry so readers
+/// holding the `Arc<Notify>` wake. Eliminates the prior 5 s polling
+/// budget that fired short of the documented ~30 s commit p99.
+///
+/// The per-digest Notify is independent from the FSS-wide
+/// `in_flight_empty_notify`, which fires only when the *whole* map
+/// drains (used by `flush_slow_writes` graceful drain). Readers care
+/// about their digest's commit; the drain cares about all digests'.
+pub type ChunkedInFlightEntry = (NonZeroU32, Arc<Notify>);
+
+/// Convenience alias for the locked refcount + Notify map used by both
+/// [`FastSlowStore`] and the chunked-write handler / dispatcher in
+/// `nativelink-service`.
+pub type ChunkedInFlightMap = Arc<Mutex<HashMap<DigestInfo, ChunkedInFlightEntry>>>;
+
 /// Default maximum aggregate bytes held in `mirror_blobs`. The runtime cap
 /// is held in `FastSlowStore::mirror_blobs_max_bytes` and is only overridable
 /// by tests via `set_mirror_blobs_max_bytes_for_test`. When exceeded,
@@ -439,7 +461,7 @@ struct PinExpireFailedWritesListener {
     /// a transient phantom-missing window for sibling readers (BLOCK-B
     /// wait would not fire; readers got NotFound for a digest the
     /// second session would commit moments later).
-    chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>>,
+    chunked_in_flight_digests: ChunkedInFlightMap,
 }
 
 impl ItemCallback for PinExpireFailedWritesListener {
@@ -502,7 +524,7 @@ fn register_pin_expire_listener(
     fast_store: &Store,
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
     in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
-    chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>>,
+    chunked_in_flight_digests: ChunkedInFlightMap,
 ) {
     let listener: Arc<dyn ItemCallback> = Arc::new(PinExpireFailedWritesListener {
         failed_slow_writes,
@@ -857,7 +879,7 @@ pub struct FastSlowStore {
     /// `PinExpireFailedWritesListener::chunked_in_flight_digests` for
     /// the bug shape (two concurrent sessions, first-to-drop removed
     /// the digest while second was still in-flight).
-    chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>>,
+    chunked_in_flight_digests: ChunkedInFlightMap,
     /// Notified when in_flight_slow_writes becomes empty. Used by
     /// `flush_slow_writes` to wait for all background writes to complete.
     in_flight_empty_notify: Arc<Notify>,
@@ -1120,7 +1142,7 @@ impl FastSlowStore {
             Arc::new(Mutex::new(HashSet::new()));
         let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+        let chunked_in_flight_digests: ChunkedInFlightMap =
             Arc::new(Mutex::new(HashMap::new()));
         // Lifted out of `Arc::new_cyclic` so the #367 slow-eviction
         // listener can carry a clone — the BIS-feeder queue must be
@@ -1309,7 +1331,7 @@ impl FastSlowStore {
     /// map would double-count memory AND trip the legacy map's
     /// size-mismatch eviction guard.
     #[must_use]
-    pub fn chunked_in_flight_digests_handle(&self) -> Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> {
+    pub fn chunked_in_flight_digests_handle(&self) -> ChunkedInFlightMap {
         self.chunked_in_flight_digests.clone()
     }
 
@@ -2037,7 +2059,7 @@ impl FastSlowStore {
                             let bytes: usize = chunks.iter().map(|b| b.len()).sum();
                             warn!(?key, bytes, "FastSlowStore: unflushed write at shutdown");
                         }
-                        for (digest, refcount) in chunked_guard.iter() {
+                        for (digest, (refcount, _notify)) in chunked_guard.iter() {
                             warn!(
                                 ?digest,
                                 refcount = refcount.get(),
@@ -2532,7 +2554,7 @@ impl FastSlowStore {
         let shared = other.failed_slow_writes.clone();
         let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+        let chunked_in_flight_digests: ChunkedInFlightMap =
             Arc::new(Mutex::new(HashMap::new()));
         // See `new` for rationale: lifted so the #367 slow-eviction
         // listener can observe the BIS-feeder queue.
@@ -5914,7 +5936,7 @@ impl StoreDriver for FastSlowStore {
             }
         }
 
-        // BLOCK-B (#499 followup, Option F1 — read-blocks-on-commit):
+        // BLOCK-B (#499 followup; DS-reviewer BLOCK-2 close-out):
         // close the H1 reader-cascade half-gap. v2 (`WriteChunkedV2`)
         // sessions register the digest in `chunked_in_flight_digests`
         // BUT do NOT register in `chunked_read_registry` — they have a
@@ -5928,80 +5950,88 @@ impl StoreDriver for FastSlowStore {
         // H1 + the dispatch-prompt BLOCK-B.
         //
         // Mechanism: when the digest is in `chunked_in_flight_digests`
-        // (v1 or v2), wait briefly (up to `V2_INFLIGHT_WAIT_BUDGET`)
-        // for it to drain — the v1 path's pin should already have served
-        // from the chunked-cascade above, so reaching this point
-        // typically means v2 (or v1 commit-window). When the wait
-        // completes (set drained), fall through to the slow tier; the
-        // canonical CAS file should now be on disk (commit success) or
-        // still missing (commit failure → NotFound from the slow tier).
-        // When the budget elapses, fall through anyway; the existing
-        // NotFound semantics survive.
+        // (v1 or v2), block this reader on the digest's per-entry
+        // `Arc<Notify>` until the writer's RAII guard transitions the
+        // refcount to zero (`InFlightChunkedGuard::Drop` calls
+        // `notify.notify_waiters()` BEFORE removing the entry, so any
+        // reader holding the cloned Arc wakes). On wakeup, fall through
+        // to the slow tier — the canonical CAS file is either now on
+        // disk (commit success) or still missing (commit failure →
+        // NotFound from the slow tier; correct, because the bytes
+        // weren't durable).
         //
-        // The wait uses the per-FSS `in_flight_empty_notify` (fires when
-        // the chunked OR legacy in-flight set drains to empty) +
-        // bounded polling — same shape as the chunked-cascade
-        // partial-miss wait above. No per-digest wakeup primitive is
-        // added because the v2 commit-watchdog is 60s and a single
-        // polling tick (50ms) is cheap; readers in the v2 commit window
-        // pay at most one extra ~50ms latency before falling through.
+        // Why unbounded (no timeout, no polling): the prior 5 s budget
+        // fired before the documented commit p99 (~30 s for multi-MiB
+        // blobs per `chunked_write_handler.rs:186`). The writer side
+        // already bounds: chunked-write watchdog enforces a 60 s
+        // commit deadline; the `CommitRunnerGuard::Drop` (and v1
+        // dispatch's spawned reaper) publishes a synthetic-Cancelled
+        // outcome that drops the refcount and fires the notify on
+        // every termination path including panic / runtime shutdown.
+        // Reader cancellation is also benign — the cloned `Arc<Notify>`
+        // drops along with the `notified` future.
         //
-        // Falsification: comment out the loop body. Concurrent reader
-        // during v2 in-flight gets NotFound immediately (the H1 bug).
-        // The bespoke message in the BLOCK-B test red-fails.
+        // Saturation note: `InFlightChunkedGuard::new` uses
+        // `saturating_add` on the refcount, so a u32::MAX-concurrent
+        // pile-up will not panic; however, once saturated the final
+        // drop may not reach zero and the notify may not fire. That's
+        // a strictly theoretical (4 G concurrent same-digest writers)
+        // failure mode; the reader still drops cleanly when its caller
+        // cancels.
+        //
+        // Falsification: comment out the `notified.await` line. The
+        // reader returns NotFound immediately and the BLOCK-B
+        // production-composition tests in
+        // `bytestream_server_test.rs::block_b_*` red-fail with the
+        // bespoke message.
         #[cfg(feature = "chunked_fast_slow")]
         if self.chunked_reads_enabled.load(Ordering::Relaxed)
             && let StoreKey::Digest(digest) = key.borrow()
         {
-            // Quick check: only block if the digest actually IS in the
-            // v2/v1 in-flight set. The vast majority of reads bypass
-            // this entirely.
-            let is_in_flight =
-                self.chunked_in_flight_digests.lock().contains_key(&digest);
-            if is_in_flight {
-                // Bound the wait to a small budget. v2 commits typically
-                // complete in <1s for small blobs; large blobs take
-                // multiple seconds but bounded by `COMMIT_WAIT_WATCHDOG`
-                // (60s) on the writer side. We use a tighter budget here
-                // because (a) reader is on the Bazel-facing critical
-                // path, and (b) on budget-elapsed we still fall through
-                // and get the standard NotFound (matching pre-fix
-                // behavior).
-                const V2_INFLIGHT_WAIT_BUDGET: Duration = Duration::from_secs(5);
-                const V2_INFLIGHT_POLL_INTERVAL: Duration =
-                    Duration::from_millis(50);
-                let deadline = tokio::time::Instant::now()
-                    + V2_INFLIGHT_WAIT_BUDGET;
+            // Clone the per-digest Arc<Notify> handle while holding the
+            // lock briefly; drop the lock before awaiting. Re-check the
+            // map after registering the notified future to avoid the
+            // canonical lost-wakeup race (writer drains between our
+            // lock-drop and `notified.as_mut().enable()`).
+            let notify_handle = {
+                let guard = self.chunked_in_flight_digests.lock();
+                guard.get(&digest).map(|(_count, n)| Arc::clone(n))
+            };
+            if let Some(notify) = notify_handle {
                 debug!(
                     ?digest,
                     "fast_slow get_part: digest is in chunked_in_flight_digests; \
-                     blocking reader for up to {V2_INFLIGHT_WAIT_BUDGET:?} \
-                     for v2/v1 commit (BLOCK-B H1 reader-cascade)",
+                     blocking reader on per-digest Notify until v2/v1 commit \
+                     completes (BLOCK-B H1 reader-cascade; unbounded — writer-side \
+                     COMMIT_WAIT_WATCHDOG 60s + RAII synthetic-Cancelled-on-drop \
+                     bounds the wait)",
                 );
-                loop {
-                    if tokio::time::Instant::now() >= deadline {
-                        warn!(
-                            ?digest,
-                            budget_secs = V2_INFLIGHT_WAIT_BUDGET.as_secs(),
-                            "fast_slow get_part: V2_INFLIGHT_WAIT_BUDGET elapsed \
-                             waiting for chunked_in_flight_digests to drain; \
-                             falling through to slow tier (may NotFound)",
-                        );
-                        break;
-                    }
-                    // Re-check WITHOUT acquiring the lock first (atomic
-                    // is cheaper); only lock on suspect.
-                    let still_in_flight =
-                        self.chunked_in_flight_digests.lock().contains_key(&digest);
-                    if !still_in_flight {
-                        debug!(
-                            ?digest,
-                            "fast_slow get_part: chunked_in_flight_digests drained \
-                             for this digest; proceeding to slow-tier read",
-                        );
-                        break;
-                    }
-                    tokio::time::sleep(V2_INFLIGHT_POLL_INTERVAL).await;
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                // `enable()` registers the waiter on the Notify BEFORE
+                // we re-check membership, closing the
+                // notify-between-check-and-await race window. See
+                // `tokio::sync::Notify` doc on `Notified::enable`.
+                notified.as_mut().enable();
+                let still_in_flight = self
+                    .chunked_in_flight_digests
+                    .lock()
+                    .contains_key(&digest);
+                if still_in_flight {
+                    notified.await;
+                    debug!(
+                        ?digest,
+                        "fast_slow get_part: per-digest Notify fired \
+                         (chunked_in_flight_digests drained for this digest); \
+                         proceeding to slow-tier read",
+                    );
+                } else {
+                    debug!(
+                        ?digest,
+                        "fast_slow get_part: chunked_in_flight_digests drained \
+                         between lock-drop and notify enable; proceeding to \
+                         slow-tier read",
+                    );
                 }
             }
         }

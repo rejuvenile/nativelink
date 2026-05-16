@@ -1699,7 +1699,7 @@ async fn v2_session_registers_in_chunked_in_flight_digests_h1() {
     // from `FastSlowStore::chunked_in_flight_digests_handle()`; the test
     // wires them by hand to assert registration without standing up a full
     // FSS.
-    let chunked_in_flight: Arc<PlMutex<HashMap<DigestInfo, core::num::NonZeroU32>>> =
+    let chunked_in_flight: nativelink_store::fast_slow_store::ChunkedInFlightMap =
         Arc::new(PlMutex::new(HashMap::new()));
     let in_flight_empty_notify: Arc<Notify> = Arc::new(Notify::new());
 
@@ -1793,6 +1793,7 @@ async fn fss_is_chunked_in_flight_returns_true_after_register_h2() {
     use nativelink_store::fast_slow_store::FastSlowStore;
     use nativelink_store::memory_store::MemoryStore;
     use nativelink_util::store_trait::Store;
+    use tokio::sync::Notify;
 
     let payload: Vec<u8> = vec![0x42; TEST_CHUNK_SIZE];
     let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
@@ -1823,7 +1824,13 @@ async fn fss_is_chunked_in_flight_returns_true_after_register_h2() {
     // MAJOR-G refactor: HashMap with refcount; tests insert with count=1.
     fss.chunked_in_flight_digests_handle()
         .lock()
-        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
+        .insert(
+            digest,
+            (
+                core::num::NonZeroU32::new(1).unwrap(),
+                Arc::new(Notify::new()),
+            ),
+        );
 
     // Now is_chunked_in_flight returns true.
     assert!(
@@ -2062,25 +2069,32 @@ async fn block_b_h1_reader_cascade_blocks_on_v2_inflight_then_serves_from_slow()
          commit hasn't landed bytes yet)"
     );
 
-    // Register the digest in chunked_in_flight_digests (the v2-style
-    // in-flight indication). The H1 reader-cascade BLOCK-B path will
-    // see this and wait. MAJOR-G refactor: HashMap with refcount.
-    fss.chunked_in_flight_digests_handle()
-        .lock()
-        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
+    // Register the digest in chunked_in_flight_digests via the proper
+    // RAII guard so the per-digest Notify is wired through correctly.
+    // BLOCK-2 (DS-reviewer): the BLOCK-B reader subscribes to the
+    // per-digest Notify on the map entry; only `InFlightChunkedGuard::
+    // Drop` (refcount → 0) fires `notify_waiters()`. A bare
+    // `map.remove(&digest)` does NOT fire the notify, so the reader
+    // would never wake.
+    let in_flight_empty_notify = fss.in_flight_empty_notify_handle();
+    let inflight_guard = nativelink_service::chunked_write_handler::InFlightChunkedGuard::new(
+        fss.chunked_in_flight_digests_handle(),
+        digest,
+        Some(Arc::clone(&in_flight_empty_notify)),
+    );
 
     // Spawn a concurrent task that simulates the v2 commit completing
-    // while the reader is mid-wait: populates the slow tier AND drains
-    // the in-flight set.
-    let fss_for_drain = Arc::clone(&fss);
+    // while the reader is mid-wait: populates the slow tier AND drops
+    // the guard (which fires the per-digest Notify the reader is
+    // awaiting). Hand the guard into the spawn so its Drop runs only
+    // after the wall-clock delay below.
     let slow_for_drain = slow_store.clone();
     let payload_for_drain = payload.clone();
     let drainer = tokio::spawn(async move {
-        // Sleep ~150ms so the reader observes the in-flight entry for
-        // at least one BLOCK-B poll interval (50ms). The wall-clock
-        // sleep is a SCHEDULING delay, not a synchronization primitive
-        // — the asserted property is "reader produced correct bytes"
-        // regardless of exact drain timing.
+        // Sleep ~150ms so the reader is parked on the per-digest Notify
+        // BEFORE the writer drops its guard. The wall-clock sleep is a
+        // SCHEDULING delay, not a synchronization primitive — the
+        // asserted property is "reader produced correct bytes".
         tokio::time::sleep(Duration::from_millis(150)).await;
         // Land the bytes on the slow tier (simulates v2 commit-rename
         // making canonical file visible).
@@ -2089,16 +2103,17 @@ async fn block_b_h1_reader_cascade_blocks_on_v2_inflight_then_serves_from_slow()
             .update_oneshot(digest, payload_for_drain.into())
             .await
             .expect("slow-tier write must succeed");
-        // Drain the in-flight set (simulates v2 InFlightChunkedGuard::Drop).
-        fss_for_drain
-            .chunked_in_flight_digests_handle()
-            .lock()
-            .remove(&digest);
+        // Drop the guard — refcount → 0 → per-digest Notify fires →
+        // reader wakes (simulates v2 InFlightChunkedGuard::Drop).
+        drop(inflight_guard);
     });
 
     // Reader: wrap the FSS in a Store via dyn StoreDriver coercion so
     // the StoreLike convenience methods work. Use get_part_unchunked
-    // for simplicity.
+    // for simplicity. The Notify-based BLOCK-B wait is unbounded but
+    // the 60s commit-watchdog (writer side) bounds the worst case; a
+    // 10s test deadlock-detector is sufficient for the ~150ms drainer
+    // simulation here.
     let fss_dyn: Arc<dyn nativelink_util::store_trait::StoreDriver> =
         Arc::clone(&fss) as Arc<dyn nativelink_util::store_trait::StoreDriver>;
     let fss_store = Store::new(fss_dyn);
@@ -2108,17 +2123,18 @@ async fn block_b_h1_reader_cascade_blocks_on_v2_inflight_then_serves_from_slow()
     )
     .await
     .expect(
-        "BLOCK-B: reader must complete within 10s; the H1 wait is bounded \
-         to V2_INFLIGHT_WAIT_BUDGET (5s) plus slow-tier serve",
+        "BLOCK-B: reader must complete within 10s — must wake on the \
+         per-digest Notify fired by InFlightChunkedGuard::Drop (commit \
+         simulation) and then read from the freshly-populated slow tier",
     )
     .expect(
         "BLOCK-B: H1 reader-cascade returned NotFound during v2 in-flight \
-         window — the H1 wait at fast_slow_store.rs (Option F1) must block \
-         reader until chunked_in_flight_digests drains, then fall through to \
-         slow tier where the bytes (now landed by the v2 commit) are served. \
-         Mutation: comment out the wait `loop {{ ... }}` body — this \
-         expectation must red-fail with the get_part NotFound from the \
-         empty slow tier",
+         window — the H1 Notify-based wait at fast_slow_store.rs must block \
+         reader until chunked_in_flight_digests drains (per-digest Notify \
+         fires), then fall through to slow tier where the bytes (now landed \
+         by the v2 commit) are served. Mutation: comment out the \
+         `notified.await` line — this expectation must red-fail with \
+         get_part NotFound from the still-empty slow tier",
     );
 
     let _ = tokio::time::timeout(Duration::from_secs(5), drainer)

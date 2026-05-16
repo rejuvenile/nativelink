@@ -89,6 +89,7 @@ use nativelink_store::chunked::pin_budget::{PinBudget, pin_budget_singleton};
 use nativelink_store::chunked_signal::{
     encode_backpressure_signal_any, encode_watchdog_timeout_signal_any,
 };
+use nativelink_store::fast_slow_store::ChunkedInFlightMap;
 use nativelink_store::filesystem_store::{FileEntry, FileEntryImpl, FilesystemStore};
 use nativelink_util::buf_channel::DropCloserReadHalf;
 use nativelink_util::common::DigestInfo;
@@ -468,9 +469,11 @@ pub struct ChunkedWriteHandler<Fe: FileEntry = FileEntryImpl> {
     ///
     /// MAJOR-G (#499 followup): refcount HashMap so concurrent sessions
     /// for the same digest both observe presence until BOTH drop.
-    chunked_in_flight_digests: Option<
-        Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
-    >,
+    /// BLOCK-2 (DS-reviewer): each entry also carries an `Arc<Notify>`
+    /// so readers blocking in
+    /// `FastSlowStore::get_part`'s BLOCK-B wait can subscribe with no
+    /// polling and no timeout — see [`ChunkedInFlightEntry`].
+    chunked_in_flight_digests: Option<ChunkedInFlightMap>,
     /// H1 (#499 followup): wakes `flush_slow_writes` waiters when the
     /// chunked in-flight set drains. Paired with `chunked_in_flight_digests`.
     in_flight_empty_notify: Option<Arc<tokio::sync::Notify>>,
@@ -524,7 +527,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     #[must_use]
     pub fn with_chunked_in_flight_digests(
         mut self,
-        digests: Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
+        digests: ChunkedInFlightMap,
         notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         self.chunked_in_flight_digests = Some(digests);
@@ -535,7 +538,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     /// H1: pub-in-crate accessors for the v2 session loop.
     pub(crate) fn chunked_in_flight_digests_for_v2(
         &self,
-    ) -> Option<&Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>> {
+    ) -> Option<&ChunkedInFlightMap> {
         self.chunked_in_flight_digests.as_ref()
     }
 
@@ -2884,9 +2887,10 @@ pub struct BazelChunkedDispatcherImpl<Fe: FileEntry = FileEntryImpl> {
     ///
     /// MAJOR-G (#499 followup): refcount HashMap so concurrent
     /// same-digest sessions both observe presence until BOTH drop.
-    chunked_in_flight_digests: Option<
-        Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
-    >,
+    /// BLOCK-2 (DS-reviewer): each entry also carries an `Arc<Notify>`
+    /// so BLOCK-B readers wake without polling or timeouts — see
+    /// [`ChunkedInFlightEntry`].
+    chunked_in_flight_digests: Option<ChunkedInFlightMap>,
     /// #212 fixup B2: notify shared with the FastSlowStore so the
     /// graceful-drain in `flush_slow_writes` wakes when in-flight goes
     /// to zero (canonical lost-wakeup pattern: `Notify::notified()` AFTER
@@ -3014,9 +3018,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
     #[must_use]
     pub fn with_in_flight_tracking(
         mut self,
-        chunked_in_flight_digests: Arc<
-            parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>,
-        >,
+        chunked_in_flight_digests: ChunkedInFlightMap,
         in_flight_empty_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         self.chunked_in_flight_digests = Some(chunked_in_flight_digests);
@@ -3189,12 +3191,13 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
 /// guard must remain trivially auditable.
 #[derive(Debug)]
 pub struct InFlightChunkedGuard {
-    set: Arc<Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
+    set: ChunkedInFlightMap,
     digest: DigestInfo,
-    /// Mirrors the existing notify-on-empty contract: when the set
-    /// transitions from non-empty to empty, wake any
-    /// `flush_slow_writes` waiters. `None` for tests / call-sites that
-    /// don't observe the notify.
+    /// FSS-wide notify fired when the **whole** map transitions from
+    /// non-empty to empty. Used by `flush_slow_writes` graceful-drain.
+    /// `None` for tests / call-sites that don't observe the drain
+    /// notify. INDEPENDENT from the per-digest notify stored INSIDE
+    /// each entry (see [`ChunkedInFlightEntry`]).
     notify: Option<Arc<tokio::sync::Notify>>,
     /// `true` until `disarm()` is called. `false` makes Drop a no-op.
     /// Required so the success path can hand removal to the spawned
@@ -3203,36 +3206,54 @@ pub struct InFlightChunkedGuard {
 }
 
 impl InFlightChunkedGuard {
-    /// MAJOR-G (#499 followup): bump the refcount for `digest` in `set`
-    /// and return a guard that will decrement on Drop. When the
-    /// refcount reaches zero the entry is removed and (if the map
-    /// becomes empty) `notify.notify_waiters()` fires.
+    /// MAJOR-G (#499 followup) + BLOCK-2 (DS-reviewer): bump the
+    /// refcount for `digest` in `set` and return a guard that will
+    /// decrement on Drop. When the refcount reaches zero the entry's
+    /// per-digest `Notify` is woken (`notify_waiters` BEFORE removal,
+    /// so any reader holding a cloned `Arc<Notify>` wakes) and the
+    /// entry is removed. If the whole map then becomes empty, the
+    /// FSS-wide `in_flight_empty_notify` also fires (preserving
+    /// `flush_slow_writes` graceful-drain).
     ///
-    /// Pre-fix this was a HashSet — two concurrent sessions for the
-    /// same digest both "inserted" (idempotent), but the first to drop
-    /// would remove the digest while the second was still in-flight.
-    /// Readers in BLOCK-B's wait loop observed the digest as drained
-    /// and proceeded to slow tier where the bytes weren't yet
-    /// committed → NotFound. Refcount HashMap keeps the digest visible
-    /// until BOTH guards drop.
+    /// Pre-MAJOR-G this was a HashSet — two concurrent sessions for
+    /// the same digest both "inserted" (idempotent), but the first to
+    /// drop would remove the digest while the second was still
+    /// in-flight. Readers in BLOCK-B's wait loop observed the digest
+    /// as drained and proceeded to slow tier where the bytes weren't
+    /// yet committed → NotFound. Refcount HashMap keeps the digest
+    /// visible until BOTH guards drop.
+    ///
+    /// Pre-BLOCK-2 the reader-cascade in `FastSlowStore::get_part`
+    /// polled the map every 50 ms up to a 5 s budget. p99 chunked
+    /// commit time is documented at ~30 s for multi-MiB blobs, so the
+    /// budget fired short, the reader fell through to the slow tier
+    /// before commit landed, and returned NotFound. The per-digest
+    /// `Notify` lets readers subscribe with no polling and no
+    /// timeout — the writer side already bounds via the 60 s
+    /// commit-watchdog + RAII synthetic-Cancelled-on-drop on every
+    /// termination path.
     #[must_use]
     pub fn new(
-        set: Arc<Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
+        set: ChunkedInFlightMap,
         digest: DigestInfo,
         notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Self {
         {
             let mut guard = set.lock();
-            // Bump the refcount; default to 1 if absent.
+            // Bump the refcount; on first insert, create the per-digest
+            // Notify. Subsequent inserts saturate to prevent overflow at
+            // u32::MAX (under normal load refcounts are O(1)-O(10)).
             guard
                 .entry(digest)
-                .and_modify(|c| {
-                    // Saturate to prevent overflow at u32::MAX; under
-                    // normal load refcounts are O(1)-O(10) (concurrent
-                    // sessions for the same digest are rare).
+                .and_modify(|(c, _n)| {
                     *c = c.checked_add(1).unwrap_or(*c);
                 })
-                .or_insert(NonZeroU32::new(1).expect("1 is non-zero"));
+                .or_insert_with(|| {
+                    (
+                        NonZeroU32::new(1).expect("1 is non-zero"),
+                        Arc::new(tokio::sync::Notify::new()),
+                    )
+                });
         }
         Self {
             set,
@@ -3245,7 +3266,8 @@ impl InFlightChunkedGuard {
     /// Disarm the guard and return its state for hand-off to a
     /// post-dispatch reaper. After disarm, Drop is a no-op — the caller
     /// is responsible for performing the equivalent of the Drop
-    /// (decrement refcount; remove on zero; fire notify if map
+    /// (decrement refcount; on zero, fire the entry's per-digest notify
+    /// BEFORE removing the entry; fire FSS-wide notify if the map
     /// becomes empty) at the appropriate moment.
     ///
     /// Used exclusively by the `dispatch` Ok branch: the chunked-driver
@@ -3255,11 +3277,7 @@ impl InFlightChunkedGuard {
     #[must_use]
     pub fn disarm(
         mut self,
-    ) -> (
-        Arc<Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
-        DigestInfo,
-        Option<Arc<tokio::sync::Notify>>,
-    ) {
+    ) -> (ChunkedInFlightMap, DigestInfo, Option<Arc<tokio::sync::Notify>>) {
         self.armed = false;
         // Cloning the Arcs is cheap and lets Drop run with placeholder
         // values that satisfy the no-op path. Alternative: ManuallyDrop
@@ -3278,28 +3296,49 @@ impl Drop for InFlightChunkedGuard {
             // Disarmed: success-path reaper owns removal. No-op here.
             return;
         }
+        // MAJOR-G + BLOCK-2: decrement refcount; remove entry only when
+        // it reaches zero. On removal, fire the per-digest notify
+        // BEFORE removing so any reader holding the cloned Arc<Notify>
+        // wakes. If the whole map becomes empty, also fire the
+        // FSS-wide drain notify.
         let mut guard = self.set.lock();
-        // MAJOR-G: decrement refcount; remove entry only when it
-        // reaches zero. NonZeroU32::checked_sub returns None when
-        // result would be zero — at that point we remove the entry.
-        let now_empty = match guard.get_mut(&self.digest) {
-            Some(count) => {
-                if let Some(new_count) = NonZeroU32::new(count.get() - 1) {
+        let (now_empty, per_digest_notify) = match guard.get_mut(&self.digest) {
+            Some((count, per_digest_notify)) => {
+                // Saturating-sub: if `count` is saturated at u32::MAX
+                // we still decrement, but we cannot detect the "true"
+                // zero point. This is the symmetric counterpart to the
+                // saturating-add in `new()` (code-reviewer M1).
+                if let Some(new_count) = NonZeroU32::new(count.get().saturating_sub(1)) {
                     *count = new_count;
-                    false // entry stays
+                    (false, None)
                 } else {
+                    // Refcount → 0: wake per-digest waiters BEFORE
+                    // removal so readers holding the Arc see the
+                    // notification, then remove. We take the
+                    // per-digest Arc<Notify> out of the map slot so
+                    // we can call notify_waiters after the lock drop.
+                    let per_digest = Arc::clone(per_digest_notify);
                     guard.remove(&self.digest);
-                    guard.is_empty()
+                    (guard.is_empty(), Some(per_digest))
                 }
             }
             None => {
                 // No entry to decrement — should not happen given the
                 // RAII shape (new() inserts; we're the only path that
                 // decrements). Defensive: treat as no-op.
-                false
+                (false, None)
             }
         };
         drop(guard);
+        // Per-digest wakeup (BLOCK-B reader-cascade). Even though
+        // `notify_waiters()` is fine to call while the entry still
+        // exists, we order it AFTER removal so that any reader that
+        // re-checks `chunked_in_flight_digests.contains_key(...)`
+        // after waking will observe the drained state.
+        if let Some(n) = per_digest_notify {
+            n.notify_waiters();
+        }
+        // FSS-wide drain notify (flush_slow_writes graceful-drain).
         if now_empty {
             if let Some(n) = self.notify.as_ref() {
                 n.notify_waiters();
@@ -3555,21 +3594,35 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                             // to this site.
                             if let Some((set, dig, notify)) = inflight_set_for_reaper {
                                 let mut guard = set.lock();
-                                let now_empty = match guard.get_mut(&dig) {
-                                    Some(count) => {
-                                        if let Some(new_count) =
-                                            NonZeroU32::new(count.get() - 1)
-                                        {
-                                            *count = new_count;
-                                            false
-                                        } else {
-                                            guard.remove(&dig);
-                                            guard.is_empty()
+                                let (now_empty, per_digest_notify) =
+                                    match guard.get_mut(&dig) {
+                                        Some((count, per_digest_notify)) => {
+                                            // Saturating-sub: symmetric with the
+                                            // saturating-add in `InFlightChunkedGuard::new`
+                                            // (code-reviewer M1).
+                                            if let Some(new_count) =
+                                                NonZeroU32::new(count.get().saturating_sub(1))
+                                            {
+                                                *count = new_count;
+                                                (false, None)
+                                            } else {
+                                                // Refcount → 0: clone the per-digest
+                                                // notify out so we can fire it after
+                                                // releasing the map lock.
+                                                let per_digest = Arc::clone(per_digest_notify);
+                                                guard.remove(&dig);
+                                                (guard.is_empty(), Some(per_digest))
+                                            }
                                         }
-                                    }
-                                    None => false,
-                                };
+                                        None => (false, None),
+                                    };
                                 drop(guard);
+                                // BLOCK-2: per-digest wakeup for BLOCK-B readers.
+                                if let Some(n) = per_digest_notify {
+                                    n.notify_waiters();
+                                }
+                                // FSS-wide drain notify (flush_slow_writes
+                                // graceful-drain).
                                 if now_empty {
                                     if let Some(n) = notify.as_ref() {
                                         n.notify_waiters();
