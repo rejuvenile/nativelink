@@ -1,4 +1,4 @@
--------------------------- MODULE ChunkRaceReadersV2_BuggedH3 --------------
+-------------------------- MODULE ChunkRaceReadersBuggedH3 -----------------
 (***************************************************************************)
 (* Bugged variant: the H3 #247 stale-negative window NEVER CLOSES.        *)
 (*                                                                          *)

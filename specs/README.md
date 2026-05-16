@@ -371,6 +371,114 @@ protocol-level invariant they share. If any one of them ever again
 declares an `ExactSize(N)` for a stream that delivers `M != N`, the
 Bugged trace reproduces the failure.
 
+### `ChunkRaceReadersV2.tla`
+
+Models the chunked-write race-state cascade with concurrent readers
+issuing `has_with_results` and `get_part` against
+`FastSlowStore::chunked_in_flight_digests` + the FilesystemStore's
+`evicting_map`. Originally landed under #499 / `e7a50f57`. Verified
+against `origin/main = 8e6be6d7` (2026-05-16) — see the spec's
+"RECENT PROTOCOL EVOLUTION" block for the #447 / #508 / #502 / #500
+walk and why each change does or does not require a spec edit.
+
+Two CONSTANT toggles drive the bug shape:
+
+- `WriterRegistersInFlight = TRUE` (post-fix v2) — `InFlightChunkedGuard`
+  is created at session entry; readers observing has() during P0..P4
+  see Some via the in-flight set.
+- `WriterRegistersInFlight = FALSE` (pre-fix H1 — see also the
+  `ChunkRaceReadersV2_BuggedH1.cfg`) — readers see has=None during the
+  bug window and conclude NotFound. `NoActiveWriterInvisibleToReader`
+  invariant red-fails.
+
+`Fixed.cfg` / `Bugged.cfg` are the verify-gate canonical configs;
+historic informational configs (`_2w_2r_2c`, `_2w_3r_2c`, `_3w_2r_2c`,
+etc.) explore larger state spaces and may exceed the 300 s gate budget.
+Companion spec `ChunkRaceReadersBuggedH3.tla` models the H3 #247
+stale-negative window (`evicting_map.insert` after PublishOk never
+fires); its `Bugged.cfg` shows the H3 hazard reachable, its `Fixed.cfg`
+asserts only structural invariants that hold in the bug spec by
+construction. The H3 spec was renamed (formerly
+`ChunkRaceReadersV2_BuggedH3.tla`) to drop the `ChunkRaceReadersV2`
+prefix, so that `verify_tla.sh`'s `${name}*.cfg` glob no longer mixes
+the H3-specific cfgs (which reference `H3HazardStateUnreachable`) into
+the canonical `ChunkRaceReadersV2.tla` spec's per-cfg sweep.
+
+### `StreamingBlobReadDuringWrite.tla`
+
+Models concurrent slow-writers x slow-readers x read-during-write over
+the `streaming_blob` primitive
+(`nativelink-util/src/streaming_blob.rs:631-822` for the reader,
+`:425-486` for the writer). Captures the post-#500 / post-#502 wire-
+shape contract between `StreamingBlobWriter::send_eof` /
+`send_error` / `Drop` and `StreamingBlobReader::next_chunk`.
+
+CONSTANTS:
+
+- `Readers`              — set of reader ids; the spec verifies clean
+                           up to 4 concurrent readers x 2 chunks
+                           within the 300 s gate budget.
+- `NumChunks`            — declared chunk count (= digest size when
+                           ChunkSize = 1).
+- `AllowShortEof`        — writer may call `send_eof` after writing
+                           fewer than `NumChunks` chunks. Models the
+                           #502 trigger; pre-fix the reader saw this
+                           as `Ok(Bytes::new())` (silent-short).
+- `AllowErrEof`          — writer may call `send_error`.
+- `AllowDropWithoutEof`  — writer may drop without `send_eof`; the
+                           Drop impl fires terminal=Err.
+- `ShortShieldOn`        — TRUE = post-#502 reader returns
+                           `Err(Code::Internal, SILENT_SHORT)` when
+                           terminal=Ok and bytes < expected.
+- `SilentZeroPropOn`     — TRUE = post-#500
+                           `bytestream_server::inner_read::consume_ok_eof`
+                           propagates producer-side Err to the reader's
+                           outcome.
+
+Bugged variants:
+
+- `Bugged.cfg` — `ShortShieldOn = FALSE`. `NoSilentShortToReader` is
+  always violated; `NoSilentZeroToReader` also violated when writer
+  shorts at chunkCount=0.
+- `_BuggedSilentZero.cfg` — `SilentZeroPropOn = FALSE` with shield
+  ON. Isolates the #500 fix from the #502 fix; `NoSilentZeroToReader`
+  red-fails.
+
+Safety invariants:
+
+- `NoSilentZeroToReader`             — no reader terminates in
+                                       `DoneSilentZero`.
+- `NoSilentShortToReader`            — no reader terminates in
+                                       `DoneSilentShort`.
+- `NoCorruptBytesToReader`           — defensive placeholder.
+- `PostFixReaderOutcomeIsTwoWay`     — under both fixes, terminated
+                                       readers are in
+                                       {DoneOk, DoneErr, TimedOut}.
+- `ReaderOkImpliesWriterFullOk`      — a `DoneOk` reader implies the
+                                       writer's terminal state is
+                                       `DoneOkFull`.
+- `PostFixErrPropagationReachesReader` — producer Err + propagation on
+                                       => no silent-zero/short reader
+                                       terminal.
+- `PostFixFullOkReachesReaderAsOk`   — writer full-Ok implies no
+                                       reader is in silent-zero/short
+                                       or corrupt.
+- `CursorAtMostChunkCountAtTerminal` — reader cursor never overshoots
+                                       what the writer wrote.
+
+Liveness:
+
+- `WriterEventuallyTerminates`       — writer reaches one of the four
+                                       Done states.
+- `ReadersEventuallyTerminate`       — every subscribed reader reaches
+                                       a terminal state.
+- `EventualConsistencyOkFull`        — a reader subscribing after
+                                       writer's full-Ok eventually
+                                       reaches `DoneOk`.
+- `NoEternalParkAfterWriterDone`     — once the writer has terminated,
+                                       no reader stays
+                                       Subscribed/Waiting forever.
+
 ## Scope honesty
 
 Each spec includes an explicit ASSUMPTION block listing what is and
@@ -488,6 +596,58 @@ that time:
 If a fix lands that changes one of the production code paths cited in
 a spec, re-run the corresponding bugged config to verify the spec
 still reproduces the bug class (i.e., the spec hasn't drifted).
+
+### Re-verification 2026-05-16 (origin/main = `8e6be6d7`)
+
+Each existing spec was re-run after the #447 / #508 / #502 / #500 /
+#487 / #503 / #504 commits landed. Three changes were applied:
+
+1. **`ChunkRaceReadersV2.tla`**: appended a "RECENT PROTOCOL EVOLUTION"
+   section to the top doc-comment block walking each commit and stating
+   why the spec did or did not need an edit. No model changes — the
+   spec correctly models the chunked-WC race-state cascade in both
+   pre-#447 and post-#447 forms (the Notify-wait helper is a caller of
+   the same primitive the spec already models).
+2. **`ChunkRaceReadersV2Fixed.cfg`** + **`ChunkRaceReadersV2Bugged.cfg`**
+   added so the Layer-1 verify gate recognises a canonical pair. The
+   historic `ChunkRaceReadersV2.cfg` was REMOVED — it was a duplicate
+   of `ChunkRaceReadersV2Fixed.cfg` whose `*V2.cfg` filename pattern
+   the gate's classifier (mis-)treats as a bugged variant, which then
+   failed since the cfg ran clean (it IS the post-fix configuration).
+   The historic `ChunkRaceReadersV2_BuggedH1.cfg` is retained as an
+   informational variant that demonstrates the H1 hazard (writer not
+   in-flight-set-registered).
+3. **`ChunkRaceReadersBuggedH3Fixed.cfg`** + **`ChunkRaceReadersBuggedH3Bugged.cfg`**
+   added: the BuggedH3 spec is bugged by construction (it omits
+   `EvictingMapInsert`), so its "Fixed" config asserts only the
+   structural invariants that hold independent of the bug — `TypeOK`.
+   The `Bugged.cfg` continues to assert `H3HazardStateUnreachable` and
+   demonstrate its violation. The H3 spec + its cfgs were renamed
+   (dropping the shared `ChunkRaceReadersV2_` prefix) so that the
+   verify gate's `ChunkRaceReadersV2*.cfg` glob no longer cross-runs
+   the H3 cfgs against the canonical `ChunkRaceReadersV2.tla`, which
+   does not define `H3HazardStateUnreachable`.
+
+The new `StreamingBlobReadDuringWrite.tla` spec (described above)
+captures the read-during-write protocol over the streaming_blob
+primitive, including the post-#500 / post-#502 wire-shape defenses.
+
+| Spec                                       | Cfg                                          | States   | Wall-clock | Outcome     |
+|--------------------------------------------|----------------------------------------------|----------|------------|-------------|
+| ChunkRaceReadersV2                         | ChunkRaceReadersV2Fixed.cfg                  | 221      | ~1 s       | clean       |
+| ChunkRaceReadersV2                         | ChunkRaceReadersV2Bugged.cfg                 | 4        | <1 s       | violated    |
+| ChunkRaceReadersBuggedH3                   | ChunkRaceReadersBuggedH3Fixed.cfg            | 199      | <1 s       | clean       |
+| ChunkRaceReadersBuggedH3                   | ChunkRaceReadersBuggedH3Bugged.cfg           | 67       | <1 s       | violated    |
+| StreamingBlobReadDuringWrite               | StreamingBlobReadDuringWriteFixed.cfg        | 795      | ~1 s       | clean       |
+| StreamingBlobReadDuringWrite               | StreamingBlobReadDuringWriteBugged.cfg       | 24       | <1 s       | violated    |
+| StreamingBlobReadDuringWrite               | StreamingBlobReadDuringWrite_BuggedSilentZero.cfg | 32       | <1 s       | violated    |
+| StreamingBlobReadDuringWrite               | StreamingBlobReadDuringWrite_1w_3r_3c.cfg    | 17 740   | ~7 s       | clean       |
+| StreamingBlobReadDuringWrite               | StreamingBlobReadDuringWrite_1w_4r_2c.cfg    | 70 743   | ~2 s       | clean       |
+
+A second set of informational ChunkRaceReadersV2 configs
+(`_2w_2r_3c`, `_2w_3r_2c`, `_3w_2r_2c`, `_3w_3r_3c`) explore larger
+state spaces and exceed the 300 s gate timeout; they continue to
+explore without surfacing violations up to ~1.5M states.
 
 ## Verification Gate (CI / pre-commit)
 
