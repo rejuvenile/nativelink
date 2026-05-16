@@ -198,71 +198,95 @@ impl StallGuard {
         let last_progress = Arc::new(AtomicU64::new(0));
         let task_progress = last_progress.clone();
         let handle = tokio::spawn(async move {
-            tokio::time::sleep(threshold).await;
             let ctx_suffix = context
                 .as_deref()
                 .map_or_else(String::new, |c| format!(" [{c}]"));
 
-            // Slow-producer immunity: if the wrapped operation called
-            // bump_progress within the threshold window, the wait is
-            // producer-driven (e.g. a Bazel client paused 80s between
-            // chunks) — emit a lightweight warn and skip the heavy
-            // ~600 KB stack dump. Operations that never bump
-            // (last_progress == 0) fall through to the legacy fire
-            // path so coarse-grained guards still trigger as before.
-            let last_progress_nanos = task_progress.load(Ordering::Relaxed);
-            let now_nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            if let StallVerdict::SuppressDumpProducerDriven {
-                since_progress_nanos,
-            } = classify_stall(last_progress_nanos, now_nanos, threshold)
-            {
-                let since_progress_ms = since_progress_nanos / 1_000_000;
-                tracing::warn!(
-                    target: "nativelink_util::stall_detector",
-                    op_name = label,
-                    elapsed_ms = threshold.as_millis() as u64,
-                    since_last_progress_ms = since_progress_ms,
-                    ctx = ctx_suffix.as_str(),
-                    "stall threshold crossed but recent server-side progress observed; \
-                     classifying as slow producer (no stack dump generated)"
-                );
-                return;
-            }
+            // Re-arm in a loop so a long-running operation that crosses
+            // the threshold multiple times keeps being evaluated. The
+            // task only exits when the StallGuard is dropped (Drop calls
+            // `handle.abort()`). Each iteration re-sleeps `threshold`
+            // and re-evaluates the verdict — so a wedge that develops
+            // AFTER an earlier suppress (slow producer that later went
+            // silent) is still caught on the next iteration. (#492)
+            //
+            // The dump-fire path is rate-limited by
+            // `MIN_DUMP_INTERVAL_SECS` (30s) via the process-global
+            // `LAST_DUMP_EPOCH` atomic, so re-arming does NOT flood
+            // /tmp with dumps during a sustained wedge — the second and
+            // subsequent iterations within the rate-limit window hit
+            // the "rate-limited" branch and only `eprintln!` a heartbeat
+            // line, while iterations OUTSIDE the rate-limit window
+            // produce a fresh dump.
+            loop {
+                tokio::time::sleep(threshold).await;
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let prev = LAST_DUMP_EPOCH.load(Ordering::Relaxed);
-            if now.saturating_sub(prev) >= MIN_DUMP_INTERVAL_SECS
-                && LAST_DUMP_EPOCH
-                    .compare_exchange(prev, now, Ordering::SeqCst, Ordering::Relaxed)
-                    .is_ok()
-            {
-                eprintln!(
-                    "STORE OPERATION STALL: {label}{ctx_suffix} has been running for >{threshold:.0?} — dumping thread stacks",
-                );
-                let dump_label = if ctx_suffix.is_empty() {
-                    label.to_string()
+                // Slow-producer immunity: if the wrapped operation
+                // called bump_progress within the threshold window, the
+                // wait is producer-driven (e.g. a Bazel client paused
+                // 80s between chunks) — emit a lightweight warn and
+                // skip the heavy ~600 KB stack dump. Operations that
+                // never bump (last_progress == 0) fall through to the
+                // legacy fire path so coarse-grained guards still
+                // trigger as before.
+                let last_progress_nanos = task_progress.load(Ordering::Relaxed);
+                let now_nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                if let StallVerdict::SuppressDumpProducerDriven {
+                    since_progress_nanos,
+                } = classify_stall(last_progress_nanos, now_nanos, threshold)
+                {
+                    let since_progress_ms = since_progress_nanos / 1_000_000;
+                    tracing::warn!(
+                        target: "nativelink_util::stall_detector",
+                        op_name = label,
+                        elapsed_ms = threshold.as_millis() as u64,
+                        since_last_progress_ms = since_progress_ms,
+                        ctx = ctx_suffix.as_str(),
+                        "stall threshold crossed but recent server-side progress observed; \
+                         classifying as slow producer (no stack dump generated)"
+                    );
+                    // Re-arm: a slow producer right now does not prove
+                    // the operation will keep making progress; we still
+                    // want to detect a wedge that develops later.
+                    continue;
+                }
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let prev = LAST_DUMP_EPOCH.load(Ordering::Relaxed);
+                if now.saturating_sub(prev) >= MIN_DUMP_INTERVAL_SECS
+                    && LAST_DUMP_EPOCH
+                        .compare_exchange(prev, now, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    eprintln!(
+                        "STORE OPERATION STALL: {label}{ctx_suffix} has been running for >{threshold:.0?} — dumping thread stacks",
+                    );
+                    let dump_label = if ctx_suffix.is_empty() {
+                        label.to_string()
+                    } else {
+                        format!("{label}{ctx_suffix}")
+                    };
+                    // dump_thread_stacks does in-process work (signal
+                    // dispatch + symbol resolution + file I/O) bounded
+                    // at 5s. We still run it on the blocking pool
+                    // because the 1ms polling sleep would otherwise
+                    // consume a tokio worker for the duration of the
+                    // dump, and the file I/O is sync.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        dump_thread_stacks(&dump_label);
+                    });
                 } else {
-                    format!("{label}{ctx_suffix}")
-                };
-                // dump_thread_stacks does in-process work (signal
-                // dispatch + symbol resolution + file I/O) bounded at
-                // 5s. We still run it on the blocking pool because the
-                // 1ms polling sleep would otherwise consume a tokio
-                // worker for the duration of the dump, and the file
-                // I/O is sync.
-                let _ = tokio::task::spawn_blocking(move || {
-                    dump_thread_stacks(&dump_label);
-                });
-            } else {
-                eprintln!(
-                    "STORE OPERATION STALL: {label}{ctx_suffix} has been running for >{threshold:.0?} (dump rate-limited)",
-                );
+                    eprintln!(
+                        "STORE OPERATION STALL: {label}{ctx_suffix} has been running for >{threshold:.0?} (dump rate-limited)",
+                    );
+                }
+                // Loop continues to re-arm for the next threshold window.
             }
         });
         Self {
@@ -2136,6 +2160,122 @@ mod tests {
              a non-zero start would silently suppress the very first dump",
         );
         drop(guard);
+    }
+
+    /// Spec (#492: stall_detector spawn task re-arm in loop): the
+    /// background task spawned by `StallGuard::new_inner` MUST NOT
+    /// exit after firing once. A long-running operation that has the
+    /// guard held for many threshold-windows must keep being evaluated
+    /// each window — otherwise a wedge that develops AFTER an initial
+    /// progress-suppress (e.g. a slow producer that later went silent)
+    /// would be invisible.
+    ///
+    /// Observable: `JoinHandle::is_finished()` returns `false` for a
+    /// looping task even after the first threshold-window has fully
+    /// elapsed AND a second window has begun. The one-shot impl
+    /// returned `true` immediately after the first iteration completed.
+    ///
+    /// Mutation: replace the `loop { ... }` body in `new_inner` with a
+    /// single `tokio::time::sleep(threshold).await; ...verdict...` (no
+    /// loop). The test red-fails with the bespoke
+    /// `"stall_detector spawn task exited after one shot — re-arm loop missing (#492)"`
+    /// message because `is_finished()` becomes `true` while the guard
+    /// is still alive.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stallguard_spawn_task_rearms_in_loop() {
+        let threshold = Duration::from_millis(50);
+        let guard = StallGuard::new(threshold, "test_rearm_loop");
+
+        // Yield once so the spawned task gets a chance to enter its
+        // first `tokio::time::sleep(threshold).await`.
+        tokio::task::yield_now().await;
+
+        // Advance well past the first threshold (3× window) so a
+        // one-shot task would have completed its single iteration and
+        // the JoinHandle would report finished. A looping task
+        // re-arms and is still alive in its next sleep.
+        tokio::time::sleep(threshold * 3).await;
+
+        // Drain spawned tasks that became ready (the suppress/fire
+        // branches are non-blocking; if a single-shot task hit `return`
+        // it would be observed as finished after this yield).
+        tokio::task::yield_now().await;
+
+        assert!(
+            !guard.handle.is_finished(),
+            "stall_detector spawn task exited after one shot — \
+             re-arm loop missing (#492). \
+             After {} of paused-time elapsed (3× threshold), the \
+             background task's JoinHandle reports finished, meaning \
+             it ran exactly one verdict-evaluation and returned. A \
+             long-running guard whose operation wedges AFTER this \
+             would never be detected.",
+            "150ms",
+        );
+
+        // Drop terminates the task — `Drop` calls `handle.abort()`.
+        drop(guard);
+    }
+
+    /// Spec (#492): the looping task MUST exit when the guard is
+    /// dropped. Otherwise re-arming creates a task-leak: a worker
+    /// process under 10K ByteStream RPCs/sec would accumulate 10K
+    /// orphan tasks/sec, each holding an `Arc<AtomicU64>` and a tokio
+    /// timer slot. The `Drop` impl already calls `handle.abort()`; this
+    /// test pins the contract end-to-end so a future refactor cannot
+    /// silently drop the abort and turn re-arm into a leak.
+    ///
+    /// Observable: `AbortHandle::is_finished()` becomes `true` after
+    /// the guard is dropped and the runtime ticks once. We capture an
+    /// `AbortHandle` from `guard.handle` BEFORE drop so we can observe
+    /// liveness across the drop boundary.
+    ///
+    /// Mutation: comment out `self.handle.abort()` in `Drop for
+    /// StallGuard`. The test red-fails with the bespoke
+    /// `"stall_detector re-armed loop did not exit on drop — task leak (#492)"`
+    /// message because `is_finished()` stays `false` indefinitely
+    /// (the loop body re-arms forever and the abort never arrives).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stallguard_loop_exits_on_drop() {
+        let threshold = Duration::from_millis(50);
+        let guard = StallGuard::new(threshold, "test_drop_exits_loop");
+
+        // Take an AbortHandle BEFORE drop so we can observe the spawn
+        // task's lifecycle from the outside. The AbortHandle outlives
+        // the JoinHandle and reports `is_finished()` without holding
+        // the JoinHandle itself.
+        let abort_handle = guard.handle.abort_handle();
+
+        // Let the task enter its first sleep + advance past one
+        // iteration so we know it's actively looping (not still
+        // unscheduled).
+        tokio::task::yield_now().await;
+        tokio::time::sleep(threshold * 2).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !abort_handle.is_finished(),
+            "precondition: looping task should still be alive before drop",
+        );
+
+        drop(guard);
+
+        // After the Drop impl runs, the abort signal is queued. Yield
+        // a bounded number of times to let the runtime deliver it.
+        // Under `start_paused = true` plus `current_thread`, yielding
+        // is deterministic; in practice the abort is observed on the
+        // first yield.
+        let mut finished = false;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+            if abort_handle.is_finished() {
+                finished = true;
+                break;
+            }
+        }
+        assert!(
+            finished,
+            "stall_detector re-armed loop did not exit on drop — task leak (#492)",
+        );
     }
 
     /// Spec: force-dump must proceed when `now - prev` is at or beyond
