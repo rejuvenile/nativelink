@@ -891,7 +891,16 @@ async fn inner_main(
                 fs_arc,
             )
             .with_v2_stable_digests_sink(fss.stable_digests_pusher())
-            .with_v2_failed_commit_sink(fss.failed_writes_inserter());
+            .with_v2_failed_commit_sink(fss.failed_writes_inserter())
+            // H1 (#499 followup): wire the FSS-level chunked_in_flight_digests
+            // set so v2 sessions are visible to FSS::has_with_results
+            // (preventing FMB → "missing" → Bazel re-upload + FailedPrecondition
+            // cascade for in-flight v2 writes). See
+            // `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H1.
+            .with_chunked_in_flight_digests(
+                fss.chunked_in_flight_digests_handle(),
+                fss.in_flight_empty_notify_handle(),
+            );
             chunked_write_handlers.insert(
                 store_name.clone(),
                 Arc::new(handler),

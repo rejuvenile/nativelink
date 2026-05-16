@@ -1662,3 +1662,285 @@ async fn fix_1b_ack_send_failure_on_runcommit_still_fires_bis_sink() {
         bis_count.load(Ordering::Relaxed)
     );
 }
+
+// -----------------------------------------------------------------------------
+// H1 (#499 followup): a Bazel ByteStream::read racing a v2 WriteChunkedV2
+// for the same digest must NOT see "FAILED_PRECONDITION: Blob not found".
+// The fix: v2 sessions register the digest in `chunked_in_flight_digests`
+// at admission and remove at commit/abort. FSS::has_with_results consults
+// this set and returns Some(declared_size) for in-flight digests, so FMB
+// callers see "exists" (preventing the Bazel re-upload + FailedPrecondition
+// chain documented in
+// `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H1).
+//
+// This test exercises only the registration contract — that the v2 session
+// inserts into a wired `chunked_in_flight_digests` set during the session
+// and removes after commit. A full end-to-end FSS::has_with_results test
+// would need to construct a FastSlowStore wrapping the FilesystemStore;
+// out of scope for this minimum-viable Phase 1 wiring.
+// -----------------------------------------------------------------------------
+
+#[nativelink_test]
+async fn v2_session_registers_in_chunked_in_flight_digests_h1() {
+    use std::collections::HashSet;
+    use parking_lot::Mutex as PlMutex;
+    use tokio::sync::Notify;
+
+    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
+        .map(|i| 0x33u8.wrapping_add((i & 0x3F) as u8))
+        .collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let in_flight = ChunkedWriteInFlight::new();
+
+    // Construct the FSS-level set + notify directly. Production gets these
+    // from `FastSlowStore::chunked_in_flight_digests_handle()`; the test
+    // wires them by hand to assert registration without standing up a full
+    // FSS.
+    let chunked_in_flight: Arc<PlMutex<HashSet<DigestInfo>>> =
+        Arc::new(PlMutex::new(HashSet::new()));
+    let in_flight_empty_notify: Arc<Notify> = Arc::new(Notify::new());
+
+    let handler = Arc::new(
+        ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
+            Arc::clone(&store),
+            in_flight,
+            budget,
+            TEST_CHUNK_SIZE,
+        )
+        .with_chunked_in_flight_digests(
+            Arc::clone(&chunked_in_flight),
+            Arc::clone(&in_flight_empty_notify),
+        ),
+    );
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    // Issue a v2 RPC and observe the in-flight set during the session.
+    let chunks = build_chunks(digest, &payload);
+    let mut c = client.clone();
+    let chunked_observe = Arc::clone(&chunked_in_flight);
+    let response = c.write_chunked_v2(tokio_stream::iter(chunks)).await
+        .expect("v2 RPC must reach server");
+
+    // Drain frames; the FIRST frame back implies the session is admitting.
+    // After at least one ack we know the session opened.
+    let mut s = response.into_inner();
+    let _first_ack = tokio::time::timeout(Duration::from_secs(15), s.next())
+        .await
+        .expect("must receive first ack within 15s")
+        .expect("must observe at least one frame")
+        .expect("first frame must be Ok status");
+
+    // Admission completed; the v2 session should have registered the digest.
+    let registered_during_session = chunked_observe.lock().contains(&digest);
+    assert!(
+        registered_during_session,
+        "H1 (#499 followup): v2 session MUST register digest in \
+         chunked_in_flight_digests at admission; without this, \
+         FastSlowStore::has_with_results returns None for in-flight v2 \
+         writes → FMB returns 'missing' → Bazel re-uploads + sees \
+         FailedPrecondition on dependent reads. Mutation: comment out \
+         InFlightChunkedGuard::new in run_v2_session and this assertion \
+         must red-fail."
+    );
+
+    // Drain the remaining frames so the session completes cleanly.
+    let drain_fut = async {
+        while let Some(frame) = s.next().await {
+            let _ = frame;
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(15), drain_fut).await;
+
+    // Wait for the in-flight set to drain (Drop fires on session exit).
+    let chunked_drain = Arc::clone(&chunked_in_flight);
+    let dig_for_wait = digest;
+    let drain_wait = async move {
+        loop {
+            if !chunked_drain.lock().contains(&dig_for_wait) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(15), drain_wait)
+        .await
+        .expect(
+            "H1 (#499 followup): chunked_in_flight_digests MUST drain \
+             after v2 session ends — InFlightChunkedGuard::Drop is \
+             paired with the admission insert. If this trips, the digest \
+             was never removed and a future has() lookup will lie."
+        );
+}
+
+// -----------------------------------------------------------------------------
+// H2 (#499 followup): the FSS::is_chunked_in_flight method MUST return true
+// for digests in the chunked in-flight set, and bytestream_server MUST use
+// it to skip the phantom-success short-circuit. This focused test exercises
+// the FSS-level method; full end-to-end ByteStream coverage is in
+// bytestream_server_test.rs (followup tracker).
+// -----------------------------------------------------------------------------
+
+#[nativelink_test]
+async fn fss_is_chunked_in_flight_returns_true_after_register_h2() {
+    // Focused unit test for FSS::is_chunked_in_flight. End-to-end
+    // ByteStream + chunked-write integration would compose 5+ wrappers;
+    // this test pins the contract for the FSS-level method that
+    // bytestream_server's H2 phantom-success guard depends on.
+    use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
+    use nativelink_store::fast_slow_store::FastSlowStore;
+    use nativelink_store::memory_store::MemoryStore;
+    use nativelink_util::store_trait::Store;
+
+    let payload: Vec<u8> = vec![0x42; TEST_CHUNK_SIZE];
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        fast_store,
+        slow_store,
+    );
+
+    // Initially empty: digest is NOT in-flight.
+    assert!(
+        !fss.is_chunked_in_flight(&digest),
+        "H2 (#499 followup): FSS must report digest NOT in-flight when \
+         the chunked_in_flight_digests set is empty"
+    );
+
+    // Insert digest manually (simulating what InFlightChunkedGuard::new does).
+    fss.chunked_in_flight_digests_handle().lock().insert(digest);
+
+    // Now is_chunked_in_flight returns true.
+    assert!(
+        fss.is_chunked_in_flight(&digest),
+        "H2 (#499 followup): FSS::is_chunked_in_flight MUST return true \
+         when the digest is in the chunked_in_flight_digests set. \
+         Without this, bytestream_server's phantom-success guard cannot \
+         distinguish 'durably committed' from 'mid-chunked-write' and a \
+         second concurrent ByteStream::write would phantom-ack while \
+         the first chunked commit is in-flight."
+    );
+
+    // Remove and verify.
+    let _ = fss.chunked_in_flight_digests_handle().lock().remove(&digest);
+    assert!(
+        !fss.is_chunked_in_flight(&digest),
+        "H2 (#499 followup): FSS::is_chunked_in_flight must reflect \
+         removal from the set"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// TLA+ COMPOSITE-LIVENESS TEST (per `specs/ChunkRaceWriter.tla` modeling
+// recommendation 2026-05-15): compose 3 writers — 1 v1 Bazel + 2 v2 — and
+// assert all 3 sessions terminate (Done OR Aborted) within 70s. This is the
+// integration test that would catch a regression of the
+// `AllAttachedWritersTerminate` invariant.
+// -----------------------------------------------------------------------------
+
+#[nativelink_test]
+async fn tla_all_attached_writers_terminate_within_70s_v1plus2v2() {
+    // Per CLAUDE.md `specs/ChunkRaceWriter.tla` modeling: every writer
+    // attached to the race-state must transition to Done OR Aborted in
+    // bounded time. The cross-version coordination gate makes this
+    // assertion meaningful: WITHOUT the gate, a v1 + v2 race could
+    // wedge waiting for the other to commit (60s watchdog × N writers
+    // → unbounded wait if the watchdog fires before propagating).
+
+    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
+        .map(|i| 0x99u8.wrapping_add((i & 0x3F) as u8))
+        .collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let in_flight = nativelink_service::chunked_write_handler::ChunkedWriteInFlight::new();
+
+    let handler = Arc::new(
+        ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
+            Arc::clone(&store),
+            in_flight,
+            budget,
+            TEST_CHUNK_SIZE,
+        ),
+    );
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    // 1 v1 Bazel + 2 v2 = 3 writers.
+    let store_for_v1 = Arc::clone(&store);
+    let payload_for_v1 = payload.clone();
+    let v1_handle = tokio::spawn(async move {
+        run_v1_bazel_dispatch_simulating_bytestream_write(store_for_v1, digest, payload_for_v1)
+            .await
+    });
+
+    let mut v2_handles = Vec::new();
+    for _ in 0..2 {
+        let chunks = build_chunks(digest, &payload);
+        let mut c = client.clone();
+        v2_handles.push(tokio::spawn(async move {
+            let stream = tokio_stream::iter(chunks);
+            let response = c.write_chunked_v2(stream).await?;
+            let (final_res, _) = drain_v2_response(response.into_inner()).await;
+            Ok::<_, tonic::Status>(final_res)
+        }));
+    }
+
+    // TLA+ composite-liveness budget: 70s (per recommendation in
+    // `.claude/audits/494-v3-tla-modeling-2026-05-15.md`). The
+    // `tokio::time::timeout` is the deadlock-detector. If any writer
+    // exceeds the budget, the test fails with the bespoke message
+    // pinned to the TLA+ invariant name.
+    let budget = Duration::from_secs(70);
+
+    let v1_join_result = tokio::time::timeout(budget, v1_handle).await.expect(
+        "TLA+ AllAttachedWritersTerminate violated — see specs/ChunkRaceWriter.tla: \
+         v1 Bazel dispatcher session did not terminate within 70s budget. \
+         Per the TLA+ model, every attached writer MUST reach Done OR Aborted \
+         in bounded time; this timeout indicates a wedge in the cross-version \
+         coordination gate (single_stream_owner / commit_done_flag). \
+         Mutation: comment out single_stream_owner short-circuits in \
+         try_attach_single_stream_writer or try_admit_chunk and this test \
+         must red-fail.",
+    );
+
+    let mut v2_results = Vec::new();
+    for h in v2_handles {
+        let r = tokio::time::timeout(budget, h).await.expect(
+            "TLA+ AllAttachedWritersTerminate violated — see specs/ChunkRaceWriter.tla: \
+             v2 worker session did not terminate within 70s budget. Per the \
+             TLA+ model, every attached writer MUST reach Done OR Aborted in \
+             bounded time; this timeout indicates a wedge in the cross-version \
+             coordination gate (single_stream_owner / commit_done_flag).",
+        );
+        v2_results.push(r);
+    }
+
+    // Liveness verified. Now sanity-check that at least one writer
+    // committed successfully (TLA+ AtLeastOneCommit).
+    let v1_size = v1_join_result
+        .expect("v1 task must not panic")
+        .expect("v1 must converge to Ok or specific Err");
+    assert_eq!(v1_size, payload.len() as u64);
+
+    for r in v2_results {
+        let result = r
+            .expect("v2 task must not panic")
+            .expect("v2 RPC status must be Ok");
+        let final_res = result.expect("v2 must observe a final frame");
+        let size = final_res.expect("v2 commit must succeed");
+        assert_eq!(size, payload.len() as u64);
+    }
+}

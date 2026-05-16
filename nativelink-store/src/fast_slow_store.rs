@@ -1299,6 +1299,20 @@ impl FastSlowStore {
         self.chunked_in_flight_digests.clone()
     }
 
+    /// H2 (#499 followup): true iff `digest` is in the chunked in-flight
+    /// set (a v1 or v2 chunked write is mid-stream / mid-commit). Used
+    /// by `bytestream_server` to detect the phantom-success case where
+    /// `has(digest)` returns Some via the chunked-in-flight cascade but
+    /// the data is NOT canonically committed yet. The pre-write
+    /// short-circuit at `bytestream_server.rs:2706` MUST consult this
+    /// to avoid acking a second concurrent ByteStream::write while the
+    /// first chunked commit hasn't run — see
+    /// `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H2.
+    #[must_use]
+    pub fn is_chunked_in_flight(&self, digest: &DigestInfo) -> bool {
+        self.chunked_in_flight_digests.lock().contains(digest)
+    }
+
     /// #212 fixup B2: shared handle to the empty-notify so the dispatcher
     /// reaper can fire it when the in_flight_slow_writes map drains. The
     /// `flush_slow_writes` waiter relies on this notify to wake on

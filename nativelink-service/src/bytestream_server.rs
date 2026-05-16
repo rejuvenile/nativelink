@@ -2731,7 +2731,29 @@ impl ByteStreamServer {
         }
 
         // Fast path: skip the write if the blob already exists.
-        if store.has(digest).await.unwrap_or(None).is_some() {
+        //
+        // H2 (#499 followup): the `store.has()` cascade returns Some for
+        // an in-flight chunked write (v1 or v2) — the
+        // `chunked_in_flight_digests` set is consulted by
+        // `FastSlowStore::has_with_results` and reports declared_size for
+        // sessions still mid-stream. If we short-circuit on Some here,
+        // a second concurrent ByteStream::write returns committed_size
+        // BEFORE the first writer's commit lands; if that first commit
+        // FAILS, the second client believes its upload was acked but the
+        // data isn't durable. See
+        // `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H2.
+        //
+        // Mitigation: when the underlying store is a `FastSlowStore` AND
+        // the digest is in the chunked in-flight set, fall through to
+        // the `in_flight_writes` watch-channel dedup below. That path
+        // makes the second writer wait for the first one's outcome
+        // (Ok → second short-circuits with the durable result; Err →
+        // second writes its own bytes).
+        let has_result = store.has(digest).await.unwrap_or(None);
+        let is_chunked_in_flight = store
+            .downcast_ref::<nativelink_store::fast_slow_store::FastSlowStore>(Some(digest.into()))
+            .is_some_and(|fss| fss.is_chunked_in_flight(&digest));
+        if has_result.is_some() && !is_chunked_in_flight {
             debug!(
                 %digest,
                 size_bytes = expected_size,
@@ -2744,6 +2766,17 @@ impl ByteStreamServer {
             return Ok(Response::new(WriteResponse {
                 committed_size: expected_size as i64,
             }));
+        }
+        if has_result.is_some() && is_chunked_in_flight {
+            debug!(
+                %digest,
+                size_bytes = expected_size,
+                "ByteStream::write: H2 phantom-success guard fired — \
+                 has() returned Some via chunked-in-flight, but the \
+                 chunked commit may still fail. Falling through to \
+                 in_flight_writes dedup so the second writer waits for \
+                 the first writer's outcome.",
+            );
         }
 
         // Dedup in-flight writes: if another RPC is already writing this

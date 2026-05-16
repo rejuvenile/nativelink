@@ -208,6 +208,25 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             .race_state_for_digest_and_attach(&digest, chunk_size_u32, writer_id);
         let mut race_guard = Some(race_guard);
 
+        // H1 (#499 followup): register the digest in the FSS-level
+        // `chunked_in_flight_digests` set via an RAII guard so
+        // `FastSlowStore::has_with_results(digest)` returns Some(size)
+        // for the duration of the v2 session. Without this, an
+        // in-flight v2 commit is invisible to FSS::has → FMB returns
+        // "missing" → Bazel re-uploads or sees FAILED_PRECONDITION on
+        // dependent reads. Drop fires on commit (success / failure)
+        // OR cancellation. The cancel-safety contract matches v1's
+        // BazelChunkedDispatcher::dispatch path.
+        let _v2_inflight_guard = self
+            .chunked_in_flight_digests_for_v2()
+            .map(|set| {
+                crate::chunked_write_handler::InFlightChunkedGuard::new(
+                    Arc::clone(set),
+                    digest,
+                    self.in_flight_empty_notify_for_v2().cloned(),
+                )
+            });
+
         // Update the `chunked_writers_per_digest_max` metric.
         let attached = race_state.attached_writer_count();
         let metrics = self.metrics_for_v2();

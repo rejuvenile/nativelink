@@ -455,6 +455,21 @@ pub struct ChunkedWriteHandler<Fe: FileEntry = FileEntryImpl> {
     /// write. Mirrors the v1 reaper at `:2110-2125`.
     v2_failed_commit_sink:
         Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
+    /// H1 (#499 followup): FSS-level chunked in-flight digest set. When
+    /// wired, the v2 session inserts the digest at admission and removes
+    /// at commit/abort via `InFlightChunkedGuard`. This makes
+    /// `FastSlowStore::has_with_results(digest)` return `Some(size)` for
+    /// in-flight v2 writes — preventing the FMB → "missing" → Bazel
+    /// re-upload + FailedPrecondition cascade documented in
+    /// `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H1.
+    /// Production wiring lives in `bin/nativelink.rs` alongside the v2
+    /// BIS / failed_commit sinks.
+    chunked_in_flight_digests: Option<
+        Arc<parking_lot::Mutex<std::collections::HashSet<DigestInfo>>>,
+    >,
+    /// H1 (#499 followup): wakes `flush_slow_writes` waiters when the
+    /// chunked in-flight set drains. Paired with `chunked_in_flight_digests`.
+    in_flight_empty_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<Fe: FileEntry> core::fmt::Debug for ChunkedWriteHandler<Fe> {
@@ -483,7 +498,48 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
             v2_stable_digests_sink: None,
             v2_failed_commit_sink: None,
+            chunked_in_flight_digests: None,
+            in_flight_empty_notify: None,
         }
+    }
+
+    /// H1 (#499 followup): wire the v2 path to the FSS-level
+    /// `chunked_in_flight_digests` set + `in_flight_empty_notify`. From
+    /// that point, every v2 RPC session inserts the digest in the set
+    /// for the duration of the session (admission → commit/abort) via
+    /// an RAII guard. Preserves the `has_with_results` returns-Some
+    /// contract for in-flight v2 blobs (mirrors what
+    /// `BazelChunkedDispatcherImpl::with_in_flight_tracking` does for
+    /// the v1 Bazel path).
+    ///
+    /// **Composite invariant:** with this wired, FSS::has_with_results
+    /// for an in-flight v2 digest returns Some(declared_size). The
+    /// triangle is: (1) v2 admission registers, (2) v2 commit (success
+    /// OR failure) removes, (3) FSS reads consult the set. All three
+    /// corners must hold for the chunked-aware reader-cascade contract.
+    #[must_use]
+    pub fn with_chunked_in_flight_digests(
+        mut self,
+        digests: Arc<parking_lot::Mutex<std::collections::HashSet<DigestInfo>>>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.chunked_in_flight_digests = Some(digests);
+        self.in_flight_empty_notify = Some(notify);
+        self
+    }
+
+    /// H1: pub-in-crate accessors for the v2 session loop.
+    pub(crate) fn chunked_in_flight_digests_for_v2(
+        &self,
+    ) -> Option<&Arc<parking_lot::Mutex<std::collections::HashSet<DigestInfo>>>> {
+        self.chunked_in_flight_digests.as_ref()
+    }
+
+    /// H1: pub-in-crate accessor for the v2 session loop.
+    pub(crate) fn in_flight_empty_notify_for_v2(
+        &self,
+    ) -> Option<&Arc<tokio::sync::Notify>> {
+        self.in_flight_empty_notify.as_ref()
     }
 
     /// #494-v3 Phase 2 (FIX-3): builder method to wire the v2 commit
@@ -564,6 +620,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
             v2_stable_digests_sink: None,
             v2_failed_commit_sink: None,
+            chunked_in_flight_digests: None,
+            in_flight_empty_notify: None,
         }
     }
 
@@ -591,6 +649,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             metrics: Arc::new(ChunkedWriteHandlerMetrics::default()),
             v2_stable_digests_sink: None,
             v2_failed_commit_sink: None,
+            chunked_in_flight_digests: None,
+            in_flight_empty_notify: None,
         }
     }
 
