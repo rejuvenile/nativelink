@@ -37,9 +37,10 @@ use nativelink_config::stores::{FastSlowSpec, FilesystemSpec, MemorySpec, StoreS
 use nativelink_error::Code;
 use nativelink_macro::nativelink_test;
 use nativelink_service::chunked_write_handler::{
-    BAZEL_AWAIT_COMMIT_SOFT_WARN_SEEN, BazelChunkedDispatcherImpl, CHUNKED_COMMIT_SOFT_WARN_SECS,
-    CHUNKED_COMMIT_WATCHDOG_SECS, ChunkedWriteHandlerMetrics, ChunkedWriteInFlight,
-    V1_REAPER_SOFT_WARN_SEEN, V2_AWAITER_SOFT_WARN_SEEN, run_async_commit_reaper,
+    AWAIT_INFLIGHT_SOFT_WARN_SEEN, BAZEL_AWAIT_COMMIT_SOFT_WARN_SEEN, BazelChunkedDispatcherImpl,
+    CHUNKED_COMMIT_SOFT_WARN_SECS, CHUNKED_COMMIT_WATCHDOG_SECS, ChunkedWriteHandlerMetrics,
+    ChunkedWriteInFlight, V1_REAPER_SOFT_WARN_SEEN, V2_AWAITER_SOFT_WARN_SEEN,
+    await_inflight_commit_with_watchdog_for_test, run_async_commit_reaper,
 };
 use nativelink_service::chunked_write_handler_v2::v2_await_commit_result_for_test;
 use nativelink_store::chunked::BazelChunkedDispatcher;
@@ -714,4 +715,206 @@ async fn bazel_dispatch_await_commit_soft_warn_does_not_fire_on_fast_commit() {
     );
 
     drop(_holder_guard);
+}
+
+// =============================================================================
+// SITE 4 — `await_inflight_commit_with_watchdog` (#510)
+// =============================================================================
+//
+// This site is the v1 worker `WriteChunked` cross-version coordination
+// path: a worker arriving while another writer holds the per-digest
+// single-stream gate drains its stream and parks on the per-digest
+// Notify via `await_inflight_commit_with_watchdog`. Added by #447 AFTER
+// the #501 narrow-scope design was sketched, hence deferred to #510.
+
+/// **#510 under-action — `await_inflight_commit_with_watchdog` site.**
+/// When no commit_runner publishes a result, the awaiter parks on the
+/// Notify. At the 30 s soft-warn deadline,
+/// `commit_watchdog_soft_warn_total` MUST bump. The infra-integrity
+/// watchdog (60 s) is byte-identical to today — including the
+/// `WatchdogTimeoutSignal` discriminator attachment that #447 / #508
+/// added.
+///
+/// **Real counter read, not constant tautology:** asserts on
+/// `metrics.commit_watchdog_soft_warn_total.load(Relaxed) == 1`.
+///
+/// **Mutation step (per CLAUDE.md TDD step 5):** comment out
+/// `metrics.commit_watchdog_soft_warn_total.fetch_add(1, Ordering::Relaxed)`
+/// inside the soft-warn select arm in
+/// `await_inflight_commit_with_watchdog`. This test then red-fails with
+/// the bespoke "#510: await_inflight soft-warn did not fire at 30s"
+/// message naming the site.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn await_inflight_commit_soft_warn_fires_once_per_digest_at_30s() {
+    let mut hash = [0u8; 32];
+    hash[0] = 0x51;
+    hash[1] = 0x10;
+    hash[2] = 0xA0; // distinguishes from sibling tests
+    let digest = DigestInfo::new(hash, 2048);
+
+    // Clear the static dedup set so a prior test (or this test on rerun)
+    // doesn't pre-populate the digest and mask the expected bump.
+    AWAIT_INFLIGHT_SOFT_WARN_SEEN.clear();
+
+    let race_state = Arc::new(ChunkRaceState::new(
+        digest,
+        2048,
+        PathBuf::from("/tmp/510-await-inflight-under-action.partial"),
+    ));
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+    let metrics_for_awaiter = Arc::clone(&metrics);
+    let race_state_for_awaiter = Arc::clone(&race_state);
+
+    let awaiter = tokio::spawn(async move {
+        await_inflight_commit_with_watchdog_for_test(
+            &race_state_for_awaiter,
+            digest,
+            &metrics_for_awaiter,
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    let pre = metrics
+        .commit_watchdog_soft_warn_total
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        pre, 0,
+        "#510 pre-flight: await_inflight counter must be 0 before \
+         soft-warn deadline; got {pre}",
+    );
+
+    // Advance virtual time PAST the soft-warn deadline (30 s) but NOT
+    // past the infra-integrity watchdog (60 s).
+    tokio::time::advance(Duration::from_secs(CHUNKED_COMMIT_SOFT_WARN_SECS + 2)).await;
+    tokio::task::yield_now().await;
+
+    let post = metrics
+        .commit_watchdog_soft_warn_total
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        post, 1,
+        "#510: await_inflight soft-warn did not fire at 30s. Expected \
+         commit_watchdog_soft_warn_total == 1 after advancing past \
+         CHUNKED_COMMIT_SOFT_WARN_SECS={CHUNKED_COMMIT_SOFT_WARN_SECS}; \
+         got {post}. The select! arm in await_inflight_commit_with_watchdog \
+         that calls `metrics.commit_watchdog_soft_warn_total.fetch_add(1, \
+         Relaxed)` either did not fire or was elided. The infra-integrity \
+         60 s watchdog (CHUNKED_COMMIT_WATCHDOG_SECS) is unchanged; only \
+         the new #510 4th-site soft-warn layer can produce this counter \
+         bump.",
+    );
+
+    // Drive past infra-integrity so the awaiter resolves cleanly via
+    // the watchdog Err arm.
+    tokio::time::advance(Duration::from_secs(
+        CHUNKED_COMMIT_WATCHDOG_SECS - CHUNKED_COMMIT_SOFT_WARN_SECS + 2,
+    ))
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(10), awaiter)
+        .await
+        .expect(
+            "#510: await_inflight must complete after infra-integrity \
+             watchdog (60 s) fires post-soft-warn",
+        )
+        .expect("await_inflight task must not panic");
+    let err = result.expect_err(
+        "await_inflight with no publisher MUST return Err on \
+         infra-integrity fire",
+    );
+    assert_eq!(
+        err.code,
+        Code::DeadlineExceeded,
+        "#510: await_inflight infra-integrity Err arm contract preserved \
+         (DeadlineExceeded); got {err:?}",
+    );
+
+    // Remove-on-completion contract: dedup set must drain.
+    assert_eq!(
+        AWAIT_INFLIGHT_SOFT_WARN_SEEN.len(),
+        0,
+        "#510: await_inflight soft-warn dedup set MUST drain the digest \
+         after the awaiter finishes (remove-on-completion contract). \
+         Observed len={}; expected 0.",
+        AWAIT_INFLIGHT_SOFT_WARN_SEEN.len(),
+    );
+}
+
+/// **#510 over-action — `await_inflight_commit_with_watchdog` site.**
+/// A publisher firing BEFORE the 30 s soft-warn deadline MUST keep the
+/// soft-warn counter at 0. Same regression-guard class as the v1 / v2 /
+/// BazelDispatcher over-action tests.
+///
+/// **Mutation step:** move the
+/// `metrics.commit_watchdog_soft_warn_total.fetch_add(1, Ordering::Relaxed)`
+/// call OUT of the soft-warn select arm body to the top of
+/// `await_inflight_commit_with_watchdog` (so it fires unconditionally on
+/// every invocation). The over-action test then red-fails with the
+/// bespoke "#510 over-action: await_inflight soft-warn fired on
+/// fast-commit path" message. Verified at test-authorship time.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn await_inflight_commit_soft_warn_does_not_fire_on_fast_resolve() {
+    let mut hash = [0u8; 32];
+    hash[0] = 0x51;
+    hash[1] = 0x10;
+    hash[2] = 0xB0;
+    let digest = DigestInfo::new(hash, 4096);
+
+    AWAIT_INFLIGHT_SOFT_WARN_SEEN.clear();
+
+    let race_state = Arc::new(ChunkRaceState::new(
+        digest,
+        4096,
+        PathBuf::from("/tmp/510-await-inflight-over-action.partial"),
+    ));
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+    let metrics_for_awaiter = Arc::clone(&metrics);
+    let race_state_for_awaiter = Arc::clone(&race_state);
+
+    let awaiter = tokio::spawn(async move {
+        await_inflight_commit_with_watchdog_for_test(
+            &race_state_for_awaiter,
+            digest,
+            &metrics_for_awaiter,
+        )
+        .await
+    });
+
+    tokio::task::yield_now().await;
+    race_state.publish_commit_result(Ok(RaceCommitResult {
+        committed_size: 4096,
+    }));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), awaiter)
+        .await
+        .expect(
+            "#510 over-action: await_inflight must resolve immediately \
+             after publish_commit_result(Ok); test hung — possibly a \
+             regression where the select! now favors the soft-warn branch \
+             over the watchdog/notify branch (biased ordering must put \
+             watchdog first)",
+        )
+        .expect("await_inflight task must not panic");
+    let committed_size = outcome.expect(
+        "#510 over-action sanity: publish was Ok so await_inflight must \
+         return Ok",
+    );
+    assert_eq!(committed_size, 4096);
+
+    tokio::time::advance(Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS + 5)).await;
+
+    let count = metrics
+        .commit_watchdog_soft_warn_total
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        count, 0,
+        "#510 over-action: await_inflight soft-warn fired on fast-commit \
+         path (commit_watchdog_soft_warn_total = {count}, expected 0). \
+         The publisher fired BEFORE CHUNKED_COMMIT_SOFT_WARN_SECS \
+         ({CHUNKED_COMMIT_SOFT_WARN_SECS} s), so the soft-warn select \
+         arm should have been cancelled by the notify branch resolving \
+         first. A non-zero counter means the soft-warn fired spuriously \
+         — likely the `if !soft_warned` gate was removed OR the select! \
+         ordering changed so the soft-warn arm wins on a same-poll tie.",
+    );
 }

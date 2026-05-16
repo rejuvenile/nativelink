@@ -110,9 +110,35 @@ const ACK_CHANNEL_CAP: usize = 64;
 /// Watchdog deadline for waiting on `commit_done` after the last chunk
 /// is admitted. If the commit-runner wedges (slow tier hang, panic
 /// during BLAKE3 hash), siblings observe `Err(DeadlineExceeded)` and
-/// propagate to their clients. Same value as the v1 handler's
-/// `CHUNKED_COMMIT_WATCHDOG_SECS`.
-const COMMIT_WAIT_WATCHDOG: Duration = Duration::from_secs(60);
+/// propagate to their clients.
+///
+/// **#510 consolidation:** previously a local literal
+/// `Duration::from_secs(60)` numerically identical to v1's
+/// `CHUNKED_COMMIT_WATCHDOG_SECS`. The local literal was a silent-drift
+/// risk: v1's `_ASSERT_WATCHDOG_ORDERING` compile-time guard pinned the
+/// 30 < 60 < 120 ordering on v1's constant only; a future commit
+/// editing v2's literal standalone would have escaped the assert. Now
+/// derived from the v1 canonical constant; v2 inherits the same
+/// compile-time guard transitively, plus the explicit v2-local assert
+/// `_ASSERT_V2_WATCHDOG_TRACKS_V1` below pins the SAME-VALUE invariant
+/// against any future v1 edit.
+const COMMIT_WAIT_WATCHDOG: Duration = Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
+
+/// #510: pin the SAME-VALUE invariant between v2's `COMMIT_WAIT_WATCHDOG`
+/// and v1's `CHUNKED_COMMIT_WATCHDOG_SECS`. Any future commit that
+/// converts `COMMIT_WAIT_WATCHDOG` back to a literal that disagrees with
+/// v1 will red-fail this const-eval at build time. Mirrors v1's
+/// `_ASSERT_WATCHDOG_ORDERING` style.
+const _ASSERT_V2_WATCHDOG_TRACKS_V1: () = {
+    assert!(
+        COMMIT_WAIT_WATCHDOG.as_secs() == CHUNKED_COMMIT_WATCHDOG_SECS,
+        "#510 invariant: v2's COMMIT_WAIT_WATCHDOG MUST equal v1's \
+         CHUNKED_COMMIT_WATCHDOG_SECS so the soft-warn (30 s) / \
+         infra-integrity (60 s) / pin-TTL (120 s) ordering on v1 \
+         transitively applies to v2; a divergent value here would \
+         re-introduce the silent-drift risk #510 closed",
+    );
+};
 
 /// Server-side response stream type alias. Tokio's `ReceiverStream`
 /// over `Result<WriteChunkedFrame, Status>` so per-chunk acks plus the

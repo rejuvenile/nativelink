@@ -253,7 +253,8 @@ pub const CHUNKED_COMMIT_WATCHDOG_SECS: u64 = 60;
 /// #501 (narrow scope): soft-warn deadline for chunked-commit observability.
 ///
 /// **What:** at every commit-watchdog site (v1 reaper, v2 sibling,
-/// BazelChunkedDispatcher AwaitCommit) we install an early `warn!` +
+/// BazelChunkedDispatcher AwaitCommit, and #510's 4th-site coverage of
+/// `await_inflight_commit_with_watchdog`) we install an early `warn!` +
 /// counter-bump that fires ~half-way between commit start and the
 /// destructive `CHUNKED_COMMIT_WATCHDOG_SECS=60` deadline. The
 /// infra-integrity watchdog is byte-identical to today — soft-warn is
@@ -308,8 +309,8 @@ const _ASSERT_WATCHDOG_ORDERING: () = {
 /// #501 (narrow scope): per-site one-shot soft-warn dedup set.
 ///
 /// Each commit-watchdog site (v1 reaper, v2 sibling, BazelChunkedDispatcher
-/// AwaitCommit) owns its OWN `SoftWarnSet` via a dedicated module-level
-/// static. Cross-site sharing was rejected by red-team review on the
+/// AwaitCommit, and #510's `await_inflight_commit_with_watchdog`) owns
+/// its OWN `SoftWarnSet` via a dedicated module-level static. Cross-site sharing was rejected by red-team review on the
 /// prior full-Option-A attempt — production wiring did not thread a
 /// shared set across crates, so the test that exercised cross-site
 /// dedup ran in a topology production never reaches. Per-site statics
@@ -402,6 +403,17 @@ pub static BAZEL_AWAIT_COMMIT_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSe
 /// `pub` so the v2 file (sibling module) and integration tests can
 /// reference it.
 pub static V2_AWAITER_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
+    std::sync::LazyLock::new(|| Arc::new(SoftWarnSet::default()));
+
+/// #510 4th-site soft-warn dedup. Used by the v1 worker
+/// `WriteChunked` cross-version AwaitCommit notify path
+/// (`await_inflight_commit_with_watchdog`). Added by #447 Notify-wait
+/// conversion; #501 narrow-scope shipped without observability on this
+/// site because #447 had not yet merged at design time. Per the per-site
+/// `SoftWarnSet` rationale on `V1_REAPER_SOFT_WARN_SEEN`, each site owns
+/// its own dedup set to keep the test fixture local. `pub` so integration
+/// tests can `clear()` between rounds.
+pub static AWAIT_INFLIGHT_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> =
     std::sync::LazyLock::new(|| Arc::new(SoftWarnSet::default()));
 
 /// In-flight map: `DigestInfo` → live driver + sender. The sender is
@@ -543,7 +555,7 @@ pub struct ChunkedWriteHandlerMetrics {
     /// recovering" signal that does NOT degrade durability (no
     /// failed_slow_writes inserts, no synthetic Err to clients).
     #[metric(
-        help = "Chunked commit slow: digests that crossed CHUNKED_COMMIT_SOFT_WARN_SECS (30s) but may still complete before CHUNKED_COMMIT_WATCHDOG_SECS (60s); aggregated across v1 reaper + v2 sibling + BazelChunkedDispatcher AwaitCommit sites; per-site dedup ensures one bump per digest per site"
+        help = "Chunked commit slow: digests that crossed CHUNKED_COMMIT_SOFT_WARN_SECS (30s) but may still complete before CHUNKED_COMMIT_WATCHDOG_SECS (60s); aggregated across v1 reaper + v2 sibling + BazelChunkedDispatcher AwaitCommit + #447 await_inflight_commit_with_watchdog sites; per-site dedup ensures one bump per digest per site"
     )]
     pub commit_watchdog_soft_warn_total: AtomicU64,
     /// #494-v3 Phase 2: max concurrent writers per digest seen since
@@ -1066,6 +1078,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 let committed_size = await_inflight_commit_with_watchdog(
                     &race_state,
                     stream_digest,
+                    &self.metrics,
                 )
                 .await?;
                 let committed_digest_proto =
@@ -4288,6 +4301,7 @@ async fn await_inflight_commit_with_watchdog(
         nativelink_store::chunked::chunked_race_state::ChunkRaceState,
     >,
     digest: DigestInfo,
+    metrics: &Arc<ChunkedWriteHandlerMetrics>,
 ) -> Result<u64, Error> {
     let notified = race_state.subscribe_commit_done();
     tokio::pin!(notified);
@@ -4299,7 +4313,62 @@ async fn await_inflight_commit_with_watchdog(
         return result.map(|r| r.committed_size);
     }
     let watchdog = core::time::Duration::from_secs(CHUNKED_COMMIT_WATCHDOG_SECS);
-    match tokio::time::timeout(watchdog, notified).await {
+    // #510 4th-site soft-warn observability: the #501 narrow-scope diff
+    // covered the v1 reaper, v2 sibling, and BazelChunkedDispatcher
+    // AwaitCommit sites. This site (`await_inflight_commit_with_watchdog`,
+    // added by #447 AFTER the #501 design landed) is the v1 worker
+    // WriteChunked cross-version coordination path: a worker arriving
+    // while another writer holds the per-digest single-stream gate parks
+    // on the per-digest Notify here. Without an early signal at 30 s,
+    // operators get no warning before the destructive 60 s
+    // infra-integrity watchdog fires. Mirrors the 3 existing sites:
+    //   - select! biased toward the watchdog branch so simultaneous-poll
+    //     ties resolve in favor of the existing path (zero behavior
+    //     change at 60 s).
+    //   - one-shot per digest via `AWAIT_INFLIGHT_SOFT_WARN_SEEN`
+    //     (dedicated per-site set per the #501 narrow-scope decision).
+    //   - counter always bumped (load-bearing operator-visible signal);
+    //     `warn!` log line suppressed only if dedup set is at cap OR the
+    //     digest already fired soft-warn here.
+    //   - dedup entry drained on ANY watchdog outcome (Ok/Err) so a
+    //     long-running process doesn't accumulate entries.
+    let watchdog_fut = tokio::time::timeout(watchdog, notified);
+    tokio::pin!(watchdog_fut);
+    let soft_warn_at = tokio::time::sleep(core::time::Duration::from_secs(
+        CHUNKED_COMMIT_SOFT_WARN_SECS,
+    ));
+    tokio::pin!(soft_warn_at);
+    let mut soft_warned = false;
+    let watchdog_result = loop {
+        tokio::select! {
+            biased;
+            r = &mut watchdog_fut => break r,
+            () = &mut soft_warn_at, if !soft_warned => {
+                soft_warned = true;
+                metrics
+                    .commit_watchdog_soft_warn_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if AWAIT_INFLIGHT_SOFT_WARN_SEEN.insert_one_shot(digest) {
+                    warn!(
+                        ?digest,
+                        soft_warn_secs = CHUNKED_COMMIT_SOFT_WARN_SECS,
+                        infra_integrity_secs = CHUNKED_COMMIT_WATCHDOG_SECS,
+                        site = "worker_await_inflight",
+                        "#510: chunked commit slow — v1 worker WriteChunked \
+                         cross-version awaiter crossed soft-warn threshold; \
+                         infra-integrity watchdog will fire if no progress \
+                         before destructive deadline"
+                    );
+                }
+            }
+        }
+    };
+    // Drain the per-digest entry on ANY outcome (success or watchdog
+    // fire). Safe to call unconditionally — `remove` on a missing key is
+    // a no-op. Mirrors the v1 reaper, v2 sibling, and BazelDispatcher
+    // remove-on-completion semantics.
+    AWAIT_INFLIGHT_SOFT_WARN_SEEN.remove(&digest);
+    match watchdog_result {
         Ok(()) => race_state
             .peek_commit_result()
             .unwrap_or_else(|| {
@@ -4336,6 +4405,27 @@ async fn await_inflight_commit_with_watchdog(
             ))
         }
     }
+}
+
+/// #510 test-only shim: expose the module-private
+/// `await_inflight_commit_with_watchdog` to integration tests in
+/// `tests/chunked_commit_soft_warn_test.rs`. Mirrors v2's
+/// `v2_await_commit_result_for_test` pattern at
+/// `chunked_write_handler_v2.rs:1076`. The integration test exercises
+/// both the soft-warn under-action (counter bumps at 30 s on park) and
+/// over-action (counter stays 0 when publisher fires before 30 s)
+/// contracts; it cannot reach this function via the WriteChunked RPC
+/// without a full gRPC server fixture, hence the shim.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub async fn await_inflight_commit_with_watchdog_for_test(
+    race_state: &std::sync::Arc<
+        nativelink_store::chunked::chunked_race_state::ChunkRaceState,
+    >,
+    digest: DigestInfo,
+    metrics: &Arc<ChunkedWriteHandlerMetrics>,
+) -> Result<u64, Error> {
+    await_inflight_commit_with_watchdog(race_state, digest, metrics).await
 }
 
 pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
