@@ -507,6 +507,35 @@ fn should_evict_locality_on_peer_error(e: &Error) -> bool {
     matches!(e.code, Code::NotFound | Code::DataLoss)
 }
 
+/// Bytes a peer OWES for a Read RPC against a blob of `blob_size`,
+/// starting at `offset`, with optional `length` (None = unbounded
+/// tail). Used by the WPS Ok+0-bytes guard on both
+/// `try_read_from_worker` and `try_read_from_endpoints` to decide
+/// whether a clean-Ok+empty-stream is a stale-positive lie (peer
+/// owed bytes, delivered zero → must evict locality) or a legitimate
+/// zero-byte response (offset past EOF, or empty zero-digest blob).
+///
+/// #500: prior to this helper, the guard only fired for
+/// `length.is_none()` whole-blob reads. Bazel's parallel-chunk reads
+/// always carry `length=Some(chunk_size)`, so silent truncations
+/// from a peer slipped through.
+const fn owed_bytes(blob_size: u64, offset: u64, length: Option<u64>) -> u64 {
+    if offset >= blob_size {
+        return 0;
+    }
+    let tail = blob_size - offset;
+    match length {
+        None => tail,
+        Some(l) => {
+            if l < tail {
+                l
+            } else {
+                tail
+            }
+        }
+    }
+}
+
 /// Returns true for transport-level errors that prove the peer is gone:
 /// `ConnectionRefused` (no listener), `NetworkUnreachable`, `HostUnreachable`.
 /// Distinct from generic `Code::Unavailable` (which also covers transients
@@ -1187,8 +1216,8 @@ impl WorkerProxyStore {
         // produce `partial_A_bytes ++ full_B_bytes`, silent corruption.
         // Capture the writer's byte-written count BEFORE the loop and
         // gate the batched path on `writer.get_bytes_written() ==
-        // bytes_before_proxy` per the streaming-path pattern at
-        // `try_read_from_worker:1165`.
+        // bytes_before_proxy` per the streaming-path pattern in
+        // `Self::try_read_from_worker`.
         let bytes_before_proxy = writer.get_bytes_written();
 
         for endpoint in endpoints {
@@ -1255,14 +1284,54 @@ impl WorkerProxyStore {
                 }
             }
 
+            // Capture writer position immediately before this peer's
+            // attempt so the post-Ok 0-byte guard observes ONLY this
+            // peer's contribution (not accumulated bytes from earlier
+            // endpoints in the loop).
+            let bytes_before_attempt = writer.get_bytes_written();
             match self
                 .get_part_and_cache(&store, key.borrow(), &mut *writer, offset, length)
                 .await
             {
                 Ok(()) => {
+                    // #500 sibling: same defensive guard as the
+                    // streaming-path 0-byte-Ok check in
+                    // `Self::try_read_from_worker`. Prior to this guard,
+                    // a redirected peer returning Ok+0-bytes for a
+                    // non-zero range silently propagated as canonical
+                    // EOF, regardless of `length=None` vs
+                    // `length=Some(N)`. Note: `try_read_from_endpoints`
+                    // does NOT carry resume state across endpoints
+                    // (offset/length are constant per call), so the
+                    // owed-bytes computation uses the caller's
+                    // (offset, length) unmodified.
+                    let bytes_written_in_attempt =
+                        writer.get_bytes_written() - bytes_before_attempt;
+                    let expected_size = digest.size_bytes();
+                    let expected_bytes_this_attempt =
+                        owed_bytes(expected_size, offset, length);
+                    if bytes_written_in_attempt == 0 && expected_bytes_this_attempt > 0 {
+                        warn!(
+                            ?digest,
+                            endpoint = endpoint.as_str(),
+                            expected_size,
+                            offset,
+                            length = ?length,
+                            expected_bytes_this_attempt,
+                            "WorkerProxyStore: redirected peer returned \
+                             Ok+0-bytes for non-zero range — treating as \
+                             stale-positive, evicting locality and trying \
+                             next endpoint (#500)"
+                        );
+                        self.locality_map
+                            .write()
+                            .evict_blobs(endpoint, &[digest]);
+                        continue;
+                    }
                     debug!(
                         ?digest,
                         endpoint = endpoint.as_str(),
+                        bytes_written_in_attempt,
                         "WorkerProxyStore: successfully read blob from redirected peer"
                     );
                     return Ok(true);
@@ -1282,15 +1351,37 @@ impl WorkerProxyStore {
                             .write()
                             .evict_blobs(endpoint, &[digest]);
                     }
-                    error!(
-                        ?digest,
-                        endpoint = endpoint.as_str(),
-                        code = ?e.code,
-                        connection_error = is_conn_err,
-                        evicted_locality = evict,
-                        ?e,
-                        "WorkerProxyStore: redirected peer fetch failed"
-                    );
+                    // Gate the error-level log on writer-still-open: when
+                    // the outer consumer has dropped the reader (or a
+                    // prior eviction `continue` left the writer in a
+                    // closed state), `get_part_and_cache` returns
+                    // "Failed to write to data, receiver disconnected" /
+                    // similar derivative errors. Those are NOT a peer
+                    // fault and should not surface as fleet-level
+                    // `error!` noise. N healthy peers × stale-positive
+                    // READ produced N-1 spurious errors per request.
+                    if writer.is_pipe_broken() {
+                        debug!(
+                            ?digest,
+                            endpoint = endpoint.as_str(),
+                            code = ?e.code,
+                            connection_error = is_conn_err,
+                            evicted_locality = evict,
+                            ?e,
+                            "WorkerProxyStore: redirected peer fetch \
+                             failed after writer pipe broken (derivative)"
+                        );
+                    } else {
+                        error!(
+                            ?digest,
+                            endpoint = endpoint.as_str(),
+                            code = ?e.code,
+                            connection_error = is_conn_err,
+                            evicted_locality = evict,
+                            ?e,
+                            "WorkerProxyStore: redirected peer fetch failed"
+                        );
+                    }
                     warn!(
                         ?digest,
                         endpoint = endpoint.as_str(),
@@ -1447,6 +1538,17 @@ impl WorkerProxyStore {
             // Stream from the peer, caching in the inner store when possible.
             // On failure, compute how many bytes were written and resume
             // from the next peer at the correct offset.
+            //
+            // Capture writer position immediately before THIS peer's
+            // attempt so the post-Ok 0-byte guard observes ONLY this
+            // peer's contribution (not accumulated bytes from earlier
+            // endpoints in the loop). Pre-fix the guard subtracted from
+            // `bytes_before_proxy` (pre-loop), which produced a stale
+            // non-zero delta when an earlier peer had partial-Err'd and
+            // the resume math advanced past its bytes — masking a
+            // subsequent peer's silent Ok+0-bytes for the remaining
+            // chunked range.
+            let bytes_before_attempt = writer.get_bytes_written();
             let attempt_res = self
                 .get_part_and_cache(&store, key.borrow(), &mut *writer, current_offset, remaining_length)
                 .await;
@@ -1468,25 +1570,33 @@ impl WorkerProxyStore {
                     // empty stream — accepting Ok+0-bytes here would
                     // pollute the consumer with a silent empty response
                     // and leave the locality_map pointing at the broken
-                    // peer. Treat 0-bytes-on-full-read as a peer failure:
-                    // evict locality and try the next peer.
-                    let bytes_written_this_peer =
-                        writer.get_bytes_written() - bytes_before_proxy;
+                    // peer. Treat 0-bytes-on-any-non-empty-range as a
+                    // peer failure: evict locality and try the next peer.
+                    //
+                    // #500: the pre-fix `was_full_read` predicate
+                    // included `length.is_none()`, so Bazel's parallel-
+                    // chunk reads (which carry `length=Some(chunk_size)`)
+                    // bypassed the guard entirely and propagated Ok+0
+                    // bytes silently. Reformulated: compute the bytes
+                    // the peer would have OWED for this chunked range
+                    // (clamped to blob size), and trigger on zero-vs-
+                    // non-zero owed.
+                    let bytes_written_in_attempt =
+                        writer.get_bytes_written() - bytes_before_attempt;
                     let expected_size = digest.size_bytes();
-                    let was_full_read = current_offset == offset
-                        && remaining_length == length
-                        && length.is_none();
-                    if bytes_written_this_peer == 0
-                        && expected_size > 0
-                        && was_full_read
-                    {
+                    let expected_bytes_this_attempt =
+                        owed_bytes(expected_size, current_offset, remaining_length);
+                    if bytes_written_in_attempt == 0 && expected_bytes_this_attempt > 0 {
                         warn!(
                             ?digest,
                             endpoint = %endpoint,
                             expected_size,
+                            current_offset,
+                            remaining_length = ?remaining_length,
+                            expected_bytes_this_attempt,
                             "WorkerProxyStore: peer returned Ok+0-bytes for \
-                             non-zero digest — treating as stale-positive, \
-                             evicting locality and trying next peer"
+                             non-zero range — treating as stale-positive, \
+                             evicting locality and trying next peer (#500)"
                         );
                         self.locality_map
                             .write()
@@ -1496,7 +1606,7 @@ impl WorkerProxyStore {
                     info!(
                         ?digest,
                         endpoint = %endpoint,
-                        bytes_written_this_peer,
+                        bytes_written_in_attempt,
                         "WorkerProxyStore: successfully proxied blob from worker"
                     );
                     return Ok(true);
@@ -1515,15 +1625,37 @@ impl WorkerProxyStore {
                             .write()
                             .evict_blobs(endpoint, &[digest]);
                     }
-                    error!(
-                        ?digest,
-                        endpoint = %endpoint,
-                        code = ?e.code,
-                        connection_error = is_conn_err,
-                        evicted_locality = evict,
-                        ?e,
-                        "WorkerProxyStore: peer fetch failed"
-                    );
+                    // Gate the error-level log on writer-still-open: when
+                    // the outer consumer has dropped the reader (or a
+                    // prior eviction `continue` left the writer in a
+                    // closed state), `get_part_and_cache` returns
+                    // "Failed to write to data, receiver disconnected" /
+                    // similar derivative errors. Those are NOT a peer
+                    // fault and should not surface as fleet-level
+                    // `error!` noise. N healthy peers × stale-positive
+                    // READ produced N-1 spurious errors per request.
+                    if writer.is_pipe_broken() {
+                        debug!(
+                            ?digest,
+                            endpoint = %endpoint,
+                            code = ?e.code,
+                            connection_error = is_conn_err,
+                            evicted_locality = evict,
+                            ?e,
+                            "WorkerProxyStore: peer fetch failed after writer \
+                             pipe broken (derivative)"
+                        );
+                    } else {
+                        error!(
+                            ?digest,
+                            endpoint = %endpoint,
+                            code = ?e.code,
+                            connection_error = is_conn_err,
+                            evicted_locality = evict,
+                            ?e,
+                            "WorkerProxyStore: peer fetch failed"
+                        );
+                    }
                     let bytes_written_total =
                         writer.get_bytes_written() - bytes_before_proxy;
                     let next_offset = offset + bytes_written_total;

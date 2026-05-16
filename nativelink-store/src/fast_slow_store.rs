@@ -6291,22 +6291,37 @@ impl StoreDriver for FastSlowStore {
         );
         let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(streaming_inner);
         let mut pos = 0u64;
-        let end = offset + length.unwrap_or(u64::MAX);
+        // #500: `end` is `None` when caller wants the unbounded tail
+        // (`length=None`). Previously `let end = offset + length.unwrap_or(u64::MAX);`
+        // overflowed for any `offset > 0` (panic in debug, silent wrap
+        // to `offset - 1` in release → loop broke immediately → silent
+        // 0-byte commit_eof on a non-zero digest). The wrap matched
+        // Bazel's parallel-chunk resume-read shape exactly
+        // (`read_offset=N, read_limit=0`).
+        let end = length.map(|l| offset.saturating_add(l));
         loop {
             match reader.next_chunk().await {
                 Ok(chunk) if chunk.is_empty() => break, // EOF
                 Ok(chunk) => {
                     let chunk_end = pos + chunk.len() as u64;
-                    if chunk_end > offset && pos < end {
+                    // `pos < end` evaluates to true when `end` is None
+                    // (unbounded tail) or when pos has not yet reached
+                    // the bounded end.
+                    let pos_lt_end = end.is_none_or(|e| pos < e);
+                    if chunk_end > offset && pos_lt_end {
                         let start = if pos < offset {
                             (offset - pos) as usize
                         } else {
                             0
                         };
-                        let stop = if chunk_end > end {
-                            chunk.len() - (chunk_end - end) as usize
-                        } else {
-                            chunk.len()
+                        // For an unbounded read (`end=None`), the
+                        // chunk's full tail is sent. For a bounded read,
+                        // trim at `end`.
+                        let stop = match end {
+                            Some(e) if chunk_end > e => {
+                                chunk.len() - (chunk_end - e) as usize
+                            }
+                            _ => chunk.len(),
                         };
                         if start < stop {
                             guard
@@ -6316,7 +6331,11 @@ impl StoreDriver for FastSlowStore {
                         }
                     }
                     pos = chunk_end;
-                    if pos >= end {
+                    // `pos >= end` breaks the loop only when the read
+                    // is bounded AND we've reached/passed the bound.
+                    // Unbounded reads (`length=None`) terminate via the
+                    // empty-chunk EOF arm above.
+                    if matches!(end, Some(e) if pos >= e) {
                         break;
                     }
                 }
