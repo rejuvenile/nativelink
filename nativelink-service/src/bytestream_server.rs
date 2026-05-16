@@ -617,6 +617,34 @@ impl LoggingReadStream {
                  confirm transport health (h2/TCP/QUIC keepalive, slow-tier hiccup)",
             );
         }
+        // #500: silent 0-byte-ok response class corrupts Bazel
+        // downloads on post-OOM reconnect. A NotFound from
+        // store.get_part SHOULD surface as status="error", but the
+        // unfold in inner_read can yield Some((Ok(ReadResponse::default()),
+        // Some(state))) on its first poll then EOF — Bazel sees
+        // stream-complete with 0 bytes and accepts the (empty) data as
+        // canonical, hashes prefix-only bytes accumulated across earlier
+        // parallel streams, reports digest mismatch as a build failure.
+        // Warn-classify so SREs can grep `ByteStream::read.*silent-zero`
+        // and see the corrupting events immediately instead of buried
+        // in the per-stream info! line.
+        let silent_zero =
+            self.bytes_sent == 0 && self.expected_size > 0 && status == "ok";
+        if silent_zero {
+            warn!(
+                target: "nativelink_service::bytestream",
+                label = self.label,
+                digest = %self.digest,
+                expected_size = self.expected_size,
+                bytes_sent = self.bytes_sent,
+                elapsed_ms,
+                status,
+                "ByteStream::read: silent-zero — stream ended with status=ok \
+                 but 0 bytes sent on an expected_size>0 read; Bazel will \
+                 accept this as a complete-empty stream and report digest \
+                 mismatch (see #500)",
+            );
+        }
         info!(
             target: "nativelink_service::bytestream",
             label = self.label,
