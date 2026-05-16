@@ -3056,12 +3056,14 @@ impl ByteStreamServer {
         //   * `InFlightWritesGuard` RAII (#402: cancel-safe RAII guard
         //     for in_flight_writes) cleans up the dedup map on
         //     grpc-future-drop.
-        //   * Per-chunk store-side timeouts (e.g.
-        //     `nativelink_store::chunked::chunked_driver::PER_CHUNK_WRITE_TIMEOUT`)
-        //     bound store-write progress for paths that go through the
+        //   * Per-chunk store-side diagnostic threshold (e.g.
+        //     `nativelink_store::chunked::chunked_driver::PER_CHUNK_WRITE_TIMEOUT`,
+        //     diagnostic-only per #487 2026-05-16) emits warn! +
+        //     bumps a counter on slow per-chunk pwrites in the
         //     SEPARATE `WriteChunked` RPC handled by
-        //     `ChunkedWriteHandler`. They do NOT apply to this Write RPC
-        //     path — `inner_write` / `inner_write_oneshot` write directly
+        //     `ChunkedWriteHandler`. It does NOT abort the blob, and
+        //     does NOT apply to this Write RPC path at all —
+        //     `inner_write` / `inner_write_oneshot` write directly
         //     via `StoreLike::update`, never through `ChunkedDriver`.
         //
         // No app-layer per-recv timer is added. Per CLAUDE.md "Falsify

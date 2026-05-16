@@ -154,47 +154,55 @@ use crate::filesystem_store::{FileEntry, FilesystemStore};
 /// (200-540 MB blob cascade after cap=64) sizing follow-up.
 pub const PER_BLOB_MPSC_CAP: usize = 256;
 
-/// Per-chunk wall-clock bound on the slow-tier `pwrite` step
-/// (#213 perf-opt NMA2 fixup for §6.7 trigger (b)). Bounds how long
-/// the driver waits for ANY single `write_chunk_at_offset` before
-/// abandoning the chunk and the rest of the blob. Chosen to be 5×
-/// the worst-case healthy ZFS pwrite latency (~1 s observed in the
-/// 2026-03 sync=disabled deploy) so a routine slow tick does not
-/// abandon a blob, while a wedged pool can't stall the driver
-/// arbitrarily long.
+/// Per-chunk wall-clock **observability threshold** on the slow-tier
+/// `pwrite` step. When a single `write_chunk_at_offset` await exceeds
+/// this duration, the driver emits `warn!` + bumps
+/// [`CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL`] and **continues awaiting**
+/// the original future — it does NOT abort the blob, does NOT return
+/// `Code::DeadlineExceeded`, does NOT trigger discard.
 ///
-/// IMPORTANT: this timeout bounds the AWAIT of the `spawn_blocking`
-/// JoinHandle, NOT the underlying syscall. `spawn_blocking` work is
-/// uncancellable per tokio API contract — once dispatched, the
-/// closure runs to completion. So the actual upper bound on shutdown
-/// drain in the worst case is `(workers_in_blocking_pool ×
-/// per-chunk-syscall-wall-clock)`, which is bounded by the kernel's
-/// I/O timeout heuristics (typically tens of seconds) but NOT by
-/// this constant. Per perf-optimizer NMA2: this gap is acknowledged
-/// and accepted as the implementation-level cost of `spawn_blocking`
-/// uncancellability — the timeout still bounds the driver task's
-/// AWAIT, which is what feeds back to the caller and to
-/// `JoinHandleDropGuard`'s `abort()` reaching a clean state.
+/// **Diagnostic-only** (#487, 2026-05-16; supersedes the 2026-04-23
+/// abort-and-discard semantics introduced as the #213 perf-opt NMA2
+/// fixup). Per user direction 2026-05-14 (memory
+/// `feedback_per_chunk_timeout_design_intent`), per-chunk store-side
+/// write timers are observability primitives, not enforcement
+/// primitives. Dead-connection detection is the transport's job
+/// (h2 keepalive 30s/20s, TCP keepalive, QUIC keepalive 5s);
+/// uncancellable spawn_blocking pool-thread exhaustion is observable
+/// via this counter + `tokio::runtime::RuntimeMetrics::num_blocking_threads()`.
+///
+/// Chosen as 5× the worst-case healthy ZFS pwrite latency (~1 s
+/// observed in the 2026-03 sync=disabled deploy) so a routine slow
+/// tick does not log noise, while a sustained per-chunk stall surfaces
+/// in operator dashboards via the counter.
+///
+/// Sibling diagnostic-only conversions:
+/// - `proto_stream_utils.rs` `WriteState::with_progress_timeout`
+///   (commit `39b60a92`, 2026-05-14).
+/// - bytestream `WRITE_TIMEOUT` + `COALESCE_TIMEOUT` removed entirely
+///   (commit `2ef908aa`, 2026-05-14).
 pub const PER_CHUNK_WRITE_TIMEOUT: core::time::Duration =
     core::time::Duration::from_secs(5);
 
-/// #213 reviewer M8 (RECONSIDER red-team): when
-/// `tokio::time::timeout` fires on a `spawn_blocking` pwrite, the
-/// blocking-pool task continues to completion BUT its result is
-/// discarded — the JoinHandle is dropped on the timeout-Err arm.
-/// `spawn_blocking` is uncancellable per tokio API contract, so the
-/// underlying syscall keeps the blocking-pool thread occupied until
-/// the kernel resolves the wedge (kernel I/O timeout, on the order
-/// of tens of seconds). Repeated wedges leak threads from the
-/// 512-thread default pool until none remain, at which point all
-/// further `spawn_blocking` calls queue indefinitely.
+/// Process-wide counter of per-chunk pwrite awaits that exceeded
+/// [`PER_CHUNK_WRITE_TIMEOUT`] (#213 reviewer M8 origin; #487
+/// 2026-05-16 semantics update — the counter now measures slow-chunk
+/// **events** on still-progressing blobs, NOT abort-on-elapse events).
 ///
-/// To make this leak observable BEFORE it's catastrophic, we
-/// increment a counter on every per-chunk pwrite timeout and warn
-/// when more than [`PWRITE_TIMEOUT_WARN_THRESHOLD`] timeouts occur
-/// within a [`PWRITE_TIMEOUT_WARN_WINDOW`]. The SRE can correlate
-/// against `tokio::runtime::RuntimeMetrics::num_blocking_threads()`
-/// to confirm the pool is approaching saturation.
+/// **Why the counter still matters post-diagnostic-only conversion:**
+/// `spawn_blocking` is uncancellable per tokio API contract, so a
+/// wedged ZFS pool keeps the blocking-pool thread occupied until the
+/// kernel resolves the wedge (kernel I/O timeout, on the order of
+/// tens of seconds). Repeated wedges leak threads from the 512-thread
+/// default pool until none remain, at which point all further
+/// `spawn_blocking` calls queue indefinitely. The transport-layer
+/// keepalive (h2/QUIC/TCP) cannot see this — the connection is live,
+/// the application is just slow to consume incoming bytes. This
+/// counter is the operator-visible signal for that failure mode; SRE
+/// correlates against
+/// `tokio::runtime::RuntimeMetrics::num_blocking_threads()` to
+/// confirm pool saturation and respond operationally (kill the
+/// wedged pool, restart, etc.) before all 512 threads are leaked.
 ///
 /// Counter is `pub` for downstream metrics surfaces (the workspace's
 /// MetricsComponent macro doesn't gate on visibility, but explicit
@@ -221,30 +229,35 @@ pub const PER_CHUNK_WRITE_TIMEOUT: core::time::Duration =
 pub static CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Sliding-window threshold: warn loudly when this many per-chunk
-/// pwrite timeouts fire inside a [`PWRITE_TIMEOUT_WARN_WINDOW`].
-/// Chosen low enough that an early warning surfaces before all 512
-/// pool threads are leaked, but high enough that a single transient
-/// slow-tier blip doesn't trigger.
+/// pwrite slow-chunk events fire inside a
+/// [`PWRITE_TIMEOUT_WARN_WINDOW`]. Chosen low enough that an early
+/// warning surfaces before all 512 pool threads are leaked, but high
+/// enough that a single transient slow-tier blip doesn't trigger.
 const PWRITE_TIMEOUT_WARN_THRESHOLD: u64 = 10;
 
 /// Sliding window for the warn rate trigger. 60 seconds is the
 /// typical scrape interval for monitoring agents; if more than
-/// `PWRITE_TIMEOUT_WARN_THRESHOLD` timeouts land in the same window
-/// the SRE will see the warn alongside the next scrape.
+/// `PWRITE_TIMEOUT_WARN_THRESHOLD` slow-chunk events land in the
+/// same window the SRE will see the warn alongside the next scrape.
 const PWRITE_TIMEOUT_WARN_WINDOW: core::time::Duration =
     core::time::Duration::from_secs(60);
 
 /// Last-warn timestamp + count baseline (paired). When the elapsed
 /// since `last_warn_at` exceeds the window OR the delta from
 /// `count_at_last_warn` exceeds the threshold, we re-warn and reset
-/// the baseline. Single-writer (the run_driver Err arm), so a plain
-/// parking_lot mutex over a 16-byte tuple is enough.
+/// the baseline. Concurrent writers are possible (multiple drivers
+/// can observe slow chunks simultaneously after #487 diagnostic-only
+/// conversion — the bare-await elapsed-check is per-chunk, no longer
+/// gated by a single Err arm), so the mutex is now load-bearing for
+/// race-free baseline updates rather than a formality.
 static PWRITE_TIMEOUT_WARN_STATE: parking_lot::Mutex<Option<(std::time::Instant, u64)>> =
     parking_lot::Mutex::new(None);
 
-/// Helper called from the per-chunk pwrite timeout-Err arm: bumps
-/// the counter and emits a warn! when the rate exceeds threshold
-/// within the window. No-op when the rate is healthy.
+/// Helper called from the per-chunk pwrite elapsed-threshold check:
+/// bumps the counter and emits a warn! when the rate exceeds
+/// threshold within the window. No-op when the rate is healthy.
+/// **Diagnostic-only (#487 2026-05-16)** — caller continues awaiting
+/// the inner future after this returns; the blob is not aborted.
 fn record_pwrite_timeout_and_maybe_warn() {
     let new_total = CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
     let now = std::time::Instant::now();
@@ -256,12 +269,12 @@ fn record_pwrite_timeout_and_maybe_warn() {
     if delta >= PWRITE_TIMEOUT_WARN_THRESHOLD && elapsed <= PWRITE_TIMEOUT_WARN_WINDOW {
         warn!(
             target: "nativelink_store::chunked",
-            total_timeouts = new_total,
-            timeouts_in_window = delta,
+            total_slow_chunks = new_total,
+            slow_chunks_in_window = delta,
             window_secs = PWRITE_TIMEOUT_WARN_WINDOW.as_secs(),
-            "chunked driver: per-chunk pwrite timeouts exceeding {PWRITE_TIMEOUT_WARN_THRESHOLD}/window — \
-             blocking-pool threads may be leaking; correlate with \
-             tokio::runtime::RuntimeMetrics::num_blocking_threads() (#213 reviewer M8)",
+            "chunked driver: per-chunk pwrite slow-chunk events exceeding {PWRITE_TIMEOUT_WARN_THRESHOLD}/window — \
+             blocking-pool threads may be leaking on a wedged slow tier; correlate with \
+             tokio::runtime::RuntimeMetrics::num_blocking_threads() (#487 diagnostic-only)",
         );
         *guard = Some((now, new_total));
     } else if elapsed > PWRITE_TIMEOUT_WARN_WINDOW {
@@ -494,18 +507,21 @@ impl ChunkedDriver {
     }
 
     /// Same as [`Self::spawn_driver`] but accepts a custom per-chunk
-    /// pwrite timeout. Production callers MUST use [`Self::spawn_driver`]
-    /// (which passes [`PER_CHUNK_WRITE_TIMEOUT`]); this entry point is
-    /// shared with tests that exercise the timeout path under a short
-    /// bound, so a wedged-slow-tier scenario fires the timeout in
-    /// bounded test wall-clock instead of waiting for the production
-    /// 5 s constant.
+    /// pwrite diagnostic threshold. Production callers MUST use
+    /// [`Self::spawn_driver`] (which passes
+    /// [`PER_CHUNK_WRITE_TIMEOUT`]); this entry point is shared with
+    /// tests that exercise the diagnostic-threshold path under a
+    /// short bound, so a wedged-slow-tier scenario fires the
+    /// diagnostic warn in bounded test wall-clock instead of waiting
+    /// for the production 5 s constant.
     ///
     /// #213 reviewer M3 fixup: visibility narrowed from `pub` to
     /// `pub(crate)`. The only callers are `Self::spawn_driver` (which
-    /// hard-codes the production constant) and the in-file unit test
-    /// `driver_per_chunk_pwrite_timeout_returns_deadline_exceeded`; no
-    /// external consumer should ever pass a non-production timeout.
+    /// hard-codes the production constant) and the in-file unit
+    /// tests `driver_per_chunk_pwrite_timeout_warns_but_does_not_abort`
+    /// and `driver_per_chunk_pwrite_slow_event_increments_total_counter_at_least_once`
+    /// (#487 2026-05-16 diagnostic-only conversion); no external
+    /// consumer should ever pass a non-production threshold.
     pub(crate) fn spawn_driver_with_per_chunk_timeout<Fe: FileEntry>(
         filesystem_store: Arc<FilesystemStore<Fe>>,
         digest: DigestInfo,
@@ -838,18 +854,25 @@ async fn run_driver<Fe: FileEntry>(
         // The clone is one `Arc` bump (Bytes is ref-counted); the
         // landed-chunk pin populated below shares the same buffer.
         //
-        // #213 NMA2 fixup: per-chunk wall-clock bound. Without this,
-        // a wedged slow tier (ZFS lockup, kernel I/O hang) blocks
-        // the driver task indefinitely, defeating §6.7 trigger (b)'s
-        // "best-effort drain bounded by the graceful-shutdown
-        // deadline" promise. The timeout bounds the AWAIT of the
-        // spawn_blocking JoinHandle (uncancellable per tokio
-        // contract); the underlying syscall may still complete or
-        // fail later, but the driver returns control to its caller
-        // (and the JoinHandleDropGuard / shutdown path) within the
-        // bound.
-        let bytes_for_write = chunk_bytes.clone();
-        let write_fut = filesystem_store.write_chunk_at_offset(&digest, chunk_offset, bytes_for_write);
+        // #487 (2026-05-16): per-chunk timer is diagnostic-only.
+        // The previous (#213 NMA2) implementation wrapped this await
+        // in `tokio::time::timeout(per_chunk_timeout, write_fut)` and
+        // aborted the blob with `Code::DeadlineExceeded` on elapse —
+        // that fragile behavior killed legitimate slow-but-progressing
+        // writes (the same incident class that drove the 2026-05-14
+        // sibling conversions `39b60a92` proto_stream and `2ef908aa`
+        // bytestream WRITE_TIMEOUT/COALESCE_TIMEOUT removals). Per
+        // user direction 2026-05-14 (memory
+        // `feedback_per_chunk_timeout_design_intent`), per-chunk
+        // store-side write timers are observability primitives, not
+        // enforcement primitives. The bare-await + post-await
+        // elapsed-check below emits `warn!` + bumps the counter when
+        // the elapsed exceeds `per_chunk_timeout` but continues
+        // awaiting the original future. Dead-connection detection is
+        // the transport's job (h2/QUIC/TCP keepalive). The
+        // `JoinHandleDropGuard` covers RPC-drop shutdown (§6.7
+        // trigger b) without needing the per-chunk abort.
+        //
         // #413 (200-540 MB blob cascade after cap=64) pre-bump
         // instrumentation: measure per-chunk back-edge wall-clock so the
         // `PER_BLOB_MPSC_CAP` doc-comment's inferred "~25-50 MB/s back-
@@ -860,58 +883,26 @@ async fn run_driver<Fe: FileEntry>(
         // syscall) — that's the wall-clock the chunker → driver back-edge
         // actually pays, NOT just the syscall. The field is named
         // `back_edge_ms` to reflect this.
+        let bytes_for_write = chunk_bytes.clone();
+        let write_fut = filesystem_store.write_chunk_at_offset(&digest, chunk_offset, bytes_for_write);
         let pwrite_started_at = std::time::Instant::now();
-        let write_result = match tokio::time::timeout(per_chunk_timeout, write_fut).await {
-            Ok(res) => res,
-            Err(_elapsed) => {
-                warn!(
-                    target: "nativelink_store::chunked",
-                    ?digest,
-                    chunk_offset,
-                    chunk_len,
-                    timeout_ms = per_chunk_timeout.as_millis() as u64,
-                    "chunked driver: per-chunk pwrite exceeded timeout; aborting blob \
-                     (slow tier wedged?)",
-                );
-                // #213 reviewer M8: record timeout + warn if rate
-                // exceeds threshold (helps SREs spot blocking-pool
-                // thread leak before catastrophic saturation).
-                record_pwrite_timeout_and_maybe_warn();
-                // Per #213 reviewer M2: bound the post-timeout discard
-                // by [`DISCARD_AFTER_FAILURE_TIMEOUT`]. The original
-                // `discard_chunked(&digest).await` was unbounded and a
-                // wedged slow tier (the same scenario that motivated
-                // the per-chunk pwrite timeout) would hang the driver
-                // task forever, defeating §6.7 trigger (b)'s
-                // "best-effort drain bounded by deadline" promise.
-                match tokio::time::timeout(
-                    DISCARD_AFTER_FAILURE_TIMEOUT,
-                    filesystem_store.discard_chunked(&digest),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(discard_err)) => error!(
-                        target: "nativelink_store::chunked",
-                        ?digest,
-                        ?discard_err,
-                        "chunked driver: discard after per-chunk pwrite timeout also failed",
-                    ),
-                    Err(_) => error!(
-                        target: "nativelink_store::chunked",
-                        ?digest,
-                        timeout_ms = DISCARD_AFTER_FAILURE_TIMEOUT.as_millis() as u64,
-                        "chunked driver: discard after per-chunk pwrite timeout also timed out; \
-                         partial persists until next FilesystemStore::new sweep \
-                         (#213 reviewer M2: driver-task bound, GC abandoned)",
-                    ),
-                }
-                return Err(make_err!(
-                    Code::DeadlineExceeded,
-                    "chunked write per-chunk pwrite exceeded {per_chunk_timeout:?} for digest {digest} offset {chunk_offset}"
-                ));
-            }
-        };
+        let write_result = write_fut.await;
+        let pwrite_elapsed = pwrite_started_at.elapsed();
+        if pwrite_elapsed >= per_chunk_timeout {
+            warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                chunk_offset,
+                chunk_len,
+                elapsed_ms = pwrite_elapsed.as_millis() as u64,
+                threshold_ms = per_chunk_timeout.as_millis() as u64,
+                "chunked driver: per-chunk pwrite exceeded diagnostic threshold; \
+                 continuing per #487 diagnostic-only design (2026-05-16) — \
+                 slow tier may be wedged, correlate with \
+                 tokio::runtime::RuntimeMetrics::num_blocking_threads()",
+            );
+            record_pwrite_timeout_and_maybe_warn();
+        }
         if let Err(write_err) = write_result {
             warn!(
                 target: "nativelink_store::chunked",
@@ -2442,19 +2433,35 @@ mod tests {
         drop(tx);
     }
 
-    /// #213 NMA2 fixup test: per-chunk pwrite-timeout contract under
-    /// a wedged slow tier. Wedges `write_chunk_at_offset` 500 ms,
-    /// runs driver with 50 ms `per_chunk_timeout`, asserts
-    /// `await_completion()` returns `Err(DeadlineExceeded)` naming
-    /// the contract. The 5 s outer detector is the deadlock alarm
-    /// (fires only if the spawned task neither sends nor drops the
-    /// completion oneshot — see round-2 NIT-1 reword); the inner
-    /// `expect_err` + `assert_eq!(err.code, DeadlineExceeded)` are
-    /// the primary mutation guards. Reverting the
-    /// `tokio::time::timeout(per_chunk_timeout, write_fut)` wrap
-    /// triggers `expect_err`; reclassifying triggers `assert_eq!`.
+    /// #487 (2026-05-16) diagnostic-only contract test: per-chunk
+    /// pwrite-timeout is observability-only — it emits `warn!` + bumps
+    /// the counter when the wedge exceeds the diagnostic threshold,
+    /// but the driver MUST NOT abort the blob, MUST NOT return
+    /// `Code::DeadlineExceeded`, and MUST complete the write once the
+    /// wedge clears.
+    ///
+    /// Wedges `write_chunk_at_offset` 500 ms, runs driver with 50 ms
+    /// `per_chunk_timeout` diagnostic threshold. Asserts:
+    /// (a) `await_completion()` returns `Ok(_)` (the blob commits
+    ///     once the underlying pwrite completes ~450 ms after the
+    ///     threshold);
+    /// (b) the counter `CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL`
+    ///     increments by at least 1 (proving the diagnostic warn arm
+    ///     fired);
+    /// (c) NEVER `Err(DeadlineExceeded)` (proving the abort is gone).
+    ///
+    /// Mutation guard: restoring the OLD
+    /// `tokio::time::timeout(per_chunk_timeout, write_fut).await`
+    /// wrap with `return Err(make_err!(Code::DeadlineExceeded, ...))`
+    /// on Elapsed must red-fail this test with the bespoke
+    /// "PER_CHUNK_WRITE_TIMEOUT must NOT abort the blob —
+    /// diagnostic-only per 2026-05-14 / #487" assertion message.
+    ///
+    /// The 5 s outer detector is the deadlock alarm — fires only if
+    /// the spawned task neither sends nor drops the completion
+    /// oneshot.
     #[nativelink_test]
-    async fn driver_per_chunk_pwrite_timeout_returns_deadline_exceeded() {
+    async fn driver_per_chunk_pwrite_timeout_warns_but_does_not_abort() {
         const CHUNK: usize = 4 * 1024;
         let total: u64 = CHUNK as u64;
         let blob = vec![0xa9u8; CHUNK];
@@ -2465,14 +2472,15 @@ mod tests {
 
         // Inject a slow-tier wedge: write_chunk_at_offset will sleep
         // for 500ms before the real pwrite. With the driver's
-        // per_chunk_timeout set to 50ms, the timeout fires
-        // deterministically (10× safety margin over typical CI
-        // jitter). The test hook is per-digest so parallel tests in
-        // the same binary do NOT collide.
+        // per_chunk_timeout (diagnostic threshold) set to 50ms, the
+        // diagnostic warn arm fires deterministically (10× safety
+        // margin over typical CI jitter) but the underlying pwrite
+        // STILL COMPLETES (after the wedge clears), so the blob
+        // commits and `await_completion` returns Ok. The test hook
+        // is per-digest so parallel tests in the same binary do NOT
+        // collide.
         const WEDGE_MS: u64 = 500;
         const TIMEOUT_MS: u64 = 50;
-        // #213 reviewer M4 fixup: LazyLock<Mutex<HashMap>> means no
-        // `Option` dance — straight `.lock().insert(digest, ...)`.
         super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
             .lock()
             .insert(digest, WEDGE_MS);
@@ -2487,6 +2495,12 @@ mod tests {
             }
         }
         let _reset_guard = ResetWriteDelay(digest);
+
+        // Baseline-snapshot the diagnostic counter so this test is
+        // robust to other tests in the same binary having
+        // incremented it.
+        let counter_baseline = super::CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL
+            .load(core::sync::atomic::Ordering::Relaxed);
 
         let (driver, tx) = ChunkedDriver::spawn_driver_with_per_chunk_timeout(
             store.clone(),
@@ -2508,25 +2522,44 @@ mod tests {
             })
             .await
             .expect("send");
-            let err = driver
-                .await_completion()
-                .await
-                .expect_err("per-chunk timeout MUST surface as Err");
-            assert_eq!(
-                err.code,
-                nativelink_error::Code::DeadlineExceeded,
-                "per-chunk pwrite timeout must classify as DeadlineExceeded; got {err:?}"
-            );
-            let msg = format!("{err:?}");
+            // Diagnostic-only: the blob MUST commit successfully even
+            // when the per-chunk wedge exceeds the diagnostic
+            // threshold. Restoring the OLD abort-on-elapse behavior
+            // would make this `await_completion` return
+            // `Err(DeadlineExceeded)`; the bespoke message names the
+            // contract so a mutation reverting the diagnostic-only
+            // conversion fails loudly here.
+            let result = driver.await_completion().await;
             assert!(
-                msg.contains("per-chunk pwrite exceeded"),
-                "error must name the timeout contract; got {msg}"
+                result.is_ok(),
+                "PER_CHUNK_WRITE_TIMEOUT must NOT abort the blob — \
+                 diagnostic-only per 2026-05-14 / #487; got {result:?}",
+            );
+            let committed = result.unwrap();
+            assert_eq!(
+                committed.committed_size, total,
+                "committed_size must equal declared size after slow-but-progressing pwrite; got {committed:?}",
             );
             drop(tx);
         })
         .await
         .expect(
-            "must not deadlock — per-chunk pwrite timeout fires within bound (#213 NMA2)"
+            "must not deadlock — diagnostic-only per-chunk timer must not stall completion (#487)"
+        );
+
+        // The diagnostic warn arm MUST have fired (the 500 ms wedge
+        // exceeds the 50 ms threshold). This is the mutation guard
+        // for `record_pwrite_timeout_and_maybe_warn()` in the
+        // post-await elapsed-check.
+        let counter_after = super::CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL
+            .load(core::sync::atomic::Ordering::Relaxed);
+        let counter_delta = counter_after.saturating_sub(counter_baseline);
+        assert!(
+            counter_delta >= 1,
+            "CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL must increment >=1 — \
+             record_pwrite_timeout_and_maybe_warn() in post-await elapsed-check \
+             dropped? (#487 diagnostic-only mutation guard) \
+             baseline={counter_baseline} after={counter_after} delta={counter_delta}",
         );
     }
 
@@ -2715,28 +2748,37 @@ mod tests {
         drop(tx);
     }
 
-    /// #213 reviewer round-2 MAJOR-B (M8 mutation test): asserts that
-    /// the per-chunk pwrite timeout-Err arm increments
+    /// #213 reviewer round-2 MAJOR-B (M8 mutation test) — updated
+    /// #487 (2026-05-16) for diagnostic-only semantics: asserts that
+    /// the post-await elapsed-check arm increments
     /// [`super::CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL`] by AT LEAST 1
-    /// per timeout. Without this, a future change that drops the
-    /// `record_pwrite_timeout_and_maybe_warn()` call (or the
-    /// `fetch_add(1, ...)` inside it) would silently disable the
+    /// per slow-chunk event. Without this, a future change that
+    /// drops the `record_pwrite_timeout_and_maybe_warn()` call (or
+    /// the `fetch_add(1, ...)` inside it) would silently disable the
     /// blocking-pool-leak observability without any test failing.
     ///
-    /// **Mutation step:** comment out the `record_pwrite_timeout_and_maybe_warn();`
-    /// call in `run_driver`'s pwrite-timeout-Err arm; rerun this
-    /// test; the `assert!(delta >= 1, ...)` panic with the bespoke
-    /// message MUST fire. (Reverted in checked-in code.)
+    /// **Mutation step:** comment out the
+    /// `record_pwrite_timeout_and_maybe_warn();` call in
+    /// `run_driver`'s post-await elapsed-check arm; rerun this test;
+    /// the `assert!(delta >= 1, ...)` panic with the bespoke message
+    /// MUST fire. (Reverted in checked-in code.)
     ///
     /// Uses a baseline-snapshot + `>= 1` pattern (rather than `== 1`)
     /// because cargo runs sibling tests in parallel and the sibling
-    /// `driver_per_chunk_pwrite_timeout_returns_deadline_exceeded`
-    /// also fires a timeout against the same global counter — a
+    /// `driver_per_chunk_pwrite_timeout_warns_but_does_not_abort`
+    /// also fires the diagnostic against the same global counter — a
     /// strict equality flakes ~20% of the time when the two tests
     /// race. The mutation guard is unchanged: removing the increment
     /// drops delta to 0, failing `>= 1`.
+    ///
+    /// Differs from
+    /// `driver_per_chunk_pwrite_timeout_warns_but_does_not_abort` by
+    /// awaiting completion via `Ok` (the diagnostic-only contract:
+    /// the blob commits despite the slow chunk). The two tests
+    /// together cover (a) abort-contract: never abort, (b)
+    /// counter-contract: must increment.
     #[nativelink_test]
-    async fn driver_per_chunk_pwrite_timeout_increments_total_counter_at_least_once() {
+    async fn driver_per_chunk_pwrite_slow_event_increments_total_counter_at_least_once() {
         const CHUNK: usize = 4 * 1024;
         let total: u64 = CHUNK as u64;
         let blob = vec![0xb3u8; CHUNK];
@@ -2745,7 +2787,7 @@ mod tests {
         let (store, _content_path) = make_test_store().await;
         let budget = ChunkBudget::new();
 
-        // Inject the wedge so the per-chunk timeout fires.
+        // Inject the wedge so the diagnostic threshold is crossed.
         const WEDGE_MS: u64 = 500;
         const TIMEOUT_MS: u64 = 50;
         super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
@@ -2786,15 +2828,19 @@ mod tests {
             })
             .await
             .expect("send");
-            let _ = driver
-                .await_completion()
-                .await
-                .expect_err("per-chunk timeout MUST surface as Err");
+            // Diagnostic-only: the slow-but-progressing pwrite must
+            // commit successfully — restoring the abort-on-elapse
+            // behavior would make this Err here.
+            let result = driver.await_completion().await;
+            assert!(
+                result.is_ok(),
+                "diagnostic-only per-chunk timer must not abort the blob (#487); got {result:?}",
+            );
             drop(tx);
         })
         .await
         .expect(
-            "must not deadlock — per-chunk pwrite timeout fires within bound (#213 reviewer M8 counter)",
+            "must not deadlock — diagnostic-only per-chunk timer (#487 counter mutation guard)",
         );
 
         let after = super::CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL
@@ -2802,9 +2848,9 @@ mod tests {
         let delta = after.saturating_sub(baseline);
         assert!(
             delta >= 1,
-            "CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL must increment by AT LEAST 1 per timeout — \
-             record_pwrite_timeout_and_maybe_warn() in pwrite-timeout-Err arm dropped? \
-             (#213 reviewer round-2 MAJOR-B M8 mutation guard) baseline={baseline} after={after} delta={delta}",
+            "CHUNKED_DRIVER_PWRITE_TIMEOUT_TOTAL must increment by AT LEAST 1 per slow-chunk event — \
+             record_pwrite_timeout_and_maybe_warn() in post-await elapsed-check arm dropped? \
+             (#487 diagnostic-only mutation guard) baseline={baseline} after={after} delta={delta}",
         );
     }
 

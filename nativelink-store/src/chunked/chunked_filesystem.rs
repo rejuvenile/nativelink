@@ -83,10 +83,12 @@ use crate::filesystem_store::digest_shard_prefix;
 
 /// #213 NMA2 test hook: per-digest millisecond delay injected at
 /// the start of [`write_chunk_at_offset`] (test builds only). Tests
-/// that exercise the chunked_driver's per-chunk pwrite timeout
-/// register their digest here so the await sleeps for `delay_ms`
-/// before opening the file — long enough for
-/// `tokio::time::timeout(per_chunk_timeout, ...)` to fire
+/// that exercise the chunked_driver's per-chunk pwrite diagnostic
+/// threshold register their digest here so the await sleeps for
+/// `delay_ms` before opening the file — long enough for the
+/// post-await `pwrite_elapsed >= per_chunk_timeout` diagnostic check
+/// (#487 2026-05-16 diagnostic-only conversion; was previously a
+/// `tokio::time::timeout(per_chunk_timeout, ...)` wrap) to fire
 /// deterministically. The map is keyed by `DigestInfo` so parallel
 /// tests never collide (each test uses a unique digest).
 ///
@@ -442,7 +444,9 @@ pub(crate) async fn write_chunk_at_offset(
 
     // #213 NMA2 test hook: when the per-digest test-only delay is set,
     // sleep BEFORE the actual write so the chunked_driver's per-chunk
-    // `tokio::time::timeout(per_chunk_timeout, ...)` can fire
+    // post-await elapsed diagnostic check (#487 2026-05-16
+    // diagnostic-only; was previously
+    // `tokio::time::timeout(per_chunk_timeout, ...)`) can fire
     // deterministically. Per-digest scoping keeps parallel tests from
     // bleeding into each other. Production binaries compile this branch
     // out via `#[cfg(test)]`.

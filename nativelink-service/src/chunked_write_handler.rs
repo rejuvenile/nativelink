@@ -1619,17 +1619,24 @@ fn err_to_status(err: Error) -> Status {
 
 /// #213 reviewer M2 fixup: wall-clock bound on the eager-GC discard.
 /// Without this, a wedged slow tier (the SAME failure mode that
-/// motivates the per-chunk pwrite timeout in chunked_driver.rs) would
-/// hang `discard_partial_best_effort` forever and the handler future
-/// would never return — violating the **post-error cleanup contract**
-/// (handler promises bounded wall-clock on every failure path so
-/// upstream gRPC streams cannot wedge open on a stalled cleanup);
-/// strictly worse than the original "partial persists" bug because
-/// the handler hang propagates upstream as a gRPC stream stuck open.
-/// 5 s matches the `PER_CHUNK_WRITE_TIMEOUT` constant; under wedge
-/// conditions the handler abandons GC, lets the file linger until
-/// next FilesystemStore::new sweep (the pre-fix behavior), but the
-/// handler still returns within the bound.
+/// `PER_CHUNK_WRITE_TIMEOUT` observes diagnostically in
+/// chunked_driver.rs) would hang `discard_partial_best_effort` forever
+/// and the handler future would never return — violating the
+/// **post-error cleanup contract** (handler promises bounded
+/// wall-clock on every failure path so upstream gRPC streams cannot
+/// wedge open on a stalled cleanup); strictly worse than the original
+/// "partial persists" bug because the handler hang propagates
+/// upstream as a gRPC stream stuck open.
+///
+/// 5 s matches the `PER_CHUNK_WRITE_TIMEOUT` constant numerically
+/// (both bound a ZFS-failure-mode magnitude); the semantic relationship
+/// is "shared wedge-magnitude budget", NOT "matches the abort
+/// timeout" (#487 2026-05-16: `PER_CHUNK_WRITE_TIMEOUT` no longer
+/// aborts — this `DISCARD_PARTIAL_TIMEOUT` still does, because it
+/// bounds a real-error cleanup path, not a speculative timer). Under
+/// wedge conditions the handler abandons GC, lets the file linger
+/// until next FilesystemStore::new sweep (the pre-fix behavior), but
+/// the handler still returns within the bound.
 const DISCARD_PARTIAL_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(5);
 
 /// #213 d-s-r MAJOR-1 helper: best-effort GC of an in-flight chunked
