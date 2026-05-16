@@ -1666,14 +1666,42 @@ impl FastSlowStore {
         // detail does NOT match. Over-matching would silently demote
         // unrelated dispatcher failures to a backpressure-shaped retry.
         //
-        // Note: this guard fires BEFORE the pin/`failed_slow_writes`
-        // bookkeeping in the existing `dispatch_res` arm at `:1283-1303`.
-        // That bookkeeping is intentionally skipped here because the
-        // mid-stream rejection means the fast tier did NOT receive a
-        // complete blob (the data-stream future erred mid-send), so
-        // pinning would pin a partial / absent entry. Callers retry with
-        // the typed-signal backoff and the next attempt re-runs the
-        // entire chunked-dispatch admission.
+        // #496 F2: this guard preserves the typed `BackpressureSignal`
+        // across the data-stream channel-closed wrapper (the wire-shape
+        // contract Bazel honors for backoff hints). It interacts with
+        // the durability/retry bookkeeping in two distinct fast-tier
+        // states:
+        //
+        //   - `fast_res.is_ok()`: fast tier received the COMPLETE blob
+        //     before the dispatcher's admit-time reject (e.g. PinBudget
+        //     exhausted at first chunk while the data future raced ahead
+        //     and finished feeding the full payload to the fast-tier
+        //     consumer). The fast tier now holds the bytes; the slow
+        //     tier does not. This satisfies the gate corner of the
+        //     admission/pin/eviction triangle (`gate-active`), so the
+        //     other two corners MUST hold: pin the fast-tier replica
+        //     AND surface the digest to the `failed_slow_writes` set so
+        //     the V3 self-retry drainer re-uploads from the pinned
+        //     fast-tier bytes on the next reconnect. Skipping either
+        //     would violate `gate ⇒ (pin AND failed_slow_writes-entry)`
+        //     — the blob would be NOT durable AND NOT flagged for
+        //     retry, surviving only until eviction pressure or the
+        //     120 s pin TTL discards it. (Pre-#496 the early return
+        //     here skipped both, dropping the recovery hook.)
+        //
+        //   - `fast_res.is_err()`: fast tier did NOT receive a complete
+        //     blob (data-stream future erred mid-send, or the fast-tier
+        //     consumer aborted). No bytes to pin, no value in flagging
+        //     a digest with no fast-tier source. The bookkeeping is
+        //     correctly skipped — callers retry with the typed-signal
+        //     backoff and the next attempt re-runs the entire chunked-
+        //     dispatch admission (including fast-tier write).
+        //
+        // Composite invariant (CLAUDE.md "Admission/Eviction/Pin
+        // Composability"): `gate-active ⇒ (fast-tier-pinned AND
+        // digest-in-failed_slow_writes)`. Pinned by test
+        // `fast_tier_ok_dispatch_err_records_failed_slow_write` in
+        // `nativelink-service/tests/bazel_facing_internal_chunking_test.rs`.
         let dispatch_res_carries_typed_backpressure = dispatch_res.as_ref().err().is_some_and(|e| {
             (e.code == Code::ResourceExhausted || e.code == Code::Aborted)
                 && error_has_backpressure_signal(e)
@@ -1685,13 +1713,27 @@ impl FastSlowStore {
                      dispatch_res.is_err(); dispatch_res must be Err here"
                 );
             };
+            // #496 F2: re-establish the composite invariant before
+            // returning the typed signal. When the fast tier holds the
+            // complete blob, record + pin so the V3 self-retry drainer
+            // can re-upload from the in-memory replica on reconnect.
+            let fast_tier_has_blob = fast_res.is_ok();
+            if fast_tier_has_blob {
+                if let StoreKey::Digest(d) = &key {
+                    self.failed_slow_writes.lock().insert(*d);
+                    self.fast_store.pin_digests(&[*d]);
+                }
+            }
             error!(
                 ?key,
                 elapsed_ms = data_elapsed.as_millis() as u64,
+                fast_tier_has_blob,
                 ?err,
                 "FastSlowStore::update (chunked): dispatcher rejected with \
                  typed BackpressureSignal — preserving across data-stream \
-                 channel-closed wrapper (M1 cascade bundle pass-2 dsr)",
+                 channel-closed wrapper (M1 cascade bundle pass-2 dsr); \
+                 fast-tier-OK case now records failed_slow_writes + pins \
+                 fast tier (#496 F2)",
             );
             return Err(err);
         }
