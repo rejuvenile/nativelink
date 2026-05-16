@@ -1100,7 +1100,11 @@ pub struct DirectoryCacheConfig {
     /// directories by replacing blocking symlinks with writable shallow-copy
     /// directories that preserve access to original content.
     ///
-    /// Default: true
+    /// Default: false. Direct-use mode is currently incompatible with
+    /// Bazel's `cargo_build_script_runner` (it writes to the input root,
+    /// creating runfiles symlinks + OUT_DIR files) which surfaces as
+    /// EEXIST/EPERM/ENOENT/ELOOP. Reverted in `f1f8267f` (2026-03-11);
+    /// re-enable once a copy-on-write approach lands.
     #[serde(default = "default_direct_use_mode")]
     pub direct_use_mode: bool,
 }
