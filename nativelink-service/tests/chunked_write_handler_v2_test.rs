@@ -1166,11 +1166,26 @@ async fn run_v1_bazel_dispatch_simulating_bytestream_write(
     digest: DigestInfo,
     payload: Vec<u8>,
 ) -> Result<u64, nativelink_error::Error> {
+    run_v1_bazel_dispatch_with_sink(filesystem_store, digest, payload, None).await
+}
+
+/// Same as `run_v1_bazel_dispatch_simulating_bytestream_write` but also
+/// wires the v1 dispatcher's `stable_digests_sink` so cross-version
+/// convergence tests can observe whether v1 fired BIS.
+async fn run_v1_bazel_dispatch_with_sink(
+    filesystem_store: Arc<FilesystemStore<FileEntryImpl>>,
+    digest: DigestInfo,
+    payload: Vec<u8>,
+    stable_digests_sink: Option<Arc<dyn Fn(DigestInfo) + Send + Sync>>,
+) -> Result<u64, nativelink_error::Error> {
     use nativelink_service::chunked_write_handler::BazelChunkedDispatcherImpl;
     use nativelink_store::chunked::BazelChunkedDispatcher;
 
-    let dispatcher = BazelChunkedDispatcherImpl::new(filesystem_store)
+    let mut dispatcher = BazelChunkedDispatcherImpl::new(filesystem_store)
         .with_chunk_size_for_test(TEST_CHUNK_SIZE);
+    if let Some(sink) = stable_digests_sink {
+        dispatcher = dispatcher.with_stable_digests_sink(sink);
+    }
 
     // Pump bytes through a buf channel so the dispatcher sees a real
     // `DropCloserReadHalf` (matching the production shape).
@@ -1346,11 +1361,17 @@ async fn cross_version_bazel_v1_plus_three_v2_bis_fires_exactly_once_497() {
     );
     let (client, _server_handle) = start_v2_server(handler).await;
 
-    // 1 v1 Bazel dispatcher + 3 v2 RPCs.
+    // 1 v1 Bazel dispatcher + 3 v2 RPCs. Wire BOTH v1 and v2 sinks
+    // to the same atomic counter so cross-version convergence is
+    // observable regardless of which path becomes the commit-runner.
+    let bis_count_v1 = Arc::clone(&bis_count);
     let store_for_v1 = Arc::clone(&store);
     let payload_for_v1 = payload.clone();
+    let v1_sink: Arc<dyn Fn(DigestInfo) + Send + Sync> = Arc::new(move |_d| {
+        bis_count_v1.fetch_add(1, Ordering::Relaxed);
+    });
     let v1_handle = tokio::spawn(async move {
-        run_v1_bazel_dispatch_simulating_bytestream_write(store_for_v1, digest, payload_for_v1)
+        run_v1_bazel_dispatch_with_sink(store_for_v1, digest, payload_for_v1, Some(v1_sink))
             .await
     });
 
@@ -1421,7 +1442,7 @@ async fn cross_version_priority_v1_first_then_v2_v2_goes_to_await_commit_497() {
 
     // v1 attaches as single_stream_owner first.
     let v1_writer_id = WriterId(101);
-    let (race_state, v1_outcome) = store
+    let (race_state, _v1_writer_guard, v1_outcome) = store
         .race_state_for_digest_and_attach_single_stream(&digest, TEST_CHUNK_SIZE as u32, v1_writer_id);
     assert!(
         matches!(v1_outcome, SingleStreamAttachOutcome::Owner),
@@ -1448,7 +1469,7 @@ async fn cross_version_priority_v1_first_then_v2_v2_goes_to_await_commit_497() {
 #[nativelink_test]
 async fn cross_version_priority_v2_first_then_v1_v1_goes_to_await_commit_497() {
     use nativelink_store::chunked::chunked_race_state::{
-        AdmitOutcome, RaceWriterGuard, SingleStreamAttachOutcome, WriterId,
+        AdmitOutcome, SingleStreamAttachOutcome, WriterId,
     };
 
     let (store, _content_path) = make_store().await;
@@ -1471,7 +1492,7 @@ async fn cross_version_priority_v2_first_then_v1_v1_goes_to_await_commit_497() {
     // v1 must observe AwaitCommit (NOT Owner) — otherwise both paths
     // would race the commit.
     let v1_writer_id = WriterId(404);
-    let (race_state2, v1_outcome) = store
+    let (race_state2, _v1_writer_guard, v1_outcome) = store
         .race_state_for_digest_and_attach_single_stream(&digest, TEST_CHUNK_SIZE as u32, v1_writer_id);
     assert!(
         Arc::ptr_eq(&race_state, &race_state2),

@@ -289,6 +289,13 @@ impl BitVec {
         true
     }
 
+    /// True if at least one bit is set. Used by #497 Option 1 to detect
+    /// "v2 has admitted at least one chunk" — yields the v1 owner gate
+    /// to v2 so v1 doesn't race v2's pwrites + commit.
+    fn any_set(&self) -> bool {
+        self.words.iter().any(|w| *w != 0)
+    }
+
     /// Returns the highest contiguous-from-zero offset (chunk index)
     /// that is set, plus 1; i.e., for chunks_present=[1,1,1,0,1,...]
     /// returns 3. Used for ADMITTED_SKIP_TO hints.
@@ -475,6 +482,20 @@ impl ChunkRaceState {
     ) -> AdmitOutcome {
         let chunk_idx = (offset / self.chunk_size as u64) as usize;
         let mut state = self.state.lock();
+        // #497 Option 1: if a commit result is already published (the
+        // single-stream owner committed and renamed `.partial` into the
+        // canonical CAS path, OR a v2 writer flipped the last bit and
+        // ran the commit), no further pwrite is meaningful — the
+        // `.partial` file no longer exists. Return AlreadyHave so the
+        // caller transitions to AwaitCommit and propagates the
+        // published result. Without this short-circuit, a v2 writer
+        // arriving AFTER v1's commit would pwrite into a vanished
+        // `.partial`, then attempt commit_to_holding on a missing file
+        // → "stat NotFound" Internal error (the original #494 v3 race
+        // window we observed in tests).
+        if state.commit_done_flag {
+            return AdmitOutcome::AlreadyHave;
+        }
         // #497 Option 1: if a single-stream writer owns the digest AND
         // it is NOT this writer, treat the offset as AlreadyHave so the
         // multi-chunk writer transitions to AwaitCommit and waits for
@@ -524,12 +545,45 @@ impl ChunkRaceState {
         writer_id: WriterId,
     ) -> SingleStreamAttachOutcome {
         let mut state = self.state.lock();
+        // #497 Option 1: also short-circuit if a result is already
+        // published. A late v1 writer that arrives after another
+        // writer's commit-rename must not claim Owner — the on-disk
+        // `.partial` no longer exists, and this writer would only
+        // discover that fact deep in `commit_to_holding`. Yield to
+        // the published result via AwaitCommit.
+        if state.commit_done_flag {
+            return SingleStreamAttachOutcome::AwaitCommit {
+                reason: AwaitCommitReason::AnotherSingleStreamOwner,
+            };
+        }
         if state.single_stream_owner.is_some() {
             return SingleStreamAttachOutcome::AwaitCommit {
                 reason: AwaitCommitReason::AnotherSingleStreamOwner,
             };
         }
+        // #497 Option 1: short-circuit if v2 has already filled the
+        // bitmap. The next event is v2's RunCommit transition (its
+        // last `mark_chunk_committed` flipped the last bit; commit-runner
+        // is about to be claimed). If we claim Owner here, the v1
+        // commit pipeline races v2's `v2_run_commit_path` for the
+        // `.partial` rename — exactly the original #494 sparse-zero
+        // corruption window. Yield: v2's commit is imminent; await
+        // its result.
+        if state.chunks_present.all_set() {
+            return SingleStreamAttachOutcome::AwaitCommit {
+                reason: AwaitCommitReason::V2WritersInFlight,
+            };
+        }
         if !state.chunks_in_flight.is_empty() {
+            return SingleStreamAttachOutcome::AwaitCommit {
+                reason: AwaitCommitReason::V2WritersInFlight,
+            };
+        }
+        // #497 Option 1: also yield if v2 has already pwritten ANY
+        // chunk (chunks_present has at least one bit set). v2's session
+        // is mid-stream and will eventually run commit; v1 claiming
+        // Owner here would race v2's pwrites + commit-rename.
+        if state.chunks_present.any_set() {
             return SingleStreamAttachOutcome::AwaitCommit {
                 reason: AwaitCommitReason::V2WritersInFlight,
             };
@@ -960,6 +1014,15 @@ impl SingleStreamOwnerGuard {
     /// Construct from an `Arc<ChunkRaceState>` after a successful
     /// `try_attach_single_stream_writer` returning `Owner`. Caller
     /// MUST keep the guard alive across the v1 write path.
+    ///
+    /// **Counting note:** this guard does NOT bump
+    /// `attached_writer_count`. The slot is held by the
+    /// `RaceWriterGuard` returned alongside this guard's outcome from
+    /// `get_or_create_and_attach_single_stream`. That arrangement
+    /// keeps the registry entry pinned for both Owner AND AwaitCommit
+    /// branches uniformly, so a v2 writer arriving after our publish
+    /// + try_remove always sees the SAME race-state (never a fresh
+    /// one, which would miss `commit_done_flag = true`).
     pub fn new(state: Arc<ChunkRaceState>, writer_id: WriterId) -> Self {
         Self {
             state,
@@ -1025,6 +1088,10 @@ impl Drop for SingleStreamOwnerGuard {
                  (commit_done already published; no synthetic publish needed)",
             );
         }
+        // Note: attached_writer_count is owned by the RaceWriterGuard
+        // returned alongside this guard from
+        // `get_or_create_and_attach_single_stream`. We do NOT decrement
+        // here — that would double-count the detach.
     }
 }
 
@@ -1205,22 +1272,32 @@ impl ChunkRaceRegistry {
     /// Holds the registry mutex across both steps (analogous to FIX-4's
     /// `get_or_create_and_attach`) so a concurrent `try_remove_if_unused`
     /// cannot split concurrent writers across two distinct race-states.
-    /// Returns the race-state Arc + the attachment outcome.
+    /// Returns the race-state Arc, a `RaceWriterGuard` (always holds an
+    /// `attached_writer_count` slot — paired Drop decrements), and the
+    /// attachment outcome.
     ///
     /// Caller-side contract:
-    ///   - On `SingleStreamAttachOutcome::Owner`, caller MUST construct
-    ///     a `SingleStreamOwnerGuard` and keep it alive across the v1
-    ///     write path. The guard's Drop releases the gate.
+    ///   - The returned `RaceWriterGuard` MUST be kept alive until the
+    ///     caller no longer needs the race-state. It pins the registry
+    ///     entry so a concurrent `try_remove_if_unused` cannot drop the
+    ///     state out from under us — and so a sibling writer that
+    ///     attaches after our `publish_commit_result` sees the SAME
+    ///     state with `commit_done_flag = true`, not a fresh state.
+    ///   - On `SingleStreamAttachOutcome::Owner`, caller ALSO constructs
+    ///     a `SingleStreamOwnerGuard`. That guard's Drop releases the
+    ///     `single_stream_owner` slot AND publishes a synthetic Cancel
+    ///     if no result was published.
     ///   - On `SingleStreamAttachOutcome::AwaitCommit`, caller MUST
     ///     drain its inbound reader to EOF (so producers can finish
     ///     their stream cleanly) and then await `commit_done` via
-    ///     `subscribe_commit_done` + `peek_commit_result`.
+    ///     `subscribe_commit_done` + `peek_commit_result`. Drop of the
+    ///     `RaceWriterGuard` after the await releases the attached slot.
     pub fn get_or_create_and_attach_single_stream<F>(
         &self,
         digest: DigestInfo,
         writer_id: WriterId,
         make: F,
-    ) -> (Arc<ChunkRaceState>, SingleStreamAttachOutcome)
+    ) -> (Arc<ChunkRaceState>, RaceWriterGuard, SingleStreamAttachOutcome)
     where
         F: FnOnce() -> ChunkRaceState,
     {
@@ -1232,6 +1309,12 @@ impl ChunkRaceRegistry {
             guard.insert(digest, Arc::clone(&new_state));
             new_state
         };
+        // ALWAYS bump attached_writer_count via RaceWriterGuard so the
+        // registry entry stays pinned for THIS caller's lifetime — even
+        // on AwaitCommit. Without this, v1's AwaitCommit branch could
+        // observe a fresh state if another writer's `try_remove_if_unused`
+        // races our peek_commit_result.
+        let race_guard = RaceWriterGuard::attach(Arc::clone(&state), writer_id);
         // try_attach_single_stream_writer takes the per-state lock
         // (separate from the registry mutex). Safe because the per-state
         // lock is a parking_lot::Mutex that does NOT re-enter the
@@ -1239,7 +1322,7 @@ impl ChunkRaceRegistry {
         // guard (Drop of the guard never re-enters the registry).
         let outcome = state.try_attach_single_stream_writer(writer_id);
         drop(guard);
-        (state, outcome)
+        (state, race_guard, outcome)
     }
 
     /// Look up the race-state for `digest` without creating one.

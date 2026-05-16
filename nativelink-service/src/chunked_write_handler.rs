@@ -747,7 +747,12 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // retries (its v1 client classifier handles Aborted → retry).
         let writer_id = next_v1_writer_id();
         let chunk_size_u32 = u32::try_from(self.chunk_size).unwrap_or(u32::MAX);
-        let (race_state, attach_outcome) = self
+        // The `_race_writer_guard` is held for the entire fn lifetime
+        // (drops at the end). It pins `attached_writer_count` so a
+        // concurrent v2 writer that arrives after our `publish_commit_result`
+        // can never observe a fresh race-state — see comment block
+        // below near the publish + cleanup site for full rationale.
+        let (race_state, _race_writer_guard, attach_outcome) = self
             .filesystem_store
             .race_state_for_digest_and_attach_single_stream(
                 &digest,
@@ -762,6 +767,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 ))
             }
             nativelink_store::chunked::chunked_race_state::SingleStreamAttachOutcome::AwaitCommit { reason } => {
+                // _race_writer_guard drops at end of fn scope (Aborted
+                // path); the reaped count covers the entire RPC lifetime.
                 self.metrics
                     .concurrent_same_digest_rejections_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -994,11 +1001,17 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         if let Some(g) = single_stream_owner_guard {
             g.relinquish();
         }
-        // Best-effort registry cleanup.
-        let _ = self
-            .filesystem_store
-            .chunked_race_registry()
-            .try_remove_if_unused(&stream_digest);
+        // Hold race_writer_guard until function return scope (drop at
+        // end). Same race-window rationale as `BazelChunkedDispatcher::dispatch`:
+        // we do NOT call `try_remove_if_unused` here. A concurrent v2
+        // writer that arrives after our publish but before our remove
+        // would observe `attached_writer_count=0`, we would remove the
+        // entry, and the v2 writer's next `race_state_for_digest_and_attach`
+        // would mint a FRESH state — missing `commit_done_flag = true`,
+        // admitting chunks, and failing at commit_to_holding. The entry
+        // persists until the next sibling writer's `try_remove_if_unused`
+        // (in v2) succeeds. (#497 v3 race window — first observed in
+        // `cross_version_bazel_v1_plus_v2_no_sparse_zero_corruption_497_option_1`.)
 
         let commit_result = match commit_result {
             Ok(r) => r,
@@ -3211,7 +3224,12 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
         // single registry.
         let writer_id = next_v1_writer_id();
         let chunk_size_u32 = u32::try_from(self.chunk_size).unwrap_or(u32::MAX);
-        let (race_state, attach_outcome) = self
+        // The `_race_writer_guard` is held for the entire fn lifetime
+        // (drops at the end). It pins `attached_writer_count` so a
+        // concurrent v2 writer that arrives after our `publish_commit_result`
+        // can never observe a fresh race-state — see the comment at the
+        // publish site below for full rationale.
+        let (race_state, _race_writer_guard, attach_outcome) = self
             .filesystem_store
             .race_state_for_digest_and_attach_single_stream(
                 &digest,
@@ -3298,56 +3316,78 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                 )
                 .await;
 
-                // #497 Option 1: publish the v1 commit outcome on the
-                // race-state so any sibling v2 writers (or another v1
-                // writer that arrived after we attached) wakes from
-                // `commit_done` with the same result.
-                let race_publish = match &dispatch_res {
-                    Ok(outcome) => Ok(RaceCommitResult {
-                        committed_size: outcome.committed_size,
-                    }),
-                    Err(err) => Err(err.clone()),
-                };
-                race_state.publish_commit_result(race_publish);
-
-                // Release the single-stream owner gate. Drop is
-                // idempotent — the guard's Drop also clears, but
-                // explicit relinquish documents intent.
-                owner_guard.relinquish();
-
-                // Best-effort cleanup of the registry entry (only
-                // removes if no writers attached; v2 writers that joined
-                // AwaitCommit may still be reading commit_result).
-                let _ = self
-                    .filesystem_store
-                    .chunked_race_registry()
-                    .try_remove_if_unused(&digest);
-
+                // #497 Option 1: dispatch_bazel_facing_internal_chunking
+                // returns Ok BEFORE the actual commit completes (CommitMode::AsyncCommit:
+                // the chunked driver task pwrites + commits + finalizes
+                // asynchronously). Publishing Ok to the race-state BEFORE
+                // the on-disk commit lands would let a sibling v2 writer
+                // observe `commit_done_flag = true` and return success to
+                // its client while the canonical CAS file is still
+                // missing on disk — a phantom-success leak (#497 v3 race).
+                //
+                // Therefore: on Ok, defer the race-state publish until
+                // the in_flight entry drains (signaling the chunked
+                // driver completed commit_and_verify + finalize_holding).
+                // On Err, publish immediately (no async commit pending).
+                //
+                // Release the single-stream owner gate AFTER we know whether
+                // to publish synchronously or defer. The owner-guard's
+                // `relinquish` clears `single_stream_owner` (which we DO
+                // want to clear immediately so a follow-up v1 writer can
+                // claim Owner) but also publishes synthetic Cancelled IF
+                // commit_done is still false at drop. We must avoid that
+                // synthetic Cancelled on the Ok-defer path, so we
+                // explicitly relinquish only on the Err path.
                 match (dispatch_res, inflight_guard) {
-                    (Ok(outcome), Some(guard)) => {
-                        let (set, dig, notify) = guard.disarm();
-                        let in_flight_for_reaper = Arc::clone(&self.in_flight);
+                    (Ok(outcome), inflight_guard_opt) => {
+                        // Schedule the deferred publish. Hold the race_state
+                        // Arc + the owner_guard alive in the spawned task.
+                        let race_state_for_publish = Arc::clone(&race_state);
+                        let owner_guard_for_publish = owner_guard;
+                        let in_flight_for_publish = Arc::clone(&self.in_flight);
+                        let dig_for_publish = digest;
+                        let committed_size = outcome.committed_size;
+                        let inflight_set_for_reaper = inflight_guard_opt.map(|g| g.disarm());
                         tokio::spawn(async move {
+                            // Wait for the chunked driver's reaper to
+                            // remove the in_flight entry — this is the
+                            // signal that commit + finalize completed.
                             loop {
-                                if !in_flight_for_reaper.contains_digest(&dig) {
+                                if !in_flight_for_publish.contains_digest(&dig_for_publish) {
                                     break;
                                 }
                                 tokio::task::yield_now().await;
                             }
-                            let mut guard = set.lock();
-                            guard.remove(&dig);
-                            let became_empty = guard.is_empty();
-                            drop(guard);
-                            if became_empty {
-                                if let Some(n) = notify.as_ref() {
-                                    n.notify_waiters();
+                            // Now publish to siblings. Owner_guard's drop
+                            // (after this) clears single_stream_owner.
+                            race_state_for_publish.publish_commit_result(Ok(RaceCommitResult {
+                                committed_size,
+                            }));
+                            // Explicit relinquish so SingleStreamOwnerGuard::Drop
+                            // does NOT publish a synthetic Cancelled.
+                            owner_guard_for_publish.relinquish();
+                            // Then handle the inflight_set bookkeeping
+                            // (mirrors the prior reaper).
+                            if let Some((set, dig, notify)) = inflight_set_for_reaper {
+                                let mut guard = set.lock();
+                                guard.remove(&dig);
+                                let became_empty = guard.is_empty();
+                                drop(guard);
+                                if became_empty {
+                                    if let Some(n) = notify.as_ref() {
+                                        n.notify_waiters();
+                                    }
                                 }
                             }
                         });
-                        Ok(outcome.committed_size)
+                        Ok(committed_size)
                     }
-                    (Ok(outcome), None) => Ok(outcome.committed_size),
-                    (Err(err), _guard) => Err(err),
+                    (Err(err), _guard) => {
+                        // Synchronous publish + relinquish on Err.
+                        race_state.publish_commit_result(Err(err.clone()));
+                        owner_guard.relinquish();
+                        Err(err)
+                    }
                 }
             }
         }

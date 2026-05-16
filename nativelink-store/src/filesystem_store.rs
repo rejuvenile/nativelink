@@ -1529,14 +1529,21 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
     /// worker WriteChunked v1) to claim exclusive write authority on a
     /// digest so concurrent v2 writers transition to AwaitCommit.
     ///
-    /// Returns the race-state Arc plus the attachment outcome:
+    /// Returns the race-state Arc, a `RaceWriterGuard` (always pinning
+    /// the registry entry for the caller's lifetime), and the attachment
+    /// outcome:
     ///   - `Owner`: caller proceeds with the v1 write path. Caller MUST
     ///     construct a `SingleStreamOwnerGuard` (NOT returned by this
-    ///     function — the guard's lifetime is tied to the caller's commit
-    ///     pipeline, not to this function's scope).
+    ///     function — the owner-guard's lifetime is tied to the caller's
+    ///     commit pipeline). The `RaceWriterGuard` returned here keeps
+    ///     the entry pinned even after `relinquish` of the owner-guard,
+    ///     so a sibling v2 writer arriving after the publish always sees
+    ///     the SAME race-state with `commit_done_flag = true`.
     ///   - `AwaitCommit`: another writer (single-stream owner OR v2
     ///     multi-chunk writers) is active. Caller MUST drain its inbound
-    ///     reader to EOF and then await `commit_done`.
+    ///     reader to EOF and then await `commit_done`. The
+    ///     `RaceWriterGuard` keeps the entry alive so the published
+    ///     result is observable.
     pub fn race_state_for_digest_and_attach_single_stream(
         &self,
         digest: &DigestInfo,
@@ -1544,6 +1551,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         writer_id: crate::chunked::chunked_race_state::WriterId,
     ) -> (
         Arc<crate::chunked::chunked_race_state::ChunkRaceState>,
+        crate::chunked::chunked_race_state::RaceWriterGuard,
         crate::chunked::chunked_race_state::SingleStreamAttachOutcome,
     ) {
         let partial_path = crate::chunked::chunked_filesystem::partial_temp_path(
