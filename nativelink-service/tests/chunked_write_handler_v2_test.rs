@@ -2608,3 +2608,198 @@ async fn major_f_deferred_publish_propagates_commit_err_to_sibling_v2() {
         }
     }
 }
+
+// =============================================================================
+// #508: v2_await_commit_result watchdog Err MUST carry the
+// `WatchdogTimeoutSignal` discriminator so chunked_client::classify_retryable
+// returns `Retry { WatchdogDeadline }` (not `Abort`) for v2 sibling writers.
+//
+// The bug: `chunked_write_handler_v2.rs::v2_await_commit_result`'s Err arm
+// built a bare `Code::DeadlineExceeded` via `make_err!` with no detail
+// attached. `chunked_client.rs::classify_retryable` (`:618-628`) requires
+// BOTH `Code::DeadlineExceeded` AND `error_has_watchdog_timeout_signal(err)`
+// to return `RetryDecision::Retry { WatchdogDeadline }`. Bare DeadlineExceeded
+// (no discriminator) maps to `RetryDecision::Abort` — so v2 sibling writers
+// whose watchdog fired would silently NOT retry, even though the watchdog is
+// the load-bearing recoverable-failure path.
+//
+// v1 attaches the discriminator correctly at `chunked_write_handler.rs:2354-2357`;
+// v2 did not. The fix mirrors v1's pattern.
+//
+// Seams crossed end-to-end by this regression test:
+//   1. Producer: `chunked_write_handler_v2::v2_await_commit_result` Err arm.
+//   2. Wire-shape: `Error::deadline_exceeded_with_detail` + the
+//      `prost_types::Any` detail with `WatchdogTimeoutSignal` payload.
+//   3. Receive-side classifier surrogate: `error_has_watchdog_timeout_signal`
+//      — the exact same predicate `classify_retryable` uses to gate its
+//      `DeadlineExceeded → Retry` arm. The classifier is module-private to
+//      `chunked_client.rs`; the predicate is the load-bearing wire contract,
+//      and its existing in-module tests at
+//      `chunked_client.rs:1100-1172` already prove that
+//      (code == DeadlineExceeded AND predicate → true) yields
+//      Retry { WatchdogDeadline } AND bare DeadlineExceeded yields Abort.
+//      This test composes the v2 producer with the same predicate so the
+//      end-to-end contract is bit-identical.
+// =============================================================================
+
+/// #508: drive `v2_await_commit_result` to its watchdog-elapsed Err arm under
+/// paused time, then assert the synthesised Err carries the
+/// `WatchdogTimeoutSignal` discriminator so `chunked_client.rs`'s
+/// `classify_retryable` returns `Retry { WatchdogDeadline }` (NOT `Abort`).
+///
+/// Mutation step (per CLAUDE.md TDD): drop the
+/// `encode_watchdog_timeout_signal_any(...) + Error::deadline_exceeded_with_detail(...)`
+/// pair in `chunked_write_handler_v2.rs` back to a bare
+/// `make_err!(Code::DeadlineExceeded, ...)`. This test red-fails with the
+/// bespoke `"#508: v2 watchdog Err missing WatchdogTimeoutSignal
+/// discriminator — classify_retryable returned Abort instead of Retry"`
+/// message.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn v2_watchdog_err_carries_discriminator_so_classifier_retries() {
+    use core::time::Duration;
+    use std::path::PathBuf;
+    use nativelink_error::Code;
+    use nativelink_service::chunked_write_handler_v2::v2_await_commit_result_for_test;
+    use nativelink_store::chunked::chunked_race_state::ChunkRaceState;
+    use nativelink_store::chunked_signal::error_has_watchdog_timeout_signal;
+
+    let mut hash = [0u8; 32];
+    hash[0] = 0x50;
+    hash[1] = 0x08;
+    let digest = DigestInfo::new(hash, 2048);
+    let race_state = Arc::new(ChunkRaceState::new(
+        digest,
+        2048,
+        PathBuf::from("/tmp/issue_508_v2_watchdog_err_carries_discriminator.partial"),
+    ));
+
+    // Spawn the awaiter task running the real production function. No
+    // publisher fires; the watchdog `COMMIT_WAIT_WATCHDOG = 60s` is the
+    // only path that resolves the await. Under paused time we advance
+    // virtual time past the deadline so the timeout future fires WITHOUT
+    // wall-clock cost.
+    let race_state_for_awaiter = Arc::clone(&race_state);
+    let awaiter = tokio::spawn(async move {
+        v2_await_commit_result_for_test(&race_state_for_awaiter).await
+    });
+
+    // Yield + advance virtual time past the 60s watchdog deadline so the
+    // inner `tokio::time::timeout` fires. The watchdog is 60s; advance
+    // 61s for safety.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+
+    // Wall-clock bound (paused-time tests advance virtual time, but the
+    // outer await still has a real-time backstop in case the test wedges).
+    let captured_err = tokio::time::timeout(Duration::from_secs(10), awaiter)
+        .await
+        .expect(
+            "#508: v2_await_commit_result must complete after virtual-time \
+             advance past COMMIT_WAIT_WATCHDOG (60s); test hung — the \
+             watchdog Err arm did not fire, possibly because the inner \
+             tokio::time::timeout call was removed or restructured",
+        )
+        .expect("awaiter task must not panic")
+        .expect_err(
+            "#508: v2_await_commit_result must return Err on watchdog fire \
+             (no publisher attached); got Ok unexpectedly",
+        );
+
+    // Producer-side seam: the Err must be DeadlineExceeded with the
+    // `WatchdogTimeoutSignal` discriminator attached. This is the
+    // bit-identical wire shape the v2 client's chunked dispatcher sees
+    // and passes through to `classify_retryable`.
+    assert_eq!(
+        captured_err.code, Code::DeadlineExceeded,
+        "#508 (seam 1, producer): v2 watchdog Err must carry \
+         Code::DeadlineExceeded; got {:?}",
+        captured_err.code,
+    );
+    assert!(
+        error_has_watchdog_timeout_signal(&captured_err),
+        "#508: v2 watchdog Err missing WatchdogTimeoutSignal \
+         discriminator — classify_retryable returned Abort instead of \
+         Retry. The bare `make_err!(Code::DeadlineExceeded, ...)` at \
+         chunked_write_handler_v2.rs v2_await_commit_result Err arm \
+         must be replaced with \
+         `Error::deadline_exceeded_with_detail(msg, \
+         encode_watchdog_timeout_signal_any(Reason::ChunkedCommitWatchdog, \
+         COMMIT_WAIT_WATCHDOG.as_secs()))` mirroring v1 at \
+         chunked_write_handler.rs:2354-2357. Captured err: {captured_err:?}",
+    );
+}
+
+/// #508 over-action / asymmetric-contract-coverage: when the commit-runner
+/// publishes Ok BEFORE the watchdog fires, the result MUST be a clean Ok
+/// (the discriminator-attachment path is on the watchdog Err arm only and
+/// must NOT contaminate the success path). Guards against a regression
+/// where the discriminator is attached unconditionally.
+///
+/// Mutation step (per CLAUDE.md TDD asymmetric-contract): change the Ok
+/// arm to re-wrap the result in an `Err(deadline_exceeded_with_detail(...))`.
+/// This test red-fails with the bespoke `"#508 over-action: success path
+/// produced Err with WatchdogTimeoutSignal discriminator — discriminator
+/// must only attach to the watchdog Err arm"` message.
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn v2_await_commit_result_success_path_carries_no_discriminator() {
+    use core::time::Duration;
+    use std::path::PathBuf;
+    use nativelink_service::chunked_write_handler_v2::v2_await_commit_result_for_test;
+    use nativelink_store::chunked::chunked_race_state::{ChunkRaceState, RaceCommitResult};
+    use nativelink_store::chunked_signal::error_has_watchdog_timeout_signal;
+
+    let mut hash = [0u8; 32];
+    hash[0] = 0x50;
+    hash[1] = 0x08;
+    hash[2] = 0x0C; // 'C' for clean — distinguishes from sibling test
+    let digest = DigestInfo::new(hash, 4096);
+    let race_state = Arc::new(ChunkRaceState::new(
+        digest,
+        4096,
+        PathBuf::from("/tmp/issue_508_v2_success_path_no_discriminator.partial"),
+    ));
+
+    // Awaiter parks on the notify; publisher fires BEFORE watchdog.
+    let race_state_for_awaiter = Arc::clone(&race_state);
+    let awaiter = tokio::spawn(async move {
+        v2_await_commit_result_for_test(&race_state_for_awaiter).await
+    });
+
+    // Let the awaiter run through subscribe + pin + enable before the
+    // publisher fires. With paused time, `yield_now` is the right
+    // primitive (CLAUDE.md "No tokio::time::sleep as synchronization").
+    tokio::task::yield_now().await;
+    race_state.publish_commit_result(Ok(RaceCommitResult { committed_size: 4096 }));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), awaiter)
+        .await
+        .expect(
+            "#508 over-action: v2_await_commit_result must resolve immediately \
+             after publish_commit_result(Ok); test hung — possibly a missed-wakeup \
+             regression unrelated to #508 (see BLOCK-E test above)",
+        )
+        .expect("awaiter task must not panic");
+
+    let commit = outcome.expect(
+        "#508 over-action: success path MUST produce Ok when commit-runner \
+         publishes Ok before watchdog — the discriminator-attachment must \
+         only fire on the watchdog Err arm, never contaminate the success \
+         path. Got Err",
+    );
+    assert_eq!(
+        commit.committed_size, 4096,
+        "#508 over-action sanity: committed_size must round-trip from the publish",
+    );
+
+    // Construct an Err with the same digest to sanity-check that
+    // `error_has_watchdog_timeout_signal` correctly distinguishes Ok
+    // (no Err to test against, but the property is "Ok carries no Err
+    // path"). The Ok arm by definition has no Err to check; the
+    // over-action contract is "success path produces Ok, not Err". The
+    // assertion above (`outcome.expect`) already proves this. If a
+    // regression makes the Ok arm re-wrap in
+    // `deadline_exceeded_with_detail`, the `expect` above red-fails
+    // with the bespoke message — discriminator presence on Err is
+    // structurally tested by the sibling under-action test.
+    let _ = error_has_watchdog_timeout_signal; // referenced for grep-able linkage
+}

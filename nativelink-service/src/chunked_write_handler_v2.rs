@@ -71,13 +71,14 @@ use tracing::{debug, info, warn};
 
 use nativelink_error::{Code, Error, make_err, make_input_err};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
-    WriteChunk, WriteChunkedAck, WriteChunkedFrame, WriteChunkedResponse, write_chunked_ack,
-    write_chunked_frame,
+    WriteChunk, WriteChunkedAck, WriteChunkedFrame, WriteChunkedResponse, watchdog_timeout_signal,
+    write_chunked_ack, write_chunked_frame,
 };
 use nativelink_store::chunked::chunked_race_state::{
     AdmitOutcome, ChunkRaceState, CommitResponsibility, CommitRunnerGuard, RaceCommitResult,
     WriterId,
 };
+use nativelink_store::chunked_signal::encode_watchdog_timeout_signal_any;
 use nativelink_store::filesystem_store::FileEntry;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::cpu_pool::cpu_pool;
@@ -974,12 +975,47 @@ async fn v2_await_commit_result(
                 "WriteChunkedV2: commit_done fired but commit_result not published"
             ))
         }),
-        Err(_) => Err(make_err!(
-            Code::DeadlineExceeded,
-            "WriteChunkedV2: commit watchdog ({} s) elapsed waiting for commit-runner",
-            COMMIT_WAIT_WATCHDOG.as_secs()
-        )),
+        Err(_) => {
+            // #508: attach the `WatchdogTimeoutSignal` discriminator so
+            // the chunked client's `classify_retryable` predicate
+            // (`chunked_client.rs::classify_retryable`) returns
+            // `Retry { WatchdogDeadline }` instead of `Abort`. Mirrors
+            // v1's pattern at `chunked_write_handler.rs:2354-2357`.
+            // Without the discriminator, ANY `DeadlineExceeded` —
+            // including a future per-RPC `tonic::Request::set_timeout`
+            // or the chunk-driver per-pwrite/e2e SHA timeouts — would
+            // silently inherit the retry intended only for the
+            // server-side watchdog; bare `DeadlineExceeded` MUST map to
+            // `Abort` at the classifier so v2 sibling writers that see
+            // the watchdog fire correctly retry the whole blob.
+            let detail = encode_watchdog_timeout_signal_any(
+                watchdog_timeout_signal::Reason::ChunkedCommitWatchdog,
+                COMMIT_WAIT_WATCHDOG.as_secs(),
+            );
+            Err(Error::deadline_exceeded_with_detail(
+                format!(
+                    "WriteChunkedV2: commit watchdog ({} s) elapsed waiting for commit-runner",
+                    COMMIT_WAIT_WATCHDOG.as_secs()
+                ),
+                detail,
+            ))
+        }
     }
+}
+
+/// #508 test-only shim: expose the module-private `v2_await_commit_result`
+/// to integration tests in `tests/chunked_write_handler_v2_test.rs`. Mirrors
+/// the `v2_pump_cross_writer_metric_for_test` pattern above. The integration
+/// test exercises the watchdog-Err arm and asserts the synthesised Err
+/// carries the `WatchdogTimeoutSignal` discriminator so that
+/// `chunked_client.rs::classify_retryable` returns `Retry { WatchdogDeadline }`
+/// rather than `Abort` for sibling writers seeing the wedge.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub async fn v2_await_commit_result_for_test(
+    race_state: &Arc<ChunkRaceState>,
+) -> Result<RaceCommitResult, Error> {
+    v2_await_commit_result(race_state).await
 }
 
 /// Send the final `WriteChunkedFrame` to the client based on the
