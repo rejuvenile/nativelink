@@ -1791,9 +1791,14 @@ mod tests {
     #[test]
     fn single_stream_owner_guard_drop_clears_slot() {
         // #497 Option 1: SingleStreamOwnerGuard's Drop MUST clear
-        // the slot so a future writer can claim. Idempotency check:
-        // dropping a guard whose slot was already cleared (by a
-        // different writer somehow) is a no-op.
+        // the slot AND publish a synthetic Cancelled (the cancel-safety
+        // contract: a sibling that waited on commit_done observes the
+        // synthetic Err rather than wedging the watchdog). After Drop
+        // (without relinquish), `single_stream_owner` is None AND
+        // `commit_done_flag` is true. A new writer attempting to attach
+        // observes AwaitCommit with the published Cancelled — NOT Owner.
+        // (To enable a new Owner attach the registry entry would need to
+        // be torn down via try_remove_if_unused first.)
         let chunk_size: u32 = 1024;
         let state = make_state(chunk_size as u64, chunk_size);
         let writer = WriterId(90);
@@ -1802,19 +1807,28 @@ mod tests {
             assert!(matches!(outcome, SingleStreamAttachOutcome::Owner));
             let _guard = SingleStreamOwnerGuard::new(Arc::clone(&state), writer);
             assert_eq!(state.single_stream_owner(), Some(writer));
-        } // _guard drops here
+        } // _guard drops here, publishing synthetic Cancelled
+
         assert_eq!(
             state.single_stream_owner(),
             None,
             "SingleStreamOwnerGuard::Drop MUST clear single_stream_owner"
         );
+        assert!(
+            state.commit_done(),
+            "SingleStreamOwnerGuard::Drop without relinquish MUST publish \
+             synthetic Cancelled (commit_done_flag = true)"
+        );
 
-        // Now another writer can attach.
+        // A new writer arriving on this state observes AwaitCommit with
+        // the published Cancelled (not Owner). To get Owner, the registry
+        // would need to evict + recreate.
         let writer2 = WriterId(91);
         let outcome2 = state.try_attach_single_stream_writer(writer2);
         assert!(
-            matches!(outcome2, SingleStreamAttachOutcome::Owner),
-            "post-drop, a new single-stream writer must be able to attach as Owner"
+            matches!(outcome2, SingleStreamAttachOutcome::AwaitCommit { .. }),
+            "post-drop (no relinquish), a new attach observes AwaitCommit \
+             because commit_done_flag is set; got {outcome2:?}"
         );
     }
 

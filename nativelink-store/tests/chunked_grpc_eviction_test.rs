@@ -67,6 +67,18 @@ struct UnavailableOnWriteChunked;
 
 #[tonic::async_trait]
 impl CasExtensions for UnavailableOnWriteChunked {
+    type WriteChunkedV2Stream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<
+                    Item = Result<
+                        nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WriteChunkedFrame,
+                        tonic::Status,
+                    >,
+                > + Send
+                + 'static,
+        >,
+    >;
+
     async fn write_chunked(
         &self,
         _request: tonic::Request<tonic::Streaming<WriteChunk>>,
@@ -79,6 +91,15 @@ impl CasExtensions for UnavailableOnWriteChunked {
         let _ = std::marker::PhantomData::<UpdateForWorker>;
         Err(tonic::Status::unavailable(
             "fake worker: GOAWAY-shaped failure for #147 eviction test",
+        ))
+    }
+
+    async fn write_chunked_v2(
+        &self,
+        _request: tonic::Request<tonic::Streaming<WriteChunk>>,
+    ) -> Result<tonic::Response<Self::WriteChunkedV2Stream>, tonic::Status> {
+        Err(tonic::Status::unavailable(
+            "fake worker: GOAWAY-shaped failure (write_chunked_v2 stub for trait completeness)",
         ))
     }
 }
