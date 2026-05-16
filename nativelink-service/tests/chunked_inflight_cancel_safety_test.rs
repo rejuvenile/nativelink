@@ -51,7 +51,8 @@
 
 #![cfg(feature = "chunked_fast_slow")]
 
-use std::collections::HashSet;
+use core::num::NonZeroU32;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nativelink_macro::nativelink_test;
@@ -61,6 +62,75 @@ use parking_lot::Mutex;
 use pretty_assertions::assert_eq;
 use tokio::sync::Notify;
 
+// MAJOR-G (#499 followup) regression: two concurrent InFlightChunkedGuards
+// for the same digest must BOTH be observable until BOTH drop. Pre-fix
+// (HashSet), the first drop removed the entry while the second was
+// still in-flight — a transient phantom-missing window for readers.
+//
+// This test exercises the refcount HashMap contract:
+//   1. Create guard1 → refcount=1
+//   2. Create guard2 → refcount=2 (entry still present)
+//   3. Drop guard1 → refcount=1 (entry STILL present)
+//   4. Drop guard2 → refcount=0 (entry removed; notify fires)
+//
+// Mutation: change `InFlightChunkedGuard::Drop` to always `guard.remove(...)`
+// regardless of refcount. Test MUST red-fail with the bespoke message
+// `"MAJOR-G: refcount removed digest while second guard still in-flight"`.
+#[nativelink_test]
+async fn major_g_refcount_keeps_digest_visible_until_both_guards_drop() {
+    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let notify = Arc::new(Notify::new());
+    let digest = make_digest(0x42);
+
+    {
+        // Guard 1: first session's RAII.
+        let _g1 = InFlightChunkedGuard::new(
+            Arc::clone(&set),
+            digest,
+            Some(Arc::clone(&notify)),
+        );
+        assert_eq!(
+            set.lock().get(&digest).map(|c| c.get()),
+            Some(1),
+            "MAJOR-G: first guard MUST bump refcount to 1"
+        );
+
+        {
+            // Guard 2: second concurrent session's RAII for the SAME digest.
+            let _g2 = InFlightChunkedGuard::new(
+                Arc::clone(&set),
+                digest,
+                Some(Arc::clone(&notify)),
+            );
+            assert_eq!(
+                set.lock().get(&digest).map(|c| c.get()),
+                Some(2),
+                "MAJOR-G: second guard MUST bump refcount to 2 (NOT \
+                 idempotent set-insert); pre-fix HashSet treated this as \
+                 no-op, leading to first-drop-removes-second-still-in-flight"
+            );
+            // g2 drops here; refcount goes 2 → 1; entry remains.
+        }
+
+        assert_eq!(
+            set.lock().get(&digest).map(|c| c.get()),
+            Some(1),
+            "MAJOR-G: refcount removed digest while second guard still \
+             in-flight — first guard drop must decrement, NOT remove, \
+             when refcount > 1. This is the central MAJOR-G contract; \
+             without it, BLOCK-B's reader-wait fails for the second \
+             session's window."
+        );
+        // g1 drops here; refcount goes 1 → 0; entry removed; notify fires.
+    }
+
+    assert!(
+        set.lock().is_empty(),
+        "MAJOR-G: both guards dropped; set MUST be empty"
+    );
+}
+
 fn make_digest(byte: u8) -> DigestInfo {
     let mut packed = [0u8; 32];
     packed[0] = byte;
@@ -69,19 +139,20 @@ fn make_digest(byte: u8) -> DigestInfo {
 
 #[nativelink_test]
 async fn guard_drop_removes_digest() {
-    let set: Arc<Mutex<HashSet<DigestInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xA1);
 
     {
         let _guard = InFlightChunkedGuard::new(Arc::clone(&set), digest, Some(Arc::clone(&notify)));
         assert!(
-            set.lock().contains(&digest),
+            set.lock().contains_key(&digest),
             "InFlightChunkedGuard::new MUST insert digest into set"
         );
     }
     assert!(
-        !set.lock().contains(&digest),
+        !set.lock().contains_key(&digest),
         "InFlightChunkedGuard::drop MUST remove digest from set"
     );
     assert_eq!(set.lock().len(), 0, "set must be empty after guard drop");
@@ -95,7 +166,8 @@ async fn guard_drop_notifies_when_set_becomes_empty() {
     // graceful-drain wakes. The RAII guard preserves this on the cancel
     // path (where the manual code path never gets a chance to call
     // notify_waiters).
-    let set: Arc<Mutex<HashSet<DigestInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xB2);
 
@@ -148,7 +220,8 @@ async fn guard_drop_notifies_when_set_becomes_empty() {
 /// the behavior and is theatre.
 #[nativelink_test]
 async fn cancel_mid_await_removes_digest() {
-    let set: Arc<Mutex<HashSet<DigestInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xC3);
 
@@ -207,7 +280,8 @@ async fn disarm_prevents_drop_removal() {
     // that removes only after the chunked-driver in-flight tracker
     // drains. Disarm MUST make Drop a no-op so the digest stays in the
     // set during async-commit (preserving #210 graceful-drain).
-    let set: Arc<Mutex<HashSet<DigestInfo>>> = Arc::new(Mutex::new(HashSet::new()));
+    let set: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xD4);
 
@@ -217,7 +291,7 @@ async fn disarm_prevents_drop_removal() {
         let (set_handed_off, dig_handed_off, notify_handed_off) = guard.disarm();
         // After disarm, Drop has fired but did NOT remove (no-op Drop).
         assert!(
-            set.lock().contains(&digest),
+            set.lock().contains_key(&digest),
             "disarm MUST leave digest in set so success-path reaper owns removal"
         );
         // Hand-off triple should be the same Arc/digest the caller passed in.

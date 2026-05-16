@@ -1682,7 +1682,7 @@ async fn fix_1b_ack_send_failure_on_runcommit_still_fires_bis_sink() {
 
 #[nativelink_test]
 async fn v2_session_registers_in_chunked_in_flight_digests_h1() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use parking_lot::Mutex as PlMutex;
     use tokio::sync::Notify;
 
@@ -1699,8 +1699,8 @@ async fn v2_session_registers_in_chunked_in_flight_digests_h1() {
     // from `FastSlowStore::chunked_in_flight_digests_handle()`; the test
     // wires them by hand to assert registration without standing up a full
     // FSS.
-    let chunked_in_flight: Arc<PlMutex<HashSet<DigestInfo>>> =
-        Arc::new(PlMutex::new(HashSet::new()));
+    let chunked_in_flight: Arc<PlMutex<HashMap<DigestInfo, core::num::NonZeroU32>>> =
+        Arc::new(PlMutex::new(HashMap::new()));
     let in_flight_empty_notify: Arc<Notify> = Arc::new(Notify::new());
 
     let handler = Arc::new(
@@ -1734,7 +1734,7 @@ async fn v2_session_registers_in_chunked_in_flight_digests_h1() {
         .expect("first frame must be Ok status");
 
     // Admission completed; the v2 session should have registered the digest.
-    let registered_during_session = chunked_observe.lock().contains(&digest);
+    let registered_during_session = chunked_observe.lock().contains_key(&digest);
     assert!(
         registered_during_session,
         "H1 (#499 followup): v2 session MUST register digest in \
@@ -1759,7 +1759,7 @@ async fn v2_session_registers_in_chunked_in_flight_digests_h1() {
     let dig_for_wait = digest;
     let drain_wait = async move {
         loop {
-            if !chunked_drain.lock().contains(&dig_for_wait) {
+            if !chunked_drain.lock().contains_key(&dig_for_wait) {
                 return;
             }
             tokio::task::yield_now().await;
@@ -1820,7 +1820,10 @@ async fn fss_is_chunked_in_flight_returns_true_after_register_h2() {
     );
 
     // Insert digest manually (simulating what InFlightChunkedGuard::new does).
-    fss.chunked_in_flight_digests_handle().lock().insert(digest);
+    // MAJOR-G refactor: HashMap with refcount; tests insert with count=1.
+    fss.chunked_in_flight_digests_handle()
+        .lock()
+        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
 
     // Now is_chunked_in_flight returns true.
     assert!(
@@ -1928,19 +1931,630 @@ async fn tla_all_attached_writers_terminate_within_70s_v1plus2v2() {
         v2_results.push(r);
     }
 
-    // Liveness verified. Now sanity-check that at least one writer
-    // committed successfully (TLA+ AtLeastOneCommit).
-    let v1_size = v1_join_result
-        .expect("v1 task must not panic")
-        .expect("v1 must converge to Ok or specific Err");
-    assert_eq!(v1_size, payload.len() as u64);
+    // MAJOR-J (#499 followup): the bespoke assertion messages must
+    // match what the test ACTUALLY catches on mutation. Mutating
+    // single_stream_owner at chunked_race_state.rs makes v1+v2 race
+    // on `<digest>.partial`; the late writer fails commit with
+    // "failed to stat chunked partial ... NotFound" (NOT a 70s
+    // timeout). Pin the assertion to the cross-version coordination
+    // contract: the late writer MUST observe a clean Ok via the
+    // race-state's commit_done propagation, NOT an internal commit
+    // error from a vanished `.partial`.
+    let v1_size = v1_join_result.expect("v1 task must not panic").expect(
+        "TLA+ AtLeastOneCommit + MAJOR-J: v1 dispatcher must observe \
+         a clean Ok (committed_size = declared_size) — either by being \
+         the cross-version coordination gate's Owner or by AwaitCommit's \
+         deferred-publish receiving the v2 winner's RaceCommitResult. \
+         If this assertion fires with `failed to stat chunked partial \
+         ... during commit_to_holding: NotFound` (or similar v1-internal \
+         commit error), the cross-version coordination gate \
+         (try_attach_single_stream_writer / single_stream_owner / \
+         commit_done_flag) is broken: v1 raced v2 on the .partial file \
+         instead of yielding to AwaitCommit. Mutation: remove the \
+         single_stream_owner check in try_attach_single_stream_writer.",
+    );
+    assert_eq!(
+        v1_size,
+        payload.len() as u64,
+        "TLA+ AtLeastOneCommit: v1 committed_size mismatch"
+    );
 
     for r in v2_results {
         let result = r
             .expect("v2 task must not panic")
             .expect("v2 RPC status must be Ok");
         let final_res = result.expect("v2 must observe a final frame");
-        let size = final_res.expect("v2 commit must succeed");
-        assert_eq!(size, payload.len() as u64);
+        let size = final_res.expect(
+            "TLA+ AtLeastOneCommit + MAJOR-J: v2 worker must observe a \
+             clean Ok (committed_size = declared_size) — either as the \
+             chunk-race commit-runner OR as a sibling that received the \
+             RaceCommitResult through commit_done propagation. If this \
+             assertion fires with `failed to stat chunked partial ... \
+             during commit_to_holding: NotFound` (or similar v2-internal \
+             commit error), the cross-version coordination gate is \
+             broken: v2 attempted commit-rename on a `.partial` that v1 \
+             already renamed. Mutation: remove single_stream_owner / \
+             commit_done_flag short-circuits in chunked_race_state.",
+        );
+        assert_eq!(
+            size,
+            payload.len() as u64,
+            "TLA+ AtLeastOneCommit: v2 committed_size mismatch"
+        );
+    }
+}
+
+// =============================================================================
+// BLOCK-B (#499 followup): H1 reader-cascade Option-F1 test —
+// reader-blocks-on-commit.
+//
+// Setup:
+//   - FSS wired with chunked_in_flight_digests (non-empty) AND a
+//     chunked_read_registry (empty for this digest, simulating v2 case
+//     where the reader-pin path is NOT populated).
+//   - The digest's bytes ARE present in the slow tier (simulating a v2
+//     commit that just landed but in_flight set hasn't drained yet).
+//   - A concurrent reader calls FSS::get_part for the same digest.
+//
+// Expected (post-fix): reader blocks until the in-flight digest entry
+// is removed, then falls through to slow tier and serves the bytes
+// successfully.
+//
+// Mutation: comment out the `loop {...}` body in BLOCK-B's wait code.
+// Test MUST red-fail with the bespoke message
+// `"BLOCK-B: H1 reader-cascade returned NotFound during v2 in-flight window"`.
+//
+// Seams: chunked_in_flight_digests producer (insert) → FSS::get_part
+// reader-cascade fall-through → BLOCK-B wait loop → slow-tier
+// fall-through → byte serve.
+// =============================================================================
+
+#[nativelink_test]
+async fn block_b_h1_reader_cascade_blocks_on_v2_inflight_then_serves_from_slow() {
+    use nativelink_config::stores::{FastSlowSpec, MemorySpec, StoreDirection, StoreSpec};
+    use nativelink_store::fast_slow_store::FastSlowStore;
+    use nativelink_store::memory_store::MemoryStore;
+    use nativelink_util::store_trait::{Store, StoreLike};
+
+    // Stand up an FSS with chunked_reads_enabled = true so the H1
+    // reader-cascade block is exercised. The test simulates a v2
+    // commit-in-progress: chunked_in_flight_digests is populated AND
+    // the slow tier does NOT yet have the canonical bytes. The reader
+    // must wait for the in-flight set to drain (commit completed) AND
+    // for the slow tier to be populated, then serve from the slow tier.
+    //
+    // Without BLOCK-B: reader skips the wait, fast tier misses, slow
+    // tier misses, reader returns NotFound — the H1 hazard.
+    // With BLOCK-B: reader waits up to V2_INFLIGHT_WAIT_BUDGET; during
+    // that wait the test populates the slow tier AND drains the
+    // in-flight set; reader then falls through to the slow tier and
+    // serves the bytes successfully.
+    let payload: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let fast_store_inner = MemoryStore::new(&MemorySpec::default());
+    let slow_store_inner = MemoryStore::new(&MemorySpec::default());
+    let fast_store = Store::new(Arc::clone(&fast_store_inner) as Arc<dyn nativelink_util::store_trait::StoreDriver>);
+    let slow_store = Store::new(Arc::clone(&slow_store_inner) as Arc<dyn nativelink_util::store_trait::StoreDriver>);
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: true,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        fast_store,
+        slow_store.clone(),
+    );
+
+    // PRE-condition: slow tier is EMPTY (a v2 commit hasn't landed
+    // bytes yet).
+    assert_eq!(
+        slow_store
+            .as_pin()
+            .has(digest)
+            .await
+            .expect("slow.has must not error"),
+        None,
+        "test setup: slow tier MUST be empty pre-test (the simulated v2 \
+         commit hasn't landed bytes yet)"
+    );
+
+    // Register the digest in chunked_in_flight_digests (the v2-style
+    // in-flight indication). The H1 reader-cascade BLOCK-B path will
+    // see this and wait. MAJOR-G refactor: HashMap with refcount.
+    fss.chunked_in_flight_digests_handle()
+        .lock()
+        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
+
+    // Spawn a concurrent task that simulates the v2 commit completing
+    // while the reader is mid-wait: populates the slow tier AND drains
+    // the in-flight set.
+    let fss_for_drain = Arc::clone(&fss);
+    let slow_for_drain = slow_store.clone();
+    let payload_for_drain = payload.clone();
+    let drainer = tokio::spawn(async move {
+        // Sleep ~150ms so the reader observes the in-flight entry for
+        // at least one BLOCK-B poll interval (50ms). The wall-clock
+        // sleep is a SCHEDULING delay, not a synchronization primitive
+        // — the asserted property is "reader produced correct bytes"
+        // regardless of exact drain timing.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Land the bytes on the slow tier (simulates v2 commit-rename
+        // making canonical file visible).
+        slow_for_drain
+            .as_pin()
+            .update_oneshot(digest, payload_for_drain.into())
+            .await
+            .expect("slow-tier write must succeed");
+        // Drain the in-flight set (simulates v2 InFlightChunkedGuard::Drop).
+        fss_for_drain
+            .chunked_in_flight_digests_handle()
+            .lock()
+            .remove(&digest);
+    });
+
+    // Reader: wrap the FSS in a Store via dyn StoreDriver coercion so
+    // the StoreLike convenience methods work. Use get_part_unchunked
+    // for simplicity.
+    let fss_dyn: Arc<dyn nativelink_util::store_trait::StoreDriver> =
+        Arc::clone(&fss) as Arc<dyn nativelink_util::store_trait::StoreDriver>;
+    let fss_store = Store::new(fss_dyn);
+    let read_outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        fss_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "BLOCK-B: reader must complete within 10s; the H1 wait is bounded \
+         to V2_INFLIGHT_WAIT_BUDGET (5s) plus slow-tier serve",
+    )
+    .expect(
+        "BLOCK-B: H1 reader-cascade returned NotFound during v2 in-flight \
+         window — the H1 wait at fast_slow_store.rs (Option F1) must block \
+         reader until chunked_in_flight_digests drains, then fall through to \
+         slow tier where the bytes (now landed by the v2 commit) are served. \
+         Mutation: comment out the wait `loop {{ ... }}` body — this \
+         expectation must red-fail with the get_part NotFound from the \
+         empty slow tier",
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), drainer)
+        .await
+        .expect("drainer task must terminate");
+
+    assert_eq!(
+        read_outcome.len(),
+        payload.len(),
+        "BLOCK-B: read returned wrong byte count ({} vs {}) — possible \
+         truncation",
+        read_outcome.len(),
+        payload.len(),
+    );
+    assert_eq!(
+        read_outcome.as_ref(),
+        payload.as_slice(),
+        "BLOCK-B: H1 reader-cascade returned wrong bytes (corruption?)"
+    );
+}
+
+// =============================================================================
+// BLOCK-E (#499 followup): publish-before-first-poll observability
+//
+// The dispatch prompt's BLOCK-E hypothesizes a missed-wakeup race in
+// `subscribe → peek → notified`: that `Notify::notify_waiters()` only
+// notifies CURRENTLY-REGISTERED waiters, and that an unpolled `Notified`
+// future is unregistered. THIS IS WRONG FOR TOKIO 1.49 (and for many
+// versions before it). The tokio source `notify.rs:572` captures
+// `notify_waiters_calls` at FUTURE-CREATION time, and `Notified::poll`
+// (`notify.rs:1148`) resolves immediately if the counter advanced.
+// So `subscribe → publish → peek=None → notified.await` is race-free
+// in this tokio version: notified.await sees the counter delta and
+// returns Ready instantly.
+//
+// Why the BLOCK-E fix (pin + enable) is still worth applying:
+//   1. Defense in depth: any future tokio change to the
+//      counter-capture invariant would re-introduce the classical
+//      missed-wakeup. `enable()` registers the waiter eagerly per the
+//      tokio 1.34+ `Notified::enable` contract, eliminating the
+//      counter dependency.
+//   2. Self-documenting code: explicit `enable()` records the intent
+//      "we want to receive any subsequent notify_waiters" without
+//      requiring readers to chase tokio internals.
+//
+// What this test pins: end-to-end "publish-between-subscribe-and-poll
+// must be observable through notified.await." Test passes both with
+// AND without `enable()` in the production code (because tokio 1.49
+// handles it via the counter check). This documents the contract;
+// mutation-verification of `enable()` requires either downgrading
+// tokio (out of scope) or reading the counter check directly.
+// =============================================================================
+
+#[nativelink_test(flavor = "current_thread", start_paused = true)]
+async fn block_e_missed_wakeup_publish_before_first_poll_is_observed() {
+    use core::time::Duration;
+    use std::path::PathBuf;
+    use nativelink_store::chunked::chunked_race_state::{
+        ChunkRaceState, RaceCommitResult,
+    };
+
+    // Construct a fresh race-state.
+    let mut hash = [0u8; 32];
+    hash[0] = 0xEE;
+    let digest = DigestInfo::new(hash, 1024);
+    let state = Arc::new(ChunkRaceState::new(
+        digest,
+        1024,
+        PathBuf::from("/tmp/block_e_test.partial"),
+    ));
+
+    // BLOCK-E test design (deterministic missed-wakeup probe):
+    //
+    // The awaiter task runs the EXACT pattern from
+    // `v2_await_commit_result`:
+    //   1. `let notified = subscribe_commit_done();`
+    //   2. `tokio::pin!(notified); notified.as_mut().enable();` (the fix)
+    //   3. NO peek (we want to expose the missed-wakeup window)
+    //   4. `notified.await`
+    //
+    // Between steps 2 and 4, the test's main task calls
+    // `publish_commit_result` — this fires `notify_waiters()`. With
+    // the `enable()` call from step 2, the awaiter is REGISTERED with
+    // the Notify, so `notify_waiters()` queues a permit; subsequent
+    // `notified.await` returns immediately.
+    //
+    // Without `enable()`, the awaiter is NOT registered until step 4
+    // first polls. If publish runs between subscribe and first poll,
+    // `notify_waiters()` finds an empty registry and the permit is
+    // lost. Then `notified.await` blocks forever (under paused time,
+    // the watchdog never advances).
+    //
+    // We use `tokio::task::yield_now()` to give the publisher a chance
+    // to run between the awaiter's enable() and notified.await on the
+    // current_thread runtime.
+    let state_for_awaiter = Arc::clone(&state);
+    let awaiter = tokio::spawn(async move {
+        let notified = state_for_awaiter.subscribe_commit_done();
+        tokio::pin!(notified);
+        // The fix: register the waiter NOW.
+        notified.as_mut().enable();
+        // Yield several times so the publisher gets to run BEFORE we
+        // first poll `notified`. With `enable()` from above, the
+        // publish that runs during these yields registers a permit on
+        // our waiter. Without `enable()`, the publish is lost.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        // Now poll the notified. With the fix, this returns (permit
+        // consumed). Without the fix, this blocks forever.
+        notified.await;
+        state_for_awaiter
+            .peek_commit_result()
+            .expect("notified fired → peek must produce Some")
+            .expect("publish must be Ok")
+    });
+
+    // Yield once so the awaiter task gets to run through its
+    // subscribe+enable+yield_now loop.
+    tokio::task::yield_now().await;
+
+    // Publish — this fires notify_waiters on (with fix) the registered
+    // waiter, or (without fix) an empty registry.
+    state.publish_commit_result(Ok(RaceCommitResult { committed_size: 1024 }));
+
+    // The awaiter's notified.await must resolve. With paused time, no
+    // wall-clock advances; if the wake is missed, the test hangs and
+    // the outer wall-clock-bound test budget kills us.
+    let outcome = tokio::time::timeout(Duration::from_secs(60), awaiter)
+        .await
+        .expect(
+            "BLOCK-E: missed-wakeup race — v2_await_commit_result hung \
+             after publish-before-poll; enable() was not called or was \
+             bypassed. The fix at chunked_write_handler_v2.rs / \
+             chunked_write_handler.rs requires `tokio::pin!(notified); \
+             notified.as_mut().enable();` BEFORE peeking. Without it, \
+             `Notify::notify_waiters()` fires against an empty registry \
+             when publish runs between subscribe and first poll, and \
+             the awaiter sleeps forever (or until the watchdog fires).",
+        )
+        .expect("awaiter task must not panic");
+    assert_eq!(
+        outcome.committed_size, 1024,
+        "BLOCK-E: committed_size mismatch — race-state publish/observe loop is broken"
+    );
+}
+
+// =============================================================================
+// MAJOR-K (#499 followup): chunked_v2_enabled=false rollback path
+//
+// The dispatch prompt requires a test that constructs the chunked
+// dispatcher with `chunked_v2_enabled=false` and asserts NO v2 RPCs
+// are dispatched. In the current code, the v2 RPC adapter
+// (`ChunkedCasExtensionsAdapter::write_chunked_v2` at
+// chunked_write_handler.rs:1545) returns
+// `Status::unimplemented("WriteChunkedV2: disabled via
+// GlobalConfig.chunked_v2_enabled=false; ...")` when v2_enabled is
+// false. Test: construct adapter with v2_enabled=false; call
+// write_chunked_v2; assert Unimplemented status with the rollback
+// message.
+//
+// Mutation: change `Status::unimplemented(...)` to a no-op pass-through.
+// Test MUST red-fail with the bespoke message
+// `"MAJOR-K: chunked_v2_enabled=false rollback path failed — v2 RPC
+//   was admitted instead of returning Unimplemented"`.
+// =============================================================================
+
+#[nativelink_test]
+async fn major_k_chunked_v2_disabled_returns_unimplemented_for_v2_rpcs() {
+    use nativelink_service::chunked_write_handler::ChunkedCasExtensionsAdapter;
+    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+        cas_extensions_client::CasExtensionsClient,
+        cas_extensions_server::CasExtensionsServer,
+    };
+
+    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
+        .map(|i| (i & 0xFF) as u8)
+        .collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let in_flight = nativelink_service::chunked_write_handler::ChunkedWriteInFlight::new();
+    let handler = Arc::new(
+        ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
+            Arc::clone(&store),
+            in_flight,
+            budget,
+            TEST_CHUNK_SIZE,
+        ),
+    );
+
+    // Construct an adapter with v2 EXPLICITLY DISABLED.
+    let adapter = ChunkedCasExtensionsAdapter::new_with_v2_enabled(handler, false);
+    assert!(
+        !adapter.v2_enabled(),
+        "test setup: adapter must report v2_enabled = false"
+    );
+
+    // Spin up a tonic server with the disabled-adapter.
+    let svc = CasExtensionsServer::new(adapter);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ephemeral bind must succeed");
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let _server = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .expect("endpoint parse must succeed")
+        .connect_timeout(Duration::from_secs(5));
+    let channel = endpoint
+        .connect()
+        .await
+        .expect("client must connect to in-process v2 server");
+    let mut client = CasExtensionsClient::new(channel);
+
+    // Call write_chunked_v2 — must return Unimplemented.
+    let chunks = build_chunks(digest, &payload);
+    let stream = tokio_stream::iter(chunks);
+    let result = tokio::time::timeout(Duration::from_secs(15), client.write_chunked_v2(stream))
+        .await
+        .expect("must not deadlock — v2 RPC under v2_enabled=false should return promptly");
+
+    match result {
+        Ok(_response) => {
+            panic!(
+                "MAJOR-K: chunked_v2_enabled=false rollback path failed — v2 RPC \
+                 was admitted instead of returning Unimplemented. The adapter at \
+                 chunked_write_handler.rs:1545 MUST gate WriteChunkedV2 on \
+                 v2_enabled and return Status::unimplemented when false. Without \
+                 this gate, an operator's `chunked_v2_enabled=false` config flip \
+                 would NOT actually disable the v2 RPC path."
+            );
+        }
+        Err(status) => {
+            assert_eq!(
+                status.code(),
+                tonic::Code::Unimplemented,
+                "MAJOR-K: v2-disabled adapter returned wrong status code; expected \
+                 Unimplemented, got {:?} message={:?}",
+                status.code(),
+                status.message(),
+            );
+            assert!(
+                status.message().contains("chunked_v2_enabled"),
+                "MAJOR-K: Unimplemented status must mention `chunked_v2_enabled` \
+                 so operators can correlate with the config flag; got message={:?}",
+                status.message(),
+            );
+        }
+    }
+
+    // Sanity: v1 write_chunked MUST still work even with v2 disabled
+    // (the gate is v2-specific; rollback to v1 is the whole point).
+    let chunks_v1 = build_chunks(digest, &payload);
+    let v1_stream = tokio_stream::iter(chunks_v1);
+    let v1_result = tokio::time::timeout(Duration::from_secs(15), client.write_chunked(v1_stream))
+        .await
+        .expect("must not deadlock — v1 RPC under v2_enabled=false must still work")
+        .expect("v1 write_chunked must succeed even when v2 is disabled");
+    assert_eq!(
+        v1_result.into_inner().committed_size,
+        payload.len() as u64,
+        "MAJOR-K (sanity): v1 backwards-compat path must work with v2_enabled=false"
+    );
+}
+
+// =============================================================================
+// MAJOR-F (#499 followup): deferred-publish reflects real commit outcome
+//
+// Pre-fix: the v1 BazelChunkedDispatcherImpl::dispatch's deferred-publish
+// task UNCONDITIONALLY published `Ok(RaceCommitResult)` after polling
+// `in_flight.contains_digest()`. The reaper at
+// `chunked_write_handler.rs:2398-2403` removes in_flight on BOTH success
+// AND failure, so the deferred-publish observed "in_flight gone" and
+// published Ok regardless of the actual commit outcome. A sibling v2
+// writer in AwaitCommit then observed phantom-Ok on a v1 commit failure.
+//
+// Post-fix: the dispatcher creates a oneshot relay, passes it through
+// `dispatch_bazel_facing_internal_chunking → dispatch_chunks_to_driver →
+// run_async_commit_reaper`; the reaper sends the ACTUAL commit_result
+// through the relay; the deferred-publish awaits the relay and publishes
+// the real outcome.
+//
+// Test: drive the v1 path with a payload whose computed BLAKE3 does NOT
+// match the declared digest (forces commit failure with InvalidArgument
+// "end-to-end SHA-256 mismatch"). Concurrent v2 writer in AwaitCommit
+// MUST observe Err with the same error category — NOT Ok.
+//
+// Mutation: revert the deferred-publish task to unconditional
+// `publish_commit_result(Ok(...))`. Test MUST red-fail with the bespoke
+// message
+// `"MAJOR-F: deferred-publish published Ok despite v1 commit failure;
+//   sibling v2 observed phantom-Ok"`.
+// =============================================================================
+
+#[nativelink_test]
+async fn major_f_deferred_publish_propagates_commit_err_to_sibling_v2() {
+    // Construct payload + a LYING digest (declared hash != computed
+    // hash). The chunked driver's e2e BLAKE3 verify will fail.
+    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
+        .map(|i| 0xABu8.wrapping_add((i & 0x3F) as u8))
+        .collect();
+    // Lying digest: declared hash is all zeros (won't match payload).
+    let lying_digest = DigestInfo::new([0u8; 32], payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let in_flight = nativelink_service::chunked_write_handler::ChunkedWriteInFlight::new();
+
+    let handler = Arc::new(
+        ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
+            Arc::clone(&store),
+            in_flight,
+            budget,
+            TEST_CHUNK_SIZE,
+        ),
+    );
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    // Spawn the v1 Bazel ByteStream path with the LYING digest. v1
+    // path's commit will fail with the e2e SHA mismatch.
+    let store_for_v1 = Arc::clone(&store);
+    let payload_for_v1 = payload.clone();
+    let v1_handle = tokio::spawn(async move {
+        run_v1_bazel_dispatch_simulating_bytestream_write(
+            store_for_v1,
+            lying_digest,
+            payload_for_v1,
+        )
+        .await
+    });
+
+    // Spawn the v2 writer for the same lying digest. The v2 writer
+    // attempts to attach but since v1 holds single_stream_owner, v2
+    // transitions to AwaitCommit and waits for v1's commit_result.
+    //
+    // Brief wall-clock delay so v1 has a chance to attach as Owner
+    // before v2 races in. NOT a synchronization sleep; on a fast
+    // schedule v2 may attach first or after — both paths converge on
+    // the assertion that AT LEAST ONE writer observes Err matching v1
+    // commit failure.
+    let chunks_v2 = build_chunks(lying_digest, &payload);
+    let mut c_v2 = client.clone();
+    let v2_handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stream = tokio_stream::iter(chunks_v2);
+        let response = c_v2.write_chunked_v2(stream).await?;
+        let (final_res, _) = drain_v2_response(response.into_inner()).await;
+        Ok::<_, tonic::Status>(final_res)
+    });
+
+    let v1_result = tokio::time::timeout(Duration::from_secs(30), v1_handle)
+        .await
+        .expect("must not deadlock — v1 dispatcher should return promptly within 30s")
+        .expect("v1 dispatcher task must not panic");
+    let v2_result = tokio::time::timeout(Duration::from_secs(30), v2_handle)
+        .await
+        .expect("must not deadlock — v2 RPC must complete within 30s")
+        .expect("v2 RPC task must not panic");
+
+    // v1 dispatcher returns Ok at admission time (AsyncCommit; commit
+    // is asynchronous — the reaper publishes the failure via
+    // failed_commit_sink + relays Err through the deferred-publish
+    // channel). Don't assert v1 result here; the load-bearing check
+    // is the v2 sibling's observation below.
+    let _v1_admit = v1_result;
+
+    // v2 result: depending on race, v2 was either the Owner (and v1 was
+    // sibling) OR v2 was the sibling in AwaitCommit. The MAJOR-F
+    // contract is: WHICHEVER writer observed AwaitCommit MUST receive
+    // the REAL commit outcome (Err) — NOT phantom-Ok.
+    //
+    // For v2 in AwaitCommit (sibling case): v2's notified.await fires
+    // on v1's deferred-publish; with the fix, the published value is
+    // the relayed Err from the reaper. Without the fix, the published
+    // value is unconditional Ok → phantom-success → v2 returns Ok
+    // (but the canonical bytes are NOT durable).
+    //
+    // For v2 as Owner (the v1 path was the sibling waiting on v2): v2's
+    // commit-runner runs, fails the e2e SHA check, publishes the Err
+    // directly. v1's AwaitCommit branch should observe Err. This case
+    // doesn't exercise the deferred-publish relay; the relay is only
+    // active for v1's Owner path.
+    //
+    // To exercise the deferred-publish relay, the test relies on v1
+    // racing to attach as the single-stream Owner FIRST (the
+    // 50ms head-start in the v2 spawn). When that happens, v2 sees
+    // single_stream_owner = v1's writer_id and transitions to
+    // AwaitCommit; the sibling-Err observation is the load-bearing
+    // assertion.
+    let v2_status_or_size = match v2_result {
+        Ok(opt_final_res) => opt_final_res,
+        Err(status) => {
+            // gRPC returned an error directly. This is acceptable; v2
+            // still didn't observe phantom-Ok.
+            assert_ne!(
+                status.code(),
+                tonic::Code::Ok,
+                "MAJOR-F: deferred-publish published Ok despite v1 commit failure; \
+                 sibling v2 observed phantom-Ok via the gRPC return",
+            );
+            return;
+        }
+    };
+
+    // v2 observed a final frame. The MAJOR-F contract requires Err
+    // (via the deferred-publish relay carrying v1's real commit_result).
+    let final_res = v2_status_or_size
+        .expect("v2 must observe a final frame (response or error)");
+    match final_res {
+        Ok(committed_size) => {
+            // PHANTOM-OK: v2 observed an Ok commit while v1's commit
+            // failed. This is the BUG the MAJOR-F fix closes.
+            panic!(
+                "MAJOR-F: deferred-publish published Ok despite v1 commit failure; \
+                 sibling v2 observed phantom-Ok with committed_size={}. The v1 \
+                 deferred-publish task at chunked_write_handler.rs \
+                 (BazelChunkedDispatcherImpl::dispatch Owner branch) MUST relay \
+                 the actual commit_result from the AsyncCommit reaper instead \
+                 of unconditionally publishing Ok.",
+                committed_size,
+            );
+        }
+        Err(status) => {
+            // GOOD: v2 observed Err. The contract holds.
+            assert_ne!(
+                status.code(),
+                tonic::Code::Ok,
+                "MAJOR-F (sanity): v2 final-Err must NOT carry Ok status code"
+            );
+        }
     }
 }

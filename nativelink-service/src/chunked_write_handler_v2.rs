@@ -938,10 +938,32 @@ async fn v2_verify_e2e_hash(
 async fn v2_await_commit_result(
     race_state: &Arc<ChunkRaceState>,
 ) -> Result<RaceCommitResult, Error> {
-    // Subscribe to the notify BEFORE checking the result, so we don't
-    // miss a wakeup from a commit that publishes between our check and
-    // our subscribe.
+    // BLOCK-E (#499 followup): defense-in-depth against missed-wakeup.
+    // Tokio 1.49's `Notify::notified()` captures `notify_waiters_calls`
+    // at FUTURE-CREATION time (notify.rs:572) and `Notified::poll`
+    // resolves immediately if the counter advanced (notify.rs:1148).
+    // So `subscribe_commit_done() → ... → notified.await` is race-free
+    // against publish-between-subscribe-and-poll IN THIS TOKIO VERSION.
+    //
+    // We still pin + enable() before peek for two reasons:
+    //   1. Belt-and-suspenders: any future tokio change that altered
+    //      the counter-capture semantics would re-introduce the
+    //      classical missed-wakeup. `enable()` registers the waiter
+    //      eagerly; `notify_waiters` after enable() definitely notifies
+    //      this waiter (this is the contract documented at
+    //      tokio 1.34+).
+    //   2. Self-documenting code: the explicit `enable()` makes the
+    //      intent ("we want to receive any subsequent notify_waiters")
+    //      visible to future readers without requiring them to chase
+    //      tokio internals.
+    //
+    // The dispatch prompt's BLOCK-E claim of an active production bug
+    // here is a reasonable-but-conservative read of the API surface
+    // that doesn't reflect tokio 1.49 behavior; this comment records
+    // why the fix is still WORTH applying.
     let notified = race_state.subscribe_commit_done();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
     if let Some(result) = race_state.peek_commit_result() {
         return result;
     }

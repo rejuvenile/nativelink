@@ -478,7 +478,7 @@ async fn chunked_commit_no_visibility_gap_between_in_flight_and_stable() {
         let mut started = false;
         let mut accumulated_drains: Vec<DigestInfo> = Vec::new();
         for _ in 0..2_000_000 {
-            let in_flight_now = chunked_set_for_observer.lock().contains(&digest);
+            let in_flight_now = chunked_set_for_observer.lock().contains_key(&digest);
             // Drain ALL stable digests; check if our target appears.
             let drained = store_for_observer.as_ref().drain_stable_digests();
             for d in &drained {
@@ -498,7 +498,7 @@ async fn chunked_commit_no_visibility_gap_between_in_flight_and_stable() {
                 // appears AFTER stable is observed (it shouldn't, but
                 // the loop is cheap).
                 for _ in 0..100 {
-                    let in_flight_post = chunked_set_for_observer.lock().contains(&digest);
+                    let in_flight_post = chunked_set_for_observer.lock().contains_key(&digest);
                     let in_stable_post = accumulated_drains.contains(&digest);
                     if !in_flight_post && !in_stable_post {
                         gap_obs_for_obs.fetch_add(1, AtomicOrdering::Relaxed);
@@ -670,6 +670,7 @@ async fn chunked_synchronous_commit_pushes_digest_to_stable_digests() {
             stream,
             CommitMode::Synchronous,
             metrics,
+            None, // async_result_relay (MAJOR-F #499 followup) — Synchronous mode uses internal relay
         ),
     )
     .await
@@ -816,6 +817,7 @@ async fn chunked_early_dedup_short_circuit_pushes_digest_to_stable_digests() {
             CHUNK,
             digest,
             rx,
+            None, // async_result_relay (MAJOR-F #499 followup)
         ),
     )
     .await
@@ -1453,6 +1455,7 @@ async fn chunked_synchronous_commit_failure_inserts_failed_writes_and_repins() {
             stream,
             CommitMode::Synchronous,
             metrics,
+            None, // async_result_relay (MAJOR-F #499 followup)
         ),
     )
     .await

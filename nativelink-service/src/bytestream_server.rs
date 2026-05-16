@@ -2661,7 +2661,33 @@ impl ByteStreamServer {
         }
 
         let has_fut = store_clone.has(digest);
-        let Some(item_size) = has_fut.await.err_tip(|| "Failed to call .has() on store")? else {
+        let item_size_or_none = has_fut.await.err_tip(|| "Failed to call .has() on store")?;
+        // BLOCK-A (H2 sibling at QueryWriteStatus, #499 followup): mirror
+        // the H2 phantom-success guard at `:2742`. The same `store.has()`
+        // cascade returns `Some(declared_size)` for an in-flight chunked
+        // write (v1 or v2) — the FSS-level `chunked_in_flight_digests`
+        // set is consulted by `FastSlowStore::has_with_results` and
+        // reports declared_size for sessions still mid-stream. If we
+        // return `complete: true` here, Bazel believes the upload is
+        // durable, but if the chunked commit subsequently fails, the
+        // digest is silently lost.
+        //
+        // Mitigation: when the underlying store is a `FastSlowStore` AND
+        // the digest is in the chunked in-flight set, return
+        // `complete: false` with `committed_size: 0` so the Bazel client
+        // re-sends from the start (the standard QueryWriteStatus
+        // semantics: `complete=false` means "the upload is not durable;
+        // continue / restart"). Without the guard, this RPC handler
+        // breaks the `has()=Some ⇒ durable` invariant on Bazel's side.
+        //
+        // Sibling-bug audit: the same `store.has()` short-circuit pattern
+        // exists at `bytestream_write` (`:2742`) — guarded since 9d8a66a9.
+        // See `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md`
+        // H2 + ds-reviewer.md BLOCK-1.
+        let is_chunked_in_flight = store_clone
+            .downcast_ref::<nativelink_store::fast_slow_store::FastSlowStore>(Some(digest.into()))
+            .is_some_and(|fss| fss.is_chunked_in_flight(&digest));
+        let Some(item_size) = item_size_or_none else {
             // We lie here and say that the stream needs to start over, even though
             // it was never started. This can happen when the client disconnects
             // before sending the first payload, but the client thinks it did send
@@ -2671,6 +2697,20 @@ impl ByteStreamServer {
                 complete: false,
             }));
         };
+        if is_chunked_in_flight {
+            debug!(
+                %digest,
+                size_bytes = item_size,
+                "QueryWriteStatus: H2 phantom-success guard fired — \
+                 has() returned Some via chunked-in-flight, but the \
+                 chunked commit may still fail. Returning complete=false \
+                 so Bazel does not treat the upload as durable.",
+            );
+            return Ok(Response::new(QueryWriteStatusResponse {
+                committed_size: 0,
+                complete: false,
+            }));
+        }
         // Defense-in-depth at the wire boundary: `committed_size` is what Bazel
         // uses to position resumed uploads, so any inner-store `has()` that
         // reports a size larger than the requested digest's size would push
@@ -2744,11 +2784,24 @@ impl ByteStreamServer {
         // `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H2.
         //
         // Mitigation: when the underlying store is a `FastSlowStore` AND
-        // the digest is in the chunked in-flight set, fall through to
-        // the `in_flight_writes` watch-channel dedup below. That path
-        // makes the second writer wait for the first one's outcome
-        // (Ok → second short-circuits with the durable result; Err →
-        // second writes its own bytes).
+        // the digest is in the chunked in-flight set, skip the
+        // phantom-success short-circuit and fall through to the standard
+        // write path. CAVEAT (MAJOR-I, ds-reviewer MINOR-2): the
+        // `in_flight_writes` watch-channel dedup below only catches
+        // duplicate ByteStream::write callers — chunked-v2 (worker
+        // WriteChunkedV2) and v1-chunked (Bazel internal-chunking
+        // dispatcher) sessions do NOT populate `in_flight_writes`, so
+        // the second ByteStream::write becomes the primary in
+        // `in_flight_writes` and runs its own write through FSS. Both
+        // writers race the slow store concurrently; CAS convergence
+        // (digest = content) makes the on-disk byte sequence well-defined
+        // (same bytes either way), and the chunked-write path's
+        // `chunked_in_flight_digests` + race-state coordination
+        // arbitrates the canonical-rename. The H2 guard is therefore
+        // "don't lie about durability" — NOT "serialize against the
+        // chunked writer." Bazel-to-Bazel concurrent uploads of the
+        // same digest still coalesce on `in_flight_writes` (the original
+        // dedup contract).
         let has_result = store.has(digest).await.unwrap_or(None);
         let is_chunked_in_flight = store
             .downcast_ref::<nativelink_store::fast_slow_store::FastSlowStore>(Some(digest.into()))

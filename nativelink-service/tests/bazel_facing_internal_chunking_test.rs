@@ -504,6 +504,7 @@ async fn dispatch_chunks_to_driver_synchronous_commits_blob() {
             stream,
             CommitMode::Synchronous,
             metrics,
+            None, // async_result_relay (MAJOR-F #499 followup) — Synchronous mode uses internal relay
         ),
     )
     .await
@@ -585,6 +586,7 @@ async fn dispatch_chunks_to_driver_async_commit_returns_promptly_then_drains() {
             stream,
             CommitMode::AsyncCommit,
             metrics,
+            None, // async_result_relay (MAJOR-F #499 followup) — test does not bridge to a v2 race-state
         ),
     )
     .await
@@ -694,6 +696,7 @@ async fn pin_budget_cap_rejects_admission_with_pinned_bytes_exhausted_signal() {
             stream,
             CommitMode::Synchronous,
             Arc::clone(&metrics),
+            None, // async_result_relay (MAJOR-F #499 followup)
         ),
     )
     .await
@@ -1062,6 +1065,7 @@ async fn dispatch_bazel_facing_skips_chunked_path_when_digest_already_indexed() 
             CHUNK,
             digest,
             producer_rx,
+            None, // async_result_relay (MAJOR-F #499 followup) — test does not bridge to a v2 race-state
         ),
     )
     .await
@@ -1175,6 +1179,7 @@ async fn dispatch_bazel_facing_runs_chunked_path_when_digest_not_indexed() {
             CHUNK,
             digest,
             producer_rx,
+            None, // async_result_relay (MAJOR-F #499 followup)
         ),
     )
     .await
@@ -1264,6 +1269,7 @@ async fn dispatch_bazel_facing_dedup_drain_size_cap_fires_on_oversized_producer(
             CHUNK,
             digest,
             producer_rx,
+            None, // async_result_relay (MAJOR-F #499 followup)
         ),
     )
     .await
@@ -1349,6 +1355,7 @@ async fn dispatch_bazel_facing_dedup_drain_per_recv_timeout_fires_on_stalled_pro
         CHUNK,
         digest,
         producer_rx,
+        None, // async_result_relay (MAJOR-F #499 followup)
     );
 
     // Outer guard: 30 virtual seconds. The per-recv timeout is 15 s,

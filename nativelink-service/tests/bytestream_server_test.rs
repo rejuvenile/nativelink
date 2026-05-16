@@ -3580,3 +3580,280 @@ pub async fn cancelled_chunked_write_replaced_not_recycled_on_retry()
 
     Ok(())
 }
+
+// =============================================================================
+// BLOCK-A + BLOCK-D (#499 followup): H2 phantom-success guard tests
+//
+// Composes: ByteStreamServer + FastSlowStore + chunked_in_flight_digests set
+// + (QueryWriteStatus / ByteStream::write seams).
+//
+// Seams crossed:
+//   - producer: chunked_in_flight_digests insertion (simulates v2 admission)
+//   - FastSlowStore::has_with_results consults the set (lies Some)
+//   - FastSlowStore::is_chunked_in_flight (the H2 probe)
+//   - ByteStreamServer::query_write_status seam (BLOCK-A)
+//   - ByteStreamServer::write fast-path seam (BLOCK-D)
+//   - downstream is the gRPC return value the Bazel client classifies
+// =============================================================================
+
+/// BLOCK-A (#499 followup): construct an FSS-backed bytestream server,
+/// register a digest into the FSS's `chunked_in_flight_digests` set
+/// (simulating a v2 chunked write mid-commit), and assert that
+/// `QueryWriteStatus` for that digest returns `complete: false` —
+/// NOT `complete: true`. Without the BLOCK-A guard at
+/// `bytestream_server.rs:2635`, the QueryWriteStatus path would
+/// short-circuit on `store.has() = Some` and tell Bazel the upload is
+/// durable while the chunked commit may still fail.
+///
+/// Mutation: comment out the `if is_chunked_in_flight { ... }` early
+/// return in `inner_query_write_status`. Test MUST red-fail with the
+/// bespoke message
+/// `"BLOCK-A: QueryWriteStatus phantom-acked in-flight chunked digest"`.
+#[nativelink_test]
+pub async fn block_a_query_write_status_does_not_phantom_ack_for_chunked_in_flight()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_config::stores::{FastSlowSpec, StoreDirection};
+    use nativelink_store::fast_slow_store::FastSlowStore;
+
+    // Stand up a real FSS (Memory/Memory) and wire it into a
+    // StoreManager + ByteStreamServer.
+    let store_manager = Arc::new(StoreManager::new());
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        fast_store,
+        slow_store,
+    );
+    // `FastSlowStore::new` returns `Arc<FastSlowStore>`; it auto-coerces
+    // to `Arc<dyn StoreDriver>` only at function-argument sites. Cloning
+    // first preserves the strong type — explicit unsizing keeps both
+    // the typed handle (for is_chunked_in_flight + handle accessors)
+    // AND the trait-object form for `Store::new`.
+    let fss_for_store: Arc<dyn nativelink_util::store_trait::StoreDriver> =
+        Arc::clone(&fss) as Arc<dyn nativelink_util::store_trait::StoreDriver>;
+    store_manager.add_store("main_cas", Store::new(fss_for_store));
+
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
+    );
+
+    // Construct the digest used in the test.
+    let digest_size: u64 = 19;
+    let digest = DigestInfo::try_new(HASH1, digest_size)?;
+
+    // Register the digest in the FSS's chunked_in_flight_digests set
+    // (simulating what `InFlightChunkedGuard::new` does at v2 admission).
+    // MAJOR-G refactor: chunked_in_flight_digests is now a refcount
+    // HashMap; tests insert with refcount = 1 to simulate
+    // InFlightChunkedGuard::new.
+    fss.chunked_in_flight_digests_handle()
+        .lock()
+        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
+
+    // Sanity: FSS::has should now return Some(declared_size) — this is
+    // the H2 cascade. Use the FSS-level convenience accessor because we
+    // hold an `Arc<FastSlowStore>` (not a `Store`) and want to verify
+    // the load-bearing predicate directly.
+    assert!(
+        fss.is_chunked_in_flight(&digest),
+        "FSS::is_chunked_in_flight must return true when the digest is in \
+         chunked_in_flight_digests (this is the H2 probe; without it the \
+         BLOCK-A guard cannot fire)"
+    );
+
+    // Issue QueryWriteStatus with a fresh UUID (not in active_uploads).
+    let resource_name = make_resource_name(digest_size);
+    let response = bs_server
+        .query_write_status(Request::new(QueryWriteStatusRequest {
+            resource_name: resource_name.clone(),
+        }))
+        .await
+        .expect("QueryWriteStatus must return Ok");
+
+    let inner = response.into_inner();
+    assert!(
+        !inner.complete,
+        "BLOCK-A: QueryWriteStatus phantom-acked in-flight chunked digest \
+         (returned complete=true while the chunked commit is still in flight; \
+         Bazel would treat the upload as durable and silently lose data on \
+         commit failure). Got committed_size={}, complete=true. Mutation: \
+         comment out the `if is_chunked_in_flight {{ ... return ... }}` block \
+         in inner_query_write_status — this assertion must red-fail.",
+        inner.committed_size
+    );
+    assert_eq!(
+        inner.committed_size, 0,
+        "BLOCK-A: when the H2 guard fires, committed_size MUST be 0 (don't \
+         lie about position into an upload that hasn't begun); got {}",
+        inner.committed_size
+    );
+
+    Ok(())
+}
+
+/// BLOCK-D (#499 followup): production-composition test for the H2
+/// phantom-success guard at `bytestream_server.rs:2724`. Stand up an
+/// FSS-backed ByteStreamServer; register a digest into
+/// `chunked_in_flight_digests` (simulating a v2 chunked write
+/// mid-commit); issue a NEW `ByteStream::write` for the same digest
+/// from a fresh UUID; assert the second writer does NOT phantom-ack
+/// (does NOT immediately return WriteResponse with the declared size
+/// before sending any bytes).
+///
+/// Seams: chunked_in_flight_digests producer → FastSlowStore::has →
+/// FastSlowStore::is_chunked_in_flight → bytestream_server fast-path
+/// seam → in_flight_writes dedup fall-through → second writer becomes
+/// the primary (its own write proceeds).
+///
+/// Mutation: change `is_chunked_in_flight` to `false` (or remove the
+/// `&& !is_chunked_in_flight` clause). Test MUST red-fail with the
+/// bespoke message
+/// `"BLOCK-D: ByteStream::write phantom-acked second concurrent writer
+/// while chunked commit was still in-flight"`.
+#[nativelink_test]
+pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_flight()
+-> Result<(), Box<dyn core::error::Error>> {
+    use core::time::Duration;
+    use nativelink_config::stores::{FastSlowSpec, StoreDirection};
+    use nativelink_store::fast_slow_store::FastSlowStore;
+
+    let store_manager = Arc::new(StoreManager::new());
+    let fast_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let slow_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        fast_store,
+        slow_store,
+    );
+    // `FastSlowStore::new` returns `Arc<FastSlowStore>`; it auto-coerces
+    // to `Arc<dyn StoreDriver>` only at function-argument sites. Cloning
+    // first preserves the strong type — explicit unsizing keeps both
+    // the typed handle (for is_chunked_in_flight + handle accessors)
+    // AND the trait-object form for `Store::new`.
+    let fss_for_store: Arc<dyn nativelink_util::store_trait::StoreDriver> =
+        Arc::clone(&fss) as Arc<dyn nativelink_util::store_trait::StoreDriver>;
+    store_manager.add_store("main_cas", Store::new(fss_for_store));
+
+    let bs_server = Arc::new(
+        make_bytestream_server(store_manager.as_ref(), None).expect("Failed to make server"),
+    );
+
+    let digest_size: u64 = 19;
+    let digest = DigestInfo::try_new(HASH1, digest_size)?;
+
+    // Register the digest in chunked_in_flight_digests BEFORE the second
+    // writer arrives. Simulates v2 admission; the actual chunked write
+    // is NOT happening (we just want the FSS to lie via its has cascade).
+    // MAJOR-G refactor: chunked_in_flight_digests is now a refcount
+    // HashMap; tests insert with refcount = 1 to simulate
+    // InFlightChunkedGuard::new.
+    fss.chunked_in_flight_digests_handle()
+        .lock()
+        .insert(digest, core::num::NonZeroU32::new(1).unwrap());
+
+    // Issue a NEW ByteStream::write for the same digest. The H2 guard
+    // SHOULD prevent the fast-path short-circuit. The write request
+    // never sends `finish_write=true`, so a true short-circuit would
+    // return Ok with committed_size=declared BEFORE any bytes flow. A
+    // properly-guarded fall-through would block until the producer
+    // either sends or the deadlock-detector fires.
+    let (tx, join_handle) =
+        make_stream_and_writer_spawn(bs_server.clone(), Some(CompressionEncoding::Gzip));
+
+    // Send a single short chunk (incomplete, no finish_write) and then
+    // close the producer side. Without the H2 guard, the server would
+    // have already returned a phantom WriteResponse before the producer
+    // sends anything — the join_handle would resolve with Ok almost
+    // immediately. With the guard, the server falls through to the
+    // standard write path and processes the (incomplete) data.
+    let resource_name = make_resource_name(digest_size);
+    let mut write_request = WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: false,
+        data: b"abcdef".to_vec().into(),
+    };
+    tx.send(Frame::data(encode_stream_proto(&write_request)?))
+        .await?;
+
+    // Yield so the server can process the first chunk. If the server
+    // phantom-acks, the join_handle would resolve here with Ok.
+    yield_now().await;
+    yield_now().await;
+
+    // Race detector: poll the join_handle. If it's READY here, the
+    // server short-circuited (phantom-ack); if it's PENDING, the server
+    // is correctly processing the partial write.
+    let mut join_handle_pinned = Box::pin(join_handle);
+    let poll_result = poll!(&mut join_handle_pinned);
+    match poll_result {
+        Poll::Ready(Ok(Ok(response))) => {
+            let resp = response.into_inner();
+            // If we see a WriteResponse with `committed_size=declared_size`
+            // here, the H2 guard FAILED — the server phantom-acked the
+            // second writer.
+            panic!(
+                "BLOCK-D: ByteStream::write phantom-acked second concurrent \
+                 writer while chunked commit was still in-flight (returned \
+                 WriteResponse with committed_size={} for declared_size={} \
+                 BEFORE the producer signaled finish_write=true). The H2 \
+                 guard at bytestream_server.rs:2724 must consult \
+                 FSS::is_chunked_in_flight and skip the short-circuit when \
+                 the digest is in the chunked-in-flight set.",
+                resp.committed_size, digest_size
+            );
+        }
+        Poll::Ready(Ok(Err(_status))) => {
+            // The server returned an error early. This is acceptable —
+            // it means the server did NOT phantom-ack; some other
+            // error path fired. Test passes (no phantom-success).
+        }
+        Poll::Ready(Err(_join_err)) => {
+            panic!("BLOCK-D: server task panicked unexpectedly");
+        }
+        Poll::Pending => {
+            // Expected post-fix: the server is still processing the
+            // write and waiting for `finish_write=true` (or for the
+            // producer to disconnect). This proves the H2 guard fired
+            // and prevented the phantom-ack.
+        }
+    }
+
+    // Cleanup: drop the producer to let the write task terminate.
+    // Closing tx makes the recv side observe end-of-stream; depending
+    // on path, the server may return Ok or Err — either is acceptable
+    // (the assertion above is the load-bearing check).
+    write_request.write_offset = 6;
+    write_request.data = b"".to_vec().into();
+    write_request.finish_write = true;
+    let _ = tx
+        .send(Frame::data(encode_stream_proto(&write_request)?))
+        .await;
+    drop(tx);
+
+    // Bounded wait for the join_handle (deadlock detector — 5s).
+    let _final_result = tokio::time::timeout(Duration::from_secs(5), join_handle_pinned)
+        .await
+        .expect(
+            "BLOCK-D: server task must terminate within 5s after producer \
+             drop; if this panics with timeout, the H2 fall-through path is \
+             wedging in `in_flight_writes` watch-channel dedup",
+        );
+
+    Ok(())
+}

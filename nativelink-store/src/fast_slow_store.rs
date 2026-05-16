@@ -17,6 +17,7 @@ use core::future::Future;
 use core::ops::Range;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::num::NonZeroU32;
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -430,7 +431,15 @@ struct PinExpireFailedWritesListener {
     /// Used as the OTHER half of the gate — the chunked path doesn't
     /// touch `in_flight_slow_writes`, so without this check the
     /// silent-hang safety net wouldn't cover chunked-commit stalls.
-    chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>>,
+    ///
+    /// MAJOR-G (#499 followup): refcount HashMap (NOT HashSet) so two
+    /// concurrent sessions for the same digest both observe presence
+    /// until BOTH guards drop. Without refcount, the first guard's
+    /// Drop removed the digest while the second was still in-flight —
+    /// a transient phantom-missing window for sibling readers (BLOCK-B
+    /// wait would not fire; readers got NotFound for a digest the
+    /// second session would commit moments later).
+    chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>>,
 }
 
 impl ItemCallback for PinExpireFailedWritesListener {
@@ -458,7 +467,7 @@ impl ItemCallback for PinExpireFailedWritesListener {
             // reconnect retry for a blob the server already has.
             let owned_key = StoreKey::Digest(digest);
             let in_legacy = self.in_flight_slow_writes.lock().contains_key(&owned_key);
-            let in_chunked = self.chunked_in_flight_digests.lock().contains(&digest);
+            let in_chunked = self.chunked_in_flight_digests.lock().contains_key(&digest);
             if !in_legacy && !in_chunked {
                 return;
             }
@@ -493,7 +502,7 @@ fn register_pin_expire_listener(
     fast_store: &Store,
     failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>>,
     in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>>,
-    chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>>,
+    chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>>,
 ) {
     let listener: Arc<dyn ItemCallback> = Arc::new(PinExpireFailedWritesListener {
         failed_slow_writes,
@@ -843,7 +852,12 @@ pub struct FastSlowStore {
     /// Populated + drained by `BazelChunkedDispatcherImpl::dispatch`.
     /// Read by `has_with_results` (returns digest.size_bytes() when
     /// present) and waited by `flush_slow_writes` (graceful drain).
-    chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>>,
+    ///
+    /// MAJOR-G (#499 followup): refcount HashMap — see field comment on
+    /// `PinExpireFailedWritesListener::chunked_in_flight_digests` for
+    /// the bug shape (two concurrent sessions, first-to-drop removed
+    /// the digest while second was still in-flight).
+    chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>>,
     /// Notified when in_flight_slow_writes becomes empty. Used by
     /// `flush_slow_writes` to wait for all background writes to complete.
     in_flight_empty_notify: Arc<Notify>,
@@ -1106,8 +1120,8 @@ impl FastSlowStore {
             Arc::new(Mutex::new(HashSet::new()));
         let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>> =
-            Arc::new(Mutex::new(HashSet::new()));
+        let chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         // Lifted out of `Arc::new_cyclic` so the #367 slow-eviction
         // listener can carry a clone — the BIS-feeder queue must be
         // observable from the slow-store eviction callback to drop
@@ -1295,7 +1309,7 @@ impl FastSlowStore {
     /// map would double-count memory AND trip the legacy map's
     /// size-mismatch eviction guard.
     #[must_use]
-    pub fn chunked_in_flight_digests_handle(&self) -> Arc<Mutex<HashSet<DigestInfo>>> {
+    pub fn chunked_in_flight_digests_handle(&self) -> Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> {
         self.chunked_in_flight_digests.clone()
     }
 
@@ -1310,7 +1324,7 @@ impl FastSlowStore {
     /// `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H2.
     #[must_use]
     pub fn is_chunked_in_flight(&self, digest: &DigestInfo) -> bool {
-        self.chunked_in_flight_digests.lock().contains(digest)
+        self.chunked_in_flight_digests.lock().contains_key(digest)
     }
 
     /// #212 fixup B2: shared handle to the empty-notify so the dispatcher
@@ -2023,9 +2037,10 @@ impl FastSlowStore {
                             let bytes: usize = chunks.iter().map(|b| b.len()).sum();
                             warn!(?key, bytes, "FastSlowStore: unflushed write at shutdown");
                         }
-                        for digest in chunked_guard.iter() {
+                        for (digest, refcount) in chunked_guard.iter() {
                             warn!(
                                 ?digest,
+                                refcount = refcount.get(),
                                 "FastSlowStore: unflushed chunked-path write at shutdown"
                             );
                         }
@@ -2517,8 +2532,8 @@ impl FastSlowStore {
         let shared = other.failed_slow_writes.clone();
         let in_flight_slow_writes: Arc<Mutex<HashMap<StoreKey<'static>, Vec<Bytes>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let chunked_in_flight_digests: Arc<Mutex<HashSet<DigestInfo>>> =
-            Arc::new(Mutex::new(HashSet::new()));
+        let chunked_in_flight_digests: Arc<Mutex<HashMap<DigestInfo, NonZeroU32>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         // See `new` for rationale: lifted so the #367 slow-eviction
         // listener can observe the BIS-feeder queue.
         let stable_digests: Arc<Mutex<Vec<DigestInfo>>> = Arc::new(Mutex::new(Vec::new()));
@@ -4344,7 +4359,7 @@ impl StoreDriver for FastSlowStore {
                     for (k, result) in key.iter().zip(results.iter_mut()) {
                         if result.is_none() {
                             let digest = k.borrow().into_digest();
-                            if chunked.contains(&digest) {
+                            if chunked.contains_key(&digest) {
                                 *result = Some(digest.size_bytes());
                             }
                         }
@@ -4440,7 +4455,7 @@ impl StoreDriver for FastSlowStore {
                 for (k, result) in key.iter().zip(results.iter_mut()) {
                     if result.is_none() {
                         let digest = k.borrow().into_digest();
-                        if chunked.contains(&digest) {
+                        if chunked.contains_key(&digest) {
                             debug!(
                                 ?digest,
                                 "has_with_results: found blob in chunked-path \
@@ -5895,6 +5910,98 @@ impl StoreDriver for FastSlowStore {
                     // Registry installed but no entry for this digest →
                     // no chunked write in flight; fall through normally.
                     registry.record_pin_miss();
+                }
+            }
+        }
+
+        // BLOCK-B (#499 followup, Option F1 — read-blocks-on-commit):
+        // close the H1 reader-cascade half-gap. v2 (`WriteChunkedV2`)
+        // sessions register the digest in `chunked_in_flight_digests`
+        // BUT do NOT register in `chunked_read_registry` — they have a
+        // different (race-state) chunk layout that the per-driver pin
+        // can't serve. Without this wait, `has_with_results` says
+        // Some(declared_size) via `chunked_in_flight_digests` while
+        // `get_part` returns NotFound (canonical not yet on disk +
+        // no pin to serve from). Bazel sees the "yes/no" oscillation
+        // and aborts builds with `FAILED_PRECONDITION`. See audit
+        // `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md`
+        // H1 + the dispatch-prompt BLOCK-B.
+        //
+        // Mechanism: when the digest is in `chunked_in_flight_digests`
+        // (v1 or v2), wait briefly (up to `V2_INFLIGHT_WAIT_BUDGET`)
+        // for it to drain — the v1 path's pin should already have served
+        // from the chunked-cascade above, so reaching this point
+        // typically means v2 (or v1 commit-window). When the wait
+        // completes (set drained), fall through to the slow tier; the
+        // canonical CAS file should now be on disk (commit success) or
+        // still missing (commit failure → NotFound from the slow tier).
+        // When the budget elapses, fall through anyway; the existing
+        // NotFound semantics survive.
+        //
+        // The wait uses the per-FSS `in_flight_empty_notify` (fires when
+        // the chunked OR legacy in-flight set drains to empty) +
+        // bounded polling — same shape as the chunked-cascade
+        // partial-miss wait above. No per-digest wakeup primitive is
+        // added because the v2 commit-watchdog is 60s and a single
+        // polling tick (50ms) is cheap; readers in the v2 commit window
+        // pay at most one extra ~50ms latency before falling through.
+        //
+        // Falsification: comment out the loop body. Concurrent reader
+        // during v2 in-flight gets NotFound immediately (the H1 bug).
+        // The bespoke message in the BLOCK-B test red-fails.
+        #[cfg(feature = "chunked_fast_slow")]
+        if self.chunked_reads_enabled.load(Ordering::Relaxed)
+            && let StoreKey::Digest(digest) = key.borrow()
+        {
+            // Quick check: only block if the digest actually IS in the
+            // v2/v1 in-flight set. The vast majority of reads bypass
+            // this entirely.
+            let is_in_flight =
+                self.chunked_in_flight_digests.lock().contains_key(&digest);
+            if is_in_flight {
+                // Bound the wait to a small budget. v2 commits typically
+                // complete in <1s for small blobs; large blobs take
+                // multiple seconds but bounded by `COMMIT_WAIT_WATCHDOG`
+                // (60s) on the writer side. We use a tighter budget here
+                // because (a) reader is on the Bazel-facing critical
+                // path, and (b) on budget-elapsed we still fall through
+                // and get the standard NotFound (matching pre-fix
+                // behavior).
+                const V2_INFLIGHT_WAIT_BUDGET: Duration = Duration::from_secs(5);
+                const V2_INFLIGHT_POLL_INTERVAL: Duration =
+                    Duration::from_millis(50);
+                let deadline = tokio::time::Instant::now()
+                    + V2_INFLIGHT_WAIT_BUDGET;
+                debug!(
+                    ?digest,
+                    "fast_slow get_part: digest is in chunked_in_flight_digests; \
+                     blocking reader for up to {V2_INFLIGHT_WAIT_BUDGET:?} \
+                     for v2/v1 commit (BLOCK-B H1 reader-cascade)",
+                );
+                loop {
+                    if tokio::time::Instant::now() >= deadline {
+                        warn!(
+                            ?digest,
+                            budget_secs = V2_INFLIGHT_WAIT_BUDGET.as_secs(),
+                            "fast_slow get_part: V2_INFLIGHT_WAIT_BUDGET elapsed \
+                             waiting for chunked_in_flight_digests to drain; \
+                             falling through to slow tier (may NotFound)",
+                        );
+                        break;
+                    }
+                    // Re-check WITHOUT acquiring the lock first (atomic
+                    // is cheaper); only lock on suspect.
+                    let still_in_flight =
+                        self.chunked_in_flight_digests.lock().contains_key(&digest);
+                    if !still_in_flight {
+                        debug!(
+                            ?digest,
+                            "fast_slow get_part: chunked_in_flight_digests drained \
+                             for this digest; proceeding to slow-tier read",
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(V2_INFLIGHT_POLL_INTERVAL).await;
                 }
             }
         }

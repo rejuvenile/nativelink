@@ -56,6 +56,7 @@
 
 #![cfg(feature = "chunked_fast_slow")]
 
+use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
@@ -464,8 +465,11 @@ pub struct ChunkedWriteHandler<Fe: FileEntry = FileEntryImpl> {
     /// `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H1.
     /// Production wiring lives in `bin/nativelink.rs` alongside the v2
     /// BIS / failed_commit sinks.
+    ///
+    /// MAJOR-G (#499 followup): refcount HashMap so concurrent sessions
+    /// for the same digest both observe presence until BOTH drop.
     chunked_in_flight_digests: Option<
-        Arc<parking_lot::Mutex<std::collections::HashSet<DigestInfo>>>,
+        Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
     >,
     /// H1 (#499 followup): wakes `flush_slow_writes` waiters when the
     /// chunked in-flight set drains. Paired with `chunked_in_flight_digests`.
@@ -520,7 +524,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     #[must_use]
     pub fn with_chunked_in_flight_digests(
         mut self,
-        digests: Arc<parking_lot::Mutex<std::collections::HashSet<DigestInfo>>>,
+        digests: Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
         notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         self.chunked_in_flight_digests = Some(digests);
@@ -531,7 +535,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
     /// H1: pub-in-crate accessors for the v2 session loop.
     pub(crate) fn chunked_in_flight_digests_for_v2(
         &self,
-    ) -> Option<&Arc<parking_lot::Mutex<std::collections::HashSet<DigestInfo>>>> {
+    ) -> Option<&Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>> {
         self.chunked_in_flight_digests.as_ref()
     }
 
@@ -2503,6 +2507,18 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     chunks: Pin<Box<dyn Stream<Item = Result<PreparedChunk, Error>> + Send>>,
     commit_mode: CommitMode,
     metrics: Arc<ChunkedWriteHandlerMetrics>,
+    // MAJOR-F (#499 followup): optional channel through which the
+    // AsyncCommit reaper relays the actual `Result<ChunkedCommitResult,
+    // Error>` to the deferred-publish task that bridges chunked
+    // commits to the v2 race-state. Pre-fix, the deferred-publish task
+    // polled `in_flight.contains_digest()` and ALWAYS published Ok —
+    // a sibling v2 writer in AwaitCommit would observe phantom-Ok on a
+    // v1 commit failure. Post-fix, the deferred-publish awaits this
+    // oneshot for the actual outcome (mirrors the existing Synchronous
+    // mode `result_relay` on this same fn). `None` for callers that
+    // don't need the outcome (Synchronous mode passes `None` to a
+    // helper that constructs its own internal relay).
+    async_result_relay: Option<oneshot::Sender<Result<ChunkedCommitResult, Error>>>,
 ) -> Result<DispatchOutcome, Error> {
     let stream_digest = digest;
 
@@ -2803,7 +2819,17 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
                 failed_sink_for_reaper,
                 metrics_for_reaper,
                 "async",
-                None, // result_relay — AsyncCommit returns Ok at admit time
+                // MAJOR-F (#499 followup): forward the deferred-publish
+                // relay channel (if the upstream caller wired one) to
+                // the reaper. The reaper sends the ACTUAL commit_result
+                // through this channel BEFORE doing the in-flight
+                // bookkeeping, so the deferred-publish task can publish
+                // the real outcome to the race-state instead of
+                // unconditionally publishing Ok (the pre-fix bug). When
+                // `None`, AsyncCommit semantics are preserved (no
+                // outcome propagation; existing callers that don't
+                // bridge to a race-state).
+                async_result_relay,
             ));
 
             Ok(DispatchOutcome {
@@ -2855,8 +2881,11 @@ pub struct BazelChunkedDispatcherImpl<Fe: FileEntry = FileEntryImpl> {
     /// actual chunk bytes; chunked writes track bytes via the
     /// chunked-driver pin instead). `None` = no in-flight registration
     /// (tests that don't care about these contracts).
+    ///
+    /// MAJOR-G (#499 followup): refcount HashMap so concurrent
+    /// same-digest sessions both observe presence until BOTH drop.
     chunked_in_flight_digests: Option<
-        Arc<parking_lot::Mutex<std::collections::HashSet<DigestInfo>>>,
+        Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
     >,
     /// #212 fixup B2: notify shared with the FastSlowStore so the
     /// graceful-drain in `flush_slow_writes` wakes when in-flight goes
@@ -2986,7 +3015,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
     pub fn with_in_flight_tracking(
         mut self,
         chunked_in_flight_digests: Arc<
-            parking_lot::Mutex<std::collections::HashSet<DigestInfo>>,
+            parking_lot::Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>,
         >,
         in_flight_empty_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
@@ -3160,7 +3189,7 @@ impl<Fe: FileEntry> BazelChunkedDispatcherImpl<Fe> {
 /// guard must remain trivially auditable.
 #[derive(Debug)]
 pub struct InFlightChunkedGuard {
-    set: Arc<Mutex<std::collections::HashSet<DigestInfo>>>,
+    set: Arc<Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
     digest: DigestInfo,
     /// Mirrors the existing notify-on-empty contract: when the set
     /// transitions from non-empty to empty, wake any
@@ -3174,16 +3203,37 @@ pub struct InFlightChunkedGuard {
 }
 
 impl InFlightChunkedGuard {
-    /// Insert `digest` into `set` and return a guard that will remove
-    /// it on Drop (and, if the removal empties the set, fire
-    /// `notify_waiters()` on `notify`).
+    /// MAJOR-G (#499 followup): bump the refcount for `digest` in `set`
+    /// and return a guard that will decrement on Drop. When the
+    /// refcount reaches zero the entry is removed and (if the map
+    /// becomes empty) `notify.notify_waiters()` fires.
+    ///
+    /// Pre-fix this was a HashSet — two concurrent sessions for the
+    /// same digest both "inserted" (idempotent), but the first to drop
+    /// would remove the digest while the second was still in-flight.
+    /// Readers in BLOCK-B's wait loop observed the digest as drained
+    /// and proceeded to slow tier where the bytes weren't yet
+    /// committed → NotFound. Refcount HashMap keeps the digest visible
+    /// until BOTH guards drop.
     #[must_use]
     pub fn new(
-        set: Arc<Mutex<std::collections::HashSet<DigestInfo>>>,
+        set: Arc<Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
         digest: DigestInfo,
         notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Self {
-        set.lock().insert(digest);
+        {
+            let mut guard = set.lock();
+            // Bump the refcount; default to 1 if absent.
+            guard
+                .entry(digest)
+                .and_modify(|c| {
+                    // Saturate to prevent overflow at u32::MAX; under
+                    // normal load refcounts are O(1)-O(10) (concurrent
+                    // sessions for the same digest are rare).
+                    *c = c.checked_add(1).unwrap_or(*c);
+                })
+                .or_insert(NonZeroU32::new(1).expect("1 is non-zero"));
+        }
         Self {
             set,
             digest,
@@ -3194,8 +3244,9 @@ impl InFlightChunkedGuard {
 
     /// Disarm the guard and return its state for hand-off to a
     /// post-dispatch reaper. After disarm, Drop is a no-op — the caller
-    /// is responsible for removing the digest at the appropriate moment
-    /// AND firing `notify.notify_waiters()` if the set becomes empty.
+    /// is responsible for performing the equivalent of the Drop
+    /// (decrement refcount; remove on zero; fire notify if map
+    /// becomes empty) at the appropriate moment.
     ///
     /// Used exclusively by the `dispatch` Ok branch: the chunked-driver
     /// continues asynchronously after `dispatch.await` returns; the
@@ -3205,7 +3256,7 @@ impl InFlightChunkedGuard {
     pub fn disarm(
         mut self,
     ) -> (
-        Arc<Mutex<std::collections::HashSet<DigestInfo>>>,
+        Arc<Mutex<std::collections::HashMap<DigestInfo, NonZeroU32>>>,
         DigestInfo,
         Option<Arc<tokio::sync::Notify>>,
     ) {
@@ -3228,10 +3279,28 @@ impl Drop for InFlightChunkedGuard {
             return;
         }
         let mut guard = self.set.lock();
-        guard.remove(&self.digest);
-        let became_empty = guard.is_empty();
+        // MAJOR-G: decrement refcount; remove entry only when it
+        // reaches zero. NonZeroU32::checked_sub returns None when
+        // result would be zero — at that point we remove the entry.
+        let now_empty = match guard.get_mut(&self.digest) {
+            Some(count) => {
+                if let Some(new_count) = NonZeroU32::new(count.get() - 1) {
+                    *count = new_count;
+                    false // entry stays
+                } else {
+                    guard.remove(&self.digest);
+                    guard.is_empty()
+                }
+            }
+            None => {
+                // No entry to decrement — should not happen given the
+                // RAII shape (new() inserts; we're the only path that
+                // decrements). Defensive: treat as no-op.
+                false
+            }
+        };
         drop(guard);
-        if became_empty {
+        if now_empty {
             if let Some(n) = self.notify.as_ref() {
                 n.notify_waiters();
             }
@@ -3315,10 +3384,17 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                          in-flight writer (cross-version coordination path)",
                     ));
                 }
-                // Subscribe BEFORE peeking to avoid the missed-wakeup
-                // race. Use the same 60s watchdog the v2 AwaitCommit
-                // branch uses (matches `COMMIT_WAIT_WATCHDOG`).
+                // BLOCK-E (#499 followup): defense-in-depth — see
+                // `chunked_write_handler_v2.rs::v2_await_commit_result`
+                // doc-comment for full rationale. tokio 1.49's
+                // `Notified` captures `notify_waiters_calls` at
+                // creation, so the classic missed-wakeup is already
+                // mitigated; pin + `enable()` is documentation-by-code
+                // (eager registration is part of the contract) AND a
+                // belt-and-suspenders against future tokio API drift.
                 let notified = race_state.subscribe_commit_done();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if let Some(result) = race_state.peek_commit_result() {
                     return result.map(|r| r.committed_size);
                 }
@@ -3361,6 +3437,28 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                         self.in_flight_empty_notify.clone(),
                     )
                 });
+                // MAJOR-F + MAJOR-H (#499 followup): replace the
+                // pre-fix unconditional-Ok deferred-publish + busy-spin
+                // (`yield_now` polling `in_flight.contains_digest`) with
+                // a reactive oneshot relay. The reaper inside
+                // `dispatch_chunks_to_driver`'s AsyncCommit branch sends
+                // the ACTUAL commit_result through this channel before
+                // performing the in-flight bookkeeping. The
+                // deferred-publish task awaits that result and publishes
+                // it faithfully to the race-state — sibling v2 writers
+                // observe the real outcome (Ok with committed_size on
+                // success; Err with the original commit error on
+                // failure) instead of a phantom Ok.
+                //
+                // Eliminates:
+                // - Busy-spin on `yield_now` (was N×100µs ticks during
+                //   commit window of multi-second blobs).
+                // - Synthetic-Cancelled trap on spawn drop (the relay
+                //   approach decouples publish from in-flight removal).
+                // - Phantom-Ok on commit failure (the prime DS hazard
+                //   the prompt identified).
+                let (commit_relay_tx, commit_relay_rx) =
+                    oneshot::channel::<Result<ChunkedCommitResult, Error>>();
                 let dispatch_res = dispatch_bazel_facing_internal_chunking(
                     Arc::clone(&self.filesystem_store),
                     Arc::clone(&self.in_flight),
@@ -3373,6 +3471,7 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                     self.chunk_size,
                     digest,
                     reader,
+                    Some(commit_relay_tx),
                 )
                 .await;
 
@@ -3385,10 +3484,11 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                 // its client while the canonical CAS file is still
                 // missing on disk — a phantom-success leak (#497 v3 race).
                 //
-                // Therefore: on Ok, defer the race-state publish until
-                // the in_flight entry drains (signaling the chunked
-                // driver completed commit_and_verify + finalize_holding).
-                // On Err, publish immediately (no async commit pending).
+                // Therefore: on Ok-from-dispatch (admission ok, commit
+                // pending), defer the race-state publish until the
+                // commit_relay receives the actual outcome. On
+                // Err-from-dispatch (admission failed before commit was
+                // ever queued), publish immediately.
                 //
                 // Release the single-stream owner gate AFTER we know whether
                 // to publish synchronously or defer. The owner-guard's
@@ -3404,43 +3504,80 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                         // Arc + the owner_guard alive in the spawned task.
                         let race_state_for_publish = Arc::clone(&race_state);
                         let owner_guard_for_publish = owner_guard;
-                        let in_flight_for_publish = Arc::clone(&self.in_flight);
                         let dig_for_publish = digest;
-                        let committed_size = outcome.committed_size;
                         let inflight_set_for_reaper = inflight_guard_opt.map(|g| g.disarm());
                         tokio::spawn(async move {
-                            // Wait for the chunked driver's reaper to
-                            // remove the in_flight entry — this is the
-                            // signal that commit + finalize completed.
-                            loop {
-                                if !in_flight_for_publish.contains_digest(&dig_for_publish) {
-                                    break;
-                                }
-                                tokio::task::yield_now().await;
-                            }
-                            // Now publish to siblings. Owner_guard's drop
-                            // (after this) clears single_stream_owner.
-                            race_state_for_publish.publish_commit_result(Ok(RaceCommitResult {
-                                committed_size,
-                            }));
+                            // MAJOR-F: await the actual commit_result from
+                            // the reaper via the oneshot relay (no more
+                            // polling). On RecvError (reaper task aborted
+                            // / runtime shutdown — should not happen on a
+                            // healthy runtime) synthesise an Internal Err
+                            // so siblings observe a deterministic failure
+                            // instead of a hang. NOTE: the reaper sends
+                            // BEFORE its in-flight removal, so the
+                            // bookkeeping below races the reaper's own
+                            // removal — both end states are
+                            // equivalent (entry gone, notify fired).
+                            let real_outcome = match commit_relay_rx.await {
+                                Ok(r) => r,
+                                Err(_recv_err) => Err(make_err!(
+                                    Code::Internal,
+                                    "v1 deferred-publish: chunked AsyncCommit reaper \
+                                     dropped commit_relay sender before propagating \
+                                     commit_result for digest {dig_for_publish} (task \
+                                     panic or runtime shutdown)"
+                                )),
+                            };
+                            let publish_outcome = real_outcome.map(|c| RaceCommitResult {
+                                committed_size: c.committed_size,
+                            });
+                            // Publish the REAL outcome to siblings. On
+                            // Ok, sibling v2 writers in AwaitCommit
+                            // observe success. On Err, they observe the
+                            // exact error category the chunked commit
+                            // produced (DeadlineExceeded for watchdog,
+                            // InvalidArgument for hash mismatch, etc.) —
+                            // NOT a synthetic phantom Ok.
+                            race_state_for_publish.publish_commit_result(publish_outcome);
                             // Explicit relinquish so SingleStreamOwnerGuard::Drop
                             // does NOT publish a synthetic Cancelled.
                             owner_guard_for_publish.relinquish();
                             // Then handle the inflight_set bookkeeping
-                            // (mirrors the prior reaper).
+                            // (mirrors the prior reaper). The reaper
+                            // independently removes from `in_flight`;
+                            // here we remove from
+                            // `chunked_in_flight_digests` (the FSS-level
+                            // set) which the reaper does NOT touch.
+                            //
+                            // MAJOR-G: refcount-aware decrement. Mirrors
+                            // `InFlightChunkedGuard::Drop` because the
+                            // disarm path transferred removal ownership
+                            // to this site.
                             if let Some((set, dig, notify)) = inflight_set_for_reaper {
                                 let mut guard = set.lock();
-                                guard.remove(&dig);
-                                let became_empty = guard.is_empty();
+                                let now_empty = match guard.get_mut(&dig) {
+                                    Some(count) => {
+                                        if let Some(new_count) =
+                                            NonZeroU32::new(count.get() - 1)
+                                        {
+                                            *count = new_count;
+                                            false
+                                        } else {
+                                            guard.remove(&dig);
+                                            guard.is_empty()
+                                        }
+                                    }
+                                    None => false,
+                                };
                                 drop(guard);
-                                if became_empty {
+                                if now_empty {
                                     if let Some(n) = notify.as_ref() {
                                         n.notify_waiters();
                                     }
                                 }
                             }
                         });
-                        Ok(committed_size)
+                        Ok(outcome.committed_size)
                     }
                     (Err(err), _guard) => {
                         // Synchronous publish + relinquish on Err.
@@ -3693,6 +3830,12 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
     chunk_size: usize,
     digest: DigestInfo,
     mut reader: DropCloserReadHalf,
+    // MAJOR-F (#499 followup): forwarded to `dispatch_chunks_to_driver`
+    // — see that fn's `async_result_relay` doc-comment. The
+    // `BazelChunkedDispatcherImpl` AsyncCommit caller passes `Some` so
+    // it can publish the actual commit outcome to the v2 race-state
+    // (instead of the pre-fix unconditional Ok publish).
+    async_result_relay: Option<oneshot::Sender<Result<ChunkedCommitResult, Error>>>,
 ) -> Result<DispatchOutcome, Error> {
     debug!(
         ?digest,
@@ -3772,6 +3915,16 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
             "bazel-facing internal chunking dispatch: early-dedup short-circuit \
              (digest already in evicting_map; per-chunk pwrite + sha-verify elided)"
         );
+        // MAJOR-F (#499 followup): the early-dedup path returns Ok without
+        // going through the chunked driver — but if the caller wired a
+        // result_relay (deferred-publish bridge to the v2 race-state),
+        // we still need to inform it. The "blob already indexed" outcome
+        // is durable; publish Ok with the declared size.
+        if let Some(tx) = async_result_relay {
+            let _ = tx.send(Ok(ChunkedCommitResult {
+                committed_size: digest.size_bytes(),
+            }));
+        }
         return Ok(DispatchOutcome {
             committed_size: digest.size_bytes(),
         });
@@ -3791,6 +3944,7 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
         chunks_stream,
         CommitMode::AsyncCommit,
         metrics,
+        async_result_relay,
     )
     .await
 }
