@@ -1,5 +1,11 @@
 #:schema tools/cargo-with-detailed-deps.json
 [workspace]
+# #495 Phase 1: `benchmarks` is the data-plane benchmark harness. It is a
+# binary-only crate that depends on all the `nativelink-*` libs but is not
+# a transitive path-dep of the root crate (the root has no need to link
+# the harness), so it must be enumerated explicitly here. All other
+# workspace members are still implicit via root path-deps.
+members = ["benchmarks"]
 exclude = [
   "nativelink-config/generate-stores-config",
   "tools/generate-bazel-rc",

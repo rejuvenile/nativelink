@@ -1,0 +1,64 @@
+[package]
+edition = "2024"
+name = "nativelink-benchmarks"
+rust-version = "1.87.0"
+version = "0.1.0"
+publish = false
+description = "Data-plane benchmark harness for NativeLink (#495 Phase 1: v3-anchoring smoke cells)."
+
+[[bin]]
+name = "data_plane_bench"
+path = "src/bin/data_plane_bench.rs"
+
+[features]
+default = []
+# `chunked_fast_slow` is required for the W3 / R5 v3-anchoring cells that
+# exercise the per-digest `Notify` + reaper-publish ownership paths added
+# in the 2026-05-15 v3 bundle. Without it those cells short-circuit with
+# a runtime "scenario disabled" marker in the JSON output.
+chunked_fast_slow = [
+  "nativelink-service/chunked_fast_slow",
+  "nativelink-store/chunked_fast_slow",
+  "nativelink-service/test-utils",
+  "nativelink-store/test-utils",
+]
+
+[dependencies]
+bytes = { version = "1.10.1", default-features = false }
+clap = { version = "4.5.35", features = [
+  "color",
+  "derive",
+  "error-context",
+  "help",
+  "std",
+  "suggestions",
+  "usage",
+], default-features = false }
+futures = { version = "0.3.31", default-features = false }
+nativelink-config = { path = "../nativelink-config" }
+nativelink-error = { path = "../nativelink-error" }
+nativelink-proto = { path = "../nativelink-proto" }
+nativelink-service = { path = "../nativelink-service" }
+nativelink-store = { path = "../nativelink-store" }
+nativelink-util = { path = "../nativelink-util" }
+serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
+sha2 = { version = "0.10.8", default-features = false, features = ["asm"] }
+tempfile = { version = "3.15.0", default-features = false }
+tokio = { version = "1.44.1", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "parking_lot",
+  "rt-multi-thread",
+  "time",
+], default-features = false }
+tokio-stream = { version = "0.1.17", features = ["net"], default-features = false }
+tonic = { version = "0.14.5", features = [
+  "transport",
+], default-features = false }
+tracing = { version = "0.1.41", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+
+[lints]
+workspace = true

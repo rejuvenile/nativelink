@@ -119,3 +119,29 @@ verify-protocol-gate: check-protocol verify-tla
 test-protocol-gate:
 	bash scripts/tests/test_check_protocol_diff.sh
 	bash scripts/tests/test_verify_tla.sh
+
+### Data-plane benchmark suite (#495 Phase 1 v3-anchoring) -----------------
+### Operator doc: benchmarks/README.md
+### Pre-flight gate refuses to run if buildcache is serving live production
+### traffic; pass `--force` to override (only acceptable for the first
+### baseline collection in a known quiet window).
+
+# Run the data-plane benchmark suite and write a baseline JSON file.
+# Usage: just bench-data-plane                   # default args, writes to baselines/<ts>-<sha>.json
+#        just bench-data-plane --fast --force    # fast smoke + bypass gate
+bench-data-plane *ARGS:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	SHA="$(git rev-parse --short=12 HEAD)"
+	TS="$(date -u +%Y%m%dT%H%M%SZ)"
+	OUT="benchmarks/baselines/${TS}-${SHA}.json"
+	mkdir -p "$(dirname "$OUT")"
+	echo "[just] running data_plane_bench → ${OUT}"
+	cargo run --release --bin data_plane_bench --features chunked_fast_slow -p nativelink-benchmarks -- \
+	    --output "${OUT}" {{ARGS}}
+	echo "[just] baseline: ${OUT}"
+
+# Print the pre-flight verdict only; useful to check whether the host is
+# clear to run benches without actually running them.
+bench-preflight:
+	cargo run --release --bin data_plane_bench --features chunked_fast_slow -p nativelink-benchmarks -- --preflight-only

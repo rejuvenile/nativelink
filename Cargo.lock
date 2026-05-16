@@ -3303,6 +3303,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nativelink-benchmarks"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "futures",
+ "nativelink-config",
+ "nativelink-error",
+ "nativelink-proto",
+ "nativelink-service",
+ "nativelink-store",
+ "nativelink-util",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nativelink-config"
 version = "1.0.0"
 dependencies = [
