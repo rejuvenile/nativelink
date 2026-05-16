@@ -3208,11 +3208,14 @@ pub struct InFlightChunkedGuard {
 impl InFlightChunkedGuard {
     /// MAJOR-G (#499 followup) + BLOCK-2 (DS-reviewer): bump the
     /// refcount for `digest` in `set` and return a guard that will
-    /// decrement on Drop. When the refcount reaches zero the entry's
-    /// per-digest `Notify` is woken (`notify_waiters` BEFORE removal,
-    /// so any reader holding a cloned `Arc<Notify>` wakes) and the
-    /// entry is removed. If the whole map then becomes empty, the
-    /// FSS-wide `in_flight_empty_notify` also fires (preserving
+    /// decrement on Drop. When the refcount reaches zero the entry is
+    /// removed from the map and the entry's per-digest `Notify` is
+    /// then woken (`notify_waiters` AFTER `map.remove`). Readers cloned
+    /// the `Arc<Notify>` while subscribing, so the wakeup survives the
+    /// map removal and any reader that re-checks
+    /// `chunked_in_flight_digests.contains_key(...)` after waking
+    /// observes the drained state. If the whole map then becomes empty,
+    /// the FSS-wide `in_flight_empty_notify` also fires (preserving
     /// `flush_slow_writes` graceful-drain).
     ///
     /// Pre-MAJOR-G this was a HashSet — two concurrent sessions for
@@ -3243,10 +3246,20 @@ impl InFlightChunkedGuard {
             // Bump the refcount; on first insert, create the per-digest
             // Notify. Subsequent inserts saturate to prevent overflow at
             // u32::MAX (under normal load refcounts are O(1)-O(10)).
+            //
+            // MAJOR-1 (code-reviewer #499 v3 fix-up): use `saturating_add`
+            // not `checked_add(1).unwrap_or(*c)`. The latter leaves the
+            // count UNCHANGED at u32::MAX, so subsequent
+            // `saturating_sub(1)` decrements in `Drop` would push the
+            // count to `u32::MAX − N` and the entry would never reach
+            // refcount-zero → never remove → per-digest Notify never
+            // fires → BLOCK-B reader blocks forever (no timeout post
+            // round-2 fix). `saturating_add` is the true symmetric
+            // counterpart of the `saturating_sub` in `Drop`.
             guard
                 .entry(digest)
                 .and_modify(|(c, _n)| {
-                    *c = c.checked_add(1).unwrap_or(*c);
+                    *c = c.saturating_add(1);
                 })
                 .or_insert_with(|| {
                     (
@@ -3266,9 +3279,11 @@ impl InFlightChunkedGuard {
     /// Disarm the guard and return its state for hand-off to a
     /// post-dispatch reaper. After disarm, Drop is a no-op — the caller
     /// is responsible for performing the equivalent of the Drop
-    /// (decrement refcount; on zero, fire the entry's per-digest notify
-    /// BEFORE removing the entry; fire FSS-wide notify if the map
-    /// becomes empty) at the appropriate moment.
+    /// (decrement refcount; on zero, remove the entry from the map and
+    /// then fire the entry's per-digest notify AFTER `map.remove` —
+    /// readers cloned the Arc<Notify> while subscribing, so the wakeup
+    /// survives removal; fire FSS-wide notify if the map becomes empty)
+    /// at the appropriate moment.
     ///
     /// Used exclusively by the `dispatch` Ok branch: the chunked-driver
     /// continues asynchronously after `dispatch.await` returns; the
@@ -3297,9 +3312,13 @@ impl Drop for InFlightChunkedGuard {
             return;
         }
         // MAJOR-G + BLOCK-2: decrement refcount; remove entry only when
-        // it reaches zero. On removal, fire the per-digest notify
-        // BEFORE removing so any reader holding the cloned Arc<Notify>
-        // wakes. If the whole map becomes empty, also fire the
+        // it reaches zero. On removal, remove the entry from the map
+        // first and then fire the per-digest notify AFTER `map.remove`.
+        // Readers that subscribed to the per-digest Notify cloned the
+        // Arc before sleeping, so the wakeup survives map removal; on
+        // wakeup a reader re-checking
+        // `chunked_in_flight_digests.contains_key(...)` observes the
+        // drained state. If the whole map becomes empty, also fire the
         // FSS-wide drain notify.
         let mut guard = self.set.lock();
         let (now_empty, per_digest_notify) = match guard.get_mut(&self.digest) {
@@ -3312,11 +3331,14 @@ impl Drop for InFlightChunkedGuard {
                     *count = new_count;
                     (false, None)
                 } else {
-                    // Refcount → 0: wake per-digest waiters BEFORE
-                    // removal so readers holding the Arc see the
-                    // notification, then remove. We take the
-                    // per-digest Arc<Notify> out of the map slot so
-                    // we can call notify_waiters after the lock drop.
+                    // Refcount → 0: clone the per-digest Arc<Notify>
+                    // out of the map slot, remove the entry, drop the
+                    // lock, then fire `notify_waiters` AFTER
+                    // `map.remove` (see inline comment below the
+                    // lock-drop). Readers cloned the Arc while
+                    // subscribing, so the wakeup survives the map
+                    // removal and a re-checking reader observes the
+                    // drained state.
                     let per_digest = Arc::clone(per_digest_notify);
                     guard.remove(&self.digest);
                     (guard.is_empty(), Some(per_digest))

@@ -14,10 +14,10 @@
 
 use core::cmp::{max, min};
 use core::future::Future;
+use core::num::NonZeroU32;
 use core::ops::Range;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use core::num::NonZeroU32;
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -72,8 +72,10 @@ type Loader = Arc<()>;
 /// `await` the `notified` future. The last [`crate::wrapper_walker`]-free
 /// path is the `InFlightChunkedGuard::Drop` (mirrored by the spawned
 /// reaper after `disarm`) — when the refcount transitions to zero, it
-/// fires `notify_waiters()` *before* removing the entry so readers
-/// holding the `Arc<Notify>` wake. Eliminates the prior 5 s polling
+/// removes the entry from the map and then fires `notify_waiters()`
+/// *after* the removal. Readers cloned the `Arc<Notify>` while
+/// subscribing, so the wakeup survives map removal and a re-checking
+/// reader observes the drained state. Eliminates the prior 5 s polling
 /// budget that fired short of the documented ~30 s commit p99.
 ///
 /// The per-digest Notify is independent from the FSS-wide
@@ -1339,11 +1341,14 @@ impl FastSlowStore {
     /// set (a v1 or v2 chunked write is mid-stream / mid-commit). Used
     /// by `bytestream_server` to detect the phantom-success case where
     /// `has(digest)` returns Some via the chunked-in-flight cascade but
-    /// the data is NOT canonically committed yet. The pre-write
-    /// short-circuit at `bytestream_server.rs:2706` MUST consult this
-    /// to avoid acking a second concurrent ByteStream::write while the
-    /// first chunked commit hasn't run — see
-    /// `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md` H2.
+    /// the data is NOT canonically committed yet. The two consumer
+    /// sites: `bytestream_server.rs:2672` (QueryWriteStatus / BLOCK-A
+    /// guard) and `bytestream_server.rs:2803` (ByteStream::write
+    /// pre-existence short-circuit / H2 phantom-success guard) — both
+    /// MUST consult this to avoid acking a second concurrent
+    /// ByteStream::write while the first chunked commit hasn't run.
+    /// See `.claude/audits/concurrent-readers-vs-writers-2026-05-15.md`
+    /// H2.
     #[must_use]
     pub fn is_chunked_in_flight(&self, digest: &DigestInfo) -> bool {
         self.chunked_in_flight_digests.lock().contains_key(digest)
@@ -5952,13 +5957,15 @@ impl StoreDriver for FastSlowStore {
         // Mechanism: when the digest is in `chunked_in_flight_digests`
         // (v1 or v2), block this reader on the digest's per-entry
         // `Arc<Notify>` until the writer's RAII guard transitions the
-        // refcount to zero (`InFlightChunkedGuard::Drop` calls
-        // `notify.notify_waiters()` BEFORE removing the entry, so any
-        // reader holding the cloned Arc wakes). On wakeup, fall through
-        // to the slow tier — the canonical CAS file is either now on
-        // disk (commit success) or still missing (commit failure →
-        // NotFound from the slow tier; correct, because the bytes
-        // weren't durable).
+        // refcount to zero (`InFlightChunkedGuard::Drop` removes the
+        // entry from the map and then calls `notify.notify_waiters()`
+        // AFTER the removal; readers cloned the Arc<Notify> while
+        // subscribing so the wakeup survives the map removal, and a
+        // re-check of `contains_key(&digest)` after waking observes the
+        // drained state). On wakeup, fall through to the slow tier —
+        // the canonical CAS file is either now on disk (commit success)
+        // or still missing (commit failure → NotFound from the slow
+        // tier; correct, because the bytes weren't durable).
         //
         // Why unbounded (no timeout, no polling): the prior 5 s budget
         // fired before the documented commit p99 (~30 s for multi-MiB
@@ -6003,7 +6010,8 @@ impl StoreDriver for FastSlowStore {
                     "fast_slow get_part: digest is in chunked_in_flight_digests; \
                      blocking reader on per-digest Notify until v2/v1 commit \
                      completes (BLOCK-B H1 reader-cascade; unbounded — writer-side \
-                     COMMIT_WAIT_WATCHDOG 60s + RAII synthetic-Cancelled-on-drop \
+                     commit-watchdog (60s; CHUNKED_COMMIT_WATCHDOG_SECS for v1, \
+                     COMMIT_WAIT_WATCHDOG for v2) + RAII synthetic-Cancelled-on-drop \
                      bounds the wait)",
                 );
                 let notified = notify.notified();

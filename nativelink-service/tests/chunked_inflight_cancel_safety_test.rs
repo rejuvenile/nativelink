@@ -401,16 +401,18 @@ async fn block_2_per_digest_notify_fires_only_on_refcount_zero() {
 }
 
 /// BLOCK-2 (DS-reviewer, #499 v3 follow-up): the per-digest Notify
-/// must fire BEFORE the entry is removed from the map. A reader that
+/// must fire AFTER the entry is removed from the map. A reader that
 /// re-checks `chunked_in_flight_digests.contains_key(...)` after
-/// waking must observe the drained state. This test pins the
-/// notify-then-remove ordering by:
+/// waking must observe the drained state. The reader cloned the
+/// `Arc<Notify>` while subscribing, so the wakeup survives the map
+/// removal even though the entry's slot is gone. This test pins the
+/// remove-then-notify ordering by:
 ///  1. subscribing the reader to the per-digest Notify,
 ///  2. dropping the guard,
 ///  3. asserting the reader wakes,
 ///  4. asserting the entry is gone from the map AFTER the reader wakes.
 #[nativelink_test]
-async fn block_2_per_digest_notify_fires_before_entry_removed() {
+async fn block_2_per_digest_notify_fires_after_entry_removed() {
     let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let drain_notify = Arc::new(Notify::new());
     let digest = make_digest(0xE6);
@@ -431,9 +433,11 @@ async fn block_2_per_digest_notify_fires_before_entry_removed() {
     let reader = tokio::spawn(async move {
         per_digest_notify.notified().await;
         // After waking, the entry must be absent — the writer's Drop
-        // calls notify_waiters BEFORE map.remove, so the per-digest
-        // Notify only fires once the map state has been mutated past
-        // the in-flight assertion.
+        // removes the entry from the map FIRST and then calls
+        // notify_waiters AFTER `map.remove`. The reader (this task)
+        // cloned the Arc<Notify> while subscribing, so the wakeup
+        // survives the map removal, and on wakeup
+        // `contains_key(&digest)` observes the drained state.
         let still_present = set_for_reader.lock().contains_key(&digest);
         assert!(
             !still_present,

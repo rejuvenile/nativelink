@@ -2032,10 +2032,15 @@ async fn block_b_h1_reader_cascade_blocks_on_v2_inflight_then_serves_from_slow()
     //
     // Without BLOCK-B: reader skips the wait, fast tier misses, slow
     // tier misses, reader returns NotFound — the H1 hazard.
-    // With BLOCK-B: reader waits up to V2_INFLIGHT_WAIT_BUDGET; during
-    // that wait the test populates the slow tier AND drains the
-    // in-flight set; reader then falls through to the slow tier and
-    // serves the bytes successfully.
+    // With BLOCK-B (post-DS-reviewer round 2): reader subscribes to the
+    // per-digest `Arc<Notify>` carried by the chunked-in-flight map
+    // entry and `.await`s `notified` (unbounded — bounded on the
+    // writer side by `CHUNKED_COMMIT_WATCHDOG_SECS = 60s` v1 and
+    // `COMMIT_WAIT_WATCHDOG = 60s` v2 + RAII synthetic-Cancelled-on-drop
+    // on every termination path). During that wait the test populates
+    // the slow tier AND drops the writer's `InFlightChunkedGuard` (which
+    // fires the per-digest notify on refcount → 0); the reader wakes and
+    // falls through to the slow tier where the bytes are now served.
     let payload: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
     let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
 
@@ -2083,19 +2088,34 @@ async fn block_b_h1_reader_cascade_blocks_on_v2_inflight_then_serves_from_slow()
         Some(Arc::clone(&in_flight_empty_notify)),
     );
 
-    // Spawn a concurrent task that simulates the v2 commit completing
-    // while the reader is mid-wait: populates the slow tier AND drops
-    // the guard (which fires the per-digest Notify the reader is
-    // awaiting). Hand the guard into the spawn so its Drop runs only
-    // after the wall-clock delay below.
+    // Synchronization (replaces the prior `tokio::time::sleep(150ms)`
+    // CLAUDE.md sleep-as-sync violation): a `tokio::sync::Barrier(2)`
+    // rendezvouses the drainer with the test body. The test body
+    // spawns the reader, performs a few `yield_now()` calls to let the
+    // reader register its `Notified` future on the per-digest Notify,
+    // then `barrier.wait().await` releases the drainer. After release
+    // the drainer lands the slow-tier bytes and drops the guard
+    // (refcount → 0 → notify_waiters fires).
+    //
+    // NOTE: even WITHOUT the yield_now+barrier pre-sync, the test
+    // would still pass on tokio 1.49 because `Notify::notified()`
+    // captures `notify_waiters_calls` at FUTURE-CREATION time and
+    // `Notified::poll` resolves immediately if the counter advanced
+    // (see `tokio/src/sync/notify.rs:572,1148`). The barrier is for
+    // INTENT — pin "reader was parked before the writer drained" as
+    // the property the test exercises, independent of tokio's
+    // counter-capture trick.
+    let drainer_barrier = Arc::new(tokio::sync::Barrier::new(2));
     let slow_for_drain = slow_store.clone();
     let payload_for_drain = payload.clone();
+    let drainer_barrier_for_task = Arc::clone(&drainer_barrier);
     let drainer = tokio::spawn(async move {
-        // Sleep ~150ms so the reader is parked on the per-digest Notify
-        // BEFORE the writer drops its guard. The wall-clock sleep is a
-        // SCHEDULING delay, not a synchronization primitive — the
-        // asserted property is "reader produced correct bytes".
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Wait until the test body has parked the reader on the
+        // per-digest Notify. The barrier is the synchronization
+        // primitive (CLAUDE.md: no `sleep` as sync); the test body
+        // releases the barrier ONLY after `yield_now()`s give the
+        // reader's `notified.await` a chance to register.
+        drainer_barrier_for_task.wait().await;
         // Land the bytes on the slow tier (simulates v2 commit-rename
         // making canonical file visible).
         slow_for_drain
@@ -2109,33 +2129,47 @@ async fn block_b_h1_reader_cascade_blocks_on_v2_inflight_then_serves_from_slow()
     });
 
     // Reader: wrap the FSS in a Store via dyn StoreDriver coercion so
-    // the StoreLike convenience methods work. Use get_part_unchunked
-    // for simplicity. The Notify-based BLOCK-B wait is unbounded but
-    // the 60s commit-watchdog (writer side) bounds the worst case; a
-    // 10s test deadlock-detector is sufficient for the ~150ms drainer
-    // simulation here.
+    // the StoreLike convenience methods work. Spawn the reader so the
+    // barrier-protected drainer can fire AFTER the reader is parked
+    // on `notified.await`. A 10s test deadlock-detector is sufficient
+    // for the in-process barrier handoff.
     let fss_dyn: Arc<dyn nativelink_util::store_trait::StoreDriver> =
         Arc::clone(&fss) as Arc<dyn nativelink_util::store_trait::StoreDriver>;
     let fss_store = Store::new(fss_dyn);
-    let read_outcome = tokio::time::timeout(
-        Duration::from_secs(10),
-        fss_store.get_part_unchunked(digest, 0, None),
-    )
-    .await
-    .expect(
-        "BLOCK-B: reader must complete within 10s — must wake on the \
-         per-digest Notify fired by InFlightChunkedGuard::Drop (commit \
-         simulation) and then read from the freshly-populated slow tier",
-    )
-    .expect(
-        "BLOCK-B: H1 reader-cascade returned NotFound during v2 in-flight \
-         window — the H1 Notify-based wait at fast_slow_store.rs must block \
-         reader until chunked_in_flight_digests drains (per-digest Notify \
-         fires), then fall through to slow tier where the bytes (now landed \
-         by the v2 commit) are served. Mutation: comment out the \
-         `notified.await` line — this expectation must red-fail with \
-         get_part NotFound from the still-empty slow tier",
-    );
+    let reader = tokio::spawn(async move {
+        fss_store.get_part_unchunked(digest, 0, None).await
+    });
+
+    // Give the reader a chance to enter `FastSlowStore::get_part`,
+    // clone the per-digest Notify, and register its `Notified` future.
+    // Tokio's scheduler runs spawned tasks cooperatively; a small batch
+    // of `yield_now()`s is enough for the reader to reach the await on
+    // a single-thread or multi-thread runtime.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    // Release the drainer; from this point the drainer lands the slow
+    // bytes and drops the guard, which fires the per-digest Notify.
+    drainer_barrier.wait().await;
+
+    let read_outcome = tokio::time::timeout(Duration::from_secs(10), reader)
+        .await
+        .expect(
+            "BLOCK-B: reader must complete within 10s — must wake on the \
+             per-digest Notify fired by InFlightChunkedGuard::Drop (commit \
+             simulation) and then read from the freshly-populated slow tier",
+        )
+        .expect("reader task panicked")
+        .expect(
+            "BLOCK-B: H1 reader-cascade returned NotFound during v2 in-flight \
+             window — the H1 Notify-based wait at fast_slow_store.rs must block \
+             reader until chunked_in_flight_digests drains (per-digest Notify \
+             fires), then fall through to slow tier where the bytes (now landed \
+             by the v2 commit) are served. Mutation: comment out the \
+             `notified.await` line — this expectation must red-fail with \
+             get_part NotFound from the still-empty slow tier",
+        );
 
     let _ = tokio::time::timeout(Duration::from_secs(5), drainer)
         .await
