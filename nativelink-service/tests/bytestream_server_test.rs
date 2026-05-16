@@ -4283,3 +4283,334 @@ async fn read_silent_zero_on_consume_ok_eof_propagates_get_part_err() -> Result<
 
     Ok(())
 }
+
+/// #500 regression (production-actual shape): silent-zero on
+/// `consume_ok_eof` branch when bytes WERE streamed before the
+/// post-EOF Err. The empty-prefix sibling test above proves the bug
+/// shape; this test proves the production-actual trigger shape
+/// (commit `ee13bee0` enumerates three real-world triggers: streaming-
+/// blob writer commit failure AFTER bytes complete, mirror-write
+/// bookkeeping error AFTER bytes complete, per-blob cache-update
+/// error AFTER bytes complete — all carry non-empty prefixes).
+///
+/// The bug is shape-invariant w.r.t. `prefix` length (the `consume_fut`
+/// only sees `Ok(empty)` AFTER all prefix chunks have been consumed),
+/// but exercising the production-actual shape closes the production-
+/// composition seam more completely. A future regression that only
+/// fired post-bytes (e.g. via a different `select!` arm gating) would
+/// slip through the empty-prefix test alone.
+///
+/// **Mutation guard (per CLAUDE.md TDD step 5):**
+/// Comment out the `if let Some(Err(err)) = state.maybe_get_part_result.take()`
+/// block at `bytestream_server.rs:1747-1758` — this test MUST red-fail
+/// with the bespoke message below.
+#[nativelink_test]
+async fn read_silent_zero_with_non_empty_prefix_propagates_get_part_err() -> Result<(), Error> {
+    // Production composition: real `StoreManager` + real
+    // `ByteStreamServer` + production-actual shape (bytes THEN err).
+    let store_manager = Arc::new(StoreManager::new());
+    let prefix_bytes = Bytes::from_static(b"production-actual-prefix-bytes");
+    let prefix_len = prefix_bytes.len();
+    let inner = Store::new(Arc::new(PartialErrThenDropStore {
+        prefix: prefix_bytes,
+        err_marker: "SILENT_ZERO_500_REGRESSION_MARKER_NONEMPTY_PREFIX",
+    }));
+    store_manager.add_store("main_cas", inner);
+
+    let bs_server = make_bytestream_server(store_manager.as_ref(), None)
+        .expect("Failed to make server");
+
+    // expected_size = prefix.len() + 1 (matches the fake's has_with_results).
+    let expected_size = prefix_len as i64 + 1;
+    let read_request = ReadRequest {
+        resource_name: format!("{INSTANCE_NAME}/blobs/{HASH1}/{expected_size}"),
+        read_offset: 0,
+        read_limit: 0,
+    };
+
+    let consume_fut = async {
+        let mut read_stream = bs_server
+            .read(Request::new(read_request))
+            .await
+            .expect(
+                "ByteStream::read RPC entry must not error — the silent-zero \
+                 fires at stream-yield time, not at RPC entry",
+            )
+            .into_inner();
+
+        let mut total_bytes = 0usize;
+        let mut sent_status_error = false;
+        while let Some(item) = read_stream.next().await {
+            match item {
+                Ok(resp) => {
+                    total_bytes += resp.data.len();
+                }
+                Err(_status) => {
+                    sent_status_error = true;
+                    break;
+                }
+            }
+        }
+        (total_bytes, sent_status_error)
+    };
+
+    let (total_bytes, sent_status_error) = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        consume_fut,
+    )
+    .await
+    .expect(
+        "deadlock detector: ByteStream::read consumer wedged >5s — \
+         silent-zero on consume_ok_eof when get_part_fut Err must propagate \
+         AFTER bytes streamed (production-actual trigger shape) — \
+         bytestream_server.rs:1730-1738 #500 production-firing site",
+    );
+
+    // Post-fix expectation: prefix bytes streamed THEN status=error.
+    // Pre-fix: prefix bytes streamed THEN clean-EOF (Poll::Ready(None))
+    // with NO error item, giving Bazel status=ok with bytes_sent=prefix_len
+    // on an expected_size=prefix_len+1 read — partial-success digest
+    // mismatch, same BulkTransferException class as the empty-prefix
+    // case but driven by the production-actual shape.
+    assert!(
+        sent_status_error,
+        "silent-zero on consume_ok_eof when get_part_fut Err must propagate \
+         AFTER bytes streamed — bytestream_server.rs:1730-1738 #500 \
+         production-actual trigger shape (non-empty prefix). \
+         Stream yielded {total_bytes} bytes then clean-EOF (Poll::Ready(None)) \
+         WITHOUT an error item. The fix at bytestream_server.rs:1747-1758 \
+         mirrors the consume_err branch's pattern — check \
+         maybe_get_part_result before returning None; if Some(Err), \
+         propagate via Some((Err, None)). The shape-invariance of this \
+         bug means the empty-prefix test ALONE is insufficient to cover \
+         the production-actual trigger family."
+    );
+
+    // Defense in depth: bytes streamed should equal the prefix exactly.
+    // (A future variant of the bug streaming PARTIAL prefix bytes before
+    // silent-EOF would be a different regression class — flag it.)
+    assert_eq!(
+        total_bytes, prefix_len,
+        "test setup: producer sends `prefix` bytes before send_eof+Err, \
+         so stream-consumer should see exactly prefix.len()={prefix_len} \
+         bytes; got {total_bytes} — adjust the fake or expectation if the \
+         production-composition path changes"
+    );
+
+    Ok(())
+}
+
+// ===================================================================
+// #500 over-action contract test: legitimate empty-blob reads MUST
+// still return clean-EOF, not a phantom error
+// ===================================================================
+//
+// CLAUDE.md "Asymmetric contract coverage" requires testing BOTH
+// directions of a state-mutating contract change:
+//   - Under-action: error NOT propagated when it SHOULD be (covered
+//     by `read_silent_zero_on_consume_ok_eof_propagates_get_part_err`
+//     and `read_silent_zero_with_non_empty_prefix_propagates_get_part_err`)
+//   - Over-action: error propagated when it should NOT be (this test)
+//
+// The fix at `bytestream_server.rs:1747-1758` correctly gates on
+// `Some(Err(_))` and falls through to the existing `return None` on
+// both `Some(Ok(()))` (legitimate clean completion with 0 bytes —
+// e.g. a 0-byte blob or a `length=0` request after offset trim) AND
+// `None` (get_part hasn't resolved yet at EOF time — possible via
+// pure tx-drop racing send_eof on a different code path). Without an
+// over-action test, a future "simplification" that drops the
+// `if let Some(Err(...))` gate (e.g. `if let Some(result) = ...` then
+// always-propagates regardless of Ok/Err) would slip through silently
+// while still passing the under-action tests above.
+
+/// Test fake reproducing the legitimate-empty-blob shape: send_eof
+/// cleanly, return `Ok(())`. This is the contract-correct producer
+/// behavior for a successful zero-byte read.
+#[derive(Debug, MetricsComponent)]
+struct SendEofThenOkStore {}
+
+default_health_status_indicator!(SendEofThenOkStore);
+
+#[async_trait]
+impl StoreDriver for SendEofThenOkStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        // Report 1-byte expected_size so the LoggingReadStream silent-zero
+        // detector predicate (`expected_size > 0 && bytes_sent == 0 &&
+        // status == "ok"`) would fire on the receive side — letting us
+        // distinguish a pre-fix-regression-style buggy phantom-error from
+        // the post-fix correct clean-EOF behavior via the journal warn.
+        for slot in results.iter_mut().take(digests.len()) {
+            *slot = Some(1);
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        Err(make_err!(
+            Code::Unimplemented,
+            "SendEofThenOkStore: update not supported"
+        ))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        // Contract-correct producer: send_eof cleanly, return Ok.
+        // The rx side surfaces Ok(empty), which routes to the
+        // `consume_ok_eof` branch in `inner_read`. The post-fix gate
+        // (`if let Some(Err(...))`) MUST fall through to the existing
+        // `return None` because `maybe_get_part_result` is
+        // `Some(Ok(()))` here.
+        writer.send_eof().map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "SendEofThenOkStore: send_eof failed: {e:?}"
+            )
+        })?;
+        Ok(())
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+/// #500 over-action regression: legitimate empty-blob reads
+/// (producer: `send_eof()` then `Ok(())`) MUST still return clean-EOF
+/// to the stream consumer, NOT a phantom error.
+///
+/// The fix at `bytestream_server.rs:1747-1758` introduces a gate on
+/// `state.maybe_get_part_result`. If a future regression mishandles
+/// the `Some(Ok(()))` case (e.g. by always-propagating any
+/// `Some(_)` slot as an Err, or by mistakenly stuffing an Err marker
+/// into a successful slot), this test red-fails.
+///
+/// **Mutation guard (per CLAUDE.md TDD step 5):**
+/// Change `if let Some(Err(err)) = state.maybe_get_part_result.take()`
+/// at `bytestream_server.rs:1747` to
+/// `if let Some(_) = state.maybe_get_part_result.take()` — this test
+/// MUST red-fail with the bespoke message below (the stream would
+/// yield a phantom-error item even though the upstream returned
+/// `Ok(())`).
+#[nativelink_test]
+async fn read_legitimate_empty_blob_returns_clean_eof_not_error() -> Result<(), Error> {
+    let store_manager = Arc::new(StoreManager::new());
+    let inner = Store::new(Arc::new(SendEofThenOkStore {}));
+    store_manager.add_store("main_cas", inner);
+
+    let bs_server = make_bytestream_server(store_manager.as_ref(), None)
+        .expect("Failed to make server");
+
+    // expected_size = 1 (matches SendEofThenOkStore::has_with_results).
+    let read_request = ReadRequest {
+        resource_name: format!("{INSTANCE_NAME}/blobs/{HASH1}/1"),
+        read_offset: 0,
+        read_limit: 0,
+    };
+
+    let consume_fut = async {
+        let mut read_stream = bs_server
+            .read(Request::new(read_request))
+            .await
+            .expect(
+                "ByteStream::read RPC entry must not error on a legitimate \
+                 empty-blob read",
+            )
+            .into_inner();
+
+        let mut total_bytes = 0usize;
+        let mut sent_status_error = false;
+        while let Some(item) = read_stream.next().await {
+            match item {
+                Ok(resp) => {
+                    total_bytes += resp.data.len();
+                }
+                Err(_status) => {
+                    sent_status_error = true;
+                    break;
+                }
+            }
+        }
+        (total_bytes, sent_status_error)
+    };
+
+    let (total_bytes, sent_status_error) = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        consume_fut,
+    )
+    .await
+    .expect(
+        "deadlock detector: ByteStream::read consumer wedged >5s on a \
+         legitimate empty-blob read — bytestream_server.rs:1747-1758 \
+         #500 over-action contract violated",
+    );
+
+    // Post-fix over-action contract: a legitimate Ok(()) from the
+    // producer MUST NOT surface as a phantom error to the stream
+    // consumer. The stream should yield zero items and complete
+    // cleanly (Poll::Ready(None) with no error).
+    assert!(
+        !sent_status_error,
+        "over-action: legitimate empty-blob read (producer returned Ok) \
+         surfaced a phantom status=error to the consumer — the fix at \
+         bytestream_server.rs:1747-1758 must gate strictly on \
+         `Some(Err(_))`, NOT on `Some(_)`. CLAUDE.md \"Asymmetric \
+         contract coverage\" demands both under-action AND over-action \
+         tests; this test guards the over-action direction. A future \
+         regression that drops the `Err(...)` pattern from the gate \
+         would slip past the under-action tests \
+         (read_silent_zero_*_propagates_get_part_err) but fail this one."
+    );
+
+    // Defense in depth: zero bytes streamed (producer sent send_eof
+    // immediately with no chunks).
+    assert_eq!(
+        total_bytes, 0,
+        "test setup: producer sends only send_eof + Ok with no bytes, \
+         so stream-consumer should see zero bytes; got {total_bytes} — \
+         adjust the fake or expectation if the production-composition \
+         path changes"
+    );
+
+    Ok(())
+}

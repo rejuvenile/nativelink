@@ -1728,31 +1728,26 @@ impl ByteStreamServer {
                             match read_result {
                                 Ok(bytes) => {
                                     if bytes.is_empty() {
-                                        // EOF observed on the receive side. The receive
-                                        // side reports `Ok(empty)` for BOTH legitimate EOF
-                                        // (tx.send_eof()) and pure tx-drop (no explicit
-                                        // EOF, no explicit error). The producer side
-                                        // (`get_part_fut`) can resolve with `Err(...)` and
-                                        // drop `tx` without `tx.send_error(...)`; the next
-                                        // iteration's `consume_fut` then sees `Ok(empty)`
-                                        // — silently swallowing the upstream error if we
-                                        // don't consult `state.maybe_get_part_result`. The
-                                        // `consume_err` branch below already does this
-                                        // (it has to merge any structured upstream error
-                                        // with the receive-side error); the symmetric
-                                        // check here closes the silent-zero corruption
-                                        // path that Bazel reports as `BulkTransferException`
-                                        // digest mismatches (#500 production-firing site).
+                                        // Symmetric with the consume_err branch at :1796-1816:
+                                        // an upstream `get_part_fut` Err may have arrived via
+                                        // the select arm at :1860 while `consume_fut` was
+                                        // racing toward EOF. The `tx.send_eof()`-then-`Err`
+                                        // shape from the producer surfaces here as
+                                        // `Ok(empty)` (legitimate-EOF), not `consume_err`.
+                                        // Without this check, the upstream error is silently
+                                        // swallowed and Bazel sees status=ok with
+                                        // bytes_sent=0 (#500 production-firing site;
+                                        // BulkTransferException digest mismatches).
                                         //
-                                        // Mirror the `consume_err` branch's pattern: if
-                                        // `get_part_fut` already resolved with `Err`,
-                                        // propagate that error as the stream's terminal
-                                        // status; only legitimate EOF (Ok(_)) or "not yet
-                                        // resolved" (None — caller would only see this if
-                                        // tx.send_eof() raced ahead of get_part_fut
-                                        // completing) returns the clean-EOF `None`.
+                                        // `.take()` is safe: we `return Some(...)` on the
+                                        // Err path, so the consume_err branch's later read of
+                                        // `maybe_get_part_result` at :1800 is unreachable for
+                                        // this stream iteration. Both branches are inside the
+                                        // same `tokio::select!` match and are mutually
+                                        // exclusive per iteration.
                                         if let Some(Err(err)) = state.maybe_get_part_result.take() {
-                                            info!(
+                                            warn!(
+                                                target: "nativelink_service::bytestream_server",
                                                 %digest,
                                                 branch = "consume_ok_eof_with_get_part_err",
                                                 code = ?err.code,
