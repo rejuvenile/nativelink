@@ -1728,7 +1728,39 @@ impl ByteStreamServer {
                             match read_result {
                                 Ok(bytes) => {
                                     if bytes.is_empty() {
-                                        // EOF.
+                                        // EOF observed on the receive side. The receive
+                                        // side reports `Ok(empty)` for BOTH legitimate EOF
+                                        // (tx.send_eof()) and pure tx-drop (no explicit
+                                        // EOF, no explicit error). The producer side
+                                        // (`get_part_fut`) can resolve with `Err(...)` and
+                                        // drop `tx` without `tx.send_error(...)`; the next
+                                        // iteration's `consume_fut` then sees `Ok(empty)`
+                                        // — silently swallowing the upstream error if we
+                                        // don't consult `state.maybe_get_part_result`. The
+                                        // `consume_err` branch below already does this
+                                        // (it has to merge any structured upstream error
+                                        // with the receive-side error); the symmetric
+                                        // check here closes the silent-zero corruption
+                                        // path that Bazel reports as `BulkTransferException`
+                                        // digest mismatches (#500 production-firing site).
+                                        //
+                                        // Mirror the `consume_err` branch's pattern: if
+                                        // `get_part_fut` already resolved with `Err`,
+                                        // propagate that error as the stream's terminal
+                                        // status; only legitimate EOF (Ok(_)) or "not yet
+                                        // resolved" (None — caller would only see this if
+                                        // tx.send_eof() raced ahead of get_part_fut
+                                        // completing) returns the clean-EOF `None`.
+                                        if let Some(Err(err)) = state.maybe_get_part_result.take() {
+                                            info!(
+                                                %digest,
+                                                branch = "consume_ok_eof_with_get_part_err",
+                                                code = ?err.code,
+                                                elapsed_ms = entry_time.elapsed().as_millis() as u64,
+                                                "inner_read EOF observed but get_part_fut had errored; propagating upstream error instead of silent EOF (#500)",
+                                            );
+                                            return Some((Err(err.into()), None));
+                                        }
                                         debug!(
                                             %digest,
                                             branch = "consume_ok_eof",

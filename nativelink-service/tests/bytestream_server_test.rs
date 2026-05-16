@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::task::Poll;
 use futures::{Future, poll};
@@ -25,8 +26,9 @@ use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use nativelink_config::cas_server::{ByteStreamConfig, HttpListener, WithInstanceName};
 use nativelink_config::stores::{MemorySpec, StoreSpec};
-use nativelink_error::{Code, Error, ResultExt};
+use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
+use nativelink_metric::MetricsComponent;
 use nativelink_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use nativelink_proto::google::bytestream::byte_stream_server::ByteStream;
 use nativelink_proto::google::bytestream::{
@@ -3961,6 +3963,323 @@ pub async fn block_d_bytestream_write_h2_does_not_phantom_ack_when_chunked_in_fl
              drop; if this panics with timeout, the H2 fall-through path is \
              wedging in `in_flight_writes` watch-channel dedup",
         );
+
+    Ok(())
+}
+
+// ===================================================================
+// #500: silent-zero `consume_ok_eof` regression test
+// ===================================================================
+//
+// Production-firing site:
+//   `nativelink-service/src/bytestream_server.rs:1730-1771`
+//
+// Mechanism: `inner_read`'s `unfold` drives two futures via
+// `tokio::select!` — `consume_fut` (the receive-side
+// `state.rx.consume()`) and `get_part_fut` (the producer-side
+// `store.get_part(.., tx, ..)`). When the producer (a) calls
+// `tx.send_eof()` (flipping the rx-half's `eof_sent` bit to true) and
+// then (b) returns `Err(...)` to the `tokio::select!`, the select arm
+// at `:1820+` stores `Some(Err)` into `state.maybe_get_part_result`
+// and reassigns `get_part_fut = Box::pin(pending())`. Next iteration:
+// `consume_fut` returns `Ok(empty)` because `eof_sent=true` — the
+// legitimate-EOF shape on the rx side. Pre-fix, the `consume_ok_eof`
+// branch returned `None` without checking `state.maybe_get_part_result`
+// — silently swallowing the upstream error. Bazel sees the response
+// stream as `Poll::Ready(None)` with status=ok and bytes_sent=0, treats
+// it as a clean-empty stream, hashes whatever prefix bytes it
+// accumulated from earlier read attempts, reports digest mismatch as a
+// `BulkTransferException` build failure.
+//
+// (A separate path — producer drops `tx` WITHOUT `send_eof` or
+// `send_error` — does NOT exercise the bug, because `buf_channel`
+// synthesizes a Code::Internal "Sender dropped before sending EOF" on
+// the rx side, landing in the `consume_err` branch which already
+// consults `maybe_get_part_result`. The bug fires only when the
+// producer's terminal action on `tx` was `send_eof` — i.e. the bytes
+// completed cleanly and an error fired downstream of EOF, in a
+// post-EOF cleanup/validation/notification step.)
+//
+// 38 of these warn events fired in one hour on 2026-05-16 at 06:30-07:30
+// PDT, correlating with 3 reported Bazel `BulkTransferException` digest
+// mismatches at 07:04 PDT. Affected blobs were ON DISK at correct sizes
+// — pure read-path wedge, not data loss.
+//
+// The mirror branch `consume_err` at `:1768-1816` already consults
+// `maybe_get_part_result` and merges any structured upstream error with
+// the receive-side error before returning `Some((Err(...), None))`.
+// The fix makes `consume_ok_eof` symmetric.
+//
+// Seams crossed: producer (`PartialErrThenDropStore::get_part`,
+// send_eof+Err shape) → `instance.store` (Store wrapper) → `inner_read`'s
+// `tokio::select!` consumer → `LoggingReadStream` (the #500
+// instrumentation) → Bazel reader (the `ReadStream` consumer in this
+// test).
+
+/// Test fake reproducing the #500 silent-zero production trigger
+/// shape: optionally write `prefix` bytes, call `tx.send_eof()` to
+/// flip the rx-half's `eof_sent` bit, THEN return `Err(...)`. The
+/// `send_eof` is load-bearing — it's what causes the rx side to
+/// surface `Ok(empty)` (legitimate-EOF shape) on its next consume,
+/// landing in the buggy `consume_ok_eof` branch in `inner_read`
+/// rather than the (already-correct) `consume_err` branch that
+/// pure-tx-drop would route through.
+///
+/// Distinct from `PartialWriteThenErrorStore` in
+/// `nativelink-store/tests/worker_proxy_store_test.rs`: that fake
+/// returns Err WITHOUT calling `send_eof`, so it exercises the
+/// `consume_err` path. This fake calls `send_eof` THEN Err, which
+/// is the only shape that crosses the silent-zero seam.
+#[derive(Debug, MetricsComponent)]
+struct PartialErrThenDropStore {
+    /// Bytes to send before send_eof + Err. May be empty (immediate
+    /// EOF + Err with no bytes streamed at all — the cleanest signal
+    /// for the silent-zero bug).
+    prefix: Bytes,
+    err_marker: &'static str,
+}
+
+default_health_status_indicator!(PartialErrThenDropStore);
+
+#[async_trait]
+impl StoreDriver for PartialErrThenDropStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        // Report the blob as present at `prefix.len() + 1` bytes so the
+        // expected_size check in LoggingReadStream's silent-zero detector
+        // fires (expected_size > 0 is part of the silent-zero predicate).
+        for (slot, _key) in results.iter_mut().zip(digests.iter()) {
+            *slot = Some(self.prefix.len() as u64 + 1);
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        Err(make_err!(
+            Code::Unimplemented,
+            "PartialErrThenDropStore: update not supported"
+        ))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        if !self.prefix.is_empty() {
+            writer.send(self.prefix.clone()).await.map_err(|e| {
+                make_err!(
+                    Code::Internal,
+                    "PartialErrThenDropStore: send failed: {e:?}"
+                )
+            })?;
+        }
+        // CRITICAL: send EOF cleanly, THEN return Err. This is the
+        // exact shape that drives the #500 silent-zero bug:
+        //
+        //   - `send_eof()` flips eof_sent=true, so the receive side
+        //     will see `Ok(empty)` (legitimate-EOF shape) on its next
+        //     poll, NOT the synthesized "Sender dropped before EOF"
+        //     Internal that pure-tx-drop produces.
+        //
+        //   - The bare `Err` return propagates up to `inner_read`'s
+        //     `tokio::select!` arm at `:1820`, which stores `Some(Err)`
+        //     into `state.maybe_get_part_result`.
+        //
+        //   - Next loop iteration: `consume_fut` returns `Ok(empty)`
+        //     (because eof_sent=true). Pre-fix, the `consume_ok_eof`
+        //     branch at `:1730-1738` returned `None` without checking
+        //     `state.maybe_get_part_result` — silently swallowing the
+        //     upstream error. Post-fix, the branch consults the slot
+        //     and propagates the Err via `Some((Err, None))`.
+        //
+        // Production trigger: stores that complete the byte stream then
+        // hit a post-EOF cleanup/validation/notification error (e.g. a
+        // streaming-blob writer commit failure, a mirror-write
+        // bookkeeping error, a per-blob cache-update error that the
+        // store reports as Err even though all blob bytes were sent).
+        // Empty `prefix` + immediate-EOF-then-Err is the cleanest
+        // shape that crosses the same buggy `consume_ok_eof` seam.
+        writer.send_eof().map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "PartialErrThenDropStore: send_eof failed: {e:?}"
+            )
+        })?;
+        Err(make_err!(Code::Internal, "{}", self.err_marker))
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+/// #500 regression: silent-zero on `consume_ok_eof` branch.
+///
+/// When `store.get_part(...)` resolves with `Err(...)` and drops `tx`
+/// (without explicit `send_error`), the next `consume_fut` returns
+/// `Ok(empty)`. Pre-fix, the `consume_ok_eof` branch returned `None`
+/// without checking `state.maybe_get_part_result` — silently swallowing
+/// the upstream error and giving Bazel a clean-EOF stream of 0 bytes.
+///
+/// The fix at bytestream_server.rs:1730-1738 mirrors the `consume_err`
+/// branch's pattern (`:1768-1816`): consult `maybe_get_part_result` and
+/// propagate `Some((Err, None))` when an upstream Err is staged.
+///
+/// **Production composition seams crossed:**
+///   producer (`PartialErrThenDropStore::get_part`) →
+///   `instance.store` (Store wrapper at `inner_read:1684`) →
+///   `inner_read`'s `tokio::select!` consumer (`:1726-1841`) →
+///   `LoggingReadStream` (#500 instrumentation, `:543+`) →
+///   `ReadStream` consumer (this test).
+///
+/// **Mutation guard (per CLAUDE.md TDD step 5):**
+/// Comment out the `if let Some(Err(err)) = state.maybe_get_part_result.take()`
+/// block at `bytestream_server.rs:1734-1745` — this test MUST red-fail
+/// with the bespoke message below.
+#[nativelink_test]
+async fn read_silent_zero_on_consume_ok_eof_propagates_get_part_err() -> Result<(), Error> {
+    // Production composition: a `StoreManager` wrapping a real
+    // `PartialErrThenDropStore` wired into the real `ByteStreamServer`.
+    let store_manager = Arc::new(StoreManager::new());
+    let inner = Store::new(Arc::new(PartialErrThenDropStore {
+        // Empty prefix: the producer calls `tx.send_eof()` then
+        // returns Err WITHOUT sending any bytes — the cleanest
+        // shape of the silent-zero bug. The send_eof flips
+        // `eof_sent=true` on the rx side, so the next consume
+        // returns `Ok(empty)` (legitimate-EOF shape) which routes
+        // to the buggy `consume_ok_eof` branch.
+        prefix: Bytes::new(),
+        err_marker: "SILENT_ZERO_500_REGRESSION_MARKER",
+    }));
+    store_manager.add_store("main_cas", inner);
+
+    let bs_server = make_bytestream_server(store_manager.as_ref(), None)
+        .expect("Failed to make server");
+
+    // Request a non-zero-size read. The fake's has_with_results reports
+    // prefix.len()+1 = 1 byte expected, matching what we put in the URL.
+    let read_request = ReadRequest {
+        resource_name: format!(
+            "{}/blobs/{}/{}",
+            INSTANCE_NAME, HASH1, 1, // expected_size = 1 byte
+        ),
+        read_offset: 0,
+        read_limit: 1,
+    };
+
+    // Production-composition deadlock detector: 5s timeout wraps the
+    // ENTIRE stream consumption, NOT just `bs_server.read()`. A
+    // tokio::time::timeout Elapsed would `is_err()` == true and mask
+    // the silent-zero bug, so the assertion below distinguishes timeout
+    // (deadlock) from status=ok with bytes_sent=0 (the bug) from
+    // status=error (the post-fix correct behavior).
+    let consume_fut = async {
+        let mut read_stream = bs_server
+            .read(Request::new(read_request))
+            .await
+            .expect(
+                "ByteStream::read RPC entry must not error — the silent-zero \
+                 fires at stream-yield time, not at RPC entry",
+            )
+            .into_inner();
+
+        let mut total_bytes = 0usize;
+        let mut sent_status_error = false;
+        while let Some(item) = read_stream.next().await {
+            match item {
+                Ok(resp) => {
+                    total_bytes += resp.data.len();
+                }
+                Err(_status) => {
+                    // Post-fix: the upstream get_part Err propagates as
+                    // a tonic::Status::error here. This is the correct
+                    // wire-shape; Bazel will retry rather than treat
+                    // status=ok+0bytes as a complete-empty stream.
+                    sent_status_error = true;
+                    break;
+                }
+            }
+        }
+        (total_bytes, sent_status_error)
+    };
+
+    let (total_bytes, sent_status_error) = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        consume_fut,
+    )
+    .await
+    .expect(
+        "deadlock detector: ByteStream::read consumer wedged >5s — \
+         silent-zero on consume_ok_eof when get_part_fut Err must propagate, \
+         NOT return None — bytestream_server.rs:1730-1738 #500 \
+         production-firing site",
+    );
+
+    // Post-fix expectation: the stream MUST yield a Status::error item.
+    // Pre-fix: it returns Poll::Ready(None) immediately with no error
+    // item, giving Bazel status=ok with bytes_sent=0 — the bug.
+    assert!(
+        sent_status_error,
+        "silent-zero on consume_ok_eof when get_part_fut Err must propagate, \
+         NOT return None — bytestream_server.rs:1730-1738 #500 \
+         production-firing site. \
+         Stream yielded {total_bytes} bytes then clean-EOF (Poll::Ready(None)) \
+         WITHOUT an error item. Bazel sees status=ok with bytes_sent={total_bytes} \
+         on an expected_size=1 read and accepts the (empty) data as canonical, \
+         hashes prefix-only bytes from earlier streams, reports digest mismatch \
+         as a BulkTransferException build failure. The fix mirrors the \
+         consume_err branch at :1768-1816 — check maybe_get_part_result before \
+         returning None; if Some(Err), propagate via Some((Err, None))."
+    );
+
+    // Defense in depth: we should not have streamed any bytes either,
+    // because the prefix is empty. (If a future variant of the bug
+    // streamed partial bytes then silently-EOF'd, total_bytes would be
+    // non-zero — the assertion above already catches the no-error case.)
+    assert_eq!(
+        total_bytes, 0,
+        "test setup: prefix is empty so no bytes should stream before the \
+         producer's Err; got {total_bytes} bytes — adjust the fake or \
+         expectation if the production-composition path changes"
+    );
 
     Ok(())
 }
