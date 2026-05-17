@@ -247,10 +247,16 @@ mod tests {
         Duration::from_millis(x)
     }
 
-    /// Pin the percentile arithmetic against a known sample set.
-    /// Mutation: comment out `samples.sort()` in `from_samples` — this
-    /// test must red-fail because the percentile indices would point
-    /// at unsorted values.
+    /// Pin the percentile arithmetic against a known PRE-SORTED sample
+    /// set. Catches an index-formula mistake (e.g. p50↔p90 swap).
+    ///
+    /// **Note on mutation discipline:** this test alone does NOT red-fail
+    /// if `samples.sort()` is removed (input is already sorted) nor if
+    /// `ceil`→`floor` is swapped (N=100 places p50/p90/p99 at integer
+    /// boundaries insensitive to the off-by-one). See
+    /// `latency_percentiles_unsorted_input_caught` (mutation-resistant
+    /// for the sort step) and `latency_percentiles_nist_off_by_one`
+    /// (mutation-resistant for the ceil/floor step).
     #[test]
     fn latency_percentiles_known_input() {
         // 1ms..100ms inclusive — 100 samples.
@@ -264,6 +270,79 @@ mod tests {
         assert_eq!(p.p99, 99.0);
         // max = samples[99] = 100ms
         assert_eq!(p.max, 100.0);
+    }
+
+    /// Deliberately UNSORTED input. The percentile formula picks indices
+    /// 49/89/98 on the post-sort vector — if `samples.sort()` is removed,
+    /// those indices land on whatever the test's shuffle put there
+    /// (1ms / 50ms / 100ms in our case), producing a wrong p50.
+    ///
+    /// **Mutation falsifier:** comment out `samples.sort()` in
+    /// `LatencyPercentiles::from_samples`. This test must red-fail with
+    /// the bespoke `sort_removed` message naming the unsorted index.
+    #[test]
+    fn latency_percentiles_unsorted_input_caught() {
+        // 100 elements with content equal to `n` for n in 1..=100, but
+        // physically reversed: index 0 holds 100ms, index 99 holds 1ms.
+        // After sort, samples[49] must be 50ms (post-sort value).
+        let mut samples: Vec<Duration> = (1..=100u64).rev().map(ms).collect();
+        // Sanity: pre-sort, index 49 holds 51ms (since reversed).
+        debug_assert_eq!(samples[49].as_millis(), 51);
+        let p = LatencyPercentiles::from_samples(&mut samples);
+        // After sort: samples[49] == 50ms → p50 == 50.
+        // If `sort()` is removed, samples[49] stays 51ms → p50 == 51.
+        assert_eq!(
+            p.p50, 50.0,
+            "percentile sort_removed mutation: from_samples must sort \
+             unsorted input before indexing — got p50={} (sort skipped \
+             produces 51.0)",
+            p.p50
+        );
+        // Same for p90: post-sort samples[89] == 90; pre-sort it == 11.
+        assert_eq!(
+            p.p90, 90.0,
+            "percentile sort_removed mutation: p90 was {} (expected 90.0 \
+             post-sort; unsorted would yield 11.0)",
+            p.p90
+        );
+    }
+
+    /// Sample shaped so `ceil(p*N)-1` and `floor(p*N)-1` differ by 1
+    /// index AND the values at those indices differ. The NIST nearest-
+    /// rank formula is `idx = ceil(p*N) - 1`; an erroneous `floor` would
+    /// pick a different sample.
+    ///
+    /// At N=10 + p=0.99: `ceil(0.99*10)-1 = 9` (samples[9] = 1000ms);
+    /// `floor(0.99*10)-1 = 8` (samples[8] = 9ms). The two formulas
+    /// give p99 == 1000.0 vs p99 == 9.0 respectively.
+    ///
+    /// **Mutation falsifier:** swap `.ceil()` for `.floor()` in
+    /// `LatencyPercentiles::from_samples`. This test must red-fail with
+    /// the bespoke `ceil_to_floor` message.
+    #[test]
+    fn latency_percentiles_nist_off_by_one() {
+        // 1ms..9ms then 1000ms — 10 samples total, pre-sorted.
+        let mut samples: Vec<Duration> = (1..=9u64).map(ms).collect();
+        samples.push(ms(1000));
+        assert_eq!(samples.len(), 10);
+        let p = LatencyPercentiles::from_samples(&mut samples);
+        // p99 must be 1000ms under NIST nearest-rank ceil.
+        assert_eq!(
+            p.p99, 1000.0,
+            "percentile ceil_to_floor mutation: at N=10 the NIST \
+             nearest-rank p99 idx = ceil(0.99*10)-1 = 9 \
+             (samples[9] = 1000ms); a `floor` mutation produces idx=8 \
+             (samples[8] = 9ms) → p99={}",
+            p.p99
+        );
+        // p50 must be the 5th-rank sample, samples[ceil(0.5*10)-1] = samples[4] = 5ms.
+        assert_eq!(
+            p.p50, 5.0,
+            "percentile ceil_to_floor mutation: p50 idx = ceil(0.5*10)-1 \
+             = 4 (samples[4] = 5ms); a `floor` mutation produces idx=3 \
+             (samples[3] = 4ms) → p50={}",
+            p.p50
+        );
     }
 
     /// At iters=20 the p99 degenerates to a single sample (essentially
@@ -291,6 +370,46 @@ mod tests {
         // Sub-µs precision preserved (vs 3-decimal would zero this):
         assert_eq!(round_emit(0.005_123), 0.005_123);
     }
+
+    /// Golden JSON literal for a SCHEMA_VERSION=2 `BenchmarkResult`.
+    /// Renaming any field on the struct red-fails the
+    /// `schema_v2_golden_json_round_trips` test below because the new
+    /// struct can no longer deserialize the golden literal.
+    ///
+    /// To add a NEW field, bump `SCHEMA_VERSION` from 2 → 3 AND update
+    /// this golden literal. The test enforces both steps.
+    pub(super) const GOLDEN_SCHEMA_V2_BENCHMARK_RESULT: &str = r#"{
+  "flow_id": "W1",
+  "scenario_name": "w1_store_update_oneshot_1KiB_c1",
+  "blob_size_bytes": 1024,
+  "concurrency": 1,
+  "cache_state": "cold",
+  "iters": 20,
+  "confidence": "medium",
+  "total_duration_ms": 10.0,
+  "latency_ms": {
+    "p50": 0.5,
+    "p90": 0.9,
+    "p99": 0.99,
+    "max": 1.0
+  },
+  "throughput": {
+    "bytes_per_sec": 1024.0
+  },
+  "extras": {}
+}"#;
+
+    /// Golden JSON literal for a SCHEMA_VERSION=2 `RunMetadata`.
+    pub(super) const GOLDEN_SCHEMA_V2_RUN_METADATA: &str = r#"{
+  "schema_version": 2,
+  "git_commit_sha": "deadbeef",
+  "git_dirty": false,
+  "host": "buildcache",
+  "timestamp_utc": "2026-05-16T00:00:00.000000Z",
+  "features": [],
+  "forced": false,
+  "temp_dir_used": "/dev/shm/nl-bench-XYZ"
+}"#;
 
     /// Golden field-set: deserialization of a SCHEMA_VERSION=2 baseline
     /// MUST accept only the known fields on every struct. Adding a new
@@ -346,6 +465,99 @@ mod tests {
         // ...) red-fails here.
         let _r2: BenchmarkResult =
             serde_json::from_value(json).expect("round-trip must preserve schema");
+    }
+
+    /// Golden round-trip: the GOLDEN_SCHEMA_V2_BENCHMARK_RESULT literal
+    /// must deserialize into a `BenchmarkResult` AND the in-tree fixture
+    /// must serialize byte-equal (as `serde_json::Value`) to it.
+    ///
+    /// **Mutation falsifier (rename):** rename ANY field on
+    /// `BenchmarkResult` (e.g. `flow_id` → `flow_identifier`). This test
+    /// must red-fail with the `golden_schema_renamed` bespoke message
+    /// because the renamed struct cannot deserialize the golden literal.
+    ///
+    /// **Mutation falsifier (retype):** change a numeric field's type
+    /// (e.g. `concurrency: u32` → `concurrency: String`). Same red-fail
+    /// path.
+    ///
+    /// **Mutation falsifier (add field without SCHEMA_VERSION bump):**
+    /// add a `pub new_field: u32` to `BenchmarkResult`. The fixture
+    /// serializes with the new key; `Value`-equality vs the golden
+    /// fails AND the literal cannot round-trip into the new struct
+    /// without a `Default`. Test red-fails.
+    #[test]
+    fn schema_v2_golden_json_round_trips() {
+        let fixture = BenchmarkResult {
+            flow_id: "W1".to_string(),
+            scenario_name: "w1_store_update_oneshot_1KiB_c1".to_string(),
+            blob_size_bytes: Some(1024),
+            concurrency: 1,
+            cache_state: CacheState::Cold,
+            iters: 20,
+            confidence: Confidence::Medium,
+            total_duration_ms: 10.0,
+            latency_ms: LatencyPercentiles {
+                p50: 0.5,
+                p90: 0.9,
+                p99: 0.99,
+                max: 1.0,
+            },
+            throughput: Throughput::BytesPerSec(1024.0),
+            extras: BTreeMap::new(),
+        };
+        // Serialize fixture → JSON value.
+        let fixture_value: serde_json::Value =
+            serde_json::to_value(&fixture).expect("fixture serialize");
+        // Parse golden literal → JSON value.
+        let golden_value: serde_json::Value =
+            serde_json::from_str(GOLDEN_SCHEMA_V2_BENCHMARK_RESULT)
+                .expect("golden literal is valid JSON");
+        assert_eq!(
+            fixture_value, golden_value,
+            "golden_schema_renamed mutation: fixture-serialized JSON \
+             diverged from GOLDEN_SCHEMA_V2_BENCHMARK_RESULT — a field \
+             rename / retype / addition is the most likely cause. To \
+             reconcile, either revert the schema change or bump \
+             SCHEMA_VERSION + update the golden literal."
+        );
+        // Round-trip: golden literal must deserialize into the in-tree
+        // struct via deny_unknown_fields.
+        let _back: BenchmarkResult =
+            serde_json::from_str(GOLDEN_SCHEMA_V2_BENCHMARK_RESULT)
+                .expect("golden_schema_renamed mutation: golden literal cannot \
+                         round-trip through the current BenchmarkResult struct \
+                         — a field was renamed / retyped or a new required field \
+                         was added");
+    }
+
+    /// Golden round-trip for `RunMetadata`. Same mutation discipline as
+    /// `schema_v2_golden_json_round_trips`.
+    #[test]
+    fn schema_v2_run_metadata_golden_json_round_trips() {
+        let fixture = RunMetadata {
+            schema_version: 2,
+            git_commit_sha: "deadbeef".to_string(),
+            git_dirty: Some(false),
+            host: "buildcache".to_string(),
+            timestamp_utc: "2026-05-16T00:00:00.000000Z".to_string(),
+            features: vec![],
+            forced: false,
+            temp_dir_used: "/dev/shm/nl-bench-XYZ".to_string(),
+        };
+        let fixture_value: serde_json::Value =
+            serde_json::to_value(&fixture).expect("fixture serialize");
+        let golden_value: serde_json::Value =
+            serde_json::from_str(GOLDEN_SCHEMA_V2_RUN_METADATA)
+                .expect("golden RunMetadata literal is valid JSON");
+        assert_eq!(
+            fixture_value, golden_value,
+            "golden_schema_renamed mutation (RunMetadata): fixture \
+             serialized JSON diverged from GOLDEN_SCHEMA_V2_RUN_METADATA"
+        );
+        let _back: RunMetadata =
+            serde_json::from_str(GOLDEN_SCHEMA_V2_RUN_METADATA)
+                .expect("golden_schema_renamed mutation: RunMetadata golden \
+                         cannot round-trip — schema bump required");
     }
 
     #[test]

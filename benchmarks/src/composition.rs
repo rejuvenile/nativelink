@@ -95,9 +95,12 @@ pub mod prod_defaults {
     pub const CAS_FAST_MEMORY_EMIT_BACKPRESSURE: bool = true;
 
     /// `SizePartitioning.size` for `cas_INNER` — `prod-server.json5:230`
-    /// `"size": 16384` (16 KiB). Blobs ≤ this go to `SMALL_CAS_CACHED`
-    /// (Memory→Redis in prod, Memory→Memory in bench); blobs > this go
-    /// to `cas_FAST_SLOW_STORE`.
+    /// `"size": 16384` (16 KiB). **Comparison is strict `<` in
+    /// `nativelink-store/src/size_partitioning_store.rs:99` — blobs with
+    /// `size_bytes < SIZE_PARTITIONING_THRESHOLD` go to
+    /// `SMALL_CAS_CACHED` (Memory→Redis in prod, Memory→Memory in
+    /// bench); blobs with `size_bytes >= SIZE_PARTITIONING_THRESHOLD`
+    /// (including exactly 16384) go to `cas_FAST_SLOW_STORE`.**
     pub const SIZE_PARTITIONING_THRESHOLD: u64 = 16 * 1024;
 
     /// `cas_INNER.existence_cache.eviction_policy.max_count` —
@@ -396,9 +399,20 @@ mod tests {
         None
     }
 
+    /// Env var that forces the prod-config-pin test to FAIL when the
+    /// config is missing instead of silently skipping. The bench's
+    /// release gate Justfile recipe sets this so the gate cannot pass
+    /// without observed prod-drift coverage; CI runners / dev laptops
+    /// without `BENCH_REQUIRE_PROD_CONFIG=1` get the legacy warn-and-skip
+    /// behavior so the test isn't spuriously red there.
+    const REQUIRE_ENV: &str = "BENCH_REQUIRE_PROD_CONFIG";
+
     /// Pin every `prod_defaults` constant against the live prod config.
     /// Tolerates the config being absent (dev / CI hosts) — in that case
-    /// the test prints a warning and passes. On buildcache and on the
+    /// the test prints a warning and passes UNLESS the
+    /// `BENCH_REQUIRE_PROD_CONFIG=1` env var is set (used by the release
+    /// gate Justfile recipe so the bench-shipping path always verifies
+    /// the pin against the live config). On buildcache and on the
     /// maintainer's dev host the mirror IS present, so this test
     /// red-fails if prod drifts.
     ///
@@ -406,11 +420,23 @@ mod tests {
     /// red-fail with a bespoke "prod_defaults::X drift detected" message.
     #[test]
     fn prod_defaults_match_buildcache_json5() {
+        let require = std::env::var(REQUIRE_ENV).ok().as_deref() == Some("1");
         let Some(json5) = read_prod_config() else {
+            if require {
+                panic!(
+                    "prod_config_required: {} is set but neither prod \
+                     config file is readable: tried {} and {}. The \
+                     release-gate Justfile recipe sets this env var so \
+                     the bench cannot ship without verifying constants \
+                     against the live prod config.",
+                    REQUIRE_ENV, PROD_CONFIG_MIRROR, PROD_CONFIG_PATH
+                );
+            }
             eprintln!(
                 "[bench-test] WARN: prod config absent at {} or {}; \
-                 skipping prod_defaults pin test",
-                PROD_CONFIG_MIRROR, PROD_CONFIG_PATH
+                 skipping prod_defaults pin test (set {}=1 to convert \
+                 this skip into a hard failure)",
+                PROD_CONFIG_MIRROR, PROD_CONFIG_PATH, REQUIRE_ENV
             );
             return;
         };
@@ -506,6 +532,49 @@ mod tests {
         assert!(
             haystack.contains(needle),
             "{message}: expected substring `{needle}` not found in prod config"
+        );
+    }
+
+    /// Composition deviation tag MUST NOT fire at exactly
+    /// `SIZE_PARTITIONING_THRESHOLD`, because `SizePartitioningStore`
+    /// uses strict `<` (see `size_partitioning_store.rs:99`). A blob
+    /// of size == 16384 routes to `cas_FAST_SLOW_STORE` (upper / large
+    /// blob path), which is full-prod-shape — the deviation tag
+    /// (which marks the Memory-substitute SMALL_CAS_CACHED path) is
+    /// only correct for blobs STRICTLY LESS THAN the threshold.
+    ///
+    /// **Mutation falsifier:** revert `<` to `<=` in
+    /// `scenarios/legacy_write.rs::run_one_cell` (or
+    /// `scenarios/legacy_read.rs`) — at size == 16384 the cell would
+    /// emit the wrong tag and reviewers reading the JSON would discount
+    /// the cell as not-prod-shape when in fact it's hitting the prod
+    /// FastSlow path.
+    #[test]
+    fn composition_deviation_tag_matches_sizepartitioning_semantics() {
+        let threshold = prod_defaults::SIZE_PARTITIONING_THRESHOLD;
+        // At exactly the threshold: routes to UPPER, NOT a deviation.
+        let at_threshold = threshold;
+        let below_by_one = threshold - 1;
+        let above_by_one = threshold + 1;
+
+        // SizePartitioning semantics (strict `<`):
+        // - at_threshold: NOT in lower (would be `<` false) → UPPER
+        // - below_by_one: in lower → emit deviation tag
+        // - above_by_one: NOT in lower → UPPER
+        assert!(
+            !(at_threshold < threshold),
+            "boundary_lowered mutation: at size == SIZE_PARTITIONING_THRESHOLD \
+             ({threshold}), strict `<` returns false; this size routes to \
+             cas_FAST_SLOW_STORE (full-prod-shape), NOT the Memory-substitute \
+             SMALL_CAS_CACHED path. The composition_deviation tag MUST NOT fire."
+        );
+        assert!(
+            below_by_one < threshold,
+            "boundary mismatch: size below threshold-by-one must trigger deviation tag"
+        );
+        assert!(
+            !(above_by_one < threshold),
+            "boundary mismatch: size above threshold-by-one must NOT trigger deviation tag"
         );
     }
 }

@@ -60,9 +60,12 @@ pub struct WriteCell {
 /// Production-aligned cell matrix:
 ///
 /// - tiny (1 KiB) — exercises SMALL_CAS_CACHED (small-blob path)
-/// - small (16 KiB) — exactly AT the SizePartitioning threshold; lower
-///   branch (small-blob path) per `>=` semantics — confirmed by
-///   `SizePartitioningStore::pick_store` at the threshold
+/// - small (16 KiB) — exactly AT the SizePartitioning threshold;
+///   `SizePartitioningStore` uses **strict `<`** at
+///   `nativelink-store/src/size_partitioning_store.rs:99,148,180,208,262,355`,
+///   so a blob with size == 16384 routes to UPPER
+///   (`cas_FAST_SLOW_STORE` with real Filesystem slow tier), NOT lower.
+///   The cell anchors the large-blob path at the boundary value.
 /// - medium (1 MiB) — exercises cas_FAST_SLOW_STORE (large-blob path)
 /// - large (16 MiB) — exercises cas_FAST_SLOW_STORE filesystem slow tier
 /// - 1 MiB c=10 — fan-out cell; per-task overlap (single-task)
@@ -132,7 +135,11 @@ async fn run_one_cell(
         "size_partitioning_threshold".to_string(),
         serde_json::json!(prod_defaults::SIZE_PARTITIONING_THRESHOLD),
     );
-    if (size as u64) <= prod_defaults::SIZE_PARTITIONING_THRESHOLD {
+    // SizePartitioningStore uses strict `<`, so blobs with
+    // size == SIZE_PARTITIONING_THRESHOLD route to UPPER (cas_FAST_SLOW).
+    // The composition_deviation tag flags ONLY cells that actually hit
+    // the SMALL_CAS_CACHED Memory-only substitute path.
+    if (size as u64) < prod_defaults::SIZE_PARTITIONING_THRESHOLD {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),

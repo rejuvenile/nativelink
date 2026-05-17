@@ -123,7 +123,9 @@ async fn run_warm_cell(
 
     let mut extras = BTreeMap::new();
     extras.insert("warm".to_string(), serde_json::json!(true));
-    if (cell.size as u64) <= prod_defaults::SIZE_PARTITIONING_THRESHOLD {
+    // SizePartitioningStore is strict `<`: at threshold the blob routes
+    // to UPPER (cas_FAST_SLOW), not to SMALL_CAS_CACHED.
+    if (cell.size as u64) < prod_defaults::SIZE_PARTITIONING_THRESHOLD {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),
@@ -261,7 +263,9 @@ async fn run_cold_cell(
         "cold_mechanism".to_string(),
         serde_json::json!("rebuild_composition_on_persisted_tempdir"),
     );
-    if (cell.size as u64) <= prod_defaults::SIZE_PARTITIONING_THRESHOLD {
+    // SizePartitioningStore is strict `<`: at threshold the blob routes
+    // to UPPER (cas_FAST_SLOW), not to SMALL_CAS_CACHED.
+    if (cell.size as u64) < prod_defaults::SIZE_PARTITIONING_THRESHOLD {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),

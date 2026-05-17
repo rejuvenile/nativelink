@@ -144,6 +144,15 @@ bench-data-plane *ARGS:
 	LOCK="/tmp/just-bench-data-plane.lock"
 	mkdir -p "$(dirname "$OUT")"
 	echo "[just] running data_plane_bench → ${OUT}"
+	# Pre-flight: require the prod-config pin test to actually verify
+	# constants against the live prod config (rather than warn-and-skip).
+	# The bench's release-gate pre-test runs cargo test for this purpose;
+	# without it a missing prod config silently passes the pin test.
+	echo "[just] verifying prod_defaults_match_buildcache_json5 against live config"
+	BENCH_REQUIRE_PROD_CONFIG=1 timeout 300 cargo test --release -p nativelink-benchmarks \
+	    --features chunked_fast_slow \
+	    -- --exact tests::prod_defaults_match_buildcache_json5 \
+	    composition::tests::prod_defaults_match_buildcache_json5
 	# flock blocks (no -n) so concurrent invocations queue rather than fail;
 	# timeout caps wall-clock at 30 min so a wedge surfaces instead of
 	# silently consuming the operator's terminal.

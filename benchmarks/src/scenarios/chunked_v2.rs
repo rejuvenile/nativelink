@@ -20,15 +20,18 @@
 //! real `FilesystemStore`. Anchors per-chunk overhead + commit-runner
 //! wall-clock for the v3-default path.
 //!
-//! **R5 (chunked v2 contended readers):** one writer drives a chunked
-//! commit (commit pending); N concurrent readers waiting on the per-
-//! digest `Notify` issue reads against the same digest and we measure
-//! reader latency from issue to byte receipt. This is the actual
-//! load-bearing v3 mechanism — `feedback_per_chunk_timeout_design_intent`
-//! + the 2026-05-15 v3 audit say the per-digest `Notify` is supposed to
-//! wake N readers in O(N) (not O(N²)). A regression that re-introduces
-//! global-broadcast wake semantics OR a serialization point in the
-//! commit-publish path shows up here as a latency cliff.
+//! **R5 (filesystem fan-out readers):** the cell pre-writes the blob to
+//! completion via `write_chunked_v2`, then spawns N concurrent readers
+//! that race `get_part_unchunked` on the underlying `FilesystemStore`.
+//! It anchors multi-reader filesystem fan-out latency, NOT the v3
+//! per-digest `Notify` wake path — the chunked-driver in-flight entry is
+//! gone by the time readers issue. **The per-digest `Notify` anchor is
+//! deferred to Phase 2** because wiring it requires the
+//! `chunked_read_registry` `OnceLock` that lives in `bin/nativelink.rs`
+//! and isn't populated by `store_factory`. The cell's
+//! `extras.v3_anchor` is therefore `DEFERRED_PHASE_2_filesystem_fanout`
+//! — a future v3-Notify regression will NOT be caught here; do not read
+//! a stable R5 baseline as evidence the wake path is healthy.
 //!
 //! Both cells are gated on `feature = "chunked_fast_slow"`. With the
 //! feature off the scenarios emit a single result with
@@ -315,19 +318,26 @@ mod enabled {
         }
     }
 
-    /// R5: per-digest-`Notify` contended-reader anchor.
+    /// R5: filesystem-store multi-reader fan-out anchor.
     ///
-    /// Mechanism: pre-write the blob through the prod store path so
-    /// it's resident on the FilesystemStore. Spawn N concurrent reader
-    /// tasks that issue `get_part_unchunked` for the same digest; the
-    /// per-digest `Notify` is what coalesces their lookups against the
-    /// chunked driver's in-flight state. Measure wall-clock from
-    /// reader-task-spawn to all-readers-bytes-received.
+    /// **Phase 2 scope honest scope-cut:** an earlier version of this
+    /// cell claimed to anchor the v3 per-digest `Notify` wake. It did
+    /// not — the cell pre-writes the blob to completion before readers
+    /// spawn, so the chunked-driver in-flight entry is gone and the
+    /// readers race the underlying `FilesystemStore`. Wiring the cell
+    /// through `WriteChunkedV2`'s commit barrier requires the
+    /// `chunked_read_registry` `OnceLock` populated by
+    /// `bin/nativelink.rs` (not `store_factory`), which is out of Phase
+    /// 1.5 scope.
     ///
-    /// The cell is NOT measuring writer contention (the previous R5
-    /// shape did, incorrectly — see `feedback_per_chunk_timeout_design_intent`
-    /// memory). It's measuring the wake-N-readers cost of the v3
-    /// per-digest `Notify`.
+    /// What this cell DOES measure: N parallel
+    /// `FilesystemStore::get_part_unchunked` on the same digest. Useful
+    /// for catching a filesystem-store regression (e.g. a `parking_lot`
+    /// mutex held across `.await`, a hardlink-table contention bug) but
+    /// it is NOT a substitute for a real v3-Notify regression detector.
+    /// `extras.v3_anchor = "DEFERRED_PHASE_2_filesystem_fanout"` flags
+    /// the gap so the diff tooling cannot treat a stable R5 baseline as
+    /// evidence the per-digest Notify path is healthy.
     pub(super) async fn run_r5(
         opts: &RunOpts,
         out: &mut Vec<BenchmarkResult>,
@@ -340,7 +350,7 @@ mod enabled {
             (16 * BENCH_CHUNK_SIZE, 4, "16MiB_n4"),
         ];
         for &(size, n_readers, label) in cells {
-            let scenario_name = format!("r5_chunked_v2_contended_readers_{label}");
+            let scenario_name = format!("r5_filesystem_fanout_readers_{label}");
             if !opts.matches(&scenario_name) {
                 continue;
             }
@@ -351,15 +361,15 @@ mod enabled {
                     continue;
                 }
             };
-            // For the reader-side cell we read against the underlying
-            // FilesystemStore (the per-digest `Notify` coordination
-            // happens in the v2 handler / chunked-driver layer; the
-            // FilesystemStore is the slow tier behind it). For now, R5
-            // measures the multi-reader fan-out cost against the
-            // filesystem; future iterations should wire the cell
-            // through `WriteChunkedV2` so the in-flight commit barrier
-            // is in the path. See followup #NNN for the in-flight-
-            // commit reader-wait extension.
+            // This cell measures filesystem-store fan-out, NOT the v3
+            // per-digest `Notify`. The prewrite below finalizes the
+            // blob before readers spawn, so the chunked-driver in-flight
+            // entry is gone. Honest-label fix per
+            // `.claude/audits/495-phase-1-5-plan-2026-05-16.md`.
+            // Phase 2 will wire the readers through `WriteChunkedV2`'s
+            // commit barrier so the per-digest Notify is in the path;
+            // that requires the `chunked_read_registry` `OnceLock` which
+            // is populated by `bin/nativelink.rs`, out of Phase 1.5 scope.
             let handler = make_handler(store.clone());
             let (client, _server_guard) = start_v2_server(handler).await;
 
@@ -389,9 +399,19 @@ mod enabled {
             let mut extras = BTreeMap::new();
             extras.insert("chunk_size".to_string(), serde_json::json!(BENCH_CHUNK_SIZE));
             extras.insert("n_readers".to_string(), serde_json::json!(n_readers));
+            // Honest-label: this cell is FilesystemStore fan-out, not
+            // the v3 per-digest Notify. Diff tooling must NOT treat a
+            // stable baseline here as evidence the Notify path is
+            // healthy. Phase 2 will provide a real v3-Notify anchor.
             extras.insert(
                 "v3_anchor".to_string(),
-                serde_json::json!("per_digest_notify_readers"),
+                serde_json::json!("DEFERRED_PHASE_2_filesystem_fanout"),
+            );
+            extras.insert(
+                "phase_2_followup".to_string(),
+                serde_json::json!(
+                    "wire cell through WriteChunkedV2 commit barrier so per-digest Notify is in read path"
+                ),
             );
 
             let throughput_per_iter = (size as u64) * (n_readers as u64);
@@ -473,7 +493,7 @@ pub async fn run(opts: &RunOpts, temp_dir_base: Option<&PathBuf>) -> Vec<Benchma
         // tooling can't tell "scenario disappeared" from "feature off".
         for (flow, name) in [
             ("W3", "w3_chunked_v2_write_single_writer_DISABLED"),
-            ("R5", "r5_chunked_v2_contended_readers_DISABLED"),
+            ("R5", "r5_filesystem_fanout_readers_DISABLED"),
         ] {
             let mut extras = BTreeMap::new();
             extras.insert("disabled".to_string(), serde_json::json!(true));
@@ -525,7 +545,7 @@ mod cfg_not_tests {
         assert_eq!(results.len(), 2, "must emit one placeholder per flow");
         let names: Vec<_> = results.iter().map(|r| r.scenario_name.as_str()).collect();
         assert!(names.contains(&"w3_chunked_v2_write_single_writer_DISABLED"));
-        assert!(names.contains(&"r5_chunked_v2_contended_readers_DISABLED"));
+        assert!(names.contains(&"r5_filesystem_fanout_readers_DISABLED"));
         for r in &results {
             assert_eq!(r.iters, 0);
             assert_eq!(
