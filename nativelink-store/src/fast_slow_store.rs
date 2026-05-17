@@ -4248,8 +4248,24 @@ impl FastSlowStore {
         read_handle
             .await
             .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
-        forward_res?;
-        write_res
+        // #476 observability: on dual-err, prefer the consumer's error
+        // (`write_res`) — it carries the authoritative root cause (h2
+        // reset, slow-store reject, admission, etc.). The producer's
+        // "receiver disconnected" in `forward_res` is the mechanically
+        // derived downstream symptom of the consumer dropping `rx`;
+        // surfacing it in place of the cause destroys observability
+        // (operators see the same buf-channel symptom regardless of
+        // root cause). When forward_res is Err but write_res Ok, the
+        // producer-side error is authoritative (likely a read/IO error
+        // from the spawn_blocking reader).
+        match (write_res, forward_res) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_err), Ok(())) => Err(write_err),
+            (Ok(()), Err(forward_err)) => Err(forward_err),
+            (Err(write_err), Err(forward_err)) => Err(write_err.append(format!(
+                "stream_path_to_store: consumer error preferred over producer 'receiver disconnected' symptom (#476); producer side: {forward_err:?}"
+            ))),
+        }
     }
 
     /// Like [`stream_path_to_store`], but accepts an already-opened
@@ -4323,8 +4339,16 @@ impl FastSlowStore {
         read_handle
             .await
             .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
-        forward_res?;
-        write_res
+        // #476 observability: see sibling at `stream_path_to_store` —
+        // prefer consumer (`write_res`) over producer symptom on dual-err.
+        match (write_res, forward_res) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(write_err), Ok(())) => Err(write_err),
+            (Ok(()), Err(forward_err)) => Err(forward_err),
+            (Err(write_err), Err(forward_err)) => Err(write_err.append(format!(
+                "stream_file_to_store: consumer error preferred over producer 'receiver disconnected' symptom (#476); producer side: {forward_err:?}"
+            ))),
+        }
     }
 
     /// Returns the range of bytes that should be sent given a slice bounds
