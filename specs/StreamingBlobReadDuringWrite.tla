@@ -77,7 +77,46 @@
     matching the production race window. The composite remains a known
     gap that the per-RPC arm-race closure work tracks.
 
+    ABSTRACTION CAVEAT — global vs per-RPC (distributed-systems cadre-2
+    MAJOR-1):
+      Production `ReaderState::maybe_get_part_result` is a PER-RPC field
+      constructed fresh (=None) inside each `inner_read` unfold at
+      `bytestream_server.rs:1688` — each concurrent reader RPC has its
+      own slot. The spec models it as a SINGLE GLOBAL monotonic boolean
+      shared across all readers. Consequence: once `seamBPropagated`
+      flips TRUE in the spec it stays TRUE forever; modeling the
+      per-RPC reset is OUT OF SCOPE for this spec. The spec is strictly
+      weaker than production in admitting race-loser interleavings —
+      it under-models the multi-RPC race-loser frequency relative to
+      production, never over-models. The leads-to property holds
+      because monotonicity only HELPS leads-to. A claim like
+      "at most one in-flight RPC sees the race-loser case" CANNOT be
+      expressed in this spec; future specs that want per-RPC accuracy
+      need a per-reader `seamBPropagated[r]` array.
+
   PRODUCTION SHAPE
+    * TWO READER PATHS exist in production; this spec collapses them
+      into ONE reader FSM. Distributed-systems cadre-2 MAJOR-2:
+        - PATH A — `StreamingBlobReader::next_chunk`
+          (`streaming_blob.rs:631`), used by the
+          `streaming_read_while_write` inline unfold at
+          `bytestream_server.rs:1421-1614` when an in-flight blob
+          exists. Path A consults `terminal` directly inside
+          `next_chunk` (`:695`); the #502 silent-short shield fires
+          inside `next_chunk` (`:792-817`). There is NO
+          `tokio::select!` race in Path A — the terminal-Err vs
+          chunk-arrival check is a single deterministic loop iteration.
+        - PATH B — `inner_read` unfold w/ buf_channel
+          (`bytestream_server.rs:1712-1873`), the post-
+          `if let Some(streaming_reader)` branch when no in-flight
+          blob exists (or it was poisoned/evicted). This is the ONLY
+          path with the seam-B `tokio::select!` race.
+      The spec ABSTRACTS both behind one reader FSM (UNION-models
+      both); the spec's race-loser `DoneSilent*` states are
+      unreachable in Path A in production. Spec is conservative —
+      admits the race-loser in both paths even though only Path B
+      produces it. Any claim like "the post-fix Bazel-CAS read still
+      has a race-loser case" applies ONLY to Path B.
     * Single writer per blob (production: `StreamingBlobWriter::new` is
       called exactly once per `StreamingBlobInner`). The writer goes
       through a finite chunk sequence and then either:
@@ -511,6 +550,25 @@ Next ==
 (* IF the writer hasn't yet terminated. Combined with WF on a writer-    *)
 (* termination disjunction, the writer is guaranteed to reach a Done    *)
 (* state.                                                                *)
+(*                                                                          *)
+(* CFG CONTRACT (distributed-systems cadre-2 MAJOR-3):                   *)
+(*   Liveness of `WriterTerminationDisjunct` requires AT LEAST ONE       *)
+(*   of {WriterSendEofFull, WriterShortEof, WriterSendError,             *)
+(*   WriterDropWithoutEof} to be enabled at any reachable state.         *)
+(*   `WriterSendEofFull` is always enabled in the language but requires  *)
+(*   `chunkCount = NumChunks` to satisfy its precondition; the other     *)
+(*   three are gated on the corresponding `Allow*` CONSTANT being TRUE.  *)
+(*   Every cfg of this spec MUST therefore either (a) set at least one   *)
+(*   `Allow*=TRUE` OR (b) rely on `WriterSendChunk` reaching             *)
+(*   `chunkCount=NumChunks` (which is guaranteed under                   *)
+(*   `WF_vars(WriterSendChunk)`). Reviewers verify each cfg satisfies    *)
+(*   this precondition for any liveness PROPERTY it lists.               *)
+(*                                                                          *)
+(*   The currently shipped cfgs all have at least one Allow*=TRUE        *)
+(*   (Fixed enables all three; Bugged has AllowShortEof=TRUE;            *)
+(*   BothOffBugged has all three; _BuggedSilentZero has AllowErrEof and  *)
+(*   AllowDropWithoutEof=TRUE), so the contract holds today; the         *)
+(*   constraint is for future cfg edits.                                 *)
 ----------------------------------------------------------------------------
 WriterTerminationDisjunct ==
     \/ WriterSendEofFull
