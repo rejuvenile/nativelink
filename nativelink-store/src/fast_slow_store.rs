@@ -128,7 +128,7 @@ const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
 /// 30 s pick (perf-optimizer MAJOR fix-up 2026-05-16, was 1 s): the
 /// in-tree documented multi-MiB chunked-commit p99 is ~30 s (see
 /// `chunked_write_handler::CHUNKED_COMMIT_SOFT_WARN_SECS` doc-comment),
-/// and CHUNK_SIZE is 1 MiB so most chunked blobs ARE in the multi-MiB
+/// and `CHUNK_SIZE` is 1 MiB so most chunked blobs ARE in the multi-MiB
 /// band. A 1 s threshold fires `warn!` on every healthy multi-MiB
 /// commit, drowning out the actual anomalies (writer wedge, commit
 /// watchdog approaching) the warn was supposed to surface. Aligning
@@ -140,6 +140,11 @@ const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
 /// Follow-up: lift this constant into `nativelink-util` so the
 /// reader-side threshold and writer-side soft-warn share one source
 /// of truth (currently a cross-crate value duplication).
+///
+/// Feature-gated `chunked_fast_slow` because the only use-site is the
+/// BLOCK-B branch in `get_part`, itself behind the same gate; without
+/// the gate cargo emits a `dead_code` warning when the feature is off.
+#[cfg(feature = "chunked_fast_slow")]
 const BLOCK_B_SLOW_WAIT_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// #334 Fix B: client-suggested backoff hint when the
