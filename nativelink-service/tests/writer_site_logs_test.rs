@@ -114,7 +114,10 @@ async fn fss_registration_emits_info_with_writer_path_label() {
     let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xA1);
-    let digest_disc = format!("{digest:?}");
+    // Display format `{digest}` matches the production log emit which
+    // uses `%digest` (Display); Debug `{digest:?}` would produce
+    // `DigestInfo("...")` which the production line does not contain.
+    let digest_disc = format!("{digest}");
 
     let _guard = InFlightChunkedGuard::new_with_caller(
         Arc::clone(&set),
@@ -158,7 +161,10 @@ async fn fss_registration_emits_info_with_writer_path_label() {
 async fn fss_removal_emits_paired_info_with_outcome_drop() {
     let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let digest = make_digest(0xB2);
-    let digest_disc = format!("{digest:?}");
+    // Display format `{digest}` matches the production log emit which
+    // uses `%digest` (Display); Debug `{digest:?}` would produce
+    // `DigestInfo("...")` which the production line does not contain.
+    let digest_disc = format!("{digest}");
 
     {
         let _guard = InFlightChunkedGuard::new_with_caller(
@@ -201,7 +207,10 @@ async fn fss_removal_emits_paired_info_with_outcome_drop() {
 async fn fss_disarm_emits_info_with_outcome_disarm() {
     let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let digest = make_digest(0xC3);
-    let digest_disc = format!("{digest:?}");
+    // Display format `{digest}` matches the production log emit which
+    // uses `%digest` (Display); Debug `{digest:?}` would produce
+    // `DigestInfo("...")` which the production line does not contain.
+    let digest_disc = format!("{digest}");
 
     let guard = InFlightChunkedGuard::new_with_caller(
         Arc::clone(&set),
@@ -311,14 +320,24 @@ async fn fss_no_emit_for_other_caller() {
 ///   cannot observe this path"`.
 #[nativelink_test]
 async fn v1_server_handler_local_insertion_label_contract() {
-    // 4 KiB micro-chunks so the test runs in milliseconds.
+    // 4 KiB micro-chunks (matches `chunked_write_handler_test.rs`
+    // pattern) so the test runs in milliseconds. Use 3 chunks because
+    // the existing handler_streams_three_chunks_then_finish_commits_blob
+    // empirically commits cleanly at this size; a 1-chunk variant races
+    // the stream-close against finish_chunk handling.
     const CHUNK: usize = 4 * 1024;
-    const N: usize = 1;
+    const N: usize = 3;
     let total = (N * CHUNK) as u64;
 
-    let mut blob = vec![0xD4u8; CHUNK];
-    blob[0] = 0xD4;
+    // Distinctive payload byte (0xD4) so the digest's hex prefix is
+    // unique among tests in this binary — disambiguates against
+    // cross-test pollution of the tracing-test global buffer.
+    let mut blob = Vec::with_capacity(N * CHUNK);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xD4u8 ^ (i as u8)).take(CHUNK));
+    }
     let digest = DigestInfo::new(sha256(&blob), total);
+    let digest_display = format!("{digest}");
 
     let (store, _content_path) = make_store().await;
     let budget = make_test_budget();
@@ -329,14 +348,21 @@ async fn v1_server_handler_local_insertion_label_contract() {
     let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
 
     tokio::time::timeout(Duration::from_secs(5), async {
-        let chunk = make_chunk(digest, 0, &blob, true);
-        tx.send(frame_chunk(&chunk))
-            .await
-            .expect("must not deadlock — channel send to handler");
+        for i in 0..N {
+            let chunk = make_chunk(
+                digest,
+                (i * CHUNK) as u64,
+                &blob[i * CHUNK..(i + 1) * CHUNK],
+                i == N - 1,
+            );
+            tx.send(frame_chunk(&chunk))
+                .await
+                .expect("must not deadlock — channel send to handler");
+        }
         drop(tx);
     })
     .await
-    .expect("must not deadlock — single-chunk send must complete promptly");
+    .expect("must not deadlock — sending 3 chunks should finish promptly");
 
     let response = tokio::time::timeout(Duration::from_secs(5), writer)
         .await
@@ -360,12 +386,9 @@ async fn v1_server_handler_local_insertion_label_contract() {
         .await
         .expect("in-flight tracker must drain after commit");
 
-    // Assert the production info! fired. We do NOT filter on the
-    // test's digest because the digest field in the production emit
-    // uses `%stream_digest` which Display-formats as `<hex>-<size>` —
-    // the digest discriminator string is the hex prefix. This test
-    // owns the writer_path label `server_v1_handler_local` so a
-    // label-only filter is unique workspace-wide.
+    // Assert the production info! fired. Filter on the digest's
+    // Display-format (matches `%digest` in the production emit) for
+    // per-test disambiguation against the shared tracing-test buffer.
     let raw = String::from_utf8(
         tracing_test::internal::global_buf().lock().unwrap().to_vec(),
     )
@@ -376,6 +399,7 @@ async fn v1_server_handler_local_insertion_label_contract() {
             l.contains("writer_path=\"server_v1_handler_local\"")
                 && l.contains("registry=\"handler_local_in_flight\"")
                 && l.contains("in_flight handler-local entry inserted")
+                && l.contains(&digest_display)
         })
         .collect();
     assert!(
@@ -387,15 +411,12 @@ async fn v1_server_handler_local_insertion_label_contract() {
          tracing-test global_buf tail: {}",
         recent_buf_tail()
     );
-    // Confirm the emit carries the digest field so journal-scan can
-    // attribute the entry to a specific blob (without it, the label
-    // alone is operator-useless).
     let entry = lines.last().expect("at least one entry line present");
-    let digest_display = format!("{digest}");
     assert!(
-        entry.contains(&digest_display),
-        "v1_server_handler_local info! MUST carry the digest field so a \
-         journal scan can attribute the entry to a blob; got: {entry}"
+        entry.contains(&format!("expected_size={total}")),
+        "v1_server_handler_local info! MUST carry expected_size as a \
+         structured field so the journal-scan playbook can size-bucket \
+         the blob; got: {entry}"
     );
 }
 
