@@ -3346,6 +3346,7 @@ dependencies = [
  "clap",
  "futures",
  "hostname",
+ "libc",
  "nativelink-config",
  "nativelink-error",
  "nativelink-proto",

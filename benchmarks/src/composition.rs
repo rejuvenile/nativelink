@@ -511,21 +511,64 @@ mod tests {
 
         // Numeric sanity — these constants must NOT change in this crate
         // without a corresponding edit to the JSON5 substrings above.
-        assert_eq!(prod_defaults::CAS_FAST_MEMORY_MAX_BYTES, 16_000_000_000);
-        assert_eq!(prod_defaults::CAS_FAST_MEMORY_EVICT_BYTES, 4_500_000_000);
-        assert_eq!(prod_defaults::CAS_FAST_MEMORY_MAX_COUNT, 1_000_000);
-        assert_eq!(prod_defaults::SIZE_PARTITIONING_THRESHOLD, 16_384);
-        assert_eq!(prod_defaults::EXISTENCE_CACHE_MAX_ENTRIES, 50_000_000);
-        assert_eq!(prod_defaults::SMALL_CAS_FAST_MEMORY_MAX_BYTES, 4_000_000_000);
-        assert_eq!(prod_defaults::SMALL_CAS_FAST_MEMORY_MAX_COUNT, 500_000);
+        // Bespoke messages so a mutation surfaces which constant drifted.
+        assert_eq!(
+            prod_defaults::CAS_FAST_MEMORY_MAX_BYTES,
+            16_000_000_000,
+            "prod_defaults_drift: CAS_FAST_MEMORY_MAX_BYTES changed; update \
+             both the constant AND prod-server.json5 line :142"
+        );
+        assert_eq!(
+            prod_defaults::CAS_FAST_MEMORY_EVICT_BYTES,
+            4_500_000_000,
+            "prod_defaults_drift: CAS_FAST_MEMORY_EVICT_BYTES changed"
+        );
+        assert_eq!(
+            prod_defaults::CAS_FAST_MEMORY_MAX_COUNT,
+            1_000_000,
+            "prod_defaults_drift: CAS_FAST_MEMORY_MAX_COUNT changed"
+        );
+        assert_eq!(
+            prod_defaults::SIZE_PARTITIONING_THRESHOLD,
+            16_384,
+            "prod_defaults_drift: SIZE_PARTITIONING_THRESHOLD changed"
+        );
+        assert_eq!(
+            prod_defaults::EXISTENCE_CACHE_MAX_ENTRIES,
+            50_000_000,
+            "prod_defaults_drift: EXISTENCE_CACHE_MAX_ENTRIES changed"
+        );
+        assert_eq!(
+            prod_defaults::SMALL_CAS_FAST_MEMORY_MAX_BYTES,
+            4_000_000_000,
+            "prod_defaults_drift: SMALL_CAS_FAST_MEMORY_MAX_BYTES changed"
+        );
+        assert_eq!(
+            prod_defaults::SMALL_CAS_FAST_MEMORY_MAX_COUNT,
+            500_000,
+            "prod_defaults_drift: SMALL_CAS_FAST_MEMORY_MAX_COUNT changed"
+        );
         assert_eq!(
             prod_defaults::SLOW_WRITES_INFLIGHT_MAX_BYTES,
-            12 * 1024 * 1024 * 1024
+            12 * 1024 * 1024 * 1024,
+            "prod_defaults_drift: SLOW_WRITES_INFLIGHT_MAX_BYTES changed"
         );
-        assert!(prod_defaults::CHUNKED_READS_ENABLED);
-        assert!(prod_defaults::VERIFY_HASH);
-        assert!(prod_defaults::VERIFY_SIZE);
-        assert!(prod_defaults::CAS_FAST_MEMORY_EMIT_BACKPRESSURE);
+        assert!(
+            prod_defaults::CHUNKED_READS_ENABLED,
+            "prod_defaults_drift: CHUNKED_READS_ENABLED flipped to false"
+        );
+        assert!(
+            prod_defaults::VERIFY_HASH,
+            "prod_defaults_drift: VERIFY_HASH flipped to false"
+        );
+        assert!(
+            prod_defaults::VERIFY_SIZE,
+            "prod_defaults_drift: VERIFY_SIZE flipped to false"
+        );
+        assert!(
+            prod_defaults::CAS_FAST_MEMORY_EMIT_BACKPRESSURE,
+            "prod_defaults_drift: CAS_FAST_MEMORY_EMIT_BACKPRESSURE flipped to false"
+        );
     }
 
     fn check_substring(haystack: &str, needle: &str, message: &str) {
