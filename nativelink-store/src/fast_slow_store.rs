@@ -4282,13 +4282,33 @@ impl FastSlowStore {
         // write_res IS the producer's real error — preferring write_res
         // here surfaces the producer root cause, not a buf-channel
         // symptom.
+        //
+        // Dual-err diagnostic honesty (#476 fixup v2 RT-MAJOR-1): when
+        // Option A's `tx.send_error(err.clone())` routes a producer-side
+        // err to the consumer, BOTH halves carry the SAME err. The
+        // "consumer preferred over receiver-disconnected symptom" append
+        // would lie in that arm — there is no "receiver disconnected"
+        // symptom; the err the consumer surfaced IS the routed producer
+        // err. Equality-guard the append so it only fires when the two
+        // halves are genuinely distinct (the case where surfacing one
+        // really does suppress information about the other).
         match (write_res, forward_res) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(write_err), Ok(())) => Err(write_err),
             (Ok(()), Err(forward_err)) => Err(forward_err),
-            (Err(write_err), Err(forward_err)) => Err(write_err.append(format!(
-                "stream_path_to_store: consumer error preferred over producer 'receiver disconnected' symptom (#476); producer side: {forward_err:?}"
-            ))),
+            (Err(write_err), Err(forward_err)) => {
+                if write_err == forward_err {
+                    // Option A routed: producer's err mirrored by
+                    // consumer via terminal_error. No symptom-masking
+                    // happened — return one copy without misleading
+                    // append.
+                    Err(write_err)
+                } else {
+                    Err(write_err.append(format!(
+                        "stream_path_to_store: consumer error preferred over producer 'receiver disconnected' symptom (#476); producer side: {forward_err:?}"
+                    )))
+                }
+            }
         }
     }
 
@@ -4378,13 +4398,22 @@ impl FastSlowStore {
             .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
         // #476 observability: see sibling at `stream_path_to_store` —
         // prefer consumer (`write_res`) over producer symptom on dual-err.
+        // RT-MAJOR-1 fixup-v2: equality-guard the append so it only
+        // fires when the two halves are genuinely distinct (i.e. NOT
+        // the Option A producer-mirrored-via-consumer case).
         match (write_res, forward_res) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(write_err), Ok(())) => Err(write_err),
             (Ok(()), Err(forward_err)) => Err(forward_err),
-            (Err(write_err), Err(forward_err)) => Err(write_err.append(format!(
-                "stream_file_to_store: consumer error preferred over producer 'receiver disconnected' symptom (#476); producer side: {forward_err:?}"
-            ))),
+            (Err(write_err), Err(forward_err)) => {
+                if write_err == forward_err {
+                    Err(write_err)
+                } else {
+                    Err(write_err.append(format!(
+                        "stream_file_to_store: consumer error preferred over producer 'receiver disconnected' symptom (#476); producer side: {forward_err:?}"
+                    )))
+                }
+            }
         }
     }
 

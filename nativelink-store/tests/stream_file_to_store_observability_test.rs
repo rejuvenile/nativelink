@@ -73,6 +73,13 @@
 //!      red-fail with the bespoke "Option A producer-IO masking fix
 //!      not enforced" message naming the synthesized
 //!      "Sender dropped before sending EOF" leak.
+//!   3. For `surfaces_consumer_abort_when_producer_succeeded`: change
+//!      the `(Err(write_err), Ok(())) => Err(write_err)` arm in
+//!      `stream_file_to_store` to `(Err(_), Ok(())) => Ok(())` (drop
+//!      the consumer's post-EOF err). Re-run — must red-fail with the
+//!      bespoke "consumer-post-EOF-Err policy regressed — the
+//!      `(Err, Ok)` arm dropped the consumer-side authoritative err"
+//!      message.
 
 use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -102,6 +109,15 @@ use nativelink_util::store_trait::{
 /// producer's "receiver disconnected" symptom was promoted in its
 /// place.
 const ABORT_TAG: &str = "TEST_SLOW_STORE_ABORTED_FOR_DIAGNOSTIC_TEST";
+
+/// Unique tag asserted-on by the `(Ok producer, Err consumer)` test.
+/// The slow tier drains all chunks + EOF, then returns Err carrying
+/// this tag, simulating the most common production dual-err shape:
+/// VerifyStore post-EOF size mismatch, h2 RST after stream complete,
+/// or slow-store commit-time rejection (storage-full, admission). If
+/// this tag fails to surface, the consumer-side post-EOF err was
+/// swallowed.
+const POST_EOF_ABORT_TAG: &str = "TEST_CONSUMER_ABORT_AT_EOF_FOR_DIAGNOSTIC";
 
 const VALID_HASH: &str =
     "0123456789abcdef000000000000000000010000000000000123456789abcdef";
@@ -423,6 +439,128 @@ impl StoreDriver for PropagateRecvErrorStore {
 
 default_health_status_indicator!(PropagateRecvErrorStore);
 
+/// Slow-tier fake that drains EVERY chunk + observes a clean EOF,
+/// then returns Err. Simulates the most common production dual-err
+/// shape — VerifyStore post-EOF size mismatch, h2 RST_STREAM after
+/// the body completes, or slow-store commit-time rejection
+/// (storage-full, admission-pressure) — where the producer happily
+/// finishes the stream and ONLY THEN the consumer errors.
+///
+/// In this shape, `write_fut` returns `Err(POST_EOF_ABORT_TAG)` while
+/// `forward_fut` returns `Ok(())` (it sent EOF before the consumer
+/// errored), hitting the `(Err(write_err), Ok(())) => Err(write_err)`
+/// arm. The post-fix policy must surface `write_err` verbatim — a
+/// regression that flips arm order or drops the consumer-side err on
+/// `(Err, Ok)` would silently mask production aborts.
+#[derive(MetricsComponent)]
+struct AcceptAllThenAbortOnEofStore {
+    update_invocations: AtomicUsize,
+    saw_clean_eof: parking_lot::Mutex<bool>,
+}
+
+impl AcceptAllThenAbortOnEofStore {
+    fn new() -> Self {
+        Self {
+            update_invocations: AtomicUsize::new(0),
+            saw_clean_eof: parking_lot::Mutex::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl StoreDriver for AcceptAllThenAbortOnEofStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _digests: &[StoreKey<'_>],
+        _results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _digest: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        self.update_invocations.fetch_add(1, Ordering::SeqCst);
+        // Drain every chunk; EOF is signalled by `Ok(empty)` from
+        // recv (see `buf_channel.rs:607,632`). Any propagated err
+        // would short-circuit to the (Err, Err) arm — that's the
+        // DIFFERENT path the dual-err test covers. This test wants
+        // the (Err producer-Ok, Err consumer) arm specifically.
+        loop {
+            match reader.recv().await {
+                Ok(chunk) if chunk.is_empty() => {
+                    // Clean EOF observed; producer fully drained and
+                    // sent send_eof. Record it (the test asserts on
+                    // this to prove the producer succeeded — the path
+                    // under test is the `(Err consumer, Ok producer)`
+                    // arm, not the dual-err arm).
+                    *self.saw_clean_eof.lock() = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    // Should not happen in this test scenario; if it
+                    // does, propagate so the test surfaces an unexpected
+                    // dual-err arm instead of masking.
+                    return Err(e);
+                }
+            }
+        }
+        // Simulate a post-EOF commit failure (VerifyStore size mismatch,
+        // slow-store admission/storage rejection, h2 RST after body).
+        Err(make_err!(Code::Aborted, "{POST_EOF_ABORT_TAG}"))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(
+            Code::NotFound,
+            "AcceptAllThenAbortOnEofStore: get_part not supported"
+        ))
+    }
+
+    fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+        self
+    }
+
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+default_health_status_indicator!(AcceptAllThenAbortOnEofStore);
+
 /// Build a production-composition `FastSlowStore` with `FileUpdates`-
 /// reporting fast tier (so `update_with_whole_file` takes the parallel
 /// `stream_file_to_store` path) and the supplied slow tier.
@@ -728,6 +866,142 @@ async fn surfaces_producer_io_error_not_buf_channel_symptom() -> Result<(), Erro
          FastSlowStore path under test was not exercised. \
          update_invocations={}",
         propagate_slow.update_invocations.load(Ordering::SeqCst)
+    );
+
+    Ok(())
+}
+
+/// **#476 Phase 1 RT-MAJOR-2 fix (fixup-v2)**: the most common
+/// production dual-err shape — `(Ok producer, Err consumer)` — must
+/// surface the consumer's authoritative post-EOF err verbatim.
+///
+/// Red-team finding #7 (red-team.md): real production failures of
+/// `stream_file_to_store` are dominated by the consumer erroring
+/// AFTER the producer has cleanly drained the file. Examples:
+///   * VerifyStore post-EOF size mismatch (the wrapping store reads
+///     the full stream + EOF, then validates declared size vs
+///     observed size and errors).
+///   * h2 RST_STREAM after the body is fully sent — slow tier's
+///     downstream RPC layer fails at commit/finalize.
+///   * Slow-store commit-time rejection (storage-full, admission
+///     pressure surfacing only on the final write).
+///
+/// In this shape, `write_fut` = `Err(post_eof_err)` and `forward_fut`
+/// = `Ok(())` (it sent EOF cleanly before the consumer's update
+/// returned). The match selects `(Err(write_err), Ok(())) =>
+/// Err(write_err)` — the single-err arm preserves the consumer's
+/// authoritative err.
+///
+/// The existing two tests both hit the `(Err, Err)` dual-err arm. A
+/// regression that drops the `(Err, Ok)` consumer-err arm — e.g. a
+/// future refactor that inverts arm order, swallows post-EOF errs, or
+/// fires on `forward_res?; ...` before checking `write_res` — would
+/// ship undetected. This test guards that arm in production
+/// composition (real `FastSlowStore` + real `MemoryStore` fast tier
+/// reporting `FileUpdates`).
+///
+/// Small payload (4 chunks × 16 KiB = 64 KiB) — well under the
+/// 128-slot buf_channel + 4-slot bridge mpsc capacity, so the
+/// producer drains fully without blocking. The slow tier's
+/// `AcceptAllThenAbortOnEofStore` then observes a clean EOF, sets
+/// `saw_clean_eof = true`, and returns Err — exactly the
+/// `(Ok producer, Err consumer)` arm.
+#[nativelink_test]
+async fn surfaces_consumer_abort_when_producer_succeeded() -> Result<(), Error> {
+    let abort_slow = Arc::new(AcceptAllThenAbortOnEofStore::new());
+    let fast_slow_store = build_fast_slow(abort_slow.clone());
+
+    // Small payload — see test doc above. 4 chunks × 16 KiB.
+    let small_payload: Vec<u8> = (0..(4 * 16 * 1024)).map(|i| (i & 0xff) as u8).collect();
+    let digest = DigestInfo::try_new(VALID_HASH, small_payload.len() as u64).unwrap();
+
+    let mut tmpfile = tempfile::NamedTempFile::new()
+        .map_err(|e| make_err!(Code::Internal, "failed to create tempfile: {:?}", e))?;
+    tmpfile
+        .write_all(&small_payload)
+        .map_err(|e| make_err!(Code::Internal, "failed to write tempfile: {:?}", e))?;
+    tmpfile
+        .flush()
+        .map_err(|e| make_err!(Code::Internal, "failed to flush tempfile: {:?}", e))?;
+    let path = tmpfile.path().to_owned();
+
+    let file = nativelink_util::common::fs::open_file(&path, 0).await?;
+
+    let store_key: StoreKey<'_> = digest.into();
+    let call = fast_slow_store.as_store_driver_pin().update_with_whole_file(
+        store_key,
+        path.into_os_string(),
+        file,
+        UploadSizeInfo::ExactSize(small_payload.len() as u64),
+    );
+
+    // Deadlock detector. The small payload means the producer drains
+    // fully in well under a second; 5s is generous even on a
+    // contended host.
+    let res = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect(
+            "stream_file_to_store (Ok producer, Err consumer) path \
+             must NOT deadlock — consumer-post-EOF-Err policy must \
+             surface the abort within 5s; hang means the (Err, Ok) \
+             arm was reordered, dropped, or its err-routing wedged",
+        );
+
+    assert!(
+        res.is_err(),
+        "update_with_whole_file must propagate the slow-tier post-EOF \
+         abort as Err; got Ok(...). The slow tier returned \
+         {POST_EOF_ABORT_TAG} after EOF so the call cannot succeed."
+    );
+    let err = res.unwrap_err();
+    let rendered = format!("{err:?}");
+
+    assert!(
+        rendered.contains(POST_EOF_ABORT_TAG),
+        "consumer-post-EOF-Err policy regressed — the `(Err, Ok)` arm \
+         dropped the consumer-side authoritative err. The slow tier \
+         returned Err({POST_EOF_ABORT_TAG}) AFTER observing a clean EOF \
+         from the producer; `write_res` carries the abort, \
+         `forward_res` is Ok(()). The post-fix arm \
+         `(Err(write_err), Ok(())) => Err(write_err)` must surface \
+         the consumer's err verbatim. Got rendered={rendered}"
+    );
+
+    // The dual-err append text MUST NOT appear — this arm is the
+    // single-err `(Err, Ok)` arm, distinct from the
+    // `surfaces_consumer_error_over_symptom_dual_err` test which
+    // hits the `(Err, Err)` dual-err arm. If the append text appears
+    // here, the test setup incorrectly exercises the dual-err arm
+    // (e.g. the producer somehow errored, masking the bug under test).
+    assert!(
+        !rendered.contains("consumer error preferred over producer 'receiver disconnected' symptom"),
+        "test setup error — the `(Err producer, Err consumer)` dual-err \
+         arm fired instead of the `(Ok producer, Err consumer)` single-err \
+         arm under test. The producer should drain cleanly on a 64 KiB \
+         payload; if it errored, the slow tier's EOF-detection logic \
+         (saw_clean_eof) or producer's read path is wrong. \
+         Got rendered={rendered}"
+    );
+
+    // Prove the slow tier actually drained the FULL stream + EOF
+    // (otherwise the test is exercising a dual-err arm vacuously and
+    // the assertion above passes for the wrong reason).
+    assert!(
+        *abort_slow.saw_clean_eof.lock(),
+        "consumer-post-EOF-Err test did not observe a clean EOF — the \
+         `(Ok producer, Err consumer)` arm was NOT exercised. The slow \
+         tier's recv loop never saw `Ok(empty)`; either the producer \
+         errored mid-stream (would hit dual-err arm), the EOF was \
+         routed through send_error (would hit dual-err arm), or the \
+         consumer aborted before draining. Test feeder setup is wrong."
+    );
+
+    assert!(
+        abort_slow.update_invocations.load(Ordering::SeqCst) >= 1,
+        "AcceptAllThenAbortOnEofStore::update was never called; the \
+         FastSlowStore path under test was not exercised. \
+         update_invocations={}",
+        abort_slow.update_invocations.load(Ordering::SeqCst)
     );
 
     Ok(())
