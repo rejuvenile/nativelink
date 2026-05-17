@@ -6646,16 +6646,43 @@ impl StoreDriver for FastSlowStore {
                             // can correlate splice firings with
                             // DataLoss events per digest.
                             let starting_chunk_idx = reader.cursor_chunk_idx();
+                            // #515 Phase 0.2: capture consumer's
+                            // ORIGINAL `offset` + `length` (the
+                            // get_part call args) alongside the
+                            // splice-computed `new_offset` /
+                            // `new_length`. Production evidence
+                            // 2026-05-17: 174 splice firings with
+                            // `cursor_chunk_idx > 0` in 80 min but
+                            // ZERO DataLoss events — so cursor > 0
+                            // alone is NOT sufficient for the
+                            // hash-mismatch path. Disambiguating
+                            // requires knowing whether the consumer
+                            // asked for the WHOLE blob (`offset = 0,
+                            // length = None` → splice fetches
+                            // `blob[bytes_already_sent..end]` while
+                            // the consumer expects `blob[0..end]` →
+                            // frankenstein) versus a partial range
+                            // matching the reader's interior cursor
+                            // (`offset = bytes_already_sent` → splice
+                            // is correct). Logging both pairs lets
+                            // post-deploy log analysis test
+                            // `original_offset == new_offset -
+                            // bytes_already_sent` per event.
+                            let original_offset = offset;
+                            let original_length = length;
                             warn!(
                                 ?key,
                                 site = "populator_caller",
+                                original_offset,
+                                ?original_length,
                                 bytes_already_sent,
                                 new_offset,
                                 ?new_length,
                                 starting_chunk_idx,
                                 "#515 splice firing: cursor_chunk_idx={starting_chunk_idx} \
                                  at populator-caller splice; if > 0, splice math \
-                                 will hash-mismatch (PrefixContinuity invariant violated)"
+                                 will hash-mismatch (PrefixContinuity invariant violated) \
+                                 UNLESS original_offset matches reader starting chunk"
                             );
                             self.metrics
                                 .streaming_buffer_reader_fallback_to_direct_total
@@ -6764,16 +6791,29 @@ impl StoreDriver for FastSlowStore {
                         // would confirm the H4 sibling-path variant
                         // also fires.
                         let starting_chunk_idx = reader.cursor_chunk_idx();
+                        // #515 Phase 0.2: mirror the populator-caller
+                        // expansion above — capture the consumer's
+                        // ORIGINAL `offset` + `length` (the get_part
+                        // call args) alongside the splice-computed
+                        // `new_offset` / `new_length`. Waiter and
+                        // populator-caller share the same reader cursor,
+                        // but the consumer args may differ across
+                        // racers, so log them here too.
+                        let original_offset = offset;
+                        let original_length = length;
                         warn!(
                             ?key,
                             site = "waiter",
+                            original_offset,
+                            ?original_length,
                             bytes_already_sent,
                             new_offset,
                             ?new_length,
                             starting_chunk_idx,
                             "#515 splice firing: cursor_chunk_idx={starting_chunk_idx} \
                              at waiter splice; if > 0, splice math will \
-                             hash-mismatch (PrefixContinuity invariant violated)"
+                             hash-mismatch (PrefixContinuity invariant violated) \
+                             UNLESS original_offset matches reader starting chunk"
                         );
                         self.metrics
                             .streaming_buffer_reader_fallback_to_direct_waiter_total
