@@ -45,10 +45,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Minimum interval between consecutive stack dumps (seconds).
 /// Prevents flooding /tmp with dumps during a sustained stall.
+///
+/// **Composition invariant with `DEFAULT_STALL_THRESHOLD`:** the loop-body
+/// rate-limit predicate at the StallGuard fire path uses strict `>` (not
+/// `>=`), so that when `threshold == MIN_DUMP_INTERVAL_SECS` (the
+/// production configuration: 30s == 30s) a sustained wedge produces
+/// exactly ONE dump on the first iteration and rate-limits every
+/// subsequent iteration. Using `>=` here would let a guard re-arming at
+/// exactly the 30s boundary win the gate on EVERY iteration, producing
+/// 1 dump per 30s per sustained wedge (~1.7 GiB/day of /tmp at the
+/// per-dump file size). See #492 fix-up: `M1 rate-limit math`.
 const MIN_DUMP_INTERVAL_SECS: u64 = 30;
 
 /// Unix epoch seconds of the last dump. Used for rate-limiting.
 static LAST_DUMP_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only counter incremented every time the StallGuard loop fires the
+/// dump branch. The production path runs `dump_thread_stacks`; the test
+/// path increments this counter instead so tests can (a) observe exact
+/// dump cadence under sustained wedges, (b) verify the rate-limit
+/// composition, (c) verify the suppress→rearm path actually produces a
+/// dump on the next window — all WITHOUT writing real
+/// `/tmp/nativelink-stall-*.txt` files on every CI run.
+///
+/// The substitution is gated behind `#[cfg(test)]` so production behavior
+/// is byte-identical. The counter is process-global and tests that read
+/// it must serialize via [`tests::TEST_DUMP_LOCK`].
+#[cfg(test)]
+static TEST_DUMPS_FIRED: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only counter incremented every time the StallGuard loop hits the
+/// "dump rate-limited" branch (the iteration ran but the rate-limit gate
+/// suppressed the dump). Used to verify rate-limit composition under
+/// sustained wedge.
+#[cfg(test)]
+static TEST_RATE_LIMITED_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Force-dump rate-limit: dumps marked "force" still get rate-limited
 /// to avoid flooding /tmp during a sustained wedge, but use a separate
@@ -74,6 +105,25 @@ pub const DEFAULT_STALL_THRESHOLD: Duration = Duration::from_secs(30);
 /// `MIN_FORCE_DUMP_INTERVAL_SECS`.
 const fn force_dump_should_proceed(now_secs: u64, prev_secs: u64) -> bool {
     now_secs.saturating_sub(prev_secs) >= MIN_FORCE_DUMP_INTERVAL_SECS
+}
+
+/// Decide whether the StallGuard re-arm loop's dump branch should
+/// proceed, given the current and previous dump unix-epoch seconds.
+/// Pure function; extracted from the loop body in `StallGuard::new_inner`
+/// so the **strict-`>`** boundary rule is unit-testable AND so a
+/// mutation test (revert `>` to `>=`) exercises the actual production
+/// predicate, not a duplicated literal.
+///
+/// **Strict `>`, not `>=`.** When a guard's `threshold` equals
+/// `MIN_DUMP_INTERVAL_SECS` (the production case: 30s == 30s), a `>=`
+/// predicate would let every re-armed iteration win the gate at the
+/// exact boundary, producing one dump per `threshold` per sustained
+/// wedge — defeating the rate-limit. With `>`, a guard re-arming
+/// exactly at the boundary loses; only iterations strictly past the
+/// previous dump's timestamp can fire. (#492 fix-up: M1 rate-limit
+/// math.)
+const fn rearm_loop_dump_should_proceed(now_secs: u64, prev_secs: u64) -> bool {
+    now_secs.saturating_sub(prev_secs) > MIN_DUMP_INTERVAL_SECS
 }
 
 /// Force a thread-stack dump for a critical event (e.g. streaming-blob
@@ -212,12 +262,16 @@ impl StallGuard {
             //
             // The dump-fire path is rate-limited by
             // `MIN_DUMP_INTERVAL_SECS` (30s) via the process-global
-            // `LAST_DUMP_EPOCH` atomic, so re-arming does NOT flood
-            // /tmp with dumps during a sustained wedge — the second and
-            // subsequent iterations within the rate-limit window hit
-            // the "rate-limited" branch and only `eprintln!` a heartbeat
-            // line, while iterations OUTSIDE the rate-limit window
-            // produce a fresh dump.
+            // `LAST_DUMP_EPOCH` atomic with a strict-`>` gate (see
+            // `MIN_DUMP_INTERVAL_SECS` doc-comment). Under a sustained
+            // wedge a guard at the production 30s threshold produces
+            // exactly one dump on the first iteration; every subsequent
+            // 30s iteration hits the "rate-limited" branch and only
+            // emits a heartbeat `tracing::warn!`. Worst-case sustained
+            // wedge `/tmp` cost: 1 dump (~600 KiB), bounded by
+            // `MAX_STALL_DUMPS` retention so unrelated stalls don't
+            // accumulate either. (#492 fix-up: M1 rate-limit math, M3
+            // tracing-warn heartbeat.)
             loop {
                 tokio::time::sleep(threshold).await;
 
@@ -259,13 +313,27 @@ impl StallGuard {
                     .unwrap_or_default()
                     .as_secs();
                 let prev = LAST_DUMP_EPOCH.load(Ordering::Relaxed);
-                if now.saturating_sub(prev) >= MIN_DUMP_INTERVAL_SECS
+                // STRICT `>`, not `>=`: when a guard's `threshold`
+                // equals `MIN_DUMP_INTERVAL_SECS` (the production case:
+                // 30s == 30s), a `>=` predicate would let every
+                // re-armed iteration win the CAS at the exact boundary,
+                // producing one dump per `threshold` per sustained
+                // wedge — defeating the rate-limit. With `>`, a guard
+                // re-arming exactly at the boundary loses, and a
+                // sustained wedge yields exactly one dump per
+                // `MIN_DUMP_INTERVAL_SECS` + 1 second window. (#492
+                // fix-up: M1 rate-limit math.)
+                if rearm_loop_dump_should_proceed(now, prev)
                     && LAST_DUMP_EPOCH
                         .compare_exchange(prev, now, Ordering::SeqCst, Ordering::Relaxed)
                         .is_ok()
                 {
-                    eprintln!(
-                        "STORE OPERATION STALL: {label}{ctx_suffix} has been running for >{threshold:.0?} — dumping thread stacks",
+                    tracing::warn!(
+                        target: "nativelink_util::stall_detector",
+                        op_name = label,
+                        threshold_ms = threshold.as_millis() as u64,
+                        ctx = ctx_suffix.as_str(),
+                        "store operation stall — dumping thread stacks"
                     );
                     let dump_label = if ctx_suffix.is_empty() {
                         label.to_string()
@@ -274,17 +342,44 @@ impl StallGuard {
                     };
                     // dump_thread_stacks does in-process work (signal
                     // dispatch + symbol resolution + file I/O) bounded
-                    // at 5s. We still run it on the blocking pool
-                    // because the 1ms polling sleep would otherwise
-                    // consume a tokio worker for the duration of the
-                    // dump, and the file I/O is sync.
-                    let _ = tokio::task::spawn_blocking(move || {
-                        dump_thread_stacks(&dump_label);
-                    });
+                    // at 5s. We run it on the blocking pool because
+                    // dump_thread_stacks is fully sync (signal
+                    // dispatch, file I/O, symbol resolution) and would
+                    // block this verdict-task's runtime worker for
+                    // ~5s. The 1ms polling-sleep loop referenced in
+                    // earlier revisions of this comment was removed in
+                    // commit f6779f3a; spawn_blocking is retained
+                    // because the underlying sync work is unchanged.
+                    #[cfg(test)]
+                    {
+                        let _ = dump_label;
+                        TEST_DUMPS_FIRED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    #[cfg(not(test))]
+                    {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            dump_thread_stacks(&dump_label);
+                        });
+                    }
                 } else {
-                    eprintln!(
-                        "STORE OPERATION STALL: {label}{ctx_suffix} has been running for >{threshold:.0?} (dump rate-limited)",
+                    // Re-armed within the rate-limit window: emit ONE
+                    // structured heartbeat via tracing instead of
+                    // `eprintln!` so per-RPC StallGuards in a
+                    // wedged-fleet scenario route through the tracing
+                    // pipeline (consistent with the suppress branch
+                    // above) rather than flooding stderr / journal.
+                    // (#492 fix-up: M3 eprintln → tracing::warn.)
+                    tracing::warn!(
+                        target: "nativelink_util::stall_detector",
+                        op_name = label,
+                        threshold_ms = threshold.as_millis() as u64,
+                        ctx = ctx_suffix.as_str(),
+                        "store operation stall — dump rate-limited"
                     );
+                    #[cfg(test)]
+                    {
+                        TEST_RATE_LIMITED_HITS.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 // Loop continues to re-arm for the next threshold window.
             }
@@ -1980,9 +2075,31 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        DEFAULT_STALL_THRESHOLD, MIN_FORCE_DUMP_INTERVAL_SECS, StallGuard, StallVerdict,
-        bump_progress_handle, classify_stall, force_dump_should_proceed,
+        DEFAULT_STALL_THRESHOLD, LAST_DUMP_EPOCH, MIN_DUMP_INTERVAL_SECS,
+        MIN_FORCE_DUMP_INTERVAL_SECS, StallGuard, StallVerdict, TEST_DUMPS_FIRED,
+        TEST_RATE_LIMITED_HITS, bump_progress_handle, classify_stall,
+        force_dump_should_proceed, rearm_loop_dump_should_proceed,
     };
+
+    /// Serialize tests that read or assert on the process-global
+    /// `TEST_DUMPS_FIRED` / `TEST_RATE_LIMITED_HITS` / `LAST_DUMP_EPOCH`
+    /// counters. Parallel tests would race on these — even when each
+    /// test uses an independent paused tokio runtime, the static
+    /// counters are shared across the whole crate's test binary. Tests
+    /// that don't touch the counters (the pure `classify_stall` /
+    /// `force_dump_should_proceed` unit tests) do NOT need this lock.
+    static TEST_DUMP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Reset the dump-fire-related process-global state so a test can
+    /// observe counters from a known zero. Called under
+    /// [`TEST_DUMP_LOCK`] to ensure serialized access. Resets both
+    /// counters AND `LAST_DUMP_EPOCH` so the strict-`>` rate-limit gate
+    /// can be exercised from cold-start in each test.
+    fn reset_dump_state() {
+        TEST_DUMPS_FIRED.store(0, Ordering::SeqCst);
+        TEST_RATE_LIMITED_HITS.store(0, Ordering::SeqCst);
+        LAST_DUMP_EPOCH.store(0, Ordering::SeqCst);
+    }
 
     /// Spec: when the wrapped operation never calls `bump_progress`
     /// (`last_progress_nanos == 0`), the verdict MUST be `ProceedToDump`.
@@ -2122,6 +2239,13 @@ mod tests {
     /// bespoke message in `classify_recent_progress_suppresses_dump`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stallguard_suppresses_dump_on_bumped_progress() {
+        // Serialize with sibling tests reading TEST_DUMPS_FIRED — even
+        // though this test hits the suppress branch (which doesn't
+        // increment counters), serialization is the safer default to
+        // avoid intermittent races on future refactors.
+        let _lock = TEST_DUMP_LOCK.lock().unwrap();
+        reset_dump_state();
+
         let threshold = Duration::from_millis(200);
         let guard = StallGuard::new(threshold, "test_slow_producer");
         // Bump progress 5 times at 50ms intervals — each bump well
@@ -2183,6 +2307,13 @@ mod tests {
     /// is still alive.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stallguard_spawn_task_rearms_in_loop() {
+        // Serialize with the other process-global-counter tests; the
+        // re-arm loop's fire/rate-limited branches increment
+        // TEST_DUMPS_FIRED / TEST_RATE_LIMITED_HITS, which sibling
+        // tests below read-assert on.
+        let _lock = TEST_DUMP_LOCK.lock().unwrap();
+        reset_dump_state();
+
         let threshold = Duration::from_millis(50);
         let guard = StallGuard::new(threshold, "test_rearm_loop");
 
@@ -2204,13 +2335,12 @@ mod tests {
         assert!(
             !guard.handle.is_finished(),
             "stall_detector spawn task exited after one shot — \
-             re-arm loop missing (#492). \
-             After {} of paused-time elapsed (3× threshold), the \
-             background task's JoinHandle reports finished, meaning \
-             it ran exactly one verdict-evaluation and returned. A \
-             long-running guard whose operation wedges AFTER this \
-             would never be detected.",
-            "150ms",
+             re-arm loop missing (#492). After {}ms of paused-time \
+             elapsed (3× threshold), the background task's JoinHandle \
+             reports finished, meaning it ran exactly one \
+             verdict-evaluation and returned. A long-running guard \
+             whose operation wedges AFTER this would never be detected.",
+            (threshold * 3).as_millis(),
         );
 
         // Drop terminates the task — `Drop` calls `handle.abort()`.
@@ -2237,6 +2367,9 @@ mod tests {
     /// (the loop body re-arms forever and the abort never arrives).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stallguard_loop_exits_on_drop() {
+        let _lock = TEST_DUMP_LOCK.lock().unwrap();
+        reset_dump_state();
+
         let threshold = Duration::from_millis(50);
         let guard = StallGuard::new(threshold, "test_drop_exits_loop");
 
@@ -2275,6 +2408,242 @@ mod tests {
         assert!(
             finished,
             "stall_detector re-armed loop did not exit on drop — task leak (#492)",
+        );
+    }
+
+    /// Spec (#492 fix-up MAJOR-1: suppress→rearm fires on next window):
+    /// the re-arm loop's load-bearing behavioral claim is that a wedge
+    /// developing AFTER an earlier `SuppressDumpProducerDriven` verdict
+    /// is still caught on the next iteration. Without this, a guard
+    /// whose first window saw recent server-side progress would exit
+    /// the suppress arm via a (hypothetical) `return` and miss every
+    /// subsequent wedge.
+    ///
+    /// Test mechanics:
+    ///
+    /// The spawn task's verdict uses `SystemTime::now()` (real wall
+    /// clock) for the progress-staleness check, while
+    /// `tokio::time::pause()` only freezes the tokio Instant clock —
+    /// so we cannot make wall-clock "old" by advancing paused time.
+    /// Instead we manipulate the `last_progress` slot directly via the
+    /// shared `Arc<AtomicU64>` handle from `progress_handle()`:
+    ///
+    ///   - Window-1: write a RECENT wall-clock timestamp (now-1ms) →
+    ///     verdict reads recent progress → SuppressDumpProducerDriven
+    ///     → loop body hits the `continue` arm.
+    ///   - Window-2: write a STALE wall-clock timestamp (now - 10s,
+    ///     well past the 50ms threshold) → verdict reads stale
+    ///     progress → ProceedToDump → loop body wins the rate-limit
+    ///     gate (cold start, `prev=0`, gap is unix-epoch seconds) and
+    ///     increments `TEST_DUMPS_FIRED`.
+    ///
+    /// We sample `TEST_DUMPS_FIRED` after each window so the assertion
+    /// can distinguish "loop exited on suppress" (dumps remains 0
+    /// forever) from "loop continued and fired on stale progress in
+    /// window-2" (dumps transitions 0 → 1).
+    ///
+    /// Mutation: change the `continue;` in the suppress arm at
+    /// `new_inner` to `return;`. Test red-fails with bespoke
+    /// `"suppress→rearm contract violated — loop exited on suppress, \
+    /// wedge in next window invisible (#492)"`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stallguard_rearms_after_suppress_when_progress_goes_stale() {
+        let _lock = TEST_DUMP_LOCK.lock().unwrap();
+        reset_dump_state();
+
+        let threshold = Duration::from_millis(50);
+        let guard = StallGuard::new(threshold, "test_suppress_then_rearm");
+        let progress = guard.progress_handle();
+
+        // Park the spawn task at its first sleep.
+        tokio::task::yield_now().await;
+
+        // Window-1: write RECENT progress timestamp so verdict
+        // suppresses. Using `now - 1ms` keeps the gap well below the
+        // 50ms threshold regardless of test-runtime jitter.
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let recent = now_nanos.saturating_sub(1_000_000); // 1ms ago
+        progress.store(recent, Ordering::SeqCst);
+
+        // Advance paused time past one threshold; loop iter 1 wakes,
+        // reads recent progress, hits suppress arm, `continue`s.
+        tokio::time::sleep(threshold + Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let dumps_after_window1 = TEST_DUMPS_FIRED.load(Ordering::SeqCst);
+        assert_eq!(
+            dumps_after_window1, 0,
+            "precondition: window-1 must suppress (recent progress), \
+             not fire — observed {dumps_after_window1} dumps. Test \
+             setup wrong; window-2 assertion below would be ambiguous.",
+        );
+
+        // Window-2: overwrite progress with a STALE timestamp (10s ago,
+        // far past the 50ms threshold). Verdict will return ProceedToDump.
+        let stale = now_nanos.saturating_sub(10_000_000_000); // 10s ago
+        progress.store(stale, Ordering::SeqCst);
+
+        // Advance another threshold. If the loop exited on iter-1
+        // suppress (mutation: `continue` → `return`), this iteration
+        // never happens and `TEST_DUMPS_FIRED` stays 0.
+        tokio::time::sleep(threshold + Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let dumps_after_window2 = TEST_DUMPS_FIRED.load(Ordering::SeqCst);
+        assert_eq!(
+            dumps_after_window2, 1,
+            "suppress→rearm contract violated — loop exited on \
+             suppress, wedge in next window invisible (#492). \
+             Expected exactly 1 dump after window-2 (window-1 suppress \
+             must `continue` rather than `return`), observed \
+             {dumps_after_window2}.",
+        );
+
+        drop(guard);
+    }
+
+    /// Spec (#492 fix-up MAJOR-2: rate-limit composition):
+    /// under a sustained wedge (no `bump_progress`, every iteration
+    /// returns `ProceedToDump`), the loop body MUST be globally
+    /// rate-limited by `LAST_DUMP_EPOCH`. With the M1 strict-`>` gate,
+    /// a guard whose threshold equals `MIN_DUMP_INTERVAL_SECS` produces
+    /// exactly ONE dump on the first iteration and N-1 rate-limited
+    /// heartbeats on subsequent iterations within the rate-limit
+    /// window.
+    ///
+    /// Scenario:
+    ///   - Threshold = 50 ms, sustained wedge (no bumps).
+    ///   - Advance through 4 windows of paused time.
+    ///   - Wall-clock between windows is microseconds, so all 4
+    ///     iterations land within a single `MIN_DUMP_INTERVAL_SECS`
+    ///     (30 s) bucket.
+    ///   - Observe: TEST_DUMPS_FIRED == 1, TEST_RATE_LIMITED_HITS >= 1.
+    ///
+    /// Mutation A (regress M1 strict-`>` back to `>=`): the rate-limit
+    /// gate degenerates when `threshold` were ever equal to
+    /// `MIN_DUMP_INTERVAL_SECS` in seconds — at 50ms threshold the gate
+    /// is dominated by wall-clock, so this mutation is observable only
+    /// for the 30s == 30s production case, which the dedicated test
+    /// `rate_limit_strict_gt_prevents_per_iter_dump_at_production_threshold`
+    /// below pins.
+    ///
+    /// Mutation B (gate predicate flipped, or `MIN_DUMP_INTERVAL_SECS`
+    /// lowered to 0): every iteration of the loop wins the gate.
+    /// Observable as `TEST_DUMPS_FIRED == N` (4) instead of 1, with
+    /// `TEST_RATE_LIMITED_HITS == 0`. Test red-fails with bespoke
+    /// `"rate-limit composition broke — re-armed loop fired N dumps \
+    /// under sustained wedge (#492 fix-up MAJOR-2)"`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stallguard_rate_limit_caps_dumps_under_sustained_wedge() {
+        let _lock = TEST_DUMP_LOCK.lock().unwrap();
+        reset_dump_state();
+
+        let threshold = Duration::from_millis(50);
+        let guard = StallGuard::new(threshold, "test_sustained_wedge");
+
+        tokio::task::yield_now().await;
+
+        // Run through 4 windows. Without bumps, every iteration
+        // classifies as `ProceedToDump`. The rate-limit gate (using
+        // wall-clock seconds) admits at most one within a 30s window;
+        // the four 50ms iterations fit in microseconds of wall-clock,
+        // so all but the first should be rate-limited.
+        for _ in 0..4 {
+            tokio::time::sleep(threshold + Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let dumps = TEST_DUMPS_FIRED.load(Ordering::SeqCst);
+        let rate_limited = TEST_RATE_LIMITED_HITS.load(Ordering::SeqCst);
+
+        assert_eq!(
+            dumps, 1,
+            "rate-limit composition broke — re-armed loop fired {dumps} \
+             dumps under sustained wedge (#492 fix-up MAJOR-2). The \
+             process-global LAST_DUMP_EPOCH must cap dump invocations \
+             to one per MIN_DUMP_INTERVAL_SECS ({MIN_DUMP_INTERVAL_SECS}s) \
+             regardless of how many iterations the re-arm loop \
+             completes. Expected exactly 1, observed {dumps}.",
+        );
+        assert!(
+            rate_limited >= 1,
+            "rate-limit heartbeat branch never fired ({rate_limited} hits) \
+             — re-arm loop produced fewer than expected iterations, so \
+             this test does not actually exercise the rate-limit \
+             composition. Expected at least 1, observed {rate_limited}.",
+        );
+
+        drop(guard);
+    }
+
+    /// Spec (#492 fix-up MAJOR-1 M1: strict-`>` rate-limit gate):
+    /// the production configuration is `threshold == MIN_DUMP_INTERVAL_SECS
+    /// == 30s`. With the prior `>=` predicate at the loop's rate-limit
+    /// gate, a guard re-arming exactly at the 30s boundary would win
+    /// the CAS on every iteration, defeating the rate-limit and
+    /// producing 1 dump per 30s per sustained wedge. With strict `>`,
+    /// the boundary loses; only iterations strictly more than 30s
+    /// after the previous dump can fire.
+    ///
+    /// This test exercises the production predicate
+    /// `rearm_loop_dump_should_proceed` directly — the same function
+    /// the loop body in `new_inner` calls — so a mutation that flips
+    /// `>` to `>=` in the predicate's body is observable.
+    ///
+    /// Mutation: revert the gate from `>` to `>=` at the predicate's
+    /// definition. Test red-fails with bespoke
+    /// `"M1 rate-limit math regressed — boundary case admitted, \
+    /// /tmp would fill at 1 dump per threshold per wedge (#492 fix-up M1)"`.
+    #[test]
+    fn rate_limit_strict_gt_prevents_per_iter_dump_at_production_threshold() {
+        // Production case: prev = N, now = N + MIN_DUMP_INTERVAL_SECS
+        // (a guard re-arming exactly at the 30s boundary). MUST be
+        // false under strict `>`.
+        let prev = 1_700_000_000u64;
+        let now_at_boundary = prev + MIN_DUMP_INTERVAL_SECS;
+        let now_past_boundary = prev + MIN_DUMP_INTERVAL_SECS + 1;
+        let now_well_past = prev + MIN_DUMP_INTERVAL_SECS + 60;
+
+        assert!(
+            !rearm_loop_dump_should_proceed(now_at_boundary, prev),
+            "M1 rate-limit math regressed — boundary case admitted, \
+             /tmp would fill at 1 dump per threshold per wedge (#492 \
+             fix-up M1). At the production config (threshold == \
+             MIN_DUMP_INTERVAL_SECS == 30s), a guard re-arming exactly \
+             at the boundary MUST lose the gate — `>` not `>=`.",
+        );
+        assert!(
+            rearm_loop_dump_should_proceed(now_past_boundary, prev),
+            "strict `>` must still admit dumps STRICTLY past the rate-limit",
+        );
+        assert!(
+            rearm_loop_dump_should_proceed(now_well_past, prev),
+            "strict `>` must admit dumps well past the rate-limit",
+        );
+        // Below the rate-limit, never admit.
+        let now_inside = prev + MIN_DUMP_INTERVAL_SECS - 1;
+        assert!(
+            !rearm_loop_dump_should_proceed(now_inside, prev),
+            "below the rate-limit, must never admit",
+        );
+        // Cold start: prev = 0, now = unix-epoch-seconds is always
+        // vastly larger than MIN_DUMP_INTERVAL_SECS, so cold-start
+        // always admits the first dump.
+        assert!(
+            rearm_loop_dump_should_proceed(now_well_past, 0),
+            "cold start must always admit the first dump",
+        );
+        // Clock skew (now < prev) — saturating_sub gives 0, which is
+        // NOT > 30, so never admit (a regression in the loop body
+        // would not panic on backwards time).
+        assert!(
+            !rearm_loop_dump_should_proceed(prev - 100, prev),
+            "clock skew (now < prev) must not admit",
         );
     }
 
