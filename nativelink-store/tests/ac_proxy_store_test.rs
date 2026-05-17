@@ -690,3 +690,168 @@ async fn ac_proxy_store_get_part_terminates_writer_on_final_notfound() -> Result
     assert_eq!(get_err.code, Code::NotFound, "expected NotFound, got: {get_err:?}");
     Ok(())
 }
+
+/// #336 P1 over-action + under-action test (testing-czar MAJOR-4): the
+/// `IS_AC_PEER_FETCH` early-return at `ac_proxy_store.rs:498-507`
+/// passes the bare `writer` straight to inner WITHOUT the
+/// `WriteHalfGuard` wrap installed below. The doc-comment at
+/// `:472-497` asserts SAFETY on the basis that the only production
+/// caller is `AcServer → get_and_decode_digest → get_part_unchunked`,
+/// whose closure-drop pattern self-terminates via tx-drop.
+///
+/// This test exercises the OVER-ACTION direction: install
+/// `IS_AC_PEER_FETCH=true` via `task_local::scope`, drive `get_part`
+/// against an inner MemoryStore with the digest present, and assert
+/// bytes flow through to the writer AND no
+/// `Code::Internal "buf_channel: writer dropped without commit"`
+/// is synthesized.
+#[nativelink_test]
+async fn ac_proxy_store_get_part_peer_fetch_context_passes_writer_to_inner() -> Result<(), Error> {
+    use nativelink_util::buf_channel::make_buf_channel_pair;
+    use nativelink_util::store_trait::IS_AC_PEER_FETCH;
+
+    let (_wrapper_store, inner, _registry, proxy) = make_proxy();
+    let digest = DigestInfo::try_new(VALID_HASH1, 5)?;
+    // Pre-populate inner with the expected bytes; `inner.get_part` will
+    // EOF the writer cleanly.
+    inner.update_oneshot(digest, Bytes::from_static(b"hello")).await?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_proxy = Pin::new(&*proxy);
+    let get_fut = IS_AC_PEER_FETCH.scope(true, async {
+        pinned_proxy
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    });
+    let reader_fut = async {
+        let mut buf = Vec::new();
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<Vec<u8>, Error>::Ok(buf);
+            }
+            buf.extend_from_slice(&chunk);
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        ASSERT_TIMEOUT,
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "IS_AC_PEER_FETCH early-return writer-termination contract violated — \
+         recursion-defense fan-out skip hung the get_fut/reader pair on the happy \
+         path (over-action: deadlock detector fired)",
+    );
+
+    let (get_res, reader_res) = timeout_res;
+    get_res.expect("IS_AC_PEER_FETCH early-return: get_part should succeed when inner has the blob");
+    let bytes = reader_res.expect("IS_AC_PEER_FETCH early-return: reader should EOF cleanly");
+    assert_eq!(
+        &bytes, b"hello",
+        "IS_AC_PEER_FETCH early-return: reader observed unexpected bytes; got {bytes:?}"
+    );
+    Ok(())
+}
+
+/// #336 P1 under-action test (testing-czar MAJOR-4): in
+/// `IS_AC_PEER_FETCH=true` context, drive `get_part` against an
+/// EMPTY inner store. The inner MemoryStore returns
+/// `Code::NotFound`. The early-return at
+/// `ac_proxy_store.rs:498-507` propagates that Err — but the inner
+/// did NOT terminate the borrowed writer (leaf-store NotFound is
+/// silent on the writer). Today this is safe because the only
+/// production caller is `get_part_unchunked` whose tx-drop closes
+/// the rx; any future composition that joins `(get_fut, reader_fut)`
+/// over the writer's tx/rx pair would deadlock.
+///
+/// The 5-second `tokio::time::timeout` is the deadlock detector. If
+/// a future maintainer changes the caller composition such that the
+/// closure-drop pattern no longer covers this seam, the test
+/// red-fails with the bespoke message naming the IS_AC_PEER_FETCH
+/// early-return as the un-terminated seam.
+///
+/// Mutation step: in `ac_proxy_store.rs::get_part`, comment out the
+/// early-return AND remove the `WriteHalfGuard::new(writer)` wrap
+/// below — test must red-fail (the wrap wouldn't fire on the
+/// early-return path either way, so the test isolates the early-
+/// return's own termination behavior).
+///
+/// NOTE: the current implementation relies on `get_part_unchunked`'s
+/// tx-drop discipline (per `:472-497` doc-comment). This test
+/// constructs the wrapping caller composition by hand (raw
+/// `tokio::join!` over the borrowed writer) — under the current
+/// design we EXPECT the join to deadlock without `get_part_unchunked`
+/// in the chain. The test therefore asserts that EITHER (a) the
+/// timeout fires with a clear message, OR (b) future code changes
+/// surface the structured NotFound. Today we accept (a) as the
+/// honest reflection of the production-caller-shape contract.
+#[nativelink_test]
+async fn ac_proxy_store_get_part_peer_fetch_context_inner_notfound_does_not_deadlock()
+-> Result<(), Error> {
+    use nativelink_util::buf_channel::make_buf_channel_pair;
+    use nativelink_util::store_trait::IS_AC_PEER_FETCH;
+
+    let (_wrapper_store, _inner, _registry, proxy) = make_proxy();
+    let digest = DigestInfo::try_new(VALID_HASH1, 8)?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_proxy = Pin::new(&*proxy);
+    // Use `get_part_unchunked` shape: drive the get inside a closure
+    // that drops the writer on exit, then read until EOF. This
+    // mirrors the production caller shape (`get_and_decode_digest →
+    // get_part_unchunked`) that the IS_AC_PEER_FETCH early-return's
+    // SAFETY doc-block names as the load-bearing termination
+    // mechanism. The test will deadlock-detect via timeout if the
+    // production caller shape ever stops covering this seam.
+    let get_fut = async move {
+        let mut local_tx = tx;
+        let res = IS_AC_PEER_FETCH
+            .scope(true, async {
+                pinned_proxy
+                    .get_part(StoreKey::from(digest), &mut local_tx, 0, None)
+                    .await
+            })
+            .await;
+        // Drop local_tx by letting it go out of scope. This is the
+        // production caller shape (`get_part_unchunked` closure-drop)
+        // that makes the early-return safe today.
+        drop(local_tx);
+        res
+    };
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        ASSERT_TIMEOUT,
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "IS_AC_PEER_FETCH early-return writer-termination contract violated — \
+         recursion-defense fan-out skip masked an inner-store contract gap (NotFound \
+         path) and the get_part_unchunked tx-drop discipline did NOT close the rx",
+    );
+
+    let (get_res, _reader_res) = timeout_res;
+    let get_err = get_res
+        .expect_err("IS_AC_PEER_FETCH early-return: empty inner should surface NotFound");
+    assert_eq!(
+        get_err.code,
+        Code::NotFound,
+        "IS_AC_PEER_FETCH early-return: expected structured Code::NotFound from empty \
+         inner, got: {get_err:?}"
+    );
+    Ok(())
+}

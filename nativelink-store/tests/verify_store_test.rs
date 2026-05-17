@@ -804,3 +804,97 @@ async fn verify_store_inner_check_get_part_hash_mismatch_terminates_writer() -> 
     );
     Ok(())
 }
+
+/// #336 P1 over-action test (testing-czar MAJOR-1): the inline doc-comment
+/// at `verify_store.rs:222-231` records the design DECISION to NOT use
+/// `WriteHalfGuard` around `inner_check_get_part`. Reason: when inner
+/// returns a structured Err (e.g. NotFound), the `?`-propagation path
+/// must surface that structured Err to the OUTER caller — wrapping it
+/// in a synthesized `Code::Internal "buf_channel: writer dropped
+/// without commit"` (which a WriteHalfGuard Drop fallback would do)
+/// shadows the structured upstream code on the writer side and breaks
+/// the `cdn_cache_failure_*` regression suite.
+///
+/// This test exercises the over-action direction: drive
+/// `VerifyStore::get_part(digest, ..)` against an EMPTY inner store.
+/// The inner `MemoryStore` returns `Code::NotFound`. With the current
+/// design, the joined Result surfaces `Code::NotFound`. If a future
+/// maintainer "simplifies" by re-introducing `WriteHalfGuard::new(writer)`
+/// around `inner_check_get_part`, the test red-fails because the joined
+/// Result would become `Code::Internal "buf_channel: writer dropped
+/// without commit"` (the synthesized over-action that would mask
+/// the structured NotFound).
+///
+/// Production-composition seam: VerifyStore wraps MemoryStore exactly as
+/// the AC store chain `AcProxyStore → VerifyStore → MemoryStore` does
+/// at the `cas_STORE` chain (the configuration that hit the original
+/// 2026-04-25 deadlock class).
+///
+/// Mutation step (for falsification): in `verify_store.rs`,
+/// `inner_check_get_part` signature, change
+/// `writer: &mut DropCloserWriteHalf` → wrap with
+/// `let mut writer = WriteHalfGuard::new(writer);` at function top. The
+/// test must red-fail with the bespoke over-action message below
+/// because the Drop fallback fires `Code::Internal "buf_channel: writer
+/// dropped without commit"` instead of letting the upstream NotFound
+/// flow through.
+#[nativelink_test]
+async fn verify_store_inner_check_get_part_inner_notfound_propagates_structured_err()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_util::store_trait::StoreKey;
+
+    let inner_store = MemoryStore::new(&MemorySpec::default());
+    let store = VerifyStore::new(
+        &VerifySpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            verify_size: true,
+            verify_hash: false,
+        },
+        Store::new(inner_store.clone()),
+    );
+
+    // Inner store is empty — digest will NOT be found. Inner returns
+    // `Code::NotFound`; the joined `(get_fut, check_fut)` must surface
+    // that structured NotFound code to the caller. The wrapping caller
+    // chain modeled here is `get_part_unchunked` (the canonical
+    // production caller shape), which owns the writer in a closure and
+    // drops it on closure exit. That tx-drop is the discipline that
+    // makes the documented "no WriteHalfGuard around inner_check_get_part"
+    // design safe today — see `verify_store.rs:222-231`.
+    let digest = DigestInfo::try_new(VALID_HASH1, 5).unwrap();
+
+    let timeout_res = tokio::time::timeout(Duration::from_secs(5), async {
+        Pin::new(&store)
+            .get_part_unchunked(StoreKey::from(digest), 0, None)
+            .await
+    })
+    .await
+    .expect(
+        "VerifyStore::inner_check_get_part over-action regression: inner NotFound hung \
+         the get_part_unchunked closure inside the deadlock-detector window — the \
+         production caller shape (closure-drop tx) should NOT cause a deadlock, even \
+         without WriteHalfGuard around inner_check_get_part",
+    );
+
+    let get_err = timeout_res
+        .expect_err("get_part_unchunked should return NotFound from empty inner store");
+    assert_eq!(
+        get_err.code,
+        Code::NotFound,
+        "VerifyStore::inner_check_get_part over-action regression: inner NotFound was \
+         masked by synthesized Drop-fallback Internal — expected Code::NotFound, got: \
+         {get_err:?}. This means a WriteHalfGuard wrap was added around \
+         inner_check_get_part and clobbered the structured upstream NotFound."
+    );
+    assert!(
+        !get_err
+            .to_string()
+            .contains("buf_channel: writer dropped without commit"),
+        "VerifyStore::inner_check_get_part over-action regression: synthesized Internal \
+         (\"buf_channel: writer dropped without commit\") appears in the joined Result, \
+         masking the structured upstream code. Got: {get_err:?}"
+    );
+    Ok(())
+}

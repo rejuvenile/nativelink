@@ -774,3 +774,114 @@ async fn compression_store_get_part_terminates_writer_on_corrupt_inner() -> Resu
     assert!(get_res.is_err(), "expected compression get_part Err on corrupt inner header");
     Ok(())
 }
+
+/// #336 P1 multi-shape coverage (testing-czar MAJOR-3): the
+/// `CompressionStore::get_part` implementation has SEVEN `error_if!`
+/// early-return branches (header version mismatch, block-size
+/// overflow, init-frame underflow, frame-type mismatch, mid-frame
+/// underflow, footer underflow, footer index-count / chunks-count /
+/// size mismatches). The existing
+/// `compression_store_get_part_terminates_writer_on_corrupt_inner`
+/// test covers ONE of these (probably init-frame / header decode
+/// against the all-0xAA payload). A regression that removes
+/// `WriteHalfGuard` for ONE specific decode-error path (e.g. a future
+/// maintainer factoring out the footer-validation block and
+/// forgetting to thread the guard through) would survive a single-
+/// shape test.
+///
+/// This table-driven helper exercises the writer-termination contract
+/// across THREE distinct corrupt-blob shapes that hit different
+/// header/footer/mid-frame decoder branches:
+///
+///   1. EMPTY inner blob: zero-length payload → header consume returns
+///      empty → `error_if!(chunk.len() as u64 != header_size, ...)`
+///      at `compression_store.rs:520`.
+///   2. ONE-BYTE inner blob: payload too short for header → same
+///      header-underflow `error_if!` arm, different boundary condition.
+///   3. ALL-0xAA 256-byte inner blob: payload covers the header size
+///      but the decoded `Header` has an invalid version field →
+///      either decode_from_slice Err (`:527`) or
+///      `header.version != CURRENT_STREAM_FORMAT_VERSION` `error_if!`
+///      at `:534`.
+///
+/// Each shape must surface an Err to the wrapping caller inside the
+/// 5-second deadlock detector with the SAME bespoke message. If the
+/// `WriteHalfGuard` wrap is removed for any of these shapes, the
+/// corresponding row red-fails with the shape's distinct timeout
+/// message.
+///
+/// Mutation step: in `compression_store.rs::get_part`, comment out
+/// `WriteHalfGuard::new(writer)` — every row of this test must
+/// red-fail with its bespoke shape-named message.
+#[nativelink_test]
+async fn compression_store_get_part_terminates_writer_on_multiple_corrupt_shapes()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::DropCloserWriteHalf;
+    use nativelink_util::store_trait::StoreKey;
+
+    // (shape_name, payload_bytes)
+    let shapes: Vec<(&str, Vec<u8>)> = vec![
+        ("empty-inner-blob", Vec::new()),
+        ("one-byte-inner-blob", vec![0x00u8]),
+        ("all-0xAA-256-byte-inner-blob", vec![0xAAu8; 256]),
+    ];
+
+    for (shape_name, corrupted) in shapes {
+        let inner_store = MemoryStore::new(&MemorySpec::default());
+        let store = CompressionStore::new(
+            &CompressionSpec {
+                backend: StoreSpec::Memory(MemorySpec::default()),
+                compression_algorithm: nativelink_config::stores::CompressionAlgorithm::Lz4(
+                    nativelink_config::stores::Lz4Config::default(),
+                ),
+            },
+            Store::new(inner_store.clone()),
+        )
+        .err_tip(|| "Failed to create compression store")?;
+
+        let payload_len = corrupted.len() as u64;
+        let digest = DigestInfo::new([0xCCu8; 32], payload_len);
+        inner_store.update_oneshot(digest, corrupted.into()).await?;
+
+        let (tx, mut rx) = make_buf_channel_pair();
+        let mut tx: DropCloserWriteHalf = tx;
+
+        let pinned_store = Pin::new(&store);
+        let get_fut = async {
+            pinned_store
+                .get_part(StoreKey::from(digest), &mut tx, 0, None)
+                .await
+        };
+        let reader_fut = async {
+            loop {
+                let chunk = rx.recv().await?;
+                if chunk.is_empty() {
+                    return Result::<(), Error>::Ok(());
+                }
+            }
+        };
+
+        let timeout_res = tokio::time::timeout(
+            Duration::from_secs(5),
+            async { tokio::join!(get_fut, reader_fut) },
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "CompressionStore::get_part writer-termination contract violated for \
+                 shape={shape_name} — wrapping caller deadlocked on un-EOF'd writer \
+                 (corrupt-inner decode `?`-propagation path)"
+            )
+        });
+
+        let (get_res, _reader_res) = timeout_res;
+        assert!(
+            get_res.is_err(),
+            "shape={shape_name}: expected compression get_part Err on corrupt inner \
+             header/frame, got: {get_res:?}"
+        );
+    }
+    Ok(())
+}

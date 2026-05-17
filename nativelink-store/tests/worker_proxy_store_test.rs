@@ -2986,3 +2986,153 @@ async fn worker_proxy_get_part_sequential_terminates_writer_on_final_notfound() 
     assert_eq!(get_err.code, Code::NotFound, "expected NotFound, got: {get_err:?}");
     Ok(())
 }
+
+/// #336 P1 sibling test (testing-czar MAJOR-5): the responder-mode
+/// top-of-function gate at `worker_proxy_store.rs::get_part` (lines
+/// 3711-3727) delegates DIRECTLY to `self.inner.get_part(...)` with
+/// the borrowed writer when both `race_peers=true` and
+/// `IS_WORKER_REQUEST=true`. Inner leaf stores (MemoryStore at
+/// `:567`, FilesystemStore at `:2275-2281`) do NOT terminate the
+/// writer on NotFound — they `?`-propagate the structured Err.
+/// Pre-fix, this left the wrapping caller's joined reader deadlocked
+/// on the un-EOF'd writer.
+///
+/// Drive `Pin::new(&proxy).get_part(..)` against an EMPTY MemoryStore
+/// inner, with `race_peers=true` (via `enable_race_peers()`) and
+/// `IS_WORKER_REQUEST=true` (via task-local scope). The wrapping
+/// caller composition is constructed by hand:
+/// `tokio::join!(get_fut, reader_fut)` over the writer's tx/rx pair.
+/// Without the explicit `writer.send_error` on the inner-Err branch,
+/// the reader hangs and the 5-second `tokio::time::timeout` panics.
+///
+/// Mutation step: comment out the `writer.send_error(e.clone())`
+/// inside the `is_responder` branch at `worker_proxy_store.rs` —
+/// test must red-fail with the bespoke message below.
+#[nativelink_test]
+async fn worker_proxy_get_part_responder_mode_terminates_writer_on_notfound() -> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::make_buf_channel_pair;
+
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let locality_map = new_shared_blob_locality_map();
+    let proxy_arc = WorkerProxyStore::new(inner, locality_map);
+    // Worker side: race_peers=true. This selects the top-of-function
+    // responder-mode early-return branch when IS_WORKER_REQUEST=true.
+    proxy_arc.enable_race_peers();
+
+    // Digest never written to inner; responder mode delegates to inner,
+    // which returns NotFound.
+    let digest = DigestInfo::try_new(VALID_HASH1, 8)?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_proxy = Pin::new(&*proxy_arc);
+    let get_fut = IS_WORKER_REQUEST.scope(true, async {
+        pinned_proxy
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    });
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "WorkerProxyStore::get_part_sequential responder-mode NotFound writer-termination \
+         contract violated (path 1 of 3 — worker-side responder mode): wrapping caller \
+         deadlocked on un-EOF'd writer when race_peers=true && IS_WORKER_REQUEST=true && \
+         inner returned NotFound",
+    );
+
+    let (get_res, _reader_res) = timeout_res;
+    let get_err = get_res
+        .expect_err("get_part responder-mode should return NotFound from empty inner");
+    assert_eq!(
+        get_err.code,
+        Code::NotFound,
+        "expected NotFound from responder-mode inner delegation, got: {get_err:?}"
+    );
+    Ok(())
+}
+
+/// #336 P1 sibling test (testing-czar MAJOR-5): the server-side
+/// is_worker no-peer NotFound branch at
+/// `worker_proxy_store.rs::get_part_sequential` (path 2 of 3, around
+/// line 2700 — "Blob {:?} not found in inner store or any peer
+/// (worker request)" Err construction). Reached when `race_peers=false`
+/// AND `IS_WORKER_REQUEST=true` AND inner returns NotFound AND the
+/// locality_map has no peers for the digest.
+///
+/// Mutation step: comment out the `writer.send_error(err.clone())`
+/// inside the server-side no-peer is_worker branch in
+/// `worker_proxy_store.rs::get_part_sequential` — test must red-fail
+/// with the bespoke "path 2 of 3" deadlock message.
+#[nativelink_test]
+async fn worker_proxy_get_part_is_worker_no_peer_terminates_writer_on_notfound()
+-> Result<(), Error> {
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::make_buf_channel_pair;
+
+    let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let locality_map = new_shared_blob_locality_map();
+    // race_peers=false (default). Combined with IS_WORKER_REQUEST=true,
+    // the top-of-function gate does NOT fire (gate requires
+    // race_peers=true), and get_part_sequential's `is_worker { if
+    // race_peers { ... } else { ... no-peer NotFound path ... } }` is
+    // entered.
+    let proxy_arc = WorkerProxyStore::new(inner, locality_map);
+
+    let digest = DigestInfo::try_new(VALID_HASH1, 8)?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_proxy = Pin::new(&*proxy_arc);
+    let get_fut = IS_WORKER_REQUEST.scope(true, async {
+        pinned_proxy
+            .get_part(StoreKey::from(digest), &mut tx, 0, None)
+            .await
+    });
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res = tokio::time::timeout(
+        Duration::from_secs(5),
+        async { tokio::join!(get_fut, reader_fut) },
+    )
+    .await
+    .expect(
+        "WorkerProxyStore::get_part_sequential server-side is_worker no-peer NotFound \
+         writer-termination contract violated (path 2 of 3): wrapping caller deadlocked on \
+         un-EOF'd writer when race_peers=false && IS_WORKER_REQUEST=true && locality_map \
+         empty",
+    );
+
+    let (get_res, _reader_res) = timeout_res;
+    let get_err = get_res
+        .expect_err("get_part is_worker no-peer should return NotFound");
+    assert_eq!(
+        get_err.code,
+        Code::NotFound,
+        "expected NotFound from is_worker no-peer branch, got: {get_err:?}"
+    );
+    Ok(())
+}

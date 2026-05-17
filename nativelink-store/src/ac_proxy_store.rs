@@ -471,14 +471,30 @@ impl StoreDriver for AcProxyStore {
         //
         // Writer-termination contract (#336 P1): this early-return passes
         // `writer` straight through to the inner store WITHOUT the
-        // WriteHalfGuard wrap installed below. The inner-pass-through is
-        // safe because we are forwarding to the same downstream caller
-        // shape that the inner store would face at the originating hop;
-        // its writer-termination obligation is unchanged. Installing the
-        // guard here would double-wrap when this AcProxyStore is itself
-        // a leaf in a peer-fetch caller chain and would convert a
+        // WriteHalfGuard wrap installed below. The reason this is SAFE
+        // in current production is the CALLER chain, NOT the inner
+        // store's own termination behavior. Concretely:
+        //   - The only production caller is `AcServer →
+        //     get_and_decode_digest → get_part_unchunked` (see
+        //     `store_trait.rs:1075-1099`).
+        //   - `get_part_unchunked` builds a fresh `(tx, rx)` and runs
+        //     `get_part(.., &mut tx, ..)` inside a closure that drops `tx`
+        //     on exit. The drop unblocks the joined `rx.consume`, so the
+        //     inner store's writer-termination behavior is moot at this
+        //     seam.
+        // The inner store ITSELF (FilesystemStore / ExistenceCacheStore /
+        // FastSlowStore in AC chains) does NOT terminate the writer on
+        // NotFound — verified in `filesystem_store.rs` and
+        // `memory_store.rs`. If a future composition routes a streaming
+        // AC read directly through `get_part` with a borrowed writer
+        // that outlives the call (e.g. an upstream VerifyStore on AC),
+        // this branch MUST be reworked to wrap `writer` in
+        // `WriteHalfGuard` or terminate explicitly before propagating
+        // inner's Err. Installing the guard here today would convert a
         // structured inner Err into the synthesized Drop-fallback
-        // Internal error.
+        // `Code::Internal` for the get_part_unchunked callers that
+        // already self-terminate via tx-drop, so the safe transition
+        // is conditioned on the caller-chain change above.
         if IS_AC_PEER_FETCH.try_with(|v| *v).unwrap_or(false) {
             trace!(
                 digest = ?key.borrow().into_digest(),
@@ -500,9 +516,15 @@ impl StoreDriver for AcProxyStore {
         match inner_result {
             Ok(()) => {
                 // Inner already terminated the writer with EOF on success;
-                // suppress the Drop fallback. Use commit_delegated_if_ok so
-                // a sub-store contract violation (Ok-with-no-EOF) still
-                // surfaces via the Drop fallback.
+                // suppress the Drop fallback. We just matched `Ok(())` from
+                // `inner_result`; this is equivalent to setting
+                // `committed = true` unconditionally. We do NOT defend
+                // against an Ok-with-no-EOF contract violation by inner
+                // here — verifying EOF actually fired would require an
+                // explicit `writer_guard.get_eof_sent()` check (currently
+                // unimplemented in WriteHalfGuard). Leaf-store EOF-on-Ok
+                // is covered by the per-store composability tests
+                // (`verify_store_around_*` family) instead.
                 writer_guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
                 return Ok(());
             }
@@ -537,6 +559,12 @@ impl StoreDriver for AcProxyStore {
             .await
         {
             Ok(true) => {
+                // Peer succeeded and already EOF'd the writer. Suppress
+                // the Drop fallback. Same note as the inner-Ok arm above:
+                // we just matched `Ok(true)`; this is equivalent to
+                // unconditional commit. Peer-side EOF-on-Ok is covered
+                // by the AlwaysReturnsBlobPeer fake's matching contract
+                // in `ac_proxy_store_test.rs`.
                 writer_guard.commit_delegated_if_ok(&Ok::<(), Error>(()));
                 return Ok(());
             }

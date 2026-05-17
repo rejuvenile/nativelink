@@ -2495,14 +2495,22 @@ impl WorkerProxyStore {
                              will be aborted (#284 part 2 invariant violated)"
                         );
                     }
-                    return Err(make_err!(
+                    // #336 P1 sibling fix: inner store wrote partial bytes
+                    // then errored without terminating the writer (leaf
+                    // contract: inner does NOT terminate on Err). Wrapping
+                    // callers that join on this writer's tx/rx pair would
+                    // deadlock. Terminate explicitly with the constructed
+                    // wrapping error so the paired reader observes it.
+                    let err = make_err!(
                         e.code,
                         "WorkerProxyStore: inner store wrote {bytes_written_by_inner} bytes \
                          then failed with {:?} ({}); cannot peer-fetch without corrupting \
                          consumer stream",
                         e.code,
                         e.message_string()
-                    ));
+                    );
+                    writer.send_error(err.clone());
+                    return Err(err);
                 }
                 // Promoted to info! to verify the client-cancellation hypothesis
                 // for digests that show inner-NotFound but never reach
@@ -2541,10 +2549,21 @@ impl WorkerProxyStore {
                     }
                 }
                 if redirect_endpoints.is_none() {
+                    // #336 P1 sibling fix: inner returned FailedPrecondition
+                    // without a parseable redirect. Inner leaf stores do not
+                    // terminate the writer on Err; wrapper layer is the
+                    // load-bearing guard. Idempotent if inner already did.
+                    writer.send_error(e.clone());
                     return Err(e);
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // #336 P1 sibling fix: catch-all inner Err. Inner leaf
+                // stores do not terminate the writer on Err. Terminate
+                // here so wrapping callers' rx unblocks. Idempotent.
+                writer.send_error(e.clone());
+                return Err(e);
+            }
         }
 
         let is_worker = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
@@ -2560,16 +2579,32 @@ impl WorkerProxyStore {
                     endpoints = ep_str.as_str(),
                     "WorkerProxyStore: passing redirect through to worker"
                 );
-                return Err(make_err!(
+                // #336 P1 sibling fix: redirect-passthrough is constructed
+                // by us; inner did not terminate the writer (it returned
+                // FailedPrecondition+redirect with no bytes). Terminate
+                // so wrapping callers' rx unblocks. Bazel-facing
+                // classifier still observes the structured redirect.
+                let err = make_err!(
                     Code::FailedPrecondition,
                     "{REDIRECT_PREFIX}{ep_str}|"
-                ));
+                );
+                writer.send_error(err.clone());
+                return Err(err);
             }
-            if self
+            // `try_read_from_endpoints` is a network helper that may
+            // partially-write before erroring; on `?` propagation the
+            // writer may be in any state. Defense-in-depth: surface the
+            // error to the paired reader. Idempotent if helper already did.
+            match self
                 .try_read_from_endpoints(key.borrow(), writer, offset, length, &endpoints)
-                .await?
+                .await
             {
-                return Ok(());
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => {
+                    writer.send_error(e.clone());
+                    return Err(e);
+                }
             }
         }
 
@@ -2613,9 +2648,12 @@ impl WorkerProxyStore {
                 // #336 P1: terminate the borrowed writer so any wrapping
                 // caller that joins on the writer's tx/rx pair sees the
                 // structured NotFound instead of deadlocking on the
-                // un-EOF'd writer. Inner store was not consulted in
-                // responder mode (we skipped via the gate at line 2484
-                // above), so no other party has terminated the writer.
+                // un-EOF'd writer. Inner WAS consulted at the top of
+                // `get_part_sequential` (the `self.inner.get_part(...)`
+                // await above) and returned NotFound with zero bytes
+                // written; per the wrapper-layer contract its NotFound
+                // does NOT terminate the writer (leaf stores leave that
+                // to the wrapper). WorkerProxyStore IS that wrapper.
                 // Idempotent — safe even if some earlier call did.
                 writer.send_error(err.clone());
                 return Err(err);
@@ -2644,10 +2682,17 @@ impl WorkerProxyStore {
                     endpoints = ep_str.as_str(),
                     "WorkerProxyStore: returning redirect to is_worker caller"
                 );
-                return Err(make_err!(
+                // #336 P1 sibling fix: we constructed this redirect Err;
+                // no inner/peer terminated the writer (inner returned
+                // NotFound with zero bytes per the guarded branch above,
+                // and we did not consult any peer here). Terminate
+                // explicitly so wrapping callers' rx unblocks. Idempotent.
+                let err = make_err!(
                     Code::FailedPrecondition,
                     "{REDIRECT_PREFIX}{ep_str}|"
-                ));
+                );
+                writer.send_error(err.clone());
+                return Err(err);
             }
             let err = Error::not_found_with_detail(
                 format!(
@@ -2665,10 +2710,20 @@ impl WorkerProxyStore {
         }
 
         let bytes_before_workers = writer.get_bytes_written();
-        if self
+        // `try_read_from_worker` is a network helper that may
+        // partially-write before erroring. Surface its Err to the paired
+        // reader on `?` propagation. Idempotent if helper already did.
+        let worker_outcome = match self
             .try_read_from_worker(key.borrow(), writer, offset, length)
-            .await?
+            .await
         {
+            Ok(v) => v,
+            Err(e) => {
+                writer.send_error(e.clone());
+                return Err(e);
+            }
+        };
+        if worker_outcome {
             return Ok(());
         }
 
@@ -2680,13 +2735,19 @@ impl WorkerProxyStore {
         // worker — otherwise the consumer would receive overlapping data.
         let bytes_written_by_workers = writer.get_bytes_written() - bytes_before_workers;
         if bytes_written_by_workers > 0 {
-            return Err(make_err!(
+            // #336 P1 sibling fix: worker wrote partial bytes then failed.
+            // We constructed this Internal Err; neither inner nor worker
+            // terminated the writer (workers stream and don't synthesize
+            // termination on caller-side abort). Terminate explicitly.
+            let err = make_err!(
                 Code::Internal,
                 "Blob {:?} worker transfer wrote {} bytes then failed, \
                  cannot retry inner store without data corruption",
                 key.borrow().into_digest(),
                 bytes_written_by_workers
-            ));
+            );
+            writer.send_error(err.clone());
+            return Err(err);
         }
         match self
             .inner
@@ -2703,7 +2764,13 @@ impl WorkerProxyStore {
             Err(e) if e.code == Code::NotFound => {
                 // Still not found — fall through to the final error.
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // #336 P1 sibling fix: inner retry returned non-NotFound
+                // Err. Leaf stores do not terminate the writer; wrapper is
+                // load-bearing. Terminate so wrapping callers' rx unblocks.
+                writer.send_error(e.clone());
+                return Err(e);
+            }
         }
 
         let digest = key.borrow().into_digest();
@@ -2811,8 +2878,19 @@ impl WorkerProxyStore {
         peer_endpoint: &Arc<str>,
         is_zero_blob: bool,
     ) -> Result<(), Error> {
-        let peer_chunk = peer_rx.recv().await
-            .err_tip(|| "WorkerProxyStore: peer recv after server failure/empty")?;
+        let peer_chunk = match peer_rx.recv().await {
+            Ok(c) => c,
+            Err(e) => {
+                // #336 P1 sibling fix (parallel-race path): peer racer
+                // failed on the second recv. We're returning Err via `?`-
+                // shaped propagation; the outer `get_part` joins on this
+                // writer's tx/rx pair (when wrapped). Terminate so the
+                // paired reader unblocks. Idempotent.
+                let err = e.append("WorkerProxyStore: peer recv after server failure/empty");
+                writer.send_error(err.clone());
+                return Err(err);
+            }
+        };
         if peer_chunk.is_empty() {
             if is_zero_blob {
                 writer.send_eof()
@@ -2821,7 +2899,10 @@ impl WorkerProxyStore {
                     .map_err(|e| make_err!(Code::Internal, "peer task join: {e}"))?;
             }
             // Non-zero digest, no data from either racer — surface NotFound.
-            return Err(Error::not_found_with_detail(
+            // #336 P1 sibling fix (parallel-race path): we constructed
+            // this NotFound; neither racer wrote bytes nor terminated the
+            // outer writer. Wrapping caller's rx must observe it.
+            let err = Error::not_found_with_detail(
                 format!(
                     "WorkerProxyStore: both server and peer {} returned empty EOF for non-zero digest {:?} (size_bytes={})",
                     peer_endpoint,
@@ -2829,7 +2910,9 @@ impl WorkerProxyStore {
                     digest.size_bytes(),
                 ),
                 make_precondition_failure_any(*digest),
-            ));
+            );
+            writer.send_error(err.clone());
+            return Err(err);
         }
         debug!(
             ?digest,
@@ -2852,8 +2935,17 @@ impl WorkerProxyStore {
         digest: &DigestInfo,
         is_zero_blob: bool,
     ) -> Result<(), Error> {
-        let server_chunk = server_rx.recv().await
-            .err_tip(|| "WorkerProxyStore: server recv after peer failure/empty")?;
+        let server_chunk = match server_rx.recv().await {
+            Ok(c) => c,
+            Err(e) => {
+                // #336 P1 sibling fix (parallel-race path): server racer
+                // failed on the second recv. Terminate the outer writer
+                // so wrapping callers' rx unblocks. Idempotent.
+                let err = e.append("WorkerProxyStore: server recv after peer failure/empty");
+                writer.send_error(err.clone());
+                return Err(err);
+            }
+        };
         if server_chunk.is_empty() {
             if is_zero_blob {
                 writer.send_eof()
@@ -2861,14 +2953,19 @@ impl WorkerProxyStore {
                 return server_handle.await
                     .map_err(|e| make_err!(Code::Internal, "server task join: {e}"))?;
             }
-            return Err(Error::not_found_with_detail(
+            // #336 P1 sibling fix (parallel-race path): we constructed
+            // this NotFound; neither racer wrote bytes nor terminated the
+            // outer writer. Wrapping caller's rx must observe it.
+            let err = Error::not_found_with_detail(
                 format!(
                     "WorkerProxyStore: both peer and server returned empty EOF for non-zero digest {:?} (size_bytes={})",
                     digest,
                     digest.size_bytes(),
                 ),
                 make_precondition_failure_any(*digest),
-            ));
+            );
+            writer.send_error(err.clone());
+            return Err(err);
         }
         debug!(
             ?digest,
@@ -3614,18 +3711,25 @@ impl StoreDriver for WorkerProxyStore {
         if self.race_peers.load(Ordering::Relaxed) {
             let is_responder = IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false);
             if is_responder {
-                // SAFETY (writer-termination contract): direct delegation to
-                // `self.inner.get_part(...)` is safe because `Store::get_part`
-                // is contractually required to terminate the writer
-                // (`send_eof` on Ok, `send_error` on Err) on every exit path.
-                // Every leaf store in the codebase satisfies this (see
-                // composability_test.rs `verify_store_around_*` family),
-                // including the per-site fixes in this audit
-                // (size_partitioning, ref, noop). Adding a `WriteHalfGuard`
-                // here would be defensive against a sub-store violating its
-                // own contract, but that violation would surface in the
-                // composability test for that sub-store directly.
-                return self.inner.get_part(key, writer, offset, length).await;
+                // Writer-termination contract (#336 P1 fix): pre-fix this
+                // delegated directly to `self.inner.get_part(...)` with the
+                // borrowed writer. Inner leaf stores (e.g. MemoryStore,
+                // FilesystemStore — verified at `memory_store.rs:567`,
+                // `filesystem_store.rs:2275-2281`) do NOT terminate the
+                // writer on NotFound — they `?`-propagate the structured
+                // Err without `send_error`. Wrapping callers that join on
+                // this writer's tx/rx pair would deadlock. WorkerProxyStore
+                // is the load-bearing wrapper at this seam — terminate
+                // explicitly on Err so the paired reader unblocks.
+                // Idempotent — safe even if some sub-store terminates too.
+                let res = self
+                    .inner
+                    .get_part(key, &mut *writer, offset, length)
+                    .await;
+                if let Err(ref e) = res {
+                    writer.send_error(e.clone());
+                }
+                return res;
             }
         }
 

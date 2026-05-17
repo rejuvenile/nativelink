@@ -536,3 +536,156 @@ async fn dedup_store_get_part_terminates_writer_on_index_miss() -> Result<(), Er
     assert!(get_res.is_err(), "expected dedup get_part Err on index-store NotFound");
     Ok(())
 }
+
+/// #336 P1 sibling test (testing-czar MAJOR-2): the writer-termination
+/// contract on `DedupStore::get_part` also fires on the
+/// content-store-miss path — `?`-propagated content-store NotFound
+/// inside the buffered stream's `.next().await` arm. Pre-fix, this
+/// `?` left the outer writer un-terminated; the wrapping caller's
+/// `tokio::join!` over the writer's tx/rx pair deadlocked.
+///
+/// Drive `Pin::new(&store).get_part(...)` against a populated
+/// index_store whose entries point at digests that do NOT exist in
+/// content_store. Read from the matching rx in `tokio::join!`.
+/// Without `WriteHalfGuard`, the reader hangs and the 5-second
+/// `tokio::time::timeout` fires the bespoke message below.
+///
+/// Mutation step: comment out `WriteHalfGuard::new(writer)` in
+/// `dedup_store.rs::get_part` — test must red-fail with the bespoke
+/// "content-store NotFound" deadlock message.
+#[nativelink_test]
+async fn dedup_store_get_part_terminates_writer_on_content_miss() -> Result<(), Error> {
+    use core::pin::Pin;
+    use core::time::Duration;
+
+    use bincode::serde::encode_to_vec;
+    use nativelink_store::dedup_store::DedupIndex;
+    use nativelink_util::buf_channel::{DropCloserWriteHalf, make_buf_channel_pair};
+    use nativelink_util::store_trait::StoreKey;
+
+    let index_store_inner = MemoryStore::new(&MemorySpec::default());
+    let content_store_inner = MemoryStore::new(&MemorySpec::default());
+    let store = DedupStore::new(
+        &make_default_config(),
+        Store::new(index_store_inner.clone()),
+        Store::new(content_store_inner.clone()),
+    )?;
+
+    // Pre-populate index_store with a valid `DedupIndex` pointing at a
+    // content digest that does NOT exist in content_store. `get_part`
+    // reaches the buffered-stream loop and the `?` on
+    // `content_store.get_part_unchunked(...)` propagates NotFound.
+    let outer_digest = DigestInfo::try_new(VALID_HASH1, 100).unwrap();
+    let missing_content_digest = DigestInfo::try_new(VALID_HASH2, 50).unwrap();
+    let index = DedupIndex {
+        entries: vec![missing_content_digest],
+    };
+    let bincode_cfg = bincode::config::legacy();
+    let serialized = encode_to_vec(&index, bincode_cfg)
+        .map_err(|e| nativelink_error::make_err!(Code::Internal, "encode failed: {e}"))?;
+    index_store_inner
+        .update_oneshot(outer_digest, serialized.into())
+        .await?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_store = Pin::new(&*store);
+    let get_fut = async {
+        pinned_store
+            .get_part(StoreKey::from(outer_digest), &mut tx, 0, None)
+            .await
+    };
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(get_fut, reader_fut) })
+            .await
+            .expect(
+                "DedupStore::get_part writer-termination contract violated — wrapping caller \
+                 deadlocked on un-EOF'd writer (content-store NotFound `?`-propagation path)",
+            );
+
+    let (get_res, _reader_res) = timeout_res;
+    assert!(
+        get_res.is_err(),
+        "expected dedup get_part Err on content-store NotFound, got: {get_res:?}"
+    );
+    Ok(())
+}
+
+/// #336 P1 sibling test (testing-czar MAJOR-2): writer-termination
+/// contract on `DedupStore::get_part` also fires on the index
+/// deserialization error path — pre-populated index_store with
+/// non-protobuf bytes, the `decode_from_slice::<DedupIndex, _>(..)?`
+/// returns Err. Pre-fix, the `?` left the outer writer un-terminated;
+/// wrapping caller deadlocked.
+///
+/// Mutation step: comment out `WriteHalfGuard::new(writer)` in
+/// `dedup_store.rs::get_part` — test must red-fail with bespoke
+/// "index deserialize" deadlock message.
+#[nativelink_test]
+async fn dedup_store_get_part_terminates_writer_on_index_deserialize_err() -> Result<(), Error> {
+    use core::pin::Pin;
+    use core::time::Duration;
+
+    use nativelink_util::buf_channel::{DropCloserWriteHalf, make_buf_channel_pair};
+    use nativelink_util::store_trait::StoreKey;
+
+    let index_store_inner = MemoryStore::new(&MemorySpec::default());
+    let content_store_inner = MemoryStore::new(&MemorySpec::default());
+    let store = DedupStore::new(
+        &make_default_config(),
+        Store::new(index_store_inner.clone()),
+        Store::new(content_store_inner.clone()),
+    )?;
+
+    // Pre-populate index_store with arbitrary bytes that are NOT a
+    // valid `DedupIndex`. The decode_from_slice in `get_part` returns
+    // a "Failed to deserialize index" Internal Err via `?`.
+    let outer_digest = DigestInfo::try_new(VALID_HASH1, 100).unwrap();
+    let garbage = vec![0xFFu8; 64];
+    index_store_inner
+        .update_oneshot(outer_digest, garbage.into())
+        .await?;
+
+    let (tx, mut rx) = make_buf_channel_pair();
+    let mut tx: DropCloserWriteHalf = tx;
+
+    let pinned_store = Pin::new(&*store);
+    let get_fut = async {
+        pinned_store
+            .get_part(StoreKey::from(outer_digest), &mut tx, 0, None)
+            .await
+    };
+    let reader_fut = async {
+        loop {
+            let chunk = rx.recv().await?;
+            if chunk.is_empty() {
+                return Result::<(), Error>::Ok(());
+            }
+        }
+    };
+
+    let timeout_res =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(get_fut, reader_fut) })
+            .await
+            .expect(
+                "DedupStore::get_part writer-termination contract violated — wrapping caller \
+                 deadlocked on un-EOF'd writer (index deserialize `?`-propagation path)",
+            );
+
+    let (get_res, _reader_res) = timeout_res;
+    assert!(
+        get_res.is_err(),
+        "expected dedup get_part Err on index deserialize, got: {get_res:?}"
+    );
+    Ok(())
+}
