@@ -125,13 +125,22 @@ const SLOW_WRITE_WATCHDOG_SECS: u64 = 60;
 /// log severity so operators can grep `WARN` for genuine BLOCK-B
 /// anomalies without losing the entry/exit pairing for healthy waits.
 ///
-/// 1 s pick: healthy chunked commits for small-to-medium blobs land
-/// well under a second per the chunked-commit budget. A wait that
-/// reaches a full second means commit-side is contending — slow-tier
-/// hiccup, multi-MiB rename, or commit-watchdog approaching — and
-/// deserves operator attention before the 30 s soft-warn
-/// (`CHUNKED_COMMIT_SOFT_WARN_SECS`) covers the deeper anomaly.
-const BLOCK_B_SLOW_WAIT_THRESHOLD: Duration = Duration::from_secs(1);
+/// 30 s pick (perf-optimizer MAJOR fix-up 2026-05-16, was 1 s): the
+/// in-tree documented multi-MiB chunked-commit p99 is ~30 s (see
+/// `chunked_write_handler::CHUNKED_COMMIT_SOFT_WARN_SECS` doc-comment),
+/// and CHUNK_SIZE is 1 MiB so most chunked blobs ARE in the multi-MiB
+/// band. A 1 s threshold fires `warn!` on every healthy multi-MiB
+/// commit, drowning out the actual anomalies (writer wedge, commit
+/// watchdog approaching) the warn was supposed to surface. Aligning
+/// with `CHUNKED_COMMIT_SOFT_WARN_SECS = 30 s` means BLOCK-B reader
+/// warns fire at the same wall-clock as the writer-side soft-warn —
+/// the two layers together pinpoint commit-side stalls without
+/// muting each other. The deeper 60 s commit-watchdog
+/// (`CHUNKED_COMMIT_WATCHDOG_SECS`) still bounds the wait itself.
+/// Follow-up: lift this constant into `nativelink-util` so the
+/// reader-side threshold and writer-side soft-warn share one source
+/// of truth (currently a cross-crate value duplication).
+const BLOCK_B_SLOW_WAIT_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// #334 Fix B: client-suggested backoff hint when the
 /// `slow_writes_in_flight_max_bytes` cap rejects an admission. Slow-tier
@@ -6230,19 +6239,19 @@ impl StoreDriver for FastSlowStore {
                 if still_in_flight {
                     notified.await;
                     let waited = wait_started.elapsed();
-                    // 1s slow-wait threshold: healthy chunked commits
-                    // for small-to-medium blobs land in tens of ms (per
-                    // chunked_write_handler.rs commit-path budget); >1s
-                    // means commit is contending (slow tier hiccup,
-                    // commit-watchdog approaching, or a multi-MiB blob
-                    // mid-rename) and operators should be able to see
-                    // it without `debug!`. Below threshold stays
-                    // `info!` — entry/exit pairing is the load-bearing
-                    // observability for "is BLOCK-B firing?" The 1 s
-                    // pick (vs `CHUNKED_COMMIT_SOFT_WARN_SECS / 2 = 15
-                    // s`) trades broader warn-coverage for earlier
-                    // operator signal; the soft-warn at 30 s already
-                    // covers the deeper anomaly.
+                    // 30 s slow-wait threshold (perf-optimizer
+                    // MAJOR fix-up 2026-05-16, was 1 s): in-tree
+                    // documented multi-MiB chunked-commit p99 ~30 s
+                    // (see CHUNKED_COMMIT_SOFT_WARN_SECS doc-comment
+                    // in chunked_write_handler.rs). A 1 s threshold
+                    // fired `warn!` on every healthy multi-MiB commit,
+                    // muting the signal. Aligned with the writer-side
+                    // soft-warn so a journal grep on WARN at 30+ s
+                    // surfaces both the reader-cascade and the
+                    // commit-side at the same wall-clock. Below
+                    // threshold stays `info!` — entry/exit pairing is
+                    // the load-bearing observability for "is BLOCK-B
+                    // firing?".
                     if waited >= BLOCK_B_SLOW_WAIT_THRESHOLD {
                         warn!(
                             ?digest,
