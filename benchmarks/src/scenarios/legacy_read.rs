@@ -254,9 +254,10 @@ async fn run_warm_cell(
 
     let mut extras = BTreeMap::new();
     extras.insert("warm".to_string(), serde_json::json!(true));
-    // SizePartitioningStore is strict `<`: at threshold the blob routes
-    // to UPPER (cas_FAST_SLOW), not to SMALL_CAS_CACHED.
-    if (cell.size as u64) < prod_defaults::SIZE_PARTITIONING_THRESHOLD {
+    // Canonical `<` predicate lives in `composition::prod_defaults`; the
+    // boundary semantics are pinned by
+    // `composition::tests::deviation_helper_boundary_pins_strict_lt`.
+    if prod_defaults::should_emit_small_cas_deviation(cell.size as u64) {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),
@@ -449,9 +450,10 @@ async fn run_cold_cell(
             serde_json::json!(fadvise_count),
         );
     }
-    // SizePartitioningStore is strict `<`: at threshold the blob routes
-    // to UPPER (cas_FAST_SLOW), not to SMALL_CAS_CACHED.
-    if (cell.size as u64) < prod_defaults::SIZE_PARTITIONING_THRESHOLD {
+    // Canonical `<` predicate lives in `composition::prod_defaults`; the
+    // boundary semantics are pinned by
+    // `composition::tests::deviation_helper_boundary_pins_strict_lt`.
+    if prod_defaults::should_emit_small_cas_deviation(cell.size as u64) {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),

@@ -149,10 +149,24 @@ bench-data-plane *ARGS:
 	# The bench's release-gate pre-test runs cargo test for this purpose;
 	# without it a missing prod config silently passes the pin test.
 	echo "[just] verifying prod_defaults_match_buildcache_json5 against live config"
+	# Tee output so the zero-test-run sanity grep below cannot be defeated
+	# by a future filter typo. The previous version of this recipe passed
+	# `--exact tests::prod_defaults_match_buildcache_json5` (wrong module
+	# path) which silently matched zero tests; cargo test exits 0 with
+	# "0 passed", certifying a release-gate that never verified anything.
+	# Defense in depth: (1) use the real module path, (2) require the
+	# tee'd output to contain `test result: ok. 1 passed`.
+	TEST_OUT="$(mktemp -t just-bench-prod-pin.XXXXXX.log)"
+	trap 'rm -f "${TEST_OUT}"' EXIT
 	BENCH_REQUIRE_PROD_CONFIG=1 timeout 300 cargo test --release -p nativelink-benchmarks \
 	    --features chunked_fast_slow \
-	    -- --exact tests::prod_defaults_match_buildcache_json5 \
-	    composition::tests::prod_defaults_match_buildcache_json5
+	    -- --exact composition::tests::prod_defaults_match_buildcache_json5 \
+	    2>&1 | tee "${TEST_OUT}"
+	if ! grep -qE '^test result: ok\. [1-9][0-9]* passed' "${TEST_OUT}"; then
+	    echo "[just] FAIL: bench prod-config pin matched 0 tests; release gate cannot certify"
+	    echo "[just]       (tee log: ${TEST_OUT}) — fix the filter or restore the test"
+	    exit 1
+	fi
 	# flock blocks (no -n) so concurrent invocations queue rather than fail;
 	# timeout caps wall-clock at 30 min so a wedge surfaces instead of
 	# silently consuming the operator's terminal.

@@ -184,6 +184,22 @@ baselines:
   matches outright). The R1 cell records its `cold_mechanism` and
   `slow_tier_backing` in extras so reviewers can tell which baseline
   measured what.
+- **True page-cache-cold disk reads.** R1's cold cell uses
+  `posix_fadvise(DONTNEED)` to evict pages between the prepopulate
+  phase and the measured read. `POSIX_FADV_DONTNEED` is documented as
+  best-effort: the Linux kernel will NOT evict dirty pages, only
+  clean ones. The bench does not call `fsync` / `sync_file_range`
+  (forbidden codebase-wide per the `mirror_blobs ≥2-replica +
+  BlobsInStableStorage ack` durability invariant), so freshly-written
+  prepopulate pages that haven't yet hit the kernel's dirty-page
+  writeback (default 30 s) may still be page-cache resident when the
+  read window begins. `extras.fadvise_files_evicted` counts file
+  descriptors on which `fadvise` returned success — NOT pages
+  actually evicted; treat it as an upper bound. Operators wanting a
+  true cold-disk anchor should either (a) wait > 30 s between
+  prepopulate and measure (not currently parameterized), or (b) drop
+  the OS page cache out-of-band (`echo 3 > /proc/sys/vm/drop_caches`)
+  before invoking the bench.
 - **Cross-host comparability** is not promised: bench numbers depend
   on the tempdir backing's filesystem class, the host's RAM, and the
   presence of co-resident load. The `metadata.host` and

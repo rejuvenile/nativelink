@@ -135,11 +135,10 @@ async fn run_one_cell(
         "size_partitioning_threshold".to_string(),
         serde_json::json!(prod_defaults::SIZE_PARTITIONING_THRESHOLD),
     );
-    // SizePartitioningStore uses strict `<`, so blobs with
-    // size == SIZE_PARTITIONING_THRESHOLD route to UPPER (cas_FAST_SLOW).
-    // The composition_deviation tag flags ONLY cells that actually hit
-    // the SMALL_CAS_CACHED Memory-only substitute path.
-    if (size as u64) < prod_defaults::SIZE_PARTITIONING_THRESHOLD {
+    // Canonical `<` predicate lives in `composition::prod_defaults`; the
+    // boundary semantics are pinned by
+    // `composition::tests::deviation_helper_boundary_pins_strict_lt`.
+    if prod_defaults::should_emit_small_cas_deviation(size as u64) {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),

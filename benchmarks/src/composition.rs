@@ -142,6 +142,32 @@ pub mod prod_defaults {
     /// `cas_FAST_SLOW_STORE.slow.filesystem.content_is_immutable` —
     /// `prod-server.json5:164` `true`.
     pub const FILESYSTEM_CONTENT_IS_IMMUTABLE: bool = true;
+
+    /// Canonical predicate for whether a bench cell of `blob_size_bytes`
+    /// hits the SMALL_CAS_CACHED (Memory-substitute-for-Redis) path
+    /// rather than the prod-shape `cas_FAST_SLOW_STORE` UPPER path.
+    ///
+    /// This is the single source of truth for the
+    /// `extras.composition_deviation = "small_cas_redis_replaced_with_memory"`
+    /// tag that gets emitted at three call-sites
+    /// (`scenarios/legacy_write.rs::run_one_cell`,
+    /// `scenarios/legacy_read.rs::run_warm_cell`,
+    /// `scenarios/legacy_read.rs::run_cold_cell`).
+    ///
+    /// **Invariant:** the predicate uses strict `<` because
+    /// `SizePartitioningStore::has_with_results` / `update` / `get_part`
+    /// route via strict `<` at every site in
+    /// `nativelink-store/src/size_partitioning_store.rs:99,148,180,208,262,355`.
+    /// A blob of exactly `SIZE_PARTITIONING_THRESHOLD` bytes routes to
+    /// UPPER (`cas_FAST_SLOW_STORE`, prod-shape), NOT to SMALL_CAS_CACHED.
+    /// Mutating `<` to `<=` here would silently misclassify boundary
+    /// blobs as deviation cells; the `boundary_lowered` test in this
+    /// module's `tests` submodule pins the semantics.
+    #[inline]
+    #[must_use]
+    pub const fn should_emit_small_cas_deviation(blob_size_bytes: u64) -> bool {
+        blob_size_bytes < SIZE_PARTITIONING_THRESHOLD
+    }
 }
 
 /// Bench-side filesystem cap (intentional deviation: we use 64 GiB so
@@ -586,38 +612,68 @@ mod tests {
     /// (which marks the Memory-substitute SMALL_CAS_CACHED path) is
     /// only correct for blobs STRICTLY LESS THAN the threshold.
     ///
-    /// **Mutation falsifier:** revert `<` to `<=` in
-    /// `scenarios/legacy_write.rs::run_one_cell` (or
-    /// `scenarios/legacy_read.rs`) — at size == 16384 the cell would
-    /// emit the wrong tag and reviewers reading the JSON would discount
-    /// the cell as not-prod-shape when in fact it's hitting the prod
-    /// FastSlow path.
+    /// This test invokes the canonical production predicate
+    /// `prod_defaults::should_emit_small_cas_deviation` at the boundary
+    /// and its immediate neighbours. The three bench scenarios that
+    /// emit the deviation tag (`scenarios/legacy_write.rs::run_one_cell`,
+    /// `scenarios/legacy_read.rs::run_warm_cell`,
+    /// `scenarios/legacy_read.rs::run_cold_cell`) ALL route their
+    /// guard through this helper, so mutating the helper's `<` to
+    /// `<=` red-fails this test AND propagates the regression to all
+    /// three scenarios in one place.
+    ///
+    /// **Mutation falsifier:** change `<` to `<=` in
+    /// `should_emit_small_cas_deviation`. The `boundary_lowered`
+    /// assertion below red-fails with a bespoke message naming the
+    /// mutation class.
     #[test]
-    fn composition_deviation_tag_matches_sizepartitioning_semantics() {
+    fn deviation_helper_boundary_pins_strict_lt() {
         let threshold = prod_defaults::SIZE_PARTITIONING_THRESHOLD;
-        // At exactly the threshold: routes to UPPER, NOT a deviation.
-        let at_threshold = threshold;
-        let below_by_one = threshold - 1;
-        let above_by_one = threshold + 1;
+        // Sanity-check the constant — if THIS drifts, the boundary
+        // values below become wrong.
+        assert_eq!(
+            threshold, 16_384,
+            "SIZE_PARTITIONING_THRESHOLD drifted away from the documented \
+             prod value (16 KiB); rebase the boundary fixtures in this test"
+        );
 
-        // SizePartitioning semantics (strict `<`):
-        // - at_threshold: NOT in lower (would be `<` false) → UPPER
-        // - below_by_one: in lower → emit deviation tag
-        // - above_by_one: NOT in lower → UPPER
+        // At exactly the threshold: strict `<` returns false → no
+        // deviation tag. A `<=` mutation would return true here.
         assert!(
-            !(at_threshold < threshold),
+            !prod_defaults::should_emit_small_cas_deviation(threshold),
             "boundary_lowered mutation: at size == SIZE_PARTITIONING_THRESHOLD \
-             ({threshold}), strict `<` returns false; this size routes to \
-             cas_FAST_SLOW_STORE (full-prod-shape), NOT the Memory-substitute \
-             SMALL_CAS_CACHED path. The composition_deviation tag MUST NOT fire."
+             ({threshold}), should_emit_small_cas_deviation MUST return false. \
+             A `<=` mutation in the helper would return true and mis-tag a \
+             cas_FAST_SLOW_STORE (full-prod-shape) cell as a SMALL_CAS_CACHED \
+             deviation, causing reviewers to discount a real prod-path baseline."
         );
+
+        // One byte below the threshold: deviation cell.
         assert!(
-            below_by_one < threshold,
-            "boundary mismatch: size below threshold-by-one must trigger deviation tag"
+            prod_defaults::should_emit_small_cas_deviation(threshold - 1),
+            "boundary mismatch: size below threshold-by-one ({}) must trigger \
+             the deviation tag (SMALL_CAS_CACHED Memory-substitute path)",
+            threshold - 1,
         );
+
+        // One byte above: prod-shape.
         assert!(
-            !(above_by_one < threshold),
-            "boundary mismatch: size above threshold-by-one must NOT trigger deviation tag"
+            !prod_defaults::should_emit_small_cas_deviation(threshold + 1),
+            "boundary mismatch: size above threshold-by-one ({}) must NOT \
+             trigger the deviation tag (routes to cas_FAST_SLOW_STORE)",
+            threshold + 1,
+        );
+
+        // Far below (1 byte): deviation cell.
+        assert!(
+            prod_defaults::should_emit_small_cas_deviation(1),
+            "1-byte blob must route to SMALL_CAS_CACHED (deviation tag set)"
+        );
+
+        // Zero-byte blob: still strictly less than threshold → deviation.
+        assert!(
+            prod_defaults::should_emit_small_cas_deviation(0),
+            "0-byte blob must route to SMALL_CAS_CACHED (deviation tag set)"
         );
     }
 }
