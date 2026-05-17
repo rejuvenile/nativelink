@@ -23,37 +23,56 @@
 //! error.
 //!
 //! **Mechanism that violates it (pre-fix):** `forward_res?; write_res`
-//! at `fast_slow_store.rs:4322-4327` (`stream_file_to_store`) and
-//! `:4220-4252` (`stream_path_to_store`) short-circuits on
+//! in `stream_path_to_store` / `stream_file_to_store` short-circuited on
 //! `forward_res?`, discarding `write_res`.
 //!
 //! **Mechanism that re-establishes it (post-fix):** `match (write_res,
 //! forward_res)` that prefers `write_res` on dual-err with appended
 //! diagnostic naming the symptom-vs-cause inversion.
 //!
-//! **Seams crossed by this test:**
-//!   1. Producer: `spawn_blocking` reader → bridge mpsc
-//!   2. Consumer wrapper: `forward_fut` → buf_channel `tx`
-//!   3. Consumer (slow store): `update(rx)` — drops `rx` mid-stream
-//!   4. The `join!` aggregator at `:4246` / `:4322`
-//!   5. Final `match` that selects which error to surface
-//!   6. `FastSlowStore::update_with_whole_file` wrapper that calls into
-//!      `stream_file_to_store` (the seam through which the test reaches
-//!      the private helper, since both `stream_*_to_store` are
-//!      private `async fn`)
-//!   7. `Store::update_with_whole_file` `err_tip` wrapping at `:5450`
+//! **Producer-IO masking fix (#476 fixup, Option A):** the
+//! `forward_fut` closure in both helpers routes any producer-side error
+//! through `tx.send_error(err.clone())` BEFORE returning the Err. This
+//! ensures the consumer's `recv()` reads the REAL typed Error verbatim
+//! (file IO err, bridge err, etc.) instead of the synthesized
+//! `"Sender dropped before sending EOF"` Internal that the buf_channel
+//! emits when `tx` is merely dropped. Without this routing, the
+//! post-fix dual-err policy still prefers `write_res`, which would
+//! carry the synthesized buf-channel symptom — masking the producer's
+//! true root cause.
 //!
-//! The test wraps the unit in production composition (real
+//! **Seams crossed by these tests:**
+//!   1. Producer: `spawn_blocking` reader → bridge mpsc
+//!   2. Consumer wrapper: `forward_fut` → buf_channel `tx` (now
+//!      includes the Option A `tx.send_error` routing on Err)
+//!   3. Consumer (slow store): `update(rx)` — may drop `rx`
+//!      mid-stream, OR may propagate the producer's `terminal_error`
+//!   4. The `join!` aggregator inside `stream_file_to_store`
+//!   5. Final `match` that selects which error to surface
+//!   6. `FastSlowStore::update_with_whole_file` wrapper that calls
+//!      into `stream_file_to_store` (the seam through which the test
+//!      reaches the private helper, since both `stream_*_to_store`
+//!      are private `async fn`)
+//!   7. `Store::update_with_whole_file` `err_tip` wrapping
+//!
+//! Both tests wrap the unit in production composition (real
 //! `MemoryStore` fast tier reporting `FileUpdates`, real
-//! `FastSlowStore`, fake slow tier that aborts mid-stream with a
-//! uniquely-tagged Err) and asserts via SPECIFIC message — not
-//! `is_err()`. `tokio::time::timeout` wraps the call as a deadlock
+//! `FastSlowStore`) and assert via SPECIFIC messages — not
+//! `is_err()`. `tokio::time::timeout` wraps each call as a deadlock
 //! detector.
 //!
-//! Mutation step (run by hand to verify):
-//!   1. Revert the dual-err arm to `forward_res?; write_res`.
-//!   2. Re-run this test. It MUST red-fail with the bespoke
-//!      "consumer-error-prefer policy not enforced" message.
+//! Mutation steps (run by hand to verify):
+//!   1. For `surfaces_consumer_error_over_symptom_dual_err`: revert
+//!      the dual-err arm to `forward_res?; write_res`. Re-run — must
+//!      red-fail with the bespoke "consumer-error-prefer policy not
+//!      enforced" message.
+//!   2. For `surfaces_producer_io_error_not_buf_channel_symptom`:
+//!      comment out the
+//!      `if let Err(ref e) = result { tx.send_error(e.clone()); }`
+//!      block in `stream_file_to_store::forward_fut`. Re-run — must
+//!      red-fail with the bespoke "Option A producer-IO masking fix
+//!      not enforced" message naming the synthesized
+//!      "Sender dropped before sending EOF" leak.
 
 use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -77,20 +96,34 @@ use nativelink_util::store_trait::{
     StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
 };
 
-/// Unique tag asserted-on in test output. If this string fails to appear
-/// in the surfaced `Err`, the consumer-error-prefer policy is broken and
-/// the producer's "receiver disconnected" symptom was promoted in its
+/// Unique tag asserted-on in test output for the consumer-error-prefer
+/// (dual-err) test. If this string fails to appear in the surfaced
+/// `Err`, the consumer-error-prefer policy is broken and the
+/// producer's "receiver disconnected" symptom was promoted in its
 /// place.
 const ABORT_TAG: &str = "TEST_SLOW_STORE_ABORTED_FOR_DIAGNOSTIC_TEST";
 
 const VALID_HASH: &str =
     "0123456789abcdef000000000000000000010000000000000123456789abcdef";
-const PAYLOAD_LEN: usize = 1024 * 1024; // 1 MiB — multi-chunk vs 256 KiB CHUNK_SIZE.
+
+/// Number of 256 KiB chunks fed to the inner `buf_channel` of
+/// `stream_file_to_store`. The inner buf_channel has capacity 128
+/// (`fast_slow_store.rs:4284`) AND a 4-slot bridge mpsc
+/// (`:4288`); the producer's chunk loop fills both before blocking
+/// on `tx.send`. Sending 256 chunks (= 64 MiB) guarantees the
+/// producer is mid-send when the consumer drops `rx`, deterministically
+/// producing the dual-err arm `(Err(Aborted), Err(channel-closed))`
+/// that distinguishes pre-fix from post-fix behavior. The technique
+/// is adopted from the #512 sibling test
+/// (`fast_slow_store_512_consumer_error_prefer_test.rs`).
+const CHUNK_BYTES: usize = 256 * 1024;
+const CHUNK_COUNT: usize = 256;
+const TOTAL_BYTES: usize = CHUNK_BYTES * CHUNK_COUNT;
 
 /// Fast-tier wrapper around `MemoryStore` that reports
 /// `StoreOptimizations::FileUpdates`. This is the precondition for
 /// `FastSlowStore::update_with_whole_file` to take the parallel
-/// `stream_file_to_store` path (see `fast_slow_store.rs:5409-5450`).
+/// `stream_file_to_store` path (see `fast_slow_store.rs:5470-5511`).
 /// Without it, the function falls through to the no-FileUpdates
 /// branches and the streaming helper under test is never invoked.
 #[derive(MetricsComponent)]
@@ -191,10 +224,12 @@ default_health_status_indicator!(FileUpdateStore);
 
 /// Slow-tier fake that, on `update()`, drains exactly one chunk from
 /// the reader and then returns a uniquely-tagged Err — dropping `rx`.
-/// The producer's next `tx.send(chunk)` then surfaces a buf_channel
-/// "receiver disconnected" symptom. Both halves of the `join!` error;
-/// the post-fix code MUST surface this `update()` error rather than
-/// the producer's symptom.
+/// With a 256-chunk feeder (CHUNK_COUNT × CHUNK_BYTES = 64 MiB) and
+/// the inner buf_channel at capacity 128 + bridge mpsc 4, the producer
+/// is guaranteed to be blocked mid-send when this drop happens. The
+/// producer's next `tx.send(chunk)` then errors with channel-closed,
+/// producing the dual-err `(Err(Aborted), Err(channel-closed))` arm
+/// that distinguishes pre-fix from post-fix.
 #[derive(MetricsComponent)]
 struct AbortAfterOneChunkStore {
     update_invocations: AtomicUsize,
@@ -225,13 +260,15 @@ impl StoreDriver for AbortAfterOneChunkStore {
         _size_info: UploadSizeInfo,
     ) -> Result<(), Error> {
         self.update_invocations.fetch_add(1, Ordering::SeqCst);
-        // Consume one chunk so the producer is fully engaged before we
-        // drop. Without this, the test could race-win the send path and
-        // dual-err would not be reliably reproduced.
+        // Consume one chunk so the producer is fully engaged before
+        // we drop. With a 256-chunk feeder vs a 128-slot buf_channel,
+        // the producer is guaranteed to be blocked on tx.send when
+        // the consumer drops `rx`, deterministically producing the
+        // dual-err arm.
         let _chunk = reader.recv().await;
         // Returning Err drops `reader` (and thus `rx` from the
-        // buf_channel pair) before EOF. The producer side then errors
-        // with "receiver disconnected" on its next send.
+        // buf_channel pair) before EOF. The producer side's pending
+        // `tx.send` then wakes with channel-closed.
         Err(make_err!(Code::Aborted, "{ABORT_TAG}"))
     }
 
@@ -282,23 +319,121 @@ impl StoreDriver for AbortAfterOneChunkStore {
 
 default_health_status_indicator!(AbortAfterOneChunkStore);
 
-/// Production composition: `FastSlowStore` with `FileUpdates`-reporting
-/// fast tier (so `update_with_whole_file` takes the parallel
-/// `stream_file_to_store` path) and `AbortAfterOneChunkStore` as the
-/// slow tier (so the consumer half errors with `ABORT_TAG`, dropping
-/// `rx` and triggering the producer's "receiver disconnected" symptom).
-/// Asserts the surfaced Err carries `ABORT_TAG`, NOT the buf_channel
-/// symptom. `tokio::time::timeout` wraps the call as a deadlock
-/// detector — a hung future would mask the bug.
-#[nativelink_test]
-async fn stream_file_to_store_surfaces_consumer_error_over_symptom() -> Result<(), Error> {
+/// Slow-tier fake that propagates the FIRST recv error verbatim. Used
+/// by the producer-IO test to verify the Option A
+/// `tx.send_error(producer_err)` routing reaches the consumer
+/// untransformed — i.e. the consumer's `update()` returns the EXACT
+/// error the producer hit, NOT the synthesized
+/// "Sender dropped before sending EOF" Internal that the buf_channel
+/// emits when `tx` is merely dropped without `send_error`.
+#[derive(MetricsComponent)]
+struct PropagateRecvErrorStore {
+    update_invocations: AtomicUsize,
+    last_err_str: parking_lot::Mutex<Option<String>>,
+}
+
+impl PropagateRecvErrorStore {
+    fn new() -> Self {
+        Self {
+            update_invocations: AtomicUsize::new(0),
+            last_err_str: parking_lot::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl StoreDriver for PropagateRecvErrorStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        _digests: &[StoreKey<'_>],
+        _results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _digest: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _size_info: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        self.update_invocations.fetch_add(1, Ordering::SeqCst);
+        // Loop until we see EOF (clean) or an error.
+        loop {
+            match reader.recv().await {
+                Ok(chunk) if chunk.is_empty() => return Ok(()),
+                Ok(_) => continue,
+                Err(e) => {
+                    // Record the error string for diagnostic-time
+                    // inspection (the dual-err match arm will wrap
+                    // this further); propagate verbatim so any
+                    // wrapper that examines write_res sees the EXACT
+                    // payload the producer routed via send_error.
+                    *self.last_err_str.lock() = Some(format!("{e:?}"));
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(
+            Code::NotFound,
+            "PropagateRecvErrorStore: get_part not supported"
+        ))
+    }
+
+    fn inner_store(&self, _digest: Option<StoreKey>) -> &'_ dyn StoreDriver {
+        self
+    }
+
+    fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+default_health_status_indicator!(PropagateRecvErrorStore);
+
+/// Build a production-composition `FastSlowStore` with `FileUpdates`-
+/// reporting fast tier (so `update_with_whole_file` takes the parallel
+/// `stream_file_to_store` path) and the supplied slow tier.
+fn build_fast_slow<S>(slow_driver: Arc<S>) -> Store
+where
+    S: StoreDriver + 'static,
+{
     let inner_fast = MemoryStore::new(&MemorySpec::default());
-    let fast_store = Store::new(Arc::new(FileUpdateStore {
-        inner: inner_fast,
-    }));
-    let abort_slow = Arc::new(AbortAfterOneChunkStore::new());
-    let slow_store = Store::new(abort_slow.clone());
-    let fast_slow_store = Store::new(FastSlowStore::new(
+    let fast_store = Store::new(Arc::new(FileUpdateStore { inner: inner_fast }));
+    let slow_store = Store::new(slow_driver);
+    Store::new(FastSlowStore::new(
         &FastSlowSpec {
             fast: StoreSpec::Memory(MemorySpec::default()),
             slow: StoreSpec::Memory(MemorySpec::default()),
@@ -309,9 +444,43 @@ async fn stream_file_to_store_surfaces_consumer_error_over_symptom() -> Result<(
         },
         fast_store,
         slow_store,
-    ));
+    ))
+}
 
-    let payload: Vec<u8> = (0..PAYLOAD_LEN).map(|i| (i & 0xff) as u8).collect();
+/// **#476 Phase 1 DS-MAJOR-1 fix**: deterministically exercise the
+/// `(Err, Err)` dual-err arm.
+///
+/// The original test used a 1 MiB payload split into 4 chunks against
+/// a 128-slot `buf_channel` — the producer's 4 sends + EOF completed
+/// before the consumer's `recv` could context-switch and drop `rx`,
+/// hitting the `(Err, Ok)` single-err arm where pre-fix and post-fix
+/// produce identical output. The fix is correct in that arm too, but
+/// the test did not exercise the SPECIFIC arm (`Err, Err`) that the
+/// fix's policy distinguishes — so the mutation step (revert to
+/// `forward_res?; write_res`) was not reliably red-failing.
+///
+/// This rewrite adopts the #512 sibling test's 256-chunk feeder
+/// technique. With CHUNK_COUNT=256 chunks of 256 KiB each (= 64 MiB
+/// payload) and the inner buf_channel at capacity 128 + bridge mpsc 4,
+/// the producer's chunk loop blocks on `tx.send` once 132 chunks are
+/// in flight. The consumer drains ONE chunk and returns Err, dropping
+/// `rx`; the producer's pending `tx.send` wakes with channel-closed.
+/// BOTH halves of the `join!` error simultaneously — exactly the
+/// dual-err arm that the post-fix `match` selects on.
+///
+/// `tokio::time::timeout` wraps the call as a deadlock detector — a
+/// hung future would mask the bug (`tokio::time::Elapsed` silently
+/// passes `is_err()`).
+#[nativelink_test]
+async fn surfaces_consumer_error_over_symptom_dual_err() -> Result<(), Error> {
+    let abort_slow = Arc::new(AbortAfterOneChunkStore::new());
+    let fast_slow_store = build_fast_slow(abort_slow.clone());
+
+    // 64 MiB payload — see CHUNK_COUNT/CHUNK_BYTES rationale above. We
+    // generate a non-trivial repeating pattern so a partial-read bug
+    // would surface in the upload size mismatch rather than silently
+    // succeeding.
+    let payload: Vec<u8> = (0..TOTAL_BYTES).map(|i| (i & 0xff) as u8).collect();
     let digest = DigestInfo::try_new(VALID_HASH, payload.len() as u64).unwrap();
 
     let mut tmpfile = tempfile::NamedTempFile::new()
@@ -334,14 +503,15 @@ async fn stream_file_to_store_surfaces_consumer_error_over_symptom() -> Result<(
         UploadSizeInfo::ExactSize(payload.len() as u64),
     );
 
-    // Deadlock detector. Without the timeout, a wedge in either half of
-    // the join! would silently consume the agent's time budget; with
-    // it, we fail loudly within bounded wall-clock.
-    let res = tokio::time::timeout(Duration::from_secs(5), call)
+    // Deadlock detector. Bumped to 30s vs the original 5s to absorb
+    // CI load while writing/reading a 64 MiB tempfile through the
+    // streaming pipeline. The happy path completes in well under a
+    // second even on a contended host.
+    let res = tokio::time::timeout(Duration::from_secs(30), call)
         .await
         .expect(
             "stream_file_to_store must NOT deadlock — \
-             consumer-error-prefer policy must surface the abort within 5s, \
+             consumer-error-prefer policy must surface the abort within 30s, \
              not hang in producer/consumer race",
         );
 
@@ -355,10 +525,28 @@ async fn stream_file_to_store_surfaces_consumer_error_over_symptom() -> Result<(
 
     assert!(
         rendered.contains(ABORT_TAG),
-        "consumer-error-prefer policy not enforced — producer-side \
+        "#476 consumer-error-prefer policy not enforced — producer-side \
          receiver-disconnected swallowed root cause. \
          Expected surfaced Err to contain `{ABORT_TAG}` (the slow \
          tier's authoritative Err), got rendered={rendered}"
+    );
+
+    // The post-fix dual-err arm appends a diagnostic naming #476;
+    // verify it appears, proving the test crossed the dual-err arm
+    // (not just the `(Err, Ok)` single-err arm which produces the
+    // same surfaced error pre-fix and post-fix). Without this
+    // assertion, a future regression that loses the dual-err
+    // behavior could still pass the `ABORT_TAG` assertion (since
+    // the consumer's err is the same regardless of which arm fires).
+    assert!(
+        rendered.contains("consumer error preferred over producer 'receiver disconnected' symptom (#476)"),
+        "test did not exercise the dual-err `(Err, Err)` arm — only \
+         the single-err `(Err, Ok)` arm fired, which produces \
+         identical output pre-fix and post-fix and therefore CANNOT \
+         catch a regression of the dual-err policy. Bug in the test \
+         feeder/saturation setup (CHUNK_COUNT={CHUNK_COUNT} chunks vs \
+         128-slot buf_channel + 4-slot bridge — investigate). \
+         Got rendered={rendered}"
     );
 
     // Sanity: confirm the slow tier really was invoked. Defends against
@@ -370,6 +558,176 @@ async fn stream_file_to_store_surfaces_consumer_error_over_symptom() -> Result<(
          FastSlowStore path under test was not exercised. \
          update_invocations={}",
         abort_slow.update_invocations.load(Ordering::SeqCst)
+    );
+
+    Ok(())
+}
+
+/// **#476 Phase 1 RT-MAJOR fix (Option A)**: producer-side IO error
+/// must surface verbatim, NOT as a buf-channel "Sender dropped"
+/// symptom.
+///
+/// Red-team's mechanism: when the `spawn_blocking` reader in
+/// `stream_file_to_store` hits a real read error (e.g. ENOSPC, EIO,
+/// EISDIR), the error is sent to the bridge_rx. The `forward_fut`'s
+/// `result?` propagates the IO error, dropping `tx`. Pre-fix, the
+/// consumer's `recv()` then surfaced the synthesized
+/// `"Sender dropped before sending EOF"` Internal Err
+/// (`buf_channel.rs:623`) — `write_res = Err(synth_internal)`,
+/// `forward_res = Err(io_err)`. The post-#476 dual-err policy prefers
+/// `write_res`, so the surfaced Code is `Internal` and the surfaced
+/// top-line message is the buf-channel symptom — burying the real IO
+/// error in an interpolated `{forward_err:?}` tail.
+///
+/// **Option A fix**: `forward_fut` now calls `tx.send_error(e.clone())`
+/// before propagating any Err. The consumer's `recv()` then reads the
+/// REAL IO error via `terminal_error` (`buf_channel.rs:614-620`)
+/// instead of the synthesized fallback. `write_res = Err(io_err)`,
+/// `forward_res = Err(io_err)` — the dual-err arm prefers write_res,
+/// which now carries the IO error.
+///
+/// The producer-IO error is injected portably by passing a DIRECTORY
+/// fd to `stream_file_to_store`. On Linux, opening a directory
+/// O_RDONLY succeeds but `read()` returns `EISDIR` ("Is a directory").
+/// The spawn_blocking reader's first `file.read()` returns the
+/// EISDIR error, which is sent to the bridge_rx. This is the EXACT
+/// shape of failure path red-team described (real syscall failure
+/// from the spawn_blocking reader), without resorting to unsafe FD
+/// tricks.
+#[nativelink_test]
+async fn surfaces_producer_io_error_not_buf_channel_symptom() -> Result<(), Error> {
+    let propagate_slow = Arc::new(PropagateRecvErrorStore::new());
+    let fast_slow_store = build_fast_slow(propagate_slow.clone());
+
+    // Two tempfiles:
+    // - `data_file`: regular file with payload; this is what we pass
+    //   to `update_with_whole_file` as `file` (FileSlot). The fast
+    //   tier's `update_with_whole_file` reads from it — this lets the
+    //   fast tier succeed normally so we don't conflate fast-tier
+    //   failures with the producer-IO behavior under test.
+    // - `dir_path`: a temp DIRECTORY. We pass its path as `path` to
+    //   `update_with_whole_file`. Inside
+    //   `FastSlowStore::update_with_whole_file` at
+    //   `fast_slow_store.rs:5492`, `std::fs::File::open(path)` opens
+    //   the directory fd successfully. The fd is then passed to
+    //   `stream_file_to_store(slow_file, ...)`. The spawn_blocking
+    //   reader's first `file.read()` returns `EISDIR` — a REAL IO
+    //   error from the producer side, matching red-team's described
+    //   failure mode exactly.
+    let payload: Vec<u8> = vec![0xC3; 4096];
+    let digest = DigestInfo::try_new(VALID_HASH, payload.len() as u64).unwrap();
+
+    let mut data_file = tempfile::NamedTempFile::new()
+        .map_err(|e| make_err!(Code::Internal, "failed to create data tempfile: {:?}", e))?;
+    data_file
+        .write_all(&payload)
+        .map_err(|e| make_err!(Code::Internal, "failed to write data tempfile: {:?}", e))?;
+    data_file
+        .flush()
+        .map_err(|e| make_err!(Code::Internal, "failed to flush data tempfile: {:?}", e))?;
+    let data_path = data_file.path().to_owned();
+
+    let dir = tempfile::tempdir()
+        .map_err(|e| make_err!(Code::Internal, "failed to create tempdir: {:?}", e))?;
+    let dir_path = dir.path().to_owned();
+
+    let file_slot = nativelink_util::common::fs::open_file(&data_path, 0).await?;
+
+    let store_key: StoreKey<'_> = digest.into();
+    let call = fast_slow_store.as_store_driver_pin().update_with_whole_file(
+        store_key,
+        // Slow tier opens this path (directory) — read() returns EISDIR.
+        dir_path.into_os_string(),
+        // Fast tier consumes this FileSlot (regular file) — succeeds.
+        file_slot,
+        UploadSizeInfo::ExactSize(payload.len() as u64),
+    );
+
+    let res = tokio::time::timeout(Duration::from_secs(30), call)
+        .await
+        .expect(
+            "stream_file_to_store producer-IO path must NOT deadlock — \
+             Option A's tx.send_error(io_err) plus the post-#476 \
+             dual-err policy must surface the IO err within 30s",
+        );
+
+    assert!(
+        res.is_err(),
+        "update_with_whole_file must propagate the producer-side EISDIR \
+         as Err; got Ok(...). Reading from a directory fd cannot succeed."
+    );
+    let err = res.unwrap_err();
+    let rendered = format!("{err:?}");
+
+    // The PRODUCTION-CRITICAL assertion: the surfaced Err must carry
+    // the real producer-side IO error identifier ("Is a directory" or
+    // "EISDIR" or "Failed to read file in stream_file_to_store"),
+    // NOT the buf-channel synthesized "Sender dropped before sending
+    // EOF" Internal that the pre-fix code would surface as the
+    // consumer's `write_res` after `tx` was merely dropped.
+    let mentions_real_io = rendered.contains("Failed to read file in stream_file_to_store")
+        || rendered.contains("Is a directory")
+        || rendered.contains("EISDIR");
+    assert!(
+        mentions_real_io,
+        "Option A producer-IO masking fix not enforced — the producer's \
+         real IO error (EISDIR from reading a directory fd) was lost. \
+         Pre-fix mechanism: producer `?`-propagated err drops `tx`; \
+         consumer's `recv` returns synthesized \
+         `Sender dropped before sending EOF` Internal; dual-err policy \
+         prefers that synthesized symptom over the real IO err. \
+         Expected surfaced Err to mention \
+         `Failed to read file in stream_file_to_store`, `Is a directory`, \
+         or `EISDIR`. Got rendered={rendered}"
+    );
+
+    // Belt-and-braces: the surfaced Err must NOT contain the
+    // buf-channel synthesized fallback string. If it does, Option A's
+    // `tx.send_error` routing is missing or broken — the consumer
+    // observed the dropped-tx synthesis instead of the producer's
+    // typed error. (The dual-err arm appends `forward_err` as `{:?}`
+    // which COULD contain the symptom string for the producer side,
+    // but the TOP-LEVEL `write_res` half — which the policy prefers —
+    // must carry the real IO error.)
+    //
+    // The strict invariant: `write_res`'s top-level message (which
+    // the dual-err arm preserves verbatim) is NOT the buf-channel
+    // synthesis. We check this by asserting the consumer-recorded
+    // last_err_str (captured by `PropagateRecvErrorStore::update`
+    // when its `recv()` returned Err) does NOT mention the synthesis.
+    let consumer_observed = propagate_slow
+        .last_err_str
+        .lock()
+        .clone()
+        .unwrap_or_else(|| "<consumer recorded no err — Option A may have suppressed it>".into());
+    assert!(
+        !consumer_observed.contains("Sender dropped before sending EOF"),
+        "Option A producer-IO masking fix not enforced at the consumer \
+         seam — the buf_channel synthesized fallback `Sender dropped \
+         before sending EOF` reached the consumer instead of the \
+         producer's real EISDIR error. The producer's `tx.send_error` \
+         routing is missing — either the `forward_fut` Err arm doesn't \
+         call `tx.send_error(err.clone())`, or the order vs `tx` drop \
+         is wrong. Consumer-observed err: {consumer_observed}"
+    );
+    assert!(
+        consumer_observed.contains("Failed to read file in stream_file_to_store")
+            || consumer_observed.contains("Is a directory")
+            || consumer_observed.contains("EISDIR"),
+        "Option A producer-IO routing not exercising the expected \
+         payload — consumer's recv did not surface the real EISDIR \
+         error. Consumer-observed err: {consumer_observed}"
+    );
+
+    // Sanity: confirm the slow tier was invoked at least once. Defends
+    // against a future refactor that skips the slow store entirely
+    // (which would make this test pass vacuously).
+    assert!(
+        propagate_slow.update_invocations.load(Ordering::SeqCst) >= 1,
+        "PropagateRecvErrorStore::update was never called; the \
+         FastSlowStore path under test was not exercised. \
+         update_invocations={}",
+        propagate_slow.update_invocations.load(Ordering::SeqCst)
     );
 
     Ok(())

@@ -4228,19 +4228,38 @@ impl FastSlowStore {
         });
 
         let forward_fut = async move {
-            while let Some(result) = bridge_rx.recv().await {
-                let chunk = result?;
-                tx.send(chunk).await.map_err(|e| {
-                    make_err!(
-                        Code::Internal,
-                        "Failed to send chunk in stream_path_to_store: {:?}",
-                        e
-                    )
-                })?;
+            // Run the chunk-forwarding loop, capturing any error.
+            let result = async {
+                while let Some(result) = bridge_rx.recv().await {
+                    let chunk = result?;
+                    tx.send(chunk).await.map_err(|e| {
+                        make_err!(
+                            Code::Internal,
+                            "Failed to send chunk in stream_path_to_store: {:?}",
+                            e
+                        )
+                    })?;
+                }
+                tx.send_eof()
+                    .err_tip(|| "Failed to send EOF in stream_path_to_store")?;
+                Result::<(), Error>::Ok(())
             }
-            tx.send_eof()
-                .err_tip(|| "Failed to send EOF in stream_path_to_store")?;
-            Result::<(), Error>::Ok(())
+            .await;
+            // #476 producer-IO masking fix: route any producer-side
+            // error through tx.send_error so the consumer's recv()
+            // reads the REAL, typed Error (file IO err, bridge err,
+            // chunk-send err) verbatim via terminal_error
+            // (`buf_channel.rs:614-620`). Without this, dropping tx
+            // on early-return makes the consumer's next recv()
+            // surface the synthesized `"Sender dropped before sending
+            // EOF"` Internal (`buf_channel.rs:623`) — a buf-channel
+            // symptom that masks the real producer-side root cause
+            // even after the post-#476 dual-err policy prefers
+            // write_res.
+            if let Err(ref e) = result {
+                tx.send_error(e.clone());
+            }
+            result
         };
 
         let (write_res, forward_res) = join!(write_fut, forward_fut);
@@ -4257,7 +4276,12 @@ impl FastSlowStore {
         // (operators see the same buf-channel symptom regardless of
         // root cause). When forward_res is Err but write_res Ok, the
         // producer-side error is authoritative (likely a read/IO error
-        // from the spawn_blocking reader).
+        // from the spawn_blocking reader). When BOTH are Err and the
+        // producer errored first (e.g. IO error), the Option A fix
+        // above routes the producer error through tx.send_error so
+        // write_res IS the producer's real error — preferring write_res
+        // here surfaces the producer root cause, not a buf-channel
+        // symptom.
         match (write_res, forward_res) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(write_err), Ok(())) => Err(write_err),
@@ -4320,19 +4344,32 @@ impl FastSlowStore {
         });
 
         let forward_fut = async move {
-            while let Some(result) = bridge_rx.recv().await {
-                let chunk = result?;
-                tx.send(chunk).await.map_err(|e| {
-                    make_err!(
-                        Code::Internal,
-                        "Failed to send chunk in stream_file_to_store: {:?}",
-                        e
-                    )
-                })?;
+            // Run the chunk-forwarding loop, capturing any error.
+            let result = async {
+                while let Some(result) = bridge_rx.recv().await {
+                    let chunk = result?;
+                    tx.send(chunk).await.map_err(|e| {
+                        make_err!(
+                            Code::Internal,
+                            "Failed to send chunk in stream_file_to_store: {:?}",
+                            e
+                        )
+                    })?;
+                }
+                tx.send_eof()
+                    .err_tip(|| "Failed to send EOF in stream_file_to_store")?;
+                Result::<(), Error>::Ok(())
             }
-            tx.send_eof()
-                .err_tip(|| "Failed to send EOF in stream_file_to_store")?;
-            Result::<(), Error>::Ok(())
+            .await;
+            // #476 producer-IO masking fix: see sibling at
+            // `stream_path_to_store::forward_fut`. Route any
+            // producer-side error through tx.send_error so the
+            // consumer's recv() reads the real typed Error instead of
+            // a synthesized "Sender dropped before sending EOF".
+            if let Err(ref e) = result {
+                tx.send_error(e.clone());
+            }
+            result
         };
 
         let (write_res, forward_res) = join!(write_fut, forward_fut);
