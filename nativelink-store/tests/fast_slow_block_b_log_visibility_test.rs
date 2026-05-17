@@ -255,3 +255,107 @@ async fn block_b_entry_emits_at_info_level() {
         }
     });
 }
+
+/// **OVER-ACTION coverage (testing-czar M2 + auditor MAJOR-1 follow-up):**
+/// BLOCK-B's entry `info!` MUST NOT fire when the digest is NOT in
+/// `chunked_in_flight_digests`. Per CLAUDE.md "Asymmetric contract
+/// coverage", every state-mutating side-effect (including log
+/// emissions) has two failure modes:
+///   - **Under-action:** info! doesn't fire when expected (covered
+///     by `block_b_entry_emits_at_info_level` above).
+///   - **Over-action:** info! fires too often or in the wrong branch
+///     (this test).
+///
+/// A regression that hoisted the `info!` ABOVE the `if let Some(notify)`
+/// guard, or that emitted it inside a polling loop, would still satisfy
+/// the under-action test (extra emissions match the substring filter)
+/// but would FLOOD the log at line rate for every reader. This test
+/// drives a `get_part_unchunked` where the digest is pre-populated in
+/// the slow tier but NEVER inserted into `chunked_in_flight_digests`;
+/// the BLOCK-B branch must NOT be taken, and ZERO `info!` lines with
+/// the BLOCK-B entry marker must appear for this digest.
+///
+/// **Mutation step:** hoist the `info!(...)` above the `if let Some(...)`
+/// (or wrap it in an `else` arm that fires when the map miss happens)
+/// — this test red-fails with the bespoke message.
+#[nativelink_test]
+async fn block_b_no_entry_emit_when_digest_not_in_flight() {
+    // Use a distinctive digest byte so the substring filter is unique
+    // and cross-test pollution cannot match.
+    let payload: Vec<u8> = (100..1124u32).map(|i| (i & 0xFF) as u8).collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+    let digest_disc = format!("{digest:?}");
+
+    let fast_store = MemoryStore::new(&MemorySpec::default());
+    let slow_store = make_real_filesystem_slow().await;
+    let slow_store_wrapped = Store::new(slow_store.clone());
+
+    let fss = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Filesystem(FilesystemSpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: true,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        Store::new(fast_store),
+        slow_store_wrapped.clone(),
+    );
+
+    // Pre-populate slow tier ONLY. Do NOT insert into
+    // `chunked_in_flight_digests` — that's the over-action precondition.
+    slow_store_wrapped
+        .as_pin()
+        .update_oneshot(digest, payload.clone().into())
+        .await
+        .expect("slow-tier write must succeed");
+
+    // Drive a normal get_part. BLOCK-B's branch should NOT fire (map
+    // miss); the read falls through to the slow tier directly.
+    let fss_store = Store::new(fss.clone());
+    let bytes_read = tokio::time::timeout(
+        Duration::from_secs(5),
+        fss_store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect("must not deadlock — over-action negative test must complete promptly")
+    .expect("over-action negative-path reader must return Ok bytes from slow tier");
+
+    assert_eq!(
+        bytes_read.as_ref(),
+        payload.as_slice(),
+        "over-action test reader returned wrong bytes",
+    );
+
+    // ZERO INFO lines with the BLOCK-B entry marker AND this digest's
+    // discriminator. Filtering on digest byte makes this assertion
+    // pollution-proof: even if another test in this binary inserts
+    // some other digest into `chunked_in_flight_digests` and fires
+    // the BLOCK-B emit, that line wouldn't carry our digest's hex
+    // prefix.
+    logs_assert(move |lines: &[&str]| {
+        let phantom_matches: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                l.contains(" INFO ")
+                    && l.contains(
+                        "fast_slow get_part: digest is in chunked_in_flight_digests",
+                    )
+                    && l.contains(&digest_disc)
+            })
+            .collect();
+        if phantom_matches.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "over-action regression: BLOCK-B entry info! fired for a \
+                 digest NOT in chunked_in_flight_digests. The emit must be \
+                 inside the `if let Some(notify) = notify_handle` arm. \
+                 Found {} phantom line(s); first = {:?}",
+                phantom_matches.len(),
+                phantom_matches.first()
+            ))
+        }
+    });
+}

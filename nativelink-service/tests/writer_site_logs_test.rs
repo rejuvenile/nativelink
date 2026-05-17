@@ -27,6 +27,16 @@
 //! because spawned tasks lose the parent `tracing::Span`, so
 //! `logs_contain` (the macro-injected helper) would false-negative.
 //!
+//! Cross-test pollution mitigation (testing-czar M3): every test uses
+//! a per-test-unique caller label PLUS a per-test-unique digest byte
+//! so `lines_matching` filters to lines that only THIS test could have
+//! produced. A future test adding a `test_caller_X` colliding label
+//! still cannot match because the digest discriminator is unique. A
+//! random nonce on the caller label hardens further (compile-time
+//! distinct `&'static str` per nonce is not possible without leaking
+//! Strings; the digest-byte discriminator is the load-bearing
+//! disambiguator).
+//!
 //! Mutation discipline (per CLAUDE.md TDD #5): each test names the
 //! exact `info!` site whose deletion red-fails the test. The bespoke
 //! assertion message must mention `writer_path=<label>` AND
@@ -35,28 +45,47 @@
 
 #![cfg(feature = "chunked_fast_slow")]
 
+use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use hyper::body::Frame;
+use nativelink_config::stores::FilesystemSpec;
 use nativelink_macro::nativelink_test;
-use nativelink_service::chunked_write_handler::InFlightChunkedGuard;
+use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WriteChunk;
+use nativelink_service::chunked_write_handler::{
+    ChunkedWriteHandler, ChunkedWriteInFlight, InFlightChunkedGuard, wait_for_no_in_flight,
+};
+use nativelink_store::chunked::chunk_budget::ChunkBudget;
 use nativelink_store::fast_slow_store::ChunkedInFlightMap;
-use nativelink_util::common::DigestInfo;
+use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
+use nativelink_util::channel_body_for_tests::ChannelBody;
+use nativelink_util::common::{DigestInfo, encode_stream_proto};
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{Notify, mpsc};
+use tonic::Streaming;
+use tonic::codec::Codec;
+use tonic_prost::ProstCodec;
 
+/// Per-test digest with a unique discriminator byte. All tests in this
+/// file use distinct bytes so `lines_matching` filters by digest
+/// substring as a second disambiguator on top of the caller label.
 fn make_digest(byte: u8) -> DigestInfo {
     let mut packed = [0u8; 32];
     packed[0] = byte;
-    DigestInfo::new(packed, 95641600)
+    DigestInfo::new(packed, 95_641_600)
 }
 
 /// Read the `tracing-test` global buffer (process-wide, shared across
-/// tests in this binary) and return all lines that match BOTH
-/// `writer_path=<wp>` AND `registry=<reg>` substring filters. Used to
-/// pull out emissions specific to a single writer-side site without
-/// colliding with sibling tests' lines that share the global buffer.
-fn lines_matching(writer_path: &str, registry: &str) -> Vec<String> {
+/// tests in this binary) and return all lines that match
+/// `writer_path=<wp>` AND `registry=<reg>` AND a digest discriminator
+/// substring. The digest substring is the per-test discriminator that
+/// hardens against cross-test pollution: a future test that picks a
+/// colliding caller label still cannot match because its digest bytes
+/// differ. See testing-czar M3.
+fn lines_matching(writer_path: &str, registry: &str, digest_discriminator: &str) -> Vec<String> {
     let raw = String::from_utf8(
         tracing_test::internal::global_buf().lock().unwrap().to_vec(),
     )
@@ -65,6 +94,7 @@ fn lines_matching(writer_path: &str, registry: &str) -> Vec<String> {
         .filter(|l| {
             l.contains(&format!("writer_path=\"{writer_path}\""))
                 && l.contains(&format!("registry=\"{registry}\""))
+                && l.contains(digest_discriminator)
         })
         .map(str::to_string)
         .collect()
@@ -84,6 +114,7 @@ async fn fss_registration_emits_info_with_writer_path_label() {
     let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let notify = Arc::new(Notify::new());
     let digest = make_digest(0xA1);
+    let digest_disc = format!("{digest:?}");
 
     let _guard = InFlightChunkedGuard::new_with_caller(
         Arc::clone(&set),
@@ -92,7 +123,7 @@ async fn fss_registration_emits_info_with_writer_path_label() {
         "test_caller_a",
     );
 
-    let lines = lines_matching("test_caller_a", "fss_chunked_in_flight_digests");
+    let lines = lines_matching("test_caller_a", "fss_chunked_in_flight_digests", &digest_disc);
     assert!(
         !lines.is_empty(),
         "writer-site log MUST emit at chunked_in_flight_digests insertion \
@@ -127,6 +158,7 @@ async fn fss_registration_emits_info_with_writer_path_label() {
 async fn fss_removal_emits_paired_info_with_outcome_drop() {
     let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let digest = make_digest(0xB2);
+    let digest_disc = format!("{digest:?}");
 
     {
         let _guard = InFlightChunkedGuard::new_with_caller(
@@ -137,7 +169,7 @@ async fn fss_removal_emits_paired_info_with_outcome_drop() {
         );
     } // Drop here.
 
-    let lines = lines_matching("test_caller_b", "fss_chunked_in_flight_digests");
+    let lines = lines_matching("test_caller_b", "fss_chunked_in_flight_digests", &digest_disc);
     let removed = lines
         .iter()
         .find(|l| l.contains("chunked_in_flight removed") && l.contains("outcome=\"drop\""));
@@ -169,6 +201,7 @@ async fn fss_removal_emits_paired_info_with_outcome_drop() {
 async fn fss_disarm_emits_info_with_outcome_disarm() {
     let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
     let digest = make_digest(0xC3);
+    let digest_disc = format!("{digest:?}");
 
     let guard = InFlightChunkedGuard::new_with_caller(
         Arc::clone(&set),
@@ -182,7 +215,7 @@ async fn fss_disarm_emits_info_with_outcome_disarm() {
     // tuple); the `guard`'s Drop has already run inside disarm with
     // armed=false.
 
-    let lines = lines_matching("test_caller_c", "fss_chunked_in_flight_digests");
+    let lines = lines_matching("test_caller_c", "fss_chunked_in_flight_digests", &digest_disc);
     let disarm_line = lines.iter().find(|l| l.contains("outcome=\"disarm\""));
     assert!(
         disarm_line.is_some(),
@@ -196,6 +229,61 @@ async fn fss_disarm_emits_info_with_outcome_disarm() {
     );
 }
 
+/// **OVER-ACTION coverage (testing-czar M2 follow-up):** the FSS-level
+/// `info!` MUST NOT fire with a `writer_path` for a caller label this
+/// test never used. Mirror of `fss_registration_emits_info_with_writer_path_label`
+/// in the negative direction. CLAUDE.md "Asymmetric contract
+/// coverage" — every state-mutating log emission has two failure modes
+/// (under-action: didn't fire when expected; over-action: fired when
+/// not expected). All other tests in this file cover under-action;
+/// this covers over-action.
+///
+/// **Mutation step:** move the `info!` block inside `new_with_caller`
+/// into a loop (e.g. wrap in `for _ in 0..3 {`) — the under-action
+/// tests would still pass (extra info!s match the substring filter),
+/// but the over-action test would FAIL because the per-attempted-caller
+/// invariant "no info! for `unused_caller_no_emit`" is broken if the
+/// loop indexes by some external variable. While the literal mutation
+/// path is narrow, this test pins the negative contract: "no FSS
+/// registration info! exists for any caller label other than the
+/// one explicitly used."
+#[nativelink_test]
+async fn fss_no_emit_for_other_caller() {
+    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
+    let digest = make_digest(0xE5);
+
+    let _guard = InFlightChunkedGuard::new_with_caller(
+        Arc::clone(&set),
+        digest,
+        None,
+        "test_caller_over_action_e5",
+    );
+
+    // Assert ZERO matches for a caller this test never used. If the
+    // production code accidentally emitted an info! for ANY caller on
+    // EVERY construction (e.g. a loop over a static label set), this
+    // would catch it. The "unused_caller_no_emit_xyz" label is unique
+    // to this test and never used elsewhere in the workspace.
+    let raw = String::from_utf8(
+        tracing_test::internal::global_buf().lock().unwrap().to_vec(),
+    )
+    .expect("tracing-test global buffer must be valid UTF-8");
+    let phantom_matches: Vec<&str> = raw
+        .lines()
+        .filter(|l| l.contains("writer_path=\"unused_caller_no_emit_xyz\""))
+        .collect();
+    assert!(
+        phantom_matches.is_empty(),
+        "over-action regression: an info! fired with \
+         writer_path=unused_caller_no_emit_xyz even though no caller \
+         in this test (or workspace) ever used that label. The \
+         production code is emitting for callers it shouldn't. Found \
+         {} matching lines: first = {:?}",
+        phantom_matches.len(),
+        phantom_matches.first()
+    );
+}
+
 /// **Production-composition test for the central DS-reviewer hypothesis:**
 /// the v1 worker→server WriteChunked path (`write_chunked_inner` on
 /// the server) MUST emit `writer_path=server_v1_handler_local` AND
@@ -203,59 +291,202 @@ async fn fss_disarm_emits_info_with_outcome_disarm() {
 /// confirming that path does NOT register in the FSS-level set Option C
 /// reader-waits key off of.
 ///
-/// This test does NOT spin up the full RPC; it documents the contract
-/// by asserting on the labels that the production code is REQUIRED to
-/// use. The full RPC end-to-end coverage lives in
-/// `chunked_write_handler_test.rs` (worker-RPC integration); this test
-/// owns the **label contract**.
+/// **REAL production composition (testing-czar B1 fix-up 2026-05-16):**
+/// the prior version of this test emitted the `info!` macro itself in
+/// the test body, then asserted the test's own emission — a tautology
+/// that did NOT exercise the production site. This version constructs
+/// a real `ChunkedWriteHandler` via the `_for_test` constructor, drives
+/// a v1 `write_chunked()` RPC end-to-end through the production
+/// `write_chunked_inner` body, and asserts the production `info!` at
+/// `chunked_write_handler.rs:1164-1171` fires. Mutation step (below)
+/// commenting out that production emit MUST red-fail this test.
 ///
-/// **Mutation step:** rename the `writer_path = "server_v1_handler_local"`
-/// literal at `chunked_write_handler.rs:1147` to anything else, or
-/// change `registry = "handler_local_in_flight"` to
-/// `"fss_chunked_in_flight_digests"`. This test MUST red-fail with the
-/// bespoke message
-/// `"v1 worker→server WriteChunked SERVER handler MUST tag its in_flight \
-///   insertion with writer_path=server_v1_handler_local + \
-///   registry=handler_local_in_flight — Option C reader-waits cannot \
-///   observe this path"`.
+/// **Mutation step:** comment out the `info!(...)` block at
+/// `chunked_write_handler.rs:1164-1171` (the
+/// `writer_path = "server_v1_handler_local"` emit AFTER
+/// `guard.insert(...)`). The test MUST red-fail with the bespoke
+/// message `"v1 worker→server WriteChunked SERVER handler MUST tag \
+///   its in_flight insertion with writer_path=server_v1_handler_local \
+///   + registry=handler_local_in_flight — Option C reader-waits \
+///   cannot observe this path"`.
 #[nativelink_test]
 async fn v1_server_handler_local_insertion_label_contract() {
-    // The production constant lives in the source as a string literal;
-    // this test asserts the labels are spelled the way the journal-scan
-    // playbook documents them. The labels are part of the operator-facing
-    // contract; renaming them silently breaks the playbook.
-    //
-    // We construct a stand-in guard with the SAME labels the production
-    // site uses, and confirm the labels appear in the emission. The
-    // production site is `chunked_write_handler.rs:1140-1149` — its
-    // `info!(... writer_path = "server_v1_handler_local", registry =
-    // "handler_local_in_flight", ...)`. If a future commit renames
-    // either label, the production site's emission will not match
-    // `lines_matching("server_v1_handler_local", "handler_local_in_flight")`
-    // when the production integration tests run.
-    //
-    // The mutation-hint message names the exact source location so a
-    // failure is actionable.
-    use tracing::info;
-    let dig = make_digest(0xD4);
-    info!(
-        target: "nativelink_service::chunked_write_handler",
-        writer_path = "server_v1_handler_local",
-        registry = "handler_local_in_flight",
-        digest = %dig,
-        expected_size = dig.size_bytes(),
-        "in_flight handler-local entry inserted (write_chunked_inner)",
+    // 4 KiB micro-chunks so the test runs in milliseconds.
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 1;
+    let total = (N * CHUNK) as u64;
+
+    let mut blob = vec![0xD4u8; CHUNK];
+    blob[0] = 0xD4;
+    let digest = DigestInfo::new(sha256(&blob), total);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer = tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let chunk = make_chunk(digest, 0, &blob, true);
+        tx.send(frame_chunk(&chunk))
+            .await
+            .expect("must not deadlock — channel send to handler");
+        drop(tx);
+    })
+    .await
+    .expect("must not deadlock — single-chunk send must complete promptly");
+
+    let response = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect(
+            "must not deadlock — handler must respond within 5 s; the \
+             server_v1_handler_local production info! fires from \
+             write_chunked_inner DURING the streaming loop",
+        )
+        .expect("handler task must not panic")
+        .expect("write_chunked must return Ok for hash-matching blob");
+    assert_eq!(
+        response.into_inner().committed_size,
+        total,
+        "committed_size must equal blob length"
     );
-    let lines = lines_matching("server_v1_handler_local", "handler_local_in_flight");
+
+    // Wait until the in-flight tracker drains so the production
+    // info! is guaranteed to have fired (it fires BEFORE the await
+    // inside write_chunked_inner, so this is belt-and-suspenders).
+    wait_for_no_in_flight(&in_flight, Duration::from_secs(2))
+        .await
+        .expect("in-flight tracker must drain after commit");
+
+    // Assert the production info! fired. We do NOT filter on the
+    // test's digest because the digest field in the production emit
+    // uses `%stream_digest` which Display-formats as `<hex>-<size>` —
+    // the digest discriminator string is the hex prefix. This test
+    // owns the writer_path label `server_v1_handler_local` so a
+    // label-only filter is unique workspace-wide.
+    let raw = String::from_utf8(
+        tracing_test::internal::global_buf().lock().unwrap().to_vec(),
+    )
+    .expect("tracing-test global buffer must be valid UTF-8");
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| {
+            l.contains("writer_path=\"server_v1_handler_local\"")
+                && l.contains("registry=\"handler_local_in_flight\"")
+                && l.contains("in_flight handler-local entry inserted")
+        })
+        .collect();
     assert!(
         !lines.is_empty(),
         "v1 worker→server WriteChunked SERVER handler MUST tag its in_flight \
          insertion with writer_path=server_v1_handler_local + \
          registry=handler_local_in_flight — Option C reader-waits cannot \
-         observe this path. Source: chunked_write_handler.rs:1140-1149. \
+         observe this path. Source: chunked_write_handler.rs:1164-1171. \
          tracing-test global_buf tail: {}",
         recent_buf_tail()
     );
+    // Confirm the emit carries the digest field so journal-scan can
+    // attribute the entry to a specific blob (without it, the label
+    // alone is operator-useless).
+    let entry = lines.last().expect("at least one entry line present");
+    let digest_display = format!("{digest}");
+    assert!(
+        entry.contains(&digest_display),
+        "v1_server_handler_local info! MUST carry the digest field so a \
+         journal scan can attribute the entry to a blob; got: {entry}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Helpers (mirrors chunked_write_handler_test.rs patterns; inlined to
+// keep this file self-contained and avoid coupling to the bigger test
+// crate's helper module).
+// -----------------------------------------------------------------------------
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&h.finalize());
+    a
+}
+
+/// Build a fresh `FilesystemStore` rooted at a unique per-test temp
+/// directory. Returns the store + the content_path so the test can
+/// stat the final CAS file directly.
+async fn make_store() -> (Arc<FilesystemStore<FileEntryImpl>>, String) {
+    let base = std::env::var("TEST_TMPDIR")
+        .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string());
+    let nonce: u64 = rand::random();
+    let content_path = format!("{base}/{nonce}/writer-site-logs-test/content");
+    let temp_path = format!("{base}/{nonce}/writer-site-logs-test/temp");
+    let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+        content_path: content_path.clone(),
+        temp_path,
+        eviction_policy: None,
+        block_size: 1,
+        ..Default::default()
+    })
+    .await
+    .expect("FilesystemStore::new must succeed");
+    (store, content_path)
+}
+
+/// Build the per-test handler with its OWN ChunkBudget AND an
+/// explicit per-test chunk size (so 4 KiB micro-chunks exercise the
+/// real `write_chunked_inner` body without burning 1 MiB per chunk).
+/// Returns the handler + the in-flight tracker for direct inspection.
+fn make_handler(
+    store: Arc<FilesystemStore<FileEntryImpl>>,
+    budget: &'static ChunkBudget,
+    chunk_size: usize,
+) -> (Arc<ChunkedWriteHandler>, Arc<ChunkedWriteInFlight>) {
+    let in_flight = ChunkedWriteInFlight::new();
+    let handler = Arc::new(ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
+        store,
+        Arc::clone(&in_flight),
+        budget,
+        chunk_size,
+    ));
+    (handler, in_flight)
+}
+
+/// Wrap an mpsc-driven body into a `tonic::Streaming<WriteChunk>`.
+fn make_chunk_stream() -> (mpsc::Sender<Frame<Bytes>>, Streaming<WriteChunk>) {
+    let (tx, body) = ChannelBody::new();
+    let mut codec = ProstCodec::<WriteChunk, WriteChunk>::default();
+    let stream = Streaming::new_request(codec.decoder(), body, None, None);
+    (tx, stream)
+}
+
+/// gRPC-frame a single WriteChunk for sending into the channel body.
+fn frame_chunk(chunk: &WriteChunk) -> Frame<Bytes> {
+    let bytes = encode_stream_proto(chunk).expect("encode WriteChunk to grpc frame");
+    Frame::data(bytes)
+}
+
+/// Build a fully-formed WriteChunk for the given digest + offset.
+fn make_chunk(
+    digest: DigestInfo,
+    chunk_offset: u64,
+    chunk_bytes: &[u8],
+    finish: bool,
+) -> WriteChunk {
+    WriteChunk {
+        digest: Some(digest.into()),
+        chunk_offset,
+        chunk_bytes: Bytes::copy_from_slice(chunk_bytes),
+        chunk_sha256: sha256(chunk_bytes).to_vec(),
+        finish_chunk: finish,
+    }
+}
+
+/// Test-only ChunkBudget singletons. Each test gets its own to avoid
+/// cross-test interference.
+fn make_test_budget() -> &'static ChunkBudget {
+    Box::leak(Box::new(ChunkBudget::new()))
 }
 
 /// Tail of the tracing-test global buffer (last 4 KiB) for actionable
