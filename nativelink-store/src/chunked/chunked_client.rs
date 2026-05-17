@@ -206,8 +206,10 @@ where
         let digest_str = chunks
             .first()
             .and_then(|c| c.digest.as_ref())
-            .map(|d| format!("{}-{}", d.hash, d.size_bytes))
-            .unwrap_or_else(|| "<no-first-chunk>".to_string());
+            .map_or_else(
+                || "<no-first-chunk>".to_string(),
+                |d| format!("{}-{}", d.hash, d.size_bytes),
+            );
         let chunk_count = chunks.len();
         info!(
             target: "nativelink_store::chunked::chunked_client",
@@ -300,8 +302,10 @@ where
         let digest_str = chunks
             .first()
             .and_then(|c| c.digest.as_ref())
-            .map(|d| format!("{}-{}", d.hash, d.size_bytes))
-            .unwrap_or_else(|| "<no-first-chunk>".to_string());
+            .map_or_else(
+                || "<no-first-chunk>".to_string(),
+                |d| format!("{}-{}", d.hash, d.size_bytes),
+            );
         let chunk_count = chunks.len();
         info!(
             target: "nativelink_store::chunked::chunked_client",

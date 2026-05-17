@@ -1126,3 +1126,225 @@ async fn committed_digest_mismatch_today_does_not_fail() {
 /// expansion if any test wants to hand the dispatcher to a sub-task.
 #[allow(dead_code)]
 fn _phantom_pin_use(_: Pin<&dyn WriteChunkedDispatcher>) {}
+
+// ---------------------------------------------------------------------------
+// #247+#477 DS-reviewer disambiguation: worker-side writer-path info!
+// ---------------------------------------------------------------------------
+
+/// `write_chunked_stream` MUST emit one `info!` line per blob with
+/// `writer_path=worker_chunked_client` carrying the blob digest +
+/// expected_size. Without this, a worker-log scan cannot attribute
+/// which blob the worker dispatched (the 21:14:28 UTC 2026-05-16
+/// trace was for a worker-originated 95.6 MB blob; identifying it
+/// in the worker log requires this exact emission).
+///
+/// **Mutation step:** delete the `info!(... \"write_chunked_stream entry\")`
+/// block at `chunked_client.rs:439-457`. The test MUST red-fail with
+/// the bespoke message
+/// `"worker-side write_chunked_stream MUST emit \
+///   writer_path=worker_chunked_client + expected_size + digest"`.
+#[nativelink_test]
+async fn worker_write_chunked_stream_emits_entry_log() {
+    const N: usize = 4 * 1024;
+    let (digest, blob) = synth_blob(N);
+    let dispatcher = FakeDispatcher::new(vec![Ok(ok_response(N as u64))]);
+    let metrics = ChunkedClientMetrics::new();
+
+    let _committed = tokio::time::timeout(
+        Duration::from_secs(5),
+        write_chunked_stream(
+            dispatcher.as_ref(),
+            digest,
+            reader_for_blob(blob.clone()),
+            ChunkedClientOptions {
+                max_attempts: 3,
+                chunk_size: N,
+            },
+            Arc::clone(&metrics),
+        ),
+    )
+    .await
+    .expect("must not deadlock — single-chunk entry emit test")
+    .expect("happy path must succeed");
+
+    let raw = String::from_utf8(
+        tracing_test::internal::global_buf().lock().unwrap().to_vec(),
+    )
+    .expect("tracing-test global buffer must be valid UTF-8");
+    let matches: Vec<&str> = raw
+        .lines()
+        .filter(|l| {
+            l.contains("writer_path=\"worker_chunked_client\"")
+                && l.contains("write_chunked_stream entry")
+        })
+        .collect();
+    assert!(
+        !matches.is_empty(),
+        "worker-side write_chunked_stream MUST emit \
+         writer_path=worker_chunked_client + expected_size + digest. \
+         Without it, a worker-log scan cannot attribute which blob the \
+         worker dispatched. Mutation hint: deleted the `info!(... \
+         \"write_chunked_stream entry\")` block at chunked_client.rs:439. \
+         tracing-test global_buf tail: {}",
+        &raw[raw.len().saturating_sub(4096)..]
+    );
+    let entry = matches.last().expect("at least one entry line");
+    assert!(
+        entry.contains(&format!("expected_size={N}")),
+        "entry log MUST carry expected_size={N} as a structured field; \
+         got: {entry}"
+    );
+}
+
+/// `WorkerApiWriteChunkedDispatcher::dispatch` MUST emit
+/// `writer_path=worker_dispatch_v1` + `wire_shape=v1` + the digest
+/// extracted from the first chunk. This is the SECOND-line
+/// disambiguation: the entry log (above) says "the chunked_client
+/// owned a blob"; the dispatch log says "the v1 wire shape carried
+/// it on the wire". Both are needed to confirm a 95 MB worker-side
+/// chunked write took the v1 path vs. v2.
+///
+/// We exercise the production-shape `WorkerApiWriteChunkedDispatcher`
+/// via the same in-process tonic harness pattern that
+/// `chunked_write_handler_v2_test.rs::v2_production_dispatcher_end_to_end`
+/// uses for v2 (a fake dispatcher cannot prove the v1 wire shape —
+/// only the production dispatcher does). To keep this test scoped to
+/// the LOG CONTRACT and avoid duplicating the v2 test's full server
+/// harness, we directly construct the dispatcher with a factory that
+/// returns an Err on `acquire_channel`. This still exercises the
+/// `dispatch()` body's pre-`acquire_channel().await` info! emission
+/// (the emission is unconditional; the channel-acquisition Err is the
+/// next step). The test then asserts the info! line fired and the
+/// dispatch returned Err.
+///
+/// **Mutation step:** delete the `info!(... \"WriteChunked dispatch attempt\")`
+/// block in `WorkerApiWriteChunkedDispatcher::dispatch`. The test MUST
+/// red-fail with the bespoke message
+/// `"v1 worker dispatcher MUST emit writer_path=worker_dispatch_v1 + \
+///   wire_shape=v1 at dispatch entry"`.
+#[nativelink_test]
+async fn v1_worker_dispatcher_dispatch_emits_wire_shape_log() {
+    use nativelink_store::chunked::chunked_client::{
+        ChannelAcquireFuture, WorkerApiWriteChunkedDispatcher,
+    };
+
+    // Build a v1 dispatcher whose factory returns Err (we do not need
+    // a live server — the info! emit happens BEFORE the factory await).
+    let dispatcher: WorkerApiWriteChunkedDispatcher<tonic::transport::Channel> =
+        WorkerApiWriteChunkedDispatcher::with_factory(
+            || -> ChannelAcquireFuture<tonic::transport::Channel> {
+                Box::pin(async {
+                    Err(nativelink_error::make_err!(
+                        Code::Internal,
+                        "test stub: no channel"
+                    ))
+                })
+            },
+        );
+
+    let (digest, blob) = synth_blob(8 * 1024);
+    // Build a single chunk so dispatch has something to log digest from.
+    let chunk = WriteChunk {
+        digest: Some(digest.into()),
+        chunk_offset: 0,
+        chunk_bytes: Bytes::from(blob),
+        chunk_sha256: vec![0u8; 32], // SHA not verified pre-dispatch
+        finish_chunk: true,
+    };
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatcher.dispatch(vec![chunk]),
+    )
+    .await
+    .expect("must not deadlock — dispatch must error on stub factory");
+
+    let raw = String::from_utf8(
+        tracing_test::internal::global_buf().lock().unwrap().to_vec(),
+    )
+    .expect("tracing-test global buffer must be valid UTF-8");
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| {
+            l.contains("writer_path=\"worker_dispatch_v1\"")
+                && l.contains("wire_shape=\"v1\"")
+                && l.contains("WriteChunked dispatch attempt")
+        })
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "v1 worker dispatcher MUST emit writer_path=worker_dispatch_v1 + \
+         wire_shape=v1 at dispatch entry. Without it, a worker-log scan \
+         cannot prove WHICH wire shape carried a chunked-write attempt. \
+         Mutation hint: deleted the `info!(... \"WriteChunked dispatch \
+         attempt\")` block in WorkerApiWriteChunkedDispatcher::dispatch. \
+         tracing-test global_buf tail: {}",
+        &raw[raw.len().saturating_sub(4096)..]
+    );
+}
+
+/// `WorkerApiWriteChunkedV2Dispatcher::dispatch` MUST emit
+/// `writer_path=worker_dispatch_v2` + `wire_shape=v2`. Mirror of the
+/// v1 test above. Together the two tests pin "every worker→server
+/// chunked-write dispatch attempt logs which wire shape it used".
+///
+/// **Mutation step:** delete the `info!(... \"WriteChunkedV2 dispatch \
+/// attempt\")` block in `WorkerApiWriteChunkedV2Dispatcher::dispatch`.
+/// The test MUST red-fail with the bespoke message
+/// `"v2 worker dispatcher MUST emit writer_path=worker_dispatch_v2 + \
+///   wire_shape=v2 at dispatch entry"`.
+#[nativelink_test]
+async fn v2_worker_dispatcher_dispatch_emits_wire_shape_log() {
+    use nativelink_store::chunked::chunked_client::{
+        ChannelAcquireFuture, WorkerApiWriteChunkedV2Dispatcher,
+    };
+
+    let dispatcher: WorkerApiWriteChunkedV2Dispatcher<tonic::transport::Channel> =
+        WorkerApiWriteChunkedV2Dispatcher::with_factory(
+            || -> ChannelAcquireFuture<tonic::transport::Channel> {
+                Box::pin(async {
+                    Err(nativelink_error::make_err!(
+                        Code::Internal,
+                        "test stub: no channel"
+                    ))
+                })
+            },
+        );
+
+    let (digest, blob) = synth_blob(8 * 1024);
+    let chunk = WriteChunk {
+        digest: Some(digest.into()),
+        chunk_offset: 0,
+        chunk_bytes: Bytes::from(blob),
+        chunk_sha256: vec![0u8; 32],
+        finish_chunk: true,
+    };
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatcher.dispatch(vec![chunk]),
+    )
+    .await
+    .expect("must not deadlock — dispatch must error on stub factory");
+
+    let raw = String::from_utf8(
+        tracing_test::internal::global_buf().lock().unwrap().to_vec(),
+    )
+    .expect("tracing-test global buffer must be valid UTF-8");
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| {
+            l.contains("writer_path=\"worker_dispatch_v2\"")
+                && l.contains("wire_shape=\"v2\"")
+                && l.contains("WriteChunkedV2 dispatch attempt")
+        })
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "v2 worker dispatcher MUST emit writer_path=worker_dispatch_v2 + \
+         wire_shape=v2 at dispatch entry. Without it, a worker-log scan \
+         cannot prove WHICH wire shape carried a chunked-write attempt. \
+         Mutation hint: deleted the `info!(... \"WriteChunkedV2 dispatch \
+         attempt\")` block in WorkerApiWriteChunkedV2Dispatcher::dispatch. \
+         tracing-test global_buf tail: {}",
+        &raw[raw.len().saturating_sub(4096)..]
+    );
+}

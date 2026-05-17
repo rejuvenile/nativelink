@@ -883,8 +883,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // (Some only when the tonic transport populates it).
         let peer_addr = request
             .remote_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .map_or_else(|| "unknown".to_string(), |a| a.to_string());
         info!(
             target: "nativelink_service::chunked_write_handler",
             writer_path = "server_v1_rpc",
