@@ -549,24 +549,26 @@ TypeOK ==
     /\ writerTerminalErr \in BOOLEAN
     /\ seamBPropagated   \in BOOLEAN
 
-\* Bound (not tautology). The spec abstracts each chunk send as a SINGLE
-\* atomic action that increments chunkCount AND bytesWritten together.
-\* Production has TWO independent AtomicU64s
+\* NOTE: an earlier draft included `BytesWrittenBoundedByChunkCount`
+\* (`bytesWritten <= chunkCount`) and a rename to that from the original
+\* `BytesWrittenMatchesChunkCount`. Red-team cadre-2 flagged BOTH forms as
+\* tautological under this spec's single-atomic-action model: only
+\* `WriterSendChunk` modifies either variable, and it increments BOTH in
+\* lockstep (`chunkCount' = chunkCount + 1 /\ bytesWritten' = bytesWritten + 1`
+\* at the action body above). The invariant reduces to
+\* `chunkCount <= chunkCount`, which is trivially TRUE.
+\*
+\* Production has TWO independent `AtomicU64`s
 \* (`StreamingBlobInner::chunk_count` + `bytes_written`) incremented at
 \* different points in `send_chunk`; a code change that swaps the
 \* increment order could open a transient window where a reader sees
-\* chunkCount=N+1 but bytesWritten=N. THIS SPEC DOES NOT MODEL THAT
-\* ATOMICS-ORDERING HAZARD. The invariant below is a structural bound
-\* on bytesWritten that does NOT prove the atomics are co-ordered;
-\* it only proves the spec's abstraction stays well-typed (bytesWritten
-\* tracks chunkCount in the spec's single-atomic-action model).
-\*
-\* Equality holds because ChunkSize=1 and writes happen atomically;
-\* production's two-atomic split would need a separate spec that
-\* models chunkCount and bytesWritten as separable transitions. See
-\* the audit's "Phase 5 — outstanding gaps" entry for this gap.
-BytesWrittenBoundedByChunkCount ==
-    bytesWritten <= chunkCount
+\* chunkCount=N+1 but bytesWritten=N. The genuine non-vacuous invariant
+\* lives in a future spec extension that splits `WriterSendChunk` into
+\* two sub-actions (`IncrChunkCount` + `IncrBytesWritten`); only then can
+\* a `bytesWritten <= chunkCount` bound discriminate "correct co-ordering"
+\* from "swapped". The DROP here is honest about coverage: the current
+\* spec does not model the atomics-ordering hazard at all. See the
+\* audit's Phase 5 #6 entry for the proper home of this invariant.
 
 \* No reader cursor advances past chunkCount (every read corresponds
 \* to a previously appended chunk).
