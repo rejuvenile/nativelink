@@ -1562,6 +1562,339 @@ async fn not_found_with_precondition_detail_translates_without_substring() -> Re
     Ok(())
 }
 
+// ----------------------------------------------------------------------
+// (#428 MAJOR-1: over-action on the CODE dimension) The predicate
+// `is_cas_blob_miss` at `local_worker.rs:515-531` short-circuits FALSE
+// when `err.code != Code::NotFound`. That early return is load-bearing:
+// every store layer is free to attach `PreconditionFailure` details on
+// errors of any code (e.g. an Internal write-amplification incident that
+// wraps a downstream NotFound in its details), and the worker must NOT
+// translate those into `FAILED_PRECONDITION` — only genuine NotFound
+// blob misses round-trip that way.
+//
+// Asymmetric-contract coverage (CLAUDE.md): under-action (translation
+// fires when it should) is covered by
+// `not_found_with_precondition_detail_translates_without_substring`
+// above; this test covers over-action (translation MUST NOT fire when
+// the code is wrong, even with a PF detail payload).
+//
+// Mutation guidance: re-order the predicate so it checks `err.details`
+// BEFORE `err.code` (i.e. `has_pf_detail` returns true regardless of
+// code). This test must red-fail with the bespoke assertion message —
+// the response classifies as ExecuteResponse with FailedPrecondition
+// instead of staying InternalError.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn non_not_found_with_precondition_detail_does_not_translate() -> Result<(), Error> {
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_default_connect_request(props);
+    }
+
+    let expected_worker_id = "foobar".to_string();
+
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: String::new(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+                        missing_digests: Vec::new(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let running_action = Arc::new(MockRunningAction::new());
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+
+    // Build the same PreconditionFailure detail payload as the
+    // positive detail-arm test — only the OUTER error code differs.
+    // The code dimension MUST be load-bearing in the predicate; if a
+    // future maintainer reorders the check (`details` first), this
+    // test red-fails.
+    #[derive(prost::Message)]
+    struct PfViolation {
+        #[prost(string, tag = "1")]
+        r#type: String,
+        #[prost(string, tag = "2")]
+        subject: String,
+        #[prost(string, tag = "3")]
+        description: String,
+    }
+    #[derive(prost::Message)]
+    struct PfFailure {
+        #[prost(message, repeated, tag = "1")]
+        violations: Vec<PfViolation>,
+    }
+
+    let missing_digest = DigestInfo::new([0x1E; 32], 52_680_784);
+    let detail = PfFailure {
+        violations: vec![PfViolation {
+            r#type: "MISSING".into(),
+            subject: format!(
+                "blobs/{}/{}",
+                missing_digest.packed_hash(),
+                missing_digest.size_bytes(),
+            ),
+            description: String::new(),
+        }],
+    };
+    let any = prost_types::Any {
+        type_url: "type.googleapis.com/google.rpc.PreconditionFailure".into(),
+        value: detail.encode_to_vec(),
+    };
+
+    // Note: Code::Internal, NOT NotFound. The predicate MUST early-return
+    // false on the code mismatch before it even inspects details.
+    let mut source_err = make_err!(
+        Code::Internal,
+        "internal write failure attached a PF detail for diagnostics"
+    );
+    source_err.details.push(any.clone());
+    let source_err_clone = source_err.clone();
+    running_action
+        .expect_prepare_action(Err(source_err))
+        .await?;
+    running_action.cleanup(Ok(())).await?;
+
+    let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+
+    // Must remain InternalError. Translation to FailedPrecondition would
+    // mean the code-dimension guard was bypassed — exactly the regression
+    // this test is designed to detect.
+    match execution_response.result.as_ref().expect(
+        "must not translate non-NotFound errors even with PF detail payload — \
+         code dimension is load-bearing",
+    ) {
+        execute_result::Result::InternalError(_) => {}
+        other => panic!(
+            "must not translate non-NotFound errors even with PF detail payload — \
+             code dimension is load-bearing; got {other:?} \
+             (predicate must short-circuit on err.code != Code::NotFound BEFORE \
+             inspecting err.details)"
+        ),
+    }
+    assert_eq!(
+        execution_response,
+        ExecuteResult {
+            instance_name: INSTANCE_NAME.to_string(),
+            operation_id: String::new(),
+            result: Some(execute_result::Result::InternalError(source_err_clone.into())),
+        }
+    );
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------
+// (#428 MAJOR-2: over-action on the TYPE_URL dimension) The predicate
+// `is_cas_blob_miss` inspects `err.details` filtered by `type_url ==
+// PRECONDITION_FAILURE_TYPE_URL`. The exact string compare is
+// load-bearing: a NotFound carrying some OTHER Any payload (e.g.
+// `google.rpc.RetryInfo`) MUST NOT match the detail arm. The legacy
+// substring fallback (`"not found in"`) must also miss, so a regression
+// in the type_url compare cannot be masked by the substring path.
+//
+// Asymmetric-contract coverage (CLAUDE.md): under-action — that a PF
+// type_url with the right code DOES translate — is covered above; this
+// test covers over-action — translation MUST NOT fire when the
+// type_url is wrong, even with NotFound code.
+//
+// Mutation guidance: loosen the type_url check in `local_worker.rs`
+// from the exact `==` compare to `!err.details.is_empty()`. This test
+// must red-fail with the bespoke assertion message — the response
+// classifies as ExecuteResponse with FailedPrecondition.
+// ----------------------------------------------------------------------
+#[nativelink_test]
+async fn not_found_with_non_pf_detail_and_no_substring_does_not_translate() -> Result<(), Error> {
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_default_connect_request(props);
+    }
+
+    let expected_worker_id = "foobar".to_string();
+
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([3u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: String::new(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+                        missing_digests: Vec::new(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let running_action = Arc::new(MockRunningAction::new());
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+
+    // Build a `google.rpc.RetryInfo` Any — a different type_url than the
+    // PRECONDITION_FAILURE_TYPE_URL the predicate matches. The encoding
+    // doesn't need to round-trip — only the type_url string matters for
+    // the predicate decision.
+    #[derive(prost::Message)]
+    struct RetryInfo {
+        #[prost(message, optional, tag = "1")]
+        retry_delay: Option<::prost_types::Duration>,
+    }
+    let retry_info = RetryInfo {
+        retry_delay: Some(::prost_types::Duration {
+            seconds: 5,
+            nanos: 0,
+        }),
+    };
+    let any = prost_types::Any {
+        // Deliberately NOT the PRECONDITION_FAILURE_TYPE_URL. Mutating
+        // the predicate to `!err.details.is_empty()` would cause this
+        // detail to match and translate — exactly what this test
+        // catches.
+        type_url: "type.googleapis.com/google.rpc.RetryInfo".into(),
+        value: retry_info.encode_to_vec(),
+    };
+
+    // Message intentionally omits the legacy `"not found in"` substring
+    // so the substring-fallback arm of the predicate also misses. If it
+    // matched, we couldn't isolate the type_url check.
+    let mut source_err = make_err!(
+        Code::NotFound,
+        "ephemeral retry-classified NotFound from upstream RPC layer"
+    );
+    source_err.details.push(any.clone());
+    let source_err_clone = source_err.clone();
+    running_action
+        .expect_prepare_action(Err(source_err))
+        .await?;
+    running_action.cleanup(Ok(())).await?;
+
+    let execution_response = test_context.client.expect_execution_response(Ok(())).await;
+
+    // Must remain InternalError. Translation to FailedPrecondition would
+    // mean the type_url compare was loosened to `!details.is_empty()` or
+    // similar — exactly the regression this test is designed to detect.
+    match execution_response.result.as_ref().expect(
+        "must not translate NotFound with non-PF detail type_url — \
+         string compare is load-bearing",
+    ) {
+        execute_result::Result::InternalError(_) => {}
+        other => panic!(
+            "must not translate NotFound with non-PF detail type_url — \
+             string compare is load-bearing; got {other:?} \
+             (predicate must exact-compare type_url == PRECONDITION_FAILURE_TYPE_URL, \
+             not `!details.is_empty()`)"
+        ),
+    }
+    assert_eq!(
+        execution_response,
+        ExecuteResult {
+            instance_name: INSTANCE_NAME.to_string(),
+            operation_id: String::new(),
+            result: Some(execute_result::Result::InternalError(source_err_clone.into())),
+        }
+    );
+
+    Ok(())
+}
+
 #[cfg(target_family = "unix")]
 #[nativelink_test]
 async fn preconditions_met_extra_envs() -> Result<(), Error> {
