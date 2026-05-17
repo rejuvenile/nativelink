@@ -24,7 +24,10 @@ use bytes::Bytes;
 use nativelink_error::Code;
 use nativelink_macro::nativelink_test;
 use nativelink_util::common::DigestInfo;
-use nativelink_util::streaming_blob::{SLIDING_WINDOW_EVICTION_MARKER, StreamingBlob};
+use nativelink_util::streaming_blob::{
+    SLIDING_WINDOW_EVICTION_MARKER, StreamingBlob, StreamingBlobInner, StreamingBlobReader,
+    StreamingBlobWriter,
+};
 
 const VALID_HASH: &str = "0123456789abcdef000000000000000000010000000000000123456789abcdef";
 
@@ -95,5 +98,57 @@ async fn production_sliding_window_message_contains_marker() {
          FastSlowStore D.1 cross-crate contract — coordinate any change \
          with the predicate at fast_slow_store.rs and the failpoint \
          predicate in fast_slow_store_325_regression_test.rs"
+    );
+}
+
+/// #515 Phase 0 diagnostic-accessor contract: a freshly-constructed
+/// reader records its starting `cursor_chunk_idx` from the current
+/// `earliest_chunk_idx` value at construction time. The accessor is
+/// load-bearing for the FastSlowStore TOCTOU-race instrumentation at
+/// `nativelink-store/src/fast_slow_store.rs:6500` — production grep
+/// on `#515 cursor_chunk_idx race detected` depends on it returning
+/// the actual recorded value, not a re-load that masks the race.
+///
+/// Mutation step: change `cursor_chunk_idx()` in
+/// `streaming_blob.rs` to re-load from `inner.earliest_chunk_idx`
+/// instead of returning `self.cursor_chunk_idx`. The second
+/// assertion below must red-fail with the bespoke message —
+/// re-loading defeats the diagnostic purpose because the reader
+/// won't see the post-construction advance.
+#[nativelink_test]
+async fn cursor_chunk_idx_accessor_returns_construction_time_value() {
+    use std::sync::Arc;
+
+    let digest = DigestInfo::try_new(VALID_HASH, 32).unwrap();
+
+    // Case 1: fresh reader on an untouched buffer sees cursor == 0.
+    let (_writer1, reader1) = StreamingBlob::new(digest, 4);
+    assert_eq!(
+        reader1.cursor_chunk_idx(),
+        0,
+        "freshly-constructed reader on an untouched StreamingBlob must \
+         report cursor_chunk_idx == 0 — the H1 happy-path value"
+    );
+
+    // Case 2: producer fills + evicts BEFORE we construct a reader.
+    // Build a shared inner directly so we can construct the writer
+    // first, drive eviction, then build a fresh reader on the same
+    // inner — mirroring the H1 race shape (reader registers AFTER
+    // producer advanced earliest_chunk_idx).
+    let inner = Arc::new(StreamingBlobInner::new(digest, 4));
+    let writer = StreamingBlobWriter::new(Arc::clone(&inner));
+    writer.send(Bytes::from(vec![0u8; 8])).await.unwrap();
+    writer.send(Bytes::from(vec![1u8; 8])).await.unwrap();
+    // Post-eviction: 8 + 8 > 4 budget, so the first chunk was popped
+    // and `earliest_chunk_idx` advanced to 1.
+    let late_reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+    assert!(
+        late_reader.cursor_chunk_idx() > 0,
+        "reader constructed AFTER the producer's sliding-window eviction \
+         must report cursor_chunk_idx > 0 — this is the diagnostic value \
+         the #515 Phase 0 FSS instrumentation grep correlates with \
+         DataLoss events. Got cursor_chunk_idx={}",
+        late_reader.cursor_chunk_idx()
     );
 }

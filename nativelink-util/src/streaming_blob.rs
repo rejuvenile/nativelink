@@ -618,6 +618,24 @@ impl StreamingBlobReader {
         &self.inner
     }
 
+    /// #515 Phase 0 diagnostic accessor: returns the absolute chunk
+    /// index this reader will read NEXT. Constructed-with value comes
+    /// from `inner.earliest_chunk_idx` at the time of `Self::new`
+    /// (`streaming_blob.rs::StreamingBlobReader::new`). A non-zero
+    /// value at construction time indicates the producer raced ahead
+    /// of the FSS pre-check + eviction triggered between the
+    /// pre-check load at `fast_slow_store.rs:6481` and the
+    /// `StreamingBlobReader::new` call at `:6500` — the H1 TOCTOU.
+    /// Used by FSS to diagnose the splice-corruption class
+    /// (`PrefixContinuity` invariant violation: splice math
+    /// `new_offset = offset + bytes_already_sent` assumes the reader
+    /// started at chunk 0 so `bytes_already_sent` is an absolute
+    /// blob offset; if `cursor_chunk_idx > 0` at construction, that
+    /// assumption fails).
+    pub fn cursor_chunk_idx(&self) -> u64 {
+        self.cursor_chunk_idx
+    }
+
     /// Returns the next chunk of data, waiting if necessary.
     ///
     /// - If the cursor has fallen behind the sliding window,

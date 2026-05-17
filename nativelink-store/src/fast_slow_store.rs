@@ -6478,11 +6478,22 @@ impl StoreDriver for FastSlowStore {
         // For blobs larger than the sliding window, early chunks may
         // have been evicted before we could read them. If our cursor is
         // already past chunk 0, fall back to the slow store directly.
-        let earliest = streaming_inner.earliest_chunk_idx();
-        if earliest > 0 {
+        //
+        // #515 Phase 0: `pre_check_earliest_chunk_idx` is captured here
+        // as the "left edge" of the H1 TOCTOU race window. Producer can
+        // advance `earliest_chunk_idx` between this load and the
+        // `StreamingBlobReader::new` call below (no `.await` between
+        // them, but producer runs on a separate worker thread via
+        // `spawn_populate_producer_with_role` `tokio::spawn`). The
+        // post-construction `cursor_chunk_idx()` query below detects
+        // any such advance and emits a WARN so the diagnostic-only
+        // phase can correlate races with DataLoss events.
+        let pre_check_earliest_chunk_idx = streaming_inner.earliest_chunk_idx();
+        if pre_check_earliest_chunk_idx > 0 {
             debug!(
                 ?key,
-                earliest, "streaming populate: chunks evicted, falling back to slow store"
+                earliest = pre_check_earliest_chunk_idx,
+                "streaming populate: chunks evicted, falling back to slow store"
             );
             let bytes_before = guard.get_bytes_written();
             let res = self
@@ -6498,6 +6509,41 @@ impl StoreDriver for FastSlowStore {
             is_populator_caller, "streaming populate: reading concurrently from populate buffer"
         );
         let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(streaming_inner);
+        // #515 Phase 0 diagnostic: detect the H1 TOCTOU race between
+        // the `earliest > 0` pre-check above (line :6481) and the
+        // reader's internal `earliest_chunk_idx.load` inside
+        // `StreamingBlobReader::new` (`streaming_blob.rs:595`). If the
+        // race fired, the reader starts at chunk `K > 0` and the splice
+        // arithmetic below (`new_offset = offset + bytes_already_sent`)
+        // treats a slice length as an absolute byte offset, producing
+        // a frankenstein hash → `Code::DataLoss` at VerifyStore.
+        //
+        // Phase 0 is OBSERVATION ONLY — no behavior change. WARN level
+        // so post-deploy correlation analysis can grep for the marker
+        // and align with DataLoss events on the same digest.
+        let post_construction_chunk_idx = reader.cursor_chunk_idx();
+        if post_construction_chunk_idx != pre_check_earliest_chunk_idx
+            && post_construction_chunk_idx > 0
+        {
+            let site = if is_populator_caller {
+                "populator_caller"
+            } else {
+                "waiter"
+            };
+            warn!(
+                ?key,
+                site,
+                pre_check_earliest_chunk_idx,
+                post_construction_chunk_idx,
+                offset,
+                ?length,
+                "#515 cursor_chunk_idx race detected at reader_new: \
+                 pre={pre_check_earliest_chunk_idx} post={post_construction_chunk_idx} \
+                 — splice math will be wrong if the reader's chunks \
+                 are subsequently forwarded then a sliding-window \
+                 eviction triggers the D.1 fallback"
+            );
+        }
         let mut pos = 0u64;
         // #500: `end` is `None` when caller wants the unbounded tail
         // (`length=None`). Previously `let end = offset + length.unwrap_or(u64::MAX);`
@@ -6585,6 +6631,32 @@ impl StoreDriver for FastSlowStore {
                             let bytes_already_sent = guard.get_bytes_written();
                             let new_offset = offset + bytes_already_sent;
                             let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
+                            // #515 Phase 0: capture the reader's
+                            // starting cursor at splice time. If
+                            // `starting_chunk_idx > 0`, the chunks
+                            // already forwarded to `guard` were NOT a
+                            // contiguous prefix of the blob (they were
+                            // an interior slice `[chunk_K ..
+                            // chunk_K+M]`), and the splice's
+                            // `new_offset = offset + bytes_already_sent`
+                            // is mis-interpreting a slice length as
+                            // an absolute blob offset → frankenstein
+                            // hash → `Code::DataLoss` at VerifyStore.
+                            // WARN level so the diagnostic-only phase
+                            // can correlate splice firings with
+                            // DataLoss events per digest.
+                            let starting_chunk_idx = reader.cursor_chunk_idx();
+                            warn!(
+                                ?key,
+                                site = "populator_caller",
+                                bytes_already_sent,
+                                new_offset,
+                                ?new_length,
+                                starting_chunk_idx,
+                                "#515 splice firing: cursor_chunk_idx={starting_chunk_idx} \
+                                 at populator-caller splice; if > 0, splice math \
+                                 will hash-mismatch (PrefixContinuity invariant violated)"
+                            );
                             self.metrics
                                 .streaming_buffer_reader_fallback_to_direct_total
                                 .fetch_add(1, Ordering::Relaxed);
@@ -6678,6 +6750,31 @@ impl StoreDriver for FastSlowStore {
                             .iter()
                             .any(|m| m.contains(SLIDING_WINDOW_EVICTION_MARKER));
                     if is_sliding_window_eviction {
+                        // #515 Phase 0: same instrumentation as the
+                        // populator-caller branch above. Waiter shares
+                        // the same `reader` (`StreamingBlobReader::new`
+                        // at :6500 outside this match), so its starting
+                        // cursor is identical, but the WARN here lets
+                        // the diagnostic correlate splice firings on
+                        // the waiter side separately. Phase 0 expects
+                        // production logs to show populator-caller
+                        // splices in the DataLoss-correlated subset
+                        // (per #515 production evidence 2026-05-17);
+                        // a waiter-side splice with `cursor_chunk_idx > 0`
+                        // would confirm the H4 sibling-path variant
+                        // also fires.
+                        let starting_chunk_idx = reader.cursor_chunk_idx();
+                        warn!(
+                            ?key,
+                            site = "waiter",
+                            bytes_already_sent,
+                            new_offset,
+                            ?new_length,
+                            starting_chunk_idx,
+                            "#515 splice firing: cursor_chunk_idx={starting_chunk_idx} \
+                             at waiter splice; if > 0, splice math will \
+                             hash-mismatch (PrefixContinuity invariant violated)"
+                        );
                         self.metrics
                             .streaming_buffer_reader_fallback_to_direct_waiter_total
                             .fetch_add(1, Ordering::Relaxed);
