@@ -216,3 +216,14 @@ required-features = ["chunked_fast_slow", "test-utils"]
 [[test]]
 name = "chunked_inflight_cancel_safety_test"
 required-features = ["chunked_fast_slow"]
+
+# #247+#477 writer-site `info!` log-contract tests. The replacement v1
+# production-composition test uses the `_for_test` constructor on
+# `ChunkedWriteHandler` (gated behind `test-utils`); the FSS guard tests
+# use the `chunked_fast_slow` feature. File-level
+# `#![cfg(feature = "chunked_fast_slow")]` would silently skip the file
+# on missing features (auditor MAJOR; cargo otherwise reports "0 tests");
+# the `required-features` declaration surfaces a "test skipped" message.
+[[test]]
+name = "writer_site_logs_test"
+required-features = ["chunked_fast_slow", "test-utils"]

@@ -350,3 +350,12 @@ required-features = ["chunked_fast_slow"]
 [[test]]
 name = "completeness_checking_pin_accumulation_test"
 required-features = ["test-utils", "chunked_fast_slow"]
+
+# #247/#477 BLOCK-B log-visibility regression tests. File-level
+# `#![cfg(feature = "chunked_fast_slow")]` would silently skip the file
+# on missing features (auditor MAJOR; cargo otherwise reports "0 tests");
+# the `required-features` declaration surfaces the standard "test
+# skipped (missing required features)" message.
+[[test]]
+name = "fast_slow_block_b_log_visibility_test"
+required-features = ["chunked_fast_slow"]
