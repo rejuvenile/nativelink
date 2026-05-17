@@ -451,4 +451,53 @@ EventualConsistencyStrong ==
          /\ readerState[r] = "ReaderIdle")
             ~> (readerState[r] = "ReaderDoneBytes")
 
+\* ===== Structural invariants that hold by construction in this bugged
+\* module — listed in `ChunkRaceReadersBuggedH3Fixed.cfg` to give the
+\* gate's "Fixed" classification real coverage (otherwise the cfg only
+\* asserted TypeOK, which is a degenerate Fixed-side check per the
+\* invariant-prover review's MAJOR-2). These hold INDEPENDENT of the
+\* H3 hazard (the missing EvictingMapInsert) because none of them
+\* reference `evictingMap` in their antecedent. =====
+
+\* commitDoneFlag is monotone: once TRUE, never returns to FALSE.
+\* (No transition ever sets commitDoneFlag back to FALSE.)
+CommitDoneFlagSticksTrue ==
+    \* Type-level statement: commitDoneFlag is in {FALSE, TRUE}.
+    \* Behavioral statement is via [][...]_vars; here we assert
+    \* a state predicate that holds at every state under Init:
+    \* if commitDoneFlag is TRUE, commitResult is one of the three
+    \* terminal results (NoResult appears only at Init).
+    commitDoneFlag => commitResult \in {"OkResult", "ErrResult", "CancelledResult"}
+
+\* runnerWriter is only NULL when commitRunning is FALSE OR when the
+\* runner has been guard-dropped (RunnerGuardDropCancelled sets it to
+\* NULL on the way to setting commitRunning=FALSE).
+RunnerWriterAssignmentDiscipline ==
+    \* If commitRunning is TRUE and the runner hasn't been guard-dropped,
+    \* runnerWriter must be a writer in the spec, not NULL.
+    (commitRunning /\ commitResult # "CancelledResult") =>
+        runnerWriter # NULL
+
+\* A writer in Done state has either (a) been the commit runner that
+\* published, or (b) is one of the AwaitCommit writers that observed
+\* the commit's result. Either way, commitDoneFlag must be TRUE.
+WriterDoneImpliesCommitDone ==
+    \A w \in Writers :
+        writerState[w] = "Done" => commitDoneFlag
+
+\* chunksInFlight is disjoint from chunksPresent post-commit: any chunk
+\* in chunksPresent has had its pwrite resolved (PwriteSucceed removed
+\* the writer from chunksInFlight[c]).
+ChunksInFlightDisjointFromPresent ==
+    \A c \in Chunks :
+        c \in chunksPresent =>
+            chunksInFlight[c] = {}
+
+\* Reader observation invariant: any reader in a terminal state has
+\* recorded an observation (other than "NotYetIssued").
+ReaderTerminalHasObservation ==
+    \A r \in Readers :
+        readerState[r] \in ReaderTerminalStates =>
+            readerObserved[r] # "NotYetIssued"
+
 ============================================================================

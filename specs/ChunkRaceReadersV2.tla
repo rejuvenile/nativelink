@@ -58,7 +58,7 @@
 (*     `Aborted+BackpressureSignal{retry_after_ms=250}` polling-retry to a *)
 (*     Notify-based wait on the per-digest `commit_done` primitive via    *)
 (*     `await_inflight_commit_with_watchdog`                              *)
-(*     (`chunked_write_handler.rs:3997+`). The waiter blocks up to        *)
+(*     (`chunked_write_handler.rs:4299`). The waiter blocks up to        *)
 (*     `CHUNKED_COMMIT_WATCHDOG_SECS` (60 s) and then surfaces a          *)
 (*     watchdog-tagged `DeadlineExceeded`. Spec correspondence:           *)
 (*     `WatchdogFires(w)` already models the timeout transition; the      *)

@@ -21,7 +21,7 @@
       delivered through the producer's `tx.drop` path was observed at the
       reader as `Ok(empty)` and forwarded to Bazel — a silent-zero read
       shape that misclassified as "blob exists, is empty" instead of
-      NotFound. Spec correspondence: `BuggedNoSilentZero` cfg disables
+      NotFound. Spec correspondence: `BuggedSilentZero` cfg disables
       the producer-side `Err` propagation; safety invariant
       `NoSilentZeroToReader` red-fails.
     [#502 8e6be6d7, 2026-05-16]
@@ -30,9 +30,52 @@
       `bytes_written < expected_size`. Pre-fix: a `send_eof` after a
       short-byte send returned `Ok(Bytes::new())` to every consumer; Bazel
       saw a clean stream with truncated bytes and reported digest mismatch
-      as a build failure. Spec correspondence: `BuggedNoShortShield` cfg
-      disables the silent-short check at the reader boundary; safety
-      invariant `NoSilentShortToReader` red-fails.
+      as a build failure. Spec correspondence: `Bugged` cfg disables the
+      silent-short check at the reader boundary; safety invariant
+      `NoSilentShortToReader` red-fails.
+
+  TWO DISTINCT PRODUCTION SEAMS — SEAM A vs SEAM B
+    The post-#500 propagation is NOT a single boolean — it is the
+    composition of two distinct state slots in two different files:
+
+      Seam A: `StreamingBlobInner::terminal` (a `Mutex<Option<Result<(),
+              Error>>>` slot set by `send_error()` at
+              `streaming_blob.rs:450` and the Drop impl at
+              `streaming_blob.rs:489`). The writer-side terminal slot.
+
+      Seam B: `state.maybe_get_part_result` (a `Option<Result<(), Error>>`
+              local to `inner_read::process_one`, populated when
+              `get_part_fut.await` resolves at
+              `bytestream_server.rs:1855`). The reader-side classifier
+              consults this slot at `:1748` to refuse `Ok(empty)`-on-EOF.
+
+    Production race window: the `tokio::select!` at `:1726-1867` chooses
+    which future to poll next non-deterministically. If `consume_fut`
+    (returning `Ok(empty)` because the producer dropped `tx`) wins the
+    select arm BEFORE `get_part_fut` (returning `Err`) does, then
+    `state.maybe_get_part_result` is still `None` at the #500 check at
+    `:1748`, and the Err is NOT propagated for THIS poll. The reader's
+    THIS `next_chunk` call returns `None` (clean EOF). The race window
+    is acknowledged in the production code's own comment at
+    `bytestream_server.rs:1856-1866` and in #500's commit message
+    (ee13bee0): "Addresses one of multiple candidate mechanisms".
+
+    This spec models the seam split via TWO state variables:
+      - `writerTerminalErr`  — Seam A: writer-side `terminal` is Err.
+      - `seamBPropagated`    — Seam B: classifier has consumed the
+                                Err from `state.maybe_get_part_result`.
+
+    Seam A is set atomically with the writer's terminal action
+    (`WriterSendError` / `WriterDropWithoutEof`). Seam B is set by a
+    SEPARATE non-deterministic action `SeamBObservesProducerErr` that
+    fires under `SilentZeroPropOn=TRUE` AND `writerTerminalErr=TRUE`.
+
+    Fairness `WF_vars(SeamBObservesProducerErr)` guarantees that under
+    fairness the propagation eventually fires — so the LIVENESS form
+    `PostFixErrPropagationReachesReaderEventually` holds. The SAFETY
+    form (every reader observation sees the propagation) does NOT hold,
+    matching the production race window. The composite remains a known
+    gap that the per-RPC arm-race closure work tracks.
 
   PRODUCTION SHAPE
     * Single writer per blob (production: `StreamingBlobWriter::new` is
@@ -94,7 +137,7 @@
   VERIFIED AGAINST origin/main: 8e6be6d7 (2026-05-16)
  ***************************************************************************)
 
-EXTENDS Naturals, FiniteSets, Sequences, TLC
+EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
     Readers,            \* Set of reader ids, e.g. {r1, r2, r3}
@@ -184,14 +227,22 @@ VARIABLES
     \* Per-reader state.
     readerState,        \* Readers -> ReaderStates
     readerCursor,       \* Readers -> Nat: next chunk to read
-    \* Whether the producer-side error has been "seen" by the
-    \* read-side classifier (i.e. propagated through the
-    \* `inner_read::consume_ok_eof` seam). Toggled by
-    \* WriterDropWithoutEof and WriterSendError when SilentZeroPropOn.
-    producerErrPropagated  \* BOOLEAN
+    \* Seam A: writer-side `StreamingBlobInner::terminal` is Err.
+    \* Set by WriterSendError / WriterDropWithoutEof at the same instant
+    \* as `writerState' = DoneErr / DoneDropped`. Independent of whether
+    \* the bytestream_server classifier has yet observed the error.
+    writerTerminalErr,     \* BOOLEAN
+    \* Seam B: bytestream_server's `state.maybe_get_part_result` slot has
+    \* been populated with the producer's Err (i.e. `get_part_fut.await`
+    \* resolved AND `consume_ok_eof` picked it up via the `take()` at
+    \* `bytestream_server.rs:1748`). Set ONLY by the separate
+    \* `SeamBObservesProducerErr` action, NOT atomically with Seam A.
+    \* Models the per-RPC select-arm race the #500 commit's "addresses
+    \* one of multiple candidate mechanisms" hedge refers to.
+    seamBPropagated        \* BOOLEAN
 
 vars == <<writerState, chunkCount, bytesWritten, terminal,
-          readerState, readerCursor, producerErrPropagated>>
+          readerState, readerCursor, writerTerminalErr, seamBPropagated>>
 
 \* Expected total bytes the writer DECLARED it would write. This is the
 \* digest's `size_bytes()` in production; modeled as the abstract
@@ -208,7 +259,8 @@ Init ==
     /\ terminal      = "None"
     /\ readerState   = [r \in Readers |-> "Idle"]
     /\ readerCursor  = [r \in Readers |-> 0]
-    /\ producerErrPropagated = FALSE
+    /\ writerTerminalErr = FALSE
+    /\ seamBPropagated   = FALSE
 
 ----------------------------------------------------------------------------
 (* WRITER ACTIONS                                                          *)
@@ -227,16 +279,16 @@ WriterSendChunk ==
     /\ chunkCount < NumChunks
     /\ chunkCount'   = chunkCount + 1
     /\ bytesWritten' = bytesWritten + 1   \* ChunkSize = 1
-    /\ UNCHANGED <<writerState, terminal,
-                   readerState, readerCursor, producerErrPropagated>>
+    /\ UNCHANGED <<writerState, terminal, readerState, readerCursor,
+                   writerTerminalErr, seamBPropagated>>
 
 WriterSendEofFull ==
     /\ writerState = "Active"
     /\ chunkCount = NumChunks
     /\ writerState' = "DoneOkFull"
     /\ terminal'    = "Ok"
-    /\ UNCHANGED <<chunkCount, bytesWritten,
-                   readerState, readerCursor, producerErrPropagated>>
+    /\ UNCHANGED <<chunkCount, bytesWritten, readerState, readerCursor,
+                   writerTerminalErr, seamBPropagated>>
 
 WriterShortEof ==
     /\ AllowShortEof
@@ -244,34 +296,56 @@ WriterShortEof ==
     /\ chunkCount < NumChunks
     /\ writerState' = "DoneOkShort"
     /\ terminal'    = "Ok"
-    /\ UNCHANGED <<chunkCount, bytesWritten,
-                   readerState, readerCursor, producerErrPropagated>>
+    /\ UNCHANGED <<chunkCount, bytesWritten, readerState, readerCursor,
+                   writerTerminalErr, seamBPropagated>>
 
+\* Seam A — writer's `terminal` slot becomes Err via `send_error()`.
+\* Does NOT touch Seam B; the bytestream_server classifier observes
+\* propagation via the separate `SeamBObservesProducerErr` action.
 WriterSendError ==
     /\ AllowErrEof
     /\ writerState = "Active"
     /\ writerState' = "DoneErr"
     /\ terminal'    = "Err"
-    \* #500 propagation: producer's Err makes it through to the
-    \* read-side classifier's `consume_ok_eof` seam. Under
-    \* SilentZeroPropOn=TRUE the classifier consults the Err slot
-    \* and surfaces Err to the reader; under FALSE it does not, so a
-    \* reader hitting a 0-byte chunk-count terminal Ok would see
-    \* `Ok(empty)` as a silent zero.
-    /\ producerErrPropagated' = SilentZeroPropOn
-    /\ UNCHANGED <<chunkCount, bytesWritten, readerState, readerCursor>>
+    /\ writerTerminalErr' = TRUE
+    /\ UNCHANGED <<chunkCount, bytesWritten, readerState, readerCursor,
+                   seamBPropagated>>
 
+\* Seam A — writer's `terminal` slot becomes Err via the Drop impl
+\* synthesizing "writer dropped without sending EOF".
+\* Does NOT touch Seam B; same as WriterSendError.
 WriterDropWithoutEof ==
     /\ AllowDropWithoutEof
     /\ writerState = "Active"
     /\ writerState' = "DoneDropped"
     /\ terminal'    = "Err"
-    \* Drop impl fires a terminal Err carrying
-    \* "writer dropped without sending EOF". Same propagation gate as
-    \* WriterSendError: pre-#500 the seam swallowed Err -> silent-zero
-    \* shape; post-#500 the seam propagates Err.
-    /\ producerErrPropagated' = SilentZeroPropOn
-    /\ UNCHANGED <<chunkCount, bytesWritten, readerState, readerCursor>>
+    /\ writerTerminalErr' = TRUE
+    /\ UNCHANGED <<chunkCount, bytesWritten, readerState, readerCursor,
+                   seamBPropagated>>
+
+\* Seam B — `inner_read::consume_ok_eof` consumes the producer's Err
+\* from `state.maybe_get_part_result` via `take()` at
+\* `bytestream_server.rs:1748`. Models the per-RPC select-arm race
+\* where `get_part_fut.await` resolves AND its result is observed by
+\* the classifier (i.e. `get_part_fut` wins the select arm BEFORE
+\* `consume_fut` returns `Ok(empty)`). Gated on the #500 propagation
+\* flag — pre-#500, this action was effectively never enabled because
+\* the classifier did not consult the slot at all.
+\*
+\* The non-determinism (TLC can interleave a reader's terminal
+\* observation BEFORE this action fires, modeling the race-loser case
+\* where `consume_fut` returns `Ok(empty)` first and the classifier
+\* misses the Err for THIS poll). Under WF fairness this action is
+\* guaranteed to fire eventually, so the LIVENESS form of propagation
+\* holds; the SAFETY form does NOT, matching the residual race window
+\* the #500 commit message acknowledged as a candidate.
+SeamBObservesProducerErr ==
+    /\ SilentZeroPropOn
+    /\ writerTerminalErr
+    /\ ~seamBPropagated
+    /\ seamBPropagated' = TRUE
+    /\ UNCHANGED <<writerState, chunkCount, bytesWritten, terminal,
+                   readerState, readerCursor, writerTerminalErr>>
 
 ----------------------------------------------------------------------------
 (* READER ACTIONS                                                          *)
@@ -302,7 +376,7 @@ ReaderSubscribe(r) ==
     /\ readerState' = [readerState EXCEPT ![r] = "Subscribed"]
     /\ readerCursor' = [readerCursor EXCEPT ![r] = 0]
     /\ UNCHANGED <<writerState, chunkCount, bytesWritten, terminal,
-                   producerErrPropagated>>
+                   writerTerminalErr, seamBPropagated>>
 
 \* Reader has a chunk available at its cursor; consume it.
 ReaderConsumeChunk(r) ==
@@ -310,7 +384,7 @@ ReaderConsumeChunk(r) ==
     /\ readerCursor[r] < chunkCount
     /\ readerCursor' = [readerCursor EXCEPT ![r] = @ + 1]
     /\ UNCHANGED <<writerState, chunkCount, bytesWritten, terminal,
-                   readerState, producerErrPropagated>>
+                   readerState, writerTerminalErr, seamBPropagated>>
 
 \* Reader has consumed up to cursor=chunkCount and there is no terminal
 \* yet; it parks on the watch channel.
@@ -320,7 +394,7 @@ ReaderWait(r) ==
     /\ terminal = "None"
     /\ readerState' = [readerState EXCEPT ![r] = "Waiting"]
     /\ UNCHANGED <<writerState, chunkCount, bytesWritten, terminal,
-                   readerCursor, producerErrPropagated>>
+                   readerCursor, writerTerminalErr, seamBPropagated>>
 
 \* Reader was Waiting; a notify woke it (or a fresh chunk is now
 \* available, or terminal flipped). Transition back to Subscribed.
@@ -330,7 +404,7 @@ ReaderWakeUp(r) ==
        \/ terminal # "None"
     /\ readerState' = [readerState EXCEPT ![r] = "Subscribed"]
     /\ UNCHANGED <<writerState, chunkCount, bytesWritten, terminal,
-                   readerCursor, producerErrPropagated>>
+                   readerCursor, writerTerminalErr, seamBPropagated>>
 
 \* Reader's notify wait exceeded the bound; surface a synthetic
 \* DeadlineExceeded. This is the streaming_blob_notify_timeout path
@@ -342,17 +416,41 @@ ReaderNotifyTimeoutAbort(r) ==
     /\ readerState[r] = "Waiting"
     /\ readerState' = [readerState EXCEPT ![r] = "TimedOut"]
     /\ UNCHANGED <<writerState, chunkCount, bytesWritten, terminal,
-                   readerCursor, producerErrPropagated>>
+                   readerCursor, writerTerminalErr, seamBPropagated>>
 
 \* The reader observes the terminal state. Cursor must have caught up
 \* to chunkCount (or have seen at most chunkCount; the spec's cursor
 \* never advances past chunkCount). Classify per #500 / #502 rules.
 \* Helper: classify the outcome for a reader observing the terminal
 \* state given current bytesWritten / terminal / shield+prop flags.
-\* Uses nested IF/ELSE (rather than nested CASE) because TLC's CASE
-\* operator does not propagate values through nested-CASE branches
-\* reliably in all evaluation orders — IF/THEN/ELSE chains are total
-\* and always reduce to a defined value.
+\*
+\* Rationale for IF/THEN/ELSE chain (NOT a nested CASE):
+\*   This helper is called only when `terminal # "None"` is guaranteed
+\*   by the caller `ReaderObserveTerminal` precondition. An earlier
+\*   draft attempted a nested CASE with arms keyed on `terminal = "Ok"`
+\*   vs `terminal = "Err"`, and TLC reported "Attempted to evaluate a
+\*   CASE with no conditions true". The cause was a SPEC BUG, not a
+\*   TLC quirk: the outer CASE's catch-all `OTHER` arm needed to handle
+\*   the impossible `terminal = "None"` branch (impossible by caller
+\*   precondition, but TLC's evaluator does not propagate the caller's
+\*   precondition into the helper's case analysis). Either:
+\*     (a) the helper would need `OTHER -> "Unreachable"` plus an
+\*         invariant asserting that branch is never reached, or
+\*     (b) the helper folds the terminal-Ok/Err split into a single
+\*         total IF/THEN/ELSE chain whose final `ELSE` branch covers
+\*         `terminal = "Err"` (the only remaining case by caller
+\*         precondition).
+\*   Option (b) is chosen for compactness; it does NOT cover up a real
+\*   reachable state — the caller precondition `terminal # "None"`
+\*   eliminates the "None" branch. Reviewers verify by reading
+\*   `ReaderObserveTerminal` immediately below: the helper is invoked
+\*   only when `terminal # "None"`.
+\*
+\* Seam B consultation: the terminal=Err branch consults `seamBPropagated`
+\* (not `writerTerminalErr`). The bytestream_server classifier folds
+\* Err propagation from `state.maybe_get_part_result` ONLY when seam B
+\* has fired; otherwise the reader misses the propagation on THIS poll
+\* (race-loser case). See PostFix*ReachesReader* invariants below.
 ReaderTerminalOutcome ==
     IF terminal = "Ok" /\ bytesWritten = ExpectedBytes
         THEN "DoneOk"
@@ -362,8 +460,8 @@ ReaderTerminalOutcome ==
              ELSE IF bytesWritten = 0
                 THEN "DoneSilentZero"
              ELSE "DoneSilentShort"
-    ELSE   \* terminal = "Err"
-        IF producerErrPropagated
+    ELSE   \* terminal = "Err" by caller precondition; "None" unreachable.
+        IF seamBPropagated
             THEN "DoneErr"
         ELSE IF bytesWritten = 0
             THEN "DoneSilentZero"
@@ -375,7 +473,7 @@ ReaderObserveTerminal(r) ==
     /\ terminal # "None"
     /\ readerState' = [readerState EXCEPT ![r] = ReaderTerminalOutcome]
     /\ UNCHANGED <<writerState, chunkCount, bytesWritten, terminal,
-                   readerCursor, producerErrPropagated>>
+                   readerCursor, writerTerminalErr, seamBPropagated>>
 
 ----------------------------------------------------------------------------
 (* Next                                                                    *)
@@ -386,6 +484,7 @@ Next ==
     \/ WriterShortEof
     \/ WriterSendError
     \/ WriterDropWithoutEof
+    \/ SeamBObservesProducerErr
     \/ \E r \in Readers : ReaderSubscribe(r)
     \/ \E r \in Readers : ReaderConsumeChunk(r)
     \/ \E r \in Readers : ReaderWait(r)
@@ -424,6 +523,12 @@ Spec ==
     /\ [][Next]_vars
     /\ WF_vars(WriterSendChunk)
     /\ WF_vars(WriterTerminationDisjunct)
+    \* Seam B propagation is fair: under fairness the bytestream_server
+    \* classifier eventually observes the producer's Err. The Liveness
+    \* form of `PostFixErrPropagationReachesReader*` holds under WF; the
+    \* Safety form does NOT (an interleaved reader may observe terminal
+    \* before SeamB fires, modeling the per-RPC race-loser case).
+    /\ WF_vars(SeamBObservesProducerErr)
     /\ \A r \in Readers : WF_vars(ReaderSubscribe(r))
     /\ \A r \in Readers : WF_vars(ReaderConsumeChunk(r))
     /\ \A r \in Readers : WF_vars(ReaderWait(r))
@@ -441,12 +546,27 @@ TypeOK ==
     /\ terminal     \in {"None", "Ok", "Err"}
     /\ \A r \in Readers : readerState[r] \in ReaderStates
     /\ \A r \in Readers : readerCursor[r] \in 0..NumChunks
-    /\ producerErrPropagated \in BOOLEAN
+    /\ writerTerminalErr \in BOOLEAN
+    /\ seamBPropagated   \in BOOLEAN
 
-\* Writer-side: chunkCount = bytesWritten when ChunkSize = 1. Also:
-\* bytesWritten <= chunkCount whenever ChunkSize >= 1.
-BytesWrittenMatchesChunkCount ==
-    bytesWritten = chunkCount
+\* Bound (not tautology). The spec abstracts each chunk send as a SINGLE
+\* atomic action that increments chunkCount AND bytesWritten together.
+\* Production has TWO independent AtomicU64s
+\* (`StreamingBlobInner::chunk_count` + `bytes_written`) incremented at
+\* different points in `send_chunk`; a code change that swaps the
+\* increment order could open a transient window where a reader sees
+\* chunkCount=N+1 but bytesWritten=N. THIS SPEC DOES NOT MODEL THAT
+\* ATOMICS-ORDERING HAZARD. The invariant below is a structural bound
+\* on bytesWritten that does NOT prove the atomics are co-ordered;
+\* it only proves the spec's abstraction stays well-typed (bytesWritten
+\* tracks chunkCount in the spec's single-atomic-action model).
+\*
+\* Equality holds because ChunkSize=1 and writes happen atomically;
+\* production's two-atomic split would need a separate spec that
+\* models chunkCount and bytesWritten as separable transitions. See
+\* the audit's "Phase 5 — outstanding gaps" entry for this gap.
+BytesWrittenBoundedByChunkCount ==
+    bytesWritten <= chunkCount
 
 \* No reader cursor advances past chunkCount (every read corresponds
 \* to a previously appended chunk).
@@ -469,12 +589,39 @@ NoSilentShortToReader ==
 NoCorruptBytesToReader ==
     \A r \in Readers : readerState[r] # "DoneCorrupt"
 
-\* Composite invariant: under the post-fix composition
-\* (ShortShieldOn AND SilentZeroPropOn), every terminated reader is
-\* in one of {DoneOk, DoneErr, TimedOut} — i.e. there is no class of
-\* observation that looks like "success" but isn't.
-PostFixReaderOutcomeIsTwoWay ==
-    (ShortShieldOn /\ SilentZeroPropOn) =>
+\* Composite "no-silent under post-fix" CANNOT be expressed as a state
+\* invariant in this spec because the spec now models the per-RPC race:
+\* a reader observation at a state where `seamBPropagated=FALSE` can
+\* legitimately reach `DoneSilent*` even with both defenses on. Once
+\* `seamBPropagated` flips TRUE in a LATER state, no STATE invariant
+\* can retroactively exclude the already-terminal reader from Silent*.
+\*
+\* The honest formulation:
+\*   - SAFETY: NONE that excludes Silent* under post-fix in the Fixed
+\*     cfg. (See `PostFixReaderOutcomeIsTwoWayIfSeamBFired` for a
+\*     CONDITIONAL form that does NOT hold under the race model and
+\*     is therefore commented OUT from the Fixed cfg's INVARIANTS list.)
+\*   - LIVENESS: `PostFixErrPropagationReachesReaderEventually` —
+\*     under WF on SeamBObservesProducerErr, the seam fires under
+\*     fairness, so any reader subscribing AFTER SeamB fires reaches
+\*     DoneErr. Reader-side terminal-observation actions are fair too,
+\*     so under repeated invocation, the leads-to is satisfied.
+\*
+\* OUT-OF-SCOPE: closing the per-RPC tokio::select! arm-ordering race
+\* at `bytestream_server.rs:1726-1867`. The #500 commit message hedges
+\* this as "one of multiple candidate mechanisms"; closing it requires
+\* either (a) eliminating the `consume_fut` Ok(empty)/get_part_fut Err
+\* race entirely or (b) reaching a hypothetically race-free classifier
+\* that consults the same atomic state as `next_chunk`. Both are
+\* outside this spec's scope.
+\*
+\* This conditional form is here as DOCUMENTATION of the strongest
+\* safety claim that would hold IF the per-RPC race were closed in
+\* production. It is NOT listed in any cfg's INVARIANTS — running it
+\* would (correctly) red-fail in Fixed.cfg because the spec models
+\* the race.
+PostFixReaderOutcomeIsTwoWayIfSeamBFired ==
+    (ShortShieldOn /\ SilentZeroPropOn /\ seamBPropagated) =>
         \A r \in Readers :
             readerState[r] \in ReaderTerminalStates =>
                 readerState[r] \in {"DoneOk", "DoneErr", "TimedOut"}
@@ -488,14 +635,15 @@ ReaderOkImpliesWriterFullOk ==
         readerState[r] = "DoneOk" =>
             writerState = "DoneOkFull"
 
-\* Composite invariant: a producer that drops or errors AND a reader
-\* that subscribed before terminal is observed must, post-fix, reach
-\* DoneErr (not silent-zero, not silent-short, not eternal park).
-\* Encoded as a state predicate: no terminated reader is in
-\* DoneSilentZero/DoneSilentShort when SilentZeroPropOn is TRUE and
-\* the writer ended via SendError or DropWithoutEof.
-PostFixErrPropagationReachesReader ==
-    (SilentZeroPropOn /\ writerState \in {"DoneErr", "DoneDropped"}) =>
+\* As with `PostFixReaderOutcomeIsTwoWayIfSeamBFired`, this conditional
+\* form does NOT hold under the race model and is NOT listed in any
+\* cfg's INVARIANTS. Documented here as the strongest safety claim
+\* that would hold IF the per-RPC race were closed in production.
+\* The leads-to companion (under WF_vars(SeamBObservesProducerErr))
+\* is `PostFixErrPropagationReachesReaderEventually` below.
+PostFixErrPropagationReachesReaderIfSeamBFired ==
+    (SilentZeroPropOn /\ writerState \in {"DoneErr", "DoneDropped"}
+       /\ seamBPropagated) =>
         \A r \in Readers :
             readerState[r] \in ReaderTerminalStates =>
                 readerState[r] \notin {"DoneSilentZero", "DoneSilentShort"}
@@ -550,5 +698,20 @@ NoEternalParkAfterWriterDone ==
                           "DoneDropped"}
          /\ readerState[r] \in {"Subscribed", "Waiting"})
             ~> (readerState[r] \in ReaderTerminalStates)
+
+\* The eventual form of #500 propagation: when the writer has set
+\* `writerTerminalErr` (Seam A) under post-#500 propagation enabled,
+\* the bytestream_server classifier (Seam B) eventually consumes the
+\* Err. Under fairness `WF_vars(SeamBObservesProducerErr)` this holds.
+\*
+\* Reviewer guarantee: this property only proves that the seam
+\* EVENTUALLY fires — it does NOT prove that EVERY reader observation
+\* sees the post-fire state. The race-loser case (reader observes
+\* terminal=Err before SeamB fires) is admitted by the safety form,
+\* by design. See `PostFixReaderOutcomeIsTwoWayIfSeamBFired` for the
+\* conditional safety form.
+PostFixErrPropagationReachesReaderEventually ==
+    (SilentZeroPropOn /\ writerTerminalErr)
+        ~> seamBPropagated
 
 ============================================================================
