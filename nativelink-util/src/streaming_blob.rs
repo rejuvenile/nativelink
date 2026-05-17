@@ -28,9 +28,32 @@ use bytes::Bytes;
 use nativelink_error::{Code, Error, make_err};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::watch;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::common::DigestInfo;
+
+/// #515 Phase 0 expansion: per-reader construction sample counter.
+/// Each `StreamingBlobReader::new` call increments this counter; the
+/// `info!` construction-sample log fires only when the counter is a
+/// multiple of `READER_CONSTRUCTION_SAMPLE_PERIOD`. Production
+/// `StreamingBlobReader::new` is called at least once per ByteStream
+/// RPC (`bytestream_server.rs:1421` `InFlightBlobMap::get_reader` →
+/// `StreamingBlobReader::new`) plus once per FSS streaming-populate
+/// fan-out (`fast_slow_store.rs:6500`); on buildcache this is thousands
+/// of calls per second under build load. Always-on `info!` would
+/// dominate the log volume; sampling provides a baseline distribution
+/// for "how often does construction-time `earliest_chunk_idx > 0`
+/// happen normally?" without saturating the log pipeline. WARN-level
+/// races at the FSS site (`fast_slow_store.rs:6500-6544`) and the
+/// `next_chunk` H_alt_I site (`streaming_blob.rs:680/695`) remain
+/// always-on — those are the diagnostic-critical signals.
+static READER_CONSTRUCTION_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Sample period for `READER_CONSTRUCTION_SAMPLE_COUNTER`. 1024 picks
+/// one construction in every ~1k; on a ~10k-construction/sec workload
+/// that is ~10 `info!` lines per second — bounded but dense enough to
+/// see the distribution of construction-time `earliest_chunk_idx`
+/// values in a few minutes of soak.
+const READER_CONSTRUCTION_SAMPLE_PERIOD: u64 = 1024;
 
 /// Maximum time `StreamingBlobReader::next_chunk` will block on a single
 /// `Notified` await before declaring the producer wedged. Generous enough
@@ -602,6 +625,31 @@ impl StreamingBlobReader {
         // current channel version (post-fire for late subscribers),
         // defeating the late-subscriber fix.
         let notify_rx = inner.notify_rx_template.clone();
+        // #515 Phase 0 expansion: per-reader construction sample.
+        // Records `starting_chunk_idx` (which equals the observed
+        // `earliest_chunk_idx` from the load above) plus the digest, so
+        // a 24 h soak yields a baseline distribution of
+        // construction-time cursor values. Independent of the FSS-site
+        // WARN at `fast_slow_store.rs:6500` — DS-reviewer / red-team
+        // flagged that the WARN-only path leaves no signal for "how
+        // common is `cursor_chunk_idx > 0` at construction OUTSIDE of
+        // the FSS pre-check path?" (e.g. the `bytestream_server.rs:1421`
+        // `InFlightBlobMap::get_reader` path which DOES tolerate
+        // `> 0` and falls through). Sampling-gated to keep volume
+        // bounded (see `READER_CONSTRUCTION_SAMPLE_PERIOD` docs).
+        let sample_idx =
+            READER_CONSTRUCTION_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if sample_idx % READER_CONSTRUCTION_SAMPLE_PERIOD == 0 {
+            info!(
+                site = "reader_new",
+                digest = %inner.digest,
+                starting_chunk_idx = earliest,
+                earliest_chunk_idx_at_construction = earliest,
+                sample_idx,
+                sample_period = READER_CONSTRUCTION_SAMPLE_PERIOD,
+                "#515 StreamingBlobReader::new construction sample"
+            );
+        }
         Self {
             inner,
             cursor_chunk_idx: earliest,
@@ -693,6 +741,47 @@ impl StreamingBlobReader {
             // Check if a chunk is available at our cursor position.
             if self.cursor_chunk_idx < chunk_count {
                 let chunks = self.inner.chunks.read();
+                // #515 Phase 0 expansion: H_alt_I race detection. Red-team
+                // (`.claude/reviews/agent-515-dataloss-design/red-team.md`
+                // section "H_alt_I") identified a TOCTOU between the
+                // `earliest` load above and the `chunks.read()` lock
+                // acquisition immediately above: the producer's
+                // `earliest_chunk_idx.fetch_add` (`streaming_blob.rs:414`,
+                // inside the sliding-window pop_front loop) can fire in
+                // that window, leaving `earliest` stale. The stale value
+                // is then used to compute `deque_idx = cursor - earliest`,
+                // which addresses the WRONG chunk for the cursor's
+                // absolute index — `chunks.get(deque_idx)` returns
+                // `Some(wrong_chunk)`, the reader emits that wrong chunk
+                // as the canonical bytes for `cursor`, and the downstream
+                // hash check (VerifyStore) fires `Code::DataLoss` with the
+                // frankenstein-bytes signature observed at
+                // `5ed2efd4 14:15` (chunk 12 / 36 MiB splice).
+                //
+                // This race is NOT closed by Approach A (the FSS
+                // construction-time fix). It is also NOT observed by the
+                // existing FSS-site WARN at `fast_slow_store.rs:6500`.
+                // OBSERVATION ONLY — we re-load `earliest` AFTER acquiring
+                // the `chunks.read()` lock and compare; the diagnostic
+                // computes `deque_idx` from the ORIGINAL `earliest`
+                // (preserving production semantics, no behavior change).
+                let post_lock_earliest =
+                    self.inner.earliest_chunk_idx.load(Ordering::Acquire);
+                if post_lock_earliest != earliest {
+                    warn!(
+                        site = "next_chunk_internal",
+                        digest = %self.inner.digest,
+                        cursor_chunk_idx = self.cursor_chunk_idx,
+                        pre_earliest_chunk_idx = earliest,
+                        post_earliest_chunk_idx = post_lock_earliest,
+                        chunk_count,
+                        chunks_consumed = self.chunks_consumed,
+                        "#515 H_alt_I race detected at next_chunk: \
+                         earliest_chunk_idx advanced between gate and \
+                         chunks.read() lock; chunks.get(deque_idx) may \
+                         return WRONG chunk for cursor's absolute index"
+                    );
+                }
                 // Convert absolute index to deque-relative index.
                 let deque_idx = (self.cursor_chunk_idx - earliest) as usize;
                 if let Some(chunk) = chunks.get(deque_idx) {
@@ -968,6 +1057,14 @@ impl StreamingBlob {
     ///
     /// Returns a writer (single owner) and the first reader.  Additional
     /// readers can be created via `new_reader`.
+    ///
+    /// #515 Phase 0 audit: this constructor creates a fresh
+    /// `StreamingBlobInner` and immediately builds the reader, so
+    /// `earliest_chunk_idx` is unconditionally 0 at reader-construction
+    /// time. No TOCTOU between a caller pre-check and the construction —
+    /// the construction-time sample inside `StreamingBlobReader::new`
+    /// covers the late-reader case via the `new_reader` /
+    /// `InFlightBlobMap::get_reader` paths.
     pub fn new(
         digest: DigestInfo,
         max_buffer_bytes: u64,
@@ -979,6 +1076,14 @@ impl StreamingBlob {
     }
 
     /// Create an additional reader from an existing inner handle.
+    ///
+    /// #515 Phase 0 audit: callers (e.g. test fixtures, fan-out
+    /// composition) pass in an existing inner with arbitrary
+    /// `earliest_chunk_idx`. No pre-check happens on this side of the
+    /// call — construction IS the only operation — so there is no
+    /// caller-side TOCTOU to instrument. The construction-time sample
+    /// emitted by `StreamingBlobReader::new` captures any non-zero
+    /// `earliest_chunk_idx` observed at construction.
     pub fn new_reader(inner: &Arc<StreamingBlobInner>) -> StreamingBlobReader {
         StreamingBlobReader::new(Arc::clone(inner))
     }
@@ -1022,6 +1127,11 @@ impl InFlightBlobMap {
 
     /// Register a new streaming blob.  Returns `Some((writer, reader))`
     /// if registered, or `None` if the map is at capacity.
+    ///
+    /// #515 Phase 0 audit: identical to `StreamingBlob::new` — fresh
+    /// inner constructed locally, then reader built immediately, so
+    /// `earliest_chunk_idx` is unconditionally 0 at construction. No
+    /// caller-side TOCTOU exists here.
     pub fn register(
         &self,
         digest: DigestInfo,
@@ -1040,6 +1150,15 @@ impl InFlightBlobMap {
     }
 
     /// Get a reader for an in-flight blob, if one exists.
+    ///
+    /// #515 Phase 0 audit: production caller `bytestream_server.rs:1421`
+    /// invokes `get_reader` THEN inspects `earliest_chunk_idx()` to
+    /// decide whether to fall through to the store read path. The check
+    /// is on the same `inner` the reader was constructed from, so there
+    /// is no caller-side pre-check / construction TOCTOU here — both
+    /// observations see the same (possibly racing) atomic. The
+    /// construction-time sample inside `StreamingBlobReader::new` covers
+    /// the `cursor_chunk_idx > 0` baseline.
     pub fn get_reader(&self, digest: &DigestInfo) -> Option<StreamingBlobReader> {
         let map = self.map.read();
         map.get(digest)
