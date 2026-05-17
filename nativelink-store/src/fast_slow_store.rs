@@ -4267,48 +4267,44 @@ impl FastSlowStore {
         read_handle
             .await
             .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
-        // #476 observability: on dual-err, prefer the consumer's error
-        // (`write_res`) — it carries the authoritative root cause (h2
-        // reset, slow-store reject, admission, etc.). The producer's
-        // "receiver disconnected" in `forward_res` is the mechanically
-        // derived downstream symptom of the consumer dropping `rx`;
-        // surfacing it in place of the cause destroys observability
-        // (operators see the same buf-channel symptom regardless of
-        // root cause). When forward_res is Err but write_res Ok, the
-        // producer-side error is authoritative (likely a read/IO error
-        // from the spawn_blocking reader). When BOTH are Err and the
-        // producer errored first (e.g. IO error), the Option A fix
-        // above routes the producer error through tx.send_error so
-        // write_res IS the producer's real error — preferring write_res
-        // here surfaces the producer root cause, not a buf-channel
+        // #476 observability: on any dual-err (or consumer-err), prefer
+        // the consumer's error (`write_res`) — it carries the
+        // authoritative root cause (h2 reset, slow-store reject,
+        // admission, etc.). The producer's "receiver disconnected" in
+        // `forward_res` is the mechanically derived downstream symptom
+        // of the consumer dropping `rx`; surfacing it in place of the
+        // cause destroys observability (operators see the same
+        // buf-channel symptom regardless of root cause). When
+        // forward_res is Err but write_res Ok, the producer-side error
+        // is authoritative (likely a read/IO error from the
+        // spawn_blocking reader). When BOTH are Err, Option A's
+        // `tx.send_error(err.clone())` routing in `forward_fut` above
+        // has already mirrored the producer's typed err into the
+        // consumer side, so `write_res` IS authoritative — preferring
+        // it surfaces the producer root cause, not a buf-channel
         // symptom.
         //
-        // Dual-err diagnostic honesty (#476 fixup v2 RT-MAJOR-1): when
-        // Option A's `tx.send_error(err.clone())` routes a producer-side
-        // err to the consumer, BOTH halves carry the SAME err. The
-        // "consumer preferred over receiver-disconnected symptom" append
-        // would lie in that arm — there is no "receiver disconnected"
-        // symptom; the err the consumer surfaced IS the routed producer
-        // err. Equality-guard the append so it only fires when the two
-        // halves are genuinely distinct (the case where surfacing one
-        // really does suppress information about the other).
+        // Why `_forward_err` is discarded on dual-err (#476 fixup v3,
+        // Option 3): under Option A's reality, the consumer's
+        // `write_res` ALREADY carries the authoritative error
+        // (producer's IO err is routed via `tx.send_error(err.clone())`
+        // → consumer's `terminal_error`). Appending `forward_err` as a
+        // diagnostic tail (the prior fixup-v1/v2 behavior) was
+        // calibrated for a pre-Option-A world where `write_res` could
+        // carry only the synthesized "Sender dropped" symptom — that
+        // world no longer exists. The fixup-v2 equality guard tried to
+        // suppress the now-misleading append, but red-team verified the
+        // guard is structurally dead in production (every leaf store's
+        // `update` chains `err_tip(...)` onto the recv result, which
+        // pushes a message to `Error.messages` and breaks the derived
+        // `PartialEq`). The clean policy: always return `write_err`,
+        // bind `forward_err` to `_` to document we observed it but
+        // intentionally drop it (it is redundant with `write_err`).
         match (write_res, forward_res) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(write_err), Ok(())) => Err(write_err),
             (Ok(()), Err(forward_err)) => Err(forward_err),
-            (Err(write_err), Err(forward_err)) => {
-                if write_err == forward_err {
-                    // Option A routed: producer's err mirrored by
-                    // consumer via terminal_error. No symptom-masking
-                    // happened — return one copy without misleading
-                    // append.
-                    Err(write_err)
-                } else {
-                    Err(write_err.append(format!(
-                        "stream_path_to_store: consumer error preferred over producer 'receiver disconnected' symptom (#476); producer side: {forward_err:?}"
-                    )))
-                }
-            }
+            (Err(write_err), Err(_forward_err)) => Err(write_err),
         }
     }
 
@@ -4397,23 +4393,18 @@ impl FastSlowStore {
             .await
             .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
         // #476 observability: see sibling at `stream_path_to_store` —
-        // prefer consumer (`write_res`) over producer symptom on dual-err.
-        // RT-MAJOR-1 fixup-v2: equality-guard the append so it only
-        // fires when the two halves are genuinely distinct (i.e. NOT
-        // the Option A producer-mirrored-via-consumer case).
+        // prefer consumer (`write_res`) over producer symptom on
+        // dual-err. fixup-v3 (Option 3) drops the diagnostic append
+        // entirely: Option A's `tx.send_error` routing already mirrors
+        // the producer's typed err into `write_res`, so `forward_err`
+        // is redundant and the append text was calibrated for a
+        // pre-Option-A world. `_forward_err` documents the observation
+        // while marking the intentional discard.
         match (write_res, forward_res) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(write_err), Ok(())) => Err(write_err),
             (Ok(()), Err(forward_err)) => Err(forward_err),
-            (Err(write_err), Err(forward_err)) => {
-                if write_err == forward_err {
-                    Err(write_err)
-                } else {
-                    Err(write_err.append(format!(
-                        "stream_file_to_store: consumer error preferred over producer 'receiver disconnected' symptom (#476); producer side: {forward_err:?}"
-                    )))
-                }
-            }
+            (Err(write_err), Err(_forward_err)) => Err(write_err),
         }
     }
 

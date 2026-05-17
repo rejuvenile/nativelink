@@ -26,9 +26,18 @@
 //! in `stream_path_to_store` / `stream_file_to_store` short-circuited on
 //! `forward_res?`, discarding `write_res`.
 //!
-//! **Mechanism that re-establishes it (post-fix):** `match (write_res,
-//! forward_res)` that prefers `write_res` on dual-err with appended
-//! diagnostic naming the symptom-vs-cause inversion.
+//! **Mechanism that re-establishes it (post-fix, v3 / Option 3):**
+//! `match (write_res, forward_res)` that prefers `write_res` on
+//! dual-err: `(Err(write_err), Err(_forward_err)) => Err(write_err)`.
+//! fixup-v3 drops the prior diagnostic append (which the fixup-v1/v2
+//! cadre added and then equality-guarded): Option A's
+//! `tx.send_error(err.clone())` routing in `forward_fut` already
+//! mirrors the producer's typed err into `write_res` via
+//! `terminal_error`, so `forward_err` carries no information that
+//! isn't already in `write_err`. The fixup-v2 equality guard turned
+//! out to be structurally dead in production (every leaf store's
+//! `update` adds `err_tip` to the recv chain, mutating
+//! `Error.messages` and breaking the derived `PartialEq`).
 //!
 //! **Producer-IO masking fix (#476 fixup, Option A):** the
 //! `forward_fut` closure in both helpers routes any producer-side error
@@ -62,10 +71,14 @@
 //! detector.
 //!
 //! Mutation steps (run by hand to verify):
-//!   1. For `surfaces_consumer_error_over_symptom_dual_err`: revert
-//!      the dual-err arm to `forward_res?; write_res`. Re-run — must
-//!      red-fail with the bespoke "consumer-error-prefer policy not
-//!      enforced" message.
+//!   1. For `surfaces_consumer_error_over_symptom_dual_err`: invert
+//!      the dual-err arm in `stream_file_to_store` from
+//!      `(Err(write_err), Err(_)) => Err(write_err)` to
+//!      `(Err(_), Err(forward_err)) => Err(forward_err)`. Re-run —
+//!      must red-fail with the bespoke "consumer-error-prefer policy
+//!      not enforced" message (the surfaced err is the producer's
+//!      `Failed to send chunk in stream_file_to_store` symptom, which
+//!      does NOT contain `ABORT_TAG`).
 //!   2. For `surfaces_producer_io_error_not_buf_channel_symptom`:
 //!      comment out the
 //!      `if let Err(ref e) = result { tx.send_error(e.clone()); }`
@@ -80,6 +93,18 @@
 //!      bespoke "consumer-post-EOF-Err policy regressed — the
 //!      `(Err, Ok)` arm dropped the consumer-side authoritative err"
 //!      message.
+//!
+//! Coverage matrix:
+//!   * `(Ok, Ok)` — covered by other crate tests; trivial passthrough.
+//!   * `(Err, Ok)` consumer-post-EOF — `surfaces_consumer_abort_when_producer_succeeded`.
+//!   * `(Ok, Err)` producer-IO routed via Option A — collapses to
+//!     `(Err, Err)` in production (because `tx.send_error` routes the
+//!     err to `write_res`); pure `(Ok, Err)` (consumer Ok despite
+//!     producer Err) is unreachable under Option A.
+//!   * `(Err, Err)` distinct halves (slow tier aborts mid-stream,
+//!     producer hits channel-closed) — `surfaces_consumer_error_over_symptom_dual_err`.
+//!   * `(Err, Err)` same payload (producer-IO routed via Option A) —
+//!     `surfaces_producer_io_error_not_buf_channel_symptom`.
 
 use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -666,26 +691,42 @@ async fn surfaces_consumer_error_over_symptom_dual_err() -> Result<(), Error> {
         "#476 consumer-error-prefer policy not enforced — producer-side \
          receiver-disconnected swallowed root cause. \
          Expected surfaced Err to contain `{ABORT_TAG}` (the slow \
-         tier's authoritative Err), got rendered={rendered}"
+         tier's authoritative Err), got rendered={rendered}. \
+         This assertion is the mutation-guard for the simplified \
+         dual-err arm: inverting `(Err(write_err), Err(_)) => Err(write_err)` \
+         to `(Err(_), Err(forward_err)) => Err(forward_err)` will \
+         surface the producer's `Failed to send chunk in \
+         stream_file_to_store` symptom instead of the consumer's \
+         `{ABORT_TAG}` — that mutation must red-fail here."
     );
 
-    // The post-fix dual-err arm appends a diagnostic naming #476;
-    // verify it appears, proving the test crossed the dual-err arm
-    // (not just the `(Err, Ok)` single-err arm which produces the
-    // same surfaced error pre-fix and post-fix). Without this
-    // assertion, a future regression that loses the dual-err
-    // behavior could still pass the `ABORT_TAG` assertion (since
-    // the consumer's err is the same regardless of which arm fires).
+    // Belt-and-braces: under fixup-v3 (Option 3), the prior
+    // diagnostic append text was dropped entirely. The surfaced
+    // err must NEVER contain it — if it does, a future revert to
+    // the v1/v2 append-on-dual-err shape has snuck back in.
     assert!(
-        rendered.contains("consumer error preferred over producer 'receiver disconnected' symptom (#476)"),
-        "test did not exercise the dual-err `(Err, Err)` arm — only \
-         the single-err `(Err, Ok)` arm fired, which produces \
-         identical output pre-fix and post-fix and therefore CANNOT \
-         catch a regression of the dual-err policy. Bug in the test \
-         feeder/saturation setup (CHUNK_COUNT={CHUNK_COUNT} chunks vs \
-         128-slot buf_channel + 4-slot bridge — investigate). \
-         Got rendered={rendered}"
+        !rendered.contains("consumer error preferred over producer 'receiver disconnected' symptom"),
+        "fixup-v3 (Option 3) policy regressed — the dual-err arm \
+         is appending the v1/v2 diagnostic text again. The append \
+         was dropped because Option A's `tx.send_error` routing \
+         already mirrors the producer err into `write_res`, making \
+         `forward_err` redundant. Got rendered={rendered}"
     );
+
+    // Setup determinism note (proves we crossed the (Err, Err) arm,
+    // not the (Err, Ok) single-err arm): with CHUNK_COUNT=256 chunks
+    // × 256 KiB = 64 MiB feeder vs the inner buf_channel capacity 128
+    // + 4-slot bridge mpsc, the producer is guaranteed to be blocked
+    // on `tx.send` when the slow tier drops `rx` after one chunk.
+    // The producer's pending `tx.send` then wakes with channel-closed,
+    // making `forward_res = Err(...)` — the (Err, Err) arm is the only
+    // reachable arm. Under the simplified arm, both the (Err, Ok) and
+    // (Err, Err) paths surface `write_err` verbatim, so an arm-shape
+    // regression isn't directly observable from the surfaced string;
+    // instead it's observable from the mutation step in the test
+    // header (item 1) inverting which half of the (Err, Err) tuple
+    // is preferred. The `update_invocations` + `ABORT_TAG` assertions
+    // are joint witnesses that the (Err, Err) arm fired.
 
     // Sanity: confirm the slow tier really was invoked. Defends against
     // a future refactor of `update_with_whole_file` that skips the slow
@@ -855,6 +896,21 @@ async fn surfaces_producer_io_error_not_buf_channel_symptom() -> Result<(), Erro
         "Option A producer-IO routing not exercising the expected \
          payload — consumer's recv did not surface the real EISDIR \
          error. Consumer-observed err: {consumer_observed}"
+    );
+
+    // fixup-v3 (Option 3): the dual-err arm no longer appends a
+    // diagnostic naming "consumer error preferred over producer
+    // 'receiver disconnected' symptom" — `forward_err` is redundant
+    // with `write_err` under Option A's `tx.send_error` routing, so
+    // no append is honest in this arm. Lock in that the misleading
+    // text never surfaces (it would mis-frame the routed-IO case as
+    // a symptom-preference inversion, which it isn't).
+    assert!(
+        !rendered.contains("consumer error preferred over producer 'receiver disconnected' symptom"),
+        "fixup-v3 (Option 3) regression — the dual-err arm appended \
+         the v1/v2 diagnostic text on a producer-IO routed err. \
+         Under Option A both halves carry the same authoritative \
+         err; appending one as a 'symptom' is wrong. Got rendered={rendered}"
     );
 
     // Sanity: confirm the slow tier was invoked at least once. Defends
