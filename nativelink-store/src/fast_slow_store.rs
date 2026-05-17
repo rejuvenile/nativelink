@@ -4975,7 +4975,30 @@ impl StoreDriver for FastSlowStore {
                 Result::<(), Error>::Ok(())
             };
             let (write_result, send_result) = tokio::join!(write_fut, send_fut);
-            return send_result.and(write_result);
+            // #512 observability sibling of #476: prefer the consumer's
+            // error (`write_result` from `slow_store.update`) over the
+            // producer's mechanically derived "receiver disconnected"
+            // symptom (`send_result`). When the slow-store consumer
+            // errors mid-stream (h2 reset, admission, server reject),
+            // it drops `rx`; the next `tx.send` then returns "channel
+            // closed" — that's the downstream symptom, not the cause.
+            // Surfacing it instead of the consumer's authoritative
+            // diagnosis destroys observability for shutdown-flush
+            // failures, which are exactly the cases an operator needs
+            // to triage (was it the server rejecting? a transport
+            // reset? an admission gate?). Producer-side errors (channel
+            // send/eof from `send_fut`) are authoritative only when the
+            // consumer reported Ok.
+            return match (write_result, send_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(write_err), Ok(())) => Err(write_err),
+                (Ok(()), Err(send_err)) => Err(send_err),
+                (Err(write_err), Err(send_err)) => Err(write_err.append(format!(
+                    "FastSlowStore::update shutdown-flush: consumer error \
+                     preferred over producer 'receiver disconnected' symptom \
+                     (#512); producer side: {send_err:?}"
+                ))),
+            };
         }
 
         // #334 Fix B: gate the in-flight pin on the aggregate-byte cap
@@ -5124,7 +5147,29 @@ impl StoreDriver for FastSlowStore {
             watchdog_handle.abort();
 
             let slow_ms = slow_start.elapsed().as_millis();
-            let mut result = send_result.and(write_result);
+            // #512 observability sibling of #476: prefer the consumer's
+            // error (`write_result` from `slow_store.update`) over the
+            // producer's mechanically derived "receiver disconnected"
+            // symptom (`send_result`). The result here drives BOTH the
+            // recovery side-effects (failed_writes insert + re-pin) and
+            // the `error = ?e` log line at the `Err(e)` arm below — the
+            // only place an operator sees WHY the slow write failed.
+            // Recovery happens either way (Err triggers both arms), but
+            // the surfaced error string controls whether the operator
+            // sees "h2 reset" / "server rejected" / "admission denied"
+            // vs. the always-same "Failed to send chunk … receiver
+            // disconnected" symptom. Producer-side errors are
+            // authoritative only when the consumer reported Ok.
+            let mut result = match (write_result, send_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(write_err), Ok(())) => Err(write_err),
+                (Ok(()), Err(send_err)) => Err(send_err),
+                (Err(write_err), Err(send_err)) => Err(write_err.append(format!(
+                    "FastSlowStore::update background-slow-write: consumer \
+                     error preferred over producer 'receiver disconnected' \
+                     symptom (#512); producer side: {send_err:?}"
+                ))),
+            };
 
             // Failpoint: force background slow-write failure regardless of
             // the actual outcome. Used by the race-fix regression test and
