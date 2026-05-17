@@ -100,39 +100,46 @@ file matches the [`BaselineFile`](src/output.rs) schema:
     "git_commit_sha": "...",
     "git_dirty": false,
     "host": "buildcache",
-    "timestamp_utc": "2026-05-16T20:00:00.000000000Z",
+    "timestamp_utc": "2026-05-16T20:00:00.000000Z",
     "features": ["chunked_fast_slow"],
-    "forced": false
+    "forced": false,
+    "temp_dir_used": "/dev/shm"
   },
   "results": [
     {
       "flow_id": "W1",
-      "scenario_name": "w1_bytestream_write_fastslow_filesystem_1MiB_c1",
+      "scenario_name": "w1_store_update_oneshot_1MiB_c1",
       "blob_size_bytes": 1048576,
       "concurrency": 1,
       "cache_state": "cold",
       "iters": 20,
+      "confidence": "medium",
       "total_duration_ms": 1234.567,
       "latency_ms": {
-        "p50": 12.345,
-        "p90": 23.456,
-        "p99": 34.567,
-        "max": 45.678
+        "p50": 12.345678,
+        "p90": 23.456789,
+        "p99": 34.567890,
+        "max": 45.678901
       },
       "throughput": {
         "bytes_per_sec": 89012345.678
       },
       "extras": {
-        "fast_tier_max_bytes": 8589934592,
-        "size_partitioning_threshold": 16777216
+        "cas_fast_memory_max_bytes": 16000000000,
+        "size_partitioning_threshold": 16384
       }
     }
   ]
 }
 ```
 
-Floats are rounded to 3 decimal places at emit-time so micro-jitter
-doesn't churn the diff. Keys are alphabetized via `BTreeMap`.
+Floats are rounded to 6 decimal places at emit-time (1 ns grid at the
+ms scale) so micro-jitter doesn't churn the diff while preserving
+sub-µs variance. Keys are alphabetized via `BTreeMap`. The
+`confidence` field gates p99 interpretability: `low` (iters < 20)
+means p99 is essentially `max`; `medium` (20 ≤ iters < 100) p99 has
+one sample of headroom; `high` (iters ≥ 100) p99 has statistical
+legitimacy.
 
 ## Diffing against a baseline
 
