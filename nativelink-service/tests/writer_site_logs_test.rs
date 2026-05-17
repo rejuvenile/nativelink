@@ -238,58 +238,155 @@ async fn fss_disarm_emits_info_with_outcome_disarm() {
     );
 }
 
-/// **OVER-ACTION coverage (testing-czar M2 follow-up):** the FSS-level
-/// `info!` MUST NOT fire with a `writer_path` for a caller label this
-/// test never used. Mirror of `fss_registration_emits_info_with_writer_path_label`
-/// in the negative direction. CLAUDE.md "Asymmetric contract
-/// coverage" — every state-mutating log emission has two failure modes
-/// (under-action: didn't fire when expected; over-action: fired when
-/// not expected). All other tests in this file cover under-action;
-/// this covers over-action.
+/// **OVER-ACTION coverage (closes code-reviewer B1 BLOCK on
+/// obs-bundle-v2, 2026-05-17):** the FSS-level `info!` in
+/// `InFlightChunkedGuard::new_with_caller` MUST fire EXACTLY ONCE per
+/// call AND with field-fidelity (the line carries the SAME `caller`
+/// the constructor received AND that call's OWN `digest`, never
+/// another concurrent guard's digest).
 ///
-/// **Mutation step:** move the `info!` block inside `new_with_caller`
-/// into a loop (e.g. wrap in `for _ in 0..3 {`) — the under-action
-/// tests would still pass (extra info!s match the substring filter),
-/// but the over-action test would FAIL because the per-attempted-caller
-/// invariant "no info! for `unused_caller_no_emit`" is broken if the
-/// loop indexes by some external variable. While the literal mutation
-/// path is narrow, this test pins the negative contract: "no FSS
-/// registration info! exists for any caller label other than the
-/// one explicitly used."
+/// **Why the prior version was a tautology:** v2's test asserted ZERO
+/// buffer lines contained `writer_path="unused_caller_no_emit_xyz"` —
+/// a label NO call-site in the workspace ever passes to
+/// `new_with_caller`. The assertion was trivially true for any
+/// production behavior. The cited mutation ("wrap in `for _ in 0..3 {`")
+/// would NOT have red-failed because the loop would emit
+/// `writer_path="test_caller_over_action_e5"` (the label this test
+/// actually used) three times — still zero with the unused label. Form
+/// (over-action coverage exists) satisfied; substance (mutation
+/// red-fails) not.
+///
+/// **What the new version pins:** two distinct guards are constructed
+/// back-to-back with distinct callers + distinct digests. The test
+/// then asserts:
+///
+/// 1. EXACTLY ONE registration emit per (caller, digest) pair — catches
+///    any mutation that emits zero (under-action regression) OR more
+///    than one (over-action via accidental loop / re-entry).
+/// 2. Field fidelity: alpha's emit line carries alpha's digest and NOT
+///    beta's; symmetric for beta. Catches a mutation that swaps the
+///    `caller` / `digest` argument positions inside the production
+///    `info!` macro (so the line would carry the wrong `writer_path`
+///    or the wrong digest discriminator).
+///
+/// **Mutation steps that red-fail this test:**
+///
+/// 1. Wrap the `info!` block in `chunked_write_handler.rs:3655-3663`
+///    in `for _ in 0..2 { ... }` — `assert_eq!(alpha_count, 1)` fires
+///    with `count=2` and the bespoke "over-action: registration info!
+///    must fire EXACTLY ONCE per new_with_caller call" message.
+/// 2. Swap `writer_path = caller,` and `%digest,` argument positions
+///    in the production `info!` macro (so the rendered line tags the
+///    digest value as `writer_path`) — the alpha-pair filter returns
+///    zero matches, fires "over-action: field fidelity violated —
+///    alpha's emit MUST carry alpha's digest".
 #[nativelink_test]
 async fn fss_no_emit_for_other_caller() {
-    let set: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
-    let digest = make_digest(0xE5);
+    let set_alpha: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
+    let set_beta: ChunkedInFlightMap = Arc::new(Mutex::new(HashMap::new()));
+    // Distinct digests so substring filters cannot cross-match between
+    // alpha's and beta's emits. Display format `{digest}` matches the
+    // production `%digest` Display emit (per cadre-#1 follow-up).
+    let digest_alpha = make_digest(0xE5);
+    let digest_beta = make_digest(0xE6);
+    let alpha_disc = format!("{digest_alpha}");
+    let beta_disc = format!("{digest_beta}");
 
-    let _guard = InFlightChunkedGuard::new_with_caller(
-        Arc::clone(&set),
-        digest,
+    // Two concurrent guards — each construction fires the production
+    // info! exactly once. Per-test-unique caller labels (`alpha_over_action`
+    // and `beta_over_action`) so cross-test pollution cannot inflate
+    // the count past 1.
+    let _g_alpha = InFlightChunkedGuard::new_with_caller(
+        Arc::clone(&set_alpha),
+        digest_alpha,
         None,
-        "test_caller_over_action_e5",
+        "test_alpha_over_action",
+    );
+    let _g_beta = InFlightChunkedGuard::new_with_caller(
+        Arc::clone(&set_beta),
+        digest_beta,
+        None,
+        "test_beta_over_action",
     );
 
-    // Assert ZERO matches for a caller this test never used. If the
-    // production code accidentally emitted an info! for ANY caller on
-    // EVERY construction (e.g. a loop over a static label set), this
-    // would catch it. The "unused_caller_no_emit_xyz" label is unique
-    // to this test and never used elsewhere in the workspace.
-    let raw = String::from_utf8(
-        tracing_test::internal::global_buf().lock().unwrap().to_vec(),
-    )
-    .expect("tracing-test global buffer must be valid UTF-8");
-    let phantom_matches: Vec<&str> = raw
-        .lines()
-        .filter(|l| l.contains("writer_path=\"unused_caller_no_emit_xyz\""))
-        .collect();
+    // Filter per (caller, digest) pair. The digest discriminator on
+    // each filter blocks any future test that picks a colliding caller
+    // label from matching here (per cadre M3 pollution hardening).
+    let alpha_lines = lines_matching(
+        "test_alpha_over_action",
+        "fss_chunked_in_flight_digests",
+        &alpha_disc,
+    );
+    let beta_lines = lines_matching(
+        "test_beta_over_action",
+        "fss_chunked_in_flight_digests",
+        &beta_disc,
+    );
+
+    // (1) Exact-one-emit per call. Mutation hint: wrapping the
+    // production `info!` block in `for _ in 0..N {` red-fails with
+    // `count=N`.
+    let alpha_count = alpha_lines
+        .iter()
+        .filter(|l| l.contains("chunked_in_flight registered"))
+        .count();
+    let beta_count = beta_lines
+        .iter()
+        .filter(|l| l.contains("chunked_in_flight registered"))
+        .count();
+    assert_eq!(
+        alpha_count, 1,
+        "over-action: registration info! must fire EXACTLY ONCE per \
+         new_with_caller call for writer_path=test_alpha_over_action. \
+         Got {alpha_count} matching lines (expected 1). Mutation hint: \
+         wrapping the `info!` block at chunked_write_handler.rs:3655 \
+         in `for _ in 0..N {{ ... }}` would red-fail this with count=N. \
+         tracing-test global_buf tail: {}",
+        recent_buf_tail()
+    );
+    assert_eq!(
+        beta_count, 1,
+        "over-action: registration info! must fire EXACTLY ONCE per \
+         new_with_caller call for writer_path=test_beta_over_action. \
+         Got {beta_count} matching lines (expected 1). Mutation hint: \
+         wrapping the `info!` block at chunked_write_handler.rs:3655 \
+         in `for _ in 0..N {{ ... }}` would red-fail this with count=N. \
+         tracing-test global_buf tail: {}",
+        recent_buf_tail()
+    );
+
+    // (2) Field fidelity: alpha's emit must NOT carry beta's digest
+    // discriminator (and vice versa). Mutation hint: swapping
+    // `writer_path = caller,` and `%digest,` argument positions inside
+    // the production `info!` macro would make alpha's writer_path-keyed
+    // line either be missing (filter returns zero, caught by (1)) or
+    // carry beta's digest (caught here). Catches a sibling field-swap
+    // defect class that the exact-count assertion alone would not.
+    let alpha_line = alpha_lines
+        .iter()
+        .find(|l| l.contains("chunked_in_flight registered"))
+        .expect("alpha registration line present (otherwise count assertion above would have fired)");
     assert!(
-        phantom_matches.is_empty(),
-        "over-action regression: an info! fired with \
-         writer_path=unused_caller_no_emit_xyz even though no caller \
-         in this test (or workspace) ever used that label. The \
-         production code is emitting for callers it shouldn't. Found \
-         {} matching lines: first = {:?}",
-        phantom_matches.len(),
-        phantom_matches.first()
+        !alpha_line.contains(&beta_disc),
+        "over-action: field fidelity violated — alpha's emit MUST \
+         carry alpha's digest, NOT beta's. Found beta's digest \
+         discriminator ({beta_disc}) in alpha's line: {alpha_line}. \
+         Mutation hint: swapped `writer_path = caller,` and `%digest,` \
+         argument positions in the production info! macro at \
+         chunked_write_handler.rs:3655."
+    );
+    let beta_line = beta_lines
+        .iter()
+        .find(|l| l.contains("chunked_in_flight registered"))
+        .expect("beta registration line present (otherwise count assertion above would have fired)");
+    assert!(
+        !beta_line.contains(&alpha_disc),
+        "over-action: field fidelity violated — beta's emit MUST \
+         carry beta's digest, NOT alpha's. Found alpha's digest \
+         discriminator ({alpha_disc}) in beta's line: {beta_line}. \
+         Mutation hint: swapped `writer_path = caller,` and `%digest,` \
+         argument positions in the production info! macro at \
+         chunked_write_handler.rs:3655."
     );
 }
 
