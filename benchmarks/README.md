@@ -20,7 +20,7 @@ Per the design doc Section 5, Phase 1 covers:
 | R1 | ByteStream::Read through FastSlow→Filesystem | 1 KiB / 1 MiB / 16 MiB warm, 1 MiB × 10 warm, 1 MiB / 16 MiB cold |
 | F1 | FindMissingBlobs through ExistenceCache | batch 1 / 16 / 128 / 1024, both cache-hit and cache-miss |
 | W3 | Chunked-v2 single writer (v3 default flip) | 4 MiB / 16 MiB |
-| R5 | Chunked-v2 N contended writers same digest (per-digest Notify) | 4 MiB × 2 / 4 MiB × 10 / 16 MiB × 4 |
+| R5 | FilesystemStore multi-reader fan-out (NOT the v3 per-digest Notify — see Phase 2 deferral) | 4 MiB × 2 / 4 MiB × 10 / 16 MiB × 4 |
 
 W3 and R5 require the `chunked_fast_slow` Cargo feature. The Justfile
 recipe builds with the feature on by default.
@@ -96,7 +96,7 @@ file matches the [`BaselineFile`](src/output.rs) schema:
 ```json
 {
   "metadata": {
-    "schema_version": 1,
+    "schema_version": 2,
     "git_commit_sha": "...",
     "git_dirty": false,
     "host": "buildcache",
@@ -156,6 +156,39 @@ applies the per-cell thresholds named in design Section 5
 (`p50 regress >25% AND new > 5ms → BLOCK`, etc.). That tool is
 deliberately deferred until enough baselines accumulate to calibrate
 the thresholds against observed noise.
+
+## What this bench does NOT measure (Phase 1 / 1.5 scope cuts)
+
+These are intentional gaps reviewers should be aware of when interpreting
+baselines:
+
+- **ByteStream gRPC wire-shape regressions** (e.g. `#500` silent
+  0-byte-ok). W1/R1 cells exercise `StoreLike::update_oneshot` /
+  `get_part_unchunked` directly; they do NOT cross the
+  `ByteStreamServer`, so a regression in that crate's read/write path
+  may not surface in a bench diff. Phase 2 deliverable: real
+  ByteStreamServer wiring per the design doc B6.
+- **v3 per-digest `Notify` wake-N-readers regressions.** The R5 cell
+  was renamed `r5_filesystem_fanout_readers_*` in Phase 1.5 because it
+  measures multi-reader fan-out against the FilesystemStore, NOT the
+  per-digest Notify wake (the writer commits BEFORE the readers spawn).
+  `extras.v3_anchor = "DEFERRED_PHASE_2_filesystem_fanout"` flags the
+  gap. Phase 2 will wire the readers through `WriteChunkedV2`'s commit
+  barrier.
+- **ZFS-specific I/O behavior** (e.g. a re-introduced `fdatasync`,
+  `O_SYNC`, `posix_fadvise(DONTNEED)` regression on writes, or ARC
+  pressure dynamics) is invisible under the `/dev/shm` default — tmpfs
+  has no underlying block device. To anchor real ZFS slow-tier numbers
+  the operator must explicitly point `--temp-dir` at a non-tmpfs
+  non-prod-pool path (the bench refuses `/srv/bulk/` and `/fast/` substring
+  matches outright). The R1 cell records its `cold_mechanism` and
+  `slow_tier_backing` in extras so reviewers can tell which baseline
+  measured what.
+- **Cross-host comparability** is not promised: bench numbers depend
+  on the tempdir backing's filesystem class, the host's RAM, and the
+  presence of co-resident load. The `metadata.host` and
+  `metadata.temp_dir_used` fields document the run context; diff tooling
+  MUST refuse cross-host diffs.
 
 ## What's NOT here (deferred to later phases)
 

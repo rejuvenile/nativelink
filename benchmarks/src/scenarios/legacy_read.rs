@@ -115,17 +115,17 @@ fn is_tmpfs(path: &Path) -> bool {
 
     // TMPFS_MAGIC per `man 2 statfs`.
     const TMPFS_MAGIC: i64 = 0x0102_1994;
-    let cstr = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
+    let Ok(cstr) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
     };
     // SAFETY: zero-initializes a POD struct; `statfs` writes into it.
     let mut sfs: libc::statfs = unsafe { core::mem::zeroed() };
-    let ret = unsafe { libc::statfs(cstr.as_ptr(), &mut sfs) };
+    let ret = unsafe { libc::statfs(cstr.as_ptr(), &raw mut sfs) };
     if ret != 0 {
         return false;
     }
-    i64::from(sfs.f_type) == TMPFS_MAGIC
+    // `f_type` is i64 on x86_64-linux. Compare directly.
+    sfs.f_type == TMPFS_MAGIC
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -147,19 +147,10 @@ fn fadvise_dontneed_tree(root: &Path) -> u64 {
     // walkdir is not in deps; use a hand-rolled BFS over `std::fs::read_dir`.
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry_res in entries {
-            let entry = match entry_res {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let ft = match entry.file_type() {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+            let Ok(entry) = entry_res else { continue };
+            let Ok(ft) = entry.file_type() else { continue };
             let path = entry.path();
             if ft.is_dir() {
                 stack.push(path);
@@ -170,10 +161,7 @@ fn fadvise_dontneed_tree(root: &Path) -> u64 {
             }
             // Open read-only and fadvise. Errors are intentionally
             // best-effort.
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+            let Ok(file) = std::fs::File::open(&path) else { continue };
             let fd = file.as_raw_fd();
             // SAFETY: fd is a valid open file from std; len=0 means
             // the whole file.
@@ -401,15 +389,16 @@ async fn run_cold_cell(
 
     // For real-disk backings, walk the persisted content_path and
     // fadvise(DONTNEED) every blob so the cold read actually crosses
-    // a cold page cache. spawn_blocking — this is sync filesystem I/O
-    // on potentially many files.
+    // a cold page cache. Use the workspace-canonical
+    // `nativelink_util::spawn_blocking!` macro (the bare
+    // `tokio::task::spawn_blocking` is in `disallowed-methods`).
     let fadvise_count: u64 = if cold_mechanism == ColdMechanism::FadviseDontneed {
         let content_path_owned = content_path.clone();
-        tokio::task::spawn_blocking(move || {
-            fadvise_dontneed_tree(Path::new(&content_path_owned))
-        })
-        .await
-        .unwrap_or(0)
+        let handle = nativelink_util::spawn_blocking!(
+            "r1-cold-fadvise",
+            move || fadvise_dontneed_tree(Path::new(&content_path_owned))
+        );
+        handle.await.unwrap_or(0)
     } else {
         0
     };
