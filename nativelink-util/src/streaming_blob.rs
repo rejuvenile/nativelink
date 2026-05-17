@@ -741,34 +741,29 @@ impl StreamingBlobReader {
             // Check if a chunk is available at our cursor position.
             if self.cursor_chunk_idx < chunk_count {
                 let chunks = self.inner.chunks.read();
-                // #515 Phase 0 expansion: H_alt_I race detection. Red-team
-                // (`.claude/reviews/agent-515-dataloss-design/red-team.md`
-                // section "H_alt_I") identified a TOCTOU between the
-                // `earliest` load above and the `chunks.read()` lock
-                // acquisition immediately above: the producer's
-                // `earliest_chunk_idx.fetch_add` (`streaming_blob.rs:414`,
-                // inside the sliding-window pop_front loop) can fire in
-                // that window, leaving `earliest` stale. The stale value
-                // is then used to compute `deque_idx = cursor - earliest`,
-                // which addresses the WRONG chunk for the cursor's
-                // absolute index — `chunks.get(deque_idx)` returns
-                // `Some(wrong_chunk)`, the reader emits that wrong chunk
-                // as the canonical bytes for `cursor`, and the downstream
-                // hash check (VerifyStore) fires `Code::DataLoss` with the
-                // frankenstein-bytes signature observed at
-                // `5ed2efd4 14:15` (chunk 12 / 36 MiB splice).
-                //
-                // This race is NOT closed by Approach A (the FSS
-                // construction-time fix). It is also NOT observed by the
-                // existing FSS-site WARN at `fast_slow_store.rs:6500`.
-                // OBSERVATION ONLY — we re-load `earliest` AFTER acquiring
-                // the `chunks.read()` lock and compare; the diagnostic
-                // computes `deque_idx` from the ORIGINAL `earliest`
-                // (preserving production semantics, no behavior change).
+                // #515 Phase 0 H_alt_I hypothesis empirically refuted
+                // (audit: `.claude/audits/515-phase02-empirical-\
+                // refutation-2026-05-17.md`). The original hypothesis
+                // was that the producer's `earliest_chunk_idx.fetch_add`
+                // could fire between the `earliest` load above and the
+                // `chunks.read()` lock acquisition, leaving `earliest`
+                // stale and producing a frankenstein-bytes splice via a
+                // wrong `deque_idx`. Phase 0.2 production data: 585
+                // splice events post-deploy, ZERO DataLoss. Combined
+                // with the FSS-side observation that readers always
+                // start at cursor=0 (per `StreamingBlobReader::new`
+                // construction sampling), the frankenstein-bytes class
+                // does not materialize from this race. Demoted WARN →
+                // INFO; the deque_idx is still computed from the
+                // ORIGINAL `earliest` (preserving semantics — no
+                // behavior change), and if it points past the deque
+                // the `chunks.get` returns `None` and the loop
+                // re-checks. Kept as a sampling-useful observation
+                // that the pre/post values differ; not an alarm.
                 let post_lock_earliest =
                     self.inner.earliest_chunk_idx.load(Ordering::Acquire);
                 if post_lock_earliest != earliest {
-                    warn!(
+                    info!(
                         site = "next_chunk_internal",
                         digest = %self.inner.digest,
                         cursor_chunk_idx = self.cursor_chunk_idx,
@@ -776,10 +771,9 @@ impl StreamingBlobReader {
                         post_earliest_chunk_idx = post_lock_earliest,
                         chunk_count,
                         chunks_consumed = self.chunks_consumed,
-                        "#515 H_alt_I race detected at next_chunk: \
-                         earliest_chunk_idx advanced between gate and \
-                         chunks.read() lock; chunks.get(deque_idx) may \
-                         return WRONG chunk for cursor's absolute index"
+                        "#515 H_alt_I pre/post earliest_chunk_idx differ \
+                         (rare; verify deque_idx still valid; benign per \
+                         Phase 0.2 verification)"
                     );
                 }
                 // Convert absolute index to deque-relative index.

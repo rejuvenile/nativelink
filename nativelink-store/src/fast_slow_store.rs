@@ -6509,18 +6509,22 @@ impl StoreDriver for FastSlowStore {
             is_populator_caller, "streaming populate: reading concurrently from populate buffer"
         );
         let mut reader = nativelink_util::streaming_blob::StreamingBlobReader::new(streaming_inner);
-        // #515 Phase 0 diagnostic: detect the H1 TOCTOU race between
-        // the `earliest > 0` pre-check above (line :6481) and the
-        // reader's internal `earliest_chunk_idx.load` inside
-        // `StreamingBlobReader::new` (`streaming_blob.rs:595`). If the
-        // race fired, the reader starts at chunk `K > 0` and the splice
-        // arithmetic below (`new_offset = offset + bytes_already_sent`)
-        // treats a slice length as an absolute byte offset, producing
-        // a frankenstein hash → `Code::DataLoss` at VerifyStore.
-        //
-        // Phase 0 is OBSERVATION ONLY — no behavior change. WARN level
-        // so post-deploy correlation analysis can grep for the marker
-        // and align with DataLoss events on the same digest.
+        // #515 Phase 0 H1 hypothesis empirically refuted (audit:
+        // `.claude/audits/515-phase02-empirical-refutation-\
+        // 2026-05-17.md`). The original hypothesis was that the
+        // producer could advance `earliest_chunk_idx` between the
+        // pre-check load at `:6491` and `StreamingBlobReader::new`
+        // below, leaving the reader CONSTRUCTED at cursor > 0 and
+        // breaking the splice arithmetic. Production sampling of
+        // reader construction (`streaming_blob.rs:642`) shows
+        // `starting_chunk_idx = 0` for 100% of samples, and 585
+        // splice firings post Phase 0.2 deploy produced ZERO DataLoss
+        // events. The frankenstein-bytes mechanism is architecturally
+        // invalid: readers always start at cursor=0. Demoted WARN →
+        // INFO; this remains as a benign observation that a pre/post
+        // mismatch occurred (expected when the producer concurrently
+        // advances), useful for verifying the construction-time
+        // invariant holds going forward.
         let post_construction_chunk_idx = reader.cursor_chunk_idx();
         if post_construction_chunk_idx != pre_check_earliest_chunk_idx
             && post_construction_chunk_idx > 0
@@ -6530,18 +6534,18 @@ impl StoreDriver for FastSlowStore {
             } else {
                 "waiter"
             };
-            warn!(
+            info!(
                 ?key,
                 site,
                 pre_check_earliest_chunk_idx,
                 post_construction_chunk_idx,
                 offset,
                 ?length,
-                "#515 cursor_chunk_idx race detected at reader_new: \
-                 pre={pre_check_earliest_chunk_idx} post={post_construction_chunk_idx} \
-                 — splice math will be wrong if the reader's chunks \
-                 are subsequently forwarded then a sliding-window \
-                 eviction triggers the D.1 fallback"
+                "#515 cursor_chunk_idx pre/post differ at reader_new \
+                 (rare; expected when producer concurrently advances; \
+                 benign per Phase 0.2 verification): \
+                 pre={pre_check_earliest_chunk_idx} \
+                 post={post_construction_chunk_idx}"
             );
         }
         let mut pos = 0u64;
@@ -6631,46 +6635,35 @@ impl StoreDriver for FastSlowStore {
                             let bytes_already_sent = guard.get_bytes_written();
                             let new_offset = offset + bytes_already_sent;
                             let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
-                            // #515 Phase 0: capture the reader's
-                            // starting cursor at splice time. If
-                            // `starting_chunk_idx > 0`, the chunks
-                            // already forwarded to `guard` were NOT a
-                            // contiguous prefix of the blob (they were
-                            // an interior slice `[chunk_K ..
-                            // chunk_K+M]`), and the splice's
-                            // `new_offset = offset + bytes_already_sent`
-                            // is mis-interpreting a slice length as
-                            // an absolute blob offset → frankenstein
-                            // hash → `Code::DataLoss` at VerifyStore.
-                            // WARN level so the diagnostic-only phase
-                            // can correlate splice firings with
-                            // DataLoss events per digest.
+                            // #515 Phase 0/0.2 empirically refuted
+                            // (audit: `.claude/audits/515-phase02-\
+                            // empirical-refutation-2026-05-17.md`):
+                            // 585 splice events post Phase 0.2 deploy,
+                            // ALL with `original_offset = 0,
+                            // original_length = None` (consumer asked
+                            // for the whole blob) and varied
+                            // `cursor_chunk_idx`, and ZERO DataLoss
+                            // events. The original frankenstein-hash
+                            // hypothesis assumed readers could be
+                            // CONSTRUCTED at cursor > 0 due to an H1
+                            // TOCTOU race; the per-reader construction
+                            // sample shows `starting_chunk_idx = 0`
+                            // for 100% of samples, so the splice
+                            // arithmetic `new_offset = offset +
+                            // bytes_already_sent` is correct — the
+                            // reader starts at cursor=0, advances as
+                            // it forwards bytes, splice continues at
+                            // the correct absolute offset. Demoted
+                            // WARN → INFO; this is benign graceful
+                            // degradation (slow reader resumes from
+                            // slow tier when it falls behind the
+                            // sliding window). Fields retained as the
+                            // baseline diagnostic; the redundant
+                            // follow-up info! has been folded in.
                             let starting_chunk_idx = reader.cursor_chunk_idx();
-                            // #515 Phase 0.2: capture consumer's
-                            // ORIGINAL `offset` + `length` (the
-                            // get_part call args) alongside the
-                            // splice-computed `new_offset` /
-                            // `new_length`. Production evidence
-                            // 2026-05-17: 174 splice firings with
-                            // `cursor_chunk_idx > 0` in 80 min but
-                            // ZERO DataLoss events — so cursor > 0
-                            // alone is NOT sufficient for the
-                            // hash-mismatch path. Disambiguating
-                            // requires knowing whether the consumer
-                            // asked for the WHOLE blob (`offset = 0,
-                            // length = None` → splice fetches
-                            // `blob[bytes_already_sent..end]` while
-                            // the consumer expects `blob[0..end]` →
-                            // frankenstein) versus a partial range
-                            // matching the reader's interior cursor
-                            // (`offset = bytes_already_sent` → splice
-                            // is correct). Logging both pairs lets
-                            // post-deploy log analysis test
-                            // `original_offset == new_offset -
-                            // bytes_already_sent` per event.
                             let original_offset = offset;
                             let original_length = length;
-                            warn!(
+                            info!(
                                 ?key,
                                 site = "populator_caller",
                                 original_offset,
@@ -6679,27 +6672,13 @@ impl StoreDriver for FastSlowStore {
                                 new_offset,
                                 ?new_length,
                                 starting_chunk_idx,
-                                "#515 splice firing: cursor_chunk_idx={starting_chunk_idx} \
-                                 at populator-caller splice; if > 0, splice math \
-                                 will hash-mismatch (PrefixContinuity invariant violated) \
-                                 UNLESS original_offset matches reader starting chunk"
+                                "#515 splice firing (benign): reader fell behind \
+                                 sliding window at cursor_chunk_idx={starting_chunk_idx}, \
+                                 resuming from slow tier at new_offset={new_offset}"
                             );
                             self.metrics
                                 .streaming_buffer_reader_fallback_to_direct_total
                                 .fetch_add(1, Ordering::Relaxed);
-                            // info! not warn! — this is graceful degradation
-                            // (a slow reader splicing into the slow tier),
-                            // not an anomaly. Producer behavior, sliding
-                            // window, and other readers are unaffected.
-                            info!(
-                                ?key,
-                                bytes_already_sent,
-                                new_offset,
-                                ?new_length,
-                                "streaming populate (populator-caller): reader \
-                                 fell behind sliding window, splicing in fresh \
-                                 slow-store read at cursor"
-                            );
                             let res = self
                                 .slow_store
                                 .get_part(key.borrow(), &mut *guard, new_offset, new_length)
@@ -6777,31 +6756,21 @@ impl StoreDriver for FastSlowStore {
                             .iter()
                             .any(|m| m.contains(SLIDING_WINDOW_EVICTION_MARKER));
                     if is_sliding_window_eviction {
-                        // #515 Phase 0: same instrumentation as the
-                        // populator-caller branch above. Waiter shares
-                        // the same `reader` (`StreamingBlobReader::new`
-                        // at :6500 outside this match), so its starting
-                        // cursor is identical, but the WARN here lets
-                        // the diagnostic correlate splice firings on
-                        // the waiter side separately. Phase 0 expects
-                        // production logs to show populator-caller
-                        // splices in the DataLoss-correlated subset
-                        // (per #515 production evidence 2026-05-17);
-                        // a waiter-side splice with `cursor_chunk_idx > 0`
-                        // would confirm the H4 sibling-path variant
-                        // also fires.
+                        // #515 Phase 0/0.2 empirically refuted (see
+                        // populator-caller branch above + audit
+                        // `.claude/audits/515-phase02-empirical-\
+                        // refutation-2026-05-17.md`). Waiter shares
+                        // the same `reader` as the populator-caller,
+                        // so its starting cursor is identical (0 per
+                        // construction-time sampling). Demoted WARN →
+                        // INFO; benign graceful degradation. Site
+                        // field retained so log analysis can
+                        // distinguish waiter vs populator-caller
+                        // splice paths.
                         let starting_chunk_idx = reader.cursor_chunk_idx();
-                        // #515 Phase 0.2: mirror the populator-caller
-                        // expansion above — capture the consumer's
-                        // ORIGINAL `offset` + `length` (the get_part
-                        // call args) alongside the splice-computed
-                        // `new_offset` / `new_length`. Waiter and
-                        // populator-caller share the same reader cursor,
-                        // but the consumer args may differ across
-                        // racers, so log them here too.
                         let original_offset = offset;
                         let original_length = length;
-                        warn!(
+                        info!(
                             ?key,
                             site = "waiter",
                             original_offset,
@@ -6810,23 +6779,13 @@ impl StoreDriver for FastSlowStore {
                             new_offset,
                             ?new_length,
                             starting_chunk_idx,
-                            "#515 splice firing: cursor_chunk_idx={starting_chunk_idx} \
-                             at waiter splice; if > 0, splice math will \
-                             hash-mismatch (PrefixContinuity invariant violated) \
-                             UNLESS original_offset matches reader starting chunk"
+                            "#515 splice firing (benign): reader fell behind \
+                             sliding window at cursor_chunk_idx={starting_chunk_idx}, \
+                             resuming from slow tier at new_offset={new_offset}"
                         );
                         self.metrics
                             .streaming_buffer_reader_fallback_to_direct_waiter_total
                             .fetch_add(1, Ordering::Relaxed);
-                        info!(
-                            ?key,
-                            bytes_already_sent,
-                            new_offset,
-                            ?new_length,
-                            "streaming populate (waiter): reader fell behind \
-                             sliding window, splicing in fresh slow-store read \
-                             at cursor"
-                        );
                     } else {
                         warn!(
                             ?key,
