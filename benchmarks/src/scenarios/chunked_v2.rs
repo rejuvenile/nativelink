@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::doc_lazy_continuation)]
 //! Flows W3 + R5: chunked-v2 anchoring cells.
 //!
 //! **W3 (chunked v2 write):** single writer drives an end-to-end

@@ -152,8 +152,7 @@ fn check_nativelink_uptime() -> Verdict {
     if svc_uptime < MIN_NATIVELINK_UPTIME {
         return Verdict::Refuse(format!(
             "nativelink.service uptime {svc_uptime:?} < MIN_NATIVELINK_UPTIME \
-             ({:?}); pass --force to override (e.g. for first-baseline collection)",
-            MIN_NATIVELINK_UPTIME
+             ({MIN_NATIVELINK_UPTIME:?}); pass --force to override (e.g. for first-baseline collection)"
         ));
     }
     Verdict::AllClear

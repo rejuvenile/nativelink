@@ -12,6 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Benchmark-crate-specific lint relaxations. The bench is a private,
+// binary-only crate (publish=false). Pedantic doc-markdown and
+// numeric-cast lints from the workspace-wide `pedantic`/`nursery`
+// groups are noise here: prose-heavy rationale doc-comments routinely
+// name types like `FastSlow`, `MemoryStore`, and `buildcache-native.json5`
+// without backticks; PRNG byte-fill truncates u64 → u8 by design.
+// Production lint coverage stays in place for the `nativelink-*` crates.
+#![allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::decimal_literal_representation,
+    clippy::default_trait_access,
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::manual_clamp,
+    clippy::match_same_arms,
+    clippy::missing_const_for_fn,
+    clippy::needless_pass_by_value,
+    clippy::pub_underscore_fields,
+    clippy::redundant_closure_for_method_calls,
+    clippy::similar_names,
+    clippy::std_instead_of_core,
+    clippy::too_many_lines,
+    clippy::unchecked_time_subtraction,
+    clippy::unreadable_literal,
+    clippy::unused_self,
+    clippy::use_debug,
+    clippy::use_self
+)]
+
 //! #495 Phase 1: data-plane benchmark harness for the v3-anchoring smoke
 //! cells.
 //!
@@ -23,7 +56,7 @@
 //! The existing `benches/transport_bench.rs` measures TCP/QUIC transport
 //! through an in-memory store; `nativelink-util/benches/fs_io_bench.rs`
 //! measures filesystem primitives. Neither covers the production wrapper
-//! chain (FastSlow → Filesystem → GrpcStore-peer-mirror) and neither has
+//! chain (`FastSlow` → `Filesystem` → `GrpcStore`-peer-mirror) and neither has
 //! baseline-diff for CI.
 //!
 //! This crate is **purely additive observability infrastructure** — it

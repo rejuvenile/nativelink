@@ -12,6 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Benchmark-binary-specific lint relaxations; see benchmarks/src/lib.rs
+// for full rationale.
+#![allow(
+    clippy::print_stdout,
+    clippy::single_match_else,
+    clippy::vec_init_then_push,
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::decimal_literal_representation,
+    clippy::default_trait_access,
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::manual_clamp,
+    clippy::match_same_arms,
+    clippy::missing_const_for_fn,
+    clippy::needless_pass_by_value,
+    clippy::pub_underscore_fields,
+    clippy::redundant_closure_for_method_calls,
+    clippy::similar_names,
+    clippy::std_instead_of_core,
+    clippy::too_many_lines,
+    clippy::unchecked_time_subtraction,
+    clippy::unreadable_literal,
+    clippy::unused_self,
+    clippy::use_debug,
+    clippy::use_self
+)]
+
 //! `data_plane_bench` CLI — runs the #495 Phase 1 v3-anchoring smoke
 //! suite and emits one JSON baseline file.
 //!
@@ -127,6 +158,9 @@ fn main() -> ExitCode {
     // top-level binaries that legitimately needs it (this IS the entry
     // point that constructs the runtime). Standard pattern for entry-
     // point binaries; see `src/bin/nativelink.rs` for the prod entry.
+    // Entry-point binary: this IS the runtime constructor, the lint
+    // exists to keep library code from doing it. Suppress for the
+    // single legitimate call-site.
     #[allow(clippy::disallowed_methods)]
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -138,6 +172,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    #[allow(clippy::disallowed_methods)]
     rt.block_on(run_main())
 }
 
