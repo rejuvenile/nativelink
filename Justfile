@@ -129,19 +129,31 @@ test-protocol-gate:
 # Run the data-plane benchmark suite and write a baseline JSON file.
 # Usage: just bench-data-plane                   # default args, writes to baselines/<ts>-<sha>.json
 #        just bench-data-plane --fast --force    # fast smoke + bypass gate
+#
+# Wrapped under a 30-minute hard timeout AND a flock-based mutex so two
+# concurrent invocations (e.g. a CI race) serialize instead of clobbering
+# each other's tempdirs. The build phase + benchmark wall-clock fits
+# comfortably under 30 min for the default cell matrix; bump the timeout
+# if Phase 3 adds nightly cells.
 bench-data-plane *ARGS:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	SHA="$(git rev-parse --short=12 HEAD)"
 	TS="$(date -u +%Y%m%dT%H%M%SZ)"
 	OUT="benchmarks/baselines/${TS}-${SHA}.json"
+	LOCK="/tmp/just-bench-data-plane.lock"
 	mkdir -p "$(dirname "$OUT")"
 	echo "[just] running data_plane_bench → ${OUT}"
-	cargo run --release --bin data_plane_bench --features chunked_fast_slow -p nativelink-benchmarks -- \
+	# flock blocks (no -n) so concurrent invocations queue rather than fail;
+	# timeout caps wall-clock at 30 min so a wedge surfaces instead of
+	# silently consuming the operator's terminal.
+	timeout 1800 flock "${LOCK}" \
+	    cargo run --release --bin data_plane_bench --features chunked_fast_slow -p nativelink-benchmarks -- \
 	    --output "${OUT}" {{ARGS}}
 	echo "[just] baseline: ${OUT}"
 
 # Print the pre-flight verdict only; useful to check whether the host is
-# clear to run benches without actually running them.
+# clear to run benches without actually running them. 5-minute timeout
+# bounds a cold build cycle.
 bench-preflight:
-	cargo run --release --bin data_plane_bench --features chunked_fast_slow -p nativelink-benchmarks -- --preflight-only
+	timeout 300 cargo run --release --bin data_plane_bench --features chunked_fast_slow -p nativelink-benchmarks -- --preflight-only

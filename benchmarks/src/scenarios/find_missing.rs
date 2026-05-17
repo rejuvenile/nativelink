@@ -20,15 +20,15 @@
 //! what makes Bazel build cache lookups fast; the miss-path is what
 //! makes a fresh build's first FMB sequence acceptable.
 
-use core::pin::Pin;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use nativelink_util::common::DigestInfo;
-use nativelink_util::store_trait::{StoreDriver, StoreKey, StoreLike};
+use nativelink_util::store_trait::{StoreKey, StoreLike};
 
-use crate::composition::{build_prod_cas_composition, prod_defaults};
+use crate::composition::build_prod_cas_composition;
 use crate::output::{BenchmarkResult, CacheState};
-use crate::scenarios::{RunOpts, make_blob, measure};
+use crate::scenarios::{RunOpts, make_blob_with_indices, measure};
 
 /// Batch sizes worth measuring. Bazel's FMB batch is variable — a
 /// fresh build often emits hundreds of digests per call; an incremental
@@ -40,27 +40,30 @@ const F1_BATCH_SIZES: &[(usize, &str)] = &[
     (1024, "1024"),
 ];
 
-pub async fn run(opts: &RunOpts) -> Vec<BenchmarkResult> {
+pub async fn run(opts: &RunOpts, temp_dir_base: Option<&PathBuf>) -> Vec<BenchmarkResult> {
     let mut out = Vec::new();
     let iters = opts.effective_iters(50);
 
-    let composition = build_prod_cas_composition(
-        prod_defaults::FAST_MEMORY_MAX_BYTES,
-        prod_defaults::SLOW_WRITES_INFLIGHT_MAX_BYTES,
-    )
-    .await
-    .expect("build_prod_cas_composition for F1");
+    let composition =
+        match build_prod_cas_composition(temp_dir_base.map(|p| p.as_path())).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[bench] F1 composition build failed: {e:?}");
+                return out;
+            }
+        };
 
     // Prepopulate one digest pool that will be the "known" set for the
-    // cache-hit cells.
+    // cache-hit cells. 1024 × 1 KiB = 1 MiB total — well under any
+    // budget.
     let mut known_digests: Vec<DigestInfo> = Vec::with_capacity(1024);
-    for j in 0..1024u64 {
-        let (digest, data) = make_blob(0xF1_C0DE_A11 ^ j, 1024);
-        composition
-            .cas_store
-            .update_oneshot(digest, data)
-            .await
-            .expect("F1 prepopulate must succeed");
+    for j in 0..1024u32 {
+        let (digest, data) =
+            make_blob_with_indices("f1_known_pool", 0, j, 1024);
+        if let Err(e) = composition.cas_store.update_oneshot(digest, data).await {
+            eprintln!("[bench] F1 prepopulate failed at j={j}: {e:?}");
+            return out;
+        }
         known_digests.push(digest);
     }
 
@@ -81,17 +84,12 @@ pub async fn run(opts: &RunOpts) -> Vec<BenchmarkResult> {
         let miss_name = format!("f1_find_missing_cache_miss_batch{label}");
         if opts.matches(&miss_name) {
             // Fresh digests for the miss path — never seen before.
+            // Per-cell seeded by the cell name so distinct cells don't
+            // collide on each other.
             let mut missing = Vec::with_capacity(batch);
-            for j in 0..(batch as u64) {
-                missing.push(DigestInfo::new(
-                    {
-                        let mut buf = [0u8; 32];
-                        buf[..8].copy_from_slice(&j.to_le_bytes());
-                        buf[8..16].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
-                        buf
-                    },
-                    999,
-                ));
+            for j in 0..(batch as u32) {
+                let (digest, _) = make_blob_with_indices(&miss_name, 0, j, 16);
+                missing.push(digest);
             }
             out.push(run_one(
                 &composition.cas_store,
@@ -123,11 +121,13 @@ async fn run_one(
     );
     let elements_per_iter = digests.len() as u64;
 
-    let keys: Vec<StoreKey<'static>> = digests
-        .iter()
-        .map(|d| StoreKey::from(*d))
-        .collect();
+    // Pre-allocate keys + results OUTSIDE the timed body — avoids
+    // 64KiB/8KiB allocs per iter that swamp µs-scale ECS hit latency.
+    let keys: Vec<StoreKey<'static>> = digests.iter().map(|d| StoreKey::from(*d)).collect();
     let cas_clone = cas.clone();
+    let keys_arc = std::sync::Arc::new(keys);
+    // Buffer reused per iter; len matches keys.len().
+    let buf_len = digests.len();
 
     measure(
         "F1",
@@ -141,16 +141,15 @@ async fn run_one(
         extras,
         move || {
             let cas = cas_clone.clone();
-            let keys = keys.clone();
+            let keys = keys_arc.clone();
+            // Fresh result-buffer per iter; allocation cost is part of
+            // the API contract for `has_with_results`, so it's fair to
+            // count it. Pre-allocate to avoid grow-on-push noise.
+            let mut results: Vec<Option<u64>> = vec![None; buf_len];
             async move {
-                let mut results = vec![None; keys.len()];
-                StoreDriver::has_with_results(
-                    Pin::new(cas.inner_store::<StoreKey<'_>>(None)),
-                    &keys,
-                    &mut results,
-                )
-                .await
-                .expect("F1 has_with_results must succeed");
+                cas.has_with_results(&keys, &mut results)
+                    .await
+                    .expect("F1 has_with_results must succeed");
                 if expect_present {
                     assert!(
                         results.iter().all(|r| r.is_some()),

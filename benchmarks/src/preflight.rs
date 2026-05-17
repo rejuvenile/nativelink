@@ -200,6 +200,17 @@ fn check_recent_traffic() -> Verdict {
         .count()
         .try_into()
         .unwrap_or(u32::MAX);
+    classify_traffic(line_count, window_secs)
+}
+
+/// Pure comparator extracted from [`check_recent_traffic`] so the gate
+/// logic can be unit-tested without shell-out. The cutoff is `>` (strict)
+/// so a line count exactly equal to [`MAX_RECENT_BYTESTREAM_LINES`] still
+/// returns `AllClear`.
+///
+/// Mutation: change `>` to `>=` — `classify_traffic_off_by_one_500_passes`
+/// red-fails because a 500-line bucket now refuses.
+fn classify_traffic(line_count: u32, window_secs: u64) -> Verdict {
     if line_count > MAX_RECENT_BYTESTREAM_LINES {
         return Verdict::Refuse(format!(
             "production traffic active: {line_count} ByteStream:: log lines in last {window_secs}s \
@@ -239,5 +250,44 @@ mod tests {
             Duration::from_secs(120),
             "doc-comment + module rationale name 2-minute window; declaration must match"
         );
+    }
+
+    /// Behavior test: 499 lines passes the gate. Substance check —
+    /// the constant could be anything, what matters is the comparator.
+    #[test]
+    fn classify_traffic_off_by_one_499_passes() {
+        match classify_traffic(MAX_RECENT_BYTESTREAM_LINES - 1, 120) {
+            Verdict::AllClear => {}
+            other => panic!("499 lines should pass; got {other:?}"),
+        }
+    }
+
+    /// Exactly-at-threshold passes (`>` strict). Mutation: change `>`
+    /// to `>=` in `classify_traffic` — this test red-fails.
+    #[test]
+    fn classify_traffic_off_by_one_500_passes() {
+        match classify_traffic(MAX_RECENT_BYTESTREAM_LINES, 120) {
+            Verdict::AllClear => {}
+            other => panic!("500 lines should pass; got {other:?}"),
+        }
+    }
+
+    /// 501 lines refuses. Mutation: comment out the `if` body in
+    /// `classify_traffic` — this test red-fails.
+    #[test]
+    fn classify_traffic_off_by_one_501_refuses() {
+        match classify_traffic(MAX_RECENT_BYTESTREAM_LINES + 1, 120) {
+            Verdict::Refuse(msg) => {
+                assert!(
+                    msg.contains("501"),
+                    "diagnostic must include the line count: {msg}"
+                );
+                assert!(
+                    msg.contains("MAX_RECENT_BYTESTREAM_LINES"),
+                    "diagnostic must name the constant: {msg}"
+                );
+            }
+            other => panic!("501 lines must refuse; got {other:?}"),
+        }
     }
 }

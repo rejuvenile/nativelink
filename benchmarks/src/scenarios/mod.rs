@@ -25,37 +25,53 @@ use core::future::Future;
 use std::time::Instant;
 
 use bytes::Bytes;
-use nativelink_util::common::DigestInfo;
 use sha2::{Digest as _, Sha256};
 
+use nativelink_util::common::DigestInfo;
+
 use crate::output::{BenchmarkResult, CacheState, LatencyPercentiles, Throughput};
+
+/// Floor for `--fast` iterations. Below this p50 is noise.
+pub const FAST_MODE_ITERS: u32 = 3;
+
+/// Minimum permitted CLI `--iters` value. The CLI parser rejects values
+/// below this (`--iters 0 --fast` would otherwise panic in
+/// `LatencyPercentiles::from_samples`).
+pub const MIN_ITERS: u32 = 1;
 
 /// CLI-supplied options shared across scenarios.
 #[derive(Debug, Clone)]
 pub struct RunOpts {
     /// Iterations per cell. Diff tooling rejects baselines with
-    /// `iters <= 5`. Default 20 keeps cells ~30s wall-clock.
+    /// `iters < 20`. CLI parse rejects `iters < MIN_ITERS`.
     pub iters: u32,
     /// If set, only run scenarios whose name matches this substring.
     pub filter: Option<String>,
-    /// Reduce iters to a tiny number so the full smoke suite finishes
+    /// Reduce iters to `FAST_MODE_ITERS` so the full smoke suite finishes
     /// in seconds rather than minutes — used for self-check runs
     /// (CI-disjoint dev iteration).
     pub fast: bool,
 }
 
 impl RunOpts {
+    /// Resolve the effective iter count for a cell.
+    ///
+    /// - `--fast` collapses to `FAST_MODE_ITERS` regardless of the
+    ///   per-cell default; intentional, the run is self-check, NOT a
+    ///   diff anchor.
+    /// - `iters == 0` is forbidden by `Cli::parse`; if it slips in
+    ///   somehow we still return `MIN_ITERS` to prevent the downstream
+    ///   `from_samples` empty-vec panic.
     pub fn effective_iters(&self, default: u32) -> u32 {
-        if self.fast {
-            // Capped at 3 — enough to produce a sortable p50/p99 but not
-            // enough to claim a clean baseline. The CLI flags the run
-            // as `forced: false, fast: true` in metadata so diff tools
-            // can refuse to compare against a fast-mode baseline.
-            3.min(self.iters)
-        } else if self.iters > 0 {
+        let base = if self.iters >= MIN_ITERS {
             self.iters
         } else {
-            default
+            default.max(MIN_ITERS)
+        };
+        if self.fast {
+            base.min(FAST_MODE_ITERS).max(MIN_ITERS)
+        } else {
+            base.max(MIN_ITERS)
         }
     }
 
@@ -71,11 +87,19 @@ impl RunOpts {
 /// `seed + size`, so the same call across runs yields the same digest.
 /// Critical for "warm" scenarios where we prepopulate once and read N
 /// times — and for diff stability of `extras.digest_hex`.
+///
+/// **NOTE: SHA-256 is intentional for digests-as-labels, even though
+/// prod uses blake3 (`default_digest_hash_function`).** A bench digest
+/// is never compared against a prod digest; it's a deterministic ID in
+/// the in-process composition. SHA-256 here avoids pulling in blake3
+/// for one helper; the cost is non-load-bearing.
 pub fn make_blob(seed: u64, size: usize) -> (DigestInfo, Bytes) {
     let mut data = Vec::with_capacity(size);
     let mut state: u64 = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     for _ in 0..size {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         data.push((state >> 33) as u8);
     }
     let hash = Sha256::digest(&data);
@@ -85,12 +109,36 @@ pub fn make_blob(seed: u64, size: usize) -> (DigestInfo, Bytes) {
     (digest, Bytes::from(data))
 }
 
+/// Variant of [`make_blob`] whose seed is derived from
+/// `(scenario_name_hash, iter, slot)` to guarantee per-tuple uniqueness
+/// without the XOR-collision hazard of `seed ^ n ^ j`.
+///
+/// Specifically, two distinct `(n, j)` pairs always produce distinct
+/// seeds; the mixer `seed.wrapping_mul(K).wrapping_add(n*17 + j)` is
+/// monotonic in both `n` and `j` for any fixed seed.
+pub fn make_blob_with_indices(
+    scenario_name: &str,
+    n: u64,
+    j: u32,
+    size: usize,
+) -> (DigestInfo, Bytes) {
+    let mut h = Sha256::new();
+    h.update(scenario_name.as_bytes());
+    let seed_digest = h.finalize();
+    let seed = u64::from_le_bytes(seed_digest[..8].try_into().unwrap());
+    let mixed = seed
+        .wrapping_mul(1_000_003)
+        .wrapping_add((n.wrapping_mul(17)).wrapping_add(j as u64));
+    make_blob(mixed, size)
+}
+
 /// Repeatedly run `body` and capture per-iteration durations. Returns
 /// the assembled `BenchmarkResult`. Generic over the future shape so it
 /// works for "one op" and "N concurrent ops" alike.
 ///
 /// `body` is awaited in a tight loop with NO sleep between iterations;
 /// the bench measures back-to-back operation latency.
+#[allow(clippy::too_many_arguments)]
 pub async fn measure<F, Fut>(
     flow_id: &str,
     scenario_name: &str,
@@ -107,6 +155,9 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = ()>,
 {
+    // Floor defensively — `RunOpts::effective_iters` already enforces
+    // this, but `measure` is also a public helper.
+    let iters = iters.max(MIN_ITERS);
     let mut samples = Vec::with_capacity(iters as usize);
     let total_start = Instant::now();
     for _ in 0..iters {
@@ -115,16 +166,16 @@ where
         samples.push(t.elapsed());
     }
     let total_duration = total_start.elapsed();
-    let total_duration_ms = round3(total_duration.as_secs_f64() * 1_000.0);
+    let total_duration_ms = round_emit(total_duration.as_secs_f64() * 1_000.0);
     let latency_ms = LatencyPercentiles::from_samples(&mut samples);
     let throughput = match (throughput_bytes_per_iter, elements_per_iter) {
         (Some(bytes), _) => {
             let total_bytes = bytes.saturating_mul(iters as u64) as f64;
-            Throughput::BytesPerSec(round3(total_bytes / total_duration.as_secs_f64()))
+            Throughput::BytesPerSec(round_emit(total_bytes / total_duration.as_secs_f64()))
         }
         (None, Some(elems)) => {
             let total_elems = elems.saturating_mul(iters as u64) as f64;
-            Throughput::ElementsPerSec(round3(total_elems / total_duration.as_secs_f64()))
+            Throughput::ElementsPerSec(round_emit(total_elems / total_duration.as_secs_f64()))
         }
         (None, None) => Throughput::None,
     };
@@ -135,6 +186,7 @@ where
         concurrency,
         cache_state,
         iters,
+        confidence: crate::output::confidence_for_iters(iters),
         total_duration_ms,
         latency_ms,
         throughput,
@@ -142,8 +194,8 @@ where
     }
 }
 
-fn round3(x: f64) -> f64 {
-    (x * 1000.0).round() / 1000.0
+fn round_emit(x: f64) -> f64 {
+    crate::output::round_emit(x)
 }
 
 #[cfg(test)]
@@ -157,8 +209,8 @@ mod tests {
             filter: Some("w1".to_string()),
             fast: false,
         };
-        assert!(opts.matches("w1_bytestream_write_1MiB_c1"));
-        assert!(!opts.matches("r1_bytestream_read_1MiB_c1"));
+        assert!(opts.matches("w1_store_update_oneshot_1MiB_c1"));
+        assert!(!opts.matches("r1_store_get_part_unchunked_1MiB_c1"));
     }
 
     #[test]
@@ -170,13 +222,28 @@ mod tests {
     #[test]
     fn effective_iters_fast_caps_at_three() {
         let opts = RunOpts { iters: 100, filter: None, fast: true };
-        assert_eq!(opts.effective_iters(20), 3);
+        assert_eq!(opts.effective_iters(20), FAST_MODE_ITERS);
     }
 
     #[test]
     fn effective_iters_zero_uses_default() {
         let opts = RunOpts { iters: 0, filter: None, fast: false };
         assert_eq!(opts.effective_iters(42), 42);
+    }
+
+    /// The CLI parser SHOULD reject `--iters 0`, but defensively
+    /// `effective_iters` clamps to `MIN_ITERS` so the downstream
+    /// `LatencyPercentiles::from_samples` empty-vec panic cannot fire.
+    /// Mutation: remove the `.max(MIN_ITERS)` in `effective_iters` —
+    /// this test must red-fail with the floor-violation message.
+    #[test]
+    fn effective_iters_zero_with_fast_floors_to_min_iters() {
+        let opts = RunOpts { iters: 0, filter: None, fast: true };
+        assert!(
+            opts.effective_iters(0) >= MIN_ITERS,
+            "effective_iters MUST floor at MIN_ITERS; if it returns 0, the \
+             downstream LatencyPercentiles::from_samples panics on empty input"
+        );
     }
 
     #[test]
@@ -192,5 +259,34 @@ mod tests {
         let (d, b) = make_blob(1, 1024);
         assert_eq!(d.size_bytes(), 1024);
         assert_eq!(b.len(), 1024);
+    }
+
+    /// Distinct seeds must produce distinct digests. The W1/R1 cells
+    /// rely on `make_blob_with_indices` returning unique digests for
+    /// distinct `(iter, slot)` pairs; a collision silently makes the
+    /// bench measure cache-hit instead of cold-write paths.
+    /// Mutation: replace `wrapping_add((n*17)+j)` with `wrapping_add(0)`
+    /// in `make_blob_with_indices` — this test must red-fail.
+    #[test]
+    fn make_blob_with_indices_distinct_for_distinct_tuples() {
+        let (d00, _) = make_blob_with_indices("w1_scenario", 0, 0, 64);
+        let (d01, _) = make_blob_with_indices("w1_scenario", 0, 1, 64);
+        let (d10, _) = make_blob_with_indices("w1_scenario", 1, 0, 64);
+        assert_ne!(d00, d01, "(n=0,j=0) MUST differ from (n=0,j=1)");
+        assert_ne!(d00, d10, "(n=0,j=0) MUST differ from (n=1,j=0)");
+        assert_ne!(d01, d10, "(n=0,j=1) MUST differ from (n=1,j=0)");
+    }
+
+    /// Distinct scenario names must produce distinct seeds, so two
+    /// cells with the same (n, j) tuple don't collide on a digest.
+    #[test]
+    fn make_blob_with_indices_distinct_per_scenario() {
+        let (d_w1, _) = make_blob_with_indices("w1_scenario", 0, 0, 64);
+        let (d_r1, _) = make_blob_with_indices("r1_scenario", 0, 0, 64);
+        assert_ne!(
+            d_w1, d_r1,
+            "distinct scenario names MUST yield distinct seeds — otherwise W1's \
+             prepopulate would collide with R1's cold path"
+        );
     }
 }

@@ -12,24 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Flow W1: legacy ByteStream::Write through the production wrapper
-//! chain (ExistenceCache → Verify → FastSlow{Memory, Filesystem}).
+//! Flow W1: writes through the prod CAS wrapper chain.
+//!
+//! **Scenario name caveat:** the cells are named
+//! `w1_store_update_oneshot_*`, NOT `w1_bytestream_*`. They exercise the
+//! `StoreLike::update_oneshot` path through
+//! `Verify → ExistenceCache → SizePartitioning → {SMALL_CAS_CACHED, cas_FAST_SLOW_STORE}`.
+//! They DO NOT cross the `ByteStreamServer` (no gRPC service in the
+//! path, no h2/QUIC framing, no WriteState machine). Wiring the
+//! ByteStream front-end is a Phase 1.5 follow-up; until then, these
+//! cells anchor the store wrapper chain only — reviewers comparing W1
+//! numbers to production ByteStream tail latency MUST account for the
+//! RPC-layer absence.
 //!
 //! **Invariant being anchored:** the prod write composition's wall-clock
-//! and throughput for sequential and parallel writes. A regression here
-//! flags any future change that adds latency to the
-//! `ExistenceCache::update → Verify::update → FastSlow::update` chain
-//! (e.g. an over-eager `has` probe added on the write path, a fsync
-//! sneaking in, a slow-write back-pressure cap firing prematurely).
+//! and throughput for sequential writes through the wrapper chain. A
+//! regression here flags any change that adds latency to
+//! `ExistenceCache::update → SizePartitioning::update →
+//! {SMALL_CAS_CACHED, cas_FAST_SLOW_STORE}::update` (e.g. an over-eager
+//! `has` probe added on the write path, a fsync sneaking in, the slow-
+//! write back-pressure cap firing prematurely).
+//!
+//! **Composition deviation note:** `SMALL_CAS_CACHED.slow` is a
+//! MemoryStore in the bench (vs Valkey/Redis in prod). Cells whose
+//! payload ≤ 16 KiB go through this Memory-only fast-slow; cells with
+//! payload > 16 KiB hit `cas_FAST_SLOW_STORE`'s real Filesystem slow
+//! tier. `extras.composition_deviation` flags the small-CAS cells.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use bytes::Bytes;
+use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::StoreLike;
 
 use crate::composition::{Composition, build_prod_cas_composition, prod_defaults};
 use crate::output::{BenchmarkResult, CacheState};
-use crate::scenarios::{RunOpts, make_blob, measure};
+use crate::scenarios::{RunOpts, make_blob_with_indices, measure};
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteCell {
@@ -38,17 +57,15 @@ pub struct WriteCell {
     pub concurrency: u32,
 }
 
-/// Production-aligned cell matrix per design Section 2:
+/// Production-aligned cell matrix:
 ///
-/// - tiny (1 KiB) — exists for diff-stable per-op overhead anchoring
-/// - small (16 KiB) — below the chunked-size threshold
-/// - medium (1 MiB) — `batch_update_threshold_bytes` boundary
-/// - large (16 MiB) — above SizePartitioning fast-tier threshold;
-///   chunked-v2 would activate in prod for this size; here it exercises
-///   the slow Filesystem write path.
-///
-/// Concurrencies: 1 (sequential baseline), 10 (typical Bazel burst).
-/// 100 is deferred to nightly per design Section 5.
+/// - tiny (1 KiB) — exercises SMALL_CAS_CACHED (small-blob path)
+/// - small (16 KiB) — exactly AT the SizePartitioning threshold; lower
+///   branch (small-blob path) per `>=` semantics — confirmed by
+///   `SizePartitioningStore::pick_store` at the threshold
+/// - medium (1 MiB) — exercises cas_FAST_SLOW_STORE (large-blob path)
+/// - large (16 MiB) — exercises cas_FAST_SLOW_STORE filesystem slow tier
+/// - 1 MiB c=10 — fan-out cell; per-task overlap (single-task)
 const W1_CELLS: &[WriteCell] = &[
     WriteCell { size: 1_024, label: "1KiB", concurrency: 1 },
     WriteCell { size: 16_384, label: "16KiB", concurrency: 1 },
@@ -57,34 +74,29 @@ const W1_CELLS: &[WriteCell] = &[
     WriteCell { size: 1_048_576, label: "1MiB", concurrency: 10 },
 ];
 
-pub async fn run(opts: &RunOpts) -> Vec<BenchmarkResult> {
+pub async fn run(opts: &RunOpts, temp_dir_base: Option<&PathBuf>) -> Vec<BenchmarkResult> {
     let mut out = Vec::new();
     let iters = opts.effective_iters(20);
 
-    // One composition per scenario family — keeps the fresh-tempdir
-    // semantics so a previous cell's evictions don't pollute the next.
-    //
-    // `slow_writes_in_flight_max_bytes`: must be non-zero per the
-    // CLAUDE.md "unbounded buffering" rule which is enforced at
-    // `FastSlowStore::new_validated`. We use the production
-    // `buildcache-native.json5` value (8 GiB) so the cell exercises the
-    // same admission gate as production.
-    let composition = build_prod_cas_composition(
-        prod_defaults::FAST_MEMORY_MAX_BYTES,
-        prod_defaults::SLOW_WRITES_INFLIGHT_MAX_BYTES,
-    )
-    .await
-    .expect("build_prod_cas_composition for W1");
-
     for cell in W1_CELLS {
         let scenario_name = format!(
-            "w1_bytestream_write_fastslow_filesystem_{label}_c{c}",
+            "w1_store_update_oneshot_{label}_c{c}",
             label = cell.label,
             c = cell.concurrency
         );
         if !opts.matches(&scenario_name) {
             continue;
         }
+        // Per-cell fresh composition so previous-cell state (in-flight
+        // slow writes, fast-tier residency) cannot pollute the next.
+        let composition =
+            match build_prod_cas_composition(temp_dir_base.map(|p| p.as_path())).await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[bench] W1 composition build failed for {scenario_name}: {e:?}");
+                    continue;
+                }
+            };
         out.push(run_one_cell(&composition, cell, iters, &scenario_name).await);
     }
     out
@@ -96,32 +108,41 @@ async fn run_one_cell(
     iters: u32,
     scenario_name: &str,
 ) -> BenchmarkResult {
-    // Per-cell seed makes each cell's blob unique while staying
-    // deterministic across runs.
-    let seed = ((cell.size as u64) << 16) ^ (cell.concurrency as u64);
     let throughput_bytes_per_iter = (cell.size as u64) * (cell.concurrency as u64);
+    let size = cell.size;
+    let concurrency = cell.concurrency;
+
+    // Pre-generate every blob OUTSIDE the timed body. `make_blob_with_indices`
+    // is a SHA-256 + PRNG per byte; at 16 MiB × 20 iters that's >40 ms of
+    // fixed cost which, if folded into wall-clock, dominates sub-50ms cells.
+    let prebuilt: Vec<Vec<(DigestInfo, Bytes)>> = (0..iters)
+        .map(|n| {
+            (0..concurrency)
+                .map(|j| make_blob_with_indices(scenario_name, n as u64, j, size))
+                .collect()
+        })
+        .collect();
 
     let mut extras = BTreeMap::new();
     extras.insert(
-        "fast_tier_max_bytes".to_string(),
-        serde_json::json!(prod_defaults::FAST_MEMORY_MAX_BYTES),
+        "cas_fast_memory_max_bytes".to_string(),
+        serde_json::json!(prod_defaults::CAS_FAST_MEMORY_MAX_BYTES),
     );
     extras.insert(
         "size_partitioning_threshold".to_string(),
         serde_json::json!(prod_defaults::SIZE_PARTITIONING_THRESHOLD),
     );
+    if (size as u64) <= prod_defaults::SIZE_PARTITIONING_THRESHOLD {
+        extras.insert(
+            "composition_deviation".to_string(),
+            serde_json::json!("small_cas_redis_replaced_with_memory"),
+        );
+    }
 
-    let cas = composition.cas_store.clone();
-    let concurrency = cell.concurrency;
-    let size = cell.size;
-    let cas_for_body = cas.clone();
-
-    // Per-iteration counter so each iter writes a fresh digest. Without
-    // this, ExistenceCacheStore's positive cache would short-circuit
-    // every write after the first one and we'd measure cache-hit
-    // overhead instead of the actual write path. We measure the WRITE
-    // path; the cache-hit path is what F1 anchors.
     let iter_counter = std::sync::atomic::AtomicU64::new(0);
+    let cas = composition.cas_store.clone();
+    let prebuilt = std::sync::Arc::new(prebuilt);
+    let prebuilt_for_body = prebuilt.clone();
 
     measure(
         "W1",
@@ -134,17 +155,13 @@ async fn run_one_cell(
         None,
         extras,
         move || {
-            let cas = cas_for_body.clone();
+            let cas = cas.clone();
+            let prebuilt = prebuilt_for_body.clone();
             let n = iter_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async move {
-                // Build N concurrent writes, each with a distinct
-                // digest. The fan-out cost is folded into the cell;
-                // diff tooling can compare per-cell totals because
-                // concurrency is part of the diff key.
+                let row = &prebuilt[n as usize];
                 let mut futs = Vec::with_capacity(concurrency as usize);
-                for j in 0..concurrency {
-                    let (digest, data): (_, Bytes) =
-                        make_blob(seed ^ n ^ (j as u64), size);
+                for (digest, data) in row.iter().cloned() {
                     let cas = cas.clone();
                     futs.push(async move {
                         cas.update_oneshot(digest, data)
@@ -152,6 +169,10 @@ async fn run_one_cell(
                             .expect("W1 write must succeed");
                     });
                 }
+                // join_all: single-task overlap (not multi-core
+                // parallelism). Documented intentional — production
+                // ByteStream gRPC handlers run on per-stream worker
+                // tasks, but the store-only path is intra-task.
                 futures::future::join_all(futs).await;
             }
         },

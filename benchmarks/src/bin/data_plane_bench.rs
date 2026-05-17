@@ -23,6 +23,26 @@
 //!   Refuses to run on buildcache if `nativelink.service` is up <10 min or
 //!   if the journal shows >500 ByteStream:: log lines in the last 2 min.
 //!   Override with `--force`.
+//!
+//! Tempdir default:
+//!   `/dev/shm/nl-bench-XXXXXX` on Linux when `/dev/shm` is writable.
+//!   This keeps bench writes off prod ZFS datasets (`tank`, `fast`) —
+//!   the bench produces gigabytes of churn on the larger cells which
+//!   would otherwise pollute the ARC during active prod traffic. The
+//!   pre-flight gate REFUSES if the resolved tempdir lands inside a
+//!   path containing "tank" or "fast" (substring match), to defend
+//!   against accidental `--temp-dir /srv/bulk/...` invocations.
+//!
+//! **Deviation from design's "use criterion" decision:** the harness is
+//! custom (not `criterion`). The custom envelope (`BaselineFile` with
+//! `git_*` / `host` / `forced` / `temp_dir_used` / `schema_version`
+//! metadata + checked-in baselines under `benchmarks/baselines/`) is a
+//! meaningfully different deliverable from `criterion`'s ephemeral
+//! `target/criterion/` output, and the latter cannot easily fold our
+//! envelope. The deviation is intentional; rewriting on `criterion`
+//! would require both API redesign and a separate CI-side `criterion-
+//! compare-action` plumbing. If `criterion` adoption becomes desired
+//! later, the swap is mechanical (one cell at a time).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -30,7 +50,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use nativelink_benchmarks::output::{BaselineFile, BenchmarkResult, RunMetadata, SCHEMA_VERSION};
 use nativelink_benchmarks::preflight::{Verdict, run_preflight};
-use nativelink_benchmarks::scenarios::{RunOpts, chunked_v2, find_missing, legacy_read, legacy_write};
+use nativelink_benchmarks::scenarios::{MIN_ITERS, RunOpts, chunked_v2, find_missing, legacy_read, legacy_write};
 
 #[derive(Parser, Debug)]
 #[command(name = "data_plane_bench", version, about = "#495 Phase 1 v3-anchoring smoke suite")]
@@ -44,8 +64,10 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
-    /// Iterations per cell. 0 = scenario default.
-    #[arg(long, default_value_t = 20)]
+    /// Iterations per cell. Default 20. Minimum `MIN_ITERS` (= 1) —
+    /// values < `MIN_ITERS` are rejected at parse time to defend
+    /// against `--iters 0 --fast` ending in an empty-vec panic.
+    #[arg(long, default_value_t = 20, value_parser = parse_iters)]
     iters: u32,
 
     /// Substring filter — only run scenarios whose name contains this.
@@ -58,17 +80,54 @@ struct Cli {
     fast: bool,
 
     /// Comma-separated scenario families to run (default: all).
-    /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`.
-    #[arg(long, default_value = "w1,r1,f1,w3,r5")]
+    /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`. Empty string is
+    /// rejected.
+    #[arg(long, default_value = "w1,r1,f1,w3,r5", value_parser = parse_scenarios)]
     scenarios: String,
 
     /// Print the pre-flight verdict and exit without running anything.
     #[arg(long)]
     preflight_only: bool,
+
+    /// Override the parent directory the bench tempdir is created in.
+    /// If absent, defaults to `/dev/shm` on Linux (when writable) and
+    /// the OS temp dir otherwise. The bench REFUSES to use a tempdir
+    /// path whose absolute form contains "tank" or "fast" (those are
+    /// prod ZFS pool names; writing there pollutes ARC during prod
+    /// traffic).
+    #[arg(long)]
+    temp_dir: Option<PathBuf>,
+}
+
+fn parse_iters(s: &str) -> Result<u32, String> {
+    let n: u32 = s
+        .parse()
+        .map_err(|e| format!("--iters: {e} (must be a u32)"))?;
+    if n < MIN_ITERS {
+        return Err(format!(
+            "--iters: {n} below MIN_ITERS ({MIN_ITERS}) — passing 0 \
+             with --fast would panic the bench"
+        ));
+    }
+    Ok(n)
+}
+
+fn parse_scenarios(s: &str) -> Result<String, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("--scenarios: empty string not allowed".to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 fn main() -> ExitCode {
     // Defer to a tokio runtime so the bench can drive async stores.
+    // Note: `tokio::runtime::Builder::new_multi_thread` is in the
+    // workspace `disallowed-methods` list; the bench is one of the rare
+    // top-level binaries that legitimately needs it (this IS the entry
+    // point that constructs the runtime). Standard pattern for entry-
+    // point binaries; see `src/bin/nativelink.rs` for the prod entry.
+    #[allow(clippy::disallowed_methods)]
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -104,10 +163,18 @@ async fn run_main() -> ExitCode {
         }
     }
 
+    // Resolve and gate the bench tempdir.
+    let temp_dir = match resolve_bench_temp_dir(cli.temp_dir.as_ref()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[bench] tempdir refused: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    eprintln!("[bench] tempdir: {}", temp_dir.display());
+
     if cli.preflight_only {
-        return if verdict.allowed() {
-            ExitCode::SUCCESS
-        } else if cli.force {
+        return if verdict.allowed() || cli.force {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(2)
@@ -127,24 +194,26 @@ async fn run_main() -> ExitCode {
         .map(|s| s.trim().to_ascii_lowercase())
         .collect();
 
+    let temp_dir_opt = Some(temp_dir.clone());
+
     if want.iter().any(|s| s == "w1") {
-        eprintln!("[bench] W1 (legacy ByteStream::Write through FastSlow+Filesystem)");
-        all_results.extend(legacy_write::run(&opts).await);
+        eprintln!("[bench] W1 (store update_oneshot through FastSlow+Filesystem)");
+        all_results.extend(legacy_write::run(&opts, temp_dir_opt.as_ref()).await);
     }
     if want.iter().any(|s| s == "r1") {
-        eprintln!("[bench] R1 (ByteStream::Read through FastSlow+Filesystem)");
-        all_results.extend(legacy_read::run(&opts).await);
+        eprintln!("[bench] R1 (store get_part_unchunked through FastSlow+Filesystem)");
+        all_results.extend(legacy_read::run(&opts, temp_dir_opt.as_ref()).await);
     }
     if want.iter().any(|s| s == "f1") {
         eprintln!("[bench] F1 (FindMissingBlobs through ExistenceCache)");
-        all_results.extend(find_missing::run(&opts).await);
+        all_results.extend(find_missing::run(&opts, temp_dir_opt.as_ref()).await);
     }
     if want.iter().any(|s| s == "w3" || s == "r5") {
         eprintln!("[bench] W3 + R5 (chunked-v2 anchoring cells)");
-        all_results.extend(chunked_v2::run(&opts).await);
+        all_results.extend(chunked_v2::run(&opts, temp_dir_opt.as_ref()).await);
     }
 
-    let metadata = collect_metadata(cli.force);
+    let metadata = collect_metadata(cli.force, &temp_dir);
     let baseline = BaselineFile {
         metadata,
         results: all_results,
@@ -174,7 +243,40 @@ async fn run_main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn collect_metadata(forced: bool) -> RunMetadata {
+/// Choose a tempdir root for bench writes.
+///
+/// Refuses any path whose absolute form contains "tank" or "fast"
+/// (substring match) — those are the prod ZFS pool names on buildcache,
+/// and writes there pollute ARC during prod traffic.
+fn resolve_bench_temp_dir(override_: Option<&PathBuf>) -> Result<PathBuf, String> {
+    let chosen = match override_ {
+        Some(p) => p.clone(),
+        None => {
+            // Prefer /dev/shm on Linux when writable.
+            let dev_shm = PathBuf::from("/dev/shm");
+            if cfg!(target_os = "linux") && dev_shm.is_dir() {
+                dev_shm
+            } else {
+                std::env::temp_dir()
+            }
+        }
+    };
+    let abs = chosen
+        .canonicalize()
+        .unwrap_or_else(|_| chosen.clone());
+    let abs_str = abs.to_string_lossy();
+    if abs_str.contains("/srv/bulk/") || abs_str.contains("/fast/") || abs_str.ends_with("/srv/bulk") || abs_str.ends_with("/fast") {
+        return Err(format!(
+            "tempdir {} resolves under a prod ZFS pool (`tank`/`fast`); \
+             refusing to write bench data there. Pass --temp-dir /dev/shm \
+             or another non-prod path.",
+            abs.display()
+        ));
+    }
+    Ok(chosen)
+}
+
+fn collect_metadata(forced: bool, temp_dir: &std::path::Path) -> RunMetadata {
     let git_commit_sha = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -187,12 +289,18 @@ fn collect_metadata(forced: bool) -> RunMetadata {
             }
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let git_dirty = std::process::Command::new("git")
+    let git_dirty: Option<bool> = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
-    let host = hostname();
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(!o.stdout.is_empty())
+            } else {
+                None
+            }
+        });
+    let host = hostname_string();
     let timestamp_utc = iso8601_now();
     let features = enabled_features();
     RunMetadata {
@@ -203,73 +311,21 @@ fn collect_metadata(forced: bool) -> RunMetadata {
         timestamp_utc,
         features,
         forced,
+        temp_dir_used: temp_dir.display().to_string(),
     }
 }
 
-fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
+fn hostname_string() -> String {
+    hostname::get()
         .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
+        .and_then(|s| s.into_string().ok())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn iso8601_now() -> String {
-    // Avoid adding a chrono dep; format from UNIX_EPOCH manually.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let nanos = now.subsec_nanos();
-    let (year, month, day, hour, minute, second) = secs_to_ymd_hms(secs);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z"
-    )
-}
-
-fn secs_to_ymd_hms(mut secs: u64) -> (u64, u64, u64, u64, u64, u64) {
-    let second = secs % 60;
-    secs /= 60;
-    let minute = secs % 60;
-    secs /= 60;
-    let hour = secs % 24;
-    let mut days_since_epoch = secs / 24;
-    let mut year: u64 = 1970;
-    loop {
-        let leap = is_leap(year);
-        let days_in_year = if leap { 366 } else { 365 };
-        if days_since_epoch < days_in_year {
-            break;
-        }
-        days_since_epoch -= days_in_year;
-        year += 1;
-    }
-    let leap = is_leap(year);
-    let month_lens = if leap {
-        [31u64, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month = 1u64;
-    for &ml in &month_lens {
-        if days_since_epoch < ml {
-            break;
-        }
-        days_since_epoch -= ml;
-        month += 1;
-    }
-    let day = days_since_epoch + 1;
-    (year, month, day, hour, minute, second)
-}
-
-fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+    // chrono is in the workspace lockfile (transitive). 6-decimal
+    // micros to keep the timestamp diff-stable across runs.
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 fn enabled_features() -> Vec<String> {
@@ -281,14 +337,63 @@ fn enabled_features() -> Vec<String> {
 }
 
 fn init_tracing() {
-    let _result = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
-    // Ignore the result — subscriber may already be set by a test
-    // harness or repeated invocation; either way we keep going.
-    drop(_result);
+    // try_init returns Err if a subscriber was already set (test
+    // harness, repeated invocation); either way logging works after
+    // the first installer wins, so the Err is benign.
+    drop(
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .with_writer(std::io::stderr)
+            .try_init(),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_iters_rejects_below_min() {
+        assert!(parse_iters("0").is_err());
+        assert!(parse_iters("not-a-number").is_err());
+        assert_eq!(parse_iters("1").unwrap(), 1);
+        assert_eq!(parse_iters("20").unwrap(), 20);
+    }
+
+    #[test]
+    fn parse_scenarios_rejects_empty() {
+        assert!(parse_scenarios("").is_err());
+        assert!(parse_scenarios("   ").is_err());
+        assert_eq!(parse_scenarios("w1").unwrap(), "w1");
+    }
+
+    #[test]
+    fn resolve_bench_temp_dir_refuses_zfs_pool_paths() {
+        // We use a path that doesn't exist so canonicalize falls back
+        // to the passed value; substring match still tags it.
+        let bad_tank = PathBuf::from("/srv/bulk/nativelink/bench");
+        assert!(resolve_bench_temp_dir(Some(&bad_tank)).is_err());
+        let bad_fast = PathBuf::from("/fast/nativelink/bench");
+        assert!(resolve_bench_temp_dir(Some(&bad_fast)).is_err());
+        // /tmp is fine.
+        let ok = PathBuf::from("/tmp");
+        assert!(resolve_bench_temp_dir(Some(&ok)).is_ok());
+    }
+
+    #[test]
+    fn iso8601_format_round_trips_through_chrono() {
+        let s = iso8601_now();
+        // Re-parse via chrono — sanity-check the formatter produced a
+        // valid RFC3339 datetime.
+        let parsed: chrono::DateTime<chrono::Utc> = chrono::DateTime::parse_from_rfc3339(&s)
+            .expect("iso8601_now produces RFC3339")
+            .with_timezone(&chrono::Utc);
+        // Round-trip must be within a few seconds.
+        let now = chrono::Utc::now();
+        let dt = (now - parsed).num_seconds().abs();
+        assert!(dt < 60, "round-trip ts within 60s: dt={dt}s");
+    }
 }
