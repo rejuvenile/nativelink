@@ -260,8 +260,17 @@ mod enabled {
     /// was ~16 MiB of memory bandwidth per call, dominating per-iter cost
     /// in the timed body (#533 retro: `make_payload` LCG-fill + copy was
     /// 24.83% of CPU on the W3 16 MiB cell).
-    fn make_chunk(digest: DigestInfo, offset: u64, payload: &Bytes, range: core::ops::Range<usize>, finish: bool) -> WriteChunk {
-        let chunk_bytes = payload.slice(range.clone());
+    fn make_chunk(
+        digest: DigestInfo,
+        offset: u64,
+        payload: &Bytes,
+        range: core::ops::Range<usize>,
+        finish: bool,
+    ) -> WriteChunk {
+        // `Bytes::slice` consumes the `Range<usize>` via `impl
+        // RangeBounds<usize>`; no `.clone()` needed (Range is two
+        // `usize`s, but the prior `.clone()` was visually noisy).
+        let chunk_bytes = payload.slice(range);
         WriteChunk {
             digest: Some(digest.into()),
             chunk_offset: offset,
@@ -795,11 +804,20 @@ mod enabled {
                 assert_eq!(c.chunk_offset, want_offset, "chunk {i} offset mismatch");
                 assert_eq!(c.chunk_bytes.len(), BENCH_CHUNK_SIZE, "chunk {i} len");
                 assert_eq!(c.finish_chunk, i == chunks.len() - 1, "chunk {i} finish flag");
-                // Zero-copy proof: the chunk's first byte address must
-                // lie WITHIN the source payload's allocation range.
+                // Zero-copy proof: the chunk's first AND last byte
+                // addresses must lie WITHIN the source payload's
+                // allocation range. Head-only checks would pass under a
+                // pathological implementation that aliased only the
+                // chunk head to the source; the tail check rules that
+                // out. Plus a byte-equality check against the canonical
+                // slice defends against an allocator-arena coincidence
+                // where the fresh copy happens to land at an in-range
+                // address but contains different bytes (testing-czar
+                // MINOR-2).
                 let src_start = payload.as_ptr() as usize;
                 let src_end = src_start + payload.len();
                 let chunk_start = c.chunk_bytes.as_ptr() as usize;
+                let chunk_end = chunk_start + c.chunk_bytes.len();
                 assert!(
                     chunk_start >= src_start && chunk_start < src_end,
                     "build_chunks_zero_copy_violation: chunk {i} chunk_bytes \
@@ -808,6 +826,23 @@ mod enabled {
                      regression would produce a fresh allocation with \
                      unrelated pointer — the per-iter 16 MiB memcpy cost \
                      would be back (#533 retro)."
+                );
+                assert!(
+                    chunk_end <= src_end,
+                    "build_chunks_zero_copy_violation: chunk {i} extends \
+                     past payload allocation; chunk end 0x{chunk_end:x} > \
+                     src end 0x{src_end:x}. A partial-aliasing regression \
+                     would pass the head check but not the tail check."
+                );
+                let canonical = &payload[i * BENCH_CHUNK_SIZE
+                    ..i * BENCH_CHUNK_SIZE + c.chunk_bytes.len()];
+                assert_eq!(
+                    &c.chunk_bytes[..], canonical,
+                    "build_chunks_zero_copy_violation: chunk {i} bytes do not \
+                     match the canonical payload slice. An allocator-arena \
+                     coincidence (fresh copy reusing the freed source's \
+                     address) would defeat the pointer check; this byte \
+                     equality defends against that."
                 );
                 // Per-chunk sha256 must be 32 B (BLAKE3 packed-hash
                 // wrapped via `to_vec`); regression to a different
