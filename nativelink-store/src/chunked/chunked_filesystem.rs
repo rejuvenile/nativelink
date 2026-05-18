@@ -77,7 +77,7 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::spawn_rate_probe::{record, SpawnSite};
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::filesystem_store::digest_shard_prefix;
 
@@ -605,6 +605,23 @@ pub(crate) async fn write_chunk_at_offset(
     // `as_micros()` (~15 ns) + one warn at high threshold (only on the
     // slow tail). Negligible vs the 1 MiB pwrite cost itself.
     let total_inner_us = mutex_acquire_us + dispatch_us + pwrite_us + closure_to_resume_us;
+    // W3 deep-trace probe: unconditional per-chunk stage-breakdown trace.
+    // The existing `warn!` below only fires for the slow tail (>50ms);
+    // this `trace!` mirror is for every chunk so the deep-dive run can
+    // bucket EVERY chunk's stages, not just the outliers. Gated to
+    // trace! (compiled out in `release_max_level_info` builds).
+    trace!(
+        target: "nativelink_store::chunked_filesystem::w3_probe",
+        %digest,
+        chunk_offset,
+        chunk_bytes = len,
+        mutex_acquire_us,
+        dispatch_us,
+        pwrite_us,
+        closure_to_resume_us,
+        total_inner_us,
+        "write_chunk_at_offset stage-breakdown",
+    );
     if total_inner_us > 50_000 {
         warn!(
             target: "nativelink_store::chunked",

@@ -67,7 +67,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use nativelink_error::{Code, Error, make_err, make_input_err};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
@@ -432,6 +432,13 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 }
             };
             let chunk_bytes_for_hash: Bytes = chunk.chunk_bytes.clone();
+            let _w3_probe_sha_start = std::time::Instant::now();
+            trace!(
+                target: "nativelink_service::w3_probe",
+                chunk_offset,
+                chunk_bytes_len,
+                "compute_sha256_blocking_v2 enter"
+            );
             let computed_sha = match compute_sha256_blocking_v2(chunk_bytes_for_hash).await {
                 Ok(s) => s,
                 Err(err) => {
@@ -440,6 +447,13 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                     return;
                 }
             };
+            trace!(
+                target: "nativelink_service::w3_probe",
+                chunk_offset,
+                chunk_bytes_len,
+                elapsed_us = _w3_probe_sha_start.elapsed().as_micros() as u64,
+                "compute_sha256_blocking_v2 exit"
+            );
             if computed_sha != chunk_sha256_arr {
                 race_state.release_chunk_in_flight(writer_id, chunk_offset);
                 metrics
@@ -456,10 +470,25 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             // pwrite the chunk via the FilesystemStore's chunked
             // adapter. Bytes is refcounted; the clone is cheap.
             let pwrite_bytes = chunk.chunk_bytes;
+            let _w3_probe_pwrite_start = std::time::Instant::now();
+            trace!(
+                target: "nativelink_service::w3_probe",
+                chunk_offset,
+                chunk_bytes_len,
+                "write_chunk_at_offset enter"
+            );
             let pwrite_res = self
                 .filesystem_store_for_v2()
                 .write_chunk_at_offset(&digest, chunk_offset, pwrite_bytes)
                 .await;
+            trace!(
+                target: "nativelink_service::w3_probe",
+                chunk_offset,
+                chunk_bytes_len,
+                elapsed_us = _w3_probe_pwrite_start.elapsed().as_micros() as u64,
+                ok = pwrite_res.is_ok(),
+                "write_chunk_at_offset exit"
+            );
             if let Err(err) = pwrite_res {
                 race_state.release_chunk_in_flight(writer_id, chunk_offset);
                 warn!(
@@ -726,11 +755,24 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // Stage 1: commit_to_holding (length validation + rename to
         // .holding). On length mismatch we return Err and the discard
         // path (caller-side) will GC the partial.
+        let _w3_probe_commit_start = std::time::Instant::now();
+        trace!(
+            target: "nativelink_service::w3_probe",
+            ?digest,
+            "commit_chunked_to_holding enter"
+        );
         if let Err(err) = self
             .filesystem_store_for_v2()
             .commit_chunked(digest, expected_size)
             .await
         {
+            trace!(
+                target: "nativelink_service::w3_probe",
+                ?digest,
+                elapsed_us = _w3_probe_commit_start.elapsed().as_micros() as u64,
+                ok = false,
+                "commit_chunked_to_holding exit"
+            );
             // Try to GC the partial best-effort.
             let _ = self.filesystem_store_for_v2().discard_chunked(digest).await;
             self.metrics_for_v2()
@@ -738,11 +780,31 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
+        trace!(
+            target: "nativelink_service::w3_probe",
+            ?digest,
+            elapsed_us = _w3_probe_commit_start.elapsed().as_micros() as u64,
+            ok = true,
+            "commit_chunked_to_holding exit"
+        );
 
         // Stage 2: end-to-end hash verify against the .holding file.
         let holding_path = self.filesystem_store_for_v2().holding_content_path(digest);
+        let _w3_probe_verify_start = std::time::Instant::now();
+        trace!(
+            target: "nativelink_service::w3_probe",
+            ?digest,
+            "v2_verify_e2e_hash enter"
+        );
         let verify_result =
             v2_verify_e2e_hash(&holding_path, digest, expected_size).await;
+        trace!(
+            target: "nativelink_service::w3_probe",
+            ?digest,
+            elapsed_us = _w3_probe_verify_start.elapsed().as_micros() as u64,
+            ok = verify_result.is_ok(),
+            "v2_verify_e2e_hash exit"
+        );
         if let Err(err) = verify_result {
             // Hash mismatch: unlink the holding file + discard the
             // partial entry. Surface the error.
@@ -759,7 +821,21 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
 
         // Stage 3: finalize_holding (rename .holding → canonical +
         // chmod + index insert).
-        if let Err(err) = self.filesystem_store_for_v2().finalize_holding(digest).await {
+        let _w3_probe_finalize_start = std::time::Instant::now();
+        trace!(
+            target: "nativelink_service::w3_probe",
+            ?digest,
+            "finalize_holding enter"
+        );
+        let finalize_res = self.filesystem_store_for_v2().finalize_holding(digest).await;
+        trace!(
+            target: "nativelink_service::w3_probe",
+            ?digest,
+            elapsed_us = _w3_probe_finalize_start.elapsed().as_micros() as u64,
+            ok = finalize_res.is_ok(),
+            "finalize_holding exit"
+        );
+        if let Err(err) = finalize_res {
             self.metrics_for_v2()
                 .commit_failures_total
                 .fetch_add(1, Ordering::Relaxed);
