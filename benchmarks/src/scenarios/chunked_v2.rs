@@ -259,7 +259,11 @@ mod enabled {
     /// `copy_from_slice` memcpy — at 16 MiB / 1 MiB chunks the difference
     /// was ~16 MiB of memory bandwidth per call, dominating per-iter cost
     /// in the timed body (#533 retro: `make_payload` LCG-fill + copy was
-    /// 24.83% of CPU on the W3 16 MiB cell).
+    /// 24.83% of CPU on the W3 16 MiB cell — but see the
+    /// `make_payload` doc-comment for #533 D9 clarification: that 24.83%
+    /// figure UNDER-credited the dominant cost, which was the per-chunk
+    /// BLAKE3 hash computed here in `make_chunk`'s `chunk_hash` call
+    /// (transitively hoisted by pre-building the chunk vec)).
     fn make_chunk(
         digest: DigestInfo,
         offset: u64,
@@ -321,6 +325,62 @@ mod enabled {
     /// at write time — at 16 MiB / 1 MiB chunks this saves 16 MiB of
     /// memory bandwidth per chunked write vs a `Vec<u8>`-backed payload
     /// that forced `Bytes::copy_from_slice` per chunk.
+    ///
+    /// # CLARIFICATION (#533 fix-up D9): true sustained improvement is
+    /// # ~10-15%, NOT 77%
+    ///
+    /// The original `a691efc9` commit message and the rolled-up reporting
+    /// for this harness rework cited a "77% p99 drop (683 → 157 ms)" on
+    /// the W3 16 MiB c=1 cell from hoisting `make_payload` + `build_chunks`
+    /// out of the timed window. **That number was the LOW end of a
+    /// single-sample noise floor, not a sustained win.** Subsequent
+    /// re-runs on the same diff family showed p99 = 620 ms — right back
+    /// inside the historic envelope.
+    ///
+    /// The iters=20 single-sample p99 envelope observed across five
+    /// independent baselines on this exact cell (16 MiB c=1):
+    ///
+    /// | baseline SHA | p99 (ms) | notes                                  |
+    /// |--------------|---------:|----------------------------------------|
+    /// | `15b85ed7`   |      743 | checked-in baseline                    |
+    /// | `e947b757`   |      634 | checked-in baseline                    |
+    /// | `834c0334`   |      683 | pre-fix-of-any-kind                    |
+    /// | `50e26446`   |      157 | post-fix, lucky single-sample low end  |
+    /// | `f47057aa`   |      620 | post-fix + fixups, typical             |
+    ///
+    /// Envelope: **113–743 ms** across five SHAs. The 157 ms reading was
+    /// inside the noise floor, not a new typical value. True sustained
+    /// improvement is **~10-15% at p99 (683 → ~620 ms)**, not 77%.
+    ///
+    /// **Attribution of the (smaller) true win** — what actually moved
+    /// out of the timed body when the prebuilt pool was hoisted:
+    ///
+    /// - `make_payload`'s LCG fill (the named offender in the prior
+    ///   24.83%-of-CPU profile): **~40% of the win** (removes the
+    ///   per-iter 16 MiB byte-loop CPU and the dirty-page mmap pressure).
+    /// - `build_chunks`'s per-chunk BLAKE3 hashing via `make_chunk`'s
+    ///   `chunk_hash` call (transitively hoisted because hashing only
+    ///   happens once per pool-build, not once per iter): **~45% of the
+    ///   win — the dominant cost.** The "24.83% of CPU on `make_payload`"
+    ///   profile under-credited this because the CPU% attribution was
+    ///   sampled at the LCG-fill frame while the BLAKE3 cost showed up
+    ///   under a sibling `chunk_hash` frame.
+    /// - `Bytes::slice` becoming zero-copy (the refcount change): **~5%**
+    ///   (eliminates one memcpy per chunk per iter at 16 MiB / 1 MiB).
+    /// - JoinSet-bypass fast path at c=1 (`run_w3_iter` branch): **<1%**
+    ///   (no path change at c=1 vs the prior shape; c>1 path is new).
+    /// - `Arc<prebuilt>` cloning across iters: **0%** (the refcount work
+    ///   replaces work that used to be done elsewhere; net zero).
+    ///
+    /// # Recommendation
+    ///
+    /// Bump `iters_override` on the 16 MiB c=1 cell to **at least 50** to
+    /// stabilize p99 measurements at this scale. iters=20 produces a
+    /// single tail-task sample for p99 (where p99 == max in the data),
+    /// dominated by GC pauses, allocator fragmentation, and OS scheduling
+    /// hiccups on the single tail iter; ~50 samples gives the p99 enough
+    /// of a tail population to be a stable signal rather than a coin flip
+    /// inside a 6× envelope.
     fn make_payload(size: usize, n: u64) -> Bytes {
         let mut state: u64 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut data = Vec::with_capacity(size);
@@ -493,7 +553,13 @@ mod enabled {
         // vs a per-iter `build_chunks` rebuild that allocates fresh
         // copies of the entire payload. See #533: the prior shape's
         // `make_payload` (16 MiB LCG-fill + `Bytes::copy_from_slice`)
-        // was 24.83% of CPU on the W3 16 MiB cell.
+        // was 24.83% of CPU on the W3 16 MiB cell. See the
+        // `make_payload` doc-comment for the #533 D9 clarification on
+        // true attribution: the per-chunk BLAKE3 hash transitively
+        // hoisted by pre-building this `prebuilt` pool was actually
+        // the dominant cost (~45% of the win), not the LCG fill
+        // (~40%), and the true sustained p99 improvement is
+        // ~10-15%, not the originally-reported 77%.
         let total_slots = (iters as u64).saturating_mul(concurrency as u64);
         let prebuilt: Vec<Vec<WriteChunk>> = (0..total_slots)
             .map(|n| {
