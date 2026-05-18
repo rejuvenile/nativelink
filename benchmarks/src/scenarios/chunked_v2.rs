@@ -747,8 +747,25 @@ mod enabled {
                     write_one_chunked(client_clone, chunks, size).await;
                 });
             }
+            // Drain the JoinSet. On a panic from any spawned task,
+            // shut down the remaining tasks BEFORE propagating the
+            // panic — otherwise stragglers continue mutating the
+            // per-cell FilesystemStore tempdir after `_td: TempDir`
+            // drops at the end of the cell, leaking fds into a
+            // deleted directory on Linux until the straggler dies
+            // (red-team #533 NIT #6). `set.shutdown()` awaits abort
+            // of every still-running task and is idempotent — safe
+            // to call on an already-empty set.
             while let Some(res) = set.join_next().await {
-                res.expect("W3 concurrent writer task must not panic");
+                if let Err(join_err) = res {
+                    set.shutdown().await;
+                    panic!(
+                        "W3 concurrent writer task must not panic; \
+                         remaining tasks aborted via set.shutdown() to \
+                         prevent straggler-into-dropped-tempdir leaks: \
+                         {join_err:?}"
+                    );
+                }
             }
         }
     }
