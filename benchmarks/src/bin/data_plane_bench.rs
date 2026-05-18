@@ -81,7 +81,10 @@ use std::process::ExitCode;
 use clap::Parser;
 use nativelink_benchmarks::output::{BaselineFile, BenchmarkResult, RunMetadata, SCHEMA_VERSION};
 use nativelink_benchmarks::preflight::{Verdict, run_preflight};
-use nativelink_benchmarks::scenarios::{MIN_ITERS, RunOpts, chunked_v2, find_missing, legacy_read, legacy_write};
+use nativelink_benchmarks::scenarios::{
+    MIN_ITERS, RunOpts, chunked_v2, existence_cache_micro, find_missing, legacy_read,
+    legacy_write,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "data_plane_bench", version, about = "#495 Phase 1 v3-anchoring smoke suite")]
@@ -111,9 +114,9 @@ struct Cli {
     fast: bool,
 
     /// Comma-separated scenario families to run (default: all).
-    /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`. Empty string is
-    /// rejected.
-    #[arg(long, default_value = "w1,r1,f1,w3,r5", value_parser = parse_scenarios)]
+    /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`, `c1`. Empty string
+    /// is rejected.
+    #[arg(long, default_value = "w1,r1,f1,w3,r5,c1", value_parser = parse_scenarios)]
     scenarios: String,
 
     /// Print the pre-flight verdict and exit without running anything.
@@ -246,6 +249,10 @@ async fn run_main() -> ExitCode {
     if want.iter().any(|s| s == "w3" || s == "r5") {
         eprintln!("[bench] W3 + R5 (chunked-v2 anchoring cells)");
         all_results.extend(chunked_v2::run(&opts, temp_dir_opt.as_ref()).await);
+    }
+    if want.iter().any(|s| s == "c1") {
+        eprintln!("[bench] C1 (ExistenceCache micro-bench — hit/miss + batch 16/128)");
+        all_results.extend(existence_cache_micro::run(&opts).await);
     }
 
     let metadata = collect_metadata(cli.force, &temp_dir);

@@ -1,7 +1,8 @@
 # `benchmarks/` — NativeLink data-plane benchmark harness
 
 This crate is the implementation of **#495 Phase 1** (v3-anchoring smoke
-cells). Design doc:
+cells) plus the **Phase 2 first scenario** (C1 ExistenceCache micro-bench).
+Design doc:
 [`.claude/audits/495-data-plane-benchmark-design-2026-05-16.md`](../.claude/audits/495-data-plane-benchmark-design-2026-05-16.md).
 
 It is **purely additive observability infrastructure** — it does not
@@ -21,6 +22,7 @@ Per the design doc Section 5, Phase 1 covers:
 | F1 | FindMissingBlobs through ExistenceCache | batch 1 / 16 / 128 / 1024, both cache-hit and cache-miss |
 | W3 | Chunked-v2 single writer (v3 default flip) | 4 MiB / 16 MiB |
 | R5 | FilesystemStore multi-reader fan-out (NOT the v3 per-digest Notify — see Phase 2 deferral) | 4 MiB × 2 / 4 MiB × 10 / 16 MiB × 4 |
+| C1 (Phase 2) | ExistenceCacheStore micro-bench | single-key hit / miss, batch 16 / batch 128 (all hit) |
 
 W3 and R5 require the `chunked_fast_slow` Cargo feature. The Justfile
 recipe builds with the feature on by default.
@@ -212,7 +214,9 @@ Per design Section 6:
 
 - **Phase 2:** M1 (FastSlow slow-write decouple, sustained writer),
   M2 (mirror replication ack latency with 2-worker mock), R4 (worker
-  peer-fetch), A1/A2 (AC), C1 (existence-cache micro).
+  peer-fetch), A1/A2 (AC). **C1 (existence-cache micro) is now
+  implemented** as the Phase 2 first scenario family — see
+  [`benchmarks/src/scenarios/existence_cache_micro.rs`](src/scenarios/existence_cache_micro.rs).
 - **Phase 3:** R5 with N=1000, xlarge/huge blobs, W5 (BatchUpdate
   coalescing), F2 (GetTree), dhat allocation-budget bench, RSS-over-
   time sustained-write probe.

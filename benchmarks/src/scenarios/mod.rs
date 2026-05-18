@@ -17,6 +17,7 @@
 //! CLI runner can dispatch uniformly.
 
 pub mod chunked_v2;
+pub mod existence_cache_micro;
 pub mod find_missing;
 pub mod legacy_read;
 pub mod legacy_write;
