@@ -837,6 +837,55 @@ mod enabled {
             }
         }
 
+        /// `make_payload` MUST produce distinct content per `n` so the
+        /// concurrent-slot pool covers `iters × concurrency` UNIQUE
+        /// digests. If a future refactor drops the
+        /// `n.wrapping_mul(0x9E37_79B9_7F4A_7C15)` LCG seed mixing — or
+        /// a copy-paste accident overwrites it with a constant — every
+        /// slot would produce identical bytes, identical digests, and
+        /// the chunked-driver's per-digest singleflight would collapse
+        /// concurrent writes into one. The W3 burst cells would then
+        /// silently measure the dedup'd path instead of throughput.
+        ///
+        /// Same seed must be deterministic so prebuilt/replay invariants
+        /// hold (re-running the bench on the same SHA produces the same
+        /// digests).
+        ///
+        /// Mutation: replace the LCG seed `n.wrapping_mul(0x9E37...)`
+        /// with a constant (`let mut state: u64 = 0;`) — both `assert_ne!`
+        /// arms red-fail with the bespoke `#533 payload-uniqueness`
+        /// message.
+        #[test]
+        fn make_payload_produces_unique_content_per_n() {
+            // Use a small payload size so the test stays fast — the
+            // uniqueness property is independent of payload length.
+            let size = BENCH_CHUNK_SIZE;
+            let p0 = make_payload(size, 0);
+            let p1 = make_payload(size, 1);
+            let p_big = make_payload(size, 0xDEAD_BEEF);
+            assert_ne!(
+                p0, p1,
+                "#533 payload-uniqueness: make_payload(_, 0) == make_payload(_, 1); \
+                 concurrent slots would collide on digest and the W3 burst cells \
+                 would silently measure the dedup/singleflight path instead of \
+                 throughput."
+            );
+            assert_ne!(
+                p1, p_big,
+                "#533 payload-uniqueness: make_payload(_, 1) == \
+                 make_payload(_, 0xDEAD_BEEF); seed mixing is degenerate."
+            );
+            // Determinism: same n must produce the same bytes (load-bearing
+            // for repeatable digests across bench runs).
+            assert_eq!(
+                make_payload(size, 1),
+                make_payload(size, 1),
+                "#533 payload-uniqueness: make_payload is non-deterministic for \
+                 fixed n; repeat bench runs on the same SHA would produce \
+                 different digests."
+            );
+        }
+
         /// The c=1 cell must exist for both 4 MiB and 16 MiB so historic
         /// baselines remain comparable. Mutation: remove a c=1 entry —
         /// red-fails.
