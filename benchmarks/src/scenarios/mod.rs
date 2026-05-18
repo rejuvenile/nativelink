@@ -29,8 +29,24 @@ use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
 
 use nativelink_util::common::DigestInfo;
+use nativelink_util::digest_hasher::{DigestHasher as _, default_digest_hasher_func};
 
 use crate::output::{BenchmarkResult, CacheState, LatencyPercentiles, Throughput};
+
+/// Compute a `DigestInfo` for `data` using the process-global default
+/// hasher (BLAKE3 in this bench, matching prod via `default_digest_hash_function`).
+///
+/// Wrappers (VerifyStore, ChunkedDriver commit) recompute and compare
+/// against the global hasher; pre-computing the declared digest with a
+/// different function (e.g. hardcoded SHA-256) produces
+/// `InvalidArgument: Hashes do not match` at the FastSlowStore::update
+/// seam. This helper is the single point that pins "bench-declared
+/// digest hash function == prod-active hash function".
+pub fn digest_via_default_hasher(data: &[u8]) -> DigestInfo {
+    let mut h = default_digest_hasher_func().hasher();
+    h.update(data);
+    h.finalize_digest()
+}
 
 /// Floor for `--fast` iterations. Below this p50 is noise.
 pub const FAST_MODE_ITERS: u32 = 3;
@@ -89,11 +105,13 @@ impl RunOpts {
 /// Critical for "warm" scenarios where we prepopulate once and read N
 /// times — and for diff stability of `extras.digest_hex`.
 ///
-/// **NOTE: SHA-256 is intentional for digests-as-labels, even though
-/// prod uses blake3 (`default_digest_hash_function`).** A bench digest
-/// is never compared against a prod digest; it's a deterministic ID in
-/// the in-process composition. SHA-256 here avoids pulling in blake3
-/// for one helper; the cost is non-load-bearing.
+/// Digest is computed via the process-global default hasher (BLAKE3
+/// per `data_plane_bench::main`, matching prod). A previous version of
+/// this helper hardcoded SHA-256 with a "digests-as-labels" rationale;
+/// that was incorrect — VerifyStore and the chunked-driver commit
+/// barrier both recompute the digest using the global hasher, so a
+/// hardcoded mismatch surfaces as `InvalidArgument: Hashes do not
+/// match` at the FastSlowStore::update seam (#524).
 pub fn make_blob(seed: u64, size: usize) -> (DigestInfo, Bytes) {
     let mut data = Vec::with_capacity(size);
     let mut state: u64 = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -103,10 +121,7 @@ pub fn make_blob(seed: u64, size: usize) -> (DigestInfo, Bytes) {
             .wrapping_add(1442695040888963407);
         data.push((state >> 33) as u8);
     }
-    let hash = Sha256::digest(&data);
-    let mut packed = [0u8; 32];
-    packed.copy_from_slice(&hash);
-    let digest = DigestInfo::new(packed, size as u64);
+    let digest = digest_via_default_hasher(&data);
     (digest, Bytes::from(data))
 }
 

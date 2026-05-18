@@ -57,7 +57,6 @@ mod enabled {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use bytes::Bytes;
-    use sha2::{Digest as _, Sha256};
     use tokio_stream::StreamExt as _;
 
     use nativelink_config::stores::FilesystemSpec;
@@ -75,19 +74,24 @@ mod enabled {
     use nativelink_util::store_trait::StoreLike;
 
     use crate::output::{BenchmarkResult, CacheState};
-    use crate::scenarios::{RunOpts, measure};
+    use crate::scenarios::{RunOpts, digest_via_default_hasher, measure};
 
     /// Chunk size used in the v2 bench cells. Matches the prod chunk-
     /// flow: 1 MiB.
     const BENCH_CHUNK_SIZE: usize = 1024 * 1024;
 
-    fn sha256(bytes: &[u8]) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(bytes);
-        let out = h.finalize();
-        let mut a = [0u8; 32];
-        a.copy_from_slice(out.as_ref());
-        a
+    /// Compute the per-chunk hash for the `WriteChunk.chunk_sha256` wire
+    /// field. **Despite the field name**, the v2 server
+    /// (`chunked_write_handler_v2::compute_sha256_blocking_v2`) actually
+    /// uses `default_digest_hasher_func()` — i.e. BLAKE3 in production
+    /// when `default_digest_hash_function = blake3`. The bench mirrors
+    /// that behavior so a BLAKE3 default does not produce per-chunk
+    /// hash mismatches at offset 0 (#524).
+    fn chunk_hash(bytes: &[u8]) -> [u8; 32] {
+        let mut h = nativelink_util::digest_hasher::default_digest_hasher_func().hasher();
+        nativelink_util::digest_hasher::DigestHasher::update(&mut h, bytes);
+        let info = nativelink_util::digest_hasher::DigestHasher::finalize_digest(&mut h);
+        **info.packed_hash()
     }
 
     /// Returns the `FilesystemStore` AND the owning `TempDir` so the
@@ -196,7 +200,7 @@ mod enabled {
             digest: Some(digest.into()),
             chunk_offset: offset,
             chunk_bytes: Bytes::copy_from_slice(bytes),
-            chunk_sha256: sha256(bytes).to_vec(),
+            chunk_sha256: chunk_hash(bytes).to_vec(),
             finish_chunk: finish,
         }
     }
@@ -269,10 +273,13 @@ mod enabled {
             let (client, _server_guard) = start_v2_server(handler).await;
 
             // Pre-generate all payloads + digests OUTSIDE the timer.
+            // Digest uses the process-global hasher (BLAKE3, matching
+            // prod) so the chunked-driver commit barrier's recompute
+            // matches the declared digest. See #524.
             let prebuilt: Vec<(DigestInfo, Vec<u8>)> = (0..iters as u64)
                 .map(|n| {
                     let payload = make_payload(size, n);
-                    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+                    let digest = digest_via_default_hasher(&payload);
                     (digest, payload)
                 })
                 .collect();
@@ -379,7 +386,9 @@ mod enabled {
                 let mut acc = Vec::with_capacity(iters as usize);
                 for n in 0..iters as u64 {
                     let payload = make_payload(size, n);
-                    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+                    // Digest uses the process-global hasher (BLAKE3,
+                    // matching prod) — see W3 note above.
+                    let digest = digest_via_default_hasher(&payload);
                     let chunks = build_chunks(digest, &payload);
                     let mut c = client.clone();
                     let response = c

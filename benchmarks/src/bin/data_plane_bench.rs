@@ -85,6 +85,7 @@ use nativelink_benchmarks::scenarios::{
     MIN_ITERS, RunOpts, chunked_v2, existence_cache_micro, find_missing, legacy_read,
     legacy_write,
 };
+use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
 
 #[derive(Parser, Debug)]
 #[command(name = "data_plane_bench", version, about = "#495 Phase 1 v3-anchoring smoke suite")]
@@ -155,6 +156,21 @@ fn parse_scenarios(s: &str) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
+    // Initialize the process-global default digest hasher to BLAKE3 BEFORE
+    // any store composition (and therefore any digest computation) is
+    // constructed. Production (`src/bin/nativelink.rs:2599`) calls this
+    // via `default_digest_hash_function = blake3` in `prod-server.json5`;
+    // omitting it here makes the bench silently fall back to SHA-256
+    // (`default_digest_hasher_func()` `get_or_init` → `Sha256` at
+    // `nativelink-util/src/digest_hasher.rs:53`), producing baselines that
+    // do not represent prod hot-path CPU cost (#524). `OnceLock::set`
+    // succeeds exactly once per process; calling it before any
+    // `make_digest` callsite is what makes the choice load-bearing.
+    if let Err(e) = set_default_digest_hasher_func(DigestHasherFunc::Blake3) {
+        eprintln!("[bench] failed to install BLAKE3 default hasher: {e:?}");
+        return ExitCode::FAILURE;
+    }
+
     // Defer to a tokio runtime so the bench can drive async stores.
     // Note: `tokio::runtime::Builder::new_multi_thread` is in the
     // workspace `disallowed-methods` list; the bench is one of the rare
