@@ -721,9 +721,26 @@ mod enabled {
             // N parallel writers; batch wall-clock is the sample.
             // `JoinSet` per CLAUDE.md (variable-count > tokio::join!).
             let mut set = tokio::task::JoinSet::new();
-            let base_slot = n.saturating_mul(concurrency as u64);
-            for j in 0..concurrency as u64 {
-                let slot = base_slot.saturating_add(j) as usize;
+            // Slot math: `n * c + j`. Realistic bounds are iters ≤ ~1000
+            // and concurrency ≤ 64, so n*c+j ≤ ~64,000 — wide of u64
+            // overflow. Prior `saturating_mul`/`saturating_add` shape
+            // would silently truncate on a 32-bit host's `as usize`
+            // cast (or saturate to u64::MAX → panic on indexing).
+            // `checked_*` + `expect` makes the overflow loud and
+            // explicit — bench is on 64-bit hosts where this never
+            // fires, but if a future contributor hand-stamps iters or
+            // concurrency to absurd values the failure is diagnostic
+            // (code-reviewer #533 m3).
+            let n_usize = usize::try_from(n)
+                .expect("iter counter must fit in usize (bench runs on 64-bit hosts)");
+            let concurrency_usize = concurrency as usize;
+            let base_slot = n_usize
+                .checked_mul(concurrency_usize)
+                .expect("slot base n*c must not overflow usize");
+            for j in 0..concurrency_usize {
+                let slot = base_slot
+                    .checked_add(j)
+                    .expect("slot index n*c+j must not overflow usize");
                 let chunks = prebuilt[slot].clone();
                 let client_clone = client.clone();
                 set.spawn(async move {
