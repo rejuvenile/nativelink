@@ -111,17 +111,25 @@
 //!
 //! ## extras.composition_deviation
 //!
-//! Both cells emit `composition_deviation = "none"` — the only delta
-//! vs prod is the *content_path location* (substituted user-scoped
-//! ZFS dataset for prod's `/srv/casdata/nativelink/stores/`); the
-//! store-shape and on-disk file format are bit-identical to prod
-//! and the dataset under `/srv/build/` shares the same on-pool
-//! recordsize/compression settings as the prod CAS dataset (modulo
-//! the dataset hierarchy difference, which does not affect
-//! per-write CPU/latency cost). Emitting `"none"` here lets diff
-//! tooling treat W1f and W3f as the authoritative prod-shape
-//! anchor, while W1/W3 continue to serve as fast-iteration
-//! continuity baselines on tmpfs.
+//! - **W1f**: emits `composition_deviation = "none"` — W1f traverses
+//!   the full prod CAS wrapper chain (Verify → ExistenceCache →
+//!   SizePartitioning → FastSlow{Memory,Filesystem}). The only delta
+//!   vs prod is the FilesystemStore content_path's on-disk medium
+//!   (substituted user-scoped ZFS dataset under `/srv/build/` for
+//!   prod's `/srv/casdata/nativelink/stores/`); the dataset shares
+//!   on-pool recordsize/compression with the prod CAS dataset.
+//! - **W3f**: emits W3's
+//!   `direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning`
+//!   tag (NOT `"none"`). W3f INHERITS W3's composition shape —
+//!   `ChunkedWriteHandler` over a bare `FilesystemStore` with NO
+//!   Verify/ExistenceCache/SizePartitioning/MemoryStore wrappers and
+//!   NO production sinks. Emitting `"none"` here was a #537 red-team
+//!   bug (Q1): a diff-tool consumer reading `composition_deviation =
+//!   "none"` for both W1f AND W3f would compare two cells with
+//!   DIFFERENT wrapper chains and conclude "chunked is N× slower"
+//!   when part of the delta is "W1f traverses 5 wrappers W3f skips
+//!   by design". Reusing W3's tag makes the asymmetry visible in the
+//!   JSON.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -398,9 +406,22 @@ async fn run_w3f(
         "filesystem_backed_by".to_string(),
         serde_json::json!("zfs_pool_fast_dataset"),
     );
+    // #537 D2: W3f INHERITS W3's composition shape — it uses the SAME
+    // `ChunkedWriteHandler::new_with_state_and_chunk_size_for_test`
+    // constructor over a bare `FilesystemStore`, WITHOUT the surrounding
+    // Verify/ExistenceCache/SizePartitioning/MemoryStore wrappers OR the
+    // three production sinks (`with_v2_stable_digests_sink`,
+    // `with_v2_failed_commit_sink`, `with_chunked_in_flight_digests`).
+    // The only delta vs W3 is the FilesystemStore content_path's
+    // on-disk medium (ZFS pool `fast` vs tmpfs). Emitting `"none"` here
+    // was WRONG (silently dropped W3's deviation tag); reuse W3's tag
+    // so diff-tool consumers see the same wrapper-chain skip on both
+    // cells and don't conclude "chunked is N× slower" when part of the
+    // delta is "W1f traverses 5 wrappers W3f skips" (see red-team #537
+    // Q1 + assumption-auditor claim 3 NIT).
     extras.insert(
         "composition_deviation".to_string(),
-        serde_json::json!("none"),
+        serde_json::json!(crate::scenarios::chunked_v2::enabled::COMPOSITION_DEVIATION_TAG),
     );
     extras.insert(
         "paired_baseline_cell".to_string(),
@@ -563,6 +584,54 @@ mod tests {
             16 * 1024 * 1024,
             "#537 size pin: PRODLIKE_CELL_SIZE_BYTES drifted from 16 MiB; \
              W1f/W3f no longer comparable to the W1/W3 16 MiB cells they shadow"
+        );
+    }
+
+    /// #537 D2: W3f MUST emit the SAME `composition_deviation` tag as
+    /// W3 — both share `ChunkedWriteHandler → bare FilesystemStore`
+    /// without the production wrapper chain. Emitting `"none"` for W3f
+    /// silently dropped W3's deviation and would let diff-tool readers
+    /// conclude "chunked is N× slower" when part of the delta is "W3f
+    /// skips 5 wrappers W1f traverses".
+    ///
+    /// This test pins W3f's deviation to W3's `COMPOSITION_DEVIATION_TAG`
+    /// at compile-time via re-export, so a future split of the W3 tag
+    /// (e.g. when R5 wires through the Notify barrier and diverges from
+    /// W3's composition) MUST re-touch W3f deliberately, not silently.
+    ///
+    /// **Mutation falsifier:** revert the deviation insert at the W3f
+    /// extras to `serde_json::json!("none")` (the pre-fix shape). The
+    /// `iters=1` smoke below will run `run_w3f` and inspect the
+    /// resulting `composition_deviation` extras key; this test must
+    /// red-fail with the bespoke `"#537 D2 W3f deviation tag must
+    /// match W3's"` message.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w3f_composition_deviation_matches_w3() {
+        let scratch_root = tempfile::TempDir::new().expect("test tempdir");
+        let result = run_w3f(scratch_root.path(), 1)
+            .await
+            .expect("W3f must run cleanly on a fresh tempdir");
+        assert_eq!(result.scenario_name, W3F_SCENARIO_NAME);
+        let dev = result
+            .extras
+            .get("composition_deviation")
+            .expect("W3f result must carry composition_deviation extras");
+        let dev_str = dev
+            .as_str()
+            .expect("composition_deviation must be a string");
+        assert_eq!(
+            dev_str,
+            crate::scenarios::chunked_v2::enabled::COMPOSITION_DEVIATION_TAG,
+            "#537 D2 W3f deviation tag must match W3's: W3 emits {:?}, W3f \
+             must emit the SAME tag (got {:?}); both cells share the same \
+             ChunkedWriteHandler → bare FilesystemStore shape and W3f's \
+             only delta vs W3 is the on-disk medium (ZFS vs tmpfs), NOT \
+             the wrapper chain — emitting 'none' would silently drop W3's \
+             tag and let diff readers conclude 'chunked is N× slower' \
+             when part of the delta is 'wrapper chain skipped by design'",
+            crate::scenarios::chunked_v2::enabled::COMPOSITION_DEVIATION_TAG,
+            dev_str
         );
     }
 

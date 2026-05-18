@@ -49,7 +49,7 @@ use crate::scenarios::RunOpts;
 use crate::output::{CacheState, Confidence, LatencyPercentiles, Throughput};
 
 #[cfg(feature = "chunked_fast_slow")]
-mod enabled {
+pub(crate) mod enabled {
     use core::time::Duration;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -130,7 +130,7 @@ mod enabled {
     /// shared constant and "be careful." A reviewer touching either
     /// cell's `composition_deviation` extras insert MUST also re-verify
     /// the OTHER cell's composition matches before reusing this tag.
-    const COMPOSITION_DEVIATION_TAG: &str =
+    pub(crate) const COMPOSITION_DEVIATION_TAG: &str =
         "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning";
 
     /// Compute the per-chunk hash for the `WriteChunk.chunk_sha256` wire
