@@ -453,6 +453,18 @@ async fn a1_run_get_batch_hit(
         "ac_batch_semantics".to_string(),
         serde_json::json!("serial_single_key_calls_no_native_batch_rpc"),
     );
+    // Disclose timed-body work other than the store call so a future
+    // investigator chasing "why is A1 batchN hit-path X µs" sees the
+    // confound up front instead of doing a deep read. The prost decode
+    // is honestly-named (matches production ac_server.rs's
+    // get_and_decode_digest path), but at batch128 it's 128 sequential
+    // decodes dominating the warm-cache FS read. #533 sibling-audit.
+    extras.insert(
+        "timed_body_includes".to_string(),
+        serde_json::json!(
+            "get_part_unchunked_plus_prost_message_decode_per_element"
+        ),
+    );
 
     // Round-robin across `known` so the cell doesn't measure a single-
     // entry hot-cacheline artifact. C1's `run_exists_hit` pattern.
