@@ -130,6 +130,27 @@
 //!   when part of the delta is "W1f traverses 5 wrappers W3f skips
 //!   by design". Reusing W3's tag makes the asymmetry visible in the
 //!   JSON.
+//!
+//! ## extras.measures (#537 D3)
+//!
+//! Both prodlike cells (and their tmpfs siblings W1 + W3) emit an
+//! `extras.measures` string naming what the timed body actually waits
+//! for:
+//!
+//! - **W1 / W1f**: `"fast_tier_ack_then_spawn_dispatch"`. The timed
+//!   body returns when the MemoryStore fast tier accepts the bytes;
+//!   the slow-tier FilesystemStore write is `tokio::spawn`'d as
+//!   fire-and-forget and its latency is NOT timed.
+//! - **W3 / W3f**: `"chunked_commit_to_disk"`. The timed body returns
+//!   when the v2 server emits `FinalResponse(committed_size)`, which
+//!   it only sends after pwrite + verify + finalize-rename complete
+//!   on disk.
+//!
+//! A reader consuming a baseline JSON in isolation (Slack snippet,
+//! 6-month post-mortem) MUST be able to derive what the cell measured
+//! WITHOUT chasing the scenario doc-comment, otherwise they'll
+//! mis-compare cells that measure fundamentally different events
+//! (red-team #537 6-month pre-mortem).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -253,6 +274,21 @@ async fn run_w1f(
     extras.insert(
         "composition_deviation".to_string(),
         serde_json::json!("none"),
+    );
+    // #537 D3: self-describing JSON. W1f mirrors W1's call shape
+    // (`cas.update_oneshot`), which at 16 MiB routes to the upper
+    // `cas_FAST_SLOW_STORE` and returns at the MemoryStore fast-tier
+    // ack; the slow-tier FilesystemStore write is `tokio::spawn`'d as
+    // fire-and-forget. The on-disk WRITE happens — and on a real-disk
+    // ZFS leaf is meaningfully slower than tmpfs — but it is NOT in
+    // the timed body. A reader comparing W1f's 6 ms p50 to W3f's
+    // 110 ms p50 MUST see this in the JSON or they'll conclude
+    // "chunked is 18× slower" when part of the delta is "W1f measures
+    // ack; W3f measures commit-to-disk" — see red-team #537 6-month
+    // pre-mortem.
+    extras.insert(
+        "measures".to_string(),
+        serde_json::json!("fast_tier_ack_then_spawn_dispatch"),
     );
     extras.insert(
         "paired_baseline_cell".to_string(),
@@ -422,6 +458,20 @@ async fn run_w3f(
     extras.insert(
         "composition_deviation".to_string(),
         serde_json::json!(crate::scenarios::chunked_v2::enabled::COMPOSITION_DEVIATION_TAG),
+    );
+    // #537 D3: self-describing JSON. W3f's timed body wraps
+    // `write_chunked_v2 + drain_v2_response` — `drain_v2_response`
+    // blocks until the v2 server emits `FinalResponse(committed_size)`,
+    // which the server only sends after pwrite + chunk-verify +
+    // finalize-rename complete on disk. So W3f measures
+    // commit-to-disk, NOT a fast-tier ack. This is the load-bearing
+    // counterpoint to W1f's `fast_tier_ack_then_spawn_dispatch` — the
+    // difference between the two values is the entire reason a reader
+    // cannot conflate W1f vs W3f as a clean "non-chunked vs chunked"
+    // comparison (see red-team #537 6-month pre-mortem).
+    extras.insert(
+        "measures".to_string(),
+        serde_json::json!("chunked_commit_to_disk"),
     );
     extras.insert(
         "paired_baseline_cell".to_string(),
@@ -633,6 +683,60 @@ mod tests {
             crate::scenarios::chunked_v2::enabled::COMPOSITION_DEVIATION_TAG,
             dev_str
         );
+    }
+
+    /// #537 D3: every W-family cell's JSON output MUST carry a non-empty
+    /// `extras.measures` key naming what the timed body waits for.
+    /// Without this, a reader consuming a baseline JSON in isolation
+    /// (Slack snippet, post-mortem) has to chase the cell's doc-comment
+    /// to know whether the latency is "fast-tier ack" vs "commit to
+    /// disk" — the difference between those was the load-bearing
+    /// 17.7× delta in the red-team pre-mortem.
+    ///
+    /// This test runs W1f + W3f with iters=1 and asserts both extras
+    /// carry the field. **Mutation falsifier:** delete the
+    /// `extras.insert("measures", ...)` call in EITHER `run_w1f` OR
+    /// `run_w3f`; this test must red-fail with the bespoke
+    /// `"#537 D3 extras.measures field must travel with every W-family
+    /// cell's JSON"` message.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w_family_cells_carry_extras_measures_field() {
+        let scratch_root = tempfile::TempDir::new().expect("test tempdir");
+        let w1f = run_w1f(scratch_root.path(), 1)
+            .await
+            .expect("W1f must run cleanly on a fresh tempdir");
+        let w3f = run_w3f(scratch_root.path(), 1)
+            .await
+            .expect("W3f must run cleanly on a fresh tempdir");
+        for (cell_name, result) in [
+            (W1F_SCENARIO_NAME, &w1f),
+            (W3F_SCENARIO_NAME, &w3f),
+        ] {
+            let measures = result.extras.get("measures").unwrap_or_else(|| {
+                panic!(
+                    "#537 D3 extras.measures field must travel with every \
+                     W-family cell's JSON: cell {cell_name} has no \
+                     `measures` key in extras; a reader of this baseline \
+                     in isolation cannot tell whether the latency \
+                     measures fast-tier ack or commit-to-disk — see \
+                     red-team #537 6-month pre-mortem"
+                );
+            });
+            let s = measures.as_str().unwrap_or_else(|| {
+                panic!(
+                    "#537 D3 extras.measures field must travel with every \
+                     W-family cell's JSON: cell {cell_name} `measures` is \
+                     not a string (got {measures:?})"
+                );
+            });
+            assert!(
+                !s.is_empty(),
+                "#537 D3 extras.measures field must travel with every \
+                 W-family cell's JSON: cell {cell_name} `measures` is \
+                 the empty string"
+            );
+        }
     }
 
     /// The default scratch root MUST live under `/srv/build/` —

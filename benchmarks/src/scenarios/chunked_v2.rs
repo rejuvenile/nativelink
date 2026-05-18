@@ -635,6 +635,20 @@ pub(crate) mod enabled {
             "composition_deviation".to_string(),
             serde_json::json!(COMPOSITION_DEVIATION_TAG),
         );
+        // #537 D3: self-describing JSON. `measures` names what the timed
+        // body actually waits for. For W3 / W3f that's the chunked-v2
+        // commit-to-disk roundtrip — the client's `drain_v2_response`
+        // blocks until the v2 server emits `FinalResponse(committed_size)`,
+        // which the server only sends after pwrite + verify + finalize-
+        // rename complete on disk. A reader consuming a W3 baseline JSON
+        // in isolation (Slack snippet, 6-month post-mortem) MUST be able
+        // to derive what the latency cell measured WITHOUT chasing the
+        // scenario doc-comment — otherwise the cell becomes a footgun
+        // (see red-team #537 6-month pre-mortem).
+        extras.insert(
+            "measures".to_string(),
+            serde_json::json!("chunked_commit_to_disk"),
+        );
         if concurrency > 1 {
             extras.insert(
                 "batch_wall_clock_semantics".to_string(),

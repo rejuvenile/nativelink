@@ -144,6 +144,20 @@ async fn run_one_cell(
             serde_json::json!("small_cas_redis_replaced_with_memory"),
         );
     }
+    // #537 D3: self-describing JSON — name what the timed body actually
+    // waits for. The W1 cell's `cas.update_oneshot` returns at the fast-
+    // tier ack: at sizes ≥ 16 KiB the upper `cas_FAST_SLOW_STORE` accepts
+    // the bytes into MemoryStore and `tokio::spawn`s the slow-tier
+    // FilesystemStore write as fire-and-forget; at sizes < 16 KiB the
+    // small-CAS path resolves in MemoryStore entirely. EITHER WAY no
+    // FilesystemStore syscall is in the timed body. A reader consuming
+    // a W1 baseline JSON in isolation MUST be able to derive this
+    // WITHOUT reading the scenario doc-comment — see #537 red-team
+    // 6-month pre-mortem.
+    extras.insert(
+        "measures".to_string(),
+        serde_json::json!("fast_tier_ack_then_spawn_dispatch"),
+    );
 
     let iter_counter = std::sync::atomic::AtomicU64::new(0);
     let cas = composition.cas_store.clone();
