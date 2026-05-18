@@ -45,9 +45,11 @@
 //!   on a pre-populated digest. Pure cache hit; never falls through to inner.
 //!   Anchors the single-key Bazel-style "is this blob known?" probe.
 //! - `c1_exists_in_cache_single_key_miss` — same API, digest never seen.
-//!   Falls through to inner `MemoryStore::has_with_results` (also hot,
-//!   but exercises the not-in-cache → inner-query → insert-into-cache
-//!   path). Compare against the hit cell to anchor the cache-miss penalty.
+//!   `exists_in_cache` is a pure moka peek (`sizes_for_keys` with
+//!   `peek=true`); on miss it returns `false` WITHOUT querying the inner
+//!   store. The hit/miss delta therefore measures only the hash+peek path,
+//!   not an inner-query penalty. Anchor for "how expensive is a moka miss
+//!   compared to a moka hit".
 //! - `c1_has_with_results_batch16_hit` — `StoreDriver::has_with_results`
 //!   with 16 known digests (all hit). Anchors the batch hot-path
 //!   per-key amortized cost at a Bazel-typical incremental-build size.
@@ -87,10 +89,11 @@
 //!   adds a `concurrency=N` axis per the design doc Section 2; the
 //!   first scenario sticks to `concurrency=1` to keep the harness
 //!   surface minimal.
-//! - **Cache-thrash / LRU sweep.** Default `EXISTENCE_CACHE_MAX_ENTRIES`
-//!   is 50M (prod) — vastly above the populate budget here. The cells
-//!   do NOT measure LRU-eviction-under-pressure. A Phase 3 cell would
-//!   need to flood the cache past capacity and time the steady-state
+//! - **Cache-thrash / LRU sweep.** The bench's ECS is configured with
+//!   `max_count = 50_000_000` (matches prod `prod-server.json5`) — vastly
+//!   above the populate budget here. The cells do NOT measure
+//!   LRU-eviction-under-pressure. A Phase 3 cell would need to flood
+//!   the cache past capacity and time the steady-state
 //!   admission-with-eviction loop.
 
 use std::collections::BTreeMap;
@@ -148,9 +151,10 @@ fn build_existence_cache() -> Result<
     // wrapper so we wrap once here.
     let memory: Arc<MemoryStore> = MemoryStore::new(&inner_spec);
     let inner_store = Store::new(memory);
-    // ECS uses the prod `EXISTENCE_CACHE_MAX_ENTRIES` (50M) — far above
-    // C1_POPULATE_COUNT (4096), so no LRU eviction fires during the
-    // hot path. The cell is intentionally NOT measuring eviction.
+    // ECS configured with `max_count = 50_000_000` to match prod
+    // `prod-server.json5` — far above C1_POPULATE_COUNT (4096), so no LRU
+    // eviction fires during the hot path. The cell is intentionally NOT
+    // measuring eviction.
     let ecs_spec = ExistenceCacheSpec {
         backend: StoreSpec::Memory(inner_spec.clone()),
         eviction_policy: Some(EvictionPolicy {
@@ -209,12 +213,13 @@ pub async fn run(opts: &RunOpts) -> Vec<BenchmarkResult> {
         out.push(run_exists_hit(ecs_typed.clone(), &known_digests, iters, hit_name).await);
     }
 
-    // Cell 2: single-key exists_in_cache MISS — digest never seen. The
-    // ECS falls through to inner.has_with_results AND inserts the
-    // result; that insert grows the cache by 1 per iter. To prevent
-    // cache state from polluting cell 1 if cells run in any order,
-    // build a FRESH cache for the miss cell so the populate set is
-    // never disturbed.
+    // Cell 2: single-key exists_in_cache MISS — digest never seen.
+    // `exists_in_cache` is a pure moka peek and does NOT fall through to
+    // inner or insert anything, so reusing the populated cache would be
+    // semantically safe today. We still build a FRESH cache here as
+    // defensive isolation: (a) future-proof against an ECS semantics
+    // change that adds an insert-on-miss path, (b) keeps cell-ordering
+    // independence explicit so test runners can shuffle freely.
     let miss_name = "c1_exists_in_cache_single_key_miss";
     if opts.matches(miss_name) {
         match build_existence_cache() {
@@ -331,13 +336,13 @@ async fn run_exists_miss(
             let n = iter_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             async move {
                 let digest = pregen[n as usize];
-                // First call: cache miss. ECS falls through to inner
-                // (which also returns None since the digest is fresh),
-                // then `inner_has_with_results` does NOT insert into
-                // the cache (only Some(size) results trigger an insert
-                // per `existence_cache_store.rs:333-342`). So this
-                // path measures the pure miss-cost: hash → not-found
-                // → inner.has_with_results → return false.
+                // Cache miss. `exists_in_cache` is a moka peek
+                // (`existence_cache_store.rs:289-295`): it calls
+                // `sizes_for_keys(... peek=true)` and returns `false` if
+                // the key isn't in the cache. It does NOT query the
+                // inner store and does NOT insert. So this path measures
+                // the pure peek-miss cost: hash → moka peek → return
+                // false.
                 let present = ecs.exists_in_cache(&digest).await;
                 assert!(
                     !present,
