@@ -77,8 +77,12 @@ pub(crate) mod enabled {
     use crate::scenarios::{RunOpts, digest_via_default_hasher, measure};
 
     /// Chunk size used in the v2 bench cells. Matches the prod chunk-
-    /// flow: 1 MiB.
-    const BENCH_CHUNK_SIZE: usize = 1024 * 1024;
+    /// flow: 1 MiB. Bumped to `pub(crate)` so the #537 prodlike cells
+    /// (W3f) reuse the SAME constant instead of declaring their own,
+    /// eliminating the m5/m3 silent-drift risk: if W3 ever changes its
+    /// chunk size, W3f inherits the change for free and the
+    /// `paired_baseline_cell` linkage stays apples-to-apples.
+    pub(crate) const BENCH_CHUNK_SIZE: usize = 1024 * 1024;
 
     /// Hard cap on the W3 per-cell prebuilt-pool memory. Sized to fit
     /// under /dev/shm on a typical 256 GiB bench host while leaving
@@ -140,7 +144,7 @@ pub(crate) mod enabled {
     /// when `default_digest_hash_function = blake3`. The bench mirrors
     /// that behavior so a BLAKE3 default does not produce per-chunk
     /// hash mismatches at offset 0 (#524).
-    fn chunk_hash(bytes: &[u8]) -> [u8; 32] {
+    pub(crate) fn chunk_hash(bytes: &[u8]) -> [u8; 32] {
         let mut h = nativelink_util::digest_hasher::default_digest_hasher_func().hasher();
         nativelink_util::digest_hasher::DigestHasher::update(&mut h, bytes);
         let info = nativelink_util::digest_hasher::DigestHasher::finalize_digest(&mut h);
@@ -278,7 +282,7 @@ pub(crate) mod enabled {
     /// figure UNDER-credited the dominant cost, which was the per-chunk
     /// BLAKE3 hash computed here in `make_chunk`'s `chunk_hash` call
     /// (transitively hoisted by pre-building the chunk vec)).
-    fn make_chunk(
+    pub(crate) fn make_chunk(
         digest: DigestInfo,
         offset: u64,
         payload: &Bytes,
@@ -303,7 +307,7 @@ pub(crate) mod enabled {
     /// per-chunk memcpy. Per-iter cloning a pre-built result is O(N)
     /// chunks of (refcount bump + 32 B sha256 vec alloc), trivially
     /// cheap vs a full rebuild.
-    fn build_chunks(digest: DigestInfo, payload: &Bytes) -> Vec<WriteChunk> {
+    pub(crate) fn build_chunks(digest: DigestInfo, payload: &Bytes) -> Vec<WriteChunk> {
         let total = payload.len();
         let mut chunks = Vec::with_capacity(total.div_ceil(BENCH_CHUNK_SIZE));
         let mut offset: usize = 0;
@@ -322,7 +326,7 @@ pub(crate) mod enabled {
         chunks
     }
 
-    async fn drain_v2_response(
+    pub(crate) async fn drain_v2_response(
         mut stream: tonic::Streaming<WriteChunkedFrame>,
     ) -> Result<u64, tonic::Status> {
         while let Some(frame_res) = stream.next().await {
@@ -407,7 +411,7 @@ pub(crate) mod enabled {
     /// fill. Removing the fill (e.g. switching to `Vec::with_capacity` +
     /// `set_len` + uninit access) would re-introduce per-iter page-fault
     /// jitter into the timed window (perf-optimizer #533 MINOR-3).
-    fn make_payload(size: usize, n: u64) -> Bytes {
+    pub(crate) fn make_payload(size: usize, n: u64) -> Bytes {
         let mut state: u64 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut data = Vec::with_capacity(size);
         for _ in 0..size {

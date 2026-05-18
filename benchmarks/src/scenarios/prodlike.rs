@@ -152,10 +152,10 @@
 //! mis-compare cells that measure fundamentally different events
 //! (red-team #537 6-month pre-mortem).
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use bytes::Bytes;
 use nativelink_util::common::DigestInfo;
@@ -254,6 +254,14 @@ async fn run_w1f(
     // so per-iter LCG + hash cost does not contaminate the measurement.
     // At 20 iters × 16 MiB = 320 MiB of resident bytes; well under any
     // host budget we ship on.
+    //
+    // UNBOUNDED-OK: bench-local fixture; size is `iters × concurrency ×
+    // payload`, capped by the CLI `--iters` value (default 20) ×
+    // concurrency=1 × PRODLIKE_CELL_SIZE_BYTES (16 MiB), so 320 MiB
+    // resident steady-state. Bench code is not network-reachable; the
+    // hoist removes per-iter LCG-fill + BLAKE3 from the timed body so
+    // the cell measures the wrapper-chain ack-latency, not payload-
+    // build cost (#533 harness-suspect-list lesson).
     let prebuilt: Vec<Vec<(DigestInfo, Bytes)>> = (0..iters)
         .map(|n| {
             (0..concurrency)
@@ -313,7 +321,7 @@ async fn run_w1f(
         move || {
             let cas = cas.clone();
             let prebuilt = prebuilt_for_body.clone();
-            let n = iter_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = iter_counter.fetch_add(1, Ordering::Relaxed);
             async move {
                 let row = &prebuilt[n as usize];
                 let (digest, data) = row[0].clone();
@@ -340,7 +348,6 @@ async fn run_w3f(
     scratch_root: &Path,
     iters: u32,
 ) -> Result<BenchmarkResult, nativelink_error::Error> {
-    use core::sync::atomic::Ordering;
     use core::time::Duration;
 
     use nativelink_config::stores::FilesystemSpec;
@@ -354,10 +361,15 @@ async fn run_w3f(
     use nativelink_store::chunked::chunk_budget::ChunkBudget;
     use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 
+    // #537 m3: reuse W3's `make_payload` + `build_chunks` +
+    // `drain_v2_response` + `BENCH_CHUNK_SIZE` from `chunked_v2::enabled`
+    // so future fixes to W3's chunk-building (e.g. the #524 chunk-hash
+    // unification) automatically apply to W3f and the W1f/W3f comparison
+    // cannot silently drift from W3.
+    use crate::scenarios::chunked_v2::enabled::{
+        BENCH_CHUNK_SIZE, build_chunks, drain_v2_response, make_payload,
+    };
     use crate::scenarios::digest_via_default_hasher;
-
-    /// Match W3's chunk size — 1 MiB.
-    const BENCH_CHUNK_SIZE: usize = 1024 * 1024;
 
     // ---- Build the FilesystemStore on pool `fast` ----
     let temp_dir = tempfile::TempDir::new_in(scratch_root).map_err(|e| {
@@ -420,13 +432,19 @@ async fn run_w3f(
     let client = CasExtensionsClient::new(channel);
 
     // ---- Pre-generate payloads + chunks OUTSIDE the timer ----
+    // UNBOUNDED-OK: bench-local fixture; size is `iters × payload`, capped
+    // by the CLI `--iters` value (default 20) and PRODLIKE_CELL_SIZE_BYTES
+    // (16 MiB), so 320 MiB resident steady-state. Bench code is not
+    // network-reachable; this is hoisting per-iter LCG-fill + BLAKE3
+    // out of the timed body so the cell measures commit-to-disk, not
+    // payload-build cost (see #533 harness-suspect-list lesson).
     let size = PRODLIKE_CELL_SIZE_BYTES;
     let concurrency: u32 = 1;
     let prebuilt: Vec<Vec<WriteChunk>> = (0..iters as u64)
         .map(|n| {
             let payload = make_payload(size, n);
             let digest = digest_via_default_hasher(&payload);
-            build_chunks(digest, &payload, BENCH_CHUNK_SIZE)
+            build_chunks(digest, &payload)
         })
         .collect();
 
@@ -532,75 +550,11 @@ async fn run_w3f(
     ))
 }
 
-/// W3-style payload generator. Distinct content per `n` (same LCG seed
-/// mixing as W3's `make_payload`) so concurrent slots cannot collide
-/// on a digest.
-#[cfg(feature = "chunked_fast_slow")]
-fn make_payload(size: usize, n: u64) -> Bytes {
-    let mut state: u64 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut data = Vec::with_capacity(size);
-    for _ in 0..size {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        data.push((state >> 33) as u8);
-    }
-    Bytes::from(data)
-}
-
-/// W3-style chunk builder — refcounted slices, zero-copy.
-#[cfg(feature = "chunked_fast_slow")]
-fn build_chunks(
-    digest: DigestInfo,
-    payload: &Bytes,
-    chunk_size: usize,
-) -> Vec<nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WriteChunk>
-{
-    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WriteChunk;
-
-    let total = payload.len();
-    let mut chunks = Vec::with_capacity(total.div_ceil(chunk_size));
-    let mut offset: usize = 0;
-    while offset < total {
-        let take = chunk_size.min(total - offset);
-        let is_final = offset + take == total;
-        let chunk_bytes = payload.slice(offset..offset + take);
-        let chunk_sha256 = {
-            let mut h = nativelink_util::digest_hasher::default_digest_hasher_func().hasher();
-            nativelink_util::digest_hasher::DigestHasher::update(&mut h, &chunk_bytes);
-            let info = nativelink_util::digest_hasher::DigestHasher::finalize_digest(&mut h);
-            (**info.packed_hash()).to_vec()
-        };
-        chunks.push(WriteChunk {
-            digest: Some(digest.into()),
-            chunk_offset: offset as u64,
-            chunk_sha256,
-            chunk_bytes,
-            finish_chunk: is_final,
-        });
-        offset += take;
-    }
-    chunks
-}
-
-#[cfg(feature = "chunked_fast_slow")]
-async fn drain_v2_response(
-    mut stream: tonic::Streaming<
-        nativelink_proto::com::github::trace_machina::nativelink::remote_execution::WriteChunkedFrame,
-    >,
-) -> Result<u64, tonic::Status> {
-    use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::write_chunked_frame;
-    use tokio_stream::StreamExt as _;
-    while let Some(frame_res) = stream.next().await {
-        let frame = frame_res?;
-        if let Some(write_chunked_frame::Payload::FinalResponse(resp)) = frame.payload {
-            return Ok(resp.committed_size);
-        }
-    }
-    Err(tonic::Status::internal(
-        "W3f stream closed before final response",
-    ))
-}
+// #537 m3: `make_payload`, `build_chunks`, and `drain_v2_response` used
+// to live here as W3f-local copies of W3's helpers. They were promoted to
+// `pub(crate)` in `chunked_v2::enabled` and imported above so future fixes
+// to W3's chunk-building cannot silently diverge from W3f. Same for the
+// chunk-size constant (`BENCH_CHUNK_SIZE`).
 
 #[cfg(test)]
 mod tests {
@@ -685,6 +639,77 @@ mod tests {
         );
     }
 
+    /// #537 D5-m6: W3f smoke. Runs `run_w3f` end-to-end at `iters=1` and
+    /// asserts: (1) the scenario name is stable, (2) throughput is
+    /// non-degenerate (commit-to-disk completed for the single iter),
+    /// (3) the `chunk_size` extras pin matches W3's `BENCH_CHUNK_SIZE`
+    /// (1 MiB), (4) `extras.measures` is `"chunked_commit_to_disk"`
+    /// EXACTLY (mirrors the D3 measures contract with the W3f-specific
+    /// value, NOT just non-empty as the D3 test asserts).
+    ///
+    /// **Mutation falsifier:** change W3f's `extras.measures` insert to
+    /// anything other than `"chunked_commit_to_disk"`; this test
+    /// red-fails with the bespoke `"#537 D5-m6 W3f measures must be
+    /// chunked_commit_to_disk"` message.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w3f_smoke_runs_with_pinned_extras() {
+        let scratch_root = tempfile::TempDir::new().expect("test tempdir");
+        let result = run_w3f(scratch_root.path(), 1)
+            .await
+            .expect("W3f must run cleanly on a fresh tempdir");
+        assert_eq!(
+            result.scenario_name, W3F_SCENARIO_NAME,
+            "scenario_name regression"
+        );
+        // Throughput non-zero confirms commit-to-disk completed for the
+        // one iter (the v2 FinalResponse drained successfully).
+        match &result.throughput {
+            crate::output::Throughput::BytesPerSec(b) => assert!(
+                *b > 0.0,
+                "#537 D5-m6: W3f reported zero throughput; commit-to-disk \
+                 did not complete or the cell short-circuited"
+            ),
+            other => panic!(
+                "#537 D5-m6: W3f throughput must be BytesPerSec, got \
+                 {other:?}"
+            ),
+        }
+        // chunk_size pin: must match W3's BENCH_CHUNK_SIZE (shared via
+        // `chunked_v2::enabled::BENCH_CHUNK_SIZE` after #537 m3
+        // dedup). A drift here means W3f and W3 are comparing
+        // apples-to-oranges chunk sizes.
+        let chunk_size = result
+            .extras
+            .get("chunk_size")
+            .and_then(|v| v.as_u64())
+            .expect("#537 D5-m6: W3f extras must carry chunk_size");
+        assert_eq!(
+            chunk_size,
+            crate::scenarios::chunked_v2::enabled::BENCH_CHUNK_SIZE as u64,
+            "#537 D5-m6: W3f chunk_size ({chunk_size}) MUST match W3's \
+             BENCH_CHUNK_SIZE ({}) — they share the constant via \
+             `chunked_v2::enabled::BENCH_CHUNK_SIZE`",
+            crate::scenarios::chunked_v2::enabled::BENCH_CHUNK_SIZE,
+        );
+        // measures pin: exact value, not just non-empty.
+        let measures = result
+            .extras
+            .get("measures")
+            .and_then(|v| v.as_str())
+            .expect("#537 D5-m6: W3f extras must carry measures");
+        assert_eq!(
+            measures, "chunked_commit_to_disk",
+            "#537 D5-m6 W3f measures must be chunked_commit_to_disk: \
+             got {measures:?}; the W3f timed body wraps `write_chunked_v2 \
+             + drain_v2_response` which blocks until the v2 server emits \
+             FinalResponse (only sent after pwrite + verify + finalize-\
+             rename complete on disk), so the measures string is the \
+             load-bearing signal that lets a reader of this baseline \
+             cell distinguish it from W1f's fast-tier-ack semantics"
+        );
+    }
+
     /// #537 D3: every W-family cell's JSON output MUST carry a non-empty
     /// `extras.measures` key naming what the timed body waits for.
     /// Without this, a reader consuming a baseline JSON in isolation
@@ -762,34 +787,34 @@ mod tests {
         );
     }
 
-    /// Integration test: after a single W1f iter, files MUST exist on
-    /// disk under the scratch path. This is the load-bearing test that
-    /// proves the cell ACTUALLY exercises the FilesystemStore — a
-    /// regression that silently routes the write to the MemoryStore
-    /// fast tier (e.g. by mis-sizing the payload below
-    /// SIZE_PARTITIONING_THRESHOLD, or by short-circuiting the
-    /// FastSlowStore mirror) would slip past a pure-perf assertion but
-    /// red-fail here.
+    /// Integration smoke test: after a single W1f iter, the cell MUST
+    /// return a non-zero throughput sample. **This test does NOT verify
+    /// a file ended up on disk** — the per-cell tempdir is rm-rf'd
+    /// before the test could observe it. The load-bearing file-on-disk
+    /// + index-visibility check lives in
+    /// `w1f_drops_to_disk_under_held_tempdir` below; this test only
+    /// confirms `run_w1f` itself runs end-to-end and reports a
+    /// non-degenerate `Throughput::BytesPerSec` sample.
     ///
-    /// **Bespoke message:** `"#537 prodlike-bench verification:
-    /// expected ≥1 file on disk after iter; cell did NOT exercise
-    /// FilesystemStore"`.
+    /// #537 D5-m1 rename: the previous name
+    /// `w1f_iter_writes_at_least_one_file_to_disk` overclaimed — a
+    /// reader (or future sub-agent) would assume the file-on-disk
+    /// contract was covered here and skip the second test. The new
+    /// name matches the assertion.
     ///
     /// **Mutation falsifier:** in `run_w1f`, comment out the
-    /// `cas.update_oneshot(...)` call. The test must red-fail with the
-    /// bespoke "≥1 file on disk" message.
+    /// `measure(...).await` call (or replace `throughput_bytes_per_iter`
+    /// with `Some(0)`). The test must red-fail with the bespoke
+    /// "reported zero throughput" message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn w1f_iter_writes_at_least_one_file_to_disk() {
+    async fn w1f_returns_nonzero_throughput() {
         // Use a tempdir under the system tempdir for the TEST
         // (the test does NOT need pool `fast` — it just needs a
-        // REAL filesystem to assert the FilesystemStore actually
-        // wrote files). `tempfile::TempDir::new()` defaults to the
-        // OS tempdir which is real disk on the test host (or tmpfs
-        // — either is fine for verifying ≥1 file was created).
+        // REAL filesystem so the FilesystemStore composition builds).
         let scratch_root = tempfile::TempDir::new().expect("test tempdir");
 
         // Use the smallest iters the harness allows so the test runs
-        // fast — the assertion is "≥1 file", not "N files".
+        // fast — the assertion is "non-zero", not "N samples".
         let iters: u32 = 1;
         let result = run_w1f(scratch_root.path(), iters)
             .await
@@ -798,16 +823,6 @@ mod tests {
             result.scenario_name, W1F_SCENARIO_NAME,
             "scenario_name regression"
         );
-        // After the cell runs and `composition` is dropped at function
-        // exit, the FilesystemStore tempdir is rm -rf'd — so we cannot
-        // count files under `scratch_root` post-hoc. Instead, count
-        // files under `scratch_root` DURING the run by snapshotting
-        // before drop. The shape of the cell makes this awkward; we
-        // accept a weaker check here (cell ran without error and
-        // returned the expected scenario_name + throughput) and rely
-        // on `w1f_drops_to_disk_under_held_tempdir` below for the
-        // load-bearing file-on-disk check.
-        //
         // The throughput must be positive — a no-op cell would still
         // record samples but with zero bytes, giving 0 B/s.
         match &result.throughput {
@@ -823,22 +838,48 @@ mod tests {
         }
     }
 
-    /// Load-bearing file-on-disk check: build the composition under a
-    /// caller-held tempdir, write ONE blob via `update_oneshot`, then
-    /// recursively count regular files under the content_path BEFORE
-    /// dropping the composition. The CAS chain stores blobs as files
-    /// named by their digest under `<content_path>/<...>/<digest>` —
-    /// at least one such file MUST exist after a successful write.
+    /// Load-bearing index-visibility check: build the composition under
+    /// a caller-held tempdir, write ONE blob via `update_oneshot`, then
+    /// query via `has_with_results` against the SAME `cas_store` handle
+    /// production callers use BEFORE dropping the composition. Per
+    /// CLAUDE.md's "Index-visibility contract": tests must not
+    /// substitute `tokio::fs::metadata`-of-final-path or
+    /// `tokio::fs::read` for the in-process visibility primitive
+    /// (`has_with_results`) — those verify the kernel view, not the
+    /// in-process index that the FilesystemStore's `evicting_map`
+    /// gives production callers. (#537 D5-m2 fix.)
     ///
-    /// **Bespoke message:** the exact string the dispatch named.
+    /// We additionally walk the FilesystemStore tempdir for ≥1
+    /// regular file as a belt-and-braces check: if a regression makes
+    /// `update_oneshot` short-circuit entirely (e.g. returns Ok
+    /// without dispatching to the slow tier), neither the file-walk
+    /// nor the `has_with_results` will catch the absence of disk I/O
+    /// at the upper layer; the file-walk gives that coverage
+    /// independently.
     ///
-    /// **Mutation falsifier:** in `build_prod_cas_composition`, swap
-    /// the `StoreSpec::Filesystem(...)` with `StoreSpec::Memory(...)`
-    /// — the composition still satisfies the trait, `update_oneshot`
-    /// still succeeds, but no on-disk file is ever produced; this
-    /// test red-fails with the bespoke message.
+    /// **Bespoke messages:**
+    ///
+    /// - `"#537 prodlike-bench verification: expected ≥1 file on disk
+    ///   after iter; cell did NOT exercise FilesystemStore"`
+    /// - `"#537 D5-m2 stale negative — index not updated post-rename"`
+    ///
+    /// **Mutation falsifier (file-walk):** in
+    /// `build_prod_cas_composition`, swap the `StoreSpec::Filesystem(...)`
+    /// with `StoreSpec::Memory(...)` — the composition still satisfies
+    /// the trait, `update_oneshot` still succeeds, but no on-disk file
+    /// is ever produced; the file-walk assertion red-fails with the
+    /// bespoke "≥1 file on disk" message.
+    ///
+    /// **Mutation falsifier (has_with_results):** comment out the
+    /// `update_oneshot` call entirely — `has_with_results` then
+    /// returns `[None]` (no entry was inserted) and the assertion
+    /// red-fails with the bespoke "stale negative — index not
+    /// updated post-rename" message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn w1f_drops_to_disk_under_held_tempdir() {
+        use core::time::Duration;
+        use nativelink_util::store_trait::StoreKey;
+
         let scratch_root = tempfile::TempDir::new().expect("test tempdir");
         let composition = build_prod_cas_composition(Some(scratch_root.path()))
             .await
@@ -854,9 +895,42 @@ mod tests {
             .update_oneshot(digest, data)
             .await
             .expect("W1f update_oneshot must succeed");
-        // Walk fs_root and count regular files. FilesystemStore lays
-        // blobs under <content_path>/<...>; we tolerate any subtree
-        // shape.
+
+        // Index-visibility check: same seam production callers cross.
+        // 5-second timeout = deadlock detector per CLAUDE.md's
+        // index-visibility contract (a stuck rename or a missed
+        // evicting_map insert manifests as a hang, not a wrong value;
+        // generic `is_err()` would mask `tokio::time::Elapsed`).
+        let key: StoreKey<'static> = StoreKey::from(digest);
+        let mut results: [Option<u64>; 1] = [None];
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            composition.cas_store.has_with_results(&[key], &mut results),
+        )
+        .await
+        .expect(
+            "#537 D5-m2 stale negative — index not updated post-rename: \
+             has_with_results timed out (>5s); upper-layer visibility \
+             primitive wedged",
+        )
+        .expect("has_with_results must not return Err");
+        assert_eq!(
+            results[0],
+            Some(PRODLIKE_CELL_SIZE_BYTES as u64),
+            "#537 D5-m2 stale negative — index not updated post-rename: \
+             expected Some({}) after update_oneshot, got {:?}; the same \
+             seam production callers cross reported the blob as absent \
+             — either the upper-layer ExistenceCache wasn't populated or \
+             the underlying FilesystemStore evicting_map insert was \
+             skipped (mirrors the 2026-05-04 finalize_holding \
+             regression class cited in CLAUDE.md)",
+            PRODLIKE_CELL_SIZE_BYTES,
+            results[0],
+        );
+
+        // Belt-and-braces: walk fs_root and count regular files.
+        // FilesystemStore lays blobs under <content_path>/<...>; we
+        // tolerate any subtree shape.
         let file_count = tokio::task::spawn_blocking(move || {
             count_regular_files(&fs_root)
         })
