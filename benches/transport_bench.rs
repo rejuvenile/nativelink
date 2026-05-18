@@ -72,6 +72,7 @@ fn make_store_manager() -> Arc<StoreManager> {
             max_bytes: 1_073_741_824,
             ..Default::default()
         }),
+        emit_backpressure_enabled: false,
     });
     store_manager.add_store("main_cas", Store::new(memory_store));
     store_manager
@@ -227,6 +228,7 @@ async fn make_tcp_client(port: u16, certs: &TlsCerts) -> Arc<GrpcStore> {
         dual_transport: false,
         zstd_compression: false,
         connection_acquire_timeout_ms: None,
+        chunked_writes_enabled: false,
     };
     GrpcStore::new(&spec)
         .await
@@ -371,6 +373,7 @@ async fn make_quic_client(port: u16) -> Arc<GrpcStore> {
         dual_transport: false,
         zstd_compression: false,
         connection_acquire_timeout_ms: None,
+        chunked_writes_enabled: false,
     };
     GrpcStore::new(&spec)
         .await
