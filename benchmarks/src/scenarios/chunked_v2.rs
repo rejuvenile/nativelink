@@ -80,6 +80,20 @@ mod enabled {
     /// flow: 1 MiB.
     const BENCH_CHUNK_SIZE: usize = 1024 * 1024;
 
+    /// `extras.composition_deviation` tag for W3 and R5. Both cells
+    /// exercise `ChunkedWriteHandler → FilesystemStore` directly —
+    /// production's `cas_STORE` wraps that leaf in
+    /// `ExistenceCacheStore → VerifyStore → FastSlowStore { fast:
+    /// SizePartitioningStore → MemoryStore, slow: FilesystemStore }`.
+    /// So W3/R5 SKIP: existence dedup, hash-verify-on-write, MemoryStore
+    /// fast tier, size-based tier routing, and the FastSlowStore
+    /// admission/mirror logic. **A W3/R5 baseline cannot be compared
+    /// directly to a production "16 MiB chunked write" wall-clock**;
+    /// production runs the MemoryStore admission gate and chunked-driver
+    /// commit barrier first. Mirrors the W1/A1/C1 convention.
+    const COMPOSITION_DEVIATION_TAG: &str =
+        "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning";
+
     /// Compute the per-chunk hash for the `WriteChunk.chunk_sha256` wire
     /// field. **Despite the field name**, the v2 server
     /// (`chunked_write_handler_v2::compute_sha256_blocking_v2`) actually
@@ -431,6 +445,14 @@ mod enabled {
             "concurrent_ops_per_iter".to_string(),
             serde_json::json!(concurrency),
         );
+        // W3 exercises ChunkedWriteHandler → FilesystemStore directly,
+        // skipping production's wrapper chain. Mirrors W1/A1/C1
+        // convention so future diff tooling cannot accidentally compare
+        // W3 numbers against production "16 MiB chunked write" baselines.
+        extras.insert(
+            "composition_deviation".to_string(),
+            serde_json::json!(COMPOSITION_DEVIATION_TAG),
+        );
         if concurrency > 1 {
             extras.insert(
                 "batch_wall_clock_semantics".to_string(),
@@ -606,6 +628,13 @@ mod enabled {
             let mut extras = BTreeMap::new();
             extras.insert("chunk_size".to_string(), serde_json::json!(BENCH_CHUNK_SIZE));
             extras.insert("n_readers".to_string(), serde_json::json!(n_readers));
+            // R5 reads from a bare FilesystemStore, skipping production's
+            // wrapper chain. Same deviation tag as W3 so diff tooling
+            // can filter consistently.
+            extras.insert(
+                "composition_deviation".to_string(),
+                serde_json::json!(COMPOSITION_DEVIATION_TAG),
+            );
             // Honest-label: this cell is FilesystemStore fan-out, not
             // the v3 per-digest Notify. Diff tooling must NOT treat a
             // stable baseline here as evidence the Notify path is
