@@ -572,7 +572,7 @@ mod tests {
     /// dataset path; this test red-fails.
     #[test]
     fn default_scratch_root_is_user_scratch_not_prod_state() {
-        let p = std::path::Path::new(DEFAULT_PRODLIKE_SCRATCH_ROOT);
+        let p = Path::new(DEFAULT_PRODLIKE_SCRATCH_ROOT);
         assert!(
             p.starts_with("/srv/build/"),
             "#537 scratch-root: must live under user-scoped /srv/build/ — \
@@ -702,7 +702,7 @@ mod tests {
     /// Recursively count regular files under `root`. Symlinks are not
     /// followed. Used by `w1f_drops_to_disk_under_held_tempdir` to
     /// verify the FilesystemStore actually wrote files.
-    fn count_regular_files(root: &std::path::Path) -> usize {
+    fn count_regular_files(root: &Path) -> usize {
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
         let mut count: usize = 0;
         while let Some(dir) = stack.pop() {

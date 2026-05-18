@@ -83,7 +83,7 @@ use nativelink_benchmarks::output::{BaselineFile, BenchmarkResult, RunMetadata, 
 use nativelink_benchmarks::preflight::{Verdict, run_preflight};
 use nativelink_benchmarks::scenarios::{
     MIN_ITERS, RunOpts, ac_micro, chunked_v2, existence_cache_micro, find_missing, legacy_read,
-    legacy_write,
+    legacy_write, prodlike,
 };
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
 
@@ -114,11 +114,25 @@ struct Cli {
     #[arg(long)]
     fast: bool,
 
-    /// Comma-separated scenario families to run (default: all).
-    /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`, `c1`, `a1`, `a2`.
-    /// Empty string is rejected.
+    /// Comma-separated scenario families to run (default: all
+    /// EXCEPT `prodlike`, which is opt-in because it writes to a
+    /// real-disk dataset on pool `fast` and is intended for
+    /// dedicated #537 chunked-vs-non-chunked-on-disk comparisons).
+    /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`, `c1`, `a1`,
+    /// `a2`, `prodlike`. Empty string is rejected.
     #[arg(long, default_value = "w1,r1,f1,w3,r5,c1,a1,a2", value_parser = parse_scenarios)]
     scenarios: String,
+
+    /// Scratch root for the #537 `prodlike` cells (W1f / W3f). Defaults
+    /// to `/srv/build/Work/nl-bench-537/` (user-scoped scratch on
+    /// ZFS pool `fast` — NOT prod state). Ignored when `prodlike` is
+    /// not in `--scenarios`. The general `--temp-dir` gate (which
+    /// refuses `/fast/` / `/srv/bulk/`) does NOT apply to this flag — the
+    /// prodlike cells INTENTIONALLY write to pool `fast` to measure
+    /// real-disk cost; pass an explicit override here if you want to
+    /// land them on a different dataset.
+    #[arg(long)]
+    prodlike_scratch_dir: Option<PathBuf>,
 
     /// Print the pre-flight verdict and exit without running anything.
     #[arg(long)]
@@ -278,6 +292,22 @@ async fn run_main() -> ExitCode {
     if want.iter().any(|s| s == "a1" || s == "a2") {
         eprintln!("[bench] A1 + A2 (ActionCache get / update — FilesystemStore leaf)");
         all_results.extend(ac_micro::run(&opts, temp_dir_opt.as_ref()).await);
+    }
+
+    // #537 prodlike: opt-in cell family that pins the FilesystemStore
+    // content_path to ZFS pool `fast` (real disk). Default
+    // `--scenarios` excludes it because most bench runs want tmpfs
+    // speed; W1f/W3f are for the dedicated chunked-vs-non-chunked
+    // on-disk comparison that #537 was filed to surface.
+    if want.iter().any(|s| s == "prodlike") {
+        eprintln!("[bench] PRODLIKE (W1f + W3f — 16 MiB c=1 on real disk for chunked-vs-not)");
+        all_results.extend(
+            prodlike::run(
+                &opts,
+                cli.prodlike_scratch_dir.as_deref(),
+            )
+            .await,
+        );
     }
 
     let metadata = collect_metadata(cli.force, &temp_dir);
