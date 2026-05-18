@@ -288,16 +288,26 @@ mod enabled {
 
     /// W3 cell matrix.
     ///
-    /// **N=1 cells:** the historic baseline shape (single writer).
-    /// Default iter budget applies.
+    /// **N=1 cells (`..._single_writer_*` scenario-name family):** the
+    /// historic baseline shape — one writer, end-to-end per-op latency.
+    /// Sample = single-writer wall-clock per iter. The c=1 cells preserve
+    /// their historic scenario name (no `_c1` suffix) so checked-in
+    /// baselines remain a continuity anchor.
     ///
-    /// **N>1 cells:** concurrent writers. Each iter dispatches N
-    /// parallel `write_chunked_v2` ops and times batch wall-clock.
-    /// Throughput is `iters * concurrency * size / total_wall_clock`.
+    /// **N>1 cells (`..._burst_*MiB_c{N}` scenario-name family):**
+    /// closed-loop burst of N concurrent writers per iter. **Measurement:
+    /// batch wall-clock for N concurrent writes to complete; NOT
+    /// comparable to `_single_writer_` cells.** Two distinct sample
+    /// shapes (per-op latency vs batch wall-clock throughput) under
+    /// different scenario-name families so future diff tooling cannot
+    /// silently compare them. Throughput math:
+    /// `iters * concurrency * size / total_wall_clock`.
+    ///
     /// Pool size for unique digests = `iters * concurrency`; sized so
-    /// the in-memory `prebuilt` Arc stays under ~6 GiB even at 16 MiB
-    /// × N=16 (largest concurrent variant — 16 MiB × N=64 would be
-    /// 20 GiB pool, refused).
+    /// the in-memory `prebuilt` Arc stays under POOL_MAX_BYTES even at
+    /// 16 MiB × N=16 (largest concurrent variant — 16 MiB × N=64 would
+    /// be 20 GiB pool, refused). The runtime guard in `run_w3_cell`
+    /// enforces this regardless of `--iters` overrides.
     const W3_CELLS: &[W3Cell] = &[
         // Historic shape — single writer, both sizes.
         W3Cell { size: 4 * BENCH_CHUNK_SIZE, concurrency: 1, label: "4MiB", iters_override: None },
@@ -332,10 +342,20 @@ mod enabled {
         let iters = opts.effective_iters(cell.iters_override.unwrap_or(20));
         let size = cell.size;
         let concurrency = cell.concurrency;
-        // Preserve the c=1 cell's HISTORIC name (no `_c1` suffix) so
-        // existing baselines (`benchmarks/baselines/<sha>.json` checked
-        // into the repo, pre-#533) keep comparing apples-to-apples.
-        // Only the new c>1 cells get a `_c{N}` disambiguator.
+        // Family split per #533 red-team:
+        //
+        // - c=1 cells emit `..._single_writer_{label}` (no suffix),
+        //   preserving historic baseline names so checked-in JSONs in
+        //   `benchmarks/baselines/` stay comparable apples-to-apples.
+        //   Sample shape: single-writer per-op latency.
+        // - c>1 cells emit `..._burst_{label}_c{N}`, a DIFFERENT
+        //   scenario-name family. Sample shape: batch wall-clock for N
+        //   concurrent writes to complete. NOT comparable to the
+        //   single-writer family — closed-loop burst load generator,
+        //   different sample semantics. Future diff tooling that joins
+        //   on `scenario_name` cannot accidentally compare a c=1
+        //   per-op-latency baseline against a c>1 batch-wall-clock
+        //   baseline because the prefixes differ.
         let scenario_name = if concurrency == 1 {
             format!(
                 "w3_chunked_v2_write_single_writer_{label}",
@@ -343,7 +363,7 @@ mod enabled {
             )
         } else {
             format!(
-                "w3_chunked_v2_write_single_writer_{label}_c{c}",
+                "w3_chunked_v2_write_burst_{label}_c{c}",
                 label = cell.label,
                 c = concurrency,
             )
@@ -693,6 +713,26 @@ mod enabled {
             }
         }
 
+        /// Reproduce the scenario_name builder used by `run_w3_cell` so
+        /// the matrix-shape tests can assert on it without spinning up
+        /// the full bench harness. If this drifts from the in-cell
+        /// builder, the c=1 baseline-continuity test below will catch
+        /// the byte-level mismatch.
+        fn scenario_name_for(cell: &W3Cell) -> String {
+            if cell.concurrency == 1 {
+                format!(
+                    "w3_chunked_v2_write_single_writer_{label}",
+                    label = cell.label,
+                )
+            } else {
+                format!(
+                    "w3_chunked_v2_write_burst_{label}_c{c}",
+                    label = cell.label,
+                    c = cell.concurrency,
+                )
+            }
+        }
+
         /// The c=1 cell must exist for both 4 MiB and 16 MiB so historic
         /// baselines remain comparable. Mutation: remove a c=1 entry —
         /// red-fails.
@@ -732,6 +772,65 @@ mod enabled {
                 levels.len(),
                 levels
             );
+        }
+
+        /// Family-split discipline (#533 red-team finding 1): the c=1
+        /// cells MUST emit the historic `..._single_writer_{label}`
+        /// scenario name (no `_c1` suffix) so checked-in baselines stay
+        /// comparable. The c>1 cells MUST emit a SEPARATE family
+        /// (`..._burst_{label}_c{N}`) so future diff tooling cannot
+        /// silently compare per-op-latency samples against
+        /// batch-wall-clock samples.
+        ///
+        /// Mutation: collapse both branches of the scenario-name builder
+        /// in `run_w3_cell` to the same `..._single_writer_` prefix —
+        /// this test red-fails because a c>1 cell would emit the wrong
+        /// family. Mutation: swap the c=1 branch to add `_c1` — also
+        /// red-fails, baseline continuity broken.
+        #[test]
+        fn w3_scenario_name_family_split_is_enforced() {
+            for cell in W3_CELLS {
+                let name = scenario_name_for(cell);
+                if cell.concurrency == 1 {
+                    // c=1 cells must use the historic single-writer
+                    // family. Disallow any `_c<digit>` suffix so the
+                    // historic baseline name is preserved byte-for-byte.
+                    let has_concurrency_suffix = name
+                        .rsplit('_')
+                        .next()
+                        .map(|tail| {
+                            tail.starts_with('c')
+                                && tail[1..].chars().all(|c| c.is_ascii_digit())
+                                && tail.len() > 1
+                        })
+                        .unwrap_or(false);
+                    assert!(
+                        name.starts_with("w3_chunked_v2_write_single_writer_")
+                            && !has_concurrency_suffix,
+                        "#533 family-split: c=1 cells must use the historic \
+                         `..._single_writer_{{label}}` name (no `_c1` \
+                         suffix) for baseline continuity; got `{name}`"
+                    );
+                } else {
+                    assert!(
+                        name.starts_with("w3_chunked_v2_write_burst_"),
+                        "#533 family-split: c>1 cells must use the \
+                         `..._burst_{{label}}_c{{N}}` name family — batch \
+                         wall-clock throughput samples are a different \
+                         shape from per-op-latency samples and must NOT \
+                         share a name family with single-writer cells; \
+                         got `{name}` (c={c})",
+                        c = cell.concurrency,
+                    );
+                    let want_suffix = format!("_c{}", cell.concurrency);
+                    assert!(
+                        name.ends_with(&want_suffix),
+                        "#533 family-split: c>1 cell must end with \
+                         `_c{{concurrency}}` so the concurrency level is \
+                         visible in the name; got `{name}`"
+                    );
+                }
+            }
         }
 
         /// Pool memory budget: the largest cell's `prebuilt` pool must
