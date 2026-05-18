@@ -22,6 +22,7 @@ pub mod existence_cache_micro;
 pub mod find_missing;
 pub mod legacy_read;
 pub mod legacy_write;
+pub mod prodlike;
 
 use core::future::Future;
 use std::time::Instant;
