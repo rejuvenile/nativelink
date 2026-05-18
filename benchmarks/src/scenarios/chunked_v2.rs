@@ -130,22 +130,40 @@ mod enabled {
         Ok((store, temp_dir))
     }
 
-    /// Per-process `ChunkBudget` lazily initialized once. Replaces the
-    /// previous per-cell `Box::leak`. Bench process is short-lived so
-    /// one budget is sufficient; lifting to truly non-static-only would
-    /// require a `ChunkedWriteHandler::new_with_state_and_chunk_size_for_test`
-    /// API change which is out of scope (followup #NNN).
-    fn process_chunk_budget() -> &'static ChunkBudget {
-        use std::sync::OnceLock;
-        static BUDGET: OnceLock<&'static ChunkBudget> = OnceLock::new();
-        BUDGET.get_or_init(|| Box::leak(Box::new(ChunkBudget::new())))
+    /// Mint a FRESH per-cell `ChunkBudget` and leak it for `'static`.
+    /// Each W3/R5 cell gets its own budget so cross-cell state leak is
+    /// physically impossible — a hypothetical permit-release bug or
+    /// straggler task in cell K cannot degrade cell K+1's permit pool
+    /// because they consult different `Semaphore` instances entirely.
+    ///
+    /// The previous shape (`OnceLock<&'static ChunkBudget>`) shared one
+    /// budget across all cells. Tokio's `OwnedSemaphorePermit` releases
+    /// on `Drop` even under task abort, so the shared shape was
+    /// theoretically leak-free — but red-team (#533) correctly noted
+    /// that "theoretically leak-free" depends on every cell's writer
+    /// task actually dropping its `ChunkWork` (and thus its permit)
+    /// before the next cell starts. Per-cell instantiation makes the
+    /// guarantee structural instead of relying on task-drop ordering.
+    ///
+    /// Cost: one ~80-byte `Box::leak` per W3 + R5 cell (~10 cells), so
+    /// ~800 bytes of heap leaked across the bench run — negligible
+    /// against the multi-GiB `prebuilt` pools the same cells allocate.
+    /// The `'static` lifetime is required by
+    /// `ChunkedWriteHandler::new_with_state_and_chunk_size_for_test`'s
+    /// signature; converting that to take `Arc<ChunkBudget>` would be
+    /// a wider refactor than this fix-up warrants.
+    fn make_chunk_budget() -> &'static ChunkBudget {
+        Box::leak(Box::new(ChunkBudget::new()))
     }
 
+    /// Build a handler with a FRESH chunk budget so each call yields a
+    /// cell whose admission semaphore starts at full permits — see
+    /// `make_chunk_budget` for the rationale.
     fn make_handler(
         store: Arc<FilesystemStore<FileEntryImpl>>,
     ) -> Arc<ChunkedWriteHandler> {
         let in_flight = ChunkedWriteInFlight::new();
-        let budget: &'static ChunkBudget = process_chunk_budget();
+        let budget: &'static ChunkBudget = make_chunk_budget();
         Arc::new(
             ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
                 store, in_flight, budget, BENCH_CHUNK_SIZE,
@@ -831,6 +849,66 @@ mod enabled {
                     );
                 }
             }
+        }
+
+        /// Per-cell `ChunkBudget` isolation (#533 red-team finding 2):
+        /// every cell MUST get a fresh `ChunkBudget` so cross-cell
+        /// permit-state leak is structurally impossible. If two
+        /// consecutive `make_chunk_budget()` calls returned the same
+        /// budget, a cell K that fault-injected a permit-holding
+        /// straggler would degrade cell K+1's measured throughput.
+        ///
+        /// The test additionally fault-injects: it acquires permits from
+        /// the FIRST budget (simulating an in-flight ChunkWork that
+        /// hasn't dropped), then verifies the SECOND budget is still at
+        /// full permits — proving the two budgets do not alias.
+        ///
+        /// Mutation: revert `make_chunk_budget()` to a `OnceLock`
+        /// singleton (the pre-#533 shape) — this test red-fails with
+        /// the bespoke `#533 chunk-budget cross-cell leak` message.
+        #[test]
+        fn chunk_budget_isolated_across_cells() {
+            use nativelink_store::chunked::chunk_budget::TOTAL_CHUNK_PERMITS;
+
+            let b1 = make_chunk_budget();
+            let b2 = make_chunk_budget();
+
+            // Distinct allocations: pointer-inequality proves the two
+            // budgets cannot share a Semaphore. If they aliased, every
+            // bench cell would share permit state with every other.
+            assert!(
+                !core::ptr::eq(b1, b2),
+                "#533 chunk-budget cross-cell leak: make_chunk_budget() \
+                 returned the SAME budget across calls. A permit-holding \
+                 straggler from cell K would degrade cell K+1's throughput \
+                 because they consult the same Semaphore."
+            );
+
+            // Both start at full permits.
+            assert_eq!(b1.available_chunks(), TOTAL_CHUNK_PERMITS);
+            assert_eq!(b2.available_chunks(), TOTAL_CHUNK_PERMITS);
+
+            // Fault-inject: acquire permits from b1 (simulating in-flight
+            // ChunkWork that hasn't dropped). b2's available_chunks MUST
+            // remain at TOTAL_CHUNK_PERMITS — if it doesn't, the budgets
+            // alias and the cross-cell isolation is broken.
+            let mut holders = Vec::with_capacity(32);
+            for _ in 0..32 {
+                holders.push(
+                    b1.try_acquire_chunk()
+                        .expect("b1 must have permits available"),
+                );
+            }
+            assert_eq!(b1.available_chunks(), TOTAL_CHUNK_PERMITS - 32);
+            assert_eq!(
+                b2.available_chunks(),
+                TOTAL_CHUNK_PERMITS,
+                "#533 chunk-budget cross-cell leak: acquiring permits from \
+                 b1 reduced b2's available count — the two budgets alias, \
+                 and a permit-holding straggler in cell K would silently \
+                 degrade cell K+1's permit pool."
+            );
+            drop(holders);
         }
 
         /// Pool memory budget: the largest cell's `prebuilt` pool must
