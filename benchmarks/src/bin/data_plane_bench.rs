@@ -300,6 +300,22 @@ async fn run_main() -> ExitCode {
     // speed; W1f/W3f are for the dedicated chunked-vs-non-chunked
     // on-disk comparison that #537 was filed to surface.
     if want.iter().any(|s| s == "prodlike") {
+        // The general `resolve_bench_temp_dir` gate refuses any `/srv/bulk/`
+        // or `/fast/` path, which is too aggressive for the prodlike
+        // cells (they INTENTIONALLY write to pool `fast`). The narrowed
+        // guard below refuses ONLY prod-state subtrees — those are the
+        // paths that would actually collide with live CAS state on this
+        // host. An operator passing `--prodlike-scratch-dir
+        // /srv/casdata/nativelink/...` (typo into a prod CAS dataset)
+        // would otherwise have bench writes pollute ARC + race against
+        // in-flight production writes on a shared inode namespace; this
+        // gate fires BEFORE any directory creation.
+        if let Some(p) = cli.prodlike_scratch_dir.as_deref() {
+            if let Err(e) = validate_prodlike_scratch_dir(p) {
+                eprintln!("[bench] {e}");
+                return ExitCode::from(2);
+            }
+        }
         eprintln!("[bench] PRODLIKE (W1f + W3f — 16 MiB c=1 on real disk for chunked-vs-not)");
         all_results.extend(
             prodlike::run(
@@ -371,6 +387,44 @@ fn resolve_bench_temp_dir(override_: Option<&PathBuf>) -> Result<PathBuf, String
         ));
     }
     Ok(chosen)
+}
+
+/// Refuse any `--prodlike-scratch-dir` whose path components contain
+/// `nativelink` or `casdata`, OR whose absolute resolution starts with
+/// `/srv/bulk/`. Those are production CAS state subtrees on buildcache; bench
+/// writes landing there would pollute live state — see red-team #537
+/// Q4 + code-reviewer M1.
+///
+/// **Why narrower than `resolve_bench_temp_dir`'s substring gate:** the
+/// general gate refuses any `/srv/bulk/` OR `/fast/` path. The prodlike
+/// cells INTENTIONALLY write to pool `fast` (that's the whole point of
+/// the cell family — real-disk numbers, not tmpfs). This validator
+/// narrows that to ONLY prod-state subtrees so the legitimate use case
+/// (user-scoped scratch under `/srv/build/Work/`) still works while
+/// a typo into `/srv/casdata/nativelink/stores/` or
+/// `/srv/nativelink/` is refused with a bespoke error.
+///
+/// **Mutation falsifier:** comment out either of the two `if` predicates
+/// below; the `prodlike_scratch_dir_rejects_production_state_paths`
+/// test must red-fail with the bespoke "refusing path" message.
+fn validate_prodlike_scratch_dir(path: &std::path::Path) -> Result<(), String> {
+    // Component-level check catches `nativelink` / `casdata` anywhere
+    // in the path. We do NOT rely on `canonicalize` because the path
+    // may not yet exist (the bench creates it); `canonicalize` would
+    // return `NotFound` and we'd silently fall through.
+    let raw = path.to_string_lossy();
+    let has_prod_component =
+        raw.contains("nativelink") || raw.contains("casdata");
+    let under_tank = path.is_absolute() && raw.starts_with("/srv/bulk/");
+    if has_prod_component || under_tank {
+        return Err(format!(
+            "--prodlike-scratch-dir: refusing path {}: contains 'nativelink' / \
+             'casdata' or under '/srv/bulk/' (would risk colliding with production \
+             CAS state on this host)",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn collect_metadata(forced: bool, temp_dir: &std::path::Path) -> RunMetadata {
@@ -478,6 +532,51 @@ mod tests {
         // /tmp is fine.
         let ok = PathBuf::from("/tmp");
         assert!(resolve_bench_temp_dir(Some(&ok)).is_ok());
+    }
+
+    /// #537 D1: `--prodlike-scratch-dir` MUST refuse prod-state paths.
+    /// The general `resolve_bench_temp_dir` gate is too aggressive (it
+    /// also refuses the legitimate `/srv/build/Work/` scratch root)
+    /// so the prodlike-specific narrower gate has its own validator.
+    ///
+    /// **Mutation falsifier:** comment out either of the two predicates
+    /// in `validate_prodlike_scratch_dir` (the `nativelink` / `casdata`
+    /// component check OR the `/srv/bulk/` absolute-path check). This test
+    /// must red-fail with the bespoke "refusing path" message.
+    #[test]
+    fn prodlike_scratch_dir_rejects_production_state_paths() {
+        // /srv/bulk/foo — absolute path under prod ZFS pool root.
+        let tank = PathBuf::from("/srv/bulk/foo");
+        let err = validate_prodlike_scratch_dir(&tank)
+            .expect_err("#537 D1: /srv/bulk/ paths must be refused");
+        assert!(
+            err.contains("refusing path") && err.contains("/srv/bulk/"),
+            "expected bespoke 'refusing path' message naming the path; got: {err}"
+        );
+        // /srv/nativelink/ — substring 'nativelink' = prod CAS
+        // state subtree on the buildcache pool `fast`.
+        let nl = PathBuf::from("/srv/nativelink/");
+        let err = validate_prodlike_scratch_dir(&nl)
+            .expect_err("#537 D1: paths containing 'nativelink' must be refused");
+        assert!(
+            err.contains("refusing path") && err.contains("nativelink"),
+            "expected bespoke 'refusing path' message naming the path; got: {err}"
+        );
+        // /srv/whatever/casdata/ — 'casdata' = prod CAS dataset
+        // name; bench must refuse regardless of parent hierarchy.
+        let st = PathBuf::from("/srv/whatever/casdata/");
+        let err = validate_prodlike_scratch_dir(&st)
+            .expect_err("#537 D1: paths containing 'casdata' must be refused");
+        assert!(
+            err.contains("refusing path") && err.contains("casdata"),
+            "expected bespoke 'refusing path' message naming the path; got: {err}"
+        );
+        // Legitimate scratch root must pass.
+        let ok = PathBuf::from("/srv/build/Work/nl-bench-537/");
+        assert!(
+            validate_prodlike_scratch_dir(&ok).is_ok(),
+            "user-scoped /srv/build/Work/ MUST pass — that's the canonical scratch root"
+        );
     }
 
     #[test]
