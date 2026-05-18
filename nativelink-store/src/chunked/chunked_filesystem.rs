@@ -612,7 +612,7 @@ pub(crate) async fn write_chunk_at_offset(
     // trace! (compiled out in `release_max_level_info` builds).
     trace!(
         target: "nativelink_store::chunked_filesystem::w3_probe",
-        %digest,
+        ?digest,
         chunk_offset,
         chunk_bytes = len,
         mutex_acquire_us,

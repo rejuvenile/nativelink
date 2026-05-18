@@ -475,7 +475,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 target: "nativelink_service::w3_probe",
                 chunk_offset,
                 chunk_bytes_len,
-                "write_chunk_at_offset enter"
+                "write_chunk_at_offset (handler) enter"
             );
             let pwrite_res = self
                 .filesystem_store_for_v2()
@@ -487,7 +487,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 chunk_bytes_len,
                 elapsed_us = _w3_probe_pwrite_start.elapsed().as_micros() as u64,
                 ok = pwrite_res.is_ok(),
-                "write_chunk_at_offset exit"
+                "write_chunk_at_offset (handler) exit"
             );
             if let Err(err) = pwrite_res {
                 race_state.release_chunk_in_flight(writer_id, chunk_offset);
