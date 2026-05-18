@@ -332,11 +332,22 @@ mod enabled {
         let iters = opts.effective_iters(cell.iters_override.unwrap_or(20));
         let size = cell.size;
         let concurrency = cell.concurrency;
-        let scenario_name = format!(
-            "w3_chunked_v2_write_single_writer_{label}_c{c}",
-            label = cell.label,
-            c = concurrency,
-        );
+        // Preserve the c=1 cell's HISTORIC name (no `_c1` suffix) so
+        // existing baselines (`benchmarks/baselines/<sha>.json` checked
+        // into the repo, pre-#533) keep comparing apples-to-apples.
+        // Only the new c>1 cells get a `_c{N}` disambiguator.
+        let scenario_name = if concurrency == 1 {
+            format!(
+                "w3_chunked_v2_write_single_writer_{label}",
+                label = cell.label,
+            )
+        } else {
+            format!(
+                "w3_chunked_v2_write_single_writer_{label}_c{c}",
+                label = cell.label,
+                c = concurrency,
+            )
+        };
         if !opts.matches(&scenario_name) {
             return;
         }
