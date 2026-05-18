@@ -26,12 +26,30 @@
 //! RPC-layer absence.
 //!
 //! **Invariant being anchored:** the prod write composition's wall-clock
-//! and throughput for sequential writes through the wrapper chain. A
-//! regression here flags any change that adds latency to
+//! and throughput for sequential writes through the wrapper chain UP TO
+//! AND INCLUDING the fast-tier ack. A regression here flags any change
+//! that adds latency to
 //! `ExistenceCache::update → SizePartitioning::update →
-//! {SMALL_CAS_CACHED, cas_FAST_SLOW_STORE}::update` (e.g. an over-eager
-//! `has` probe added on the write path, a fsync sneaking in, the slow-
-//! write back-pressure cap firing prematurely).
+//! {SMALL_CAS_CACHED, cas_FAST_SLOW_STORE}::update` BEFORE the fast tier
+//! returns (e.g. an over-eager `has` probe added on the write path, a
+//! fsync sneaking in, the slow-write back-pressure cap firing
+//! prematurely, MemoryStore admission contention).
+//!
+//! **What this cell does NOT measure (#537 red-team sibling-bug fix):**
+//! at any size ≥ SizePartitioning threshold (16 KiB strict `<`), the
+//! upper-tier `cas_FAST_SLOW_STORE.update_oneshot` returns AS SOON AS
+//! the MemoryStore fast tier accepts the bytes; the slow-tier
+//! FilesystemStore write is `tokio::spawn`'d as fire-and-forget. So at
+//! 1 MiB / 16 MiB the W1 sample is "fast-tier MemoryStore ack +
+//! spawn-dispatch of slow-tier write", NOT "disk write to completion".
+//! `extras.measures = "fast_tier_ack_then_spawn_dispatch"` (set per
+//! cell) makes this visible in the JSON output so a reader cannot
+//! conflate the W1 16 MiB number with a real disk-commit-to-completion
+//! latency. (For the chunked-v2 commit-to-disk anchor, see W3 / W3f —
+//! those wait synchronously on the v2 FinalResponse.) At small sizes
+//! (≤ 16 KiB) the small-CAS path resolves entirely in MemoryStore
+//! anyway, so the distinction is moot — there is no slow tier at that
+//! size.
 //!
 //! **Composition deviation note:** `SMALL_CAS_CACHED.slow` is a
 //! MemoryStore in the bench (vs Valkey/Redis in prod). Cells whose
