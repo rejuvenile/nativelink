@@ -116,6 +116,20 @@ mod enabled {
     /// directly to a production "16 MiB chunked write" wall-clock**;
     /// production runs the MemoryStore admission gate and chunked-driver
     /// commit barrier first. Mirrors the W1/A1/C1 convention.
+    ///
+    /// # Phase-2 divergence guard (red-team #533 out-of-scope #1)
+    ///
+    /// W3 and R5 share this constant ONLY because both currently skip
+    /// the same wrapper chain. If a future R5 wire-up (e.g. Phase 2
+    /// routes readers through `WriteChunkedV2`'s commit barrier so the
+    /// per-digest `Notify` is in the path) changes R5's composition
+    /// relative to W3 — even by adding a single wrapper — this shared
+    /// constant becomes silently WRONG for the divergent cell. The fix
+    /// is mechanical: split into `W3_COMPOSITION_DEVIATION_TAG` +
+    /// `R5_COMPOSITION_DEVIATION_TAG` at that point, NOT to keep the
+    /// shared constant and "be careful." A reviewer touching either
+    /// cell's `composition_deviation` extras insert MUST also re-verify
+    /// the OTHER cell's composition matches before reusing this tag.
     const COMPOSITION_DEVIATION_TAG: &str =
         "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning";
 
@@ -381,6 +395,18 @@ mod enabled {
     /// hiccups on the single tail iter; ~50 samples gives the p99 enough
     /// of a tail population to be a stable signal rather than a coin flip
     /// inside a 6× envelope.
+    ///
+    /// # Page-fault pre-pay
+    ///
+    /// The `data.push(...)` loop writes every byte before `Bytes::from`
+    /// hands ownership to the caller's `chunk_bytes`. That means every
+    /// page in the returned allocation is **dirty + resident** when the
+    /// timer starts — no latent page-fault cost is paid inside the timed
+    /// body. Future reviewers asking "does the bench warm-touch the pool
+    /// pages before timing?" can stop here: yes, implicitly via the LCG
+    /// fill. Removing the fill (e.g. switching to `Vec::with_capacity` +
+    /// `set_len` + uninit access) would re-introduce per-iter page-fault
+    /// jitter into the timed window (perf-optimizer #533 MINOR-3).
     fn make_payload(size: usize, n: u64) -> Bytes {
         let mut state: u64 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut data = Vec::with_capacity(size);
@@ -565,6 +591,25 @@ mod enabled {
         // the dominant cost (~45% of the win), not the LCG fill
         // (~40%), and the true sustained p99 improvement is
         // ~10-15%, not the originally-reported 77%.
+        //
+        // Pool-build cost note (code-reviewer #533 m6): this loop runs
+        // `make_payload` (LCG fill, byte-loop CPU) PLUS
+        // `digest_via_default_hasher` (one BLAKE3 over the whole payload
+        // for the per-blob digest) PLUS `build_chunks` (one BLAKE3 over
+        // each chunk for the per-chunk `chunk_sha256` wire field). For a
+        // 16 MiB c=16 × 20-iter cell that is 320 × 16 = 5120 1-MiB
+        // BLAKE3 hashes + 320 16-MiB BLAKE3 hashes for the digests, all
+        // single-threaded on this tokio worker BEFORE the timer starts.
+        // That is several seconds of cell setup at default iters (tens
+        // of seconds under `--iters 100`). Setup wall-clock is counted
+        // against the bench's total run time but NOT against the
+        // `samples` collected by `measure` — so it does not pollute the
+        // p50/p99 numbers, only the wall-clock for the whole bench to
+        // complete. Future reviewers seeing the bench wall-clock balloon
+        // at high concurrency should look here first, not at the timed
+        // body. (Parallelizing this loop via `rayon::scope` /
+        // `spawn_blocking` would cut bench wall-clock meaningfully at
+        // c=64 — perf-optimizer #533 m2 — tracked as a #535 follow-up.)
         let total_slots = (iters as u64).saturating_mul(concurrency as u64);
         let prebuilt: Vec<Vec<WriteChunk>> = (0..total_slots)
             .map(|n| {
@@ -601,6 +646,15 @@ mod enabled {
 
         let client_for_body = client.clone();
         let prebuilt = Arc::new(prebuilt);
+        // `Arc::new(iter_counter)` is asymmetric with R5's plain
+        // `AtomicU64`: W3's iter body is `run_w3_iter` (extracted free
+        // async fn), so the counter must cross an `.await` boundary AND
+        // be `Send` + `'static` for the `set.spawn(...)` JoinSet path at
+        // c>1. R5's iter body is an inline `async move` closure that
+        // moves `iter_counter` directly. A future cleanup agent should
+        // NOT "consistency-fix" this asymmetry — the wrapping is
+        // load-bearing for the JoinSet spawn at W3 c>1 (code-reviewer
+        // #533 m7).
         let iter_counter = Arc::new(iter_counter);
         // Bytes-per-iter = concurrency × size (one batch's worth);
         // `measure` multiplies by `iters` to get total bytes for
@@ -632,6 +686,24 @@ mod enabled {
     /// in `measure(...)` stays small and the compiler doesn't hit the
     /// monomorphization-blowup ICE on the nested `async move` block
     /// (rustc 1.95.0-nightly seen 2026-05-18).
+    ///
+    /// # c=1 vs c>1 path asymmetry (red-team #533 out-of-scope #2)
+    ///
+    /// The c=1 branch directly `.await`s `write_one_chunked` — no
+    /// `JoinSet`, no `set.spawn`. The c>1 branch dispatches N tasks
+    /// via `tokio::task::JoinSet` and drains via `join_next()`. Both
+    /// branches measure the same physical work (a chunked-v2 stream),
+    /// but the c>1 wall-clock includes the cost of `set.spawn(N tasks)`
+    /// + `set.join_next() × N` plumbing — small, but not zero. This
+    /// is intentional: the c=1 branch preserves byte-identical
+    /// methodology against the historic single-writer baseline (so old
+    /// JSONs under `benchmarks/baselines/` remain a continuity anchor),
+    /// while the c>1 branch lives in its own scenario-name family
+    /// (`..._burst_*`) where the spawn-loop overhead is part of the
+    /// honest "closed-loop burst of N writers" workload definition.
+    /// **Do not "unify" the two branches by routing c=1 through the
+    /// JoinSet path** — that would invalidate every historic c=1
+    /// baseline by adding spawn-loop overhead to the measurement.
     async fn run_w3_iter(
         client: CasExtensionsClient<tonic::transport::Channel>,
         prebuilt: Arc<Vec<Vec<WriteChunk>>>,
