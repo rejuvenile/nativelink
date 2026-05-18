@@ -437,7 +437,12 @@ mod enabled {
     const W3_CELLS: &[W3Cell] = &[
         // Historic shape — single writer, both sizes.
         W3Cell { size: 4 * BENCH_CHUNK_SIZE, concurrency: 1, label: "4MiB", iters_override: None },
-        W3Cell { size: 16 * BENCH_CHUNK_SIZE, concurrency: 1, label: "16MiB", iters_override: None },
+        // 16 MiB c=1 p99 sits in a 113-743 ms single-sample envelope at
+        // iters=20 (see make_payload doc-block). 50 iters narrows the
+        // p99/max-of-N estimator enough that future runs land near the
+        // typical ~620 ms rather than the lucky-sample lows. 50 × 16 MiB
+        // = 800 MiB pool, well under POOL_MAX_BYTES.
+        W3Cell { size: 16 * BENCH_CHUNK_SIZE, concurrency: 1, label: "16MiB", iters_override: Some(50) },
         // 4 MiB at multiple concurrency levels (small enough memory to
         // tolerate N=64).
         W3Cell { size: 4 * BENCH_CHUNK_SIZE, concurrency: 4, label: "4MiB", iters_override: None },
