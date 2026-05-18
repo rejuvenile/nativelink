@@ -16,6 +16,7 @@
 //! `pub async fn run(opts: &RunOpts) -> Vec<BenchmarkResult>` so the
 //! CLI runner can dispatch uniformly.
 
+pub mod ac_micro;
 pub mod chunked_v2;
 pub mod existence_cache_micro;
 pub mod find_missing;

@@ -82,7 +82,7 @@ use clap::Parser;
 use nativelink_benchmarks::output::{BaselineFile, BenchmarkResult, RunMetadata, SCHEMA_VERSION};
 use nativelink_benchmarks::preflight::{Verdict, run_preflight};
 use nativelink_benchmarks::scenarios::{
-    MIN_ITERS, RunOpts, chunked_v2, existence_cache_micro, find_missing, legacy_read,
+    MIN_ITERS, RunOpts, ac_micro, chunked_v2, existence_cache_micro, find_missing, legacy_read,
     legacy_write,
 };
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
@@ -115,9 +115,9 @@ struct Cli {
     fast: bool,
 
     /// Comma-separated scenario families to run (default: all).
-    /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`, `c1`. Empty string
-    /// is rejected.
-    #[arg(long, default_value = "w1,r1,f1,w3,r5,c1", value_parser = parse_scenarios)]
+    /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`, `c1`, `a1`, `a2`.
+    /// Empty string is rejected.
+    #[arg(long, default_value = "w1,r1,f1,w3,r5,c1,a1,a2", value_parser = parse_scenarios)]
     scenarios: String,
 
     /// Print the pre-flight verdict and exit without running anything.
@@ -269,6 +269,15 @@ async fn run_main() -> ExitCode {
     if want.iter().any(|s| s == "c1") {
         eprintln!("[bench] C1 (ExistenceCache micro-bench — hit/miss + batch 16/128)");
         all_results.extend(existence_cache_micro::run(&opts).await);
+    }
+    // A1 (AC get) + A2 (AC update) share one `ac_micro::run` entry-point
+    // because they share one FilesystemStore fixture per invocation. The
+    // CLI accepts either or both family tags; if both are listed (the
+    // default), the call still runs once and the filter inside `run`
+    // selects which cells fire.
+    if want.iter().any(|s| s == "a1" || s == "a2") {
+        eprintln!("[bench] A1 + A2 (ActionCache get / update — FilesystemStore leaf)");
+        all_results.extend(ac_micro::run(&opts, temp_dir_opt.as_ref()).await);
     }
 
     let metadata = collect_metadata(cli.force, &temp_dir);
