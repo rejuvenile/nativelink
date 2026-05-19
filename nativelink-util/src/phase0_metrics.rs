@@ -92,12 +92,14 @@ use crate::common::DigestInfo;
 ///   - Sub-ms (1, 5) — floor case: notify-driven, healthy
 ///   - Single-digit ms (10, 25) — fast-RTT BIS round-trip
 ///   - Tens of ms (50, 100) — typical drained-loop sleep wake
-///   - Hundreds (250, 500) — drained-loop 500 ms backoff envelope
-///   - Seconds (1000, 5000, 10000) — slow-path / wedge debug
+///   - Hundreds (250, 500, 1000) — drained-loop 500 ms backoff envelope
+///     and beyond
 ///
 /// Bucket index `i` counts samples with `value <= LATENCY_BUCKETS_MS[i]`.
 /// Implicit `+inf` bucket at the tail catches values above the largest
-/// boundary. Prometheus exposition convention is `le` (less-than-or-equal).
+/// boundary — values above 1000 ms (slow-path / wedge debug) fall into
+/// the `+inf` bucket and are visible via `_count - le_1000_ms`.
+/// Prometheus exposition convention is `le` (less-than-or-equal).
 pub const LATENCY_BUCKETS_MS: [u64; 9] = [1, 5, 10, 25, 50, 100, 250, 500, 1000];
 
 /// Byte-size histogram boundaries for `worker_concurrent_pinned_bytes`.
@@ -199,7 +201,6 @@ impl LatencyHistogram {
                 nativelink_metric::MetricKind::Counter,
                 help.as_str()
             );
-            let _ = idx; // suppress unused-warning when buckets has zero len
         }
         let count = self.inf_bucket.load(Ordering::Relaxed);
         let sum = self.sum.load(Ordering::Relaxed);
@@ -270,7 +271,6 @@ impl BytesHistogram {
                 nativelink_metric::MetricKind::Counter,
                 help.as_str()
             );
-            let _ = idx;
         }
         let count = self.inf_bucket.load(Ordering::Relaxed);
         let sum = self.sum.load(Ordering::Relaxed);
@@ -339,9 +339,14 @@ pub struct WorkerPhase0Metrics {
     /// released (any unpin records the value; the action commits the
     /// histogram observation when all its digests have been unpinned).
     ///
-    /// Cap shape identical to `tonic_ok_timestamps` — bounded LRU.
-    /// Conservative cap of 10_000 because actions outnumber digests
-    /// at typical 10×-100× ratio.
+    /// CAPPED AT 10_000 entries: actions outnumber digests at typical
+    /// 10×-100× ratio, so even at the digest cap of 100_000 in
+    /// `tonic_ok_timestamps` only ~1k-10k distinct actions are in
+    /// flight. 10_000 gives 10× headroom over the 1k actions/min
+    /// steady-state mentioned in the project memory. At ~32 B per
+    /// entry (3 × u64) the worst-case memory footprint is ~320 KiB —
+    /// trivial. Same 10-min TTL as `tonic_ok_timestamps` ensures
+    /// abandoned actions self-evict.
     action_pin_accumulators: Cache<u64, ActionAccumulator>,
 }
 

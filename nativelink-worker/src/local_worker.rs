@@ -2253,7 +2253,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     // the recorded gap names the worker-side
                                     // dispatcher contribution only (NOT the
                                     // handler runtime). Pure observability.
-                                    let _phase0_bis_arrival_ts =
+                                    let phase0_bis_arrival_ts =
                                         worker_phase0_metrics().record_bis_chunk_arrival();
                                     let digest_count = chunk.digests.len();
                                     let broadcast_id = chunk.broadcast_id;
@@ -2275,7 +2275,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         // handler so the gap matches the
                                         // dispatcher contribution.
                                         worker_phase0_metrics()
-                                            .commit_arrival_to_handler(_phase0_bis_arrival_ts);
+                                            .commit_arrival_to_handler(phase0_bis_arrival_ts);
                                         // Send the ack inline so the resend
                                         // buffer is released as soon as the
                                         // unpins land. The async send is

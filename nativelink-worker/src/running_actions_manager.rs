@@ -5090,11 +5090,27 @@ impl RunningActionsManagerImpl {
             // observability — the commit is a single Cache lookup +
             // histogram observe + invalidate; latency-irrelevant. If
             // no per-digest gaps were folded the commit is a no-op.
-            let action_key_for_commit = phase0_action_key;
+            //
+            // **New tokio::spawn acknowledgment (code-reviewer MAJOR-1):**
+            // This adds one deferred-commit `tokio::spawn` per
+            // `spawn_upload_to_remote` call (i.e. per Bazel action with
+            // outputs). At a typical steady-state of ~1k actions/min
+            // and a 30s sleep window, this is ~500 sleeping tasks
+            // resident at any moment. Tokio handles this trivially
+            // (each sleeping task is one timer-wheel entry, ~80 B
+            // futures); steady-state cost is <1 MiB. The futures
+            // perform no I/O, no channel sends, no lock acquisition —
+            // they fire one Cache lookup + at most two histogram
+            // observations + one Cache invalidate before completing.
+            // It will be visible in stack dumps and
+            // `RuntimeMetrics::tokio_total_tasks`, which is the only
+            // operator-observable difference from a "no behavior
+            // change" diff. No flow-control change; the spawn is
+            // independent of the upload task's lifecycle.
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 worker_phase0_metrics()
-                    .commit_action_pin_extension(action_key_for_commit);
+                    .commit_action_pin_extension(phase0_action_key);
             });
         });
     }
