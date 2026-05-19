@@ -69,6 +69,7 @@ use nativelink_util::action_messages::{
 use nativelink_util::common::{DigestInfo, fs, make_precondition_failure_any};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
+use nativelink_util::phase0_metrics::worker_phase0_metrics;
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::store_trait::{Store, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo};
 use nativelink_util::log_utils::throughput_mbps;
@@ -4714,7 +4715,22 @@ impl RunningActionsManagerImpl {
         let filesystem_store = self.filesystem_store.clone();
         for digest in &digests {
             filesystem_store.pin_digest(digest);
+            // #547 Phase 0 instrumentation: record live pinned-bytes
+            // gauge growth + histogram sample. Pure observability.
+            worker_phase0_metrics().record_pin_acquired(digest.size_bytes());
         }
+
+        // #547 Phase 0 instrumentation: assign a per-action key so the
+        // BIS-unpin handler can fold per-digest gaps into the action's
+        // total + max pin-extension histograms. The key is a fresh
+        // process-wide atomic counter; uniqueness across worker
+        // lifecycle is sufficient for the per-action histogram emit.
+        // Pure observability.
+        let phase0_action_key = {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static PHASE0_ACTION_COUNTER: AtomicU64 = AtomicU64::new(1);
+            PHASE0_ACTION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        };
 
         // Lifecycle log: emitted unconditionally so silent loss of the
         // spawned upload task (drop, panic, runtime shutdown before run)
@@ -4838,6 +4854,9 @@ impl RunningActionsManagerImpl {
                         // Pin tree file digests to prevent eviction.
                         for digest in &file_digests {
                             filesystem_store.pin_digest(digest);
+                            // #547 Phase 0 instrumentation. Pure observability.
+                            worker_phase0_metrics()
+                                .record_pin_acquired(digest.size_bytes());
                         }
                         digests.extend(file_digests);
                     }
@@ -4968,8 +4987,28 @@ impl RunningActionsManagerImpl {
                             }
                         };
                         match result {
-                            Ok(()) => break true,
-                            Err(e) if e.code == Code::AlreadyExists => break true,
+                            Ok(()) => {
+                                // #547 Phase 0 instrumentation: record the
+                                // tonic-Ok timestamp keyed by digest + this
+                                // action's key. The BIS-unpin handler on
+                                // this worker will compute the per-digest
+                                // pin-release latency when the matching
+                                // BIS chunk arrives. Pure observability.
+                                worker_phase0_metrics()
+                                    .record_tonic_ok(digest, phase0_action_key);
+                                break true;
+                            }
+                            Err(e) if e.code == Code::AlreadyExists => {
+                                // #547 Phase 0 instrumentation: AlreadyExists
+                                // counts as a successful tonic Ok from the
+                                // worker's perspective — the server has the
+                                // bytes, the worker will be told to unpin
+                                // via BIS. Record so the pin-release window
+                                // measurement is complete. Pure observability.
+                                worker_phase0_metrics()
+                                    .record_tonic_ok(digest, phase0_action_key);
+                                break true;
+                            }
                             Err(e) if e.code == Code::InvalidArgument
                                 || e.code == Code::PermissionDenied
                                 || e.code == Code::Unauthenticated
@@ -5033,6 +5072,21 @@ impl RunningActionsManagerImpl {
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "upload_to_remote: background CAS upload completed",
             );
+
+            // #547 Phase 0 instrumentation: schedule the per-action
+            // accumulator commit after a BIS-round-trip wait window.
+            // The window is generous (30s) because under healthy load
+            // BIS arrives well under 1s; under degraded load we accept
+            // partial folding rather than block the spawned task. Pure
+            // observability — the commit is a single Cache lookup +
+            // histogram observe + invalidate; latency-irrelevant. If
+            // no per-digest gaps were folded the commit is a no-op.
+            let action_key_for_commit = phase0_action_key;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                worker_phase0_metrics()
+                    .commit_action_pin_extension(action_key_for_commit);
+            });
         });
     }
 

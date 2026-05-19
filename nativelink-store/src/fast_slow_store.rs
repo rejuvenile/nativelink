@@ -40,6 +40,7 @@ use nativelink_util::buf_channel::{
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::fs;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+use nativelink_util::phase0_metrics::server_phase0_metrics;
 use nativelink_util::store_trait::{
     DelegationChildren, IS_MIRROR_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
     StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
@@ -1419,6 +1420,11 @@ impl FastSlowStore {
         Arc::new(move |digest: DigestInfo| {
             stable_digests.lock().push(digest);
             stable_notify.notify_one();
+            // #547 Phase 0 instrumentation: record the pusher invocation
+            // so operators can confirm the server commit path is firing
+            // the BIS pipeline AND so the BIS broadcast loop can compute
+            // per-digest queue dwell time. Pure observability.
+            server_phase0_metrics().record_pusher_invoke(digest);
         })
     }
 

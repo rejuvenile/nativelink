@@ -542,6 +542,28 @@ async fn inner_main(
     // the counters are process-global; double-registration would
     // publish duplicate lines. Same shape as the
     // pin_budget/chunk_budget singletons above.
+    // #547 Phase 0 instrumentation: register the WorkerPhase0Metrics
+    // and ServerPhase0Metrics singletons so every `/metrics` listener
+    // exposes the BIS-ack-past-tonic-Ok latency histogram + 7 other
+    // metrics needed to characterize the BIS pipeline before the #546
+    // pin-trigger shift ships. Same shape as the pin_budget / chunk_budget
+    // registrations above (Arc accessor backed by OnceLock; the publish
+    // path reads live state from the producer-shared instance).
+    //
+    // Both metric sets are registered unconditionally because both
+    // sides of the BIS pipeline (server commits + worker BIS handler)
+    // run in the same binary depending on role; registering both means
+    // a single binary build serves both worker and server scrapes
+    // without conditional cfgs.
+    metrics_registry.register(
+        "phase0_worker",
+        nativelink_util::phase0_metrics::worker_phase0_metrics_arc(),
+    );
+    metrics_registry.register(
+        "phase0_server",
+        nativelink_util::phase0_metrics::server_phase0_metrics_arc(),
+    );
+
     metrics_registry.register(
         "grpc_stream",
         nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),
@@ -989,6 +1011,13 @@ async fn inner_main(
                         () = merged_notify.notified() => {}
                         () = tokio::time::sleep(Duration::from_millis(500)) => {}
                     }
+                    // #547 Phase 0 instrumentation: capture loop-wake
+                    // timestamp here so the wake-to-send histogram
+                    // measures coalescing-loop overhead. The commit
+                    // fires after the broadcast loop finishes
+                    // dispatching all batches. Pure observability.
+                    let phase0_wake_ts = nativelink_util::phase0_metrics::server_phase0_metrics()
+                        .record_loop_wake();
                     // Build broadcast batches in a single list:
                     //   - CAS first: all CAS-store drains merged into one
                     //     bucket tagged store_id="" (CAS share locality_map;
@@ -1102,7 +1131,32 @@ async fn inner_main(
                                 "BlobsInStableStorage {kind} chunked: broadcast returned"
                             );
                         }
+                        // #547 Phase 0 instrumentation: only CAS digests
+                        // went through stable_digests_pusher (AC has its
+                        // own path that doesn't populate the
+                        // pusher_timestamps side-channel). Record CAS
+                        // per-digest queue dwell + update the depth
+                        // gauge. AC batches are still observable via the
+                        // wake-to-send histogram. Pure observability.
+                        if !is_ac {
+                            // Queue depth reported = batch size just
+                            // drained. The post-drain queue is empty (the
+                            // drain is std::mem::take); the meaningful
+                            // signal is "how big a batch did this wake
+                            // produce" — proxy for queueing pressure
+                            // between wakes. A persistently growing batch
+                            // size means writes are arriving faster than
+                            // the broadcast loop can fire.
+                            let depth = digests.len() as u64;
+                            nativelink_util::phase0_metrics::server_phase0_metrics()
+                                .record_broadcast(digests, depth);
+                        }
                     }
+                    // #547 Phase 0 instrumentation: commit the
+                    // wake-to-send histogram observation now that all
+                    // batches have been dispatched. Pure observability.
+                    nativelink_util::phase0_metrics::server_phase0_metrics()
+                        .commit_loop_wake_to_send(phase0_wake_ts);
 
                     // #334 Fix C: release server-side fast-tier pins for
                     // every CAS and AC digest just broadcast. The

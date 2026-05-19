@@ -299,18 +299,20 @@ impl BytesHistogram {
 /// at process start by `bin/nativelink.rs`.
 #[derive(Debug)]
 pub struct WorkerPhase0Metrics {
-    /// Per-digest tonic-Ok timestamp side-channel. Producer:
-    /// `spawn_upload_to_remote` records on successful per-digest upload
-    /// (each `break true` from the retry loop). Consumer:
-    /// `handle_blobs_in_stable_storage_for_store` looks up by digest
-    /// when unpinning, computes the gap, records into the histogram.
+    /// Per-digest tonic-Ok timestamp + action-key side-channel.
+    /// Producer: `spawn_upload_to_remote` records on successful
+    /// per-digest upload (each `break true` from the retry loop).
+    /// Consumer: `handle_blobs_in_stable_storage_for_store` looks up
+    /// by digest when unpinning, computes the gap, records into the
+    /// per-digest histogram AND folds the gap into the per-action
+    /// accumulator keyed by the recorded `action_key`.
     ///
     /// CAPPED AT 100_000 (`TONIC_OK_TS_CACHE_CAPACITY`): bounded by
     /// moka's size-aware LRU. If the BIS chunk arrives after the entry
     /// is evicted (older than 10 minutes per `TONIC_OK_TS_CACHE_TTL`)
     /// no observation is recorded — acceptable; the queue-depth gauge
     /// and wake-to-send histogram already cover that pathology class.
-    tonic_ok_timestamps: Cache<DigestInfo, Instant>,
+    tonic_ok_timestamps: Cache<DigestInfo, (Instant, u64)>,
     /// Histogram of per-digest pin-release latency: `bis_ack_at -
     /// tonic_ok_at`. The headline Phase 0 metric.
     pin_release_latency: LatencyHistogram,
@@ -387,10 +389,17 @@ impl WorkerPhase0Metrics {
     }
 
     /// Producer: called from `spawn_upload_to_remote` after a successful
-    /// per-digest upload (tonic Ok). Stores the timestamp keyed by
-    /// digest so the BIS handler can compute the gap later.
-    pub fn record_tonic_ok(&self, digest: DigestInfo) {
-        self.tonic_ok_timestamps.insert(digest, Instant::now());
+    /// per-digest upload (tonic Ok). Stores the timestamp + the caller's
+    /// `action_key` keyed by digest, so the BIS handler can both compute
+    /// the per-digest gap AND fold the gap into the right action's
+    /// accumulator. The `action_key` is opaque (caller-chosen u64; the
+    /// upload spawn point uses an action-scoped fresh counter). Passing
+    /// `0` for `action_key` is fine — `record_bis_unpin` will still
+    /// record the per-digest histogram observation; only the per-action
+    /// aggregate is shared across digests with the same key.
+    pub fn record_tonic_ok(&self, digest: DigestInfo, action_key: u64) {
+        self.tonic_ok_timestamps
+            .insert(digest, (Instant::now(), action_key));
     }
 
     /// Producer: called from `spawn_upload_to_remote` when a digest
@@ -427,16 +436,24 @@ impl WorkerPhase0Metrics {
 
     /// Consumer: called from `handle_blobs_in_stable_storage_for_store`
     /// when unpinning a digest. Looks up the tonic-Ok timestamp,
-    /// computes the gap, records it. Returns the gap in ms if found
-    /// (so the caller can optionally fold into per-action stats);
-    /// returns `None` if the digest was not in the side-channel
-    /// (cache evicted, or the digest was a Bazel-source / non-worker
-    /// upload that didn't go through `spawn_upload_to_remote`).
+    /// computes the gap, records it AND folds the gap into the
+    /// per-action accumulator (if the recorded action_key is non-zero).
+    /// Returns the gap in ms if found (so the caller can optionally
+    /// log / publish it); returns `None` if the digest was not in the
+    /// side-channel (cache evicted, or the digest was a Bazel-source /
+    /// non-worker upload that didn't go through `spawn_upload_to_remote`).
     pub fn record_bis_unpin(&self, digest: &DigestInfo) -> Option<u64> {
-        let tonic_ok_at = self.tonic_ok_timestamps.get(digest)?;
+        let (tonic_ok_at, action_key) = self.tonic_ok_timestamps.get(digest)?;
         let gap = Instant::now().saturating_duration_since(tonic_ok_at);
         let gap_ms = u64::try_from(gap.as_millis()).unwrap_or(u64::MAX);
         self.pin_release_latency.observe(gap_ms);
+        // Fold the per-digest gap into the per-action accumulator. The
+        // caller commits the accumulator with `commit_action_pin_extension`
+        // once all the action's BIS-unpins have arrived (typically a few
+        // hundred ms after the last per-digest unpin under healthy load).
+        if action_key != 0 {
+            self.record_action_pin_extension(action_key, gap_ms);
+        }
         // Evict the entry once consumed; the BIS broadcast is one-shot
         // per digest under the producer protocol.
         self.tonic_ok_timestamps.invalidate(digest);
@@ -728,6 +745,51 @@ mod tests {
         assert_eq!(m.pin_release_latency.inf_bucket.load(Ordering::Relaxed), 0);
     }
 
+    /// Per-action accumulator fold: tonic-Ok with a non-zero action key
+    /// + BIS unpin folds the gap into the action's accumulator. Commit
+    /// emits the histogram observation, which the per-digest path does
+    /// NOT do on its own (verified by `tonic_ok_then_bis_unpin_records_gap`
+    /// only bumping `pin_release_latency`).
+    #[test]
+    fn tonic_ok_with_action_key_folds_into_accumulator() {
+        let m = WorkerPhase0Metrics::new();
+        let d1 = DigestInfo::try_new(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            1,
+        )
+        .unwrap();
+        let d2 = DigestInfo::try_new(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            2,
+        )
+        .unwrap();
+        let action_key = 0xCAFE_BABE;
+        m.record_tonic_ok(d1, action_key);
+        m.record_tonic_ok(d2, action_key);
+        // BIS unpins fold gaps into the action accumulator.
+        let _ = m.record_bis_unpin(&d1);
+        let _ = m.record_bis_unpin(&d2);
+        // No commit yet → action histograms still empty.
+        assert_eq!(
+            m.action_total_pin_extension
+                .inf_bucket
+                .load(Ordering::Relaxed),
+            0
+        );
+        // Commit emits the histograms.
+        m.commit_action_pin_extension(action_key);
+        assert_eq!(
+            m.action_total_pin_extension
+                .inf_bucket
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            m.action_max_pin_extension.inf_bucket.load(Ordering::Relaxed),
+            1
+        );
+    }
+
     /// Producer + consumer round-trip: record a tonic-Ok, then a BIS
     /// unpin for the same digest, observe a non-zero gap recorded.
     #[test]
@@ -738,7 +800,7 @@ mod tests {
             42,
         )
         .unwrap();
-        m.record_tonic_ok(digest);
+        m.record_tonic_ok(digest, 0);
         // Tiny spin so the gap is non-zero. Avoid sleep — synchronization
         // is via the moka cache; the gap need only be measurable, not real.
         for _ in 0..10_000 {
@@ -942,7 +1004,7 @@ mod tests {
             100,
         )
         .unwrap();
-        worker.record_tonic_ok(digest);
+        worker.record_tonic_ok(digest, 0);
         let _ = worker.record_bis_unpin(&digest);
         worker.record_pin_acquired(4096);
         let arr = worker.record_bis_chunk_arrival();

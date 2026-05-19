@@ -44,6 +44,7 @@ use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::common::{DigestInfo, fs};
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
+use nativelink_util::phase0_metrics::worker_phase0_metrics;
 use nativelink_util::shutdown_guard::ShutdownGuard;
 use nativelink_util::store_trait::{
     ItemCallback, Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo,
@@ -1119,6 +1120,14 @@ pub fn handle_blobs_in_stable_storage_for_store(
         let fs_store = &state.fs_store;
         for digest in &acked_digests {
             fs_store.unpin_digest(digest);
+            // #547 Phase 0 instrumentation: record the pin-release
+            // latency for any digest that went through
+            // spawn_upload_to_remote on this worker (the side-channel
+            // returns None for digests that didn't, which includes
+            // Bazel-source uploads landing here only via the receive-
+            // side mirror path — for those the metric is correctly
+            // skipped). Pure observability; no behavior change.
+            let _gap_ms = worker_phase0_metrics().record_bis_unpin(digest);
         }
         if let Some(cas_store) = cas_store {
             cas_store.ack_digests(&acked_digests);
@@ -2225,6 +2234,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                     );
                                 }
                                 Some(chunked_message::Payload::BlobsInStableStorage(chunk)) => {
+                                    // #547 Phase 0 instrumentation: capture
+                                    // the arrival timestamp at the earliest
+                                    // moment after the chunk is matched from
+                                    // the dispatch arm. The commit fires
+                                    // immediately before handle_bis_chunk so
+                                    // the recorded gap names the worker-side
+                                    // dispatcher contribution only (NOT the
+                                    // handler runtime). Pure observability.
+                                    let _phase0_bis_arrival_ts =
+                                        worker_phase0_metrics().record_bis_chunk_arrival();
                                     let digest_count = chunk.digests.len();
                                     let broadcast_id = chunk.broadcast_id;
                                     let sequence = chunk.sequence;
@@ -2240,6 +2259,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         let cas_store_for_ack =
                                             self.running_actions_manager.get_cas_store();
                                         let mut grpc_client = self.grpc_client.clone();
+                                        // Commit the arrival→handler timer
+                                        // immediately before invoking the
+                                        // handler so the gap matches the
+                                        // dispatcher contribution.
+                                        worker_phase0_metrics()
+                                            .commit_arrival_to_handler(_phase0_bis_arrival_ts);
                                         // Send the ack inline so the resend
                                         // buffer is released as soon as the
                                         // unpins land. The async send is
