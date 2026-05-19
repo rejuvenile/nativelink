@@ -1169,6 +1169,62 @@ impl Drop for LoaderGuard {
     }
 }
 
+/// Shared low-level helper for pushing digests onto the BIS
+/// stable-digests queue and bumping the Phase 0 pusher-invoke metric
+/// for each.
+///
+/// Free function (not a method on `FastSlowStore`) so spawn contexts
+/// that own cloned `Arc<Mutex<Vec<DigestInfo>>>` and `Arc<Notify>`
+/// (e.g. the background tokio::spawn inside the success arms of
+/// `FastSlowStore::update` / `FastSlowStore::update_oneshot`) can call
+/// it without re-capturing `Arc<Self>`. (Line-number refs intentionally
+/// omitted — line numbers drift; see #249, #347. Use function-name +
+/// grep to find call-sites.)
+///
+/// # #554 metric-completeness invariant
+///
+/// EVERY production push into `stable_digests` MUST route through this
+/// helper (directly or via the `stable_digests_pusher` closure, the
+/// `FastSlowStore::push_stable_digests` method, or the `mark_stable`
+/// override that delegates to it). Direct `stable_digests.lock().push(...)`
+/// or `extend_from_slice(...)` calls bypass the metric and re-open the
+/// undercount gap that #554 closed.
+///
+/// Per-digest metric bump (not per-batch) so the counter matches the
+/// queue-insert count exactly — the BIS broadcast loop dwell-time
+/// histogram (`server_bis_broadcast_queue_latency`) likewise records
+/// one observation per digest at the consumer side.
+///
+/// # Lock discipline
+///
+/// Single `parking_lot::Mutex` acquisition for `extend_from_slice`,
+/// followed by one `Notify::notify_one`. Both are non-blocking.
+/// Empty slice is a no-op (early return) so callers don't need to
+/// guard their batches.
+fn push_stable_digests_via_arcs(
+    stable_digests: &Arc<Mutex<Vec<DigestInfo>>>,
+    stable_notify: &Arc<Notify>,
+    digests: &[DigestInfo],
+) {
+    if digests.is_empty() {
+        return;
+    }
+    stable_digests.lock().extend_from_slice(digests);
+    stable_notify.notify_one();
+    // #547 Phase 0 instrumentation (#554 coverage expansion): record
+    // a pusher invocation per digest so the
+    // `server_stable_digests_pusher_invoke_count` counter reflects
+    // EVERY push into the BIS queue regardless of arm (chunked-commit,
+    // legacy update/update_oneshot success, V3 self-retry, mark_stable).
+    // Pre-#554 only the chunked-commit closure bumped the counter; the
+    // direct-push sites were silent. Per-digest bumps keep the counter
+    // equal to the per-digest dwell-time histogram count.
+    let metrics = server_phase0_metrics();
+    for digest in digests {
+        metrics.record_pusher_invoke(*digest);
+    }
+}
+
 impl FastSlowStore {
     pub fn new(spec: &FastSlowSpec, fast_store: Store, slow_store: Store) -> Arc<Self> {
         let failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>> =
@@ -1395,6 +1451,38 @@ impl FastSlowStore {
         self.in_flight_empty_notify.clone()
     }
 
+    /// Shared helper: push the given digests onto the stable-digests
+    /// queue, wake the BIS broadcast loop, and bump the Phase 0
+    /// `server_stable_digests_pusher_invoke_count` metric ONCE PER
+    /// DIGEST.
+    ///
+    /// Convenience method-form of [`push_stable_digests_via_arcs`] for
+    /// callers that hold an `&self`. Spawn contexts that own cloned
+    /// Arcs (the legacy success arms inside `FastSlowStore::update` and
+    /// `FastSlowStore::update_oneshot`) call the free function directly
+    /// so the closure doesn't need to capture `Arc<Self>`.
+    ///
+    /// Producers that route through this helper (or its closure/arc
+    /// variants) and therefore bump the metric:
+    ///   - `stable_digests_pusher` closure → chunked-write dispatcher
+    ///     commit-success path.
+    ///   - `try_self_retry_slow_write` success arm (V3 self-retry after
+    ///     a failed slow write — #335 liveness fix).
+    ///   - Background spawn inside `FastSlowStore::update`'s success
+    ///     arm (#212 streaming path).
+    ///   - Background spawn inside `FastSlowStore::update_oneshot`'s
+    ///     success arm (small-blob path).
+    ///   - `StoreDriver::mark_stable` override (BlobsAvailable handler
+    ///     in `worker_api_server.rs`).
+    ///
+    /// Lock acquisition: parking_lot::Mutex on `stable_digests` (single
+    /// `extend_from_slice`) + one `notify_one`. Never holds across
+    /// `.await`. Empty slice is a no-op (early return) so callers don't
+    /// need to guard.
+    fn push_stable_digests(&self, digests: &[DigestInfo]) {
+        push_stable_digests_via_arcs(&self.stable_digests, &self.stable_notify, digests);
+    }
+
     /// Returns a closure that, when invoked with a digest, pushes it
     /// onto the stable-digests queue and wakes the BIS broadcast loop.
     ///
@@ -1407,6 +1495,13 @@ impl FastSlowStore {
     /// (the production-incident-2026-05-06 mechanism that drove the
     /// MemoryStore to its 48 GB cap and produced ResourceExhausted).
     ///
+    /// The closure delegates to [`push_stable_digests_via_arcs`] so the
+    /// metric (`server_stable_digests_pusher_invoke_count`) increments
+    /// for every push regardless of arm (chunked-commit dispatcher
+    /// closure, legacy `update`/`update_oneshot` success arms,
+    /// `try_self_retry_slow_write` success arm, `mark_stable`). See
+    /// the helper for the full list of producers.
+    ///
     /// Lock acquisition: parking_lot::Mutex, single push + one
     /// notify_one. Never holds across `.await` (the closure is
     /// synchronous). Calling more than once for the same digest is
@@ -1418,13 +1513,7 @@ impl FastSlowStore {
         let stable_digests = self.stable_digests.clone();
         let stable_notify = self.stable_notify.clone();
         Arc::new(move |digest: DigestInfo| {
-            stable_digests.lock().push(digest);
-            stable_notify.notify_one();
-            // #547 Phase 0 instrumentation: record the pusher invocation
-            // so operators can confirm the server commit path is firing
-            // the BIS pipeline AND so the BIS broadcast loop can compute
-            // per-digest queue dwell time. Pure observability.
-            server_phase0_metrics().record_pusher_invoke(digest);
+            push_stable_digests_via_arcs(&stable_digests, &stable_notify, &[digest]);
         })
     }
 
@@ -2610,11 +2699,13 @@ impl FastSlowStore {
             }
         }
         // Success: clear from `failed_slow_writes` and notify BIS.
-        // Mirrors the legacy success path at
-        // `:3972-3975` (background slow-write Ok arm).
+        // Mirrors the legacy success path in the background slow-write
+        // Ok arm inside `FastSlowStore::update`. Routes through
+        // `push_stable_digests` so #547 Phase 0
+        // `server_stable_digests_pusher_invoke_count` reflects the
+        // V3-self-retry contribution to BIS traffic (#554).
         self.failed_slow_writes.lock().remove(&digest);
-        self.stable_digests.lock().push(digest);
-        self.stable_notify.notify_one();
+        self.push_stable_digests(&[digest]);
         info!(
             ?digest,
             bytes = bytes_len,
@@ -5241,8 +5332,16 @@ impl StoreDriver for FastSlowStore {
             match &result {
                 Ok(()) => {
                     if let StoreKey::Digest(digest) = &key_for_bg {
-                        stable_digests_ref.lock().push(*digest);
-                        stable_notify_ref.notify_one();
+                        // #554: route through the shared helper so
+                        // `server_stable_digests_pusher_invoke_count`
+                        // increments for this arm. Pre-#554 the direct
+                        // `stable_digests.lock().push` here bypassed the
+                        // Phase 0 metric (undercount of BIS traffic).
+                        push_stable_digests_via_arcs(
+                            &stable_digests_ref,
+                            &stable_notify_ref,
+                            &[*digest],
+                        );
                     }
                     debug!(
                         key = ?key_for_bg,
@@ -5495,8 +5594,16 @@ impl StoreDriver for FastSlowStore {
             match &result {
                 Ok(()) => {
                     if let StoreKey::Digest(digest) = &key_for_bg {
-                        stable_digests_ref.lock().push(*digest);
-                        stable_notify_ref.notify_one();
+                        // #554: route through the shared helper so
+                        // `server_stable_digests_pusher_invoke_count`
+                        // increments for this arm. See companion site
+                        // inside the spawn body of `FastSlowStore::update`'s
+                        // success arm for the full rationale.
+                        push_stable_digests_via_arcs(
+                            &stable_digests_ref,
+                            &stable_notify_ref,
+                            &[*digest],
+                        );
                     }
                     debug!(
                         key = ?key_for_bg,
@@ -6974,15 +7081,13 @@ impl StoreDriver for FastSlowStore {
     /// (durable under pin v2) would leak forever for those paths.
     /// Idempotent: the broadcast loop dedups downstream and the
     /// worker's `unpin_digest` is itself idempotent.
+    ///
+    /// #554: delegates to [`Self::push_stable_digests`] so the BlobsAvailable
+    /// path contributes to `server_stable_digests_pusher_invoke_count`
+    /// (one bump per supplied digest). Pre-#554 the direct
+    /// `extend_from_slice` here bypassed the Phase 0 metric.
     fn mark_stable(&self, digests: &[DigestInfo]) {
-        if digests.is_empty() {
-            return;
-        }
-        {
-            let mut guard = self.stable_digests.lock();
-            guard.extend_from_slice(digests);
-        }
-        self.stable_notify.notify_one();
+        self.push_stable_digests(digests);
     }
 
     fn drain_failed_digests(&self) -> Vec<DigestInfo> {

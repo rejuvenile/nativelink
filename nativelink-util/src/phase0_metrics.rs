@@ -39,14 +39,16 @@
 //! - **`worker_concurrent_pinned_bytes`** (gauge): point-in-time bytes
 //!   held in worker FilesystemStore pins from chunked-upload commits.
 //!   Informs Phase 2 (#549) pin_budget cap selection.
-//! - **`server_stable_digests_pusher_invoke_via_commit_path_count` +
+//! - **`server_stable_digests_pusher_invoke_count` +
 //!   `_last_at_unix_ms`**: counter + timestamp gauge so operators can
-//!   confirm the server-side commit path is actually firing the BIS
-//!   pusher (and how recently). The `_via_commit_path_` infix names
-//!   the coverage limit per CF2 — this is NOT total BIS broadcast
-//!   traffic; three direct-push sites in `fast_slow_store.rs` bypass
-//!   the `stable_digests_pusher` closure (see the `pusher_invoke_count`
-//!   field doc on `ServerPhase0Metrics`).
+//!   confirm BIS-queue producers are actually firing (and how recently).
+//!   Counts EVERY push into the FSS `stable_digests` queue — chunked-
+//!   commit dispatcher, legacy `update`/`update_oneshot` success arms,
+//!   V3 self-retry success, and `mark_stable` from BlobsAvailable. The
+//!   #554 metric-coverage expansion routed every direct-push site
+//!   through the shared `push_stable_digests` helper so the counter
+//!   matches BIS broadcast traffic (1:1 with the per-digest
+//!   `server_bis_broadcast_queue_latency` observations).
 //! - **`server_bis_broadcast_loop_wake_to_send_ms`** (histogram, ms): gap
 //!   between BIS pipeline loop wake (notify or 500ms tick) and the
 //!   `broadcast_blobs_in_stable_storage_chunked` call returning. Names
@@ -622,28 +624,49 @@ impl MetricsComponent for WorkerPhase0Metrics {
 /// `server_phase0_metrics()` accessor.
 #[derive(Debug)]
 pub struct ServerPhase0Metrics {
-    /// Counter: invocations of `stable_digests_pusher` (the commit-path
-    /// → BIS pipeline entry point). Non-zero confirms the commit path
-    /// is firing the pusher.
+    /// Counter: pushes into the FSS `stable_digests` BIS queue
+    /// across ALL production producers. Non-zero confirms BIS traffic
+    /// is flowing.
     ///
-    /// **Coverage limit (#547 fix-up CF2).** This counter is bumped
-    /// ONLY by the `stable_digests_pusher` closure at
-    /// `fast_slow_store.rs:1420-1428`. Three other production sites
-    /// push directly to `stable_digests.lock()` without routing
-    /// through `stable_digests_pusher` and therefore do NOT bump this
-    /// counter (and do NOT populate `pusher_timestamps`):
-    ///   - `fast_slow_store.rs:2616` `try_self_retry_slow_write`
-    ///     success arm (V3 self-retry after a failed slow write).
-    ///   - `fast_slow_store.rs:5244` and `:5498` failed-write drain
-    ///     re-broadcast paths.
-    /// Per-digest `bis_broadcast_queue_latency` will silently drop
-    /// samples for those digests. Operators reading this counter
-    /// should treat it as "commit-path pusher invocations" — not as
-    /// total BIS broadcast traffic. (`server_bis_broadcast_queue_depth`
-    /// reflects the FULL queue regardless of insert site.) If a
-    /// future audit shows the direct-push sites are non-negligible,
-    /// either route them through `stable_digests_pusher` or add a
-    /// separate counter for the direct-push paths.
+    /// **#554 coverage expansion (SEMANTIC SCOPE CHANGE).** Pre-#554
+    /// this counter was bumped ONLY by the `stable_digests_pusher`
+    /// closure (chunked-commit dispatcher) and was named
+    /// `_via_commit_path_count` to flag the undercount. The #554
+    /// refactor routed every direct-push site through the shared
+    /// `push_stable_digests_via_arcs` helper and dropped the
+    /// misleading suffix. Producers now ALL bump this counter (each
+    /// with one increment per digest pushed):
+    ///   - `FastSlowStore::stable_digests_pusher` closure →
+    ///     chunked-commit dispatcher (commit-path activity, was the
+    ///     pre-#554 sole producer).
+    ///   - `FastSlowStore::try_self_retry_slow_write` success arm
+    ///     (V3 self-retry after a failed slow write).
+    ///   - Background spawn inside `FastSlowStore::update`'s success
+    ///     arm (streaming path).
+    ///   - Background spawn inside `FastSlowStore::update_oneshot`'s
+    ///     success arm (small-blob path).
+    ///   - `FastSlowStore::mark_stable` (`StoreDriver` override called
+    ///     by the worker API server's BlobsAvailable handler in
+    ///     `worker_api_server.rs`).
+    ///
+    /// **Operator interpretation change post-#554.** The counter's
+    /// dominant contributor switches from "Bazel commit pipeline
+    /// activity" (pre-#554: bytes Bazel just uploaded) to "BlobsAvailable
+    /// cadence" (post-#554: invoked on every worker BlobsAvailable
+    /// tick — see `worker_api_server.rs` — per worker per present
+    /// digest). Order-of-magnitude estimate: N workers × ~10 Hz × ~100
+    /// digests/tick → ~10K bumps/sec steady-state, dwarfing the
+    /// commit-path contribution. Operators previously alerting on the
+    /// counter as a Bazel-activity proxy MUST re-baseline against the
+    /// BlobsAvailable cadence; the counter is now most useful as a
+    /// 1:1 cross-check against `server_bis_broadcast_queue_latency`
+    /// histogram count.
+    ///
+    /// Reviewers verifying #554's metric-completeness invariant
+    /// (`server_bis_broadcast_queue_depth` matches the per-digest
+    /// dwell-time histogram count) MUST grep for any new
+    /// `stable_digests.lock().push` / `extend_from_slice` calls outside
+    /// the shared helper — those would re-open the undercount gap.
     pusher_invoke_count: AtomicU64,
     /// Unix-ms timestamp of the most recent pusher invocation. Operators
     /// can compare against `wall_clock_now()` to detect a stalled commit
@@ -664,14 +687,48 @@ pub struct ServerPhase0Metrics {
     /// be visible NOW.
     bis_broadcast_queue_depth: AtomicU64,
     /// Per-digest pusher-invoke-timestamp side channel for queue
-    /// dwell measurement. Producer: `stable_digests_pusher` records
-    /// timestamp; consumer: the BIS broadcast loop computes the gap
-    /// when each digest is broadcast.
+    /// dwell measurement. Producer: every push into FSS `stable_digests`
+    /// records a timestamp via `record_pusher_invoke` (routed through
+    /// the `push_stable_digests_via_arcs` helper since #554); consumer:
+    /// the BIS broadcast loop computes the gap when each digest is
+    /// broadcast.
     ///
-    /// CAPPED AT 100_000: same cap shape and rationale as
-    /// `WorkerPhase0Metrics::tonic_ok_timestamps`; bounded LRU
-    /// prevents OOM under digest-storm scenarios.
+    /// CAPPED AT 100_000 (`TONIC_OK_TS_CACHE_CAPACITY`) / 600 s TTL
+    /// (`TONIC_OK_TS_CACHE_TTL`): bounded moka LRU; same cap shape as
+    /// `WorkerPhase0Metrics::tonic_ok_timestamps`; prevents OOM under
+    /// digest-storm scenarios.
+    ///
+    /// **#554 cap re-justification.** Pre-#554 the cap was sized for
+    /// chunked-commit-only producer cadence (worst-case ~commit-rate ×
+    /// 600 s, comfortably under 100K). Post-#554 the BlobsAvailable
+    /// path also inserts; back-of-envelope:
+    /// 10 workers × ~10 Hz × ~100-1000 present digests per tick
+    /// → 10K-100K inserts/sec; at the 100-digest end the cap fills in
+    /// ~10 s and the moka LRU evicts entries that the broadcast loop
+    /// may still want. Eviction-under-window appears as a SILENT
+    /// histogram undercount (`record_broadcast` skips digests whose
+    /// timestamp `get` returned `None`).
+    ///
+    /// `pusher_timestamp_miss_count` (below) makes the silent drop
+    /// observable: every `record_broadcast` miss bumps the counter.
+    /// Operators monitoring `record_broadcast` miss rate vs. invoke
+    /// count can detect cap-saturation under burst without growing
+    /// the cap (which would raise the steady-state memory floor for
+    /// all deployments).
     pusher_timestamps: Cache<DigestInfo, Instant>,
+    /// Counter: `record_broadcast` lookups that found NO matching
+    /// pusher-invoke timestamp. Non-zero indicates the
+    /// `pusher_timestamps` LRU cache evicted a timestamp before the
+    /// BIS broadcast loop drained the digest (cap-saturation under
+    /// burst). Under-counts the dwell-time histogram by this number.
+    ///
+    /// #554 follow-up: the BlobsAvailable producer arm raised the
+    /// steady-state insert rate from "commit cadence" to
+    /// "N workers × 10 Hz × N digests/tick"; this counter surfaces
+    /// the resulting cap pressure as a first-class metric so
+    /// operators can decide whether to grow `TONIC_OK_TS_CACHE_CAPACITY`
+    /// rather than silently lose observations.
+    pusher_timestamp_miss_count: AtomicU64,
 }
 
 impl ServerPhase0Metrics {
@@ -686,11 +743,26 @@ impl ServerPhase0Metrics {
                 .max_capacity(TONIC_OK_TS_CACHE_CAPACITY)
                 .time_to_live(TONIC_OK_TS_CACHE_TTL)
                 .build(),
+            pusher_timestamp_miss_count: AtomicU64::new(0),
         }
     }
 
-    /// Producer: called inside `stable_digests_pusher` when a digest
-    /// is pushed into the BIS queue.
+    /// Snapshot the current value of `pusher_invoke_count`. Provided
+    /// for integration tests asserting on counter deltas (the field
+    /// itself is private to keep producers honest — only
+    /// `record_pusher_invoke` should mutate it). Singleton state is
+    /// process-global so tests MUST snapshot before/after and assert
+    /// on the delta, not the absolute value.
+    #[must_use]
+    pub fn pusher_invoke_count_for_test(&self) -> u64 {
+        self.pusher_invoke_count.load(Ordering::Relaxed)
+    }
+
+    /// Producer: called inside `push_stable_digests_via_arcs` (the
+    /// shared FSS BIS-push helper) for every digest pushed onto the
+    /// `stable_digests` queue. #554 routed every direct-push site
+    /// through the helper so this counter reflects ALL BIS-queue
+    /// inserts, not just the chunked-commit closure path.
     pub fn record_pusher_invoke(&self, digest: DigestInfo) {
         self.pusher_invoke_count.fetch_add(1, Ordering::Relaxed);
         let now_ms = SystemTime::now()
@@ -732,8 +804,29 @@ impl ServerPhase0Metrics {
                 let gap_ms = u64::try_from(gap.as_millis()).unwrap_or(u64::MAX);
                 self.bis_broadcast_queue_latency.observe(gap_ms);
                 self.pusher_timestamps.invalidate(digest);
+            } else {
+                // #554 follow-up: surface silent cap-saturation. The
+                // `pusher_timestamps` moka LRU may have evicted the
+                // entry between `record_pusher_invoke` and this drain
+                // (especially under BlobsAvailable burst — see field
+                // doc). Bumping a counter makes the under-count
+                // observable to operators without growing the cap.
+                // MUTATION-TEST: comment out the next two lines and
+                // `broadcast_without_prior_invoke_bumps_miss_count`
+                // red-fails with the bespoke "#554 follow-up:" message.
+                self.pusher_timestamp_miss_count
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Snapshot the current value of `pusher_timestamp_miss_count`.
+    /// Test-only accessor (the field is private); singleton state is
+    /// process-global so tests MUST snapshot before/after and assert
+    /// on the delta.
+    #[must_use]
+    pub fn pusher_timestamp_miss_count_for_test(&self) -> u64 {
+        self.pusher_timestamp_miss_count.load(Ordering::Relaxed)
     }
 }
 
@@ -746,17 +839,18 @@ impl MetricsComponent for ServerPhase0Metrics {
         let invokes = self.pusher_invoke_count.load(Ordering::Relaxed);
         let last_at = self.pusher_last_at_unix_ms.load(Ordering::Relaxed);
         let depth = self.bis_broadcast_queue_depth.load(Ordering::Relaxed);
+        let ts_misses = self.pusher_timestamp_miss_count.load(Ordering::Relaxed);
         nativelink_metric::publish!(
-            "server_stable_digests_pusher_invoke_via_commit_path_count",
+            "server_stable_digests_pusher_invoke_count",
             &invokes,
             nativelink_metric::MetricKind::Counter,
-            "#547 Phase 0 (CF2): stable_digests pushed via the chunked-v2 commit path (stable_digests_pusher closure) only; direct push paths from failed_writes_drain (fast_slow_store.rs:2616 / :5244 / :5498) bypass this counter. Non-zero confirms commit path is firing; this is NOT total BIS broadcast traffic."
+            "#547 Phase 0 (#554 expansion): stable_digests pushes across ALL FSS BIS-queue producers (chunked-commit dispatcher, legacy update/update_oneshot success arms, V3 self-retry, mark_stable from BlobsAvailable). One increment per digest pushed. Reflects full BIS broadcast traffic (1:1 with server_bis_broadcast_queue_latency observations). Pre-#554 this was named _via_commit_path_count and only covered the chunked-commit closure; rename + helper-routing dropped the misleading suffix."
         );
         nativelink_metric::publish!(
             "server_stable_digests_pusher_last_at_unix_ms",
             &last_at,
             nativelink_metric::MetricKind::Default,
-            "#547 Phase 0: SystemTime-derived unix-ms timestamp of most recent stable_digests_pusher invocation (commit-path only — see _via_commit_path_count for coverage limits); zero means pusher has never fired. Wall-clock source: NTP-step backward can move this gauge backward; operators alerting on monotonic increase should additionally cross-check the _count counter (monotonic) before paging on a step."
+            "#547 Phase 0 (#554 expansion): SystemTime-derived unix-ms timestamp of most recent stable_digests push (any producer arm via push_stable_digests_via_arcs); zero means no push has ever fired. Wall-clock source: NTP-step backward can move this gauge backward; operators alerting on monotonic increase should additionally cross-check the _count counter (monotonic) before paging on a step."
         );
         nativelink_metric::publish!(
             "server_bis_broadcast_queue_depth",
@@ -772,6 +866,12 @@ impl MetricsComponent for ServerPhase0Metrics {
             "server_bis_broadcast_queue_latency",
             "#547 Phase 0: per-digest BIS-queue dwell time (broadcast_send_at - pusher_invoke_at); end-to-end server-side commit→broadcast contribution"
         )?;
+        nativelink_metric::publish!(
+            "server_stable_digests_pusher_timestamp_miss_count",
+            &ts_misses,
+            nativelink_metric::MetricKind::Counter,
+            "#554 follow-up: count of record_broadcast lookups that found NO matching pusher-invoke timestamp (pusher_timestamps moka LRU evicted the entry before drain). Non-zero indicates cap-saturation under burst, and means server_bis_broadcast_queue_latency is under-counted by this many observations. Sized for chunked-commit-only cadence pre-#554; BlobsAvailable cadence post-#554 can saturate at high digest-counts-per-tick. Operators monitoring miss-rate / pusher_invoke_count > a few % should consider raising TONIC_OK_TS_CACHE_CAPACITY (trade-off: steady-state memory floor)."
+        );
         Ok(MetricPublishKnownKindData::Component)
     }
 }
@@ -1281,6 +1381,70 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+        // Paired invoke+broadcast = no miss.
+        assert_eq!(
+            m.pusher_timestamp_miss_count.load(Ordering::Relaxed),
+            0,
+            "#554 follow-up: paired record_pusher_invoke + record_broadcast \
+             must NOT bump the miss-count"
+        );
+    }
+
+    /// #554 follow-up: `record_broadcast` for a digest that has NO
+    /// matching `record_pusher_invoke` (simulating moka LRU eviction
+    /// between invoke and drain) must bump
+    /// `pusher_timestamp_miss_count` AND must NOT record a dwell-time
+    /// observation (we don't fabricate a zero gap). One miss per absent
+    /// digest in the batch.
+    ///
+    /// Mutation step: comment out the `pusher_timestamp_miss_count
+    /// .fetch_add(1, Ordering::Relaxed)` call in `record_broadcast`.
+    /// This test must red-fail with the bespoke "#554 follow-up:" message.
+    #[test]
+    fn broadcast_without_prior_invoke_bumps_miss_count() {
+        let m = ServerPhase0Metrics::new();
+        let d_present = DigestInfo::try_new(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            1,
+        )
+        .unwrap();
+        let d_evicted = DigestInfo::try_new(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            2,
+        )
+        .unwrap();
+        let d_evicted_2 = DigestInfo::try_new(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            3,
+        )
+        .unwrap();
+        // Only d_present has an invoke timestamp; the other two simulate
+        // post-eviction state. record_broadcast must bump miss-count by
+        // exactly 2 (one per absent digest).
+        m.record_pusher_invoke(d_present);
+        let before = m.pusher_timestamp_miss_count.load(Ordering::Relaxed);
+        m.record_broadcast(&[d_present, d_evicted, d_evicted_2], 0);
+        let after = m.pusher_timestamp_miss_count.load(Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            2,
+            "#554 follow-up: pusher_timestamp_miss_count must increment \
+             once per absent digest in record_broadcast (the
+             pusher_timestamps moka cache evicted the entry between \
+             invoke and drain — silent dwell-time under-count without \
+             this counter). Got before={before} after={after}, expected \
+             delta=2."
+        );
+        // Histogram must NOT have observations for the absent digests
+        // (only the one present digest).
+        assert_eq!(
+            m.bis_broadcast_queue_latency
+                .inf_bucket
+                .load(Ordering::Relaxed),
+            1,
+            "absent digests must NOT contribute fabricated zeros to the \
+             dwell-time histogram"
+        );
     }
 
     /// Server: wake-to-send timer records into the histogram.
@@ -1393,7 +1557,7 @@ mod tests {
         // metric, value separated by single space, terminated by
         // newline — matches the `nativelink_metric::publish!` macro's
         // emission shape and `render_prometheus`'s capture).
-        let assertions: [(&str, &str, &str); 13] = [
+        let assertions: [(&str, &str, &str); 14] = [
             // (line to find, metric short-name for error message, expected-state description)
             (
                 "phase0_worker_worker_pin_release_latency_after_tonic_ok_count 1\n",
@@ -1438,8 +1602,8 @@ mod tests {
                 "1 record_bis_chunk_arrival + commit_arrival_to_handler pair",
             ),
             (
-                "phase0_server_server_stable_digests_pusher_invoke_via_commit_path_count 1\n",
-                "pusher_invoke_via_commit_path count (CF2 rename)",
+                "phase0_server_server_stable_digests_pusher_invoke_count 1\n",
+                "pusher_invoke count (#554 rename: dropped via_commit_path infix)",
                 "1 record_pusher_invoke call",
             ),
             (
@@ -1456,6 +1620,11 @@ mod tests {
                 "phase0_server_server_bis_broadcast_queue_latency_count 1\n",
                 "bis_broadcast_queue_latency count",
                 "record_broadcast saw 1 digest with a matching pusher_invoke",
+            ),
+            (
+                "phase0_server_server_stable_digests_pusher_timestamp_miss_count 0\n",
+                "pusher_timestamp_miss_count (#554 follow-up)",
+                "record_broadcast was preceded by record_pusher_invoke for the same digest so the timestamp lookup succeeds; miss-count must stay at 0 when invoke and drain are paired",
             ),
             // pin_release_latency sum is timing-dependent (0-1ms typical
             // in isolation, occasionally up to hundreds of ms under
