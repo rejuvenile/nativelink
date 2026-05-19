@@ -2336,7 +2336,7 @@ mod cfg_not_tests {
     #[tokio::test]
     async fn cfg_not_branch_emits_disabled_placeholders() {
         let opts = RunOpts {
-            iters: 20,
+            iters: Some(20),
             filter: None,
             fast: false,
         };

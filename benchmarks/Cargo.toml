@@ -22,6 +22,20 @@ chunked_fast_slow = [
   "nativelink-service/test-utils",
   "nativelink-store/test-utils",
 ]
+# #538/#539: forwards the `bench-trace` feature into `nativelink-service`
+# and `nativelink-store` so the W3 chunked-v2 hot-path probes
+# (`_w3_probe_*_start = Instant::now()` + matching `info!` emits) fire
+# during bench runs. Default OFF; the standard `just bench-data-plane`
+# recipe does NOT enable this — production parity (no probes) is the
+# baseline. Enable for ad-hoc deep-dive runs:
+#   cargo run --release --bin data_plane_bench -p nativelink-benchmarks \
+#     --features chunked_fast_slow,bench-trace -- --filter w3
+# Verification: `strings target/release/data_plane_bench |
+#   grep -c 'w3_probe'` is 0 without the feature, >0 with.
+bench-trace = [
+  "nativelink-service/bench-trace",
+  "nativelink-store/bench-trace",
+]
 
 [dependencies]
 bytes = { version = "1.10.1", default-features = false }

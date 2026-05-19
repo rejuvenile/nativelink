@@ -77,7 +77,9 @@ use nativelink_util::common::DigestInfo;
 use nativelink_util::spawn_rate_probe::{record, SpawnSite};
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{debug, trace, warn};
+#[cfg(feature = "bench-trace")]
+use tracing::info;
+use tracing::{debug, warn};
 
 use crate::filesystem_store::digest_shard_prefix;
 
@@ -607,10 +609,23 @@ pub(crate) async fn write_chunk_at_offset(
     let total_inner_us = mutex_acquire_us + dispatch_us + pwrite_us + closure_to_resume_us;
     // W3 deep-trace probe: unconditional per-chunk stage-breakdown trace.
     // The existing `warn!` below only fires for the slow tail (>50ms);
-    // this `trace!` mirror is for every chunk so the deep-dive run can
-    // bucket EVERY chunk's stages, not just the outliers. Gated to
-    // trace! (compiled out in `release_max_level_info` builds).
-    trace!(
+    // this probe mirror is for every chunk so the deep-dive run can
+    // bucket EVERY chunk's stages, not just the outliers.
+    //
+    // #538/#539: `#[cfg]`-gated on `bench-trace` so the macro expansion
+    // does not survive in default / production builds. The probe uses
+    // `info!` rather than `trace!` because the workspace's
+    // `release_max_level_info` pin on `tracing` compile-eliminates
+    // `trace!`/`debug!` everywhere, which would silently swallow the
+    // probe when the bench is built with `--features bench-trace` (the
+    // whole point of which is for these probes to fire). Unlike the
+    // `_w3_probe_*_start` Instants in `chunked_write_handler_v2.rs`,
+    // the four stage-timing `*_us` locals here are load-bearing for
+    // the `>50_000`-µs `warn!` below, so they remain computed
+    // unconditionally — there is nothing to gate at the timing-read
+    // sites, only at the probe emission.
+    #[cfg(feature = "bench-trace")]
+    info!(
         target: "nativelink_store::chunked_filesystem::w3_probe",
         ?digest,
         chunk_offset,

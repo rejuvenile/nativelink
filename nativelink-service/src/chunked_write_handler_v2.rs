@@ -67,7 +67,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 use nativelink_error::{Code, Error, make_err, make_input_err};
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
@@ -305,13 +305,51 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         let mut chunk_iter_first = Some(first_chunk);
 
         loop {
+            // #540 probe: per-chunk tonic frame-recv seam. Brackets the
+            // server-side `Streaming::message().await` so deep-dive
+            // runs can attribute per-chunk wall-clock to "waiting on
+            // client" (h2 frame in-flight, congestion window) vs
+            // server-side stages (SHA-256, pwrite, ack-tx backpressure).
+            // Closes the #531 trace-coverage gap that left the W3
+            // bimodal investigation unable to discriminate "h2 frame
+            // stuck" from "commit-path stuck".
+            #[cfg(feature = "bench-trace")]
+            let _w3_probe_recv_start = std::time::Instant::now();
             let chunk_opt = if let Some(c) = chunk_iter_first.take() {
                 Some(c)
             } else {
                 match stream.message().await {
-                    Ok(Some(c)) => Some(c),
-                    Ok(None) => None,
+                    Ok(Some(c)) => {
+                        #[cfg(feature = "bench-trace")]
+                        info!(
+                            target: "nativelink_service::w3_probe",
+                            ?digest,
+                            elapsed_us = _w3_probe_recv_start.elapsed().as_micros() as u64,
+                            ok = true,
+                            "tonic_stream_message recv",
+                        );
+                        Some(c)
+                    }
+                    Ok(None) => {
+                        #[cfg(feature = "bench-trace")]
+                        info!(
+                            target: "nativelink_service::w3_probe",
+                            ?digest,
+                            elapsed_us = _w3_probe_recv_start.elapsed().as_micros() as u64,
+                            ok = true,
+                            "tonic_stream_message recv (eos)",
+                        );
+                        None
+                    }
                     Err(status) => {
+                        #[cfg(feature = "bench-trace")]
+                        info!(
+                            target: "nativelink_service::w3_probe",
+                            ?digest,
+                            elapsed_us = _w3_probe_recv_start.elapsed().as_micros() as u64,
+                            ok = false,
+                            "tonic_stream_message recv (err)",
+                        );
                         warn!(
                             target: "nativelink_service::chunked_write_handler_v2",
                             ?digest,
@@ -432,8 +470,20 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 }
             };
             let chunk_bytes_for_hash: Bytes = chunk.chunk_bytes.clone();
+            // #538/#539: probe block is `#[cfg]`-gated on the
+            // `bench-trace` feature. When OFF (the default, including
+            // production builds), neither the `Instant::now()` nor the
+            // `info!` macro expansion survive in the release binary —
+            // verified via `strings target/release/data_plane_bench |
+            // grep -c 'w3_probe' == 0`. When ON (bench deep-dive
+            // builds), the probe emits at `info!` level so the
+            // workspace's `release_max_level_info` pin on `tracing`
+            // does NOT silently compile the message back out (which
+            // is what would happen at `trace!` / `debug!`).
+            #[cfg(feature = "bench-trace")]
             let _w3_probe_sha_start = std::time::Instant::now();
-            trace!(
+            #[cfg(feature = "bench-trace")]
+            info!(
                 target: "nativelink_service::w3_probe",
                 chunk_offset,
                 chunk_bytes_len,
@@ -447,7 +497,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                     return;
                 }
             };
-            trace!(
+            #[cfg(feature = "bench-trace")]
+            info!(
                 target: "nativelink_service::w3_probe",
                 chunk_offset,
                 chunk_bytes_len,
@@ -470,8 +521,12 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             // pwrite the chunk via the FilesystemStore's chunked
             // adapter. Bytes is refcounted; the clone is cheap.
             let pwrite_bytes = chunk.chunk_bytes;
+            // #538/#539 probe: see compute_sha256 probe block above for
+            // the cfg-gating rationale.
+            #[cfg(feature = "bench-trace")]
             let _w3_probe_pwrite_start = std::time::Instant::now();
-            trace!(
+            #[cfg(feature = "bench-trace")]
+            info!(
                 target: "nativelink_service::w3_probe",
                 chunk_offset,
                 chunk_bytes_len,
@@ -481,7 +536,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 .filesystem_store_for_v2()
                 .write_chunk_at_offset(&digest, chunk_offset, pwrite_bytes)
                 .await;
-            trace!(
+            #[cfg(feature = "bench-trace")]
+            info!(
                 target: "nativelink_service::w3_probe",
                 chunk_offset,
                 chunk_bytes_len,
@@ -524,7 +580,24 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                     already_have_max_offset: 0,
                 })),
             };
+            // #540 probe: per-chunk tonic frame-send seam (ACCEPTED ack
+            // back to client). Wall-clock for `frame_tx.send().await`
+            // measures `ACK_CHANNEL_CAP` backpressure / `ReceiverStream`
+            // poll-rate / h2 write-window — orthogonal to the recv-side
+            // probe above. The two together let deep-dive runs separate
+            // client-uplink stall from server-downlink stall.
+            #[cfg(feature = "bench-trace")]
+            let _w3_probe_ack_send_start = std::time::Instant::now();
             let send_err = frame_tx.send(Ok(frame)).await.is_err();
+            #[cfg(feature = "bench-trace")]
+            info!(
+                target: "nativelink_service::w3_probe",
+                ?digest,
+                chunk_offset,
+                elapsed_us = _w3_probe_ack_send_start.elapsed().as_micros() as u64,
+                ok = !send_err,
+                "tonic_frame_send accepted_ack",
+            );
             if send_err && !matches!(resp, CommitResponsibility::RunCommit) {
                 // Client hung up AND we're not the commit-runner. Abort
                 // — race-state guard's Drop purges in-flight markers
@@ -682,7 +755,25 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             CommitResponsibility::AwaitCommit => {
                 // Some other writer is the commit-runner. Wait for the
                 // result via the race-state's Notify.
+                // #540 probe: commit-path wrapper seam. Brackets the
+                // `v2_await_commit_result` call so deep-dive runs can
+                // attribute sibling-writer wait time to the per-digest
+                // `Notify` wakeup latency (vs the commit-runner's own
+                // 3-stage `v2_run_commit_path` probes published above).
+                // Distinguishes "h2 frame stuck" (recv probe) from
+                // "commit-path stuck" (this probe) — the gap the #531
+                // probe wave left open per #540.
+                #[cfg(feature = "bench-trace")]
+                let _w3_probe_await_start = std::time::Instant::now();
                 let result = v2_await_commit_result(&race_state, digest, &metrics).await;
+                #[cfg(feature = "bench-trace")]
+                info!(
+                    target: "nativelink_service::w3_probe",
+                    ?digest,
+                    elapsed_us = _w3_probe_await_start.elapsed().as_micros() as u64,
+                    ok = result.is_ok(),
+                    "v2_await_commit_result",
+                );
 
                 // FIX-2 watchdog → force_remove. If the watchdog fired
                 // (DeadlineExceeded), the registry entry is wedged
@@ -755,8 +846,14 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // Stage 1: commit_to_holding (length validation + rename to
         // .holding). On length mismatch we return Err and the discard
         // path (caller-side) will GC the partial.
+        // #538/#539 probe: cfg-gated on `bench-trace`. See the
+        // compute_sha256 probe block in `run_v2_session` for the
+        // rationale (Instant + `info!` both compile-eliminated in the
+        // default / production build).
+        #[cfg(feature = "bench-trace")]
         let _w3_probe_commit_start = std::time::Instant::now();
-        trace!(
+        #[cfg(feature = "bench-trace")]
+        info!(
             target: "nativelink_service::w3_probe",
             ?digest,
             "commit_chunked_to_holding enter"
@@ -766,7 +863,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             .commit_chunked(digest, expected_size)
             .await
         {
-            trace!(
+            #[cfg(feature = "bench-trace")]
+            info!(
                 target: "nativelink_service::w3_probe",
                 ?digest,
                 elapsed_us = _w3_probe_commit_start.elapsed().as_micros() as u64,
@@ -780,7 +878,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        trace!(
+        #[cfg(feature = "bench-trace")]
+        info!(
             target: "nativelink_service::w3_probe",
             ?digest,
             elapsed_us = _w3_probe_commit_start.elapsed().as_micros() as u64,
@@ -790,15 +889,19 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
 
         // Stage 2: end-to-end hash verify against the .holding file.
         let holding_path = self.filesystem_store_for_v2().holding_content_path(digest);
+        // #538/#539 probe: cfg-gated; see Stage 1 block above.
+        #[cfg(feature = "bench-trace")]
         let _w3_probe_verify_start = std::time::Instant::now();
-        trace!(
+        #[cfg(feature = "bench-trace")]
+        info!(
             target: "nativelink_service::w3_probe",
             ?digest,
             "v2_verify_e2e_hash enter"
         );
         let verify_result =
             v2_verify_e2e_hash(&holding_path, digest, expected_size).await;
-        trace!(
+        #[cfg(feature = "bench-trace")]
+        info!(
             target: "nativelink_service::w3_probe",
             ?digest,
             elapsed_us = _w3_probe_verify_start.elapsed().as_micros() as u64,
@@ -821,14 +924,18 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
 
         // Stage 3: finalize_holding (rename .holding → canonical +
         // chmod + index insert).
+        // #538/#539 probe: cfg-gated; see Stage 1 block above.
+        #[cfg(feature = "bench-trace")]
         let _w3_probe_finalize_start = std::time::Instant::now();
-        trace!(
+        #[cfg(feature = "bench-trace")]
+        info!(
             target: "nativelink_service::w3_probe",
             ?digest,
             "finalize_holding enter"
         );
         let finalize_res = self.filesystem_store_for_v2().finalize_holding(digest).await;
-        trace!(
+        #[cfg(feature = "bench-trace")]
+        info!(
             target: "nativelink_service::w3_probe",
             ?digest,
             elapsed_us = _w3_probe_finalize_start.elapsed().as_micros() as u64,

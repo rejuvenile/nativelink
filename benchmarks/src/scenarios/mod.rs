@@ -61,9 +61,19 @@ pub const MIN_ITERS: u32 = 1;
 /// CLI-supplied options shared across scenarios.
 #[derive(Debug, Clone)]
 pub struct RunOpts {
-    /// Iterations per cell. Diff tooling rejects baselines with
-    /// `iters < 20`. CLI parse rejects `iters < MIN_ITERS`.
-    pub iters: u32,
+    /// Iterations per cell. `None` means "use the per-cell default"
+    /// (which may itself be a per-cell `iters_override`). `Some(N)`
+    /// means the operator explicitly passed `--iters N` and that value
+    /// wins over any per-cell default. Diff tooling rejects baselines
+    /// with `iters < 20`; CLI parse rejects `iters < MIN_ITERS`.
+    ///
+    /// #536: distinguishing "operator passed --iters" from "operator
+    /// accepted the bench-wide default of 20" is what lets per-cell
+    /// `iters_override` (e.g. the 16 MiB c=1 cell's `Some(50)`) take
+    /// effect; the previous `u32` shape with clap's `default_value_t = 20`
+    /// collapsed the two states so the override was silently ignored
+    /// (every `effective_iters(_)` call returned `self.iters = 20`).
+    pub iters: Option<u32>,
     /// If set, only run scenarios whose name matches this substring.
     pub filter: Option<String>,
     /// Reduce iters to `FAST_MODE_ITERS` so the full smoke suite finishes
@@ -75,17 +85,24 @@ pub struct RunOpts {
 impl RunOpts {
     /// Resolve the effective iter count for a cell.
     ///
-    /// - `--fast` collapses to `FAST_MODE_ITERS` regardless of the
-    ///   per-cell default; intentional, the run is self-check, NOT a
-    ///   diff anchor.
-    /// - `iters == 0` is forbidden by `Cli::parse`; if it slips in
-    ///   somehow we still return `MIN_ITERS` to prevent the downstream
-    ///   `from_samples` empty-vec panic.
+    /// - **Operator-supplied `--iters N` wins.** When `self.iters` is
+    ///   `Some(N)` (operator explicitly passed `--iters N`), `N` is
+    ///   honored (still subject to `--fast` clamp + `MIN_ITERS` floor).
+    /// - **Otherwise the per-cell default fires.** When `self.iters` is
+    ///   `None`, the `default` argument is used — this is where a cell's
+    ///   `iters_override` (e.g. W3 16 MiB c=1 = `Some(50)`) flows in via
+    ///   `opts.effective_iters(cell.iters_override.unwrap_or(20))`.
+    /// - **`--fast` collapses to `FAST_MODE_ITERS`** regardless of the
+    ///   above; intentional, the run is self-check, NOT a diff anchor.
+    /// - **Defensive floor:** `default == 0` or any other slip-through
+    ///   is clamped to `MIN_ITERS` to prevent the downstream
+    ///   `LatencyPercentiles::from_samples` empty-vec panic.
     pub fn effective_iters(&self, default: u32) -> u32 {
-        let base = if self.iters >= MIN_ITERS {
-            self.iters
-        } else {
-            default.max(MIN_ITERS)
+        let base = match self.iters {
+            Some(n) if n >= MIN_ITERS => n,
+            // `iters == Some(0)` is rejected by `parse_iters`; the
+            // unwrap_or() handles a hypothetical bypass safely.
+            Some(_) | None => default.max(MIN_ITERS),
         };
         if self.fast {
             base.min(FAST_MODE_ITERS).max(MIN_ITERS)
@@ -223,7 +240,7 @@ mod tests {
     #[test]
     fn run_opts_filter_matches_substring() {
         let opts = RunOpts {
-            iters: 0,
+            iters: None,
             filter: Some("w1".to_string()),
             fast: false,
         };
@@ -233,19 +250,19 @@ mod tests {
 
     #[test]
     fn run_opts_no_filter_matches_all() {
-        let opts = RunOpts { iters: 20, filter: None, fast: false };
+        let opts = RunOpts { iters: Some(20), filter: None, fast: false };
         assert!(opts.matches("anything"));
     }
 
     #[test]
     fn effective_iters_fast_caps_at_three() {
-        let opts = RunOpts { iters: 100, filter: None, fast: true };
+        let opts = RunOpts { iters: Some(100), filter: None, fast: true };
         assert_eq!(opts.effective_iters(20), FAST_MODE_ITERS);
     }
 
     #[test]
-    fn effective_iters_zero_uses_default() {
-        let opts = RunOpts { iters: 0, filter: None, fast: false };
+    fn effective_iters_none_uses_default() {
+        let opts = RunOpts { iters: None, filter: None, fast: false };
         assert_eq!(opts.effective_iters(42), 42);
     }
 
@@ -255,12 +272,52 @@ mod tests {
     /// Mutation: remove the `.max(MIN_ITERS)` in `effective_iters` —
     /// this test must red-fail with the floor-violation message.
     #[test]
-    fn effective_iters_zero_with_fast_floors_to_min_iters() {
-        let opts = RunOpts { iters: 0, filter: None, fast: true };
+    fn effective_iters_zero_default_with_fast_floors_to_min_iters() {
+        let opts = RunOpts { iters: None, filter: None, fast: true };
         assert!(
             opts.effective_iters(0) >= MIN_ITERS,
             "effective_iters MUST floor at MIN_ITERS; if it returns 0, the \
              downstream LatencyPercentiles::from_samples panics on empty input"
+        );
+    }
+
+    /// #536 regression: a per-cell `iters_override` (passed in as the
+    /// `default` arg) must take effect when the operator did NOT pass
+    /// `--iters` on the CLI. The prior shape (`iters: u32` with clap's
+    /// `default_value_t = 20`) made `self.iters` indistinguishable from
+    /// "operator-supplied 20"; `effective_iters(50)` returned 20 because
+    /// the `self.iters >= MIN_ITERS` branch always won.
+    ///
+    /// Mutation: rewrite the `Some(n) if n >= MIN_ITERS => n` arm to
+    /// `Some(n) => n` (drop the `MIN_ITERS` floor guard) — this test
+    /// must still pass; the discriminating test is
+    /// `iters_explicit_some_overrides_per_cell_default` below.
+    #[test]
+    fn effective_iters_iters_none_lets_per_cell_default_win() {
+        let opts = RunOpts { iters: None, filter: None, fast: false };
+        assert_eq!(
+            opts.effective_iters(50),
+            50,
+            "when --iters absent, per-cell default (e.g. iters_override) MUST fire"
+        );
+    }
+
+    /// #536 regression (the discriminating case): `Some(N)` on the CLI
+    /// overrides per-cell `iters_override`. This is the half of the
+    /// contract that lets operators force a single iter count across
+    /// the whole matrix for ad-hoc debugging.
+    ///
+    /// Mutation: rewrite `Some(n) if n >= MIN_ITERS => n` to
+    /// `Some(_) | None => default.max(MIN_ITERS)` (always take the
+    /// default) — this test must red-fail with the explicit-precedence
+    /// violation.
+    #[test]
+    fn effective_iters_iters_some_overrides_per_cell_default() {
+        let opts = RunOpts { iters: Some(7), filter: None, fast: false };
+        assert_eq!(
+            opts.effective_iters(50),
+            7,
+            "explicit --iters N MUST override per-cell iters_override (#536)"
         );
     }
 

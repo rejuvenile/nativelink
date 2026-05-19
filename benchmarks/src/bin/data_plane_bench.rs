@@ -99,11 +99,18 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
-    /// Iterations per cell. Default 20. Minimum `MIN_ITERS` (= 1) —
-    /// values < `MIN_ITERS` are rejected at parse time to defend
-    /// against `--iters 0 --fast` ending in an empty-vec panic.
-    #[arg(long, default_value_t = 20, value_parser = parse_iters)]
-    iters: u32,
+    /// Iterations per cell. **Absent flag = per-cell defaults apply**
+    /// (W3's 16 MiB c=1 uses `iters_override = 50`, other cells fall
+    /// back to the scenario-level default such as 20). Passing
+    /// `--iters N` forces N across every cell regardless of override
+    /// (subject to the runtime pool-memory guards in `chunked_v2`).
+    /// Minimum `MIN_ITERS` (= 1) — values < `MIN_ITERS` are rejected at
+    /// parse time to defend against `--iters 0 --fast` ending in an
+    /// empty-vec panic. #536: the prior shape (`default_value_t = 20`)
+    /// silently disabled per-cell `iters_override` because the absent
+    /// flag was indistinguishable from `--iters 20`.
+    #[arg(long, value_parser = parse_iters)]
+    iters: Option<u32>,
 
     /// Substring filter — only run scenarios whose name contains this.
     #[arg(long)]

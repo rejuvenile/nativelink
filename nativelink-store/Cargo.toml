@@ -141,6 +141,13 @@ test-utils = []
 # `WriteChunked` RPC, and the FilesystemStore `pwrite`-at-offset APIs.
 # Default: OFF.
 chunked_fast_slow = []
+# #538/#539: forwards the `bench-trace` feature into the chunked
+# filesystem adapter so the per-chunk stage-breakdown `info!` probe
+# fires during bench runs. Default OFF; production builds (which do
+# not enable this flag) compile the probe out entirely. See
+# `nativelink-service`'s `bench-trace` feature for the operator-facing
+# doc.
+bench-trace = []
 # Tests that drive a real `valkey-server` / `redis-server` subprocess to
 # exercise the keyspace-notification dispatch path end-to-end (CONFIG SET
 # notify-keyspace-events + PSUBSCRIBE __keyevent@<db>__:* + DEL/PEXPIRE

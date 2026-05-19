@@ -91,6 +91,22 @@ test-utils = ["nativelink-store/test-utils"]
 # `sha2` (used by the per-chunk SHA-256 verify step on `spawn_blocking`
 # per #213 perf-opt NMA1).
 chunked_fast_slow = ["nativelink-store/chunked_fast_slow", "dep:sha2", "dep:async-trait"]
+# #538/#539: when enabled, the W3 chunked-v2 hot-path probes
+# (`_w3_probe_*_start = Instant::now()` + matching `info!` emits)
+# compile in and fire during bench runs. When disabled (the default,
+# including production builds), the entire probe block is `#[cfg]`-d
+# out so neither the timer reads nor the macro expansions survive in
+# the release binary. Use the `info!` level (not `trace!`) so the
+# workspace's `release_max_level_info` pin on `tracing` does NOT
+# silently compile the message back out.
+#
+# Operator: enable via `cargo build -p nativelink-benchmarks
+# --features bench-trace`, which forwards into this crate through
+# `nativelink-benchmarks`'s `bench-trace` feature.
+#
+# Verification: `strings target/release/data_plane_bench |
+# grep -c 'w3_probe'` must be 0 without the feature, >0 with.
+bench-trace = []
 
 [dev-dependencies]
 nativelink-macro = { path = "../nativelink-macro" }
