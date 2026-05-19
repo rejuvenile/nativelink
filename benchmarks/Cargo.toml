@@ -43,6 +43,15 @@ nativelink-proto = { path = "../nativelink-proto" }
 nativelink-service = { path = "../nativelink-service" }
 nativelink-store = { path = "../nativelink-store" }
 nativelink-util = { path = "../nativelink-util" }
+# #541: the W3 / W3f cells construct the three production durability
+# sinks (stable_digests pusher, failed_writes inserter, chunked_in_flight
+# refcount map) inline so the chunked-v2 commit path pays the same
+# per-iter bookkeeping cost it pays in production. The
+# `ChunkedInFlightMap` type alias in `nativelink-store` is
+# `Arc<parking_lot::Mutex<HashMap<...>>>`; constructing it requires
+# `parking_lot::Mutex` directly. Pinned to the same `0.12.3` the
+# nativelink-* crates depend on so the lockfile doesn't bifurcate.
+parking_lot = { version = "0.12.3", default-features = false }
 # Used by the A2 (AC update) cells to serialize an `ActionResult` proto
 # before calling `update_oneshot` — mirrors the `prost::Message::encode`
 # call in `nativelink-service/src/ac_server.rs::inner_update_action_result`.

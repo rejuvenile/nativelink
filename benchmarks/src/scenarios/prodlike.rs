@@ -53,14 +53,17 @@
 //! Driven via `Store::update_oneshot` — same call-shape as W1.
 //!
 //! **W3f (`w3f_*` cell family):** identical store + driver to W3 —
-//! `ChunkedWriteHandler` over a bare `FilesystemStore` (the same
-//! architecture production uses for chunked writes; see
-//! `src/bin/nativelink.rs:853-892` where `fs_arc` is peeled out of
-//! the FastSlowStore slow tier and fed to `ChunkedWriteHandler::new`
-//! WITHOUT the surrounding Verify/ExistenceCache/SizePartitioning
-//! wrappers). The chunked path skips the CAS chain BY DESIGN — the
-//! v2 commit barrier does its own dedupe via the per-digest
-//! `Notify`, not via `ExistenceCacheStore::has`.
+//! `ChunkedWriteHandler` over a bare `FilesystemStore` WITH the three
+//! production durability sinks wired (`with_v2_stable_digests_sink`,
+//! `with_v2_failed_commit_sink`, `with_chunked_in_flight_digests`).
+//! Mirrors the production wiring at `src/bin/nativelink.rs:912-925`
+//! where `fs_arc` is peeled out of the FastSlowStore slow tier and
+//! fed to `ChunkedWriteHandler::new` with the three sink closures
+//! obtained from the sibling FastSlowStore. The CAS-chain wrappers
+//! (Verify/ExistenceCache/SizePartitioning/MemoryStore) are STILL
+//! skipped — the chunked path bypasses them by design (the v2 commit
+//! barrier does its own dedupe via the per-digest `Notify`, not via
+//! `ExistenceCacheStore::has`).
 //!
 //! ```text
 //! ChunkedWriteHandler → FilesystemStore(<temp_dir on POOL_FAST>)
@@ -355,10 +358,7 @@ async fn run_w3f(
         WriteChunk, cas_extensions_client::CasExtensionsClient,
         cas_extensions_server::CasExtensionsServer,
     };
-    use nativelink_service::chunked_write_handler::{
-        ChunkedCasExtensionsAdapter, ChunkedWriteHandler, ChunkedWriteInFlight,
-    };
-    use nativelink_store::chunked::chunk_budget::ChunkBudget;
+    use nativelink_service::chunked_write_handler::ChunkedCasExtensionsAdapter;
     use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 
     // #537 m3: reuse W3's `make_payload` + `build_chunks` +
@@ -367,7 +367,8 @@ async fn run_w3f(
     // unification) automatically apply to W3f and the W1f/W3f comparison
     // cannot silently drift from W3.
     use crate::scenarios::chunked_v2::enabled::{
-        BENCH_CHUNK_SIZE, build_chunks, drain_v2_response, make_payload,
+        BENCH_CHUNK_SIZE, PRODUCTION_SINKS_WIRED_TAG, build_chunks, drain_v2_response,
+        make_payload,
     };
     use crate::scenarios::digest_via_default_hasher;
 
@@ -389,17 +390,21 @@ async fn run_w3f(
     })
     .await?;
 
-    // ---- Build the handler ----
-    let in_flight = ChunkedWriteInFlight::new();
-    let chunk_budget: &'static ChunkBudget = Box::leak(Box::new(ChunkBudget::new()));
-    let handler = Arc::new(
-        ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
-            store,
-            in_flight,
-            chunk_budget,
-            BENCH_CHUNK_SIZE,
-        ),
-    );
+    // ---- Build the handler with production sinks (#541) ----
+    //
+    // W3f pairs byte-for-byte against W3; both go through the SAME
+    // helper so the per-iter durability bookkeeping cost
+    // (stable_digests pusher mutex+notify, failed_writes inserter,
+    // chunked_in_flight RAII guard insert+remove) is included in the
+    // commit-to-disk wall-clock for both cells. Pre-#541 W3f built the
+    // handler inline via `new_with_state_and_chunk_size_for_test`
+    // without the three sinks; the bench numbers UNDERSTATED the
+    // per-iter cost production pays at
+    // `src/bin/nativelink.rs:912-925`. `_sinks_state` is held until the
+    // timed body completes so the drain task stays alive + the
+    // stable-digests Vec keeps getting drained.
+    let (handler, _sinks_state) =
+        crate::scenarios::chunked_v2::enabled::make_handler_with_production_sinks(store);
 
     // ---- Bring up an in-process v2 server + client ----
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -461,11 +466,9 @@ async fn run_w3f(
         serde_json::json!("zfs_pool_fast_dataset"),
     );
     // #537 D2: W3f INHERITS W3's composition shape — it uses the SAME
-    // `ChunkedWriteHandler::new_with_state_and_chunk_size_for_test`
-    // constructor over a bare `FilesystemStore`, WITHOUT the surrounding
-    // Verify/ExistenceCache/SizePartitioning/MemoryStore wrappers OR the
-    // three production sinks (`with_v2_stable_digests_sink`,
-    // `with_v2_failed_commit_sink`, `with_chunked_in_flight_digests`).
+    // helper as W3 (`make_handler_with_production_sinks` after #541)
+    // over a bare `FilesystemStore`, WITHOUT the surrounding
+    // Verify/ExistenceCache/SizePartitioning/MemoryStore wrappers.
     // The only delta vs W3 is the FilesystemStore content_path's
     // on-disk medium (ZFS pool `fast` vs tmpfs). Emitting `"none"` here
     // was WRONG (silently dropped W3's deviation tag); reuse W3's tag
@@ -476,6 +479,16 @@ async fn run_w3f(
     extras.insert(
         "composition_deviation".to_string(),
         serde_json::json!(crate::scenarios::chunked_v2::enabled::COMPOSITION_DEVIATION_TAG),
+    );
+    // #541: W3f wires the three production durability sinks
+    // (`stable_digests_pusher`, `failed_writes_inserter`,
+    // `chunked_in_flight_digests`) via the shared
+    // `make_handler_with_production_sinks` helper. Same tag value as W3
+    // so diff tooling joining on `scenario_name` can filter pre-#541
+    // vs post-#541 baselines consistently across both cells.
+    extras.insert(
+        "production_sinks_wired".to_string(),
+        serde_json::json!(PRODUCTION_SINKS_WIRED_TAG),
     );
     // #537 D3: self-describing JSON. W3f's timed body wraps
     // `write_chunked_v2 + drain_v2_response` — `drain_v2_response`
@@ -637,6 +650,248 @@ mod tests {
             crate::scenarios::chunked_v2::enabled::COMPOSITION_DEVIATION_TAG,
             dev_str
         );
+    }
+
+    /// #541: W3f MUST emit the SAME `production_sinks_wired` extras tag
+    /// as W3. The tag is what the diff tool joins on to filter pre-#541
+    /// vs post-#541 baselines; a drift between W3 and W3f silently
+    /// splits the paired baseline diff. This is a string-level pin —
+    /// the substantive behavioral assertion (the sinks ACTUALLY fire
+    /// during W3f's v2 commit) lives in
+    /// [`w3f_production_sinks_actually_fire_through_helper`] below.
+    ///
+    /// **Mutation falsifier:** change `PRODUCTION_SINKS_WIRED_TAG` or
+    /// remove the extras insert in `run_w3f`. The 1-iter smoke runs
+    /// `run_w3f` and inspects `production_sinks_wired`; this test
+    /// red-fails with the bespoke `#541 W3f production_sinks_wired
+    /// tag must match W3's` message.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w3f_production_sinks_wired_extras_tag_matches_w3() {
+        let scratch_root = tempfile::TempDir::new().expect("test tempdir");
+        let result = run_w3f(scratch_root.path(), 1)
+            .await
+            .expect("W3f must run cleanly on a fresh tempdir");
+        assert_eq!(result.scenario_name, W3F_SCENARIO_NAME);
+        let sinks = result
+            .extras
+            .get("production_sinks_wired")
+            .expect(
+                "#541 W3f result must carry production_sinks_wired extras; \
+                 absence breaks the diff tool's pre-vs-post #541 filter",
+            );
+        let sinks_str = sinks
+            .as_str()
+            .expect("production_sinks_wired must be a string");
+        assert_eq!(
+            sinks_str,
+            crate::scenarios::chunked_v2::enabled::PRODUCTION_SINKS_WIRED_TAG,
+            "#541 W3f production_sinks_wired tag must match W3's: W3 emits \
+             {:?}, W3f must emit the SAME tag (got {:?}); both cells use \
+             the shared `make_handler_with_production_sinks` helper and \
+             pay identical per-iter durability-bookkeeping cost. A drift \
+             between the two cells silently splits the W3-vs-W3f \
+             paired-baseline diff.",
+            crate::scenarios::chunked_v2::enabled::PRODUCTION_SINKS_WIRED_TAG,
+            sinks_str
+        );
+    }
+
+    /// #541 fix-up: behavioral pin for W3f's wiring. The string-tag
+    /// test above pins the JSON extras key but does NOT prove the
+    /// sinks actually fire during W3f's v2 commit path. This test
+    /// rebuilds W3f's exact composition (FilesystemStore on a
+    /// tempdir + `make_handler_with_production_sinks` + in-process v2
+    /// server), drives ONE v2 commit through it, and observes the
+    /// visible side effects:
+    ///   - `drain_count` increments from 0 (the pusher fired).
+    ///   - In-flight map is EMPTY post-commit (the RAII guard fired).
+    ///   - Structurally, all three `is_*_wired` accessors return true.
+    ///
+    /// Mirrors `make_handler_with_production_sinks_installs_all_three`
+    /// in `chunked_v2.rs` but anchored at the W3f-shape composition
+    /// the prodlike scenario uses, so a future refactor that diverges
+    /// W3f from W3's wiring (e.g. wires a different sink shape inline
+    /// instead of going through the shared helper) cannot pass this
+    /// test even if the extras tag still matches.
+    ///
+    /// Whole sequence wrapped in `tokio::time::timeout(10s)` as a
+    /// deadlock detector — a wedge here means the v2 commit barrier
+    /// did not complete (e.g. a sink held a lock across `.await`).
+    ///
+    /// **Mutation falsifier:** revert the `run_w3f` handler-build to
+    /// `new_with_state_and_chunk_size_for_test` (no sinks). The
+    /// structural assertion red-fails with "#541 W3f sink wiring
+    /// violated: stable_digests_sink reported NOT wired" because the
+    /// bare constructor leaves all three sinks `None`. The behavioral
+    /// `drain_count > 0` assertion also red-fails — the v2 commit
+    /// skips the sink invocation entirely.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn w3f_production_sinks_actually_fire_through_helper() {
+        use core::sync::atomic::Ordering;
+        use core::time::Duration;
+
+        use nativelink_config::stores::FilesystemSpec;
+        use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
+            cas_extensions_client::CasExtensionsClient,
+            cas_extensions_server::CasExtensionsServer,
+        };
+        use nativelink_service::chunked_write_handler::ChunkedCasExtensionsAdapter;
+        use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
+
+        use crate::scenarios::chunked_v2::enabled::{
+            build_chunks, drain_v2_response, make_handler_with_production_sinks,
+            make_payload,
+        };
+        use crate::scenarios::digest_via_default_hasher;
+
+        // ---- Build the W3f-shape composition ----
+        //
+        // Same code path as `run_w3f`: a bare FilesystemStore on a
+        // per-test tempdir, then `make_handler_with_production_sinks`
+        // for the handler. We hold `state` so the drain task stays
+        // alive AND so we can observe `drain_count` after the commit.
+        let scratch_root = tempfile::TempDir::new().expect("test tempdir");
+        let temp_dir = tempfile::TempDir::new_in(scratch_root.path())
+            .expect("W3f-shape tempdir");
+        let content_path = temp_dir
+            .path()
+            .join("content")
+            .to_string_lossy()
+            .into_owned();
+        let temp_path = temp_dir
+            .path()
+            .join("temp")
+            .to_string_lossy()
+            .into_owned();
+        let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path,
+            temp_path,
+            eviction_policy: None,
+            block_size: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("W3f-shape FilesystemStore build must succeed");
+
+        let (handler, state) = make_handler_with_production_sinks(store);
+
+        // ---- Structural: handler reports all three sinks wired ----
+        assert!(
+            handler.is_v2_stable_digests_sink_wired(),
+            "#541 W3f sink wiring violated: stable_digests_sink \
+             reported NOT wired by make_handler_with_production_sinks. \
+             The W3f cell would silently skip BIS notification on \
+             commit success and worker mirror_blobs would accumulate."
+        );
+        assert!(
+            handler.is_v2_failed_commit_sink_wired(),
+            "#541 W3f sink wiring violated: failed_commit_sink reported \
+             NOT wired by make_handler_with_production_sinks."
+        );
+        assert!(
+            handler.is_chunked_in_flight_digests_wired(),
+            "#541 W3f sink wiring violated: chunked_in_flight_digests \
+             reported NOT wired by make_handler_with_production_sinks. \
+             `FastSlowStore::has_with_results` would silently return \
+             None for in-flight v2 writes."
+        );
+
+        // ---- Behavioral: drive one v2 commit and observe sinks ----
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral bind must succeed");
+            let port = listener.local_addr().unwrap().port();
+            let incoming =
+                tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let adapter = ChunkedCasExtensionsAdapter::new(handler.clone());
+            let svc = CasExtensionsServer::new(adapter);
+            let _server_guard = nativelink_util::spawn!(
+                "w3f-sink-wiring-test-server",
+                async move {
+                    if let Err(e) = tonic::transport::Server::builder()
+                        .add_service(svc)
+                        .serve_with_incoming(incoming)
+                        .await
+                    {
+                        eprintln!(
+                            "[test] W3f wiring v2 server exited with error: {e:?}"
+                        );
+                    }
+                }
+            );
+            let endpoint = tonic::transport::Endpoint::from_shared(format!(
+                "http://127.0.0.1:{port}"
+            ))
+            .expect("endpoint parse must succeed")
+            .connect_timeout(Duration::from_secs(5));
+            let channel = endpoint
+                .connect()
+                .await
+                .expect("client must connect to in-process W3f wiring v2 server");
+            let mut client = CasExtensionsClient::new(channel);
+
+            // Tiny single-chunk payload: minimum surface for the v2
+            // commit path so the test stays fast.
+            let payload = make_payload(64 * 1024, 0xD15EA5E);
+            let digest = digest_via_default_hasher(&payload);
+            let chunks = build_chunks(digest, &payload);
+            let expected_size = payload.len() as u64;
+            let response = client
+                .write_chunked_v2(tokio_stream::iter(chunks))
+                .await
+                .expect("W3f-shape write_chunked_v2 RPC must return Ok");
+            let committed = drain_v2_response(response.into_inner())
+                .await
+                .expect("W3f-shape v2 commit must succeed");
+            assert_eq!(committed, expected_size);
+        })
+        .await
+        .expect(
+            "#541 W3f sink wiring violated: v2 commit did not complete \
+             within 10 s — the W3f-shape composition wedged at the v2 \
+             commit barrier",
+        );
+
+        // The drain task races our resumption after the commit
+        // completes; poll with a short tick for up to 5 s.
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let n = state.drain_count.load(Ordering::Relaxed);
+                if n > 0 {
+                    return n;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect(
+            "#541 W3f sink wiring violated: drain_count stayed at 0 \
+             for 5 s after commit — the stable_digests_sink did not \
+             fire on W3f's commit-success path. Production BIS \
+             notification would also be skipped.",
+        );
+        assert!(
+            drained >= 1,
+            "drain_count must be >= 1 after one v2 commit (got {drained})"
+        );
+
+        // RAII guard must have removed the in-flight entry on session
+        // drop.
+        assert!(
+            state.in_flight.lock().is_empty(),
+            "#541 W3f sink wiring violated: chunked_in_flight map NOT \
+             empty after commit (entries: {}). InFlightChunkedGuard's \
+             Drop did not run, or the v2 session held the entry beyond \
+             commit.",
+            state.in_flight.lock().len()
+        );
+
+        drop(state);
+        drop(temp_dir);
+        drop(scratch_root);
     }
 
     /// #537 D5-m6: W3f smoke. Runs `run_w3f` end-to-end at `iters=1` and

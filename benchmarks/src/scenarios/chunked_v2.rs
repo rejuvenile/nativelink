@@ -56,7 +56,10 @@ pub(crate) mod enabled {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use std::collections::{HashMap, HashSet};
+
     use bytes::Bytes;
+    use parking_lot::Mutex;
     use tokio_stream::StreamExt as _;
 
     use nativelink_config::stores::FilesystemSpec;
@@ -68,6 +71,7 @@ pub(crate) mod enabled {
         ChunkedCasExtensionsAdapter, ChunkedWriteHandler, ChunkedWriteInFlight,
     };
     use nativelink_store::chunked::chunk_budget::ChunkBudget;
+    use nativelink_store::fast_slow_store::ChunkedInFlightMap;
     use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
     use nativelink_util::background_spawn;
     use nativelink_util::common::DigestInfo;
@@ -216,6 +220,19 @@ pub(crate) mod enabled {
     /// Build a handler with a FRESH chunk budget so each call yields a
     /// cell whose admission semaphore starts at full permits — see
     /// `make_chunk_budget` for the rationale.
+    ///
+    /// **Bare-handler shape.** None of the three production sinks
+    /// (`with_v2_stable_digests_sink`, `with_v2_failed_commit_sink`,
+    /// `with_chunked_in_flight_digests`) are installed. Used by R5
+    /// (filesystem-fanout reader cell) where the readers race
+    /// `FilesystemStore::get_part_unchunked` directly after a prewrite
+    /// completes — the v2 commit path runs once during prewrite (outside
+    /// the timed body) and is not the load-bearing measurement.
+    ///
+    /// W3 / W3f use [`make_handler_with_production_sinks`] instead
+    /// (#541) so the chunked-v2 commit path pays the same per-iter
+    /// bookkeeping cost it pays in production
+    /// (`src/bin/nativelink.rs:912-925`).
     fn make_handler(
         store: Arc<FilesystemStore<FileEntryImpl>>,
     ) -> Arc<ChunkedWriteHandler> {
@@ -226,6 +243,263 @@ pub(crate) mod enabled {
                 store, in_flight, budget, BENCH_CHUNK_SIZE,
             ),
         )
+    }
+
+    /// `extras.production_sinks_wired` value for the W3 / W3f cells
+    /// after #541. Names the three sinks installed on the handler so a
+    /// reader of a baseline JSON in isolation can tell that the per-iter
+    /// p50/p99 includes production durability-bookkeeping cost
+    /// (mutex+notify per commit on success, HashMap insert+remove per
+    /// session). Pinned by `w3_production_sinks_wired_tag_is_stable`;
+    /// drift of this tag breaks the diff tooling's ability to filter
+    /// pre-#541 vs post-#541 baselines.
+    pub(crate) const PRODUCTION_SINKS_WIRED_TAG: &str =
+        "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests";
+
+    /// `extras.production_sinks_wired` value for cells that DO NOT wire
+    /// the three production sinks. Used by R5 (which only runs the v2
+    /// write path during prewrite, outside the timed body). Distinct
+    /// string so the diff tooling can filter on this field rather than
+    /// inferring sink-state from cell name.
+    pub(crate) const PRODUCTION_SINKS_NOT_WIRED_TAG: &str = "none";
+
+    /// Owns the per-cell state behind the three production sinks plus
+    /// the drain task that mirrors `src/bin/nativelink.rs`'s BIS
+    /// broadcast loop. Held alive by the W3 / W3f cell so the
+    /// `stable_digests` Vec doesn't grow unbounded across iterations and
+    /// the spawned drain task is aborted when the cell drops.
+    ///
+    /// **Bench-scope only.** Production's BIS broadcast does much more
+    /// (per-store dispatch, scheduler notification, AC-vs-CAS routing).
+    /// The bench equivalent just drains the queue + counts — the cost
+    /// production pays at the PUSHER site (the closure invocation that
+    /// runs inside the v2 commit path, inside the timed body) is what
+    /// we're measuring; the BROADCAST side runs on a separate task
+    /// outside the timed body in production AND here.
+    pub(crate) struct ProductionSinksState {
+        /// Live stable-digests Vec the pusher writes into. Held so the
+        /// drain task has a target AND so the unit test can assert
+        /// "helper installs a sink that mutates this Vec"; the field
+        /// is read in tests only, hence `allow(dead_code)`.
+        #[allow(dead_code)]
+        pub(crate) stable_digests: Arc<Mutex<Vec<DigestInfo>>>,
+        /// Drain task; aborted on cell drop via `JoinHandleDropGuard`.
+        #[allow(dead_code)]
+        drain_task: nativelink_util::task::JoinHandleDropGuard<()>,
+        /// In-flight refcount HashMap; production analogue lives on the
+        /// FastSlowStore. Held so the v2 session's RAII guard has
+        /// something to mutate. The drain side has no per-iter work
+        /// here — entries decrement to zero in `InFlightChunkedGuard::Drop`
+        /// at the end of each v2 session.
+        #[allow(dead_code)]
+        pub(crate) in_flight: ChunkedInFlightMap,
+        /// FSS-wide empty-notify; production analogue lives on the
+        /// FastSlowStore. Fired by `InFlightChunkedGuard::Drop` when
+        /// the map goes empty. No consumer here — `flush_slow_writes`
+        /// graceful-drain isn't part of the W3 bench shape.
+        #[allow(dead_code)]
+        in_flight_empty_notify: Arc<tokio::sync::Notify>,
+        /// Failed-writes HashSet; production analogue is the
+        /// `failed_slow_writes` on FastSlowStore drained by worker
+        /// reconnect. W3 expects every commit to succeed, so this stays
+        /// empty in practice; held for shape parity.
+        #[allow(dead_code)]
+        pub(crate) failed_writes: Arc<Mutex<HashSet<DigestInfo>>>,
+        /// #541 fix-up: monotonic count of digests drained by the
+        /// background drain task. Bumped by `drained.len()` after each
+        /// `core::mem::take`. Tests use this to observe that the pusher
+        /// sink fired without racing the drain task (the drain
+        /// immediately empties `stable_digests`, so a direct `lock()`
+        /// from the test side sees zero even though the sink fired).
+        ///
+        /// Bench-runtime cost: one `AtomicU64::fetch_add` per drain
+        /// batch (not per push) — entirely off the timed body since the
+        /// drain task runs on a separate spawn.
+        #[allow(dead_code)]
+        pub(crate) drain_count: Arc<AtomicU64>,
+    }
+
+    /// Build a handler wired with the three production durability sinks
+    /// the v2 commit path consumes in production (see
+    /// `src/bin/nativelink.rs:912-925`). Returns the handler **and** a
+    /// [`ProductionSinksState`] that the cell MUST hold until the timed
+    /// body completes (otherwise the drain task aborts mid-iter and the
+    /// stable-digests Vec grows unbounded).
+    ///
+    /// **#541 fidelity intent.** Pre-#541 the W3 / W3f cells called
+    /// `new_with_state_and_chunk_size_for_test` and SKIPPED the three
+    /// sinks, so the bench numbers UNDERSTATED the per-iter cost
+    /// production pays:
+    ///
+    /// - **`with_v2_stable_digests_sink`** — fires once per commit
+    ///   success; one `parking_lot::Mutex` lock + `Vec::push` +
+    ///   `Notify::notify_one`. Production wiring at
+    ///   `nativelink-store/src/fast_slow_store.rs:1417-1429`.
+    /// - **`with_v2_failed_commit_sink`** — fires once per commit
+    ///   failure; one `Mutex` lock + `HashSet::insert` (production
+    ///   also calls `fast_store.pin_digests(&[digest])`, but the bench
+    ///   has no fast store and W3 expects success so this path is
+    ///   never hit). Production wiring at `fast_slow_store.rs:1460-1470`.
+    /// - **`with_chunked_in_flight_digests`** — installs an RAII guard
+    ///   that does one `Mutex` lock + `HashMap` insert at admission +
+    ///   one lock + `HashMap` remove at commit (success or failure) +
+    ///   one `Notify::notify_waiters` on refcount-zero. Production
+    ///   wiring at `fast_slow_store.rs:1367-1369, 1394-1396`.
+    ///
+    /// The drain task mirrors the BIS broadcast loop's behavior
+    /// (`src/bin/nativelink.rs:1008-1075`): wait on the
+    /// `stable_notify`, drain the queue, discard. Production does
+    /// MUCH more on drain (scheduler broadcast, AC-vs-CAS routing) but
+    /// that work is OFF the timed body in production AND here; the
+    /// pusher-side cost (which IS on the timed body) is what #541
+    /// re-introduces.
+    ///
+    /// # Fidelity gap (acknowledged, NOT closed)
+    ///
+    /// The bench faithfully measures the PUSHER-SIDE cost of the three
+    /// sinks (mutex lock + Vec push + notify_one; HashSet insert;
+    /// HashMap insert+remove + notify_waiters on refcount-zero). Three
+    /// production-side dimensions are NOT replicated and may bias the
+    /// per-iter measurement vs production under load:
+    ///
+    /// - **`record_pusher_invoke` omitted.** Production's
+    ///   `stable_digests_sink` also calls
+    ///   `server_phase0_metrics().record_pusher_invoke(digest)` (a
+    ///   histogram observation under a registry RwLock). The bench
+    ///   skips this because there is no production metrics registry
+    ///   wired in-process. Under heavy push rate the histogram-write
+    ///   cost is not free; the bench may UNDER-state production push
+    ///   cost by ~1-2 µs per push in tight bursts.
+    /// - **`pin_digests` omitted in the failed-commit path.** Production
+    ///   also calls `fast_store.pin_digests(&[digest])` on commit
+    ///   failure so the in-memory replica survives until the worker
+    ///   retries. The bench has no fast store and W3 expects every
+    ///   commit to succeed, so this path is structurally unreachable
+    ///   here; future W3 variants exercising commit failure would need
+    ///   a bench fast-store + pin wiring.
+    /// - **Drain-side lock-hold time understated.** The bench's drain
+    ///   task does `core::mem::take(&mut *drain_stable_digests.lock())`
+    ///   and discards — total lock hold ≈ tens-of-nanoseconds. Production's
+    ///   drain holds the mutex through scheduler broadcast + AC pin
+    ///   sweep + per-store unpin, lock hold ≈ ms-scale under load. So
+    ///   the bench measures the pusher's UNCONTENDED-lock cost; under
+    ///   production load the pusher pays contended-lock cost too. The
+    ///   true production pusher tail under load is HIGHER than this
+    ///   bench reports — by an amount proportional to the production
+    ///   drain's lock-hold envelope. (Followup: simulate
+    ///   production drain-side mutex-hold-time in bench, calibrated
+    ///   against production timings — tracked as a #541 followup, to
+    ///   be filed if perf needs the closer envelope.)
+    ///
+    /// These gaps are acknowledged here so future reviewers cannot
+    /// silently treat the bench numbers as a complete production-cost
+    /// substitute; the bench is necessary-but-not-sufficient evidence
+    /// for the sinks' per-iter cost.
+    pub(crate) fn make_handler_with_production_sinks(
+        store: Arc<FilesystemStore<FileEntryImpl>>,
+    ) -> (Arc<ChunkedWriteHandler>, ProductionSinksState) {
+        let in_flight_inner = ChunkedWriteInFlight::new();
+        let budget: &'static ChunkBudget = make_chunk_budget();
+
+        // The three production sinks' backing state. Shape mirrors the
+        // FastSlowStore fields at fast_slow_store.rs:1174-1184 byte-for-
+        // byte (same Arc / Mutex / collection types) so the bench pays
+        // production-shaped lock contention.
+        let stable_digests: Arc<Mutex<Vec<DigestInfo>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let stable_notify = Arc::new(tokio::sync::Notify::new());
+        let failed_writes: Arc<Mutex<HashSet<DigestInfo>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        let chunked_in_flight: ChunkedInFlightMap =
+            Arc::new(Mutex::new(HashMap::new()));
+        let in_flight_empty_notify = Arc::new(tokio::sync::Notify::new());
+
+        // Closures mirror fast_slow_store.rs:1417-1429 (stable pusher)
+        // and :1460-1470 (failed inserter). The pusher's
+        // `server_phase0_metrics().record_pusher_invoke(digest)` call
+        // is intentionally OMITTED: the bench runs in-process with no
+        // production metrics registry wired and the histogram code path
+        // is exercised at the production binary level, not the
+        // store-helper level.
+        let pusher_stable_digests = stable_digests.clone();
+        let pusher_stable_notify = stable_notify.clone();
+        let stable_digests_sink: Arc<dyn Fn(DigestInfo) + Send + Sync> =
+            Arc::new(move |digest: DigestInfo| {
+                pusher_stable_digests.lock().push(digest);
+                pusher_stable_notify.notify_one();
+            });
+        let inserter_failed_writes = failed_writes.clone();
+        let failed_commit_sink: Arc<dyn Fn(DigestInfo) + Send + Sync> =
+            Arc::new(move |digest: DigestInfo| {
+                inserter_failed_writes.lock().insert(digest);
+                // Production also calls `fast_store.pin_digests(&[digest])`
+                // here so the in-memory replica survives until the
+                // worker reconnects and retries. The bench has no fast
+                // store and W3 expects every commit to succeed, so this
+                // path is structurally unreachable; we'd add the call
+                // back if a future W3 variant exercises commit failure.
+            });
+
+        // Drain task: mirrors the BIS broadcast loop's wake-and-drain
+        // shape (src/bin/nativelink.rs:1008-1075) without the broadcast
+        // dispatch. Bounds the stable_digests Vec at "drained-after-
+        // each-batch", same liveness contract as production. The
+        // `JoinHandleDropGuard` aborts the task when the cell's
+        // `ProductionSinksState` drops at end-of-cell.
+        //
+        // #541 fix-up: bumps `drain_count` by `drained.len()` after
+        // each take so tests can observe that the pusher sink fired
+        // without racing the drain task (a direct `lock()` from the
+        // test side sees zero — the drain task wakes on the same
+        // `notify_one` and empties the Vec before the test can read it).
+        let drain_stable_digests = stable_digests.clone();
+        let drain_stable_notify = stable_notify.clone();
+        let drain_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let drain_count_for_task = drain_count.clone();
+        let drain_task = nativelink_util::spawn!(
+            "w3-bench-stable-digests-drain",
+            async move {
+                loop {
+                    drain_stable_notify.notified().await;
+                    // Drain + discard. Production fans this out to
+                    // worker schedulers + AC-pin registries; the bench
+                    // just needs the queue to not grow unbounded.
+                    let drained: Vec<DigestInfo> =
+                        core::mem::take(&mut *drain_stable_digests.lock());
+                    // Bump the test-observable drain counter; the count
+                    // is the only side-effect surface tests can use to
+                    // assert the sink fired (the Vec itself is empty
+                    // again by the time control returns to the test).
+                    drain_count_for_task
+                        .fetch_add(drained.len() as u64, Ordering::Relaxed);
+                }
+            }
+        );
+
+        let handler = Arc::new(
+            ChunkedWriteHandler::new_with_state_and_chunk_size_for_test(
+                store,
+                in_flight_inner,
+                budget,
+                BENCH_CHUNK_SIZE,
+            )
+            .with_v2_stable_digests_sink(stable_digests_sink)
+            .with_v2_failed_commit_sink(failed_commit_sink)
+            .with_chunked_in_flight_digests(
+                chunked_in_flight.clone(),
+                in_flight_empty_notify.clone(),
+            ),
+        );
+
+        let state = ProductionSinksState {
+            stable_digests,
+            drain_task,
+            in_flight: chunked_in_flight,
+            in_flight_empty_notify,
+            failed_writes,
+            drain_count,
+        };
+        (handler, state)
     }
 
     /// Bring up an in-process `CasExtensions` v2 server bound to an
@@ -573,7 +847,14 @@ pub(crate) mod enabled {
                 return;
             }
         };
-        let handler = make_handler(store);
+        // #541: wire the three production durability sinks
+        // (stable_digests_pusher + failed_writes_inserter +
+        // chunked_in_flight_digests) so the v2 commit path's per-iter
+        // bookkeeping cost is paid inside the timed body, matching the
+        // production composition at src/bin/nativelink.rs:912-925.
+        // `_sinks_state` is held to keep the drain task + stable-digests
+        // Vec alive for the cell; dropping aborts the drain task.
+        let (handler, _sinks_state) = make_handler_with_production_sinks(store);
         let (client, _server_guard) = start_v2_server(handler).await;
 
         // Pre-generate all payloads + digests + chunks OUTSIDE the
@@ -638,6 +919,17 @@ pub(crate) mod enabled {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!(COMPOSITION_DEVIATION_TAG),
+        );
+        // #541: as of this commit W3 wires the three production
+        // durability sinks the v2 commit path consumes
+        // (`with_v2_stable_digests_sink`, `with_v2_failed_commit_sink`,
+        // `with_chunked_in_flight_digests`). Pre-#541 baselines did NOT
+        // wire these and so understated the per-iter cost — diff tooling
+        // joining on `scenario_name` MUST filter by this extras field to
+        // avoid attributing the wiring-up cost to a code regression.
+        extras.insert(
+            "production_sinks_wired".to_string(),
+            serde_json::json!(PRODUCTION_SINKS_WIRED_TAG),
         );
         // #537 D3: self-describing JSON. `measures` names what the timed
         // body actually waits for. For W3 / W3f that's the chunked-v2
@@ -895,6 +1187,21 @@ pub(crate) mod enabled {
             extras.insert(
                 "composition_deviation".to_string(),
                 serde_json::json!(COMPOSITION_DEVIATION_TAG),
+            );
+            // #541: R5 runs the v2 write path ONCE per iter during
+            // prewrite (outside the timed body) and the timed body
+            // exercises `FilesystemStore::get_part_unchunked` directly —
+            // no v2 commit happens inside the timed body, so the three
+            // production sinks would not be invoked even if wired. Tag
+            // explicitly so a diff-tool reader doesn't infer sink-state
+            // from cell name. If a Phase-2 R5 variant ever routes
+            // readers through the `WriteChunkedV2` commit barrier, this
+            // tag MUST flip to `PRODUCTION_SINKS_WIRED_TAG` and the
+            // handler builder switched to
+            // `make_handler_with_production_sinks`.
+            extras.insert(
+                "production_sinks_wired".to_string(),
+                serde_json::json!(PRODUCTION_SINKS_NOT_WIRED_TAG),
             );
             // Honest-label: this cell is FilesystemStore fan-out, not
             // the v3 per-digest Notify. Diff tooling must NOT treat a
@@ -1327,6 +1634,332 @@ pub(crate) mod enabled {
         /// below evaluate to a runaway pool size — red-fails because
         /// 200 × 64 × 4 MiB = 51.2 GiB > 6 GiB cap.
         ///
+        /// #541: the production-sinks-wired tag string MUST stay stable.
+        /// Diff tooling joins on `scenario_name` + filters on the
+        /// `production_sinks_wired` extras key; a drift of either the
+        /// key NAME or the VALUE silently splits pre-#541 from
+        /// post-#541 baselines and the diff tool either compares apples
+        /// to oranges or drops cells. The two-pronged assertion (key
+        /// presence + exact string value) makes both directions of the
+        /// failure caught by one mutation.
+        ///
+        /// Mutation: rename `PRODUCTION_SINKS_WIRED_TAG` (or change its
+        /// value) — this test red-fails with the bespoke
+        /// `#541 production-sinks-wired tag drift` message.
+        #[test]
+        fn production_sinks_wired_tag_is_stable() {
+            assert_eq!(
+                PRODUCTION_SINKS_WIRED_TAG,
+                "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests",
+                "#541 production-sinks-wired tag drift: the W3 / W3f extras key \
+                 `production_sinks_wired` carries this string verbatim; checked-in \
+                 baselines and the diff tool's filter logic both pin it. Any \
+                 rename of the three sink-method names in this string requires \
+                 a baseline-replay sweep so historic JSONs don't fail to join."
+            );
+            assert_eq!(
+                PRODUCTION_SINKS_NOT_WIRED_TAG, "none",
+                "#541 production-sinks-not-wired tag drift: R5 emits this \
+                 string to mark its bare-handler shape; the diff tool filters \
+                 on it to exclude R5 from any pre-vs-post #541 comparison",
+            );
+        }
+
+        /// #541 fix-up: the sinks-wired helper MUST install all three
+        /// sinks AND those sinks MUST actually fire from the v2 commit
+        /// path. A future refactor that drops any single `.with_*` call
+        /// would silently understate the per-iter cost and re-introduce
+        /// the #541 fidelity gap.
+        ///
+        /// Two-tier coverage:
+        ///
+        /// 1. **Structural** — assert the handler reports all three
+        ///    sinks wired via the `is_*_wired` test-only accessors. A
+        ///    `.with_*` call that silently no-ops (e.g. setter
+        ///    overwritten by a subsequent `None` assignment) would
+        ///    red-fail here.
+        /// 2. **Behavioral** — drive ONE real chunked-v2 write through
+        ///    the in-process v2 server (the same harness W3 uses), then
+        ///    observe the visible side effects:
+        ///      - `drain_count` increments from 0 (the pusher fired and
+        ///        the drain task drained the Vec — using `drain_count`
+        ///        rather than reading `stable_digests` directly avoids
+        ///        the test racing the drain task, which empties the Vec
+        ///        as soon as the pusher's `notify_one` wakes it).
+        ///      - `in_flight` map is EMPTY at commit completion (the
+        ///        RAII `InFlightChunkedGuard` fired on session-drop and
+        ///        removed the entry; if it didn't, future
+        ///        `flush_slow_writes` waiters would wedge in production).
+        ///
+        /// Whole test runs under `tokio::time::timeout(10s)` as a
+        /// deadlock detector — `tokio::time::Elapsed` would surface as
+        /// a bespoke "deadlock — v2 commit barrier did not complete"
+        /// message, not a generic `is_err()`.
+        ///
+        /// **Mutation falsifier (must red-fail for the right reason):**
+        /// comment out `.with_v2_stable_digests_sink(stable_digests_sink)`
+        /// in `make_handler_with_production_sinks`. The structural
+        /// assertion (`is_v2_stable_digests_sink_wired()`) red-fails
+        /// with "#541 v2-commit-barrier sink wiring violated:
+        /// stable_digests_sink reported NOT wired". The behavioral
+        /// assertion (`drain_count > 0`) also red-fails because the v2
+        /// commit path skips the sink invocation entirely, the drain
+        /// task is never notified, and the counter stays at 0.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn make_handler_with_production_sinks_installs_all_three() {
+            // ---- Build store + handler via the helper under test ----
+            let temp_dir = tempfile::TempDir::new()
+                .expect("test tempdir creation must succeed");
+            let content_path = temp_dir
+                .path()
+                .join("content")
+                .to_string_lossy()
+                .into_owned();
+            let temp_path = temp_dir
+                .path()
+                .join("temp")
+                .to_string_lossy()
+                .into_owned();
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path,
+                temp_path,
+                eviction_policy: None,
+                block_size: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("test FilesystemStore build must succeed");
+
+            let (handler, state) =
+                make_handler_with_production_sinks(store);
+
+            // ---- (1) Structural wiring assertions ----
+            //
+            // Catches the silent-no-op shape where a `.with_*` setter is
+            // overwritten or commented out — the v2 commit path would
+            // never invoke the sink, the behavioral assertion below
+            // would also red-fail, but this structural check fires
+            // FIRST so the failure attribution is unambiguous (test
+            // failure says "wiring violated", not "drain count was 0").
+            assert!(
+                handler.is_v2_stable_digests_sink_wired(),
+                "#541 v2-commit-barrier sink wiring violated: \
+                 stable_digests_sink reported NOT wired by \
+                 make_handler_with_production_sinks. A `.with_v2_stable_digests_sink(...)` \
+                 call was dropped or no-op'd — the v2 commit path will \
+                 skip BIS notification and worker mirror_blobs will \
+                 accumulate in production."
+            );
+            assert!(
+                handler.is_v2_failed_commit_sink_wired(),
+                "#541 v2-commit-barrier sink wiring violated: \
+                 failed_commit_sink reported NOT wired by \
+                 make_handler_with_production_sinks. A \
+                 `.with_v2_failed_commit_sink(...)` call was dropped — \
+                 v2 commit failures will not surface to the worker \
+                 reconnect-retry path in production."
+            );
+            assert!(
+                handler.is_chunked_in_flight_digests_wired(),
+                "#541 v2-commit-barrier sink wiring violated: \
+                 chunked_in_flight_digests reported NOT wired by \
+                 make_handler_with_production_sinks. A \
+                 `.with_chunked_in_flight_digests(...)` call was \
+                 dropped — `FastSlowStore::has_with_results` will \
+                 silently return None for in-flight v2 writes in \
+                 production, breaking the chunked-aware reader-cascade \
+                 contract."
+            );
+            // Sanity: the in-flight map starts empty before any commit.
+            assert!(
+                state.in_flight.lock().is_empty(),
+                "#541 chunked_in_flight map must start empty"
+            );
+            assert_eq!(
+                state.drain_count.load(Ordering::Relaxed),
+                0,
+                "drain_count must start at 0 before the test drives a commit"
+            );
+
+            // ---- (2) Behavioral: drive ONE real v2 commit ----
+            //
+            // Spin up the same in-process v2 server W3 uses, write a
+            // single small payload, drain to FinalResponse. After the
+            // commit completes the wired sinks MUST have fired:
+            //   - stable_digests_sink → drain task wakes and increments
+            //     `drain_count` by at least 1.
+            //   - chunked_in_flight RAII guard → entry removed on
+            //     session drop, map back to empty.
+            //
+            // Whole sequence wrapped in tokio::time::timeout as a
+            // deadlock detector; an Elapsed here means the v2 commit
+            // barrier wedged (e.g. a sink hold a lock across .await,
+            // or the drain task starved).
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let (mut client, _server_guard) =
+                    start_v2_server(handler.clone()).await;
+
+                // Tiny single-chunk payload — minimum surface for the
+                // commit path (admission + one chunk + finalize) so the
+                // test stays fast.
+                let payload = make_payload(64 * 1024, 0xC0FFEE);
+                let digest = digest_via_default_hasher(&payload);
+                let chunks = build_chunks(digest, &payload);
+                let expected_size = payload.len() as u64;
+
+                let stream = tokio_stream::iter(chunks);
+                let response = client
+                    .write_chunked_v2(stream)
+                    .await
+                    .expect("v2 write_chunked_v2 RPC must return Ok");
+                let committed = drain_v2_response(response.into_inner())
+                    .await
+                    .expect("v2 commit must succeed within the test budget");
+                assert_eq!(
+                    committed, expected_size,
+                    "v2 commit bytes mismatch"
+                );
+            })
+            .await
+            .expect(
+                "#541 v2-commit-barrier sink wiring violated: \
+                 v2 commit did not complete within 10s — either the \
+                 RAII in-flight guard wedged, a sink held a lock \
+                 across .await, or the drain task starved",
+            );
+
+            // ---- Observe sink side effects ----
+            //
+            // `drain_count` is a polling target because the drain task
+            // races with the test's resumption after `await`. Bounded
+            // polling loop (up to 5 s of wall-clock budget, 5 ms
+            // ticks) — the drain task wakes via `notify_one` from the
+            // pusher inside the commit path; on a quiet single-thread
+            // bench host the wake-and-drain typically completes in
+            // <1 ms.
+            let drained_observed = tokio::time::timeout(
+                Duration::from_secs(5),
+                async {
+                    loop {
+                        let n = state.drain_count.load(Ordering::Relaxed);
+                        if n > 0 {
+                            return n;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                },
+            )
+            .await
+            .expect(
+                "#541 v2-commit-barrier sink wiring violated: \
+                 drain_count stayed at 0 for 5 s after commit — the \
+                 stable_digests_sink did not fire on commit success. \
+                 The v2 commit path skipped the pusher invocation; \
+                 production BIS notification would also be skipped \
+                 and worker mirror_blobs would accumulate.",
+            );
+            assert!(
+                drained_observed >= 1,
+                "drain_count must be >= 1 after one v2 commit (got {drained_observed})"
+            );
+
+            // RAII in-flight guard must have fired on session drop.
+            assert!(
+                state.in_flight.lock().is_empty(),
+                "#541 v2-commit-barrier sink wiring violated: \
+                 chunked_in_flight map NOT empty after commit \
+                 (entries: {entries}). The InFlightChunkedGuard's Drop \
+                 did not run, or the v2 session held the entry beyond \
+                 commit. In production `FastSlowStore::has_with_results` \
+                 would keep reporting in-flight after the commit, \
+                 wedging readers that wait on the FSS empty-notify.",
+                entries = state.in_flight.lock().len()
+            );
+
+            // Tear down the helper state — aborts the drain task
+            // (JoinHandleDropGuard) so subsequent tests inherit a
+            // clean tokio task tree.
+            drop(state);
+        }
+
+        /// #541 fix-up — OVER-action pin: the bare `make_handler`
+        /// (R5's code path) MUST NOT wire any of the three production
+        /// durability sinks. The R5 cell pre-writes blobs OUTSIDE the
+        /// timed body and then measures multi-reader fan-out; wiring
+        /// the sinks would silently add per-iter cost the R5 timing is
+        /// NOT supposed to include, breaking the apples-to-apples
+        /// comparison against historic R5 baselines (which were
+        /// collected pre-#541 with NO sinks).
+        ///
+        /// Per CLAUDE.md "Asymmetric contract coverage": the
+        /// `make_handler_with_production_sinks` under-action test
+        /// (above) covers the wired direction; this test covers the
+        /// NOT-wired direction. A future refactor that "harmonizes"
+        /// the two helpers by routing R5 through
+        /// `make_handler_with_production_sinks` would silently move
+        /// R5's measurement off the historic baseline.
+        ///
+        /// **Mutation falsifier:** swap the `make_handler(store)` call
+        /// below for `make_handler_with_production_sinks(store).0` —
+        /// the three `assert!(!handler.is_*_wired())` checks red-fail
+        /// with the bespoke "#541 R5 bare-handler over-action
+        /// violated" message.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn r5_production_sinks_wired_is_none() {
+            let temp_dir = tempfile::TempDir::new()
+                .expect("test tempdir creation must succeed");
+            let content_path = temp_dir
+                .path()
+                .join("content")
+                .to_string_lossy()
+                .into_owned();
+            let temp_path = temp_dir
+                .path()
+                .join("temp")
+                .to_string_lossy()
+                .into_owned();
+            let store = FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+                content_path,
+                temp_path,
+                eviction_policy: None,
+                block_size: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("test FilesystemStore build must succeed");
+
+            // The R5 code path: bare handler, no production sinks.
+            let handler = make_handler(store);
+
+            assert!(
+                !handler.is_v2_stable_digests_sink_wired(),
+                "#541 R5 bare-handler over-action violated: \
+                 stable_digests_sink reported WIRED on the bare \
+                 make_handler output. R5's timed body would silently \
+                 pay per-iter pusher cost (mutex+notify on every v2 \
+                 commit) the R5 baseline did NOT pay; historic R5 \
+                 numbers become incomparable to post-change numbers."
+            );
+            assert!(
+                !handler.is_v2_failed_commit_sink_wired(),
+                "#541 R5 bare-handler over-action violated: \
+                 failed_commit_sink reported WIRED on the bare \
+                 make_handler output. R5 has no failed-commit path in \
+                 the timed body, but the wiring would still bloat the \
+                 handler's per-iter footprint vs the historic baseline."
+            );
+            assert!(
+                !handler.is_chunked_in_flight_digests_wired(),
+                "#541 R5 bare-handler over-action violated: \
+                 chunked_in_flight_digests reported WIRED on the bare \
+                 make_handler output. R5's prewrite would insert + \
+                 remove into the map, adding HashMap-lock contention \
+                 the historic R5 baseline did NOT pay; the
+                 multi-reader fan-out timing becomes a measurement of \
+                 lock contention rather than read throughput."
+            );
+        }
+
         /// Acknowledged limitation: the simulation arm above is a
         /// declarative invariant on the clamp formula. The runtime
         /// guard's behavior (clamp + log) is exercised end-to-end only

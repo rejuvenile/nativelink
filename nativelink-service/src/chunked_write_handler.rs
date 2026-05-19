@@ -789,6 +789,47 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         self.v2_failed_commit_sink.as_ref()
     }
 
+    /// #541 fix-up: test-only boolean accessors for the three production
+    /// durability sinks the v2 commit path consumes. Cross-crate test
+    /// callers (e.g. `nativelink-benchmarks`) need to assert BOTH
+    /// directions of the wiring contract — that a "production-shape"
+    /// helper installs all three (under-action) AND that a "bare" helper
+    /// installs NONE (over-action; e.g. R5's bench cell where the v2
+    /// commit path runs once during prewrite outside the timed body and
+    /// the sinks would silently add per-iter cost the cell is not
+    /// supposed to pay).
+    ///
+    /// Gated behind `#[cfg(any(test, feature = "test-utils"))]` so
+    /// production builds cannot accidentally rely on these for control
+    /// flow. Returns booleans rather than the closure handles themselves
+    /// because the closure-handle accessors above are intentionally
+    /// `pub(crate)` (production must NOT inspect the closures from
+    /// outside this module).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_v2_stable_digests_sink_wired(&self) -> bool {
+        self.v2_stable_digests_sink.is_some()
+    }
+
+    /// See [`is_v2_stable_digests_sink_wired`] for the rationale on
+    /// cross-crate test-only boolean accessors.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_v2_failed_commit_sink_wired(&self) -> bool {
+        self.v2_failed_commit_sink.is_some()
+    }
+
+    /// See [`is_v2_stable_digests_sink_wired`] for the rationale on
+    /// cross-crate test-only boolean accessors.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_chunked_in_flight_digests_wired(&self) -> bool {
+        self.chunked_in_flight_digests.is_some()
+    }
+
     /// Construct a handler with externally-provided in-flight tracker
     /// + chunk budget. Used by tests so the test harness can observe
     /// the in-flight map AND so each test gets its own budget (avoiding
