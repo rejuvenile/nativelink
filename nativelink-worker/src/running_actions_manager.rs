@@ -4999,14 +4999,23 @@ impl RunningActionsManagerImpl {
                                 break true;
                             }
                             Err(e) if e.code == Code::AlreadyExists => {
-                                // #547 Phase 0 instrumentation: AlreadyExists
-                                // counts as a successful tonic Ok from the
-                                // worker's perspective — the server has the
-                                // bytes, the worker will be told to unpin
-                                // via BIS. Record so the pin-release window
-                                // measurement is complete. Pure observability.
-                                worker_phase0_metrics()
-                                    .record_tonic_ok(digest, phase0_action_key);
+                                // #547 fix-up CF2 (perf-optimizer N4): do
+                                // NOT record_tonic_ok here. AlreadyExists
+                                // means the slow tier short-circuits
+                                // FastSlowStore::update without invoking
+                                // stable_digests_pusher → no BIS chunk
+                                // will be broadcast for this digest from
+                                // THIS write. The side-channel entry
+                                // would then sit until 10 min TTL evicts
+                                // it (cache leak, capped by
+                                // TONIC_OK_TS_CACHE_CAPACITY at ~12 MiB
+                                // but operator-confusing on the
+                                // pin-release histogram which would
+                                // appear under-populated). The action's
+                                // per-digest histogram is correctly
+                                // skipped for AlreadyExists; the action
+                                // accumulator's per-action max/total are
+                                // load-bearing on fresh-write semantics.
                                 break true;
                             }
                             Err(e) if e.code == Code::InvalidArgument

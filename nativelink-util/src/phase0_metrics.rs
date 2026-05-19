@@ -555,9 +555,28 @@ impl MetricsComponent for WorkerPhase0Metrics {
 /// `server_phase0_metrics()` accessor.
 #[derive(Debug)]
 pub struct ServerPhase0Metrics {
-    /// Counter: total invocations of `stable_digests_pusher` (the
-    /// commit-path → BIS pipeline entry point). Non-zero confirms the
-    /// commit path is actually firing the pusher.
+    /// Counter: invocations of `stable_digests_pusher` (the commit-path
+    /// → BIS pipeline entry point). Non-zero confirms the commit path
+    /// is firing the pusher.
+    ///
+    /// **Coverage limit (#547 fix-up CF2).** This counter is bumped
+    /// ONLY by the `stable_digests_pusher` closure at
+    /// `fast_slow_store.rs:1420-1428`. Three other production sites
+    /// push directly to `stable_digests.lock()` without routing
+    /// through `stable_digests_pusher` and therefore do NOT bump this
+    /// counter (and do NOT populate `pusher_timestamps`):
+    ///   - `fast_slow_store.rs:2616` `try_self_retry_slow_write`
+    ///     success arm (V3 self-retry after a failed slow write).
+    ///   - `fast_slow_store.rs:5244` and `:5498` failed-write drain
+    ///     re-broadcast paths.
+    /// Per-digest `bis_broadcast_queue_latency` will silently drop
+    /// samples for those digests. Operators reading this counter
+    /// should treat it as "commit-path pusher invocations" — not as
+    /// total BIS broadcast traffic. (`server_bis_broadcast_queue_depth`
+    /// reflects the FULL queue regardless of insert site.) If a
+    /// future audit shows the direct-push sites are non-negligible,
+    /// either route them through `stable_digests_pusher` or add a
+    /// separate counter for the direct-push paths.
     pusher_invoke_count: AtomicU64,
     /// Unix-ms timestamp of the most recent pusher invocation. Operators
     /// can compare against `wall_clock_now()` to detect a stalled commit
@@ -661,16 +680,16 @@ impl MetricsComponent for ServerPhase0Metrics {
         let last_at = self.pusher_last_at_unix_ms.load(Ordering::Relaxed);
         let depth = self.bis_broadcast_queue_depth.load(Ordering::Relaxed);
         nativelink_metric::publish!(
-            "server_stable_digests_pusher_invoke_count",
+            "server_stable_digests_pusher_invoke_via_commit_path_count",
             &invokes,
             nativelink_metric::MetricKind::Counter,
-            "#547 Phase 0: cumulative count of stable_digests_pusher invocations (server commit → BIS pipeline entry); non-zero confirms commit path is firing"
+            "#547 Phase 0 (CF2): stable_digests pushed via the chunked-v2 commit path (stable_digests_pusher closure) only; direct push paths from failed_writes_drain (fast_slow_store.rs:2616 / :5244 / :5498) bypass this counter. Non-zero confirms commit path is firing; this is NOT total BIS broadcast traffic."
         );
         nativelink_metric::publish!(
             "server_stable_digests_pusher_last_at_unix_ms",
             &last_at,
             nativelink_metric::MetricKind::Default,
-            "#547 Phase 0: unix-ms timestamp of most recent stable_digests_pusher invocation; zero means pusher has never fired"
+            "#547 Phase 0: SystemTime-derived unix-ms timestamp of most recent stable_digests_pusher invocation (commit-path only — see _via_commit_path_count for coverage limits); zero means pusher has never fired. Wall-clock source: NTP-step backward can move this gauge backward; operators alerting on monotonic increase should additionally cross-check the _count counter (monotonic) before paging on a step."
         );
         nativelink_metric::publish!(
             "server_bis_broadcast_queue_depth",
@@ -1074,7 +1093,7 @@ mod tests {
             "phase0_worker_worker_concurrent_pinned_bytes_count",
             "phase0_worker_worker_concurrent_pinned_bytes_live",
             "phase0_worker_worker_bis_chunk_arrive_to_handler_count",
-            "phase0_server_server_stable_digests_pusher_invoke_count",
+            "phase0_server_server_stable_digests_pusher_invoke_via_commit_path_count",
             "phase0_server_server_stable_digests_pusher_last_at_unix_ms",
             "phase0_server_server_bis_broadcast_queue_depth",
             "phase0_server_server_bis_broadcast_loop_wake_to_send_count",
