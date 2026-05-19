@@ -498,25 +498,28 @@ impl WorkerPhase0Metrics {
     pub fn record_action_pin_extension(&self, action_key: u64, gap_ms: u64) {
         // Atomic RMW via moka's per-key serialized upsert. Concurrent
         // same-key calls execute in invocation order; cross-key calls
-        // remain fully concurrent.
-        let _ = self
-            .action_pin_accumulators
-            .entry(action_key)
-            .and_upsert_with(|maybe_entry| match maybe_entry {
-                Some(entry) => {
-                    let acc = entry.into_value();
-                    ActionAccumulator {
-                        total_ms: acc.total_ms.saturating_add(gap_ms),
-                        max_ms: acc.max_ms.max(gap_ms),
-                        digest_count: acc.digest_count.saturating_add(1),
+        // remain fully concurrent. The returned `Entry` carries an Arc
+        // to the value; we drop it explicitly to avoid the
+        // `let _ = ... <destructor> ...` lint.
+        drop(
+            self.action_pin_accumulators
+                .entry(action_key)
+                .and_upsert_with(|maybe_entry| match maybe_entry {
+                    Some(entry) => {
+                        let acc = entry.into_value();
+                        ActionAccumulator {
+                            total_ms: acc.total_ms.saturating_add(gap_ms),
+                            max_ms: acc.max_ms.max(gap_ms),
+                            digest_count: acc.digest_count.saturating_add(1),
+                        }
                     }
-                }
-                None => ActionAccumulator {
-                    total_ms: gap_ms,
-                    max_ms: gap_ms,
-                    digest_count: 1,
-                },
-            });
+                    None => ActionAccumulator {
+                        total_ms: gap_ms,
+                        max_ms: gap_ms,
+                        digest_count: 1,
+                    },
+                }),
+        );
     }
 
     /// Producer: called from `spawn_upload_to_remote` when all upload
@@ -1151,34 +1154,52 @@ mod tests {
     /// under-action gap is "publish silently emits nothing" — invisible
     /// to in-process callers, fatal for operator scrapes.
     ///
+    /// **CF4 strengthening (testing-czar finding):** the test now
+    /// asserts specific VALUES for every emitted metric, not just
+    /// presence. Per memory `feedback_publish_body_not_field_existence`
+    /// (#160 / #380 incident 2026-05-11): a future refactor that
+    /// silently dis-wires a producer (e.g. moves it inside an
+    /// `if !mirror_request { ... }` branch that's always false in
+    /// production) would leave the metric in the scrape body but with
+    /// stale-zero values. Presence-only assertions would not catch
+    /// that; value assertions do.
+    ///
     /// Mutation step: comment out any of the `nativelink_metric::publish!`
     /// calls in `WorkerPhase0Metrics::publish` or `ServerPhase0Metrics::publish`.
-    /// This test must red-fail with the bespoke "#547 phase0:" message.
+    /// OR replace a producer-side `fetch_add(1)` with `load()`. The
+    /// test must red-fail with the bespoke "#547 fix-up CF4:" message
+    /// naming the metric whose value was wrong.
     #[test]
     fn publish_emits_metrics_via_render_prometheus() {
         use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
 
         let worker = Arc::new(WorkerPhase0Metrics::new());
-        // Generate at least one observation per histogram so non-zero
-        // buckets prove the publish loop actually walked the buckets,
-        // not just emitted the metric metadata.
         let digest = DigestInfo::try_new(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             100,
         )
         .unwrap();
+        // Pin lifecycle: acquire 4096, release 4096 → live gauge = 0,
+        // concurrent_pinned_bytes count = 1.
+        worker.record_pin_acquired(4096);
+        worker.record_pin_released(4096);
+        // tonic_ok → bis_unpin: pin_release_latency count = 1.
         worker.record_tonic_ok(digest, 0);
         let _ = worker.record_bis_unpin(&digest);
-        worker.record_pin_acquired(4096);
+        // BIS chunk arrival: bis_chunk_arrive_to_handler count = 1.
         let arr = worker.record_bis_chunk_arrival();
         worker.commit_arrival_to_handler(arr);
+        // Per-action: record + commit → action_total + action_max count = 1, sum = 33.
         worker.record_action_pin_extension(99, 33);
         worker.commit_action_pin_extension(99);
 
         let server = Arc::new(ServerPhase0Metrics::new());
+        // Pusher invoke: count = 1, last_at > 0.
         server.record_pusher_invoke(digest);
+        // Wake → send: loop_wake_to_send count = 1.
         let wake = server.record_loop_wake();
         server.commit_loop_wake_to_send(wake);
+        // Broadcast: depth = 7, queue_latency count = 1.
         server.record_broadcast(&[digest], 7);
 
         let registry = MetricsRegistry::new();
@@ -1186,40 +1207,112 @@ mod tests {
         registry.register("phase0_server", server.clone());
         let body = render_prometheus(&registry);
 
-        // Worker-side metric presence assertions. The bespoke "#547 phase0:"
-        // prefix in the assertion message is what makes mutation failures
-        // identifiable in a triage log.
-        let must_contain = [
-            "phase0_worker_worker_pin_release_latency_after_tonic_ok_count",
-            "phase0_worker_worker_pin_release_latency_after_tonic_ok_le_5_ms",
-            "phase0_worker_worker_pin_release_latency_after_tonic_ok_sum_ms",
-            "phase0_worker_worker_action_total_pin_extension_count",
-            "phase0_worker_worker_max_pin_extension_count",
-            "phase0_worker_worker_concurrent_pinned_bytes_count",
-            "phase0_worker_worker_concurrent_pinned_bytes_live",
-            "phase0_worker_worker_bis_chunk_arrive_to_handler_count",
-            "phase0_server_server_stable_digests_pusher_invoke_via_commit_path_count",
-            "phase0_server_server_stable_digests_pusher_last_at_unix_ms",
-            "phase0_server_server_bis_broadcast_queue_depth",
-            "phase0_server_server_bis_broadcast_loop_wake_to_send_count",
-            "phase0_server_server_bis_broadcast_queue_latency_count",
+        // Value-bearing assertions. Each (line, why) pair below names
+        // the producer side-effect that the metric value reflects;
+        // if the producer is silently dis-wired, the line is absent or
+        // the value is stale-zero.
+        //
+        // Format: "<metric> <value>\n" (exposition is one line per
+        // metric, value separated by single space, terminated by
+        // newline — matches the `nativelink_metric::publish!` macro's
+        // emission shape and `render_prometheus`'s capture).
+        let assertions: [(&str, &str, &str); 13] = [
+            // (line to find, metric short-name for error message, expected-state description)
+            (
+                "phase0_worker_worker_pin_release_latency_after_tonic_ok_count 1\n",
+                "pin_release_latency count",
+                "1 round-trip recorded (record_tonic_ok + record_bis_unpin)",
+            ),
+            (
+                "phase0_worker_worker_action_total_pin_extension_count 1\n",
+                "action_total_pin_extension count",
+                "1 commit_action_pin_extension after a 33ms fold",
+            ),
+            (
+                "phase0_worker_worker_action_total_pin_extension_sum_ms 33\n",
+                "action_total_pin_extension sum_ms",
+                "sum should equal the single 33ms gap recorded",
+            ),
+            (
+                "phase0_worker_worker_max_pin_extension_count 1\n",
+                "max_pin_extension count",
+                "1 commit recorded",
+            ),
+            (
+                "phase0_worker_worker_max_pin_extension_sum_ms 33\n",
+                "max_pin_extension sum_ms",
+                "single observation; sum = max = 33ms",
+            ),
+            (
+                "phase0_worker_worker_concurrent_pinned_bytes_count 1\n",
+                "concurrent_pinned_bytes count",
+                "1 pin_acquired (4096 bytes) sampled the gauge",
+            ),
+            (
+                "phase0_worker_worker_concurrent_pinned_bytes_live 0\n",
+                "concurrent_pinned_bytes_live (CF1 invariant)",
+                "acquire(4096) + release(4096) must return live gauge to 0; \
+                 non-zero here would mean record_pin_released was broken or \
+                 the gauge was never decremented",
+            ),
+            (
+                "phase0_worker_worker_bis_chunk_arrive_to_handler_count 1\n",
+                "bis_chunk_arrive_to_handler count",
+                "1 record_bis_chunk_arrival + commit_arrival_to_handler pair",
+            ),
+            (
+                "phase0_server_server_stable_digests_pusher_invoke_via_commit_path_count 1\n",
+                "pusher_invoke_via_commit_path count (CF2 rename)",
+                "1 record_pusher_invoke call",
+            ),
+            (
+                "phase0_server_server_bis_broadcast_queue_depth 7\n",
+                "bis_broadcast_queue_depth",
+                "record_broadcast(_, 7) sets the depth gauge to the last-drained batch size",
+            ),
+            (
+                "phase0_server_server_bis_broadcast_loop_wake_to_send_count 1\n",
+                "bis_broadcast_loop_wake_to_send count",
+                "1 record_loop_wake + commit_loop_wake_to_send pair",
+            ),
+            (
+                "phase0_server_server_bis_broadcast_queue_latency_count 1\n",
+                "bis_broadcast_queue_latency count",
+                "record_broadcast saw 1 digest with a matching pusher_invoke",
+            ),
+            // pin_release_latency sum is timing-dependent (0-1ms typical);
+            // assert on the `_le_5_ms` bucket instead so the test isn't
+            // flaky. A round-trip on the unit timer is sub-ms; the
+            // `le_5_ms` bucket count = 1 confirms the observation
+            // landed in the smallest reasonable bucket.
+            (
+                "phase0_worker_worker_pin_release_latency_after_tonic_ok_le_5_ms 1\n",
+                "pin_release_latency le_5_ms bucket",
+                "unit-test round-trip is sub-ms; the le_5_ms bucket must contain the observation",
+            ),
         ];
-        for needle in must_contain {
+        for (needle, short_name, why) in &assertions {
             assert!(
                 body.contains(needle),
-                "#547 phase0: metric {needle} not emitted via render_prometheus seam; \
-                 publish() either skipped the field or the wrapper struct didn't fire publish_buckets. \
-                 body=\n{body}"
+                "#547 fix-up CF4: metric {short_name} value expected in \
+                 render_prometheus body but not found.\n\
+                 Expected line: {needle:?}\n\
+                 Why: {why}\n\
+                 If this fails after a producer-wiring change, the producer \
+                 stopped firing OR the publish() body dropped this metric \
+                 OR the registry prefix changed. body=\n{body}"
             );
         }
 
-        // Belt-and-braces: at least one histogram count is non-zero
-        // (we recorded observations above), confirming the value path
-        // reaches Prometheus, not just the label scaffolding.
+        // Last-at gauge is non-zero — exact value is SystemTime-derived
+        // so we can only assert presence + a non-zero pattern (any digit).
         assert!(
-            body.contains("phase0_worker_worker_pin_release_latency_after_tonic_ok_count 1\n"),
-            "#547 phase0: pin_release_latency count must be 1 after one round-trip; \
-             observed body=\n{body}"
+            body.contains("phase0_server_server_stable_digests_pusher_last_at_unix_ms ")
+                && !body.contains("phase0_server_server_stable_digests_pusher_last_at_unix_ms 0\n"),
+            "#547 fix-up CF4: pusher_last_at_unix_ms must be non-zero after \
+             record_pusher_invoke; observed it as 0 or missing. The producer \
+             side-effect (SystemTime::now().store(...)) was either not invoked \
+             or its write was discarded by publish(). body=\n{body}"
         );
     }
 }
