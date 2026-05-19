@@ -39,9 +39,14 @@
 //! - **`worker_concurrent_pinned_bytes`** (gauge): point-in-time bytes
 //!   held in worker FilesystemStore pins from chunked-upload commits.
 //!   Informs Phase 2 (#549) pin_budget cap selection.
-//! - **`server_stable_digests_pusher_invoke_count` + `_last_at_unix_ms`**:
-//!   counter + timestamp gauge so operators can confirm the server-side
-//!   commit path is actually firing the BIS pusher (and how recently).
+//! - **`server_stable_digests_pusher_invoke_via_commit_path_count` +
+//!   `_last_at_unix_ms`**: counter + timestamp gauge so operators can
+//!   confirm the server-side commit path is actually firing the BIS
+//!   pusher (and how recently). The `_via_commit_path_` infix names
+//!   the coverage limit per CF2 — this is NOT total BIS broadcast
+//!   traffic; three direct-push sites in `fast_slow_store.rs` bypass
+//!   the `stable_digests_pusher` closure (see the `pusher_invoke_count`
+//!   field doc on `ServerPhase0Metrics`).
 //! - **`server_bis_broadcast_loop_wake_to_send_ms`** (histogram, ms): gap
 //!   between BIS pipeline loop wake (notify or 500ms tick) and the
 //!   `broadcast_blobs_in_stable_storage_chunked` call returning. Names
