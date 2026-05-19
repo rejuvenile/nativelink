@@ -351,8 +351,6 @@ async fn run_w3f(
     scratch_root: &Path,
     iters: u32,
 ) -> Result<BenchmarkResult, nativelink_error::Error> {
-    use core::time::Duration;
-
     use nativelink_config::stores::FilesystemSpec;
     use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
         WriteChunk, cas_extensions_client::CasExtensionsClient,
@@ -367,8 +365,8 @@ async fn run_w3f(
     // unification) automatically apply to W3f and the W1f/W3f comparison
     // cannot silently drift from W3.
     use crate::scenarios::chunked_v2::enabled::{
-        BENCH_CHUNK_SIZE, PRODUCTION_SINKS_WIRED_TAG, build_chunks, drain_v2_response,
-        make_payload,
+        BENCH_CHUNK_SIZE, PRODUCTION_SINKS_WIRED_TAG, bench_client_endpoint,
+        bench_server_builder, build_chunks, drain_v2_response, make_payload,
     };
     use crate::scenarios::digest_via_default_hasher;
 
@@ -417,7 +415,9 @@ async fn run_w3f(
     let _server_guard = nativelink_util::spawn!(
         "w3f-bench-server",
         async move {
-            if let Err(e) = tonic::transport::Server::builder()
+            // h2 settings via shared helper — see #563 + #528, mirrors
+            // production at `src/bin/nativelink.rs:1848-1865`.
+            if let Err(e) = bench_server_builder()
                 .add_service(svc)
                 .serve_with_incoming(incoming)
                 .await
@@ -426,10 +426,10 @@ async fn run_w3f(
             }
         }
     );
-    let endpoint =
-        tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
-            .expect("endpoint parse must succeed")
-            .connect_timeout(Duration::from_secs(5));
+    // h2 settings via shared helper — see #563 + #528, mirrors production
+    // client at `nativelink-util/src/tls_utils.rs:153-208`.
+    let endpoint = bench_client_endpoint(format!("http://127.0.0.1:{port}"))
+        .expect("endpoint parse must succeed");
     let channel = endpoint
         .connect()
         .await
@@ -741,8 +741,8 @@ mod tests {
         use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 
         use crate::scenarios::chunked_v2::enabled::{
-            build_chunks, drain_v2_response, make_handler_with_production_sinks,
-            make_payload,
+            bench_client_endpoint, bench_server_builder, build_chunks,
+            drain_v2_response, make_handler_with_production_sinks, make_payload,
         };
         use crate::scenarios::digest_via_default_hasher;
 
@@ -811,7 +811,8 @@ mod tests {
             let _server_guard = nativelink_util::spawn!(
                 "w3f-sink-wiring-test-server",
                 async move {
-                    if let Err(e) = tonic::transport::Server::builder()
+                    // h2 settings via shared helper — #563 + #528.
+                    if let Err(e) = bench_server_builder()
                         .add_service(svc)
                         .serve_with_incoming(incoming)
                         .await
@@ -822,11 +823,10 @@ mod tests {
                     }
                 }
             );
-            let endpoint = tonic::transport::Endpoint::from_shared(format!(
-                "http://127.0.0.1:{port}"
-            ))
-            .expect("endpoint parse must succeed")
-            .connect_timeout(Duration::from_secs(5));
+            // h2 settings via shared helper — #563 + #528.
+            let endpoint =
+                bench_client_endpoint(format!("http://127.0.0.1:{port}"))
+                    .expect("endpoint parse must succeed");
             let channel = endpoint
                 .connect()
                 .await

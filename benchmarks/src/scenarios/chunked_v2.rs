@@ -502,10 +502,76 @@ pub(crate) mod enabled {
         (handler, state)
     }
 
+    /// HTTP/2 flow-control + frame-size settings the W3 / W3f bench
+    /// helpers apply to BOTH the in-process `tonic::transport::Server`
+    /// and the client `tonic::transport::Endpoint`. Mirrors the
+    /// production server config at
+    /// `src/bin/nativelink.rs:1848-1865` and the client config at
+    /// `nativelink-util/src/tls_utils.rs:153-208`. See #563 (tune W3
+    /// bench h2 flow-control windows) + #528 audit
+    /// (`.claude/audits/528-w3-bimodal-investigation-20260519.md`):
+    /// tonic / hyper RFC defaults are 64 KiB stream + 64 KiB connection,
+    /// which forces one WINDOW_UPDATE round-trip per ~64 KiB segment.
+    /// On the W3 16 MiB single-writer cell that triggered a bimodal
+    /// slow-mode (~+600 ms p99) when a state transition mid-iter caused
+    /// the Linux kernel's 40 ms `tcp_delack_min` toll to fire per chunk.
+    ///
+    /// Drift detector: if either production site changes its value,
+    /// the bench measures something the production fleet does NOT see.
+    /// Reviewers touching either site MUST verify the corresponding
+    /// constant here.
+    pub(crate) const W3_BENCH_INITIAL_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+    /// See [`W3_BENCH_INITIAL_STREAM_WINDOW`].
+    pub(crate) const W3_BENCH_INITIAL_CONNECTION_WINDOW: u32 = 128 * 1024 * 1024;
+    /// See [`W3_BENCH_INITIAL_STREAM_WINDOW`]. Server-side only —
+    /// tonic's `Endpoint` does not expose `max_frame_size` on the
+    /// client; clients negotiate down via the server's SETTINGS frame.
+    pub(crate) const W3_BENCH_MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
+
+    /// Construct a `tonic::transport::Server::Builder` pre-configured
+    /// with the W3 / W3f bench h2 settings (see
+    /// [`W3_BENCH_INITIAL_STREAM_WINDOW`]). Used by `start_v2_server`
+    /// in this file AND by the W3f prodlike cells in `prodlike.rs` so
+    /// the two cells share one source of truth for h2 config — a
+    /// future production-config bump only needs to update the three
+    /// `W3_BENCH_*` constants in this file. **Falsifier:** remove the
+    /// `.initial_stream_window_size(...)` call here; the
+    /// `bench_server_builder_applies_h2_settings` test below red-fails
+    /// with the bespoke "#563 W3 bench h2 stream-window violated"
+    /// message.
+    pub(crate) fn bench_server_builder() -> tonic::transport::Server {
+        tonic::transport::Server::builder()
+            .initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)
+            .initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)
+            .max_frame_size(W3_BENCH_MAX_FRAME_SIZE)
+    }
+
+    /// Construct a `tonic::transport::Endpoint` pre-configured with
+    /// the W3 / W3f bench h2 settings (see
+    /// [`W3_BENCH_INITIAL_STREAM_WINDOW`]) AND a 5 s connect timeout.
+    /// Used by `start_v2_server` and the W3f prodlike cells. The
+    /// `connect_timeout` is preserved from the prior inline call-sites
+    /// (one source of truth for the connect window too). **Falsifier:**
+    /// remove `.initial_stream_window_size(...)` here; the
+    /// `bench_client_endpoint_applies_h2_settings` test red-fails with
+    /// the bespoke "#563 W3 bench h2 stream-window violated" message.
+    pub(crate) fn bench_client_endpoint(
+        uri: String,
+    ) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
+        Ok(tonic::transport::Endpoint::from_shared(uri)?
+            .initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)
+            .initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)
+            .connect_timeout(Duration::from_secs(5)))
+    }
+
     /// Bring up an in-process `CasExtensions` v2 server bound to an
     /// ephemeral port + a connected client. Returns the client and an
     /// `AbortOnDropHandle` for the server task so dropping the cell
     /// aborts the server (no leak).
+    ///
+    /// h2 settings come from [`bench_server_builder`] +
+    /// [`bench_client_endpoint`] — see [`W3_BENCH_INITIAL_STREAM_WINDOW`]
+    /// for the production cross-reference (#563 + #528).
     async fn start_v2_server(
         handler: Arc<ChunkedWriteHandler>,
     ) -> (
@@ -522,7 +588,7 @@ pub(crate) mod enabled {
         let handle = nativelink_util::spawn!(
             "v2-bench-server",
             async move {
-                if let Err(e) = tonic::transport::Server::builder()
+                if let Err(e) = bench_server_builder()
                     .add_service(svc)
                     .serve_with_incoming(incoming)
                     .await
@@ -533,10 +599,8 @@ pub(crate) mod enabled {
                 }
             }
         );
-        let endpoint =
-            tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
-                .expect("endpoint parse must succeed")
-                .connect_timeout(Duration::from_secs(5));
+        let endpoint = bench_client_endpoint(format!("http://127.0.0.1:{port}"))
+            .expect("endpoint parse must succeed");
         let channel = endpoint
             .connect()
             .await
@@ -644,6 +708,27 @@ pub(crate) mod enabled {
     /// inside the noise floor, not a new typical value. True sustained
     /// improvement is **~10-15% at p99 (683 → ~620 ms)**, not 77%.
     ///
+    /// # SUPERSEDED (#563 / #528): the 113-743 ms envelope was
+    /// # h2-window-confounded — re-baseline post-fix
+    ///
+    /// The #528 bimodal investigation root-caused the ~600 ms spread
+    /// to the bench's h2 flow-control defaults (64 KiB stream window
+    /// vs production's 16 MiB). Under default windows, 1 MiB chunks
+    /// forced a WINDOW_UPDATE round-trip per ~64 KiB segment; mid-iter
+    /// state transitions triggered the Linux kernel's 40 ms
+    /// `tcp_delack_min` toll per chunk, producing the bimodal slow-mode
+    /// that anchored the 113-743 ms envelope's wide tail. #563 fixed
+    /// this by wiring the production h2 settings into the bench via
+    /// [`bench_server_builder`] + [`bench_client_endpoint`].
+    ///
+    /// **The 113-743 ms envelope above is therefore no longer
+    /// load-bearing.** Future reviewers comparing baselines on this
+    /// cell should re-collect a fresh envelope on the post-#563 SHA
+    /// (expected p99 ≤ 150 ms per the #528 prediction) and treat THAT
+    /// as the new typical. The historical table is preserved here so
+    /// the regression context is auditable if a future change
+    /// re-introduces a similar confound.
+    ///
     /// **Attribution of the (smaller) true win** — what actually moved
     /// out of the timed body when the prebuilt pool was hoisted:
     ///
@@ -741,11 +826,14 @@ pub(crate) mod enabled {
     const W3_CELLS: &[W3Cell] = &[
         // Historic shape — single writer, both sizes.
         W3Cell { size: 4 * BENCH_CHUNK_SIZE, concurrency: 1, label: "4MiB", iters_override: None },
-        // 16 MiB c=1 p99 sits in a 113-743 ms single-sample envelope at
-        // iters=20 (see make_payload doc-block). 50 iters narrows the
-        // p99/max-of-N estimator enough that future runs land near the
-        // typical ~620 ms rather than the lucky-sample lows. 50 × 16 MiB
-        // = 800 MiB pool, well under POOL_MAX_BYTES.
+        // 16 MiB c=1 p99 SUPERSEDED ENVELOPE: the historic 113-743 ms
+        // single-sample envelope at iters=20 was h2-window-confounded
+        // (see make_payload doc-block "SUPERSEDED" section + #563 +
+        // #528). Post-#563 expected p99 ≤ ~150 ms; re-baseline before
+        // treating any value here as typical. The 50-iter override is
+        // retained because it still gives p99 a stable tail population
+        // independent of the absolute value. 50 × 16 MiB = 800 MiB
+        // pool, well under POOL_MAX_BYTES.
         W3Cell { size: 16 * BENCH_CHUNK_SIZE, concurrency: 1, label: "16MiB", iters_override: Some(50) },
         // 4 MiB at multiple concurrency levels (small enough memory to
         // tolerate N=64).
@@ -1992,6 +2080,197 @@ pub(crate) mod enabled {
                     POOL_MAX_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
                 );
             }
+        }
+
+        /// #563: the W3 / W3f bench h2 window constants must match the
+        /// production server (`src/bin/nativelink.rs:1848-1865`) and
+        /// the production client (`nativelink-util/src/tls_utils.rs:153-208`).
+        /// If either production site changes, this test red-fails with
+        /// a bespoke message that names the constant — the bench is
+        /// then measuring a configuration the fleet does not see.
+        ///
+        /// Mutation: change `W3_BENCH_INITIAL_STREAM_WINDOW` to any
+        /// other value (e.g. `64 * 1024` — the pre-#563 default) and
+        /// the assertion below red-fails with
+        /// `#563 W3 bench h2 stream-window violated`.
+        #[test]
+        fn bench_h2_window_constants_match_production() {
+            assert_eq!(
+                W3_BENCH_INITIAL_STREAM_WINDOW,
+                16 * 1024 * 1024,
+                "#563 W3 bench h2 stream-window violated: \
+                 W3_BENCH_INITIAL_STREAM_WINDOW must equal production's \
+                 16 MiB (src/bin/nativelink.rs:1848-1851). \
+                 64 KiB tonic/hyper default triggers per-segment \
+                 WINDOW_UPDATE round-trips + Linux tcp_delack_min toll \
+                 (#528 audit)."
+            );
+            assert_eq!(
+                W3_BENCH_INITIAL_CONNECTION_WINDOW,
+                128 * 1024 * 1024,
+                "#563 W3 bench h2 connection-window violated: \
+                 W3_BENCH_INITIAL_CONNECTION_WINDOW must equal \
+                 production's 128 MiB (src/bin/nativelink.rs:1853-1857)."
+            );
+            assert_eq!(
+                W3_BENCH_MAX_FRAME_SIZE,
+                4 * 1024 * 1024,
+                "#563 W3 bench h2 max-frame-size violated: \
+                 W3_BENCH_MAX_FRAME_SIZE must equal production's 4 MiB \
+                 (src/bin/nativelink.rs:1861-1865)."
+            );
+        }
+
+        /// #563 source-introspection falsifier: the helper bodies
+        /// MUST call the h2-setter chain with the named constants.
+        /// A future drift where someone removes the
+        /// `.initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)`
+        /// call from `bench_server_builder` or `bench_client_endpoint`
+        /// while leaving the constants alone would silently regress
+        /// every W3 / W3f cell back to tonic's 64 KiB default.
+        ///
+        /// This test uses `include_str!` on the source file at compile
+        /// time, **strips line-comments** (so a commented-out setter
+        /// no longer satisfies the assertion), then string-greps for
+        /// the required setter chain on the constant. **Mutation:**
+        /// comment out OR delete the
+        /// `.initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)`
+        /// line in either helper; this test red-fails with the bespoke
+        /// `#563 W3 bench h2 stream-window violated` message naming
+        /// which helper lost the setter.
+        ///
+        /// Why source-introspection vs a behavioral timing check:
+        /// loopback bypasses the kernel TCP stack's `tcp_delack_min`
+        /// code path, so the 40 ms toll that triggered the production
+        /// bimodal slow-mode does NOT reproduce in a unit test. A
+        /// timing-based behavioral test on loopback cannot
+        /// distinguish 64 KiB windows from 16 MiB windows by p99
+        /// alone. The source-introspection approach catches the
+        /// regression directly at the configuration site.
+        #[test]
+        fn helpers_call_setters_on_named_constants() {
+            const SRC: &str = include_str!("chunked_v2.rs");
+            // Strip line-comments (anything after `//`) BEFORE
+            // grepping so that commenting-out the setter line does
+            // not satisfy the contains check. This is a deliberate
+            // simplification: we don't strip block comments (none
+            // are used in the helper bodies) or string-literal `//`
+            // sequences (none in this file). If those forms appear
+            // here in future, switch to a proper Rust tokenizer.
+            let strip_line_comments = |s: &str| -> String {
+                s.lines()
+                    .map(|l| match l.find("//") {
+                        Some(idx) => &l[..idx],
+                        None => l,
+                    })
+                    .collect::<Vec<&str>>()
+                    .join("\n")
+            };
+            // bench_server_builder: server side — all three.
+            let raw_server_block = SRC
+                .split("fn bench_server_builder")
+                .nth(1)
+                .expect("bench_server_builder helper must exist")
+                .split("\n    }")
+                .next()
+                .expect("server helper body must end with `    }`");
+            let server_block = strip_line_comments(raw_server_block);
+            assert!(
+                server_block.contains(
+                    ".initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)"
+                ),
+                "#563 W3 bench h2 stream-window violated: \
+                 bench_server_builder no longer calls \
+                 .initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW). \
+                 Reverting to tonic's 64 KiB default re-introduces the \
+                 #528 bimodal slow-mode. Server body (comments stripped):\n{server_block}"
+            );
+            assert!(
+                server_block.contains(
+                    ".initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)"
+                ),
+                "#563 W3 bench h2 connection-window violated: \
+                 bench_server_builder no longer calls \
+                 .initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)."
+            );
+            assert!(
+                server_block.contains(".max_frame_size(W3_BENCH_MAX_FRAME_SIZE)"),
+                "#563 W3 bench h2 max-frame-size violated: \
+                 bench_server_builder no longer calls \
+                 .max_frame_size(W3_BENCH_MAX_FRAME_SIZE)."
+            );
+            // bench_client_endpoint: client side — stream + connection
+            // only; tonic's Endpoint does not expose max_frame_size.
+            let raw_client_block = SRC
+                .split("fn bench_client_endpoint")
+                .nth(1)
+                .expect("bench_client_endpoint helper must exist")
+                .split("\n    }")
+                .next()
+                .expect("client helper body must end with `    }`");
+            let client_block = strip_line_comments(raw_client_block);
+            assert!(
+                client_block.contains(
+                    ".initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)"
+                ),
+                "#563 W3 bench h2 stream-window violated: \
+                 bench_client_endpoint no longer calls \
+                 .initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW). \
+                 Reverting to tonic's 64 KiB default re-introduces the \
+                 #528 bimodal slow-mode. Client body (comments stripped):\n{client_block}"
+            );
+            assert!(
+                client_block.contains(
+                    ".initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)"
+                ),
+                "#563 W3 bench h2 connection-window violated: \
+                 bench_client_endpoint no longer calls \
+                 .initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)."
+            );
+        }
+
+        /// #563 end-to-end behavioral sanity: bringing up a v2 server
+        /// + client via the helpers, the round-trip of a single
+        /// 4 MiB chunk (well above the 64 KiB default window) must
+        /// succeed within a generous timeout. The point is NOT to
+        /// time the transfer precisely (loopback masks the
+        /// `tcp_delack_min` toll — see `helpers_call_setters...`
+        /// doc-comment) but to PROVE the configured windows do not
+        /// reject or stall a payload that needs more than one window
+        /// of in-flight bytes.
+        #[tokio::test]
+        async fn helpers_round_trip_payload_above_default_window() {
+            // 4 MiB > 64 KiB default stream window — would require
+            // ~64 WINDOW_UPDATE round-trips under tonic defaults.
+            let payload_size = 4 * 1024 * 1024;
+            let (store, _temp_dir) = make_filesystem_store(None)
+                .await
+                .expect("test filesystem store must build");
+            let handler = make_handler(store);
+            let (mut client, _server_guard) = start_v2_server(handler).await;
+            let payload = make_payload(payload_size, 0xC0DE_F00D);
+            let digest = digest_via_default_hasher(&payload);
+            let chunks = build_chunks(digest, &payload);
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.write_chunked_v2(tokio_stream::iter(chunks)),
+            )
+            .await
+            .expect("#563 helpers round-trip must complete in 10 s")
+            .expect("write_chunked_v2 RPC must return Ok");
+            let committed = tokio::time::timeout(
+                Duration::from_secs(10),
+                drain_v2_response(response.into_inner()),
+            )
+            .await
+            .expect("#563 helpers drain must complete in 10 s")
+            .expect("v2 commit must succeed");
+            assert_eq!(
+                committed, payload_size as u64,
+                "#563 helpers round-trip: committed bytes must equal \
+                 payload size; mismatch implies a window/frame setting \
+                 truncated the stream"
+            );
         }
     }
 }
