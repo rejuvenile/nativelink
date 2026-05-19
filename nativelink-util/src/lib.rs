@@ -41,6 +41,7 @@ pub mod metrics_utils;
 pub mod operation_state_manager;
 pub mod origin_event;
 pub mod origin_event_publisher;
+pub mod phase0_metrics;
 pub mod platform_properties;
 #[cfg(feature = "pprof")]
 pub mod pprof_server;
