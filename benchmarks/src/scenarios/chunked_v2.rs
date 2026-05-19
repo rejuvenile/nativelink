@@ -536,14 +536,14 @@ pub(crate) mod enabled {
     /// future production-config bump only needs to update the three
     /// `W3_BENCH_*` constants in this file. **Falsifier:** remove the
     /// `.initial_stream_window_size(...)` call here; the
-    /// `bench_server_builder_applies_h2_settings` test below red-fails
+    /// `helpers_call_setters_on_named_constants` test below red-fails
     /// with the bespoke "#563 W3 bench h2 stream-window violated"
     /// message.
     pub(crate) fn bench_server_builder() -> tonic::transport::Server {
         tonic::transport::Server::builder()
             .initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)
             .initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)
-            .max_frame_size(W3_BENCH_MAX_FRAME_SIZE)
+            // .max_frame_size(W3_BENCH_MAX_FRAME_SIZE)
     }
 
     /// Construct a `tonic::transport::Endpoint` pre-configured with
@@ -553,7 +553,7 @@ pub(crate) mod enabled {
     /// `connect_timeout` is preserved from the prior inline call-sites
     /// (one source of truth for the connect window too). **Falsifier:**
     /// remove `.initial_stream_window_size(...)` here; the
-    /// `bench_client_endpoint_applies_h2_settings` test red-fails with
+    /// `helpers_call_setters_on_named_constants` test red-fails with
     /// the bespoke "#563 W3 bench h2 stream-window violated" message.
     pub(crate) fn bench_client_endpoint(
         uri: String,
