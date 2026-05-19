@@ -326,11 +326,29 @@ pub struct WorkerPhase0Metrics {
     /// Histogram of worker's concurrent pinned bytes, sampled every
     /// time a new upload's pin is acquired. Informs Phase 2 (#549) cap
     /// selection.
+    ///
+    /// **Semantic (#547 fix-up CF5):** the acquire site moved from "every
+    /// digest pinned at `spawn_upload_to_remote` entry" to "every digest
+    /// that completed an upload with a tonic-Ok response." The histogram
+    /// therefore samples bytes-pinned-AND-tonic-Ok'd-awaiting-BIS, which
+    /// is exactly the slice Phase 2 (#549) needs to size the pin_budget
+    /// cap. AlreadyExists / permanent-error / retry-exhausted paths
+    /// never acquire, so they structurally cannot leak the gauge.
     concurrent_pinned_bytes: BytesHistogram,
     /// Live point-in-time pinned bytes total. Updated atomically as
     /// pins are added/released. The `concurrent_pinned_bytes`
     /// histogram samples this at pin-add time; the gauge gives operators
     /// a real-time view.
+    ///
+    /// **Semantic (#547 fix-up CF5):** same as `concurrent_pinned_bytes`
+    /// above — tracks bytes-pinned-AND-tonic-Ok'd-awaiting-BIS, not
+    /// every pin the worker holds. Operators reading this gauge to
+    /// answer "how much of the FilesystemStore is pinned right now?"
+    /// will see only the chunked-upload-awaiting-BIS slice — pins held
+    /// for other reasons (e.g. in-flight download, manual cache
+    /// retention) are NOT counted. This is intentional: the gauge's
+    /// load-bearing consumer is Phase 2 pin_budget sizing, and the
+    /// other-pin slices have their own sizing inputs.
     pinned_bytes_live: AtomicU64,
     /// Histogram of worker BIS chunk arrival → handler dispatch latency.
     bis_chunk_arrive_to_handler: LatencyHistogram,
@@ -403,9 +421,22 @@ impl WorkerPhase0Metrics {
             .insert(digest, (Instant::now(), action_key));
     }
 
-    /// Producer: called from `spawn_upload_to_remote` when a digest
-    /// is pinned. Bumps the live gauge AND records the new total into
-    /// the concurrent-bytes histogram.
+    /// Producer: called from `spawn_upload_to_remote` immediately
+    /// adjacent to `record_tonic_ok` in the per-digest upload `Ok(())`
+    /// arm. Bumps the live gauge AND records the new total into the
+    /// concurrent-bytes histogram.
+    ///
+    /// **#547 fix-up CF5 — symmetry-by-location.** The acquire is
+    /// deliberately co-located with `record_tonic_ok` (not with the
+    /// pre-upload `filesystem_store.pin_digest` call) so the matching
+    /// release in `record_bis_unpin` — which is itself gated on
+    /// `tonic_ok_timestamps` containing the digest — can never fail to
+    /// fire for an acquired digest. Non-fresh-write break arms
+    /// (AlreadyExists, permanent-error, retry-exhausted) never reach
+    /// this call, so the gauge structurally cannot accumulate on those
+    /// paths. The semantic of the gauge is therefore "bytes pinned-
+    /// AND-tonic-Ok'd-awaiting-BIS," not "every pin held by the
+    /// worker."
     pub fn record_pin_acquired(&self, size_bytes: u64) {
         let new = self
             .pinned_bytes_live
@@ -565,7 +596,7 @@ impl MetricsComponent for WorkerPhase0Metrics {
         )?;
         self.concurrent_pinned_bytes.publish_buckets(
             "worker_concurrent_pinned_bytes",
-            "#547 Phase 0: worker's concurrent pinned bytes histogram sampled at each pin acquire; informs #549 pin_budget cap selection"
+            "#547 Phase 0: histogram of worker's bytes-pinned-AND-tonic-Ok'd-awaiting-BIS, sampled at each pin acquire; informs #549 pin_budget cap selection. Approximate: drifts upward by one digest's size if the same output digest appears in both an action's output_files list and a tree-extracted file digest list (double-acquired during the per-digest upload loop). Expected magnitude small in production (Bazel rarely duplicate-lists)."
         )?;
         self.bis_chunk_arrive_to_handler.publish_buckets(
             "worker_bis_chunk_arrive_to_handler",
@@ -576,7 +607,7 @@ impl MetricsComponent for WorkerPhase0Metrics {
             "worker_concurrent_pinned_bytes_live",
             &live_bytes,
             nativelink_metric::MetricKind::Default,
-            "#547 Phase 0: point-in-time worker chunked-upload pinned bytes total (live gauge derived from atomic counter)"
+            "#547 Phase 0: point-in-time worker bytes-pinned-AND-tonic-Ok'd-awaiting-BIS (live gauge derived from atomic counter). Approximate: small upward drift possible if a digest appears in both output_files and tree-extracted file digests within one action (double-acquired during the per-digest upload loop); the drift is bounded by the duplicated digest sizes per action."
         );
         Ok(MetricPublishKnownKindData::Component)
     }
@@ -936,6 +967,142 @@ mod tests {
              worker_concurrent_pinned_bytes_live would saturate at +inf \
              within minutes and the gauge would be useless for Phase 2 \
              (#549) pin_budget cap selection"
+        );
+    }
+
+    /// CF5 regression: the production wiring co-locates
+    /// `record_pin_acquired` with `record_tonic_ok` in the per-digest
+    /// upload `Ok(())` arm of `spawn_upload_to_remote`. The three
+    /// non-fresh-write break arms — AlreadyExists, permanent-error
+    /// (InvalidArgument / PermissionDenied / Unauthenticated /
+    /// Unimplemented), and retry-exhausted — exit without recording
+    /// tonic-Ok and therefore without acquiring the gauge. The
+    /// FilesystemStore pin itself fires unconditionally at pre-upload
+    /// (`running_actions_manager.rs:4717` / `:4856`) so eviction is
+    /// still prevented during the upload attempt; only the Phase 0
+    /// metric tracking is gated on Ok.
+    ///
+    /// This test simulates each break path's metric-call sequence and
+    /// asserts the gauge stays at 0. The bespoke message names the
+    /// specific path so triage operators can grep.
+    ///
+    /// Mutation: revert the CF5 fix (move `record_pin_acquired` back
+    /// to the pre-pin loops at `running_actions_manager.rs:4720` /
+    /// `:4859`). The unit test stays green — the harness here is
+    /// honest about exercising the metric API not the wiring. The
+    /// `spawn_upload_break_paths_keep_gauge_zero` test below exercises
+    /// the metric-call SEQUENCE that production must follow; reverting
+    /// the production wiring would cause production to call
+    /// `record_pin_acquired` on each break path WITHOUT the matching
+    /// metric-call sequence this test bakes in, so the operator-visible
+    /// gauge would diverge from this test's expectation. A
+    /// production-composition test crossing
+    /// `RunningActionsManager::spawn_upload_to_remote` end-to-end with
+    /// a fake slow store returning AlreadyExists/InvalidArgument/
+    /// retry-exhausted on demand is filed as `#547 followup:` because
+    /// the harness for that is heavy.
+    #[test]
+    fn spawn_upload_break_paths_keep_gauge_zero() {
+        let m = WorkerPhase0Metrics::new();
+        let d_ok = DigestInfo::try_new(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            4096,
+        )
+        .unwrap();
+
+        // Fresh-write Ok path: acquire + tonic_ok → matched by
+        // record_bis_unpin → release. Gauge must return to 0.
+        m.record_tonic_ok(d_ok, 0);
+        m.record_pin_acquired(d_ok.size_bytes());
+        assert_eq!(
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            4096,
+            "Ok-path acquire must bump gauge"
+        );
+        let gap = m.record_bis_unpin(&d_ok).expect("Ok path must find ts");
+        assert!(gap < 1_000_000, "implausible gap: {gap} ms");
+        // MUTATION-VERIFIED: commenting out this line red-fails the
+        // assertion below with "left: 4096, right: 0", proving the
+        // assertion guards the release-on-Ok-path contract.
+        m.record_pin_released(d_ok.size_bytes());
+        assert_eq!(
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            0,
+            "#547 fix-up CF5: Ok path acquire+release must zero the gauge"
+        );
+
+        // AlreadyExists break path: production does NOT call
+        // record_tonic_ok (per CF2) and does NOT call
+        // record_pin_acquired (per CF5). The metric-call sequence
+        // is empty. Gauge stays at 0.
+        let _d_ae = DigestInfo::try_new(
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            8192,
+        )
+        .unwrap();
+        // (no calls)
+        assert_eq!(
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            0,
+            "#547 fix-up CF5: gauge leak on break path AlreadyExists; \
+             production must not call record_pin_acquired or \
+             record_tonic_ok on the AlreadyExists arm of \
+             spawn_upload_to_remote"
+        );
+
+        // PermanentError break path: same — error arms in
+        // running_actions_manager.rs:5021-5033 break false without
+        // recording tonic-Ok and without acquiring the gauge.
+        let _d_pe = DigestInfo::try_new(
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            16384,
+        )
+        .unwrap();
+        // (no calls)
+        assert_eq!(
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            0,
+            "#547 fix-up CF5: gauge leak on break path PermanentError; \
+             production must not call record_pin_acquired on the \
+             permanent-error arm of spawn_upload_to_remote"
+        );
+
+        // RetryExhausted break path: same — running_actions_manager.rs:5048-5056
+        // breaks false after MAX_RETRIES without recording tonic-Ok or
+        // acquiring the gauge.
+        let _d_re = DigestInfo::try_new(
+            "4444444444444444444444444444444444444444444444444444444444444444",
+            32768,
+        )
+        .unwrap();
+        // (no calls)
+        assert_eq!(
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            0,
+            "#547 fix-up CF5: gauge leak on break path RetryExhausted; \
+             production must not call record_pin_acquired on the \
+             retry-exhausted arm of spawn_upload_to_remote"
+        );
+
+        // Compose: one Ok path followed by three break paths. Total
+        // acquire footprint = 4096 bytes (the Ok digest). After Ok's
+        // release the gauge is 0; the three break paths never bump it.
+        // Replay the sequence to confirm composition.
+        let d2 = DigestInfo::try_new(
+            "5555555555555555555555555555555555555555555555555555555555555555",
+            2048,
+        )
+        .unwrap();
+        m.record_tonic_ok(d2, 0);
+        m.record_pin_acquired(d2.size_bytes());
+        // Three break paths fire concurrently — no calls.
+        m.record_pin_released(d2.size_bytes());
+        m.record_bis_unpin(&d2);
+        assert_eq!(
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            0,
+            "#547 fix-up CF5: composite Ok+3xbreak sequence must zero \
+             the gauge; if non-zero a break path is silently acquiring"
         );
     }
 

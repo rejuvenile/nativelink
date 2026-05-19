@@ -4715,10 +4715,21 @@ impl RunningActionsManagerImpl {
         let filesystem_store = self.filesystem_store.clone();
         for digest in &digests {
             filesystem_store.pin_digest(digest);
-            // #547 Phase 0 instrumentation: record live pinned-bytes
-            // gauge growth + histogram sample. Pure observability.
-            worker_phase0_metrics().record_pin_acquired(digest.size_bytes());
         }
+        // #547 fix-up CF5: record_pin_acquired moved out of this loop into
+        // the per-digest upload `Ok(())` arm (see `:5000-5005` below).
+        // Rationale: the previous unconditional acquire at this pre-upload
+        // site leaked the `worker_concurrent_pinned_bytes_live` gauge on
+        // every non-fresh-write break path (AlreadyExists, permanent-error,
+        // retry-exhausted) because the BIS-unpin handler only ever
+        // decrements digests that recorded a tonic-Ok timestamp (and CF2
+        // intentionally skips that for AlreadyExists). Tying acquire to
+        // the same control-flow seam as `record_tonic_ok` makes
+        // acquire+release structurally symmetric and closes the leak class
+        // (distributed-systems-reviewer re-verify MAJOR-A, 2026-05-15).
+        // The FilesystemStore pin itself stays unconditional — it
+        // prevents eviction during the upload attempt regardless of
+        // outcome; only the Phase 0 metric tracking moves.
 
         // #547 Phase 0 instrumentation: assign a per-action key so the
         // BIS-unpin handler can fold per-digest gaps into the action's
@@ -4852,11 +4863,14 @@ impl RunningActionsManagerImpl {
                             }
                         }
                         // Pin tree file digests to prevent eviction.
+                        // #547 fix-up CF5: see the matching comment above
+                        // the initial digest-pin loop — `record_pin_acquired`
+                        // has moved to the per-digest upload `Ok(())` arm
+                        // so the gauge only tracks bytes-pinned-AND-tonic-
+                        // Ok'd-awaiting-BIS, which is exactly the slice
+                        // Phase 2 (#549) needs for cap sizing.
                         for digest in &file_digests {
                             filesystem_store.pin_digest(digest);
-                            // #547 Phase 0 instrumentation. Pure observability.
-                            worker_phase0_metrics()
-                                .record_pin_acquired(digest.size_bytes());
                         }
                         digests.extend(file_digests);
                     }
@@ -4996,6 +5010,20 @@ impl RunningActionsManagerImpl {
                                 // BIS chunk arrives. Pure observability.
                                 worker_phase0_metrics()
                                     .record_tonic_ok(digest, phase0_action_key);
+                                // #547 fix-up CF5: acquire the live-pin
+                                // gauge HERE (adjacent to record_tonic_ok)
+                                // rather than at the pre-upload pin sites.
+                                // This ties acquire to the same control-
+                                // flow seam as the release in the BIS-
+                                // unpin handler (gated on
+                                // `record_bis_unpin().is_some()`, which
+                                // requires the tonic_ok_timestamps entry
+                                // this call populates). Non-Ok break arms
+                                // (AlreadyExists, permanent-error, retry-
+                                // exhausted) never acquire, so they
+                                // structurally cannot leak the gauge.
+                                worker_phase0_metrics()
+                                    .record_pin_acquired(digest.size_bytes());
                                 break true;
                             }
                             Err(e) if e.code == Code::AlreadyExists => {
