@@ -358,15 +358,11 @@ struct ActionAccumulator {
     digest_count: u64,
 }
 
-impl ActionAccumulator {
-    const fn new() -> Self {
-        Self {
-            total_ms: 0,
-            max_ms: 0,
-            digest_count: 0,
-        }
-    }
-}
+// ActionAccumulator has no `new()` because the only callers are
+// `record_action_pin_extension`'s `and_upsert_with` arms, which
+// construct via struct literal so the initial values reflect the
+// caller's first observation (None arm: total_ms = gap_ms, max_ms =
+// gap_ms, digest_count = 1) — a constructed "zero" would be wrong.
 
 impl WorkerPhase0Metrics {
     fn new() -> Self {
@@ -482,18 +478,45 @@ impl WorkerPhase0Metrics {
     /// is any caller-chosen u64 that uniquely identifies the action
     /// across its lifecycle; using `OperationId.hash()` or similar is
     /// fine because the accumulator self-resets on commit.
+    ///
+    /// **Invariant (#547 fix-up CF3): concurrent invocations with the
+    /// same `action_key` produce the correct sum/max.** Earlier
+    /// implementation used a get-update-insert pattern which under
+    /// concurrent BIS dispatch (e.g. a future refactor that
+    /// `tokio::spawn`s the chunk handler to unblock the dispatch loop)
+    /// would lose updates: both invocations would read the same
+    /// baseline, both compute their own updates, the second `insert`
+    /// would clobber the first. Today single-threaded BIS dispatch in
+    /// `local_worker.rs:2229` protects against this; tomorrow's
+    /// refactor would silently corrupt per-action `total_ms` /
+    /// `max_ms` / `digest_count` by up to 50% per collision.
+    ///
+    /// Fix: `moka::sync::Cache::entry(key).and_upsert_with(|opt| ...)`
+    /// uses per-key locking (documented in moka 0.12 `and_upsert_with`)
+    /// so concurrent same-key calls serialize and each sees the prior
+    /// update's result.
     pub fn record_action_pin_extension(&self, action_key: u64, gap_ms: u64) {
-        // Fetch-or-create accumulator, update, write back.
-        let existing = self
+        // Atomic RMW via moka's per-key serialized upsert. Concurrent
+        // same-key calls execute in invocation order; cross-key calls
+        // remain fully concurrent.
+        let _ = self
             .action_pin_accumulators
-            .get(&action_key)
-            .unwrap_or_else(ActionAccumulator::new);
-        let updated = ActionAccumulator {
-            total_ms: existing.total_ms.saturating_add(gap_ms),
-            max_ms: existing.max_ms.max(gap_ms),
-            digest_count: existing.digest_count.saturating_add(1),
-        };
-        self.action_pin_accumulators.insert(action_key, updated);
+            .entry(action_key)
+            .and_upsert_with(|maybe_entry| match maybe_entry {
+                Some(entry) => {
+                    let acc = entry.into_value();
+                    ActionAccumulator {
+                        total_ms: acc.total_ms.saturating_add(gap_ms),
+                        max_ms: acc.max_ms.max(gap_ms),
+                        digest_count: acc.digest_count.saturating_add(1),
+                    }
+                }
+                None => ActionAccumulator {
+                    total_ms: gap_ms,
+                    max_ms: gap_ms,
+                    digest_count: 1,
+                },
+            });
     }
 
     /// Producer: called from `spawn_upload_to_remote` when all upload
@@ -922,6 +945,88 @@ mod tests {
                 .inf_bucket
                 .load(Ordering::Relaxed),
             1
+        );
+    }
+
+    /// CF3 regression: concurrent calls to `record_action_pin_extension`
+    /// with the same `action_key` must produce the correct sum + max.
+    /// The earlier get-update-insert pattern would lose updates under
+    /// concurrent BIS dispatch (a refactor that `tokio::spawn`s the
+    /// chunk handler to unblock the dispatch loop would silently
+    /// corrupt `total_ms` / `max_ms` / `digest_count`).
+    ///
+    /// This test spawns 2 OS threads that each call
+    /// `record_action_pin_extension(key, gap)` N times. Expected
+    /// outcomes after both complete:
+    ///   - `digest_count == 2 * N` (no lost updates)
+    ///   - `total_ms == 2 * N * gap_per_call_avg`
+    ///   - `max_ms == max(gap_per_call)`
+    ///
+    /// Mutation: revert `and_upsert_with` to the original
+    /// get-update-insert pattern; test must red-fail with the bespoke
+    /// "#547 fix-up CF3" message because concurrent loads will see a
+    /// stale baseline and the second writer will clobber the first.
+    /// Note: under a single-threaded scheduler this race is hard to
+    /// hit; the test deliberately uses `std::thread::spawn` (NOT
+    /// tokio) to maximize OS-thread interleaving so the race surfaces
+    /// reliably in CI.
+    #[test]
+    fn action_accumulator_concurrent_updates_atomic_rmw() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let m = StdArc::new(WorkerPhase0Metrics::new());
+        let key: u64 = 0xC0FFEE_DEAD_BEEF;
+        const ITERS: u64 = 1000;
+        const GAP_PER_CALL: u64 = 7;
+
+        let m1 = StdArc::clone(&m);
+        let h1 = thread::spawn(move || {
+            for _ in 0..ITERS {
+                m1.record_action_pin_extension(key, GAP_PER_CALL);
+            }
+        });
+        let m2 = StdArc::clone(&m);
+        let h2 = thread::spawn(move || {
+            for _ in 0..ITERS {
+                m2.record_action_pin_extension(key, GAP_PER_CALL);
+            }
+        });
+        h1.join().expect("thread 1 must complete");
+        h2.join().expect("thread 2 must complete");
+
+        let acc = m
+            .action_pin_accumulators
+            .get(&key)
+            .expect("accumulator must exist after 2 * ITERS records");
+        let expected_total = 2 * ITERS * GAP_PER_CALL;
+        let expected_count = 2 * ITERS;
+        assert_eq!(
+            acc.digest_count, expected_count,
+            "#547 fix-up CF3: action accumulator RMW race; concurrent fold \
+             corrupts total_ms/max_ms — digest_count under-counted by \
+             {} (expected {}, observed {}). Mechanism: get-update-insert \
+             pattern non-atomic on moka::sync::Cache; per-key serialized \
+             entry().and_upsert_with() is required.",
+            expected_count - acc.digest_count,
+            expected_count,
+            acc.digest_count
+        );
+        assert_eq!(
+            acc.total_ms, expected_total,
+            "#547 fix-up CF3: action accumulator RMW race; concurrent fold \
+             corrupts total_ms (expected {}, observed {}). Lost-update count: {}.",
+            expected_total,
+            acc.total_ms,
+            expected_count.saturating_sub(acc.digest_count)
+        );
+        // max_ms is associative under concurrent max, so even a racy
+        // implementation gets this right. Verify anyway.
+        assert_eq!(
+            acc.max_ms, GAP_PER_CALL,
+            "#547 fix-up CF3: max_ms should equal GAP_PER_CALL = {} under \
+             constant-gap workload (observed {})",
+            GAP_PER_CALL, acc.max_ms
         );
     }
 
