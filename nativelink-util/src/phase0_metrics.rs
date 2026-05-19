@@ -1285,15 +1285,20 @@ mod tests {
                 "bis_broadcast_queue_latency count",
                 "record_broadcast saw 1 digest with a matching pusher_invoke",
             ),
-            // pin_release_latency sum is timing-dependent (0-1ms typical);
-            // assert on the `_le_5_ms` bucket instead so the test isn't
-            // flaky. A round-trip on the unit timer is sub-ms; the
-            // `le_5_ms` bucket count = 1 confirms the observation
-            // landed in the smallest reasonable bucket.
+            // pin_release_latency sum is timing-dependent (0-1ms typical
+            // in isolation, occasionally up to hundreds of ms under
+            // parallel-test scheduler load in CI); assert on the
+            // largest bucket (`_le_1000_ms`) which always catches the
+            // observation regardless of scheduler jitter. This still
+            // confirms the value path reaches Prometheus — a missing
+            // wiring would leave ALL buckets at 0, not just the small
+            // ones. Asserting le_5_ms here would be flaky under
+            // contention (observed in `cargo test -p nativelink-util
+            // --lib` parallel runs).
             (
-                "phase0_worker_worker_pin_release_latency_after_tonic_ok_le_5_ms 1\n",
-                "pin_release_latency le_5_ms bucket",
-                "unit-test round-trip is sub-ms; the le_5_ms bucket must contain the observation",
+                "phase0_worker_worker_pin_release_latency_after_tonic_ok_le_1000_ms 1\n",
+                "pin_release_latency le_1000_ms bucket",
+                "round-trip must land somewhere in the histogram; the le_1000_ms bucket is the largest finite boundary and must contain the observation regardless of scheduler jitter",
             ),
         ];
         for (needle, short_name, why) in &assertions {
