@@ -88,6 +88,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use moka::sync::Cache;
+use nativelink_config::cas_server::CasConfig;
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
 };
@@ -948,7 +949,18 @@ pub fn server_phase0_metrics_arc() -> Arc<ServerPhase0Metrics> {
 // Production setter is `set_is_server_process` (set-once via the
 // `IS_SERVER_PROCESS_FROZEN` `OnceLock`); accessor is
 // `is_server_process()` (cheap relaxed load of the
-// `IS_SERVER_PROCESS_RUNTIME` `AtomicBool`).
+// `IS_SERVER_PROCESS_RUNTIME` `AtomicBool`). The discriminator that
+// feeds the setter lives in `is_server_process_from_config`: a
+// binary classifies as a WORKER iff `cfg.workers` is
+// `Some(non_empty)`. The first revision of #564 used the inverse
+// (`!cfg.servers.is_empty()`) which mis-classified every production
+// worker as a server because every worker config defines server
+// listeners (peer-CAS on :50051 + worker_api/admin/health/metrics on
+// :50061; see `~/fl/bld/infra/nativelink/worker.json5:211-278`). A
+// mixed binary (servers + workers in one process) is conservatively
+// classified as a worker — the gate exists to suppress an
+// unconsumed metric subtree, and a mixed binary's subtree is
+// operationally a worker subtree.
 //
 // Default-when-unset is `true` (server). Rationale: a misconfigured
 // production binary that forgot to call the setter still produces
@@ -983,10 +995,42 @@ static IS_SERVER_PROCESS_FROZEN: OnceLock<bool> = OnceLock::new();
 /// freely).
 static IS_SERVER_PROCESS_RUNTIME: AtomicBool = AtomicBool::new(true);
 
+/// Classify a `CasConfig` as a server or worker process for purposes
+/// of the `is_server_process` gate. Returns `true` if the binary
+/// should be treated as a server (i.e. NOT a worker).
+///
+/// A binary is treated as a WORKER iff `cfg.workers` is
+/// `Some(non_empty)`. Everything else is a server:
+///   - `cfg.workers = None`: server (legacy / non-worker binaries).
+///   - `cfg.workers = Some(vec![])`: server (e.g. buildcache —
+///     `~/fl/bld/infra/nativelink/prod-server.json5:286` has
+///     `"workers": []`).
+///   - `cfg.workers = Some(non_empty)`: worker. Includes the
+///     "mixed binary" case where both `cfg.servers` and `cfg.workers`
+///     are non-empty (every production worker config defines server
+///     listeners for peer-CAS + admin/health/metrics; see
+///     `~/fl/bld/infra/nativelink/worker.json5:211-278`). The gate
+///     exists to suppress an unconsumed metric subtree, and a mixed
+///     binary's subtree is operationally a worker subtree.
+///
+/// This predicate is the discriminator that feeds
+/// `set_is_server_process`. It is extracted as a public function so
+/// the discriminator can be exercised by a config → discriminator
+/// regression test crossing the same seam production does (the
+/// `set_is_server_process_for_test` bypass tests only the gate, not
+/// the discriminator that feeds it). The first revision of #564
+/// shipped `!cfg.servers.is_empty()` here, which mis-classified
+/// every production worker as a server and produced zero savings.
+#[must_use]
+pub fn is_server_process_from_config(cfg: &CasConfig) -> bool {
+    let is_worker = cfg.workers.as_ref().is_some_and(|w| !w.is_empty());
+    !is_worker
+}
+
 /// Set the process-wide server/worker discriminator. Call ONCE from
 /// `main` (or equivalent process-entry) BEFORE any `FastSlowStore`
-/// instance constructs, based on whether the binary will run server
-/// listeners (`!cfg.servers.is_empty()`).
+/// instance constructs, with the result of
+/// `is_server_process_from_config(&cfg)`.
 ///
 /// Returns `Ok(())` on first call. Returns `Err(prior)` if a previous
 /// call already set the flag — `prior` is the value the OnceLock froze

@@ -190,20 +190,38 @@ async fn inner_main(
     // of ns per digest for the moka `pusher_timestamps` cache insert
     // is an unobservable cost.
     //
-    // Discriminator: any binary with server listeners
-    // (`!cfg.servers.is_empty()`) is treated as a server process. A
-    // mixed binary (servers + workers in one process) is treated as
-    // a server process — server BIS traffic dominates and is what
-    // operators consume the counter for. A worker-only binary
-    // (`cfg.servers.is_empty() && cfg.workers.is_some()`) flips the
-    // gate off.
+    // Discriminator: any binary that defines workers
+    // (`cfg.workers` is `Some(non_empty)`) is treated as a worker
+    // process. The first revision of #564 inverted this: it used
+    // `!cfg.servers.is_empty()` ("treat as server if any listener is
+    // configured"). That was wrong because every production worker
+    // ALSO runs server listeners (e.g.
+    // `~/fl/bld/infra/nativelink/worker.json5:211-278` exposes the
+    // public peer-CAS on :50051 + a private worker_api/admin/health/
+    // metrics block on :50061), so the gate stayed open on workers
+    // and #564 shipped zero savings. Correct predicate: workers are
+    // identified by having `cfg.workers` populated. The buildcache
+    // server config (`~/fl/bld/infra/nativelink/prod-server.json5:286`)
+    // has `"workers": []` (`Some(empty)`), so `is_some_and(|w|
+    // !w.is_empty())` is `false` and the buildcache binary classifies
+    // as a server. A mixed binary (servers + workers in one process)
+    // is conservatively treated as a worker — the gate exists to
+    // suppress the metric where the subtree is not consumed, and a
+    // mixed binary's metric subtree is operationally a worker
+    // subtree (no `phase0_server_*` dashboard scrapes it).
+    //
+    // Predicate extracted into `is_server_process_from_config` so the
+    // discriminator can be exercised by a config → discriminator
+    // regression test that crosses the same seam production does
+    // (the prior `set_is_server_process_for_test` bypass tests only
+    // the gate, NOT the discriminator that feeds it).
     //
     // Set-once via OnceLock: a second call would return Err. We log
     // a warn! on Err to surface buggy double-set without panicking
     // (the first-writer-wins guarantee means we'd silently keep the
     // first value anyway; the warn surfaces the bug).
     {
-        let is_server = !cfg.servers.is_empty();
+        let is_server = nativelink_util::phase0_metrics::is_server_process_from_config(&cfg);
         match nativelink_util::phase0_metrics::set_is_server_process(is_server) {
             Ok(()) => {
                 info!(
