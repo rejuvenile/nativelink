@@ -6,14 +6,27 @@
 	<string>com.tracemachina.nativelink.rotate-log</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/user/Applications/NativeLink.app/Contents/Resources/rotate-log.sh</string>
+		<string>/usr/local/bin/nativelink-rotate-log.sh</string>
 	</array>
-	<key>StartCalendarInterval</key>
+	<!-- #560: deploy installs this as a system LaunchDaemon running as
+	     root. Without UserName + EnvironmentVariables.HOME, the script's
+	     ${HOME} resolves to /var/root and rotation silently no-ops the
+	     SAME way the prior wrong-path bug did. The fl-repo justfile's
+	     setup-logrotate comment promises these keys; this plist now
+	     actually provides them. -->
+	<key>UserName</key>
+	<string>user</string>
+	<key>EnvironmentVariables</key>
 	<dict>
-		<key>Hour</key>
-		<integer>2</integer>
-		<key>Minute</key>
-		<integer>30</integer>
+		<key>HOME</key>
+		<string>/Users/user</string>
 	</dict>
+	<!-- Hourly cadence: with the prior daily-at-2:30AM schedule, a busy
+	     worker accreted 33-38 GB between fires. Hourly bounds the live
+	     log to ~512 MB or whatever traffic generates in 60 min. -->
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>RunAtLoad</key>
+	<true/>
 </dict>
 </plist>
