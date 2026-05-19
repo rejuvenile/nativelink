@@ -4869,6 +4869,25 @@ impl RunningActionsManagerImpl {
                         // so the gauge only tracks bytes-pinned-AND-tonic-
                         // Ok'd-awaiting-BIS, which is exactly the slice
                         // Phase 2 (#549) needs for cap sizing.
+                        //
+                        // #547 fix-up CF5-MINOR-B: a digest that appears
+                        // in BOTH the initial `digests` (from output_files
+                        // / stdout / stderr) AND in `file_digests` here
+                        // (tree-extracted) will be pinned twice and
+                        // uploaded twice. Under Option A the upload Ok
+                        // arm fires `record_pin_acquired` per upload, so
+                        // a double-success would double-acquire the
+                        // gauge. The matching BIS-unpin handler fires
+                        // once per BIS chunk per digest (single
+                        // `record_pin_released`). Net: gauge over-counts
+                        // by one digest-size per duplicate. Magnitude is
+                        // small in production (Bazel rarely duplicate-
+                        // lists a file in both output_files and
+                        // output_directories); the published metric
+                        // help-text in `WorkerPhase0Metrics::publish`
+                        // documents this drift inline so operators
+                        // sizing Phase 2 caps know the gauge is
+                        // approximate-upward.
                         for digest in &file_digests {
                             filesystem_store.pin_digest(digest);
                         }
