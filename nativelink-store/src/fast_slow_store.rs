@@ -40,7 +40,7 @@ use nativelink_util::buf_channel::{
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::fs;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
-use nativelink_util::phase0_metrics::server_phase0_metrics;
+use nativelink_util::phase0_metrics::{is_server_process, server_phase0_metrics};
 use nativelink_util::store_trait::{
     DelegationChildren, IS_MIRROR_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
     StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike, StoreOptimizations,
@@ -1201,6 +1201,34 @@ impl Drop for LoaderGuard {
 /// followed by one `Notify::notify_one`. Both are non-blocking.
 /// Empty slice is a no-op (early return) so callers don't need to
 /// guard their batches.
+///
+/// # #564 worker-process gate
+///
+/// The per-digest `record_pusher_invoke` bump is gated on
+/// `is_server_process()`. Workers also reach this helper (via
+/// `nativelink-worker/src/local_worker.rs` constructing
+/// `FastSlowStore` instances + `directory_cache.rs` using their FSS),
+/// but the metric is named `server_stable_digests_pusher_invoke_count`
+/// and is consumed by server-side dashboards only — workers paying
+/// ~hundreds of ns per digest for the moka `pusher_timestamps` cache
+/// insert produces an unobservable signal at non-trivial steady-state
+/// cost. Server processes (set by `set_is_server_process(true)` from
+/// `src/bin/nativelink.rs` early in `inner_main`) record; worker
+/// processes skip silently (no log per CLAUDE.md "trace! for hot-path
+/// / repetitive loops; avoid logging inside tight loops").
+///
+/// Cost on the server path: one extra relaxed atomic load
+/// (`AtomicBool` backing `is_server_process()`) per call. Negligible
+/// vs the existing `parking_lot::Mutex` acquisition + the moka
+/// `pusher_timestamps.insert` already on the path.
+///
+/// The `stable_digests` queue push and `Notify::notify_one` happen
+/// regardless of `is_server_process()` — on worker processes the
+/// queue's consumer (the server-side BIS broadcast loop) never runs,
+/// so the queue is a benign O(N) memory accumulator that's drained
+/// by the existing `register_slow_eviction_stable_set_listener` and
+/// the FSS lifecycle. The gate strictly removes the metric bump cost,
+/// not the queue mechanics.
 fn push_stable_digests_via_arcs(
     stable_digests: &Arc<Mutex<Vec<DigestInfo>>>,
     stable_notify: &Arc<Notify>,
@@ -1219,9 +1247,20 @@ fn push_stable_digests_via_arcs(
     // Pre-#554 only the chunked-commit closure bumped the counter; the
     // direct-push sites were silent. Per-digest bumps keep the counter
     // equal to the per-digest dwell-time histogram count.
-    let metrics = server_phase0_metrics();
-    for digest in digests {
-        metrics.record_pusher_invoke(*digest);
+    //
+    // #564 gate: skip on worker processes. The metric is named
+    // `server_*` and is consumed by server-side dashboards; worker
+    // bumps are unobservable AND pay ~hundreds of ns per digest via
+    // the moka `pusher_timestamps.insert` call inside
+    // `record_pusher_invoke`. See helper rustdoc + the
+    // `pusher_invoke_count` field doc in `phase0_metrics.rs` for the
+    // full rationale + the over-action regression test in
+    // `nativelink-store/tests/fast_slow_store_564_*.rs`.
+    if is_server_process() {
+        let metrics = server_phase0_metrics();
+        for digest in digests {
+            metrics.record_pusher_invoke(*digest);
+        }
     }
 }
 

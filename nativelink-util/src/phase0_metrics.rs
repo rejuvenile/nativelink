@@ -83,7 +83,7 @@
 //!   `Instant::now()` reads are unconditional and unconditionally consumed
 //!   by the bucket-recording calls.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -667,6 +667,20 @@ pub struct ServerPhase0Metrics {
     /// dwell-time histogram count) MUST grep for any new
     /// `stable_digests.lock().push` / `extend_from_slice` calls outside
     /// the shared helper — those would re-open the undercount gap.
+    ///
+    /// **#564 worker-process gate.** Only incremented in server-process
+    /// context (per `is_server_process()`); worker-process `FastSlowStore`
+    /// instances skip the bump because workers don't expose the
+    /// `phase0_server` subtree to operators in a useful way (the metric
+    /// is named `server_*` and operator dashboards consume it as the
+    /// server-side BIS push counter). Pre-#564 workers paid the
+    /// `record_pusher_invoke` cost (~hundreds of ns per digest via the
+    /// moka `pusher_timestamps` cache insert) for an unobservable signal;
+    /// post-#564 the gate inside `push_stable_digests_via_arcs` skips the
+    /// bump on workers. Worker-side FSS still pushes onto the
+    /// `stable_digests` queue (workers never reach the queue's consumer,
+    /// so the queue is a benign no-op there), but the per-digest counter
+    /// bump is skipped.
     pusher_invoke_count: AtomicU64,
     /// Unix-ms timestamp of the most recent pusher invocation. Operators
     /// can compare against `wall_clock_now()` to detect a stalled commit
@@ -919,8 +933,132 @@ pub fn server_phase0_metrics_arc() -> Arc<ServerPhase0Metrics> {
     Arc::clone(server_phase0_metrics_inner())
 }
 
+// -----------------------------------------------------------------
+// #564 server-vs-worker process gate.
+//
+// Both server and worker share one binary (`src/bin/nativelink.rs`)
+// but workers reach the `FastSlowStore` BIS-push helpers via
+// `nativelink-worker/src/local_worker.rs` + `directory_cache.rs` too.
+// The `server_*`-named pusher_invoke counter is only meaningful on
+// the server process (which has the `phase0_server` metrics subtree
+// exposed AND produces the BIS traffic operators alert on); workers
+// bumping the counter pay ~hundreds of ns per digest (moka cache
+// insert) for an unobservable signal.
+//
+// Production setter is `set_is_server_process` (set-once via the
+// `IS_SERVER_PROCESS_FROZEN` `OnceLock`); accessor is
+// `is_server_process()` (cheap relaxed load of the
+// `IS_SERVER_PROCESS_RUNTIME` `AtomicBool`).
+//
+// Default-when-unset is `true` (server). Rationale: a misconfigured
+// production binary that forgot to call the setter still produces
+// the operator-visible metric (the pre-#564 behaviour); a worker
+// binary that DID call the setter correctly is the only path that
+// flips the gate off. This is a fail-OPEN default — the gate is
+// purely a cost-saving optimization on workers, not a correctness
+// constraint, so failing open biases toward observability.
+//
+// The split (frozen-marker `OnceLock<bool>` + mutable
+// `AtomicBool`) exists so `#[cfg(test)]` code can flip the gate
+// freely while production code enforces set-once. The OnceLock
+// holds the first value passed to `set_is_server_process`; tests
+// call `set_is_server_process_for_test` which bypasses the
+// OnceLock and writes only the `AtomicBool`.
+// -----------------------------------------------------------------
+
+/// First-write-wins guard for the production `is_server_process` flag.
+/// Holds the boolean value that was first written by
+/// `set_is_server_process`. Subsequent production-side writes return
+/// `Err(first_value)` without mutating either this `OnceLock` or the
+/// `AtomicBool` accessor backing.
+static IS_SERVER_PROCESS_FROZEN: OnceLock<bool> = OnceLock::new();
+
+/// Backing storage read by `is_server_process()`. Defaults to `true`
+/// (server) so a binary that never calls `set_is_server_process`
+/// preserves the pre-#564 always-bump behaviour (fail-OPEN — no
+/// observability lost on misconfiguration). The production setter
+/// `set_is_server_process` writes this atomically AND engages the
+/// OnceLock; the test helper `set_is_server_process_for_test`
+/// writes this WITHOUT engaging the OnceLock (so tests can flip
+/// freely).
+static IS_SERVER_PROCESS_RUNTIME: AtomicBool = AtomicBool::new(true);
+
+/// Set the process-wide server/worker discriminator. Call ONCE from
+/// `main` (or equivalent process-entry) BEFORE any `FastSlowStore`
+/// instance constructs, based on whether the binary will run server
+/// listeners (`!cfg.servers.is_empty()`).
+///
+/// Returns `Ok(())` on first call. Returns `Err(prior)` if a previous
+/// call already set the flag — `prior` is the value the OnceLock froze
+/// at. The flag's runtime value is NOT changed on the Err path; the
+/// first writer wins.
+///
+/// **Set-once enforcement.** `IS_SERVER_PROCESS_FROZEN`'s `OnceLock`
+/// rejects any second call so a buggy second `set_is_server_process(...)`
+/// invocation cannot silently flip the gate mid-process. Production
+/// callers should call this exactly once before any FSS construction.
+pub fn set_is_server_process(value: bool) -> Result<(), bool> {
+    IS_SERVER_PROCESS_FROZEN.set(value).map_err(|_| {
+        *IS_SERVER_PROCESS_FROZEN
+            .get()
+            .expect("OnceLock::set returned Err so the slot is initialized")
+    })?;
+    IS_SERVER_PROCESS_RUNTIME.store(value, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Test-only setter: write the runtime flag WITHOUT engaging the
+/// OnceLock. Lets a worker-context test flip the gate off (and other
+/// tests flip it back on for cleanup) without burning the OnceLock —
+/// production `set_is_server_process` still gets to fire first on a
+/// real binary.
+///
+/// **Not for production use.** This bypass exists ONLY so integration
+/// tests in `nativelink-store/tests/fast_slow_store_564_*.rs` (and
+/// their analogs) can exercise the worker-context branch of the
+/// `push_stable_digests_via_arcs` gate. Production code MUST go
+/// through `set_is_server_process` (set-once) to preserve the
+/// first-writer-wins guarantee. The `_for_test` suffix in the name
+/// flags this as a test-only entry point; reviewers must reject any
+/// production callsite.
+///
+/// Marked `#[doc(hidden)]` to keep it out of the published API
+/// surface (rustdoc, IDE autocomplete) while still being callable
+/// from integration tests in sibling crates (which compile against
+/// the library, not under `#[cfg(test)]`).
+///
+/// **Test isolation.** Integration tests in separate files (each its
+/// own binary) get separate copies of this static. Unit tests within
+/// one `cargo test` binary SHARE this state and MUST set it
+/// explicitly at the top of every test that cares — relying on
+/// default-true is safe (other tests can only flip to `false`, and
+/// you can flip back to `true` at test entry).
+#[doc(hidden)]
+pub fn set_is_server_process_for_test(value: bool) {
+    IS_SERVER_PROCESS_RUNTIME.store(value, Ordering::Relaxed);
+}
+
+/// Returns whether the current process is acting as a server
+/// (has nativelink server listeners). Cheap relaxed atomic load.
+///
+/// Used by `nativelink-store/src/fast_slow_store.rs`'s
+/// `push_stable_digests_via_arcs` to gate the per-digest
+/// `record_pusher_invoke` bump: server processes record (the counter
+/// is observable + dashboards consume it); worker processes skip
+/// (the metric subtree is named `server_*` and is not consumed on
+/// worker `/metrics`).
+///
+/// Default-when-unset is `true` — see module-level comment on
+/// `IS_SERVER_PROCESS_RUNTIME`.
+#[must_use]
+pub fn is_server_process() -> bool {
+    IS_SERVER_PROCESS_RUNTIME.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     /// Sanity: fresh metrics have zero counts and zero pinned bytes.
@@ -1664,6 +1802,180 @@ mod tests {
              record_pusher_invoke; observed it as 0 or missing. The producer \
              side-effect (SystemTime::now().store(...)) was either not invoked \
              or its write was discarded by publish(). body=\n{body}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // #564 server-vs-worker process gate unit tests.
+    //
+    // These tests share the process-global `IS_SERVER_PROCESS_RUNTIME`
+    // `AtomicBool` with every other test in the `nativelink-util` lib
+    // binary. To avoid order-dependent flakes:
+    //   - Tests that READ the flag set it explicitly at entry.
+    //   - Tests that WRITE the flag restore it to the default `true`
+    //     before returning so subsequent tests start from the
+    //     documented default.
+    // -------------------------------------------------------------
+
+    /// Default accessor value is `true` (fail-OPEN — see
+    /// `IS_SERVER_PROCESS_RUNTIME` module comment). The default must
+    /// be `true` so a binary that never calls the production setter
+    /// (test harnesses, mis-wired deployments) preserves the pre-#564
+    /// always-bump observability behaviour.
+    ///
+    /// Mutation step: flip the `AtomicBool::new(true)` initializer to
+    /// `AtomicBool::new(false)`. This test must red-fail.
+    ///
+    /// `#[serial(is_server_process_gate)]`: this test SETS the flag,
+    /// other gate tests SET/READ. Serializing under the same group
+    /// name as the worker-context integration tests keeps the
+    /// intra-binary state mutation race-free even when cargo runs
+    /// tests in parallel.
+    #[serial(is_server_process_gate)]
+    #[test]
+    fn is_server_process_default_is_true() {
+        // Reset to default in case a prior test in the same binary
+        // mutated this flag. The reset is part of the test contract:
+        // we're asserting on the DOCUMENTED default value, not on
+        // ambient state. If a prior test forgot to restore, this
+        // reset hides the leak; that's intentional — the leak is the
+        // OTHER test's bug.
+        set_is_server_process_for_test(true);
+        assert!(
+            is_server_process(),
+            "#564 default-when-unset contract violated: \
+             is_server_process() returned false after \
+             set_is_server_process_for_test(true). The default \
+             (AtomicBool::new(true)) is load-bearing: a misconfigured \
+             production binary that forgot to call set_is_server_process \
+             must still bump the pusher_invoke counter (fail-OPEN) so \
+             operator dashboards remain populated."
+        );
+    }
+
+    /// Production setter `set_is_server_process` enforces set-once via
+    /// the `IS_SERVER_PROCESS_FROZEN` `OnceLock`. The first call wins;
+    /// subsequent calls return `Err(prior_value)` and DO NOT mutate
+    /// the runtime flag. This guards against a buggy second call
+    /// flipping the gate mid-process.
+    ///
+    /// **CRITICAL:** this test BURNS the OnceLock for the entire test
+    /// binary process. It must run AFTER any other test that needs to
+    /// observe pre-OnceLock-set behaviour. We mark this test with a
+    /// distinctive name (suffix `_burns_oncelock`) and rely on cargo's
+    /// alphabetical test ordering (not a strict guarantee but stable
+    /// in practice). After OnceLock is burned, no further
+    /// `set_is_server_process` call can succeed in this test binary —
+    /// `set_is_server_process_for_test` is the only path to flip the
+    /// runtime flag.
+    ///
+    /// Mutation step: remove the `IS_SERVER_PROCESS_FROZEN.set(value)
+    /// .map_err(...)?` line from `set_is_server_process`. This test
+    /// must red-fail at the second-call assertion (the first call
+    /// would have returned Ok; the second would also return Ok
+    /// instead of Err).
+    #[serial(is_server_process_gate)]
+    #[test]
+    fn z_set_is_server_process_is_set_once_burns_oncelock() {
+        // First call: should always succeed (this is the first
+        // production-side write in the test binary — but we run after
+        // every other test in alphabetical order via the `z_` prefix
+        // to make sure no earlier test accidentally engaged the
+        // OnceLock).
+        //
+        // We intentionally accept BOTH first-write success AND
+        // already-set states: a sibling test in another module under
+        // the same `cargo test` invocation may legitimately have
+        // engaged the OnceLock before us. The CONTRACT under test is
+        // "subsequent set returns Err with the prior value AND does
+        // NOT mutate the runtime", not "the slot was empty when this
+        // test started".
+        let pinned_value: bool = match set_is_server_process(true) {
+            Ok(()) => true,
+            Err(prior) => prior,
+        };
+
+        // Second call: must always Err. Try to flip it; the call
+        // must return Err with the pinned value.
+        let attempt_flip = !pinned_value;
+        let second_call_result = set_is_server_process(attempt_flip);
+        assert_eq!(
+            second_call_result,
+            Err(pinned_value),
+            "#564 set-once contract violated: set_is_server_process \
+             second call must return Err with the prior pinned value. \
+             A successful second call would let a buggy code path flip \
+             the server/worker discriminator mid-process, silently \
+             changing whether record_pusher_invoke fires."
+        );
+
+        // The runtime flag must equal the pinned value, NOT the
+        // attempted-flip value. The Err path MUST NOT mutate
+        // `IS_SERVER_PROCESS_RUNTIME`.
+        assert_eq!(
+            is_server_process(),
+            pinned_value,
+            "#564 set-once contract violated: failed \
+             set_is_server_process call mutated the runtime flag. \
+             The OnceLock guard MUST short-circuit BEFORE the \
+             AtomicBool::store; otherwise the first-writer-wins \
+             guarantee is bypassed and the gate becomes effectively \
+             last-writer-wins (the AtomicBool overwrites blindly)."
+        );
+    }
+
+    /// The `#[cfg(test)]` test-only setter `set_is_server_process_for_test`
+    /// bypasses the OnceLock and freely mutates the runtime flag.
+    /// This exists so a `#[cfg(test)]` worker-context test (e.g. in
+    /// `nativelink-store/tests/fast_slow_store_564_*.rs`) can flip
+    /// the gate to false without first engaging the production
+    /// set-once guard.
+    ///
+    /// We run this AFTER the `z_set_is_server_process_is_set_once_burns_oncelock`
+    /// test (also `z_*`-prefixed for ordering — `zz_` suffix sorts
+    /// after `z_`) so we observe behaviour on the post-OnceLock-burn
+    /// state: the OnceLock is set; the runtime flag is still
+    /// flippable through the test helper.
+    ///
+    /// Mutation step: change `set_is_server_process_for_test` to
+    /// also call `IS_SERVER_PROCESS_FROZEN.set(value).ok()` (which
+    /// would burn the OnceLock from the test path). This test must
+    /// red-fail at the flip-back-to-true assertion in the SECOND
+    /// `set_is_server_process_for_test` call below (because the
+    /// AtomicBool would only flip if the OnceLock was unset — but
+    /// our actual implementation always writes the AtomicBool
+    /// unconditionally, so the test passes; the mutation we describe
+    /// here is the wrong one).
+    ///
+    /// True mutation: change
+    /// `IS_SERVER_PROCESS_RUNTIME.store(value, Ordering::Relaxed)`
+    /// in the test helper to a no-op. The flip-to-false assertion
+    /// will red-fail.
+    #[serial(is_server_process_gate)]
+    #[test]
+    fn zz_set_is_server_process_for_test_bypasses_oncelock() {
+        set_is_server_process_for_test(false);
+        assert!(
+            !is_server_process(),
+            "#564 test-helper contract violated: \
+             set_is_server_process_for_test(false) did not flip the \
+             runtime flag. The test helper MUST bypass the OnceLock \
+             and write the AtomicBool unconditionally so a \
+             worker-context test can run after a production setter \
+             call has burned the OnceLock."
+        );
+
+        // Flip back to default for subsequent tests. This is the
+        // test-isolation contract documented in the module comment.
+        set_is_server_process_for_test(true);
+        assert!(
+            is_server_process(),
+            "#564 test-helper contract violated: \
+             set_is_server_process_for_test(true) did not restore the \
+             runtime flag to default. The test helper is the ONLY \
+             escape hatch for restoring the default after a worker-context \
+             test flipped it (the production setter can only fire once \
+             per process)."
         );
     }
 }

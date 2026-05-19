@@ -178,6 +178,51 @@ async fn inner_main(
         }
     }
 
+    // #564: pin the process-wide server-vs-worker discriminator BEFORE
+    // any `FastSlowStore` constructs. The `push_stable_digests_via_arcs`
+    // helper in `nativelink-store/src/fast_slow_store.rs` gates the
+    // per-digest `record_pusher_invoke` bump on `is_server_process()`;
+    // workers reach the helper too (via
+    // `nativelink-worker/src/local_worker.rs:2986,:3094` +
+    // `directory_cache.rs:5373`) but the metric subtree is
+    // `phase0_server_*` and server-dashboard consumers expect it to
+    // reflect server-side BIS traffic only. Workers paying ~hundreds
+    // of ns per digest for the moka `pusher_timestamps` cache insert
+    // is an unobservable cost.
+    //
+    // Discriminator: any binary with server listeners
+    // (`!cfg.servers.is_empty()`) is treated as a server process. A
+    // mixed binary (servers + workers in one process) is treated as
+    // a server process — server BIS traffic dominates and is what
+    // operators consume the counter for. A worker-only binary
+    // (`cfg.servers.is_empty() && cfg.workers.is_some()`) flips the
+    // gate off.
+    //
+    // Set-once via OnceLock: a second call would return Err. We log
+    // a warn! on Err to surface buggy double-set without panicking
+    // (the first-writer-wins guarantee means we'd silently keep the
+    // first value anyway; the warn surfaces the bug).
+    {
+        let is_server = !cfg.servers.is_empty();
+        match nativelink_util::phase0_metrics::set_is_server_process(is_server) {
+            Ok(()) => {
+                info!(
+                    is_server,
+                    "#564: pinned is_server_process discriminator for \
+                     FastSlowStore::push_stable_digests_via_arcs gate"
+                );
+            }
+            Err(prior) => {
+                warn!(
+                    is_server,
+                    prior,
+                    "#564: set_is_server_process called more than once; \
+                     keeping first value (set-once OnceLock)"
+                );
+            }
+        }
+    }
+
     let health_registry_builder =
         Arc::new(AsyncMutex::new(HealthRegistryBuilder::new("nativelink")));
 
