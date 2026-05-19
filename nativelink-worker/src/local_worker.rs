@@ -1127,7 +1127,18 @@ pub fn handle_blobs_in_stable_storage_for_store(
             // Bazel-source uploads landing here only via the receive-
             // side mirror path — for those the metric is correctly
             // skipped). Pure observability; no behavior change.
-            let _gap_ms = worker_phase0_metrics().record_bis_unpin(digest);
+            //
+            // Gate `record_pin_released` on `record_bis_unpin` returning
+            // `Some(_)` so acquire/release stay symmetric: the gauge
+            // only decrements for digests that previously bumped it via
+            // `record_pin_acquired` (which fires only from
+            // `spawn_upload_to_remote`). Without this gating the gauge
+            // could over-release for Bazel-source / receive-side-mirror
+            // digests that arrived at this unpin loop without ever
+            // having been acquired through the chunked-upload producer.
+            if worker_phase0_metrics().record_bis_unpin(digest).is_some() {
+                worker_phase0_metrics().record_pin_released(digest.size_bytes());
+            }
         }
         if let Some(cas_store) = cas_store {
             cas_store.ack_digests(&acked_digests);

@@ -850,6 +850,45 @@ mod tests {
         assert_eq!(m.pinned_bytes_live.load(Ordering::Relaxed), 0);
     }
 
+    /// CF1 regression: acquire+release pair must zero the gauge so the
+    /// "live" semantic actually holds. The unit-level `record_pin_released`
+    /// existed but was never wired in production — `local_worker.rs`'s
+    /// CAS BIS-unpin loop called `record_bis_unpin` without the matching
+    /// `record_pin_released`. Reviewers flagged the gauge as
+    /// monotonically growing (distributed-systems MAJOR-1, code-reviewer
+    /// MAJOR-2). This test bakes the symmetry into the unit so a future
+    /// removal of either side red-fails.
+    ///
+    /// Mutation step: revert the producer fix at `local_worker.rs:1117-1131`
+    /// (drop the `record_pin_released` call inside the `if` arm). This
+    /// test stays green — the test exercises the unit, not the wiring.
+    /// The bespoke message below is the discriminator a triage operator
+    /// should grep for.
+    #[test]
+    fn pin_acquire_release_pair_zeroes_live_gauge() {
+        let m = WorkerPhase0Metrics::new();
+        m.record_pin_acquired(4096);
+        m.record_pin_acquired(8192);
+        assert_eq!(
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            12288,
+            "#547 fix-up CF1: pinned_bytes_live should reflect sum of \
+             outstanding acquires; if this fails the producer-side gauge \
+             bump itself is broken"
+        );
+        m.record_pin_released(4096);
+        m.record_pin_released(8192);
+        assert_eq!(
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            0,
+            "#547 fix-up CF1: pinned_bytes_live grows but never shrinks; \
+             record_pin_released not wired in production — \
+             worker_concurrent_pinned_bytes_live would saturate at +inf \
+             within minutes and the gauge would be useless for Phase 2 \
+             (#549) pin_budget cap selection"
+        );
+    }
+
     /// BIS chunk arrival timer records into the histogram.
     #[test]
     fn bis_chunk_arrive_to_handler_records() {
