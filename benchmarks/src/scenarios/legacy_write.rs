@@ -64,7 +64,7 @@ use bytes::Bytes;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::StoreLike;
 
-use crate::composition::{Composition, build_prod_cas_composition, prod_defaults};
+use crate::composition::{Composition, build_prod_cas_composition};
 use crate::output::{BenchmarkResult, CacheState};
 use crate::scenarios::{RunOpts, make_blob_with_indices, measure};
 
@@ -147,16 +147,16 @@ async fn run_one_cell(
     let mut extras = BTreeMap::new();
     extras.insert(
         "cas_fast_memory_max_bytes".to_string(),
-        serde_json::json!(prod_defaults::CAS_FAST_MEMORY_MAX_BYTES),
+        serde_json::json!(composition.cas_fast_memory_max_bytes),
     );
     extras.insert(
         "size_partitioning_threshold".to_string(),
-        serde_json::json!(prod_defaults::SIZE_PARTITIONING_THRESHOLD),
+        serde_json::json!(composition.size_partitioning_threshold),
     );
-    // Canonical `<` predicate lives in `composition::prod_defaults`; the
-    // boundary semantics are pinned by
+    // Canonical `<` predicate lives on `Composition`; the boundary
+    // semantics are pinned by
     // `composition::tests::deviation_helper_boundary_pins_strict_lt`.
-    if prod_defaults::should_emit_small_cas_deviation(size as u64) {
+    if composition.should_emit_small_cas_deviation(size as u64) {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),

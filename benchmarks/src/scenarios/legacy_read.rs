@@ -71,7 +71,7 @@ use std::sync::Arc;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::store_trait::StoreLike;
 
-use crate::composition::{build_prod_cas_composition, prod_defaults};
+use crate::composition::build_prod_cas_composition;
 use crate::output::{BenchmarkResult, CacheState};
 use crate::scenarios::{RunOpts, make_blob_with_indices, measure};
 
@@ -254,10 +254,10 @@ async fn run_warm_cell(
 
     let mut extras = BTreeMap::new();
     extras.insert("warm".to_string(), serde_json::json!(true));
-    // Canonical `<` predicate lives in `composition::prod_defaults`; the
-    // boundary semantics are pinned by
+    // Canonical `<` predicate lives on `Composition`; the boundary
+    // semantics are pinned by
     // `composition::tests::deviation_helper_boundary_pins_strict_lt`.
-    if prod_defaults::should_emit_small_cas_deviation(cell.size as u64) {
+    if composition.should_emit_small_cas_deviation(cell.size as u64) {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),
@@ -450,10 +450,10 @@ async fn run_cold_cell(
             serde_json::json!(fadvise_count),
         );
     }
-    // Canonical `<` predicate lives in `composition::prod_defaults`; the
-    // boundary semantics are pinned by
+    // Canonical `<` predicate lives on `Composition`; the boundary
+    // semantics are pinned by
     // `composition::tests::deviation_helper_boundary_pins_strict_lt`.
-    if prod_defaults::should_emit_small_cas_deviation(cell.size as u64) {
+    if cold_comp.should_emit_small_cas_deviation(cell.size as u64) {
         extras.insert(
             "composition_deviation".to_string(),
             serde_json::json!("small_cas_redis_replaced_with_memory"),

@@ -144,11 +144,15 @@ bench-data-plane *ARGS:
 	LOCK="/tmp/just-bench-data-plane.lock"
 	mkdir -p "$(dirname "$OUT")"
 	echo "[just] running data_plane_bench → ${OUT}"
-	# Pre-flight: require the prod-config pin test to actually verify
-	# constants against the live prod config (rather than warn-and-skip).
-	# The bench's release-gate pre-test runs cargo test for this purpose;
-	# without it a missing prod config silently passes the pin test.
-	echo "[just] verifying prod_defaults_match_buildcache_json5 against live config"
+	# Pre-flight: require the prod-composition round-trip test to actually
+	# parse the snapshot AND build a Composition from it (exercises the
+	# full parse → override → build → name-resolve → field-extract path).
+	# Pattern C Phase 1 replaced the prior substring-grep
+	# `prod_defaults_match_buildcache_json5` test — this round-trip is
+	# strictly stronger because it actually constructs the production
+	# composition via the same `build_store_manager` helper production
+	# uses, and asserts the live-snapshot threshold + memory cap values.
+	echo "[just] verifying build_prod_composition_round_trips against snapshot"
 	# Tee output so the zero-test-run sanity grep below cannot be defeated
 	# by a future filter typo. The previous version of this recipe passed
 	# `--exact tests::prod_defaults_match_buildcache_json5` (wrong module
@@ -158,12 +162,12 @@ bench-data-plane *ARGS:
 	# tee'd output to contain `test result: ok. 1 passed`.
 	TEST_OUT="$(mktemp -t just-bench-prod-pin.XXXXXX.log)"
 	trap 'rm -f "${TEST_OUT}"' EXIT
-	BENCH_REQUIRE_PROD_CONFIG=1 timeout 300 cargo test --release -p nativelink-benchmarks \
+	timeout 300 cargo test --release -p nativelink-benchmarks \
 	    --features chunked_fast_slow \
-	    -- --exact composition::tests::prod_defaults_match_buildcache_json5 \
+	    -- --exact composition::tests::build_prod_composition_round_trips \
 	    2>&1 | tee "${TEST_OUT}"
 	if ! grep -qE '^test result: ok\. [1-9][0-9]* passed' "${TEST_OUT}"; then
-	    echo "[just] FAIL: bench prod-config pin matched 0 tests; release gate cannot certify"
+	    echo "[just] FAIL: bench prod-composition pin matched 0 tests; release gate cannot certify"
 	    echo "[just]       (tee log: ${TEST_OUT}) — fix the filter or restore the test"
 	    exit 1
 	fi

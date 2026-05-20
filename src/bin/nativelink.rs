@@ -33,7 +33,7 @@ use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
 use nativelink_config::cas_server::{
     CasConfig, GlobalConfig, HttpCompressionAlgorithm, ListenerConfig, SchedulerConfig,
-    ServerConfig, StoreConfig, WorkerConfig,
+    ServerConfig, WorkerConfig,
 };
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
@@ -49,8 +49,7 @@ use nativelink_service::health_server::HealthServer;
 use nativelink_service::push_server::PushServer;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_util::blob_locality_map;
-use nativelink_store::default_store_factory::store_factory;
-use nativelink_store::store_manager::StoreManager;
+use nativelink_store::store_manager::{StoreManager, build_store_manager};
 use nativelink_util::common::fs::set_open_file_limit;
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
 use nativelink_util::health_utils::HealthRegistryBuilder;
@@ -244,20 +243,7 @@ async fn inner_main(
     let health_registry_builder =
         Arc::new(AsyncMutex::new(HealthRegistryBuilder::new("nativelink")));
 
-    let store_manager = Arc::new(StoreManager::new());
-    {
-        let mut health_registry_lock = health_registry_builder.lock().await;
-
-        for StoreConfig { name, spec } in cfg.stores {
-            let health_component_name = format!("stores/{name}");
-            let mut health_register_store =
-                health_registry_lock.sub_builder(&health_component_name);
-            let store = store_factory(&spec, &store_manager, Some(&mut health_register_store))
-                .await
-                .err_tip(|| format!("Failed to create store '{name}'"))?;
-            store_manager.add_store(&name, store);
-        }
-    }
+    let store_manager = build_store_manager(&cfg.stores, &health_registry_builder).await?;
     STORE_MANAGER.set(store_manager.clone()).ok();
 
     let mut root_futures: Vec<BoxFuture<Result<(), Error>>> = Vec::new();

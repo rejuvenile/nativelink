@@ -38,6 +38,12 @@ bench-trace = [
 ]
 
 [dependencies]
+# `async-lock::Mutex` is the type production wraps the
+# `HealthRegistryBuilder` in (`src/bin/nativelink.rs::inner_main`); bench
+# passes the same wrapper into `build_store_manager` so the signature
+# matches production bit-for-bit. Version pinned to match the workspace
+# declaration in the root `Cargo.toml`.
+async-lock = { version = "3.4.0", features = ["std"], default-features = false }
 bytes = { version = "1.10.1", default-features = false }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5.35", features = [
@@ -79,6 +85,10 @@ parking_lot = { version = "0.12.3", default-features = false }
 prost = { version = "0.14.3", default-features = false }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
+# Bench parses `benchmarks/prod-server.json5` into a `CasConfig` via the same
+# JSON5 reader nativelink-config uses (`CasConfig::try_from_json5_file`).
+# Version pinned to match nativelink-config's declaration.
+serde_json5 = { version = "0.2.1", default-features = false }
 sha2 = { version = "0.10.8", default-features = false, features = ["asm"] }
 tempfile = { version = "3.15.0", default-features = false }
 tokio = { version = "1.44.1", features = [

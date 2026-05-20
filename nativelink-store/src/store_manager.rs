@@ -13,11 +13,18 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use async_lock::Mutex as AsyncMutex;
+use nativelink_config::cas_server::StoreConfig;
+use nativelink_error::{Error, ResultExt};
 use nativelink_metric::{MetricsComponent, RootMetricsComponent};
+use nativelink_util::health_utils::HealthRegistryBuilder;
 use nativelink_util::store_trait::Store;
 use parking_lot::RwLock;
 use tracing::{info, warn};
+
+use crate::default_store_factory::store_factory;
 
 /// Period for the progress log emitted while the shutdown drain is waiting.
 /// Operators see "still draining N writes after Ms" so they know the
@@ -369,3 +376,40 @@ impl StoreManager {
 }
 
 impl RootMetricsComponent for StoreManager {}
+
+/// Build a populated `StoreManager` from a list of `StoreConfig` entries.
+///
+/// This is the single canonical store-stack constructor. Production
+/// (`src/bin/nativelink.rs::inner_main`) and the bench harness
+/// (`benchmarks/src/composition.rs`) both call this so any drift between
+/// "the store stack production ships" and "the store stack a bench
+/// measures" becomes impossible by construction.
+///
+/// `health_registry_builder` is the caller-owned root registry; each
+/// store registers a `stores/<name>` sub-builder under it. The Arc is
+/// borrowed (not consumed) so the caller can keep registering other
+/// components against the same root after this returns.
+///
+/// The async-recursive `store_factory` walks the spec tree and resolves
+/// `RefStore` lookups against the in-progress `StoreManager`, so stores
+/// must be processed in declaration order — exactly as the inline code
+/// did before extraction.
+pub async fn build_store_manager(
+    stores: &[StoreConfig],
+    health_registry_builder: &Arc<AsyncMutex<HealthRegistryBuilder>>,
+) -> Result<Arc<StoreManager>, Error> {
+    let store_manager = Arc::new(StoreManager::new());
+    let mut health_registry_lock = health_registry_builder.lock().await;
+
+    for StoreConfig { name, spec } in stores {
+        let health_component_name = format!("stores/{name}");
+        let mut health_register_store =
+            health_registry_lock.sub_builder(&health_component_name);
+        let store = store_factory(spec, &store_manager, Some(&mut health_register_store))
+            .await
+            .err_tip(|| format!("Failed to create store '{name}'"))?;
+        store_manager.add_store(name, store);
+    }
+
+    Ok(store_manager)
+}
