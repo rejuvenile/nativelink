@@ -1,0 +1,987 @@
+{
+  "metadata": {
+    "schema_version": 2,
+    "git_commit_sha": "4f9c42d226a467893208da2d91ff190a267a75f8",
+    "git_dirty": true,
+    "host": "cache.example.com",
+    "timestamp_utc": "2026-05-20T13:21:32.527357Z",
+    "features": [
+      "chunked_fast_slow"
+    ],
+    "forced": false,
+    "temp_dir_used": "/dev/shm"
+  },
+  "results": [
+    {
+      "flow_id": "W1",
+      "scenario_name": "w1_store_update_oneshot_1KiB_c1",
+      "blob_size_bytes": 1024,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 0.864351,
+      "latency_ms": {
+        "p50": 0.028571,
+        "p90": 0.044061,
+        "p99": 0.275937,
+        "max": 0.275937
+      },
+      "throughput": {
+        "bytes_per_sec": 23694077.984522
+      },
+      "extras": {
+        "cas_fast_memory_max_bytes": 16000000000,
+        "composition_deviation": "small_cas_redis_replaced_with_memory",
+        "measures": "fast_tier_ack_then_spawn_dispatch",
+        "size_partitioning_threshold": 16384
+      }
+    },
+    {
+      "flow_id": "W1",
+      "scenario_name": "w1_store_update_oneshot_16KiB_c1",
+      "blob_size_bytes": 16384,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 0.698218,
+      "latency_ms": {
+        "p50": 0.031641,
+        "p90": 0.049422,
+        "p99": 0.062332,
+        "max": 0.062332
+      },
+      "throughput": {
+        "bytes_per_sec": 469309012.371494
+      },
+      "extras": {
+        "cas_fast_memory_max_bytes": 16000000000,
+        "measures": "fast_tier_ack_then_spawn_dispatch",
+        "size_partitioning_threshold": 16384
+      }
+    },
+    {
+      "flow_id": "W1",
+      "scenario_name": "w1_store_update_oneshot_1MiB_c1",
+      "blob_size_bytes": 1048576,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 7.775703,
+      "latency_ms": {
+        "p50": 0.380559,
+        "p90": 0.39918,
+        "p99": 0.512232,
+        "max": 0.512232
+      },
+      "throughput": {
+        "bytes_per_sec": 2697057745.132498
+      },
+      "extras": {
+        "cas_fast_memory_max_bytes": 16000000000,
+        "measures": "fast_tier_ack_then_spawn_dispatch",
+        "size_partitioning_threshold": 16384
+      }
+    },
+    {
+      "flow_id": "W1",
+      "scenario_name": "w1_store_update_oneshot_16MiB_c1",
+      "blob_size_bytes": 16777216,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 112.750794,
+      "latency_ms": {
+        "p50": 5.491217,
+        "p90": 5.713642,
+        "p99": 6.874211,
+        "max": 6.874211
+      },
+      "throughput": {
+        "bytes_per_sec": 2975981880.890347
+      },
+      "extras": {
+        "cas_fast_memory_max_bytes": 16000000000,
+        "measures": "fast_tier_ack_then_spawn_dispatch",
+        "size_partitioning_threshold": 16384
+      }
+    },
+    {
+      "flow_id": "W1",
+      "scenario_name": "w1_store_update_oneshot_1MiB_c10",
+      "blob_size_bytes": 1048576,
+      "concurrency": 10,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 82.590354,
+      "latency_ms": {
+        "p50": 3.885707,
+        "p90": 4.336879,
+        "p99": 7.569079,
+        "max": 7.569079
+      },
+      "throughput": {
+        "bytes_per_sec": 2539221468.889696
+      },
+      "extras": {
+        "cas_fast_memory_max_bytes": 16000000000,
+        "measures": "fast_tier_ack_then_spawn_dispatch",
+        "size_partitioning_threshold": 16384
+      }
+    },
+    {
+      "flow_id": "R1",
+      "scenario_name": "r1_store_get_part_unchunked_1KiB_c1_warm",
+      "blob_size_bytes": 1024,
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 0.198885,
+      "latency_ms": {
+        "p50": 0.00735,
+        "p90": 0.01149,
+        "p99": 0.046261,
+        "max": 0.046261
+      },
+      "throughput": {
+        "bytes_per_sec": 102974080.498781
+      },
+      "extras": {
+        "composition_deviation": "small_cas_redis_replaced_with_memory",
+        "warm": true
+      }
+    },
+    {
+      "flow_id": "R1",
+      "scenario_name": "r1_store_get_part_unchunked_1MiB_c1_warm",
+      "blob_size_bytes": 1048576,
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 8.83757,
+      "latency_ms": {
+        "p50": 0.432441,
+        "p90": 0.467142,
+        "p99": 0.525163,
+        "max": 0.525163
+      },
+      "throughput": {
+        "bytes_per_sec": 2372996196.918384
+      },
+      "extras": {
+        "warm": true
+      }
+    },
+    {
+      "flow_id": "R1",
+      "scenario_name": "r1_store_get_part_unchunked_16MiB_c1_warm",
+      "blob_size_bytes": 16777216,
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 108.065858,
+      "latency_ms": {
+        "p50": 5.399455,
+        "p90": 5.474776,
+        "p99": 5.706542,
+        "max": 5.706542
+      },
+      "throughput": {
+        "bytes_per_sec": 3104998435.305997
+      },
+      "extras": {
+        "warm": true
+      }
+    },
+    {
+      "flow_id": "R1",
+      "scenario_name": "r1_store_get_part_unchunked_1MiB_c10_warm",
+      "blob_size_bytes": 1048576,
+      "concurrency": 10,
+      "cache_state": "warm",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 59.444658,
+      "latency_ms": {
+        "p50": 2.943573,
+        "p90": 2.995144,
+        "p99": 3.319542,
+        "max": 3.319542
+      },
+      "throughput": {
+        "bytes_per_sec": 3527906578.249639
+      },
+      "extras": {
+        "warm": true
+      }
+    },
+    {
+      "flow_id": "R1",
+      "scenario_name": "r1_store_get_part_unchunked_1MiB_c1_cold",
+      "blob_size_bytes": 1048576,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 87.468656,
+      "latency_ms": {
+        "p50": 4.216425,
+        "p90": 5.296722,
+        "p99": 6.716118,
+        "max": 6.716118
+      },
+      "throughput": {
+        "bytes_per_sec": 239760400.571377
+      },
+      "extras": {
+        "cold_mechanism": "in_process_only_tmpfs",
+        "slow_tier_backing": "tmpfs",
+        "warm": false
+      }
+    },
+    {
+      "flow_id": "R1",
+      "scenario_name": "r1_store_get_part_unchunked_16MiB_c1_cold",
+      "blob_size_bytes": 16777216,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 409.579136,
+      "latency_ms": {
+        "p50": 19.428083,
+        "p90": 24.410807,
+        "p99": 37.300148,
+        "max": 37.300148
+      },
+      "throughput": {
+        "bytes_per_sec": 819241730.125628
+      },
+      "extras": {
+        "cold_mechanism": "in_process_only_tmpfs",
+        "slow_tier_backing": "tmpfs",
+        "warm": false
+      }
+    },
+    {
+      "flow_id": "F1",
+      "scenario_name": "f1_find_missing_cache_hit_batch1",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 0.02626,
+      "latency_ms": {
+        "p50": 0.00028,
+        "p90": 0.00069,
+        "p99": 0.00681,
+        "max": 0.00681
+      },
+      "throughput": {
+        "elements_per_sec": 1904036.557502
+      },
+      "extras": {
+        "batch_size": 1
+      }
+    },
+    {
+      "flow_id": "F1",
+      "scenario_name": "f1_find_missing_cache_miss_batch1",
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 0.096832,
+      "latency_ms": {
+        "p50": 0.00165,
+        "p90": 0.00209,
+        "p99": 0.01143,
+        "max": 0.01143
+      },
+      "throughput": {
+        "elements_per_sec": 516358.228685
+      },
+      "extras": {
+        "batch_size": 1
+      }
+    },
+    {
+      "flow_id": "F1",
+      "scenario_name": "f1_find_missing_cache_hit_batch16",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 0.168864,
+      "latency_ms": {
+        "p50": 0.00215,
+        "p90": 0.00585,
+        "p99": 0.01304,
+        "max": 0.01304
+      },
+      "throughput": {
+        "elements_per_sec": 4737540.269092
+      },
+      "extras": {
+        "batch_size": 16
+      }
+    },
+    {
+      "flow_id": "F1",
+      "scenario_name": "f1_find_missing_cache_miss_batch16",
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 0.351149,
+      "latency_ms": {
+        "p50": 0.00633,
+        "p90": 0.00864,
+        "p99": 0.019381,
+        "max": 0.019381
+      },
+      "throughput": {
+        "elements_per_sec": 2278235.165129
+      },
+      "extras": {
+        "batch_size": 16
+      }
+    },
+    {
+      "flow_id": "F1",
+      "scenario_name": "f1_find_missing_cache_hit_batch128",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 1.265002,
+      "latency_ms": {
+        "p50": 0.02405,
+        "p90": 0.024471,
+        "p99": 0.072792,
+        "max": 0.072792
+      },
+      "throughput": {
+        "elements_per_sec": 5059280.538687
+      },
+      "extras": {
+        "batch_size": 128
+      }
+    },
+    {
+      "flow_id": "F1",
+      "scenario_name": "f1_find_missing_cache_miss_batch128",
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 2.153384,
+      "latency_ms": {
+        "p50": 0.041531,
+        "p90": 0.042451,
+        "p99": 0.097983,
+        "max": 0.097983
+      },
+      "throughput": {
+        "elements_per_sec": 2972066.291939
+      },
+      "extras": {
+        "batch_size": 128
+      }
+    },
+    {
+      "flow_id": "F1",
+      "scenario_name": "f1_find_missing_cache_hit_batch1024",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 10.797179,
+      "latency_ms": {
+        "p50": 0.208625,
+        "p90": 0.217955,
+        "p99": 0.486912,
+        "max": 0.486912
+      },
+      "throughput": {
+        "elements_per_sec": 4741979.363313
+      },
+      "extras": {
+        "batch_size": 1024
+      }
+    },
+    {
+      "flow_id": "F1",
+      "scenario_name": "f1_find_missing_cache_miss_batch1024",
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 16.411158,
+      "latency_ms": {
+        "p50": 0.320968,
+        "p90": 0.332509,
+        "p99": 0.575884,
+        "max": 0.575884
+      },
+      "throughput": {
+        "elements_per_sec": 3119828.594667
+      },
+      "extras": {
+        "batch_size": 1024
+      }
+    },
+    {
+      "flow_id": "W3",
+      "scenario_name": "w3_chunked_v2_write_single_writer_4MiB",
+      "blob_size_bytes": 4194304,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 958.829075,
+      "latency_ms": {
+        "p50": 46.6759,
+        "p90": 50.124106,
+        "p99": 55.421008,
+        "max": 55.421008
+      },
+      "throughput": {
+        "bytes_per_sec": 87488043.68495
+      },
+      "extras": {
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "concurrent_ops_per_iter": 1,
+        "measures": "chunked_commit_to_disk",
+        "production_sinks_wired": "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests",
+        "v3_anchor": "chunked_v2"
+      }
+    },
+    {
+      "flow_id": "W3",
+      "scenario_name": "w3_chunked_v2_write_single_writer_16MiB",
+      "blob_size_bytes": 16777216,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 50,
+      "confidence": "medium",
+      "total_duration_ms": 2991.161498,
+      "latency_ms": {
+        "p50": 59.87913,
+        "p90": 63.332075,
+        "p99": 76.319018,
+        "max": 76.319018
+      },
+      "throughput": {
+        "bytes_per_sec": 280446509.01026
+      },
+      "extras": {
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "concurrent_ops_per_iter": 1,
+        "measures": "chunked_commit_to_disk",
+        "production_sinks_wired": "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests",
+        "v3_anchor": "chunked_v2"
+      }
+    },
+    {
+      "flow_id": "W3",
+      "scenario_name": "w3_chunked_v2_write_burst_4MiB_c4",
+      "blob_size_bytes": 4194304,
+      "concurrency": 4,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 1226.063256,
+      "latency_ms": {
+        "p50": 56.676299,
+        "p90": 56.770071,
+        "p99": 149.934198,
+        "max": 149.934198
+      },
+      "throughput": {
+        "bytes_per_sec": 273676189.509752
+      },
+      "extras": {
+        "batch_wall_clock_semantics": "latency_samples_are_full_batch_walltime_not_sum_of_per_op",
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "concurrent_ops_per_iter": 4,
+        "measures": "chunked_commit_to_disk",
+        "production_sinks_wired": "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests",
+        "v3_anchor": "chunked_v2"
+      }
+    },
+    {
+      "flow_id": "W3",
+      "scenario_name": "w3_chunked_v2_write_burst_4MiB_c16",
+      "blob_size_bytes": 4194304,
+      "concurrency": 16,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 2013.49069,
+      "latency_ms": {
+        "p50": 100.015156,
+        "p90": 103.415592,
+        "p99": 113.386829,
+        "max": 113.386829
+      },
+      "throughput": {
+        "bytes_per_sec": 666592245.330918
+      },
+      "extras": {
+        "batch_wall_clock_semantics": "latency_samples_are_full_batch_walltime_not_sum_of_per_op",
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "concurrent_ops_per_iter": 16,
+        "measures": "chunked_commit_to_disk",
+        "production_sinks_wired": "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests",
+        "v3_anchor": "chunked_v2"
+      }
+    },
+    {
+      "flow_id": "W3",
+      "scenario_name": "w3_chunked_v2_write_burst_4MiB_c64",
+      "blob_size_bytes": 4194304,
+      "concurrency": 64,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 5260.688078,
+      "latency_ms": {
+        "p50": 259.941811,
+        "p90": 299.892174,
+        "p99": 316.954968,
+        "max": 316.954968
+      },
+      "throughput": {
+        "bytes_per_sec": 1020533633.699314
+      },
+      "extras": {
+        "batch_wall_clock_semantics": "latency_samples_are_full_batch_walltime_not_sum_of_per_op",
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "concurrent_ops_per_iter": 64,
+        "measures": "chunked_commit_to_disk",
+        "production_sinks_wired": "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests",
+        "v3_anchor": "chunked_v2"
+      }
+    },
+    {
+      "flow_id": "W3",
+      "scenario_name": "w3_chunked_v2_write_burst_16MiB_c4",
+      "blob_size_bytes": 16777216,
+      "concurrency": 4,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 1990.110559,
+      "latency_ms": {
+        "p50": 96.649441,
+        "p90": 116.903536,
+        "p99": 123.306105,
+        "max": 123.306105
+      },
+      "throughput": {
+        "bytes_per_sec": 674423475.585408
+      },
+      "extras": {
+        "batch_wall_clock_semantics": "latency_samples_are_full_batch_walltime_not_sum_of_per_op",
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "concurrent_ops_per_iter": 4,
+        "measures": "chunked_commit_to_disk",
+        "production_sinks_wired": "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests",
+        "v3_anchor": "chunked_v2"
+      }
+    },
+    {
+      "flow_id": "W3",
+      "scenario_name": "w3_chunked_v2_write_burst_16MiB_c16",
+      "blob_size_bytes": 16777216,
+      "concurrency": 16,
+      "cache_state": "cold",
+      "iters": 20,
+      "confidence": "medium",
+      "total_duration_ms": 5207.505523,
+      "latency_ms": {
+        "p50": 263.317262,
+        "p90": 276.527781,
+        "p99": 280.193532,
+        "max": 280.193532
+      },
+      "throughput": {
+        "bytes_per_sec": 1030956010.759472
+      },
+      "extras": {
+        "batch_wall_clock_semantics": "latency_samples_are_full_batch_walltime_not_sum_of_per_op",
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "concurrent_ops_per_iter": 16,
+        "measures": "chunked_commit_to_disk",
+        "production_sinks_wired": "stable_digests_pusher + failed_writes_inserter + chunked_in_flight_digests",
+        "v3_anchor": "chunked_v2"
+      }
+    },
+    {
+      "flow_id": "R5",
+      "scenario_name": "r5_filesystem_fanout_readers_4MiB_n2",
+      "blob_size_bytes": 4194304,
+      "concurrency": 2,
+      "cache_state": "contended",
+      "iters": 10,
+      "confidence": "low",
+      "total_duration_ms": 72.779178,
+      "latency_ms": {
+        "p50": 6.352858,
+        "p90": 10.285215,
+        "p99": 11.434204,
+        "max": 11.434204
+      },
+      "throughput": {
+        "bytes_per_sec": 1152610984.421946
+      },
+      "extras": {
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "n_readers": 2,
+        "phase_2_followup": "wire cell through WriteChunkedV2 commit barrier so per-digest Notify is in read path",
+        "production_sinks_wired": "none",
+        "v3_anchor": "DEFERRED_PHASE_2_filesystem_fanout"
+      }
+    },
+    {
+      "flow_id": "R5",
+      "scenario_name": "r5_filesystem_fanout_readers_4MiB_n10",
+      "blob_size_bytes": 4194304,
+      "concurrency": 10,
+      "cache_state": "contended",
+      "iters": 10,
+      "confidence": "low",
+      "total_duration_ms": 92.272232,
+      "latency_ms": {
+        "p50": 8.616674,
+        "p90": 10.88533,
+        "p99": 15.724651,
+        "max": 15.724651
+      },
+      "throughput": {
+        "bytes_per_sec": 4545575531.325611
+      },
+      "extras": {
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "n_readers": 10,
+        "phase_2_followup": "wire cell through WriteChunkedV2 commit barrier so per-digest Notify is in read path",
+        "production_sinks_wired": "none",
+        "v3_anchor": "DEFERRED_PHASE_2_filesystem_fanout"
+      }
+    },
+    {
+      "flow_id": "R5",
+      "scenario_name": "r5_filesystem_fanout_readers_16MiB_n4",
+      "blob_size_bytes": 16777216,
+      "concurrency": 4,
+      "cache_state": "contended",
+      "iters": 10,
+      "confidence": "low",
+      "total_duration_ms": 249.693093,
+      "latency_ms": {
+        "p50": 18.251273,
+        "p90": 35.129063,
+        "p99": 51.331735,
+        "max": 51.331735
+      },
+      "throughput": {
+        "bytes_per_sec": 2687653999.303858
+      },
+      "extras": {
+        "chunk_size": 1048576,
+        "composition_deviation": "direct_filesystem_no_cas_chain_wrappers_no_memorystore_no_sizepartitioning",
+        "n_readers": 4,
+        "phase_2_followup": "wire cell through WriteChunkedV2 commit barrier so per-digest Notify is in read path",
+        "production_sinks_wired": "none",
+        "v3_anchor": "DEFERRED_PHASE_2_filesystem_fanout"
+      }
+    },
+    {
+      "flow_id": "C1",
+      "scenario_name": "c1_exists_in_cache_single_key_hit",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 2000,
+      "confidence": "high",
+      "total_duration_ms": 0.663306,
+      "latency_ms": {
+        "p50": 0.0002,
+        "p90": 0.00023,
+        "p99": 0.005391,
+        "max": 0.00683
+      },
+      "throughput": {
+        "elements_per_sec": 3015199.621291
+      },
+      "extras": {
+        "composition_deviation": "micro_no_wrappers",
+        "hit_path": true,
+        "populate_count": 4096
+      }
+    },
+    {
+      "flow_id": "C1",
+      "scenario_name": "c1_exists_in_cache_single_key_miss",
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 2000,
+      "confidence": "high",
+      "total_duration_ms": 0.516352,
+      "latency_ms": {
+        "p50": 0.00015,
+        "p90": 0.00016,
+        "p99": 0.0031,
+        "max": 0.007541
+      },
+      "throughput": {
+        "elements_per_sec": 3873326.722856
+      },
+      "extras": {
+        "composition_deviation": "micro_no_wrappers",
+        "hit_path": false
+      }
+    },
+    {
+      "flow_id": "C1",
+      "scenario_name": "c1_has_with_results_batch16_hit",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 2000,
+      "confidence": "high",
+      "total_duration_ms": 7.120316,
+      "latency_ms": {
+        "p50": 0.00221,
+        "p90": 0.00687,
+        "p99": 0.0077,
+        "max": 0.069832
+      },
+      "throughput": {
+        "elements_per_sec": 4494182.56156
+      },
+      "extras": {
+        "batch_size": 16,
+        "composition_deviation": "micro_no_wrappers",
+        "hit_path": true
+      }
+    },
+    {
+      "flow_id": "C1",
+      "scenario_name": "c1_has_with_results_batch128_hit",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 2000,
+      "confidence": "high",
+      "total_duration_ms": 57.436348,
+      "latency_ms": {
+        "p50": 0.028131,
+        "p90": 0.028421,
+        "p99": 0.037541,
+        "max": 0.343998
+      },
+      "throughput": {
+        "elements_per_sec": 4457107.892723
+      },
+      "extras": {
+        "batch_size": 128,
+        "composition_deviation": "micro_no_wrappers",
+        "hit_path": true
+      }
+    },
+    {
+      "flow_id": "A1",
+      "scenario_name": "a1_get_action_result_hit_batch1",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 200,
+      "confidence": "high",
+      "total_duration_ms": 211.450123,
+      "latency_ms": {
+        "p50": 0.877461,
+        "p90": 1.249551,
+        "p99": 6.656446,
+        "max": 7.388253
+      },
+      "throughput": {
+        "elements_per_sec": 945.849533
+      },
+      "extras": {
+        "ac_batch_semantics": "serial_single_key_calls_no_native_batch_rpc",
+        "batch_size": 1,
+        "composition_deviation": "filesystem_only_not_prod_ac_chain",
+        "hit_path": true,
+        "populate_count": 4096,
+        "timed_body_includes": "get_part_unchunked_plus_prost_message_decode_per_element"
+      }
+    },
+    {
+      "flow_id": "A1",
+      "scenario_name": "a1_get_action_result_hit_batch16",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 200,
+      "confidence": "high",
+      "total_duration_ms": 2701.093668,
+      "latency_ms": {
+        "p50": 12.970553,
+        "p90": 14.034108,
+        "p99": 23.661098,
+        "max": 63.917907
+      },
+      "throughput": {
+        "elements_per_sec": 1184.705306
+      },
+      "extras": {
+        "ac_batch_semantics": "serial_single_key_calls_no_native_batch_rpc",
+        "batch_size": 16,
+        "composition_deviation": "filesystem_only_not_prod_ac_chain",
+        "hit_path": true,
+        "populate_count": 4096,
+        "timed_body_includes": "get_part_unchunked_plus_prost_message_decode_per_element"
+      }
+    },
+    {
+      "flow_id": "A1",
+      "scenario_name": "a1_get_action_result_hit_batch128",
+      "concurrency": 1,
+      "cache_state": "warm",
+      "iters": 200,
+      "confidence": "high",
+      "total_duration_ms": 21954.279577,
+      "latency_ms": {
+        "p50": 105.403398,
+        "p90": 120.697847,
+        "p99": 162.918176,
+        "max": 173.257222
+      },
+      "throughput": {
+        "elements_per_sec": 1166.05967
+      },
+      "extras": {
+        "ac_batch_semantics": "serial_single_key_calls_no_native_batch_rpc",
+        "batch_size": 128,
+        "composition_deviation": "filesystem_only_not_prod_ac_chain",
+        "hit_path": true,
+        "populate_count": 4096,
+        "timed_body_includes": "get_part_unchunked_plus_prost_message_decode_per_element"
+      }
+    },
+    {
+      "flow_id": "A1",
+      "scenario_name": "a1_get_action_result_miss_batch1",
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 200,
+      "confidence": "high",
+      "total_duration_ms": 0.859972,
+      "latency_ms": {
+        "p50": 0.00358,
+        "p90": 0.00437,
+        "p99": 0.019291,
+        "max": 0.033491
+      },
+      "throughput": {
+        "elements_per_sec": 232565.711442
+      },
+      "extras": {
+        "batch_size": 1,
+        "composition_deviation": "filesystem_only_not_prod_ac_chain",
+        "hit_path": false
+      }
+    },
+    {
+      "flow_id": "A2",
+      "scenario_name": "a2_update_action_result_small",
+      "blob_size_bytes": 114,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 100,
+      "confidence": "high",
+      "total_duration_ms": 26.130389,
+      "latency_ms": {
+        "p50": 0.250226,
+        "p90": 0.305458,
+        "p99": 0.420941,
+        "max": 0.518093
+      },
+      "throughput": {
+        "bytes_per_sec": 436273.642922
+      },
+      "extras": {
+        "ar_encoded_len": 114,
+        "composition_deviation": "filesystem_only_not_prod_ac_chain",
+        "inline_logs_bytes": 0,
+        "output_file_count": 1,
+        "serialized_ar_bytes": 114
+      }
+    },
+    {
+      "flow_id": "A2",
+      "scenario_name": "a2_update_action_result_medium",
+      "blob_size_bytes": 1140,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 100,
+      "confidence": "high",
+      "total_duration_ms": 24.026866,
+      "latency_ms": {
+        "p50": 0.233386,
+        "p90": 0.285367,
+        "p99": 0.299177,
+        "max": 0.306938
+      },
+      "throughput": {
+        "bytes_per_sec": 4744688.716373
+      },
+      "extras": {
+        "ar_encoded_len": 1140,
+        "composition_deviation": "filesystem_only_not_prod_ac_chain",
+        "inline_logs_bytes": 0,
+        "output_file_count": 10,
+        "serialized_ar_bytes": 1140
+      }
+    },
+    {
+      "flow_id": "A2",
+      "scenario_name": "a2_update_action_result_large",
+      "blob_size_bytes": 19688,
+      "concurrency": 1,
+      "cache_state": "cold",
+      "iters": 100,
+      "confidence": "high",
+      "total_duration_ms": 25.181445,
+      "latency_ms": {
+        "p50": 0.242606,
+        "p90": 0.276867,
+        "p99": 0.441061,
+        "max": 0.687557
+      },
+      "throughput": {
+        "bytes_per_sec": 78184552.157352
+      },
+      "extras": {
+        "ar_encoded_len": 19688,
+        "composition_deviation": "filesystem_only_not_prod_ac_chain",
+        "inline_logs_bytes": 4096,
+        "output_file_count": 100,
+        "serialized_ar_bytes": 19688
+      }
+    }
+  ]
+}
