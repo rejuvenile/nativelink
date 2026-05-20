@@ -26,6 +26,7 @@ pub mod chunked_write_handler_v2;
 pub mod execution_server;
 pub mod failed_writes_drain;
 pub mod fetch_server;
+pub mod h2_server;
 pub mod health_server;
 pub mod push_server;
 pub mod remote_asset_proto;

@@ -3342,11 +3342,13 @@ name = "nativelink-benchmarks"
 version = "0.1.0"
 dependencies = [
  "async-lock",
+ "axum",
  "bytes",
  "chrono",
  "clap",
  "futures",
  "hostname",
+ "hyper-util",
  "libc",
  "mimalloc",
  "nativelink-config",
@@ -3365,6 +3367,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

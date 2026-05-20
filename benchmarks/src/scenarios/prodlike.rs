@@ -366,7 +366,7 @@ async fn run_w3f(
     // cannot silently drift from W3.
     use crate::scenarios::chunked_v2::enabled::{
         BENCH_CHUNK_SIZE, PRODUCTION_SINKS_WIRED_TAG, bench_client_endpoint,
-        bench_server_builder, build_chunks, drain_v2_response, make_payload,
+        build_chunks, drain_v2_response, make_payload, run_bench_h2_server,
     };
     use crate::scenarios::digest_via_default_hasher;
 
@@ -409,22 +409,16 @@ async fn run_w3f(
         .await
         .expect("ephemeral bind must succeed");
     let port = listener.local_addr().unwrap().port();
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let adapter = ChunkedCasExtensionsAdapter::new(handler);
     let svc = CasExtensionsServer::new(adapter);
+    // h2 settings via shared helper — Pattern-C Phase 2 (Option B):
+    // `run_bench_h2_server` drives `hyper_util::server::conn::auto::Builder`
+    // through `nativelink_service::h2_server::build_h2_server_builder`,
+    // mirroring production at `src/bin/nativelink.rs:1868-1935` with all
+    // 10 h2 settings (vs the prior 3-of-10 tonic wrapper). See #584/#586.
     let _server_guard = nativelink_util::spawn!(
         "w3f-bench-server",
-        async move {
-            // h2 settings via shared helper — see #563 + #528, mirrors
-            // production at `src/bin/nativelink.rs:1848-1865`.
-            if let Err(e) = bench_server_builder()
-                .add_service(svc)
-                .serve_with_incoming(incoming)
-                .await
-            {
-                eprintln!("[bench] W3f v2 server exited with error: {e:?}");
-            }
-        }
+        run_bench_h2_server(listener, svc)
     );
     // h2 settings via shared helper — see #563 + #528, mirrors production
     // client at `nativelink-util/src/tls_utils.rs:153-208`.
@@ -741,8 +735,8 @@ mod tests {
         use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 
         use crate::scenarios::chunked_v2::enabled::{
-            bench_client_endpoint, bench_server_builder, build_chunks,
-            drain_v2_response, make_handler_with_production_sinks, make_payload,
+            bench_client_endpoint, build_chunks, drain_v2_response,
+            make_handler_with_production_sinks, make_payload, run_bench_h2_server,
         };
         use crate::scenarios::digest_via_default_hasher;
 
@@ -804,24 +798,13 @@ mod tests {
                 .await
                 .expect("ephemeral bind must succeed");
             let port = listener.local_addr().unwrap().port();
-            let incoming =
-                tokio_stream::wrappers::TcpListenerStream::new(listener);
             let adapter = ChunkedCasExtensionsAdapter::new(handler.clone());
             let svc = CasExtensionsServer::new(adapter);
+            // h2 settings via shared helper — Pattern-C Phase 2 (Option B);
+            // see #584 + #563 + #528.
             let _server_guard = nativelink_util::spawn!(
                 "w3f-sink-wiring-test-server",
-                async move {
-                    // h2 settings via shared helper — #563 + #528.
-                    if let Err(e) = bench_server_builder()
-                        .add_service(svc)
-                        .serve_with_incoming(incoming)
-                        .await
-                    {
-                        eprintln!(
-                            "[test] W3f wiring v2 server exited with error: {e:?}"
-                        );
-                    }
-                }
+                run_bench_h2_server(listener, svc)
             );
             // h2 settings via shared helper — #563 + #528.
             let endpoint =

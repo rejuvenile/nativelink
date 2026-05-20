@@ -29,6 +29,16 @@ http = { version = "1.3.1", default-features = false }
 http-body = { version = "1.0.1", default-features = false }
 http-body-util = { version = "0.1.3", default-features = false }
 hyper = { version = "1.6.0", default-features = false }
+# `h2_server::build_h2_server_builder` constructs a
+# `hyper_util::server::conn::auto::Builder<TaskExecutor>` with `TokioTimer`
+# so both `src/bin/nativelink.rs::inner_main` and the bench `start_v2_server`
+# share one source of truth for the 10 production h2 settings sourced from
+# `nativelink-config::HttpServerConfig`. Pattern-C Phase 2 extraction
+# (parallels Phase 1's `build_store_manager` in nativelink-store).
+hyper-util = { version = "0.1.11", default-features = false, features = [
+  "server-auto",
+  "tokio",
+] }
 opentelemetry = { version = "0.31.0", default-features = false }
 opentelemetry-semantic-conventions = { version = "0.31.0", default-features = false, features = [
   "default",
@@ -121,7 +131,6 @@ blake3 = { version = "1.8.0", default-features = false }
 async-trait = { version = "0.1.88", default-features = false }
 hex = { version = "0.4.3", default-features = false }
 hyper = { version = "1.6.0", default-features = false }
-hyper-util = { version = "0.1.11", default-features = false }
 pretty_assertions = { version = "1.4.1", features = [
   "std",
 ], default-features = false }

@@ -503,12 +503,12 @@ pub(crate) mod enabled {
     }
 
     /// HTTP/2 flow-control + frame-size settings the W3 / W3f bench
-    /// helpers apply to BOTH the in-process `tonic::transport::Server`
-    /// and the client `tonic::transport::Endpoint`. Mirrors the
-    /// production server config at
-    /// `src/bin/nativelink.rs:1848-1865` and the client config at
-    /// `nativelink-util/src/tls_utils.rs:153-208`. See #563 (tune W3
-    /// bench h2 flow-control windows) + #528 audit
+    /// helpers apply to the in-process h2 server (built via
+    /// [`nativelink_service::h2_server::build_h2_server_builder`]) and to
+    /// the client `tonic::transport::Endpoint`. Mirrors the production
+    /// server config at `src/bin/nativelink.rs:1868-1935` and the client
+    /// config at `nativelink-util/src/tls_utils.rs:153-208`. See #563
+    /// (tune W3 bench h2 flow-control windows) + #528 audit
     /// (`.claude/audits/528-w3-bimodal-investigation-20260519.md`):
     /// tonic / hyper RFC defaults are 64 KiB stream + 64 KiB connection,
     /// which forces one WINDOW_UPDATE round-trip per ~64 KiB segment.
@@ -520,6 +520,17 @@ pub(crate) mod enabled {
     /// the bench measures something the production fleet does NOT see.
     /// Reviewers touching either site MUST verify the corresponding
     /// constant here.
+    ///
+    /// Note on the server side: Pattern-C Phase 2 (Option B) wires
+    /// these constants through a synthesized `HttpServerConfig` in
+    /// [`bench_h2_server_config`] so the bench applies all 10
+    /// production h2 settings by construction (not just these three).
+    /// The other 7 settings (keep-alive interval/timeout, max-pending-
+    /// reset, adaptive window, max-concurrent-streams, max-send-buf,
+    /// max-header-list-size, enable-connect-protocol) are left at the
+    /// `HttpServerConfig` `None` defaults — `build_h2_server_builder`
+    /// applies its hardcoded production fallback for the four
+    /// load-bearing ones (stream/conn window, max-frame, max-send-buf).
     pub(crate) const W3_BENCH_INITIAL_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
     /// See [`W3_BENCH_INITIAL_STREAM_WINDOW`].
     pub(crate) const W3_BENCH_INITIAL_CONNECTION_WINDOW: u32 = 128 * 1024 * 1024;
@@ -528,22 +539,41 @@ pub(crate) mod enabled {
     /// client; clients negotiate down via the server's SETTINGS frame.
     pub(crate) const W3_BENCH_MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 
-    /// Construct a `tonic::transport::Server::Builder` pre-configured
-    /// with the W3 / W3f bench h2 settings (see
-    /// [`W3_BENCH_INITIAL_STREAM_WINDOW`]). Used by `start_v2_server`
-    /// in this file AND by the W3f prodlike cells in `prodlike.rs` so
-    /// the two cells share one source of truth for h2 config — a
-    /// future production-config bump only needs to update the three
-    /// `W3_BENCH_*` constants in this file. **Falsifier:** remove the
-    /// `.initial_stream_window_size(...)` call here; the
-    /// `helpers_call_setters_on_named_constants` test below red-fails
-    /// with the bespoke "#563 W3 bench h2 stream-window violated"
-    /// message.
-    pub(crate) fn bench_server_builder() -> tonic::transport::Server {
-        tonic::transport::Server::builder()
-            .initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)
-            .initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)
-            .max_frame_size(W3_BENCH_MAX_FRAME_SIZE)
+    /// Construct an `HttpServerConfig` populated with the W3 / W3f
+    /// bench h2 settings (see [`W3_BENCH_INITIAL_STREAM_WINDOW`]).
+    /// Consumed by [`run_bench_h2_server`] via
+    /// [`nativelink_service::h2_server::build_h2_server_builder`] —
+    /// production reads from this same struct at
+    /// `src/bin/nativelink.rs:1875-1878`, so any future production h2
+    /// setting addition flows into the bench by construction (the
+    /// struct is `#[non_exhaustive]`-style via `#[serde(default)]` on
+    /// every field).
+    ///
+    /// Pattern-C Phase 2 (Option B): replaces the prior
+    /// `tonic::transport::Server::builder()` wrapper that applied only
+    /// 3 of the 10 production settings (#586 catch-up; #584 audit).
+    /// **Falsifier:** the `helpers_use_extracted_h2_builder` test
+    /// below red-fails if the helper no longer calls into the
+    /// `build_h2_server_builder` extraction.
+    pub(crate) fn bench_h2_server_config() -> nativelink_config::cas_server::HttpServerConfig {
+        nativelink_config::cas_server::HttpServerConfig {
+            experimental_http2_initial_stream_window_size: Some(
+                W3_BENCH_INITIAL_STREAM_WINDOW,
+            ),
+            experimental_http2_initial_connection_window_size: Some(
+                W3_BENCH_INITIAL_CONNECTION_WINDOW,
+            ),
+            experimental_http2_max_frame_size: Some(W3_BENCH_MAX_FRAME_SIZE),
+            // Other 7 settings: left at None so `build_h2_server_builder`
+            // applies its production-default fallback for the four
+            // load-bearing ones (max_send_buf 2 MiB) and skips the rest
+            // (keep_alive_interval/timeout, max_pending_accept_reset,
+            // adaptive_window, max_concurrent_streams,
+            // enable_connect_protocol, max_header_list_size) exactly as
+            // production does when the operator doesn't set them in
+            // `prod-server.json5`. See `nativelink-service/src/h2_server.rs`.
+            ..Default::default()
+        }
     }
 
     /// Construct a `tonic::transport::Endpoint` pre-configured with
@@ -564,14 +594,113 @@ pub(crate) mod enabled {
             .connect_timeout(Duration::from_secs(5)))
     }
 
+    /// Run a hyper_util-driven h2 accept loop on `listener` serving a
+    /// single `CasExtensionsServer` until the surrounding spawn is
+    /// dropped. Pattern-C Phase 2 (Option B): replaces the prior
+    /// `tonic::transport::Server::builder().add_service(svc).serve_with_incoming(...)`
+    /// call so the bench uses the same `hyper_util::server::conn::auto::Builder`
+    /// primitives production does. Settings come from
+    /// [`bench_h2_server_config`] via
+    /// [`nativelink_service::h2_server::build_h2_server_builder`].
+    ///
+    /// Bench-specific simplifications vs production (`src/bin/nativelink.rs:1937-2105`):
+    /// - **No TLS** — loopback only; tls_acceptor branch omitted.
+    /// - **No `GracefulShutdown`** — the outer accept-loop task (this
+    ///   future) is wrapped by `start_v2_server` in `nativelink_util::spawn!`
+    ///   whose `JoinHandleDropGuard` aborts the accept loop on cell drop.
+    ///   Per-connection futures spawned below via `background_spawn!`
+    ///   are fire-and-forget — they are NOT aborted by the guard and
+    ///   instead finish naturally when the client tears down its TCP
+    ///   side (RST / FIN) at end-of-cell. This is acceptable for the
+    ///   bench because cells use a single client that drops at iter
+    ///   end, but it is not equivalent to production's SIGTERM drain.
+    /// - **No SO_KEEPALIVE / SNDBUF/RCVBUF tuning** — loopback has zero
+    ///   BDP; the 8 MiB buffers production sets matter for 10 GbE only.
+    /// - **TCP_NODELAY set** — matches production; loopback can still
+    ///   produce Nagle 40 ms hiccups on small frames.
+    /// - **No structured logging** — bench is silent on success;
+    ///   error path uses `eprintln!` to surface server-side panics that
+    ///   would otherwise hide behind a cell timeout.
+    ///
+    /// Errors that escape `serve_connection` are reported via
+    /// `eprintln!` (not `tracing` — bench typically runs without a
+    /// subscriber and a silent server-side panic was the failure mode
+    /// the prior `bench_server_builder` site already guarded against).
+    pub(crate) async fn run_bench_h2_server(
+        listener: tokio::net::TcpListener,
+        svc: CasExtensionsServer<ChunkedCasExtensionsAdapter>,
+    ) {
+        let http = match nativelink_service::h2_server::build_h2_server_builder(
+            nativelink_util::task::TaskExecutor::default(),
+            &bench_h2_server_config(),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[bench] build_h2_server_builder failed (h2 config invalid?): {e:?}"
+                );
+                return;
+            }
+        };
+        // Wrap the single tonic service in Routes → axum::Router so the
+        // tower::Service shape matches production's
+        // `src/bin/nativelink.rs:1666-1671`.
+        let router = tonic::service::Routes::builder()
+            .routes()
+            .add_service(svc)
+            .into_axum_router();
+        loop {
+            let (tcp_stream, _remote_addr) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("[bench] accept failed: {e:?}");
+                    return;
+                }
+            };
+            // Matches production at `src/bin/nativelink.rs:1953`. Even
+            // on loopback, Nagle can produce 40 ms delays on small
+            // frames; disabling it removes that noise floor.
+            if let Err(e) = tcp_stream.set_nodelay(true) {
+                eprintln!("[bench] set_nodelay failed: {e:?}");
+            }
+            let http = http.clone();
+            let router = router.clone();
+            nativelink_util::background_spawn!(
+                "bench_h2_connection",
+                async move {
+                    let conn = http.serve_connection(
+                        hyper_util::rt::tokio::TokioIo::new(tcp_stream),
+                        hyper_util::service::TowerToHyperService::new(router),
+                    );
+                    if let Err(e) = conn.await {
+                        // Don't classify errors here — bench cells fail
+                        // loud on RPC error at the call site; printing
+                        // every connection-close noise would drown that.
+                        // But a panic or unexpected error still warrants
+                        // a single eprintln so a cell timeout has a
+                        // breadcrumb.
+                        let s = format!("{e:?}");
+                        if !s.contains("BrokenPipe")
+                            && !s.contains("ConnectionReset")
+                            && !s.contains("ConnectionAborted")
+                        {
+                            eprintln!("[bench] h2 serve_connection error: {s}");
+                        }
+                    }
+                }
+            );
+        }
+    }
+
     /// Bring up an in-process `CasExtensions` v2 server bound to an
     /// ephemeral port + a connected client. Returns the client and an
     /// `AbortOnDropHandle` for the server task so dropping the cell
     /// aborts the server (no leak).
     ///
-    /// h2 settings come from [`bench_server_builder`] +
-    /// [`bench_client_endpoint`] — see [`W3_BENCH_INITIAL_STREAM_WINDOW`]
-    /// for the production cross-reference (#563 + #528).
+    /// h2 settings come from [`bench_h2_server_config`] (server) +
+    /// [`bench_client_endpoint`] (client) — see
+    /// [`W3_BENCH_INITIAL_STREAM_WINDOW`] for the production
+    /// cross-reference (#563 + #528).
     async fn start_v2_server(
         handler: Arc<ChunkedWriteHandler>,
     ) -> (
@@ -582,22 +711,11 @@ pub(crate) mod enabled {
             .await
             .expect("ephemeral bind must succeed");
         let port = listener.local_addr().unwrap().port();
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         let adapter = ChunkedCasExtensionsAdapter::new(handler);
         let svc = CasExtensionsServer::new(adapter);
         let handle = nativelink_util::spawn!(
             "v2-bench-server",
-            async move {
-                if let Err(e) = bench_server_builder()
-                    .add_service(svc)
-                    .serve_with_incoming(incoming)
-                    .await
-                {
-                    // Surface the cause so a cell timing out doesn't
-                    // hide a server-side panic.
-                    eprintln!("[bench] v2 server exited with error: {e:?}");
-                }
-            }
+            run_bench_h2_server(listener, svc)
         );
         let endpoint = bench_client_endpoint(format!("http://127.0.0.1:{port}"))
             .expect("endpoint parse must succeed");
@@ -2122,22 +2240,28 @@ pub(crate) mod enabled {
         }
 
         /// #563 source-introspection falsifier: the helper bodies
-        /// MUST call the h2-setter chain with the named constants.
-        /// A future drift where someone removes the
-        /// `.initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)`
-        /// call from `bench_server_builder` or `bench_client_endpoint`
-        /// while leaving the constants alone would silently regress
-        /// every W3 / W3f cell back to tonic's 64 KiB default.
+        /// MUST wire each named constant into the configuration the
+        /// h2 server / client consume. A future drift where someone
+        /// removes a setter while leaving the constant alive would
+        /// silently regress the W3 / W3f cells back to hyper / tonic
+        /// defaults.
+        ///
+        /// Pattern-C Phase 2 update: server-side h2 settings now flow
+        /// through `bench_h2_server_config` →
+        /// `nativelink_service::h2_server::build_h2_server_builder`
+        /// (see #584/#586). Test asserts the synthesized
+        /// `HttpServerConfig` carries each named constant on the right
+        /// field. Client side (`bench_client_endpoint`) is unchanged.
         ///
         /// This test uses `include_str!` on the source file at compile
         /// time, **strips line-comments** (so a commented-out setter
         /// no longer satisfies the assertion), then string-greps for
-        /// the required setter chain on the constant. **Mutation:**
-        /// comment out OR delete the
-        /// `.initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)`
-        /// line in either helper; this test red-fails with the bespoke
-        /// `#563 W3 bench h2 stream-window violated` message naming
-        /// which helper lost the setter.
+        /// the required wiring on the constant. **Mutation:** comment
+        /// out OR delete the
+        /// `experimental_http2_initial_stream_window_size: Some(W3_BENCH_INITIAL_STREAM_WINDOW)`
+        /// line in `bench_h2_server_config`; this test red-fails with
+        /// the bespoke `#563 W3 bench h2 stream-window violated`
+        /// message.
         ///
         /// Why source-introspection vs a behavioral timing check:
         /// loopback bypasses the kernel TCP stack's `tcp_delack_min`
@@ -2166,41 +2290,80 @@ pub(crate) mod enabled {
                     .collect::<Vec<&str>>()
                     .join("\n")
             };
-            // bench_server_builder: server side — all three.
+            // bench_h2_server_config: server side — the synthesized
+            // HttpServerConfig must carry each named constant on the
+            // right field. After Pattern-C Phase 2, server h2 settings
+            // flow into hyper_util via this struct →
+            // `nativelink_service::h2_server::build_h2_server_builder`.
             let raw_server_block = SRC
-                .split("fn bench_server_builder")
+                .split("fn bench_h2_server_config")
                 .nth(1)
-                .expect("bench_server_builder helper must exist")
+                .expect("bench_h2_server_config helper must exist")
                 .split("\n    }")
                 .next()
-                .expect("server helper body must end with `    }`");
+                .expect("server config helper body must end with `    }`");
             let server_block = strip_line_comments(raw_server_block);
             assert!(
                 server_block.contains(
-                    ".initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)"
+                    "experimental_http2_initial_stream_window_size: Some(\n                W3_BENCH_INITIAL_STREAM_WINDOW,"
+                ) || server_block.contains(
+                    "experimental_http2_initial_stream_window_size: Some(W3_BENCH_INITIAL_STREAM_WINDOW)"
                 ),
                 "#563 W3 bench h2 stream-window violated: \
-                 bench_server_builder no longer calls \
-                 .initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW). \
-                 Reverting to tonic's 64 KiB default re-introduces the \
-                 #528 bimodal slow-mode. Server body (comments stripped):\n{server_block}"
+                 bench_h2_server_config no longer assigns \
+                 W3_BENCH_INITIAL_STREAM_WINDOW to \
+                 experimental_http2_initial_stream_window_size. \
+                 Reverting to hyper's 64 KiB default re-introduces the \
+                 #528 bimodal slow-mode. Server config body (comments stripped):\n{server_block}"
             );
             assert!(
                 server_block.contains(
-                    ".initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)"
+                    "experimental_http2_initial_connection_window_size: Some(\n                W3_BENCH_INITIAL_CONNECTION_WINDOW,"
+                ) || server_block.contains(
+                    "experimental_http2_initial_connection_window_size: Some(W3_BENCH_INITIAL_CONNECTION_WINDOW)"
                 ),
                 "#563 W3 bench h2 connection-window violated: \
-                 bench_server_builder no longer calls \
-                 .initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)."
+                 bench_h2_server_config no longer assigns \
+                 W3_BENCH_INITIAL_CONNECTION_WINDOW to \
+                 experimental_http2_initial_connection_window_size."
             );
             assert!(
-                server_block.contains(".max_frame_size(W3_BENCH_MAX_FRAME_SIZE)"),
+                server_block.contains(
+                    "experimental_http2_max_frame_size: Some(W3_BENCH_MAX_FRAME_SIZE)"
+                ),
                 "#563 W3 bench h2 max-frame-size violated: \
-                 bench_server_builder no longer calls \
-                 .max_frame_size(W3_BENCH_MAX_FRAME_SIZE)."
+                 bench_h2_server_config no longer assigns \
+                 W3_BENCH_MAX_FRAME_SIZE to experimental_http2_max_frame_size."
+            );
+            // run_bench_h2_server: must call into the extracted h2
+            // builder so all 10 production settings apply, not just
+            // the 3 named constants. Pattern-C Phase 2 drift detector.
+            let raw_run_block = SRC
+                .split("async fn run_bench_h2_server")
+                .nth(1)
+                .expect("run_bench_h2_server helper must exist")
+                .split("\n    }\n")
+                .next()
+                .expect("run_bench_h2_server body must end with `    }` + newline");
+            let run_block = strip_line_comments(raw_run_block);
+            assert!(
+                run_block
+                    .contains("nativelink_service::h2_server::build_h2_server_builder"),
+                "#584 Pattern-C Phase 2 violated: run_bench_h2_server no \
+                 longer calls nativelink_service::h2_server::build_h2_server_builder. \
+                 Bench has reverted to a non-production h2 setting surface; \
+                 future production setting changes will silently drift from \
+                 the bench. Run body (comments stripped):\n{run_block}"
+            );
+            assert!(
+                run_block.contains("bench_h2_server_config()"),
+                "#584 Pattern-C Phase 2 violated: run_bench_h2_server no \
+                 longer calls bench_h2_server_config() — the named-constant \
+                 wiring is bypassed."
             );
             // bench_client_endpoint: client side — stream + connection
             // only; tonic's Endpoint does not expose max_frame_size.
+            // Unchanged from #563.
             let raw_client_block = SRC
                 .split("fn bench_client_endpoint")
                 .nth(1)

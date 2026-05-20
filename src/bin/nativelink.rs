@@ -25,9 +25,7 @@ use clap::Parser;
 use futures::FutureExt;
 use futures::future::{BoxFuture, OptionFuture, TryFutureExt, try_join_all};
 use hyper::StatusCode;
-use hyper_util::rt::TokioTimer;
 use hyper_util::rt::tokio::TokioIo;
-use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use mimalloc::MiMalloc;
@@ -1865,74 +1863,18 @@ async fn inner_main(
                 make_input_err!("Invalid address '{}' - {e:?}", http_config.socket_address)
             })?;
         let tcp_listener = TcpListener::bind(&socket_addr).await?;
-        let mut http = auto::Builder::new(TaskExecutor::default());
-        // hyper 1.x requires a Timer on the http2 builder; the keepalive
-        // PingPong, header-read, and stream-idle paths panic with
-        // "You must supply a timer." on the first poll otherwise. The
-        // panic fires regardless of whether keep_alive_interval is set
-        // because http2's idle-stream tracker also schedules timer
-        // events. Always install TokioTimer; the cost is one allocation
-        // per connection and the panic surface is total: every gRPC
-        // request fails with ClosedChannelException at the client.
-        // (Production outage 2026-05-12: panic on every connection at
-        // port 50051/50061 after infra commit db1ac5bf enabled
-        // http2_keep_alive_interval=30 in prod-server.json5.)
-        http.http2().timer(TokioTimer::new());
-
-        let http_config = &http_config.advanced_http;
-        if let Some(value) = http_config.http2_keep_alive_interval {
-            http.http2()
-                .keep_alive_interval(Duration::from_secs(u64::from(value)));
-        }
-
-        if let Some(value) = http_config.experimental_http2_max_pending_accept_reset_streams {
-            http.http2()
-                .max_pending_accept_reset_streams(usize::try_from(value).err_tip(
-                    || "Could not convert experimental_http2_max_pending_accept_reset_streams",
-                )?);
-        }
-        // Default to 16 MiB stream window and 128 MiB connection window
-        // to avoid capping per-stream throughput at ~64 MB/s with 1ms RTT
-        // (hyper's default of 64 KiB is too small for high-bandwidth links).
-        http.http2().initial_stream_window_size(
-            http_config
-                .experimental_http2_initial_stream_window_size
-                .unwrap_or(16 * 1024 * 1024),
-        );
-        http.http2().initial_connection_window_size(
-            http_config
-                .experimental_http2_initial_connection_window_size
-                .unwrap_or(128 * 1024 * 1024),
-        );
-        if let Some(value) = http_config.experimental_http2_adaptive_window {
-            http.http2().adaptive_window(value);
-        }
-        http.http2().max_frame_size(
-            http_config
-                .experimental_http2_max_frame_size
-                .unwrap_or(4 * 1024 * 1024),
-        );
-        if let Some(value) = http_config.experimental_http2_max_concurrent_streams {
-            http.http2().max_concurrent_streams(value);
-        }
-        if let Some(value) = http_config.experimental_http2_keep_alive_timeout {
-            http.http2()
-                .keep_alive_timeout(Duration::from_secs(u64::from(value)));
-        }
-        http.http2().max_send_buf_size(
-            usize::try_from(
-                http_config
-                    .experimental_http2_max_send_buf_size
-                    .unwrap_or(2 * 1024 * 1024),
-            )
-            .err_tip(|| "Could not convert http2_max_send_buf_size")?,
-        );
-        if http_config.experimental_http2_enable_connect_protocol == Some(true) {
-            http.http2().enable_connect_protocol();
-        }
-        if let Some(value) = http_config.experimental_http2_max_header_list_size {
-            http.http2().max_header_list_size(value);
-        }
+        // Pattern-C Phase 2: the 10-setting h2 builder construction was
+        // extracted to `nativelink_service::h2_server::build_h2_server_builder`
+        // so the bench `start_v2_server` (in
+        // `benchmarks/src/scenarios/chunked_v2.rs`) can apply the
+        // identical settings by construction — no more drift between
+        // production and the W3 / W3f bench cells (#584 audit / #586
+        // catch-up). See the fn doc-comment for the load-bearing
+        // `TokioTimer` install (production outage 2026-05-12).
+        let http = nativelink_service::h2_server::build_h2_server_builder(
+            TaskExecutor::default(),
+            &http_config.advanced_http,
+        )?;
         info!("Ready, listening on {socket_addr}",);
         let graceful = GracefulShutdown::new();
         let mut accept_stop_rx = accept_stop_tx.subscribe();

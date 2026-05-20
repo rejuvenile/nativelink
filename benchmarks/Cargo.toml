@@ -101,8 +101,28 @@ tokio = { version = "1.44.1", features = [
 ], default-features = false }
 tokio-stream = { version = "0.1.17", features = ["net"], default-features = false }
 tonic = { version = "0.14.5", features = [
+  "router",
   "transport",
 ], default-features = false }
+# Pattern-C Phase 2: bench `start_v2_server` (chunked_v2.rs) +
+# `run_w3f_prodlike` (prodlike.rs) drive `hyper_util::server::conn::auto::Builder`
+# directly so the bench applies all 10 production h2 settings via
+# `nativelink_service::h2_server::build_h2_server_builder`. Previously the
+# bench used `tonic::transport::Server::builder()` and applied only 3
+# settings (#586 catch-up). `axum` is needed for the `Router` type
+# returned by `tonic::service::Routes::into_axum_router` (the same shape
+# production uses at `src/bin/nativelink.rs:1668`).
+axum = { version = "0.8.3", default-features = false }
+hyper-util = { version = "0.1.11", default-features = false, features = [
+  "server-auto",
+  "service",
+  "tokio",
+] }
+# `tower::ServiceExt::clone()` is implicit, but the bench accept loop
+# also needs `tower::Service` to satisfy the bound on
+# `TowerToHyperService::new`. tonic 0.14's `Routes` and axum's `Router`
+# both impl it; tower brings the trait into scope.
+tower = { version = "0.5.2", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 tracing-subscriber = { version = "0.3.19", default-features = false, features = ["fmt", "env-filter"] }
 
