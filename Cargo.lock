@@ -3347,6 +3347,7 @@ dependencies = [
  "futures",
  "hostname",
  "libc",
+ "mimalloc",
  "nativelink-config",
  "nativelink-error",
  "nativelink-proto",

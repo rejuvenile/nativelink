@@ -79,6 +79,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use mimalloc::MiMalloc;
 use nativelink_benchmarks::output::{BaselineFile, BenchmarkResult, RunMetadata, SCHEMA_VERSION};
 use nativelink_benchmarks::preflight::{Verdict, run_preflight};
 use nativelink_benchmarks::scenarios::{
@@ -86,6 +87,16 @@ use nativelink_benchmarks::scenarios::{
     legacy_write, prodlike,
 };
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
+
+// #585: match production allocator (`src/bin/nativelink.rs:90-91`). The
+// bench previously used the platform default malloc, which diverges 5-20%
+// on hot allocation paths (Bytes per chunk, MemoryStore moka churn) versus
+// mimalloc — invisible noise in cell-vs-cell deltas that distorts cross-
+// scenario comparisons. Mimalloc env-var tuning (Fix F per #333) NOT
+// replicated here; default mimalloc is the production-parity floor.
+// Follow-up if measurement shows divergence.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
 #[command(name = "data_plane_bench", version, about = "#495 Phase 1 v3-anchoring smoke suite")]

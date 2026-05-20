@@ -51,6 +51,13 @@ clap = { version = "4.5.35", features = [
 ], default-features = false }
 futures = { version = "0.3.31", default-features = false }
 hostname = { version = "0.4.0", default-features = false }
+# #585: match production allocator. `src/bin/nativelink.rs:90-91` installs
+# mimalloc as the global allocator; the bench previously used system malloc,
+# which diverges 5-20% on hot allocation paths (Bytes per chunk, MemoryStore
+# moka churn). Mirroring production removes that source of measurement
+# noise. Version pinned to the same `0.1.44` + `override`,`v3` features as
+# the workspace declaration in the root `Cargo.toml`.
+mimalloc = { version = "0.1.44", default-features = false, features = ["override", "v3"] }
 nativelink-config = { path = "../nativelink-config" }
 nativelink-error = { path = "../nativelink-error" }
 nativelink-proto = { path = "../nativelink-proto" }
