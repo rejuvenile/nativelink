@@ -543,7 +543,7 @@ pub(crate) mod enabled {
         tonic::transport::Server::builder()
             .initial_stream_window_size(W3_BENCH_INITIAL_STREAM_WINDOW)
             .initial_connection_window_size(W3_BENCH_INITIAL_CONNECTION_WINDOW)
-            // .max_frame_size(W3_BENCH_MAX_FRAME_SIZE)
+            .max_frame_size(W3_BENCH_MAX_FRAME_SIZE)
     }
 
     /// Construct a `tonic::transport::Endpoint` pre-configured with
