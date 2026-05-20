@@ -286,7 +286,14 @@ async fn build_at_paths(
         }),
         block_size: 4096,
         max_concurrent_writes: 0,
-        sync_data_only: true,
+        // CLAUDE.md HARD-RULE: NO fsync / fdatasync / sync_file_range /
+        // msync / O_SYNC / O_DSYNC anywhere in the codebase, including
+        // bench. Production runs ZFS tank with sync=disabled; durability
+        // is the mirror_blobs ≥2-replica + BlobsInStableStorage ack, not
+        // per-write flushes. Today the field is dead (no code reads it),
+        // but reviewers grep `sync_data` as severity BLOCK — keep this
+        // false so the bench fixture mirrors the rule literally. #589.
+        sync_data_only: false,
         content_is_immutable: prod_defaults::FILESYSTEM_CONTENT_IS_IMMUTABLE,
         fadvise_dontneed: false,
         max_concurrent_large_reads: 0,
