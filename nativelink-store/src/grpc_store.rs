@@ -271,6 +271,34 @@ pub struct GrpcStore {
     chunked_metrics: Arc<crate::chunked::chunked_client::ChunkedClientMetrics>,
 }
 
+/// #548 Phase 1 (Seam 3): build the `ChunkedClientOptions` value that
+/// `GrpcStore::update_via_chunked_inner` hands to the worker-side
+/// chunked client. Extracted so the inline test can mutation-verify the
+/// `source = Worker` hardcode without spinning up a tonic transport.
+/// All callers of this function are inside `GrpcStore`; production has
+/// exactly one (`update_via_chunked_inner`).
+#[cfg(feature = "chunked_fast_slow")]
+#[must_use]
+fn grpc_store_chunked_client_options() -> crate::chunked::chunked_client::ChunkedClientOptions {
+    use crate::chunked::CHUNK_SIZE;
+    use crate::chunked::ChunkedWriteSource;
+    use crate::chunked::chunked_client::{ChunkedClientOptions, DEFAULT_MAX_ATTEMPTS};
+
+    // #548 Phase 1: source = Worker. `GrpcStore::update_via_chunked_inner`
+    // is invoked from `GrpcStore::update`, the path a remote worker takes
+    // to upload bytes to the server via the chunked RPC. The server-side
+    // V1 InFlightEntry independently sets `source = Worker` at admission
+    // (`chunked_write_handler.rs:1219`); the two values are derived from
+    // WHICH RPC LANDED, not from any wire field (see SECURITY-NOTE on
+    // `ChunkedWriteSource`). `ChunkedClientOptions` has no `Default`;
+    // every field is explicit at every construction site.
+    ChunkedClientOptions {
+        max_attempts: DEFAULT_MAX_ATTEMPTS,
+        chunk_size: CHUNK_SIZE,
+        source: ChunkedWriteSource::Worker,
+    }
+}
+
 impl GrpcStore {
     pub async fn new(spec: &GrpcSpec) -> Result<Arc<Self>, Error> {
         Self::new_with_jitter(spec, spec.retry.make_jitter_fn()).await
@@ -2440,16 +2468,12 @@ impl GrpcStore {
         digest: DigestInfo,
         reader: DropCloserReadHalf,
     ) -> Result<(), Error> {
-        use crate::chunked::CHUNK_SIZE;
         use crate::chunked::chunked_client::{
             ChunkedClientOptions, WorkerApiWriteChunkedDispatcher, WriteChunkedDispatcher,
             write_chunked_stream,
         };
 
-        let options = ChunkedClientOptions {
-            chunk_size: CHUNK_SIZE,
-            ..Default::default()
-        };
+        let options: ChunkedClientOptions = grpc_store_chunked_client_options();
         let metrics = Arc::clone(&self.chunked_metrics);
 
         // Build a per-call dispatcher whose factory captures the
@@ -2949,6 +2973,49 @@ mod tests {
     use nativelink_error::{Code, Error, make_err};
 
     use super::{ChunkAttemptOutcome, classify_chunk_attempt, looks_like_dead_channel};
+
+    /// #548 Phase 1 Seam 3: the `ChunkedClientOptions` that
+    /// `GrpcStore::update_via_chunked_inner` hands to the worker-side
+    /// chunked client MUST carry `source = Worker`. Phase 4 (#551) will
+    /// branch on this discriminator at the server-side InFlightEntry to
+    /// elide the BIS broadcast (the worker is its own durable holder).
+    /// A future contributor flipping the literal at the construction site
+    /// would silently re-classify worker-originated writes — Phase 4's
+    /// BIS-elision would not fire, slow-tier ack would still gate the
+    /// worker's pin release, and the #547 phase0 mean-pin-lifetime
+    /// optimisation Phase 1 sets up would silently regress.
+    ///
+    /// Mutation step: change the hardcode at
+    /// `grpc_store_chunked_client_options` (`source: Worker` → any other
+    /// variant). This test red-fails with the bespoke
+    /// "#548 Phase 1 Seam 3: GrpcStore must construct ChunkedClientOptions
+    /// with source = Worker" message.
+    ///
+    /// Note: V1 server-side InFlightEntry independently sets
+    /// `source = Worker` at admission (see
+    /// `chunked_write_handler.rs:1219`). The two values are derived from
+    /// WHICH RPC LANDED, not from any wire field (SECURITY-NOTE on
+    /// `ChunkedWriteSource`); this test pins the worker-side half of
+    /// that derivation. The server-side half is pinned by the Seam 9
+    /// test below in `bazel_facing_internal_chunking_test.rs`.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[test]
+    fn grpc_store_constructs_chunked_client_options_with_source_worker_548_phase1_seam3() {
+        use crate::chunked::ChunkedWriteSource;
+        use super::grpc_store_chunked_client_options;
+
+        let options = grpc_store_chunked_client_options();
+        assert_eq!(
+            options.source,
+            ChunkedWriteSource::Worker,
+            "#548 Phase 1 Seam 3: GrpcStore must construct ChunkedClientOptions \
+             with source = Worker — `update_via_chunked_inner` is reached \
+             exclusively by remote workers uploading via `GrpcStore::update`. \
+             If this fails, the worker-side classifier has been flipped and \
+             Phase 4 (#551) BIS-elision will misroute every worker-originated \
+             chunked write."
+        );
+    }
 
     /// #147 classifier: codes that DO indicate a stale/transport-broken
     /// channel must return true; application-level codes must return false.

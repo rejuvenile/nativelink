@@ -497,6 +497,7 @@ async fn dispatch_chunks_to_driver_synchronous_commits_blob() {
             budget,
             None, // pin_budget
             None, // chunked_read_registry
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             None, // stable_digests_sink
             None, // failed_commit_sink
             CHUNK,
@@ -530,6 +531,247 @@ async fn dispatch_chunks_to_driver_synchronous_commits_blob() {
         in_flight.in_flight_count(),
         0,
         "in-flight tracker must drain after Synchronous commit"
+    );
+}
+
+/// #548 Phase 1: the `ChunkedWriteSource` value passed at the
+/// `dispatch_chunks_to_driver` entry MUST reach the in-flight entry by
+/// the time the reaper fires `stable_digests_sink`. This is the seam
+/// Phase 4 (#551) will branch on; Phase 1 only proves the value
+/// threads end-to-end.
+///
+/// Setup: wrap the `stable_digests_sink` in a closure that, on fire,
+/// reads `in_flight.source_for_test(&digest)` and stores it via
+/// `Arc<Mutex<Option<ChunkedWriteSource>>>`. Reaper fires the sink
+/// BEFORE removing the in-flight entry (see `run_async_commit_reaper`
+/// — `if let Ok(...)` block precedes `in_flight.inner.lock().remove`),
+/// so the entry is observable at sink-fire time.
+///
+/// Mutation step: at the call site below, change
+/// `ChunkedWriteSource::Bazel` to `ChunkedWriteSource::Mirror`. The
+/// `assert_eq!(captured, Some(Bazel))` MUST red-fail with the bespoke
+/// "#548 Phase 1: source threaded from dispatch entry to reaper sink"
+/// message. Without the source-on-InFlightEntry field
+/// (`InFlightEntry::source`) the captured value would be `None` (or
+/// the test would not type-check, depending on which line is mutated).
+#[nativelink_test]
+async fn dispatch_chunks_to_driver_threads_source_through_to_reaper_sink_548_phase1() {
+    use parking_lot::Mutex;
+    use tokio::sync::Notify;
+
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    const SIZE: usize = N * CHUNK;
+
+    let mut blob = Vec::with_capacity(SIZE);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xd0u8 + i as u8).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let (fs_store, _content_path) = make_filesystem_store().await;
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+    let metrics = Arc::new(ChunkedWriteHandlerMetrics::default());
+
+    // Side-channel capture: the wrapped sink reads
+    // `in_flight.source_for_test(&digest)` at fire time and records it,
+    // then fires a `tokio::sync::Notify` so the test wakes deterministically
+    // (per CLAUDE.md "No `thread::sleep` / `tokio::time::sleep` as
+    // synchronization in tests").
+    let captured: Arc<Mutex<Option<nativelink_store::chunked::ChunkedWriteSource>>> =
+        Arc::new(Mutex::new(None));
+    let fired_notify = Arc::new(Notify::new());
+    let captured_for_sink = Arc::clone(&captured);
+    let notify_for_sink = Arc::clone(&fired_notify);
+    let in_flight_for_sink = Arc::clone(&in_flight);
+    let sink: Arc<dyn Fn(DigestInfo) + Send + Sync> = Arc::new(move |d: DigestInfo| {
+        *captured_for_sink.lock() = in_flight_for_sink.source_for_test(&d);
+        notify_for_sink.notify_one();
+    });
+
+    let chunks: Vec<Result<PreparedChunk, nativelink_error::Error>> = (0..N)
+        .map(|i| {
+            let chunk_bytes = Bytes::copy_from_slice(&blob[i * CHUNK..(i + 1) * CHUNK]);
+            Ok(PreparedChunk {
+                chunk_offset: (i * CHUNK) as u64,
+                chunk_bytes,
+                finish: i == N - 1,
+            })
+        })
+        .collect();
+    let stream = Box::pin(futures::stream::iter(chunks));
+
+    // Subscribe BEFORE dispatch so a fast sink-fire (notify_one happens
+    // before .notified().await is polled) is not missed — Notify's
+    // documented behavior: a permit pending at subscription time
+    // immediately satisfies the next notified() await.
+    let sink_fired = fired_notify.notified();
+    tokio::pin!(sink_fired);
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        dispatch_chunks_to_driver(
+            Arc::clone(&fs_store),
+            Arc::clone(&in_flight),
+            budget,
+            None, // pin_budget
+            None, // chunked_read_registry
+            // The source under test. Mutation: change to Mirror; the
+            // assertion below must red-fail with the bespoke "#548 Phase 1"
+            // message.
+            nativelink_store::chunked::ChunkedWriteSource::Bazel,
+            Some(sink), // stable_digests_sink — wrapped to capture source
+            None,       // failed_commit_sink
+            CHUNK,
+            digest,
+            stream,
+            CommitMode::Synchronous,
+            metrics,
+            None,
+        ),
+    )
+    .await
+    .expect("must not deadlock — dispatch_chunks_to_driver must complete in 5s")
+    .expect("dispatch must succeed for hash-matching blob");
+
+    // Reactive wait on the per-test Notify; 5s deadlock-detector bound.
+    tokio::time::timeout(Duration::from_secs(5), sink_fired)
+        .await
+        .expect("stable_digests_sink must fire within 5s of Synchronous commit");
+
+    let captured = *captured.lock();
+    assert_eq!(
+        captured,
+        Some(nativelink_store::chunked::ChunkedWriteSource::Bazel),
+        "#548 Phase 1: source threaded from dispatch entry to reaper sink \
+         — expected Bazel (the value passed at the dispatch_chunks_to_driver \
+         call site), observed via in_flight.source_for_test(&digest) inside \
+         the wrapped stable_digests_sink. If this fails with Some(other), \
+         the source argument is being ignored or overwritten between admission \
+         and sink-fire. If it fails with None, the in-flight entry was removed \
+         before the sink fired (reaper ordering invariant violated — see \
+         `run_async_commit_reaper`: sink call MUST precede `in_flight.inner.lock().remove`)."
+    );
+}
+
+/// #548 Phase 1 Seam 8: drive `BazelChunkedDispatcherImpl::dispatch`
+/// (NOT the lower-layer `dispatch_chunks_to_driver`) and assert that
+/// the source it passes downstream reaches the reaper sink as
+/// `ChunkedWriteSource::Bazel`. This is the actual production seam —
+/// `FastSlowStore::update` routes Bazel-originated writes through
+/// `BazelChunkedDispatcherImpl::dispatch`, which hardcodes
+/// `ChunkedWriteSource::Bazel` at `chunked_write_handler.rs:4179`.
+///
+/// Setup: wire a custom `stable_digests_sink` on the dispatcher that,
+/// on fire, reads `in_flight.source_for_test(&digest)` (the same
+/// reader-of-truth used by the
+/// `dispatch_chunks_to_driver_threads_source_through_to_reaper_sink_548_phase1`
+/// test above). Drive `.dispatch(digest, reader)` directly with a
+/// hash-matching multi-chunk blob.
+///
+/// Mutation step: at `chunked_write_handler.rs:4179`, change
+/// `ChunkedWriteSource::Bazel` to any other variant. This test red-fails
+/// with the bespoke "#548 Phase 1 Seam 8: BazelChunkedDispatcherImpl
+/// must thread source = Bazel to reaper sink" message.
+#[nativelink_test]
+async fn bazel_chunked_dispatcher_impl_threads_source_to_reaper_sink_548_phase1_seam8() {
+    use parking_lot::Mutex;
+    use tokio::sync::Notify;
+
+    const CHUNK: usize = 4 * 1024;
+    const N: usize = 2;
+    const SIZE: usize = N * CHUNK;
+
+    let mut blob = Vec::with_capacity(SIZE);
+    for i in 0..N {
+        blob.extend(std::iter::repeat(0xb1u8 + i as u8).take(CHUNK));
+    }
+    let digest = DigestInfo::new(sha256(&blob), SIZE as u64);
+
+    let (fs_store, _content_path) = make_filesystem_store().await;
+    let in_flight = ChunkedWriteInFlight::new();
+    let budget = make_test_budget();
+
+    // Capture-on-sink-fire: read source_for_test inside the wrapped
+    // sink. Reaper invokes `stable_digests_sink` BEFORE removing the
+    // in-flight entry, so the entry is observable at sink-fire time.
+    // Use `tokio::sync::Notify` for deterministic wake (per CLAUDE.md
+    // test discipline: no sleep-based synchronization).
+    let captured: Arc<Mutex<Option<nativelink_store::chunked::ChunkedWriteSource>>> =
+        Arc::new(Mutex::new(None));
+    let fired_notify = Arc::new(Notify::new());
+    let captured_for_sink = Arc::clone(&captured);
+    let notify_for_sink = Arc::clone(&fired_notify);
+    let in_flight_for_sink = Arc::clone(&in_flight);
+    let sink: Arc<dyn Fn(DigestInfo) + Send + Sync> = Arc::new(move |d: DigestInfo| {
+        *captured_for_sink.lock() = in_flight_for_sink.source_for_test(&d);
+        notify_for_sink.notify_one();
+    });
+
+    let dispatcher = BazelChunkedDispatcherImpl::new_with_state_for_test(
+        Arc::clone(&fs_store),
+        Arc::clone(&in_flight),
+        budget,
+        CHUNK,
+    )
+    .with_stable_digests_sink(sink);
+
+    // Subscribe to the notify BEFORE dispatch so a fast sink-fire
+    // (notify_one before .notified() polled) is not missed.
+    let sink_fired = fired_notify.notified();
+    tokio::pin!(sink_fired);
+
+    // Stream the bytes through a buf-channel pair into the dispatcher's
+    // `reader` arg. Send all bytes then EOF so the chunked driver's
+    // recv loop terminates.
+    let (mut tx, rx) = make_buf_channel_pair_with_size(128);
+    let blob_bytes = Bytes::from(blob);
+    let send_task = tokio::spawn(async move {
+        tx.send(blob_bytes).await.expect("tx.send must succeed");
+        tx.send_eof().expect("tx.send_eof must succeed");
+    });
+
+    let dispatched_size = tokio::time::timeout(
+        Duration::from_secs(5),
+        <BazelChunkedDispatcherImpl<FileEntryImpl> as BazelChunkedDispatcher>::dispatch(
+            &dispatcher,
+            digest,
+            rx,
+        ),
+    )
+    .await
+    .expect("must not deadlock — BazelChunkedDispatcherImpl::dispatch must complete in 5s")
+    .expect("dispatch must succeed for hash-matching blob");
+    send_task
+        .await
+        .expect("blob-sender task must complete cleanly");
+    assert_eq!(
+        dispatched_size, SIZE as u64,
+        "dispatch must report the declared size on AsyncCommit Ok"
+    );
+
+    // Reactive wait on the per-test Notify; 5s deadlock-detector bound.
+    tokio::time::timeout(Duration::from_secs(5), sink_fired)
+        .await
+        .expect("stable_digests_sink must fire within 5s of dispatcher commit");
+
+    let captured = *captured.lock();
+    assert_eq!(
+        captured,
+        Some(nativelink_store::chunked::ChunkedWriteSource::Bazel),
+        "#548 Phase 1 Seam 8: BazelChunkedDispatcherImpl must thread \
+         source = Bazel to reaper sink — `dispatch` calls into \
+         `dispatch_bazel_facing_internal_chunking` with \
+         `ChunkedWriteSource::Bazel` hardcoded at \
+         `chunked_write_handler.rs:4179`. If this fails with Some(other), \
+         the production literal at the dispatch site has been flipped \
+         and Phase 4 (#551) BIS-elision will misclassify Bazel writes \
+         as Worker (Bazel is NOT a durable holder; eliding the BIS \
+         broadcast would leave the worker fleet unaware of the new \
+         digest). If it fails with None, the in-flight entry was \
+         removed before the sink fired (reaper ordering invariant \
+         violated)."
     );
 }
 
@@ -579,6 +821,7 @@ async fn dispatch_chunks_to_driver_async_commit_returns_promptly_then_drains() {
             budget,
             None, // pin_budget
             None, // chunked_read_registry
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             None, // stable_digests_sink
             None, // failed_commit_sink
             CHUNK,
@@ -689,6 +932,7 @@ async fn pin_budget_cap_rejects_admission_with_pinned_bytes_exhausted_signal() {
             chunk_budget,
             Some(pin_budget),
             None, // chunked_read_registry
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             None, // stable_digests_sink
             None, // failed_commit_sink
             CHUNK,
@@ -1059,6 +1303,7 @@ async fn dispatch_bazel_facing_skips_chunked_path_when_digest_already_indexed() 
             budget,
             None, // pin_budget
             None, // chunked_read_registry
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             None, // stable_digests_sink
             None, // failed_commit_sink
             metrics,
@@ -1173,6 +1418,7 @@ async fn dispatch_bazel_facing_runs_chunked_path_when_digest_not_indexed() {
             budget,
             None,
             None,
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             None, // stable_digests_sink
             None, // failed_commit_sink
             metrics,
@@ -1263,6 +1509,7 @@ async fn dispatch_bazel_facing_dedup_drain_size_cap_fires_on_oversized_producer(
             budget,
             None,
             None,
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             None, // stable_digests_sink
             None, // failed_commit_sink
             metrics,
@@ -1349,6 +1596,7 @@ async fn dispatch_bazel_facing_dedup_drain_per_recv_timeout_fires_on_stalled_pro
         budget,
         None,
         None,
+        nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
         None, // stable_digests_sink
         None, // failed_commit_sink
         metrics,

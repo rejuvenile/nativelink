@@ -663,6 +663,7 @@ async fn chunked_synchronous_commit_pushes_digest_to_stable_digests() {
             chunk_budget,
             None, // pin_budget
             None, // chunked_read_registry
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             Some(sink),
             None, // failed_commit_sink — not exercised here (Synchronous + hash-matching blob)
             CHUNK,
@@ -811,6 +812,7 @@ async fn chunked_early_dedup_short_circuit_pushes_digest_to_stable_digests() {
             chunk_budget,
             None, // pin_budget
             None, // chunked_read_registry
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             Some(sink),
             None, // failed_commit_sink — not exercised here (early-dedup short-circuit)
             metrics,
@@ -1448,6 +1450,7 @@ async fn chunked_synchronous_commit_failure_inserts_failed_writes_and_repins() {
             chunk_budget,
             None, // pin_budget
             None, // chunked_read_registry
+            nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
             Some(stable_sink),
             Some(failed_sink),
             CHUNK,
@@ -1656,6 +1659,7 @@ async fn chunked_async_commit_watchdog_fires_on_stalled_completion() {
         Arc::clone(&metrics),
         "async",
         None, // result_relay — Async test asserts via in_flight + failed_sink
+        nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
     ));
 
     // Yield once so the spawned reaper makes progress past the spawn
@@ -2111,6 +2115,7 @@ async fn chunked_async_commit_watchdog_unlinks_partial() {
         Arc::clone(&metrics),
         "async",
         None,
+        nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
     ));
 
     tokio::task::yield_now().await;
@@ -2305,6 +2310,7 @@ async fn chunked_synchronous_commit_watchdog_fires_on_stalled_completion() {
         // hang (never receive); the outer 10s virtual-time timeout
         // would trip on the deadlock-detector.
         Some(relay_tx),
+        nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
     ));
 
     // Yield once so the spawned reaper makes progress past the spawn

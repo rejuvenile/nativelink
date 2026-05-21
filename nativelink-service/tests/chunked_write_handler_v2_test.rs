@@ -214,6 +214,128 @@ impl AckCounts {
 }
 
 // -----------------------------------------------------------------------------
+// #548 Phase 1 Seam 10: V2 source threading
+// -----------------------------------------------------------------------------
+
+/// #548 Phase 1 Seam 10: drive the V2 RPC `write_chunked_v2` and assert
+/// that `run_v2_session` records `ChunkedWriteSource::Worker` for the
+/// digest. The recording happens at the V2 entry point
+/// (`chunked_write_handler_v2.rs:207`) immediately after digest parsing
+/// and before the per-session spawn; `v2_fire_post_commit_sinks`
+/// receives `source` via the spawn closure. The test observes the
+/// recording via the test-only accessor `v2_source_for_test(&digest)`
+/// on `ChunkedWriteHandler`.
+///
+/// Mutation step: change the literal `ChunkedWriteSource::Worker` at
+/// `chunked_write_handler_v2.rs:207` to any other variant. This test
+/// red-fails with the bespoke "#548 Phase 1 Seam 10: V2 write_chunked_v2
+/// must record source = Worker" message.
+///
+/// Why V2 needs its own accessor: V2 doesn't use `ChunkedWriteInFlight`
+/// (it uses `ChunkRaceState` per-digest in the FilesystemStore's
+/// `chunked_race_registry`). Mirroring V1's `source_for_test` pattern,
+/// V2 records via `v2_record_source` at admission and exposes via
+/// `v2_source_for_test`. Both maps drop at session teardown — observe
+/// while the session is still in-flight by sending only the first chunk
+/// then asserting before sending the final chunk.
+///
+/// **Coverage scope:** this test asserts the RECORDING site only
+/// (`chunked_write_handler_v2.rs:215` → `v2_record_source` → the
+/// `v2_source_for_test` side map). The OTHER derivation of the `:207`
+/// literal — the `source` argument forwarded into `run_v2_session` at
+/// `:219` and from there into `v2_fire_post_commit_sinks` at the Phase 4
+/// commit site — is UNASSERTED in Phase 1 because no production
+/// consumer exists today. Phase 4 (#551) MUST add a test that exercises
+/// the forwarding derivation end-to-end at `v2_fire_post_commit_sinks`
+/// so a future mutation that flips ONLY `:219` (e.g. `source: Worker`
+/// → `source: ChunkedWriteSource::Mirror`) red-fails. Track in #551.
+#[nativelink_test]
+async fn v2_run_v2_session_records_source_worker_548_phase1_seam10() {
+    let payload: Vec<u8> = (0..(2 * TEST_CHUNK_SIZE))
+        .map(|i| (i as u8).wrapping_mul(17))
+        .collect();
+    let digest = DigestInfo::new(sha256(&payload), payload.len() as u64);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    // Hold a handle to the handler so we can read v2_source_for_test
+    // directly (start_v2_server consumes its argument by Arc::clone).
+    let handler = make_handler(Arc::clone(&store), budget);
+    let handler_for_observation = Arc::clone(&handler);
+    let (client, _server_handle) = start_v2_server(handler).await;
+
+    let chunks = build_chunks(digest, &payload);
+    let mut c = client.clone();
+    // Stream chunks via an mpsc-backed adapter so we can hold the
+    // session open mid-blob (send first chunk, observe, then send the
+    // rest).
+    let (tx, rx) = tokio::sync::mpsc::channel::<WriteChunk>(8);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let writer_handle = tokio::spawn(async move {
+        let response = c.write_chunked_v2(stream).await?;
+        let (final_res, _) = drain_v2_response(response.into_inner()).await;
+        Ok::<_, tonic::Status>(final_res)
+    });
+
+    // Send only the first chunk; do NOT finish yet. The V2 handler
+    // parses the digest from the first chunk, calls `v2_record_source`,
+    // then spawns `run_v2_session`. After the source is recorded,
+    // `v2_source_for_test(&digest)` returns Some(Worker).
+    tx.send(chunks[0].clone())
+        .await
+        .expect("must not deadlock — first chunk send");
+
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(source) = handler_for_observation.v2_source_for_test(&digest) {
+                return source;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "must not deadlock — v2 source must be recorded within 5s of the V2 RPC entry",
+    );
+
+    assert_eq!(
+        observed,
+        nativelink_store::chunked::ChunkedWriteSource::Worker,
+        "#548 Phase 1 Seam 10: V2 write_chunked_v2 must record source = Worker \
+         (chunked_write_handler_v2.rs:207). If this fails, the literal at the \
+         V2 admission site has been flipped — Phase 4 (#551) BIS-elision at \
+         `v2_fire_post_commit_sinks` will misclassify the producer and either \
+         (a) fire BIS broadcast for worker-originated writes that don't need \
+         it (no harm but no perf gain) or (b) elide BIS broadcast for \
+         non-worker writes (CAS poisoning attack window if the wire protocol \
+         later carries this field — see SECURITY-NOTE on ChunkedWriteSource)."
+    );
+
+    // Tear down cleanly: send the remaining chunks (chunks[1..] including
+    // the final one with finish_chunk=true) so the session commits and
+    // the writer task exits.
+    for c in &chunks[1..] {
+        tx.send(c.clone())
+            .await
+            .expect("must not deadlock — remaining chunk send");
+    }
+    drop(tx);
+
+    let res = tokio::time::timeout(Duration::from_secs(15), writer_handle)
+        .await
+        .expect("must not deadlock — V2 session must commit within 15s")
+        .expect("writer task must not panic")
+        .expect("write_chunked_v2 must return Ok for hash-matching blob");
+    let final_res = res.expect("final frame must arrive");
+    let size = final_res.expect("commit must succeed");
+    assert_eq!(
+        size,
+        payload.len() as u64,
+        "committed_size must equal blob length"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test 1: Multi-writer happy path
 // -----------------------------------------------------------------------------
 
@@ -685,6 +807,7 @@ async fn v2_production_dispatcher_end_to_end() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: TEST_CHUNK_SIZE,
+                source: nativelink_store::chunked::ChunkedWriteSource::Worker, // #548 Phase 1
             },
             metrics_a,
         )
@@ -710,6 +833,7 @@ async fn v2_production_dispatcher_end_to_end() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: TEST_CHUNK_SIZE,
+                source: nativelink_store::chunked::ChunkedWriteSource::Worker, // #548 Phase 1
             },
             metrics_b,
         )

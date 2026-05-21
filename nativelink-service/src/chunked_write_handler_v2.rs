@@ -199,10 +199,33 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         //  - the request stream (to consume chunks)
         //  - the response sender (to push acks + final)
         //  - a writer-id + RaceWriterGuard
+        //
+        // #548 Phase 1: source = Worker. The V2 server RPC handler is
+        // reached exclusively from `CasExtensions/WriteChunkedV2` — by
+        // construction the producer is a worker uploading to the server.
+        // Phase 4 (#551) will consume this at `v2_fire_post_commit_sinks`.
+        let source = nativelink_store::chunked::ChunkedWriteSource::Worker;
+        // #548 Phase 1: record the source in the per-handler test-only
+        // side map so `v2_source_for_test(&digest)` returns it. Mirrors
+        // the V1 path (`InFlightEntry.source` populated at admission +
+        // exposed via `ChunkedWriteInFlight::source_for_test`). V2
+        // doesn't share that registry; recording here is the seam where
+        // a test can assert the source threaded from the RPC entry
+        // before `v2_fire_post_commit_sinks` reads it.
+        //
+        // CFG-GATED: production builds (no `test-utils` feature) do not
+        // compile this call, do not lock the Mutex, and do not insert.
+        // The in-stack `source` value is still forwarded into
+        // `run_v2_session` below (and from there into
+        // `v2_fire_post_commit_sinks`) — Phase 4 (#551) consumes it
+        // there without any side map. Closes the "unbounded in-process
+        // buffer on a network-reachable path" defect class.
+        #[cfg(any(test, feature = "test-utils"))]
+        self.v2_record_source(digest, source);
         let handler = Arc::clone(&self);
         tokio::spawn(async move {
             handler
-                .run_v2_session(stream, frame_tx, digest, first_chunk)
+                .run_v2_session(stream, frame_tx, digest, first_chunk, source)
                 .await;
         });
 
@@ -221,6 +244,11 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         frame_tx: mpsc::Sender<Result<WriteChunkedFrame, Status>>,
         digest: DigestInfo,
         first_chunk: WriteChunk,
+        // #548 Phase 1: source threaded from the V2 RPC entry point.
+        // Recorded for observability; Phase 4 (#551) will branch on
+        // `source == Worker` at `v2_fire_post_commit_sinks` to elide the
+        // BIS broadcast for worker-sourced writes.
+        source: nativelink_store::chunked::ChunkedWriteSource,
     ) {
         let chunk_size_u32 = self.chunk_size_for_v2() as u32;
 
@@ -726,7 +754,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 // failed_commit_sink so the worker reconnect-retry
                 // picks up the digest. Mirrors the v1 reaper at
                 // chunked_write_handler.rs:2089-2125.
-                self.v2_fire_post_commit_sinks(&digest, &commit_result);
+                self.v2_fire_post_commit_sinks(&digest, &commit_result, source);
 
                 // FIX-5 cross-writer metric: pull the per-state
                 // counter into the exported total so operators see a
@@ -979,7 +1007,13 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         self: &Arc<Self>,
         digest: &DigestInfo,
         commit_result: &Result<RaceCommitResult, Error>,
+        // #548 Phase 1: source forwarded from `run_v2_session`. PHASE 4
+        // (#551) will branch on `source == ChunkedWriteSource::Worker`
+        // below to elide the BIS broadcast (the worker is its own durable
+        // holder and releases pins on tonic-Ok). Phase 1 just records.
+        source: nativelink_store::chunked::ChunkedWriteSource,
     ) {
+        let _phase4_source = source; // PHASE 4 (#551): branch on source == Worker to elide BIS broadcast — worker releases its pin on tonic-Ok; Phase 1 unconditionally fires v2_stable_digests_sink_for_v2 (no behavior change)
         match commit_result {
             Ok(_) => {
                 if let Some(sink) = self.v2_stable_digests_sink_for_v2() {
@@ -987,6 +1021,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                     debug!(
                         target: "nativelink_service::chunked_write_handler_v2",
                         ?digest,
+                        ?source,
                         "WriteChunkedV2: pushed to stable_digests on commit success",
                     );
                 }
@@ -997,6 +1032,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                     debug!(
                         target: "nativelink_service::chunked_write_handler_v2",
                         ?digest,
+                        ?source,
                         "WriteChunkedV2: inserted into failed_slow_writes on commit failure",
                     );
                 }

@@ -95,7 +95,7 @@ use prost::Message as _;
 use tonic::Response;
 use tracing::{debug, info, warn};
 
-use crate::chunked::CHUNK_SIZE;
+use crate::chunked::ChunkedWriteSource;
 use crate::chunked_signal::{error_has_backpressure_signal, error_has_watchdog_timeout_signal};
 
 /// Type alias for the boxed-and-pinned future returned by
@@ -430,22 +430,27 @@ impl ChunkedClientMetrics {
 
 /// Per-call options. Today only the retry budget is configurable;
 /// future fields can land here without churning every call site.
+///
+/// #548 Phase 1: `Default` is intentionally NOT implemented. The
+/// `source` discriminator is load-bearing for Phase 4 (#551) — silently
+/// defaulting to `Worker` at any caller would be a CAS-poisoning attack
+/// window when the BIS-elision branch lands (a Bazel caller silently
+/// classified as Worker would skip the BIS broadcast and the worker
+/// fleet would never see the digest). Each construction site MUST
+/// specify `source` explicitly so a future contributor adding a new
+/// caller is forced to think about WHO produced the bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkedClientOptions {
     /// Maximum number of full-blob attempts before giving up.
     pub max_attempts: u32,
-    /// Production chunk size in bytes. Defaults to `CHUNK_SIZE`
-    /// (1 MiB); tests pass smaller for speed.
+    /// Production chunk size in bytes. Production callers pass
+    /// `CHUNK_SIZE` (1 MiB); tests pass smaller for speed.
     pub chunk_size: usize,
-}
-
-impl Default for ChunkedClientOptions {
-    fn default() -> Self {
-        Self {
-            max_attempts: DEFAULT_MAX_ATTEMPTS,
-            chunk_size: CHUNK_SIZE,
-        }
-    }
+    /// #548 Phase 1: source of the bytes being written. Threaded
+    /// end-to-end for Phase 4 (#551) to consume; Phase 1 stores the
+    /// value but does NOT branch on it. Required at every construction
+    /// site — no `Default` (see struct doc).
+    pub source: ChunkedWriteSource,
 }
 
 /// Send a single CAS blob via the `CasExtensions/WriteChunked` RPC.
@@ -484,15 +489,23 @@ pub async fn write_chunked_stream(
     // pulling both. The exact wire shape (v1 vs v2) is logged separately
     // inside each dispatcher impl (`WorkerApiWriteChunkedDispatcher::dispatch`
     // / `WorkerApiWriteChunkedV2Dispatcher::dispatch`).
-    info!(
+    // #548 Phase 1 (Item 7): demoted info!→debug! after adding the
+    // `source` field. Per CLAUDE.md "info! for state transitions", an
+    // entry-point log is not a state transition; keeping it at info!
+    // would expand the production journal by one extra field per
+    // chunked-write start. debug! preserves opt-in observability
+    // without survival past `release_max_level_info`.
+    debug!(
         target: "nativelink_store::chunked::chunked_client",
         writer_path = "worker_chunked_client",
         %digest,
         expected_size = digest.size_bytes(),
         max_attempts = options.max_attempts,
         chunk_size = options.chunk_size,
+        source = ?options.source,
         "write_chunked_stream entry",
     );
+    let _phase4_source = options.source; // PHASE 4 (#551): branch on source == Worker — post-tonic-Ok return below suffices to release the worker pin under the "one SIGKILL" invariant (#545/#546); Phase 1 only THREADS the value
 
     if options.chunk_size == 0 {
         return Err(make_err!(

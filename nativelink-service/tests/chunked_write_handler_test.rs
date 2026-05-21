@@ -242,6 +242,107 @@ async fn handler_streams_three_chunks_then_finish_commits_blob() {
         .expect("in-flight entry must drain after successful commit");
 }
 
+/// #548 Phase 1 Seam 9: drive the V1 server RPC `write_chunked_inner`
+/// and assert that the source recorded on the `InFlightEntry` at
+/// admission is `ChunkedWriteSource::Worker`.
+///
+/// **DEAD-WIRE DISCLOSURE** (see `chunked_write_handler.rs:1213-1230`):
+/// the V1 RPC has no post-commit sink in this revision. After
+/// `await_completion` returns Ok, `write_chunked_inner` constructs a
+/// `WriteChunkedResponse` and returns directly (see :1442-1445); it
+/// never invokes `stable_digests_sink` or `v2_fire_post_commit_sinks`
+/// (those are V2-exclusive at `chunked_write_handler_v2.rs:740, 989`).
+/// Phase 4 (#551) must add a V1 sink + branch on `source == Worker`,
+/// restrict the BIS-elision relaxation to V2-only (documenting V1 as
+/// exempt), or deprecate V1 entirely. Until then, the field's only
+/// consumer is the V1 `source_for_test` accessor.
+///
+/// Because the field is not consumed by any production sink, this test
+/// asserts the RECORDING (via `source_for_test`) rather than the
+/// downstream observation. The recording happens at admission (line
+/// :1219), so we observe BEFORE finishing the stream (the InFlightEntry
+/// is removed during teardown of `write_chunked_inner`).
+///
+/// Mutation step: change the literal `ChunkedWriteSource::Worker` at
+/// `chunked_write_handler.rs:1219` to any other variant. This test
+/// red-fails with the bespoke "#548 Phase 1 Seam 9: V1 server RPC
+/// write_chunked_inner must record source = Worker on InFlightEntry"
+/// message.
+#[nativelink_test]
+async fn v1_write_chunked_inner_records_source_worker_on_inflight_548_phase1_seam9() {
+    const CHUNK: usize = 4 * 1024;
+    let total = (2 * CHUNK) as u64;
+    let mut blob = Vec::with_capacity(2 * CHUNK);
+    blob.extend(std::iter::repeat(0xc1u8).take(CHUNK));
+    blob.extend(std::iter::repeat(0xc2u8).take(CHUNK));
+    let digest = DigestInfo::new(sha256(&blob), total);
+
+    let (store, _content_path) = make_store().await;
+    let budget = make_test_budget();
+    let (handler, in_flight) = make_handler(Arc::clone(&store), budget, CHUNK);
+
+    let (tx, stream) = make_chunk_stream();
+    let h = Arc::clone(&handler);
+    let writer =
+        tokio::spawn(async move { h.write_chunked(tonic::Request::new(stream)).await });
+
+    // Send the FIRST chunk (NOT finish). After admission of the first
+    // chunk the V1 handler has inserted an `InFlightEntry` keyed by
+    // `digest` with `source = Worker` (`chunked_write_handler.rs:1219`).
+    // Observe via `source_for_test` BEFORE sending the final chunk.
+    let first = make_chunk(digest, 0, &blob[..CHUNK], false);
+    tx.send(frame_chunk(&first))
+        .await
+        .expect("must not deadlock — channel send to handler");
+
+    // Wait for the in-flight entry to appear (admission is async — the
+    // handler reads the first chunk + inserts the entry after a tokio
+    // tick). Bounded poll = no hang.
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(source) = in_flight.source_for_test(&digest) {
+                return source;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("must not deadlock — InFlightEntry must appear within 5s of first chunk");
+
+    assert_eq!(
+        observed,
+        nativelink_store::chunked::ChunkedWriteSource::Worker,
+        "#548 Phase 1 Seam 9: V1 server RPC write_chunked_inner must \
+         record source = Worker on InFlightEntry (chunked_write_handler.rs:1219). \
+         If this fails, the literal at the V1 admission site has been \
+         flipped. NOTE: V1 has no post-commit sink today (DEAD-WIRE — \
+         see inline comment at :1213-1230); this test pins the recording, \
+         and Phase 4 (#551) must either add a V1 sink that branches on \
+         this field, restrict the BIS-elision relaxation to V2-only, or \
+         deprecate the V1 RPC entirely."
+    );
+
+    // Tear down cleanly: send the final chunk + finish so the handler
+    // exits and the in-flight entry drains. Without this the writer
+    // task wedges and the test reaper bubbles the deadlock 5s later.
+    let last = make_chunk(digest, CHUNK as u64, &blob[CHUNK..], true);
+    tx.send(frame_chunk(&last))
+        .await
+        .expect("must not deadlock — final chunk send");
+    drop(tx);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("must not deadlock — handler must respond within 5s")
+        .expect("handler task must not panic")
+        .expect("write_chunked must return Ok for hash-matching blob");
+    assert_eq!(response.into_inner().committed_size, total);
+
+    wait_for_no_in_flight(&in_flight, Duration::from_secs(2))
+        .await
+        .expect("in-flight entry must drain after successful commit");
+}
+
 /// #447 architectural fix: two concurrent worker `WriteChunked`
 /// streams for the SAME digest → the SECOND stream's RPC MUST block on
 /// the per-digest `commit_done` Notify (NOT return `Code::Aborted +

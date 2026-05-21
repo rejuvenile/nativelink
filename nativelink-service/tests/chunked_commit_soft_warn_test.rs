@@ -167,6 +167,7 @@ async fn v1_reaper_soft_warn_fires_once_per_digest_at_30s() {
         Arc::clone(&metrics),
         "async",
         None,
+        nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
     ));
 
     tokio::task::yield_now().await;
@@ -281,6 +282,7 @@ async fn v1_reaper_soft_warn_does_not_fire_on_fast_commit() {
         Arc::clone(&metrics),
         "async",
         None,
+        nativelink_store::chunked::ChunkedWriteSource::Bazel, // #548 Phase 1
     ));
 
     tokio::time::timeout(Duration::from_secs(10), reaper_handle)

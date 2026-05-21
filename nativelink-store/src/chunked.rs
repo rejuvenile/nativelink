@@ -52,6 +52,64 @@ use nativelink_error::Error;
 use nativelink_util::buf_channel::DropCloserReadHalf;
 use nativelink_util::common::DigestInfo;
 
+/// #548 Phase 1: source discriminator for chunked-write code paths.
+///
+/// Phase 1 of the #543/#546/#551 architectural shift: relax worker
+/// pin lifetime from BIS-ack-bound to tonic-Ok-bound under the
+/// "one SIGKILL" durability invariant (#545/#546). Phase 1 only
+/// THREADS this value end-to-end; no behavior changes. Phase 4 (#551)
+/// will branch on `source == Worker` to release pins on tonic-Ok
+/// instead of BIS-ack.
+///
+/// Variants reflect WHO produced the bytes that landed at the chunked
+/// driver:
+/// - `Worker`: bytes came from a remote worker uploading via the
+///   `CasExtensions/WriteChunked[V2]` RPC. The worker is its own
+///   durable holder; tonic-Ok back to the worker is sufficient
+///   acknowledgement and a separate BIS broadcast back to that same
+///   worker is redundant (the post-#551 optimization Phase 5/#553
+///   exploits).
+/// - `Bazel`: bytes came from a Bazel client via the legacy
+///   `FastSlowStore::update` tee, routed into the chunked driver by
+///   `BazelChunkedDispatcherImpl`. Bazel is NOT a durable holder for
+///   the slow tier; the server's BIS broadcast to the worker fleet
+///   provides the only ack signal back to the durable holder.
+/// - `Mirror`: bytes were sourced from a mirror replication path
+///   (e.g. worker-to-worker peer replication). Reserved for Phase 5+
+///   wiring; today no production code path produces this value.
+/// - `Internal`: bytes were sourced from an in-process repair / backfill
+///   / test harness. Reserved for future use.
+///
+/// Phase 1 does NOT add this discriminator to any wire protocol — it
+/// lives only in process-local types. The source for server-side paths
+/// is determined at the RPC entry point (V1 server RPC = `Worker`,
+/// V2 server RPC = `Worker`, `BazelChunkedDispatcherImpl::dispatch`
+/// = `Bazel`). The source for worker-side calls is set on
+/// `ChunkedClientOptions` at the `GrpcStore::update_via_chunked_inner`
+/// site (= `Worker`).
+///
+/// # SECURITY-NOTE: do NOT add to wire protocol
+///
+/// This discriminator is process-local. Server-side variants are derived
+/// from WHICH RPC LANDED, not from any field on the inbound message. Phase 4
+/// (#551) will branch on `source == Worker` to elide the BIS broadcast that
+/// otherwise serves as the worker's pin-release trigger. If a future
+/// contributor adds `source` to `WriteChunkedRequest.proto` (or to any
+/// other inbound wire message) for any reason — "operator convenience",
+/// "debugging", "client-side tagging" — they MUST FIRST audit Phase 4's
+/// BIS-elision branch. Attacker-controlled `source` on the wire =
+/// attacker-spoofed `Worker` classification = elided BIS broadcast =
+/// early pin release on a digest the durable holder never actually held
+/// = CAS poisoning attack window. The mitigation is to keep this enum
+/// strictly process-local and derived at the RPC entry point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChunkedWriteSource {
+    Worker,
+    Bazel,
+    Mirror,
+    Internal,
+}
+
 /// Process-wide kill-switch for #212 Phase 2.7 Bazel-facing internal
 /// chunking. Default: OFF.
 ///

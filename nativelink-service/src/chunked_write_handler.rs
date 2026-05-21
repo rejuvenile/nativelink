@@ -433,6 +433,10 @@ pub static AWAIT_INFLIGHT_SOFT_WARN_SEEN: std::sync::LazyLock<Arc<SoftWarnSet>> 
 struct InFlightEntry {
     sender: nativelink_store::chunked::chunked_driver::ChunkWorkSender,
     driver: Arc<ChunkedDriver>,
+    /// #548 Phase 1: source discriminator captured at admission. Phase 4
+    /// (#551) will branch on this at the reaper's BIS-broadcast trigger;
+    /// Phase 1 only stores it for observability + test assertions.
+    source: nativelink_store::chunked::ChunkedWriteSource,
 }
 
 /// Per-server in-flight chunked-write tracker.
@@ -472,6 +476,21 @@ impl ChunkedWriteInFlight {
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
         self.inner.lock().len()
+    }
+
+    /// #548 Phase 1: return the `ChunkedWriteSource` recorded on the
+    /// in-flight entry for `digest`, if present. Test-only — used to
+    /// assert that the source discriminator threaded from the entry
+    /// point reached the shared `dispatch_chunks_to_driver` admission
+    /// site.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn source_for_test(
+        &self,
+        digest: &DigestInfo,
+    ) -> Option<nativelink_store::chunked::ChunkedWriteSource> {
+        self.inner.lock().get(digest).map(|e| e.source)
     }
 }
 
@@ -659,6 +678,25 @@ pub struct ChunkedWriteHandler<Fe: FileEntry = FileEntryImpl> {
     /// H1 (#499 followup): wakes `flush_slow_writes` waiters when the
     /// chunked in-flight set drains. Paired with `chunked_in_flight_digests`.
     in_flight_empty_notify: Option<Arc<tokio::sync::Notify>>,
+    /// #548 Phase 1: test-only side map of V2 sources keyed by digest.
+    /// V2 doesn't use `ChunkedWriteInFlight` (it uses
+    /// `ChunkRaceState` instead), so we mirror the V1 `source_for_test`
+    /// accessor pattern via this separate map. Populated at v2 admission
+    /// and read by `v2_source_for_test`. NOT used by production code
+    /// paths — Phase 4 (#551) will branch on the in-stack `source`
+    /// parameter inside `v2_fire_post_commit_sinks` directly.
+    ///
+    /// **CFG-GATED:** field, initializer in every constructor, the
+    /// `v2_record_source` writer, and the call site in
+    /// `chunked_write_handler_v2.rs` are ALL behind
+    /// `#[cfg(any(test, feature = "test-utils"))]` so the production
+    /// binary (no `test-utils` feature) never allocates the map, never
+    /// locks the Mutex, and never inserts. Closes the "unbounded
+    /// in-process buffer on a network-reachable path" defect class
+    /// (CLAUDE.md Async & Concurrency).
+    #[cfg(any(test, feature = "test-utils"))]
+    v2_source_for_test:
+        Arc<Mutex<HashMap<DigestInfo, nativelink_store::chunked::ChunkedWriteSource>>>,
 }
 
 impl<Fe: FileEntry> core::fmt::Debug for ChunkedWriteHandler<Fe> {
@@ -689,6 +727,8 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             v2_failed_commit_sink: None,
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            v2_source_for_test: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -830,6 +870,44 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         self.chunked_in_flight_digests.is_some()
     }
 
+    /// #548 Phase 1: test-only accessor returning the
+    /// `ChunkedWriteSource` recorded at V2 admission for `digest`. V2
+    /// doesn't share `ChunkedWriteInFlight` with V1 (V2 keys per-digest
+    /// state on `ChunkRaceState`); this accessor reads a separate
+    /// test-only side map populated at `run_v2_session` entry. Mirrors
+    /// the V1 `ChunkedWriteInFlight::source_for_test` pattern so tests
+    /// can assert the source threaded from the V2 RPC entry reached the
+    /// `v2_fire_post_commit_sinks` decision site.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn v2_source_for_test(
+        &self,
+        digest: &DigestInfo,
+    ) -> Option<nativelink_store::chunked::ChunkedWriteSource> {
+        self.v2_source_for_test.lock().get(digest).copied()
+    }
+
+    /// #548 Phase 1: insert hook used by `run_v2_session` to record the
+    /// source for `v2_source_for_test`. CFG-GATED behind
+    /// `#[cfg(any(test, feature = "test-utils"))]` together with the
+    /// backing field and the V2 admission call site — production builds
+    /// (no `test-utils` feature) do NOT compile this method, do NOT
+    /// allocate the underlying HashMap, and do NOT insert per chunked
+    /// write. Closes the "unbounded in-process buffer on a
+    /// network-reachable path" defect class (CLAUDE.md Async &
+    /// Concurrency). Phase 4 (#551) reads the source via the in-stack
+    /// `_phase4_source` parameter; this side map exists only for tests
+    /// to assert the V2 admission seam end-to-end.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn v2_record_source(
+        &self,
+        digest: DigestInfo,
+        source: nativelink_store::chunked::ChunkedWriteSource,
+    ) {
+        self.v2_source_for_test.lock().insert(digest, source);
+    }
+
     /// Construct a handler with externally-provided in-flight tracker
     /// + chunk budget. Used by tests so the test harness can observe
     /// the in-flight map AND so each test gets its own budget (avoiding
@@ -852,6 +930,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             v2_failed_commit_sink: None,
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
+            v2_source_for_test: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -881,6 +960,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
             v2_failed_commit_sink: None,
             chunked_in_flight_digests: None,
             in_flight_empty_notify: None,
+            v2_source_for_test: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1186,11 +1266,37 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
                 PER_BLOB_MPSC_CAP,
             );
             let driver_arc = Arc::new(driver);
+            // #548 Phase 1 DEAD-WIRE DISCLOSURE: this V1 InFlightEntry
+            // records `source = Worker` for symmetry with the V2 handler
+            // path, BUT the V1 server RPC (`write_chunked_inner`) has no
+            // post-commit sink in the current revision. After
+            // `await_completion` returns Ok, `write_chunked_inner`
+            // constructs `WriteChunkedResponse` and returns directly
+            // (see :1442-1445 below); it never invokes
+            // `stable_digests_sink` or `v2_fire_post_commit_sinks`
+            // (those are V2-exclusive at
+            // `chunked_write_handler_v2.rs:740, 989`). Phase 4 (#551)
+            // must pick one of:
+            //   (a) add a V1 post-commit sink + branch on
+            //       `source == Worker` here, mirroring V2;
+            //   (b) restrict the BIS-elision relaxation to V2-only,
+            //       documenting V1 as exempt from the relaxation;
+            //   (c) deprecate the V1 RPC entirely before #551 lands,
+            //       so the dead-wire becomes deleted code.
+            // Until Phase 4 picks, the field's only consumer is the
+            // V1 `source_for_test` accessor (test-introspection only).
             guard.insert(
                 digest,
                 InFlightEntry {
                     sender: sender.clone(),
                     driver: Arc::clone(&driver_arc),
+                    // #548 Phase 1: source = Worker. The V1 server RPC
+                    // handler is reached when a worker invokes
+                    // `CasExtensions/WriteChunked` — by construction the
+                    // producer is the worker, the worker is the durable
+                    // holder, and the tonic-Ok response back to the worker
+                    // is sufficient ack. Phase 4 (#551) will use this.
+                    source: nativelink_store::chunked::ChunkedWriteSource::Worker,
                 },
             );
             (sender, driver_arc)
@@ -2586,6 +2692,12 @@ pub async fn run_async_commit_reaper<Fe: FileEntry>(
     metrics: Arc<ChunkedWriteHandlerMetrics>,
     mode_label: &'static str,
     result_relay: Option<oneshot::Sender<Result<ChunkedCommitResult, Error>>>,
+    // #548 Phase 1: source discriminator forwarded from
+    // `dispatch_chunks_to_driver`. Recorded for observability; Phase 4
+    // (#551) will branch on `source == Worker` at the stable_digests_sink
+    // call below to elide the BIS broadcast when the producer is a worker
+    // (the worker releases its own pin on tonic-Ok).
+    source: nativelink_store::chunked::ChunkedWriteSource,
 ) {
     // #283 sub-item 3 (watchdog): bound `await_completion()` by
     // `CHUNKED_COMMIT_WATCHDOG_SECS`. Without this bound, a wedged
@@ -2745,12 +2857,14 @@ pub async fn run_async_commit_reaper<Fe: FileEntry>(
     // into `failed_writes` (BIS never acks bytes that aren't durably
     // stored).
     if let Ok(ref r) = commit_result {
+        let _phase4_source = source; // PHASE 4 (#551): branch on source == Worker to elide BIS broadcast — worker is its own durable holder and releases its pin on tonic-Ok; Phase 1 unconditionally fires the sink (no behavior change)
         if let Some(sink) = stable_digests_sink.as_ref() {
             sink(stream_digest);
         }
         debug!(
             ?stream_digest,
             committed_size = r.committed_size,
+            ?source,
             "chunked dispatch reaper: pushed to stable_digests"
         );
     }
@@ -2856,6 +2970,11 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     chunked_read_registry: Option<
         Arc<nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry>,
     >,
+    // #548 Phase 1: source discriminator from the caller's entry point
+    // (`BazelChunkedDispatcherImpl::dispatch` passes `Bazel`; test callers
+    // pass whatever they want to exercise). Recorded on the in-flight
+    // entry and forwarded to the reaper. Phase 1 = no behavior change.
+    source: nativelink_store::chunked::ChunkedWriteSource,
     // #282 fix: optional stable_digests sink. When `Some`, the
     // dispatcher invokes the closure on commit success — both the
     // AsyncCommit reaper AND the Synchronous commit success branch —
@@ -2929,6 +3048,9 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
             InFlightEntry {
                 sender: sender.clone(),
                 driver: Arc::clone(&driver_arc),
+                // #548 Phase 1: persist the source on the in-flight entry
+                // so the reaper (and test introspection) can observe it.
+                source,
             },
         );
         (sender, driver_arc)
@@ -3116,6 +3238,7 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
                 metrics_for_reaper,
                 "synchronous",
                 Some(relay_tx),
+                source,
             ));
 
             // Await the result the reaper relays. On RecvError (the
@@ -3221,6 +3344,7 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
                 // outcome propagation; existing callers that don't
                 // bridge to a race-state).
                 async_result_relay,
+                source,
             ));
 
             Ok(DispatchOutcome {
@@ -4052,6 +4176,14 @@ impl<Fe: FileEntry> nativelink_store::chunked::BazelChunkedDispatcher
                     self.chunk_budget,
                     Some(self.pin_budget),
                     self.chunked_read_registry.clone(),
+                    // #548 Phase 1: source = Bazel. This is the
+                    // BazelChunkedDispatcherImpl path that
+                    // `FastSlowStore::update` routes Bazel-originated
+                    // writes through. Phase 4 (#551) will use this to
+                    // keep BIS-broadcast firing (Bazel is not a durable
+                    // holder; the broadcast remains the only ack path
+                    // for the worker fleet).
+                    nativelink_store::chunked::ChunkedWriteSource::Bazel,
                     self.stable_digests_sink.clone(),
                     self.failed_commit_sink.clone(),
                     Arc::clone(&self.metrics),
@@ -4617,6 +4749,10 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
     chunked_read_registry: Option<
         Arc<nativelink_store::chunked::chunked_read_registry::ChunkedReadRegistry>,
     >,
+    // #548 Phase 1: source discriminator. The only production caller
+    // (`BazelChunkedDispatcherImpl::dispatch`) passes `Bazel`; tests can
+    // pass any variant to exercise the seam.
+    source: nativelink_store::chunked::ChunkedWriteSource,
     // #282 fix: forwarded to `dispatch_chunks_to_driver` so the
     // AsyncCommit reaper can push chunked-committed digests onto the
     // FastSlowStore's `stable_digests` queue. See the parameter
@@ -4740,6 +4876,7 @@ pub async fn dispatch_bazel_facing_internal_chunking<Fe: FileEntry>(
         chunk_budget,
         pin_budget,
         chunked_read_registry,
+        source,
         stable_digests_sink,
         failed_commit_sink,
         chunk_size,

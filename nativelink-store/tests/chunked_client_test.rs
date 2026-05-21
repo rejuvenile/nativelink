@@ -49,7 +49,7 @@ use nativelink_macro::nativelink_test;
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     WriteChunk, WriteChunkedResponse, backpressure_signal,
 };
-use nativelink_store::chunked::CHUNK_SIZE;
+use nativelink_store::chunked::{CHUNK_SIZE, ChunkedWriteSource};
 use nativelink_store::chunked::chunked_client::{
     ChunkedClientMetrics, ChunkedClientOptions, DispatchFuture, WriteChunkedDispatcher,
     write_chunked_stream,
@@ -178,6 +178,7 @@ async fn end_to_end_one_chunk_blob_succeeds() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -228,6 +229,7 @@ async fn end_to_end_4_chunk_aligned_blob_succeeds() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: CHUNK,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -276,6 +278,7 @@ async fn end_to_end_unaligned_blob_final_chunk_partial() {
             ChunkedClientOptions {
                 max_attempts: 1,
                 chunk_size: CHUNK,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -320,6 +323,7 @@ async fn retry_on_aborted_with_backpressure_signal() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -370,6 +374,7 @@ async fn retry_on_resource_exhausted_with_backpressure_signal() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -408,6 +413,7 @@ async fn no_retry_on_bare_resource_exhausted() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -453,6 +459,7 @@ async fn give_up_after_max_attempts_exhausted() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -495,6 +502,7 @@ async fn server_size_mismatch_returns_internal_error() {
             ChunkedClientOptions {
                 max_attempts: 1,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -583,6 +591,7 @@ async fn anti_203_call_resolves_iff_dispatcher_resolves() {
             ChunkedClientOptions {
                 max_attempts: 1,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             metrics,
         )
@@ -628,6 +637,7 @@ async fn end_to_end_one_byte_blob_succeeds() {
             ChunkedClientOptions {
                 max_attempts: 1,
                 chunk_size: CHUNK_SIZE, // production chunk size; 1-byte will be a single tiny chunk
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -728,6 +738,7 @@ async fn upfront_buffering_dispatch_waits_for_eof() {
             ChunkedClientOptions {
                 max_attempts: 1,
                 chunk_size: CHUNK,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             metrics,
         )
@@ -795,6 +806,7 @@ async fn give_up_after_max_attempts_exhausted_resource_exhausted() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -923,6 +935,7 @@ async fn concurrent_same_digest_second_call_retries_to_success() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             metrics_a_for_call,
         )
@@ -938,6 +951,7 @@ async fn concurrent_same_digest_second_call_retries_to_success() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             metrics_b_for_call,
         )
@@ -1005,6 +1019,7 @@ async fn no_retry_on_data_loss() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -1049,6 +1064,7 @@ async fn no_retry_on_bare_aborted() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -1105,6 +1121,7 @@ async fn committed_digest_mismatch_today_does_not_fail() {
             ChunkedClientOptions {
                 max_attempts: 1,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
@@ -1159,6 +1176,7 @@ async fn worker_write_chunked_stream_emits_entry_log() {
             ChunkedClientOptions {
                 max_attempts: 3,
                 chunk_size: N,
+                source: ChunkedWriteSource::Worker, // #548 Phase 1
             },
             Arc::clone(&metrics),
         ),
