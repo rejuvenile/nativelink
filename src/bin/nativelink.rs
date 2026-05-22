@@ -217,8 +217,10 @@ async fn inner_main(
     // a warn! on Err to surface buggy double-set without panicking
     // (the first-writer-wins guarantee means we'd silently keep the
     // first value anyway; the warn surfaces the bug).
+    let is_server_process =
+        nativelink_util::phase0_metrics::is_server_process_from_config(&cfg);
     {
-        let is_server = nativelink_util::phase0_metrics::is_server_process_from_config(&cfg);
+        let is_server = is_server_process;
         match nativelink_util::phase0_metrics::set_is_server_process(is_server) {
             Ok(()) => {
                 info!(
@@ -569,6 +571,39 @@ async fn inner_main(
         metrics_registry.register(
             "chunked_chunk_budget",
             nativelink_store::chunked::chunk_budget::chunk_budget_arc(),
+        );
+    }
+
+    // #549 Phase 2: register the process-wide WorkerPinBudget singleton
+    // so every `/metrics` listener exposes the worker-side defense-in-
+    // depth pin-budget gauges (`worker_pinned_bytes_used`,
+    // `worker_pinned_bytes_capacity`, `worker_pin_budget_rejections_total`,
+    // `worker_pin_admission_bytes_total`,
+    // `worker_pin_inflight_admission_bytes`).
+    //
+    // Unlike the chunked module, `worker_pin_budget` is NOT cfg-gated —
+    // the worker pin sites in nativelink-worker/src/{local_worker,
+    // directory_cache,running_actions_manager}.rs call into it
+    // unconditionally. The same singleton accessor must therefore be
+    // reachable in every build variant. The `Arc` accessor aliases the
+    // same instance that the worker's `try_acquire` calls consume from
+    // (see the singleton-arc-and-ref-point-to-same-instance test).
+    //
+    // **Worker-only registration (#549 fix-up M1, 2026-05-22):**
+    // suppress on server processes per the #564 precedent
+    // (`is_server_process_from_config` already gates other worker-
+    // namespace metric subtrees above). On a pure-server process the
+    // worker pin sites never fire, so the gauges are structurally zero
+    // (capacity constant, all others 0); publishing them anyway would
+    // pollute the server's `/metrics` body with a worker-shaped subtree
+    // that the operator dashboard would have to filter on prefix. The
+    // gate is conservative on mixed binaries (treated as worker per
+    // the same #564 fallback) so the metric subtree is published
+    // wherever a worker MIGHT call `try_acquire`.
+    if !is_server_process {
+        metrics_registry.register(
+            "worker_pin_budget",
+            nativelink_store::worker_pin_budget::worker_pin_budget_arc(),
         );
     }
 

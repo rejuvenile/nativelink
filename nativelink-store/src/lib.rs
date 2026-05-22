@@ -52,5 +52,6 @@ pub mod size_partitioning_store;
 pub mod small_blob_dispatcher;
 pub mod store_manager;
 pub mod verify_store;
+pub mod worker_pin_budget;
 pub mod worker_proxy_store;
 pub mod wrapper_walker;
