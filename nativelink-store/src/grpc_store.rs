@@ -2515,8 +2515,8 @@ impl GrpcStore {
         reader: DropCloserReadHalf,
     ) -> Result<(), Error> {
         use crate::chunked::chunked_client::{
-            ChunkedClientOptions, WorkerApiWriteChunkedDispatcher, WriteChunkedDispatcher,
-            write_chunked_stream,
+            ChunkedClientOptions, WorkerApiWriteChunkedDispatcher,
+            WorkerApiWriteChunkedV2Dispatcher, WriteChunkedDispatcher, write_chunked_stream,
         };
 
         let options: ChunkedClientOptions = grpc_store_chunked_client_options();
@@ -2543,7 +2543,25 @@ impl GrpcStore {
                 // is internally Arc-wrapped, so cloning is cheap.
                 let cm_clone = cm.clone();
                 let acquire_timeout_ms = self.connection_acquire_timeout_ms;
-                let dispatcher: Box<dyn WriteChunkedDispatcher> =
+                let v2 = self.chunked_v2_writes_enabled.load(Ordering::Relaxed);
+                let dispatcher: Box<dyn WriteChunkedDispatcher> = if v2 {
+                    Box::new(WorkerApiWriteChunkedV2Dispatcher::with_factory(move || {
+                        let cm = cm_clone.clone();
+                        Box::pin(async move {
+                            match acquire_timeout_ms {
+                                Some(ms) => {
+                                    cm.connection_with_timeout(
+                                        "worker_api_write_chunked".to_string(),
+                                        Duration::from_millis(ms),
+                                    )
+                                    .await
+                                }
+                                None => cm.connection("worker_api_write_chunked".to_string()).await,
+                            }
+                            .err_tip(|| "in GrpcStore::update_via_chunked_inner (tcp)")
+                        })
+                    }))
+                } else {
                     Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
                         let cm = cm_clone.clone();
                         Box::pin(async move {
@@ -2559,24 +2577,50 @@ impl GrpcStore {
                             }
                             .err_tip(|| "in GrpcStore::update_via_chunked_inner (tcp)")
                         })
-                    }));
+                    }))
+                };
                 write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
             }
             #[cfg(feature = "quic")]
             Transport::Quic(ch) => {
                 let ch = ch.clone();
-                let dispatcher: Box<dyn WriteChunkedDispatcher> =
+                let v2 = self.chunked_v2_writes_enabled.load(Ordering::Relaxed);
+                let dispatcher: Box<dyn WriteChunkedDispatcher> = if v2 {
+                    Box::new(WorkerApiWriteChunkedV2Dispatcher::with_factory(move || {
+                        let ch = ch.clone();
+                        Box::pin(async move { Ok(ch) })
+                    }))
+                } else {
                     Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
                         let ch = ch.clone();
                         Box::pin(async move { Ok(ch) })
-                    }));
+                    }))
+                };
                 write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
             }
             #[cfg(feature = "quic")]
             Transport::Dual { tcp, .. } => {
                 let cm_clone = tcp.clone();
                 let acquire_timeout_ms = self.connection_acquire_timeout_ms;
-                let dispatcher: Box<dyn WriteChunkedDispatcher> =
+                let v2 = self.chunked_v2_writes_enabled.load(Ordering::Relaxed);
+                let dispatcher: Box<dyn WriteChunkedDispatcher> = if v2 {
+                    Box::new(WorkerApiWriteChunkedV2Dispatcher::with_factory(move || {
+                        let cm = cm_clone.clone();
+                        Box::pin(async move {
+                            match acquire_timeout_ms {
+                                Some(ms) => {
+                                    cm.connection_with_timeout(
+                                        "worker_api_write_chunked".to_string(),
+                                        Duration::from_millis(ms),
+                                    )
+                                    .await
+                                }
+                                None => cm.connection("worker_api_write_chunked".to_string()).await,
+                            }
+                            .err_tip(|| "in GrpcStore::update_via_chunked_inner (dual/tcp)")
+                        })
+                    }))
+                } else {
                     Box::new(WorkerApiWriteChunkedDispatcher::with_factory(move || {
                         let cm = cm_clone.clone();
                         Box::pin(async move {
@@ -2592,7 +2636,8 @@ impl GrpcStore {
                             }
                             .err_tip(|| "in GrpcStore::update_via_chunked_inner (dual/tcp)")
                         })
-                    }));
+                    }))
+                };
                 write_chunked_stream(&*dispatcher, digest, reader, options, metrics).await
             }
         };
