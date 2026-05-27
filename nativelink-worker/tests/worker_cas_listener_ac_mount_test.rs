@@ -495,6 +495,7 @@ async fn worker_cas_listener_recursion_defense_test() {
         zstd_compression: false,
         connection_acquire_timeout_ms: Some(2000),
         chunked_writes_enabled: false,
+        chunked_v2_writes_enabled: false,
     })
     .await
     .expect("loopback GrpcStore");

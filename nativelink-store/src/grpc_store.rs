@@ -259,6 +259,12 @@ pub struct GrpcStore {
     /// `enable_locality_in_has` on `WorkerProxyStore`.
     #[cfg(feature = "chunked_fast_slow")]
     chunked_writes_enabled: AtomicBool,
+    /// #550 Phase 3: selects V1 (unary) vs V2 (bidi-per-chunk-ack)
+    /// dispatcher inside `update_via_chunked_inner`. Default OFF —
+    /// preserves V1 behavior. Flip ON for opt-in rollout of the V2
+    /// wire shape.
+    #[cfg(feature = "chunked_fast_slow")]
+    chunked_v2_writes_enabled: AtomicBool,
     /// #212 Phase 2.4 metrics for the chunked-write path. Counters
     /// are populated via `chunked_client::write_chunked_stream` and
     /// readable through the `chunked_metrics()` accessor. Folding into
@@ -424,6 +430,8 @@ impl GrpcStore {
             #[cfg(feature = "chunked_fast_slow")]
             chunked_writes_enabled: AtomicBool::new(false),
             #[cfg(feature = "chunked_fast_slow")]
+            chunked_v2_writes_enabled: AtomicBool::new(false),
+            #[cfg(feature = "chunked_fast_slow")]
             chunked_metrics: crate::chunked::chunked_client::ChunkedClientMetrics::new(),
         });
 
@@ -445,6 +453,13 @@ impl GrpcStore {
         #[cfg(feature = "chunked_fast_slow")]
         if spec.chunked_writes_enabled {
             store.enable_chunked_writes();
+        }
+
+        // #550 Phase 3: honor the V2 dispatcher config knob. Same
+        // compile-ship/flip-later pattern as V1.
+        #[cfg(feature = "chunked_fast_slow")]
+        if spec.chunked_v2_writes_enabled {
+            store.enable_chunked_v2_writes();
         }
 
         Ok(store)
@@ -487,6 +502,37 @@ impl GrpcStore {
     #[must_use]
     pub fn chunked_writes_enabled(&self) -> bool {
         self.chunked_writes_enabled.load(Ordering::Relaxed)
+    }
+
+    /// #550 Phase 3 runtime kill-switch: enable the V2 dispatcher
+    /// (`WorkerApiWriteChunkedV2Dispatcher`) inside
+    /// `update_via_chunked_inner()`. Default OFF — preserves V1
+    /// behavior. Flip ON for opt-in rollout.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn enable_chunked_v2_writes(&self) {
+        self.chunked_v2_writes_enabled.store(true, Ordering::Relaxed);
+        tracing::info!(
+            instance_name = %self.instance_name,
+            "GrpcStore: chunked V2 writes enabled (WorkerApi/WriteChunkedV2 path active for blobs >= CHUNK_SIZE)",
+        );
+    }
+
+    /// Operator kill-switch: disable the V2 dispatcher. Falls back to
+    /// the V1 (`WorkerApiWriteChunkedDispatcher`) path.
+    #[cfg(feature = "chunked_fast_slow")]
+    pub fn disable_chunked_v2_writes(&self) {
+        self.chunked_v2_writes_enabled.store(false, Ordering::Relaxed);
+        tracing::info!(
+            instance_name = %self.instance_name,
+            "GrpcStore: chunked V2 writes disabled (V1 path)",
+        );
+    }
+
+    /// Inspector for the V2 dispatcher kill-switch.
+    #[cfg(feature = "chunked_fast_slow")]
+    #[must_use]
+    pub fn chunked_v2_writes_enabled(&self) -> bool {
+        self.chunked_v2_writes_enabled.load(Ordering::Relaxed)
     }
 
     /// Read-only accessor for the chunked-write metrics. Used by

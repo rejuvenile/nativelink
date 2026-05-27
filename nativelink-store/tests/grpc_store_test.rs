@@ -66,6 +66,7 @@ fn make_test_spec() -> GrpcSpec {
         zstd_compression: false,
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
+        chunked_v2_writes_enabled: false,
     }
 }
 

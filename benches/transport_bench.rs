@@ -229,6 +229,7 @@ async fn make_tcp_client(port: u16, certs: &TlsCerts) -> Arc<GrpcStore> {
         zstd_compression: false,
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
+        chunked_v2_writes_enabled: false,
     };
     GrpcStore::new(&spec)
         .await
@@ -374,6 +375,7 @@ async fn make_quic_client(port: u16) -> Arc<GrpcStore> {
         zstd_compression: false,
         connection_acquire_timeout_ms: None,
         chunked_writes_enabled: false,
+        chunked_v2_writes_enabled: false,
     };
     GrpcStore::new(&spec)
         .await

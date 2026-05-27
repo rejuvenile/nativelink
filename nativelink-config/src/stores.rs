@@ -1554,6 +1554,22 @@ pub struct GrpcSpec {
     /// Default: false (legacy path)
     #[serde(default)]
     pub chunked_writes_enabled: bool,
+
+    /// #550 Phase 3 (part of #546 multi-phase pin-lifetime relaxation):
+    /// worker-side WriteChunkedV2 client kill-switch. Default OFF for
+    /// opt-in rollout — set true to route blobs >= `CHUNK_SIZE` through
+    /// the V2 wire shape (`WorkerApi/WriteChunkedV2` bidi RPC with
+    /// per-chunk acks) instead of the V1 unary `WorkerApi/WriteChunked`.
+    ///
+    /// Requires `chunked_writes_enabled=true` AND the
+    /// `chunked_fast_slow` feature compiled in. When true, the
+    /// `update_via_chunked_inner()` path constructs a
+    /// `WorkerApiWriteChunkedV2Dispatcher` instead of the V1 dispatcher;
+    /// the retry loop (`write_chunked_stream`) is identical for both.
+    ///
+    /// Default: false (V1 path, pre-#550 behavior)
+    #[serde(default)]
+    pub chunked_v2_writes_enabled: bool,
 }
 
 /// The possible error codes that might occur on an upstream request.

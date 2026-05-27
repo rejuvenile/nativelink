@@ -3495,6 +3495,7 @@ async fn create_worker_cas_connection(
         // Scheduler→worker prefetch reads do not write blobs through
         // this connection, so the chunked-write kill-switch is N/A.
         chunked_writes_enabled: false,
+        chunked_v2_writes_enabled: false,
     };
     let store = GrpcStore::new(&spec)
         .await
