@@ -2052,4 +2052,57 @@ mod tests {
              boot-panic mechanism this guards."
         );
     }
+
+    /// #550 Phase 3: verify `chunked_v2_writes_enabled` defaults to false
+    /// when absent from JSON5, and can be explicitly set to true/false.
+    #[test]
+    fn grpc_spec_chunked_v2_writes_enabled_defaults_false() {
+        let spec: GrpcSpec = serde_json5::from_str(
+            r#"{
+                "instance_name": "",
+                "endpoints": [{"address": "http://localhost:50051"}],
+                "store_type": "cas",
+            }"#,
+        )
+        .expect("GrpcSpec must deserialize from minimal JSON5");
+        assert!(
+            !spec.chunked_v2_writes_enabled,
+            "chunked_v2_writes_enabled MUST default to false — #550 Phase 3 \
+             opt-in rollout requires V1 behavior as the default"
+        );
+    }
+
+    #[test]
+    fn grpc_spec_chunked_v2_writes_enabled_explicit_true() {
+        let spec: GrpcSpec = serde_json5::from_str(
+            r#"{
+                "instance_name": "",
+                "endpoints": [{"address": "http://localhost:50051"}],
+                "store_type": "cas",
+                "chunked_v2_writes_enabled": true,
+            }"#,
+        )
+        .expect("GrpcSpec must deserialize with explicit chunked_v2_writes_enabled");
+        assert!(
+            spec.chunked_v2_writes_enabled,
+            "chunked_v2_writes_enabled MUST honor explicit true"
+        );
+    }
+
+    #[test]
+    fn grpc_spec_chunked_v2_writes_enabled_explicit_false() {
+        let spec: GrpcSpec = serde_json5::from_str(
+            r#"{
+                "instance_name": "",
+                "endpoints": [{"address": "http://localhost:50051"}],
+                "store_type": "cas",
+                "chunked_v2_writes_enabled": false,
+            }"#,
+        )
+        .expect("GrpcSpec must deserialize with explicit chunked_v2_writes_enabled=false");
+        assert!(
+            !spec.chunked_v2_writes_enabled,
+            "chunked_v2_writes_enabled MUST honor explicit false"
+        );
+    }
 }
