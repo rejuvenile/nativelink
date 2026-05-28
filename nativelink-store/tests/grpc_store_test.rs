@@ -1117,11 +1117,15 @@ async fn t_grpc_store_propagates_is_worker_header_on_write()
 // Gated on `chunked_fast_slow` because the flag is behind the same cfg
 // on `GrpcStore::chunked_v2_writes_enabled` and the accessor methods.
 
+// `make_test_spec()` leaves `chunked_v2_writes_enabled` at its default
+// (`false`); this test does NOT re-set it, so it verifies that the spec
+// default flows through `GrpcStore::new()` into the `AtomicBool` rather
+// than re-asserting a value the test itself wrote. The serde-absent
+// default is covered separately by the `nativelink-config` crate test.
 #[cfg(feature = "chunked_fast_slow")]
 #[nativelink_test]
 async fn chunked_v2_writes_enabled_defaults_false() -> Result<(), Error> {
-    let mut spec = make_test_spec();
-    spec.chunked_v2_writes_enabled = false;
+    let spec = make_test_spec();
     let store = GrpcStore::new(&spec).await?;
     assert!(
         !store.chunked_v2_writes_enabled(),

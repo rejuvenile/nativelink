@@ -1263,4 +1263,28 @@ mod tests {
              for unrelated codes."
         );
     }
+
+    /// **#550 Phase 3 (red-team version-skew finding):** a worker that
+    /// has opted into V2 (`chunked_v2_writes_enabled = true`) but talks
+    /// to a server without the `WriteChunkedV2` handler receives
+    /// `Code::Unimplemented`. That error carries no `BackpressureSignal`
+    /// and is not watchdog-tagged, so it MUST classify as `Abort`: the
+    /// write fails loud and fast — no retry storm, no hang, and (by
+    /// design) no silent fallback to the V1 dispatcher. This makes the
+    /// "version skew is safe" claim explicit rather than relying on the
+    /// implicit `!has_signal → Abort` fallthrough.
+    #[nativelink_test]
+    async fn classify_unimplemented_is_abort() {
+        let err = make_err!(
+            Code::Unimplemented,
+            "server does not implement WriteChunkedV2"
+        );
+        assert!(
+            matches!(classify_retryable(&err), RetryDecision::Abort),
+            "Code::Unimplemented (no BackpressureSignal) MUST classify \
+             as Abort — a V2-enabled worker hitting a server without the \
+             WriteChunkedV2 handler must fail loud, not retry-storm or \
+             hang. There is no fallback to the V1 dispatcher by design."
+        );
+    }
 }

@@ -25,6 +25,12 @@
 //! Mutation hint: in `grpc_store.rs` the `if v2 {` branch in
 //! `update_via_chunked_inner` — flipping to `if !v2 {` must cause this test
 //! to fail on the V2 assertion.
+//!
+//! Transport scope: this test drives the Tcp arm only (`dual_transport:
+//! false`, `use_http3: false` — the production config). The Quic
+//! (`:2588`) and Dual (`:2606`) arms select the dispatcher with the
+//! identical `if v2 { .. } else { .. }` expression; exercising them would
+//! require binding a QUIC server for zero additional branch coverage.
 
 #![cfg(feature = "chunked_fast_slow")]
 
