@@ -1179,39 +1179,3 @@ async fn chunked_v2_writes_enabled_runtime_toggle() -> Result<(), Error> {
     Ok(())
 }
 
-/// #550 Phase 3: mutation-verification test.
-#[cfg(feature = "chunked_fast_slow")]
-///
-/// This test asserts that with V1 enabled (chunked_v2_writes_enabled=false),
-/// the dispatcher construction path selects V1. The branch is in
-/// `update_via_chunked_inner` — we verify the flag controls dispatch
-/// selection by checking that enabling V2 changes the flag state, which
-/// is the sole gate for the V2-vs-V1 branch.
-///
-/// Mutation hint: comment out `store.enable_chunked_v2_writes()` —
-/// the assertion must red-fail with the bespoke message below.
-#[nativelink_test]
-async fn chunked_v2_flag_gates_dispatcher_selection() -> Result<(), Error> {
-    let spec = make_test_spec();
-    let store = GrpcStore::new(&spec).await?;
-
-    // Baseline: V1 path (flag is false)
-    assert!(
-        !store.chunked_v2_writes_enabled(),
-        "Baseline: V2 flag must be false"
-    );
-
-    // Flip to V2
-    store.enable_chunked_v2_writes();
-
-    assert!(
-        store.chunked_v2_writes_enabled(),
-        "#550 Phase 3: after enable_chunked_v2_writes(), the flag MUST be \
-         true — this flag is the sole gate in update_via_chunked_inner's \
-         if/else that selects WorkerApiWriteChunkedV2Dispatcher vs \
-         WorkerApiWriteChunkedDispatcher. Without this check, the branch \
-         is dead code."
-    );
-
-    Ok(())
-}
