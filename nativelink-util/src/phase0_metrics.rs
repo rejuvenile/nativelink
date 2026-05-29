@@ -125,6 +125,17 @@ pub const PINNED_BYTES_BUCKETS: [u64; 9] = [
     64 << 30,        // 64 GiB
 ];
 
+/// #551 probe (task #20): the large/small size-class boundary for the
+/// pinned-mass split. MUST mirror `BATCH_THRESHOLD` in
+/// `running_actions_manager.rs` (the byte size above which a worker upload
+/// takes the streaming/chunked path and, under #551 Flow A, releases its
+/// pin at tonic-Ok instead of at BIS-ack). Blobs `> threshold` are "large";
+/// `<= threshold` are "small" and keep BIS-ack unpin. Splitting the live
+/// pinned-bytes gauge on this boundary measures the concurrent pinned-mass
+/// fraction attributable to large blobs — the load-bearing input to the
+/// "large blobs dominate pinned mass" benefit estimate (≈2× vs ≈10×).
+pub const PIN_SIZE_CLASS_THRESHOLD_BYTES: u64 = 1 << 20; // 1 MiB
+
 /// Side-channel cache cap for per-digest tonic-Ok timestamps. Capped to
 /// prevent unbounded growth under a digest-storm. At 100k entries the
 /// memory footprint is approximately 100k × (32 byte digest + 16 byte
@@ -358,6 +369,18 @@ pub struct WorkerPhase0Metrics {
     /// load-bearing consumer is Phase 2 pin_budget sizing, and the
     /// other-pin slices have their own sizing inputs.
     pinned_bytes_live: AtomicU64,
+    /// #551 probe (task #20): the `pinned_bytes_live` total split by the
+    /// `PIN_SIZE_CLASS_THRESHOLD_BYTES` (1 MiB) size class. `_large` =
+    /// live pinned bytes from blobs `> 1 MiB` (the blobs Flow A would
+    /// release at tonic-Ok); `_small` = `<= 1 MiB` (keep BIS-ack unpin).
+    /// `_large / (_large + _small)` is the concurrent pinned-mass fraction
+    /// that Flow A would shed — the measurement that settles whether the
+    /// reduction is ≈2× (large ~50%) or ≈10× (large ~90%). Same
+    /// acquire/release lifecycle and "awaiting-BIS" semantic as
+    /// `pinned_bytes_live`; the two fields sum to it (modulo the same
+    /// double-acquire drift noted there).
+    pinned_bytes_live_large: AtomicU64,
+    pinned_bytes_live_small: AtomicU64,
     /// Histogram of worker BIS chunk arrival → handler dispatch latency.
     bis_chunk_arrive_to_handler: LatencyHistogram,
     /// Per-action accumulators for total + max pin-extension. Keyed by
@@ -407,6 +430,8 @@ impl WorkerPhase0Metrics {
             action_max_pin_extension: LatencyHistogram::new(),
             concurrent_pinned_bytes: BytesHistogram::new(),
             pinned_bytes_live: AtomicU64::new(0),
+            pinned_bytes_live_large: AtomicU64::new(0),
+            pinned_bytes_live_small: AtomicU64::new(0),
             bis_chunk_arrive_to_handler: LatencyHistogram::new(),
             action_pin_accumulators: Cache::builder()
                 .max_capacity(10_000)
@@ -451,6 +476,14 @@ impl WorkerPhase0Metrics {
             .fetch_add(size_bytes, Ordering::Relaxed)
             .wrapping_add(size_bytes);
         self.concurrent_pinned_bytes.observe(new);
+        // #551 probe (task #20): mirror the add onto the size-class gauge.
+        if size_bytes > PIN_SIZE_CLASS_THRESHOLD_BYTES {
+            self.pinned_bytes_live_large
+                .fetch_add(size_bytes, Ordering::Relaxed);
+        } else {
+            self.pinned_bytes_live_small
+                .fetch_add(size_bytes, Ordering::Relaxed);
+        }
     }
 
     /// Producer: called from `spawn_upload_to_remote` when an upload's
@@ -469,9 +502,20 @@ impl WorkerPhase0Metrics {
                 .compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                return;
+                break;
             }
         }
+        // #551 probe (task #20): mirror the saturating decrement onto the
+        // matching size-class gauge. Same size_bytes ⇒ same class as the
+        // acquire that added it (classification is a pure function of size).
+        let class = if size_bytes > PIN_SIZE_CLASS_THRESHOLD_BYTES {
+            &self.pinned_bytes_live_large
+        } else {
+            &self.pinned_bytes_live_small
+        };
+        let _ = class.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(size_bytes))
+        });
     }
 
     /// Consumer: called from `handle_blobs_in_stable_storage_for_store`
@@ -616,6 +660,20 @@ impl MetricsComponent for WorkerPhase0Metrics {
             &live_bytes,
             nativelink_metric::MetricKind::Default,
             "#547 Phase 0: point-in-time worker bytes-pinned-AND-tonic-Ok'd-awaiting-BIS (live gauge derived from atomic counter). Approximate: small upward drift possible if a digest appears in both output_files and tree-extracted file digests within one action (double-acquired during the per-digest upload loop); the drift is bounded by the duplicated digest sizes per action."
+        );
+        let live_bytes_large = self.pinned_bytes_live_large.load(Ordering::Relaxed);
+        nativelink_metric::publish!(
+            "worker_concurrent_pinned_bytes_live_large",
+            &live_bytes_large,
+            nativelink_metric::MetricKind::Default,
+            "#551 probe (task #20): the worker_concurrent_pinned_bytes_live total restricted to blobs > 1 MiB (PIN_SIZE_CLASS_THRESHOLD_BYTES). These are the blobs #551 Flow A would release at tonic-Ok. live_large / (live_large + live_small) is the concurrent pinned-mass fraction Flow A would shed — the measurement that settles the ≈2× vs ≈10× benefit estimate."
+        );
+        let live_bytes_small = self.pinned_bytes_live_small.load(Ordering::Relaxed);
+        nativelink_metric::publish!(
+            "worker_concurrent_pinned_bytes_live_small",
+            &live_bytes_small,
+            nativelink_metric::MetricKind::Default,
+            "#551 probe (task #20): the worker_concurrent_pinned_bytes_live total restricted to blobs <= 1 MiB (PIN_SIZE_CLASS_THRESHOLD_BYTES). These keep BIS-ack unpin under #551 Flow A. Sums with worker_concurrent_pinned_bytes_live_large to worker_concurrent_pinned_bytes_live (modulo the same double-acquire drift)."
         );
         Ok(MetricPublishKnownKindData::Component)
     }
@@ -1218,6 +1276,60 @@ mod tests {
         assert_eq!(m.pinned_bytes_live.load(Ordering::Relaxed), 0);
     }
 
+    /// #551 probe (task #20): the live gauge is split by the 1 MiB size
+    /// class, the two halves sum to the total, the boundary (== 1 MiB)
+    /// classifies SMALL (only `> threshold` is large), and releases
+    /// decrement the matching class.
+    ///
+    /// Mutation step: flip the `>` to `>=` in `record_pin_acquired`'s
+    /// class check — the boundary assertion below red-fails with the
+    /// bespoke message ("1 MiB must classify SMALL ...").
+    #[test]
+    fn pin_size_class_split_tracks_large_vs_small() {
+        let m = WorkerPhase0Metrics::new();
+        let small = 4096u64; // <= 1 MiB
+        let large = 4 << 20; // 4 MiB, > 1 MiB
+        let boundary = PIN_SIZE_CLASS_THRESHOLD_BYTES; // exactly 1 MiB
+
+        m.record_pin_acquired(small);
+        m.record_pin_acquired(large);
+        m.record_pin_acquired(boundary);
+
+        let live_large = m.pinned_bytes_live_large.load(Ordering::Relaxed);
+        let live_small = m.pinned_bytes_live_small.load(Ordering::Relaxed);
+        assert_eq!(live_large, large, "only the > 1 MiB blob is large");
+        assert_eq!(
+            live_small,
+            small + boundary,
+            "1 MiB must classify SMALL (boundary is inclusive on the small side)"
+        );
+        // The split sums to the unsplit total — the load-bearing invariant
+        // that makes live_large / (live_large + live_small) the pinned-mass
+        // fraction.
+        assert_eq!(
+            live_large + live_small,
+            m.pinned_bytes_live.load(Ordering::Relaxed),
+            "#551 probe: size-class gauges must sum to the total live gauge"
+        );
+
+        // Release the large blob: large gauge drains, small untouched.
+        // (Production releases per-digest with the digest's own size, so the
+        // release classifies into the same class as its acquire.)
+        m.record_pin_released(large);
+        assert_eq!(m.pinned_bytes_live_large.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            m.pinned_bytes_live_small.load(Ordering::Relaxed),
+            small + boundary
+        );
+        // Release the two small-class blobs individually (each <= 1 MiB).
+        m.record_pin_released(boundary);
+        m.record_pin_released(small);
+        assert_eq!(m.pinned_bytes_live_small.load(Ordering::Relaxed), 0);
+        // Over-release of a small-class size saturates at 0, doesn't wrap.
+        m.record_pin_released(small);
+        assert_eq!(m.pinned_bytes_live_small.load(Ordering::Relaxed), 0);
+    }
+
     /// CF1 regression: acquire+release pair must zero the gauge so the
     /// "live" semantic actually holds. The unit-level `record_pin_released`
     /// existed but was never wired in production — `local_worker.rs`'s
@@ -1739,7 +1851,7 @@ mod tests {
         // metric, value separated by single space, terminated by
         // newline — matches the `nativelink_metric::publish!` macro's
         // emission shape and `render_prometheus`'s capture).
-        let assertions: [(&str, &str, &str); 14] = [
+        let assertions: [(&str, &str, &str); 16] = [
             // (line to find, metric short-name for error message, expected-state description)
             (
                 "phase0_worker_worker_pin_release_latency_after_tonic_ok_count 1\n",
@@ -1777,6 +1889,20 @@ mod tests {
                 "acquire(4096) + release(4096) must return live gauge to 0; \
                  non-zero here would mean record_pin_released was broken or \
                  the gauge was never decremented",
+            ),
+            (
+                "phase0_worker_worker_concurrent_pinned_bytes_live_large 0\n",
+                "concurrent_pinned_bytes_live_large (#551 probe exposure)",
+                "no >1 MiB blob acquired in this scenario, so the large-class \
+                 gauge is 0; the line's PRESENCE proves the #551 probe metric \
+                 is wired into the render_prometheus body, not merely a struct \
+                 field (per feedback_publish_body_not_field_existence)",
+            ),
+            (
+                "phase0_worker_worker_concurrent_pinned_bytes_live_small 0\n",
+                "concurrent_pinned_bytes_live_small (#551 probe exposure)",
+                "acquire(4096, small-class) + release(4096) returns the \
+                 small-class gauge to 0; line presence proves exposure",
             ),
             (
                 "phase0_worker_worker_bis_chunk_arrive_to_handler_count 1\n",
