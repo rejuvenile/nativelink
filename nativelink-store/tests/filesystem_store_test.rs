@@ -1789,3 +1789,146 @@ async fn pin_digest_with_result_reports_eviction_race() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// #605 Bug A regression (production-composition seam): when
+/// `content_path` is OVER-CAP at startup, `FilesystemStore::new` must
+/// bleed it down to the configured byte cap before returning. The unit
+/// test in `moka_evicting_map.rs`
+/// (`run_pending_tasks_and_drain_evicts_startup_overshoot`) proves moka
+/// fires the eviction listener; this test proves the LISTENER →
+/// `FileEntryImpl::unref` → `content_path → temp_path` rename actually
+/// runs against real on-disk files via real `FilesystemStore::new` —
+/// the seam the unit test cannot reach.
+///
+/// Layout: each pre-seeded file lives at
+/// `{content_path}/d/{hash[0..2]}/{hash}-{size}` (matches
+/// `digest_content_path`). With `block_size = 1`, `size_on_disk ==
+/// data_size`, so moka's KB-rounded weight is deterministic.
+///
+/// Mutation step: comment out the
+/// `evicting_map.run_pending_tasks_and_drain().await;` line in
+/// `FilesystemStore::new` (after `add_files_to_cache`) — the
+/// post-construction file-count assertion below MUST red-fail with
+/// "#605 fix: content_path must be bled down to cap during startup"
+/// because moka's listener never fires for the startup overshoot and
+/// every pre-seeded file remains in `content_path`.
+#[nativelink_test]
+async fn startup_over_cap_content_path_drained_to_cap() -> Result<(), Error> {
+    let content_path = make_temp_path("content_path");
+    let temp_path = make_temp_path("temp_path");
+
+    // Five 10 KiB files = 50 KiB on disk; cap = 20 KiB. moka's KB-scaled
+    // capacity: max_capacity = 20 KiB / 1024 = 20; weight per file =
+    // div_ceil(10 KiB, 1024) = 10. After drain at most 2 files (weight 20)
+    // may remain — strictly less than 5.
+    const FILE_BYTES: usize = 10 * 1024;
+    const MAX_BYTES: usize = 20 * 1024;
+    const NUM_FILES: usize = 5;
+    const HASHES: [&str; NUM_FILES] = [
+        "0123456789abcdef000000000000000000010000000000000123456789abcdef",
+        "1123456789abcdef000000000000000000010000000000000123456789abcdef",
+        "2123456789abcdef000000000000000000010000000000000123456789abcdef",
+        "3123456789abcdef000000000000000000010000000000000123456789abcdef",
+        "4123456789abcdef000000000000000000010000000000000123456789abcdef",
+    ];
+
+    let payload = make_random_data(FILE_BYTES);
+    let mut digests = Vec::with_capacity(NUM_FILES);
+    for hash in HASHES {
+        let digest = DigestInfo::try_new(hash, FILE_BYTES)?;
+        let file_path = digest_content_path(&content_path, &digest);
+        // Create the sharded parent directory (`{content_path}/d/{shard}`).
+        let parent = Path::new(&file_path)
+            .parent()
+            .expect("digest path must have a parent shard dir");
+        fs::create_dir_all(parent).await?;
+        std::fs::write(&file_path, &payload)
+            .err_tip(|| format!("writing pre-seeded over-cap file {:?}", file_path))?;
+        digests.push(digest);
+    }
+
+    // Build the store with a small byte cap. The drain inside
+    // `FilesystemStore::new` MUST evict enough entries to bring the
+    // moka cache at-or-below cap, which in turn renames their on-disk
+    // files out of `content_path` and into `temp_path`. Wrap in a
+    // tokio timeout: deadlock detector (e.g. drain looping forever)
+    // beats hanging the suite.
+    let store = tokio::time::timeout(
+        Duration::from_secs(10),
+        FilesystemStore::<FileEntryImpl>::new(&FilesystemSpec {
+            content_path: content_path.clone(),
+            temp_path: temp_path.clone(),
+            eviction_policy: Some(EvictionPolicy {
+                max_bytes: MAX_BYTES,
+                ..Default::default()
+            }),
+            block_size: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("FilesystemStore::new must not deadlock — #605 startup drain contract violated")?;
+
+    // The drain enqueues eviction events for moka's background listener
+    // drain task; that task `spawn`s on the runtime so the rename can
+    // land after `new` returns. Yield until the file count settles
+    // at-or-below cap, bounded by a tokio timeout.
+    let content_dir = format!("{content_path}/{DIGEST_FOLDER}");
+    let drained: Result<(), Error> = tokio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            loop {
+                let remaining = collect_digest_dir_files(&content_dir).await?;
+                if remaining.len() <= 2 {
+                    return Ok(());
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .map_err(|_| {
+        make_err!(
+            Code::Internal,
+            "#605 fix: content_path must be bled down to cap during startup — \
+             timed out waiting for drained eviction-listener renames"
+        )
+    })?;
+    drained?;
+
+    let remaining_content = collect_digest_dir_files(&content_dir).await?;
+    let remaining_n = remaining_content.len();
+    assert!(
+        remaining_n <= 2,
+        "#605 fix: content_path must be bled down to cap during startup — \
+         pre-seeded {NUM_FILES}× {FILE_BYTES}-byte files on a {MAX_BYTES}-byte cap, \
+         expected ≤ 2 remaining in content_path after `FilesystemStore::new`, got {remaining_n}",
+    );
+    assert!(
+        remaining_n < NUM_FILES,
+        "#605 fix: content_path drain produced ZERO evictions — startup overshoot was not enforced",
+    );
+
+    // (Renamed-to-temp files are picked up immediately by
+    // `prune_temp_path`, which runs right after the drain inside
+    // `FilesystemStore::new`. So we don't assert on temp_path contents
+    // here — they're transient and gone by the time `new` returns.)
+
+    // The moka index agrees with the disk: surviving digests are
+    // visible via `has`, evicted ones are not. Use the store's own
+    // visibility primitive (this is the seam the unit test cannot
+    // reach).
+    let store = Store::new(store);
+    let mut visible = 0usize;
+    for digest in &digests {
+        if store.has(*digest).await?.is_some() {
+            visible += 1;
+        }
+    }
+    assert_eq!(
+        visible, remaining_n,
+        "#605 fix: moka entry count must match remaining on-disk file count after startup drain"
+    );
+
+    Ok(())
+}
