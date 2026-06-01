@@ -992,6 +992,24 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
             rename_fn,
         )
         .await?;
+        // Honor `insert_startup`'s post-batch-drain contract: the startup
+        // load above goes through `insert_with_time` → `insert_startup`,
+        // which intentionally defers `cache.run_pending_tasks()` for
+        // throughput, putting the burden on the caller. Run it now so a
+        // startup overshoot — on-disk content above the configured cap —
+        // is bled down SYNCHRONOUSLY before `start_background_eviction`
+        // takes over. Without this, an idle worker (no runtime `insert` to
+        // kick moka's per-insert capacity check) stays over-cap
+        // indefinitely.
+        //
+        // One of N contributors to #605 (worker disk-cap overshoot, 2026-05-29
+        // production observation). NOT a complete fix on its own: workers
+        // observed at 70–124 GiB on a 40 GiB cap exceed even moka's design
+        // ceiling of `1.25 × max_bytes` (configured cap + `pin_cap` for the
+        // side `pinned` map), so the residual must come from on-disk regions
+        // outside moka's authority (rename-failure orphans, etc — tracked
+        // separately).
+        evicting_map.run_pending_tasks_and_drain().await;
         prune_temp_path(&shared_context.temp_path).await?;
 
         // #212 Phase 2.2-3 B1 fixup: GC any leftover `.holding` files

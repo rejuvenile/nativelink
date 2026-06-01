@@ -574,6 +574,58 @@ where
         }
     }
 
+    /// Honor `insert_startup`'s post-batch-drain contract (see its
+    /// doc-comment: "Caller should call cache.run_pending_tasks() after
+    /// the full batch"). After a batch of `insert_with_time` (the
+    /// startup load path), the caller must kick moka's capacity check +
+    /// drain the eviction queue. Without this, on-disk content loaded
+    /// above the cap stays above the cap until the first runtime
+    /// `insert` — which on idle workers may never come.
+    ///
+    /// Loops `cache.run_pending_tasks()` + `drain_pending_evictions()`
+    /// until idle. moka's per-call eviction is BOUNDED in principle (per
+    /// moka's `DEFAULT_MAINTENANCE_TASK_TIMEOUT_MILLIS` ≈ 100 ms +
+    /// `DEFAULT_EVICTION_BATCH_SIZE` ≈ 384), so a single call CAN return
+    /// with `more_to_evict=true` and leave the cache above cap. In
+    /// practice moka's internal `do_run_pending_tasks` re-loops until
+    /// drained and reaches the time bound only on very large overshoots
+    /// (~tens of GiB at production file-size granularity). The outer
+    /// loop here is forward-defense for that edge case: at any
+    /// production scale the post-call invariant
+    /// `cache.weighted_size() ≤ max_capacity` actually holds. Bounded by
+    /// `MAX_ITERATIONS` to defend against pathological cycles.
+    ///
+    /// Each iteration mirrors the post-`cache.insert()` enforcement
+    /// block in `insert_inner`: one `run_pending_tasks()`, a `max_count`
+    /// re-check that may fire a second one, then drain. (Anchors are
+    /// by symbol to avoid line-cite drift across edits — this is the
+    /// 3rd round of fix-ups where numeric cites have drifted.)
+    pub async fn run_pending_tasks_and_drain(&self) {
+        // 1000 iterations × ≤ 384 evictions/iter = 384 000 evictions
+        // before warn-and-bail. Far above any plausible single-startup
+        // overshoot; large enough that hitting the cap signals a bug.
+        const MAX_ITERATIONS: u32 = 1000;
+        for _ in 0..MAX_ITERATIONS {
+            self.cache.run_pending_tasks();
+            if self.max_count > 0
+                && self.max_bytes > 0
+                && self.cache.entry_count() > self.max_count
+            {
+                self.cache.run_pending_tasks();
+            }
+            // If moka produced no new eviction events this iteration, it
+            // considers itself drained — done.
+            if self.pending_evictions.lock().is_empty() {
+                return;
+            }
+            self.drain_pending_evictions().await;
+        }
+        tracing::warn!(
+            "run_pending_tasks_and_drain hit iteration cap ({}); cache may still be above capacity",
+            MAX_ITERATIONS,
+        );
+    }
+
     pub async fn insert_with_time(
         &self,
         key: K,
@@ -1867,6 +1919,113 @@ mod tests {
             pin_expired_count.load(Ordering::Relaxed),
             1,
             "pin-expiry MUST fire on_pin_expired exactly once",
+        );
+    }
+
+    /// #605 regression test: a startup load past the cap stays past the cap
+    /// (no eviction listener fires) until `run_pending_tasks_and_drain` is
+    /// called, after which moka enforces the byte cap synchronously. Models
+    /// what `FilesystemStore::new` does after `add_files_to_cache`.
+    ///
+    /// Mutation step: revert `run_pending_tasks_and_drain` to just
+    /// `drain_pending_evictions()` (drop the `cache.run_pending_tasks()`
+    /// call) — the post-drain assertion red-fails because moka was never
+    /// asked to enforce the cap.
+    #[tokio::test]
+    async fn run_pending_tasks_and_drain_evicts_startup_overshoot() {
+        let cfg = policy(100, 0); // 100-byte cap, no count cap.
+        let map = make_map_cb(&cfg);
+        let cb = CountingCallback::new();
+        let removal_count = Arc::clone(&cb.removal_count);
+        map.add_item_callback(cb);
+
+        // Simulate startup load: 20 entries of 10 bytes each = 200 bytes (2x cap).
+        // insert_with_time is the path `FilesystemStore::add_files_to_cache` uses;
+        // by contract (insert_startup doc-comment) it skips
+        // `cache.run_pending_tasks()` for throughput.
+        for k in 0..20u64 {
+            map.insert_with_time(k, BytesEntry(10), 0).await;
+        }
+
+        // BEFORE the drain: nothing has kicked moka's capacity check, so the
+        // eviction listener has NOT fired. This IS the production failure
+        // mode (worker-05: 124 GiB on 40 GiB cap, zero evict log lines).
+        assert_eq!(
+            removal_count.load(Ordering::Relaxed),
+            0,
+            "#605 precondition: insert_with_time must NOT fire eviction (the bug being fixed)",
+        );
+
+        // The fix: run moka's capacity check + drain the listener queue
+        // (looped until idle so the bounded per-call eviction doesn't leave
+        // the cache above cap).
+        map.run_pending_tasks_and_drain().await;
+
+        // AFTER the drain: the listener fired AND the cache is at-or-below
+        // cap. The cap assertion is the load-bearing one — a single
+        // `run_pending_tasks()` is bounded by
+        // `DEFAULT_EVICTION_BATCH_SIZE`, so for a 2×-overshoot it can
+        // produce SOME evictions yet leave the cache still over. Only the
+        // loop-until-idle behaviour guarantees the end-state invariant.
+        let evicted = removal_count.load(Ordering::Relaxed);
+        assert!(
+            evicted > 0,
+            "#605 fix: run_pending_tasks_and_drain must fire the eviction listener for over-cap entries (got 0; cap not being enforced)",
+        );
+        let remaining = map.cache.entry_count();
+        let remaining_bytes = remaining * 10; // 10 = BytesEntry size
+        assert!(
+            remaining_bytes <= 100,
+            "#605 fix: post-drain cache must be at-or-below cap (got {remaining} entries × 10 B = {remaining_bytes} B, cap = 100 B). \
+             A single run_pending_tasks() exits at moka's eviction-batch ceiling; only the loop in run_pending_tasks_and_drain brings the cache fully under cap.",
+        );
+    }
+
+    /// #605 large-overshoot property test: post-drain cache must satisfy
+    /// `entry_count × size ≤ cap` even for an overshoot WAY above the
+    /// per-iteration eviction-batch ceiling. This test inserts 2000 ×
+    /// 1-byte entries into a 100-byte cap (20×, well above moka's
+    /// `DEFAULT_EVICTION_BATCH_SIZE` ≈ 384).
+    ///
+    /// NOTE on the loop: a single-iteration mutation of the helper
+    /// (one `run_pending_tasks` + one drain, no loop) PASSES this test
+    /// on debug-build infrastructure. Moka's internal
+    /// `do_run_pending_tasks` itself loops `evict_lru_entries` until
+    /// drained OR the 100 ms maintenance-task timeout fires, so for a
+    /// 2000 × 1 B workload the inner loop drains the queue in a single
+    /// outer call. The outer loop in `run_pending_tasks_and_drain`
+    /// becomes load-bearing only at production scale (~30–80 GiB
+    /// overshoot at ~10–100 KiB file granularity = ~1M–10M eviction
+    /// events, where the 100 ms inner-timeout CAN fire). This test
+    /// guards the END-STATE PROPERTY (cap-enforced) — which holds with
+    /// or without the loop on this workload size — not the loop's
+    /// necessity per se.
+    #[tokio::test]
+    async fn run_pending_tasks_and_drain_loops_for_large_overshoot() {
+        let cfg = policy(100, 0); // 100-byte cap.
+        let map = make_map_cb(&cfg);
+        let cb = CountingCallback::new();
+        map.add_item_callback(cb);
+
+        // 2000 × 1-byte entries = 2000 B (20× cap), well above moka's
+        // per-call eviction batch (~384). At this scale moka's inner
+        // re-loop drains in one outer call; at production scale it
+        // wouldn't, which is when the helper's outer loop matters.
+        for k in 0..2000u64 {
+            map.insert_with_time(k, BytesEntry(1), 0).await;
+        }
+
+        map.run_pending_tasks_and_drain().await;
+
+        // Cache must be ≤ cap. With 1-byte entries, cap=100 means at
+        // most 100 entries remain.
+        let remaining = map.cache.entry_count();
+        assert!(
+            remaining <= 100,
+            "#605 fix loop: post-drain cache must be at-or-below cap for overshoots > eviction-batch ceiling \
+             (got {remaining} entries × 1 B = {remaining} B, cap = 100 B). A single run_pending_tasks call \
+             is bounded by DEFAULT_EVICTION_BATCH_SIZE; only the loop in run_pending_tasks_and_drain brings \
+             the cache fully under cap.",
         );
     }
 
