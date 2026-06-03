@@ -225,6 +225,7 @@ fn build_chain() -> (Arc<CompletenessCheckingStore>, Arc<MemoryStore>) {
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));
@@ -424,6 +425,7 @@ fn build_chain_with_gate_on() -> (Arc<CompletenessCheckingStore>, Arc<MemoryStor
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));

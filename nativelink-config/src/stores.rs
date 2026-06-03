@@ -966,6 +966,28 @@ pub struct ExistenceCacheSpec {
     /// value will cause items to never be removed from the store causing
     /// infinite memory usage.
     pub eviction_policy: Option<EvictionPolicy>,
+
+    /// When `true`, emit `info!` log lines every time this
+    /// `ExistenceCacheStore` returns `NotFound` to its caller — both
+    /// the `inner_has_with_results` per-slot path and the `get_part`
+    /// Err path. Operators can then correlate Bazel-reported AC
+    /// misses with a specific digest at the AC layer without enabling
+    /// tracing-level debug.
+    ///
+    /// **Set this only on AC instances.** The CAS-side ExistenceCache
+    /// is hit by Bazel's `FindMissingBlobs` pre-action sweep at
+    /// 1k-10k entries/sec during build-start bursts — info-level
+    /// logging there would produce thousands of false drill-down
+    /// candidates per minute (per the
+    /// `existence_cache_eviction_codes_test.rs::
+    /// get_part_not_found_does_not_log_for_never_cached_digest`
+    /// contract test). The AC instance is one-call-per-action and
+    /// stays within `info!` budget.
+    ///
+    /// Default: `false` (preserves the contract test + the CAS-side
+    /// silent behavior).
+    #[serde(default)]
+    pub log_not_found_at_info: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

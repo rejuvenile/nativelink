@@ -245,6 +245,7 @@ async fn mirror_blobs_size_mismatch_does_not_terminate_outer_writer_when_gate_se
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));

@@ -238,6 +238,7 @@ async fn existence_cache_write_fail_does_not_cache() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()), // Not used directly.
         eviction_policy: None,
+        log_not_found_at_info: false,
     };
     let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let store = ExistenceCacheStore::new(&spec, inner_store.clone());
@@ -302,6 +303,7 @@ async fn existence_cache_update_oneshot_fail_does_not_cache() -> Result<(), Erro
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: None,
+        log_not_found_at_info: false,
     };
     let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let store = ExistenceCacheStore::new(&spec, inner_store.clone());
@@ -356,6 +358,7 @@ async fn existence_cache_get_part_not_found_cleans_cache() -> Result<(), Error> 
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: None,
+        log_not_found_at_info: false,
     };
     let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let store = ExistenceCacheStore::new(&spec, inner_store.clone());
@@ -546,6 +549,7 @@ async fn existence_cache_concurrent_write_one_fails() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: None,
+        log_not_found_at_info: false,
     };
     let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let store = std::sync::Arc::new(ExistenceCacheStore::new(&spec, inner_store.clone()));

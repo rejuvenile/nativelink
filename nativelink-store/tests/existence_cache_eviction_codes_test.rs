@@ -202,6 +202,7 @@ async fn make_primed_cache_store(
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: None,
+        log_not_found_at_info: false,
     };
     let store = ExistenceCacheStore::new(&spec, inner);
 
@@ -642,6 +643,7 @@ async fn get_part_not_found_does_not_log_for_never_cached_digest()
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: None,
+        log_not_found_at_info: false,
     };
     let store = ExistenceCacheStore::new(&spec, inner);
 

@@ -38,6 +38,7 @@ async fn simple_exist_cache_test() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()), // Note: Not used.
         eviction_policy: Option::default(),
+        log_not_found_at_info: false,
     };
     let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let store = ExistenceCacheStore::new(&spec, inner_store.clone());
@@ -76,6 +77,7 @@ async fn update_flags_existence_cache_test() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: Option::default(),
+        log_not_found_at_info: false,
     };
     let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let store = ExistenceCacheStore::new(&spec, inner_store.clone());
@@ -99,6 +101,7 @@ async fn get_part_caches_if_exact_size_set() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: Option::default(),
+        log_not_found_at_info: false,
     };
     let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let digest = DigestInfo::try_new(VALID_HASH1, 3).unwrap();
@@ -139,6 +142,7 @@ async fn ensure_has_requests_do_let_evictions_happen() -> Result<(), Error> {
                 max_seconds: 0, // Explicitly set this level to "don't timeout"
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         Store::new(inner_store.clone()),
         MockInstantWrapped::default(),
@@ -178,6 +182,7 @@ async fn copes_with_dropped_items() -> Result<(), Error> {
     let spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()), // Note: Not used.
         eviction_policy: Option::default(),
+        log_not_found_at_info: false,
     };
     let inner_store = Store::new(MemoryStore::new(&MemorySpec::default()));
     let store = ExistenceCacheStore::new(&spec, inner_store.clone());
@@ -255,6 +260,7 @@ async fn mark_stable_delegates_to_inner_store_test() -> Result<(), Error> {
         &ExistenceCacheSpec {
             backend: StoreSpec::Memory(MemorySpec::default()),
             eviction_policy: None,
+            log_not_found_at_info: false,
         },
         inner_fast_slow.clone(),
     );

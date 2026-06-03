@@ -2112,6 +2112,7 @@ async fn inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_writer_termin
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));
@@ -2252,6 +2253,7 @@ async fn cdn_cache_populates_local_on_first_peer_fetch() -> Result<(), Error> {
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));
@@ -2426,6 +2428,7 @@ async fn cdn_cache_does_not_populate_on_partial_range_read() -> Result<(), Error
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));
@@ -2625,6 +2628,7 @@ async fn cdn_cache_failure_does_not_fail_read() -> Result<(), Error> {
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));
@@ -2749,6 +2753,7 @@ async fn cdn_cache_failure_on_peer_mid_stream_err_does_not_deadlock() -> Result<
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));

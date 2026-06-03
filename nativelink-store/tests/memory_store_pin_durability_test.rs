@@ -224,6 +224,7 @@ async fn make_harness() -> Result<Harness, Error> {
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify_store,
     ));

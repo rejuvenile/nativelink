@@ -153,6 +153,13 @@ pub struct ExistenceCacheStore<I: InstantWrapper> {
     /// recoverable signal.
     #[metric(help = "1 if register_item_callback failed at construction (stale positives self-correct via get_part/update bypass, but eager invalidation is gone)")]
     vulnerable_mode: bool,
+
+    /// When `true`, fire `info!` for every `NotFound` returned to the
+    /// caller (inner_has slot=None + get_part Err path). Operator-set
+    /// per-instance via `ExistenceCacheSpec.log_not_found_at_info`.
+    /// Intended ONLY for AC instances; CAS-side leaves at false to
+    /// avoid the FindMissingBlobs burst class documented on the spec.
+    log_not_found_at_info: bool,
 }
 
 impl ExistenceCacheStore<SystemTime> {
@@ -246,6 +253,7 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
             inner_store,
             existence_cache,
             vulnerable_mode: !supports_callbacks,
+            log_not_found_at_info: spec.log_not_found_at_info,
         });
         if supports_callbacks {
             let weak_ref = Arc::downgrade(&existence_cache_store);
@@ -332,12 +340,22 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
             // (the iterator wouldn't be Send). Collect into a Vec first.
             let mut inserts = Vec::with_capacity(not_cached_keys.len());
             for (key, result) in not_cached_keys.iter().zip(inner_results.iter()) {
+                let digest = key.borrow().into_digest();
                 if let Some(size) = result {
-                    let digest = key.borrow().into_digest();
                     if debug_digest_match(&digest) {
                         info!(?digest, size = *size, source = "inner_has_with_results", "DEBUG: ExistenceCacheStore inserting wedge digest (inner.has returned Some)");
                     }
                     inserts.push((digest, ExistenceItem(*size)));
+                } else if self.log_not_found_at_info {
+                    // Inner store reported NotFound; ECS will pass the
+                    // None up to its caller. Gated behind the per-instance
+                    // `log_not_found_at_info` flag (true only on AC
+                    // instances per the spec doc-comment) so the CAS
+                    // path stays silent under FindMissingBlobs bursts.
+                    info!(
+                        ?digest,
+                        "ExistenceCacheStore: inner store reported NotFound; returning None to caller",
+                    );
                 }
             }
             drop(self.existence_cache.insert_many(inserts).await);
@@ -703,6 +721,29 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
                 }
             }
             Err(_) => {}
+        }
+        // Log every NotFound we return to the caller, gated behind the
+        // per-instance `log_not_found_at_info` flag (true only on AC
+        // instances per the spec doc-comment). The CAS side stays silent
+        // — the `existence_cache_eviction_codes_test.rs::
+        // get_part_not_found_does_not_log_for_never_cached_digest`
+        // contract test covers the volume case (1k-10k/sec bursts during
+        // FindMissingBlobs sweeps), and that test runs with the flag
+        // defaulted to `false`.
+        //
+        // The debug! stale-positive log above only fires for the
+        // EC.cache=Some + inner=NotFound subcase; this catches the
+        // EC.cache=None + inner=NotFound case as well, which is the
+        // common "we genuinely don't have it" path.
+        if self.log_not_found_at_info {
+            if let Err(ref err) = result {
+                if err.code == Code::NotFound {
+                    info!(
+                        ?digest,
+                        "ExistenceCacheStore::get_part: returning NotFound to caller",
+                    );
+                }
+            }
         }
         result
     }

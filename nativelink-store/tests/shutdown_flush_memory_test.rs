@@ -249,6 +249,7 @@ async fn shutdown_flush_propagates_through_production_chain() -> Result<(), Erro
                 max_count: 1024,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         Store::new(size_part),
     );
@@ -850,6 +851,7 @@ async fn store_manager_flush_descends_production_composition() -> Result<(), Err
                 max_count: 1024,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         Store::new(verify),
     );

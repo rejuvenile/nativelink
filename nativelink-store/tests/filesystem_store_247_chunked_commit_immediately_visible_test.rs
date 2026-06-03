@@ -71,6 +71,7 @@ async fn make_test_store() -> Arc<FilesystemStore<FileEntryImpl>> {
         content_path,
         temp_path,
         eviction_policy: None,
+        log_not_found_at_info: false,
         block_size: 1,
         ..Default::default()
     })
@@ -278,6 +279,7 @@ async fn chunked_commit_visible_through_existence_cache_store_247() {
             &ExistenceCacheSpec {
                 backend: StoreSpec::Memory(MemorySpec::default()),
                 eviction_policy: None,
+                log_not_found_at_info: false,
             },
             Store::new(store.clone()),
         );

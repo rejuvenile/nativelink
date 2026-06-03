@@ -600,6 +600,7 @@ async fn existence_cache_drops_positive_after_redis_eviction() -> Result<(), Err
         // `inner_store: Store` parameter to ExistenceCacheStore::new.
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: None,
+        log_not_found_at_info: false,
     };
     // Wrap the redis store directly. ExistenceCacheStore::new_with_time
     // calls inner_store.register_item_callback for us — so wiring through
@@ -1263,6 +1264,7 @@ async fn existence_cache_drops_positive_through_full_production_seam() -> Result
             max_count: 1_000_000,
             ..Default::default()
         }),
+        log_not_found_at_info: false,
     };
     let ec = ExistenceCacheStore::new(&ec_spec, partitioned);
 
@@ -1331,6 +1333,7 @@ async fn existence_cache_construction_does_not_panic_when_redis_notifications_di
     let ec_spec = ExistenceCacheSpec {
         backend: StoreSpec::Noop(NoopSpec::default()),
         eviction_policy: None,
+        log_not_found_at_info: false,
     };
     // The load-bearing assertion: this MUST NOT panic. The pre-fix
     // `.expect("Register item callback should work")` would panic here.
@@ -1475,6 +1478,7 @@ async fn existence_cache_drops_positive_through_full_ac_production_seam() -> Res
             max_count: 1_000_000,
             ..Default::default()
         }),
+        log_not_found_at_info: false,
     };
     let ec = ExistenceCacheStore::new(&ec_spec, ac_backend_cached);
 

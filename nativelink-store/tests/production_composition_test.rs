@@ -175,6 +175,7 @@ async fn build_cas_chain() -> Result<(Store, std::sync::Arc<FilesystemStore<File
                 max_count: 1024,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         Store::new(size_part),
     );

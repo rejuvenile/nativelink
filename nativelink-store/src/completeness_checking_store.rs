@@ -239,9 +239,16 @@ impl CompletenessCheckingStore {
                     Result::<(), Error>::Ok(())
                 }
                 // Add a tip to the error to help with debugging and the index of the
-                // digest that failed so we know which one to unset.
+                // digest that failed so we know which one to unset. Always
+                // append the ActionResult digest (including for NotFound),
+                // so the downstream `warn!` for incomplete entries can name
+                // which AC entry CCS filtered.
                 .map_err(move |mut e| {
-                    if e.code != Code::NotFound {
+                    if e.code == Code::NotFound {
+                        e = e.append(
+                            format!("CCS flagged ActionResult ({digest}) incomplete — at least one referenced CAS blob is missing"),
+                        );
+                    } else {
                         e = e.append(
                             format!("Error checking existence of digest ({digest}) in CompletenessCheckingStore::has"),
                         );
@@ -340,12 +347,27 @@ impl CompletenessCheckingStore {
                         Some(Err((err, i))) => {
                             self.incomplete_entries_counter.inc();
                             state_mux.lock().results[i] = None;
-                            // Note: Don't return the errors. We just flag the result as
-                            // missing but show a warning if it's not a NotFound.
-                            if err.code != Code::NotFound {
+                            // Always log — operators previously had no
+                            // visibility into the common case where an
+                            // ActionResult is reported incomplete because
+                            // a referenced output blob is missing from CAS
+                            // (NotFound). The counter ticked but no log
+                            // fired, so operators couldn't tell which
+                            // AC entry CCS filtered. This silently fed
+                            // Bazel "cache miss → re-execute" for actions
+                            // whose AC entry was intact but whose
+                            // referenced CAS blob was absent. The err
+                            // carries the AC digest via the append in the
+                            // map_err above.
+                            if err.code == Code::NotFound {
                                 warn!(
                                     ?err,
-                                    "Error checking existence of digest"
+                                    "ActionResult incomplete — referenced CAS digest missing",
+                                );
+                            } else {
+                                warn!(
+                                    ?err,
+                                    "Error checking existence of digest",
                                 );
                             }
                         }

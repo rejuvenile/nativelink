@@ -240,6 +240,7 @@ async fn fix_a_small_blob_preserves_backpressure_signal_through_fast_slow_store(
                 max_count: 1024,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         Store::new(verify),
     );

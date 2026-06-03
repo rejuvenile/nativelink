@@ -331,6 +331,7 @@ async fn waiter_path_inner_miss_with_peer_fallback_does_not_lose_peer_bytes_to_d
                 max_count: 1_000_000,
                 ..Default::default()
             }),
+            log_not_found_at_info: false,
         },
         verify,
     ));
