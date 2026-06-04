@@ -2723,6 +2723,51 @@ impl GrpcStore {
         if let Err(ref err) = result {
             self.evict_pool_on_transport_err(err);
         }
+        // #62 Phase 2 instrumentation: per #56 RCA candidate (a),
+        // capture committed_size reported by `write_chunked_stream`
+        // vs expected_size from the digest, with explicit
+        // truncation arm. The (Ok, Err) arm in
+        // `FastSlowStore::stream_file_to_store` (#59) shows
+        // `update_via_chunked_inner` returning Ok while the producer
+        // is still streaming; this log answers WHETHER the chunked
+        // dispatcher returned Ok with `committed_bytes < expected`
+        // (early-Ok) or with `committed_bytes == expected`
+        // (well-formed Ok, indicating the producer-side `send_error`
+        // surfaces _after_ EOF was already accepted upstream).
+        let expected_size = digest.size_bytes();
+        match &result {
+            Ok(committed_bytes) => {
+                let delta = expected_size as i64 - *committed_bytes as i64;
+                if delta == 0 {
+                    info!(
+                        %digest,
+                        committed_bytes = *committed_bytes,
+                        expected_size,
+                        delta,
+                        arm_name = "chunked_inner_ok",
+                        "#62 GrpcStore::update_via_chunked_inner: returned Ok at expected size",
+                    );
+                } else {
+                    info!(
+                        %digest,
+                        committed_bytes = *committed_bytes,
+                        expected_size,
+                        delta,
+                        arm_name = "chunked_inner_truncated",
+                        "#62 GrpcStore::update_via_chunked_inner: returned Ok with committed < expected (early-Ok candidate)",
+                    );
+                }
+            }
+            Err(err) => {
+                info!(
+                    %digest,
+                    expected_size,
+                    ?err,
+                    arm_name = "chunked_inner_err",
+                    "#62 GrpcStore::update_via_chunked_inner: returned Err",
+                );
+            }
+        }
         result.err_tip(|| format!("in GrpcStore::update_via_chunked_inner for digest {digest}"))?;
         Ok(())
     }
