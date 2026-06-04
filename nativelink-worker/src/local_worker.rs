@@ -3057,6 +3057,12 @@ pub async fn new_local_worker(
     } else {
         (fast_slow_store.clone(), None)
     };
+    // #37 Phase 2 (Q4): tag the worker's CAS FastSlowStore with
+    // store_class = "cas" so the background slow-tier failure log
+    // carries the discriminator that lets operators grep
+    // worker_slow_tier_async_fail{store_class=cas} separately from
+    // the AC tier (tagged below at AC FSS construction).
+    effective_cas_store.set_store_class("cas");
 
     // Initialize directory cache if configured.
     // This is done after effective_cas_store is created so the cache can use
@@ -3203,6 +3209,12 @@ pub async fn new_local_worker(
                     nativelink_store::small_blob_dispatcher::find_fast_slow_for_pin(driver);
                 match fss_borrow.and_then(|fss| fss.get_arc()) {
                     Some(fss) => {
+                        // #37 Phase 2 (Q4): tag the AC FastSlowStore
+                        // with store_class = "ac" so its background
+                        // slow-tier failure log carries the
+                        // discriminator (paired with the CAS tag at
+                        // effective_cas_store above).
+                        fss.set_store_class("ac");
                         info!(
                             ac_store_name = name,
                             "AC pin advertisement enabled — found FastSlowStore in AC chain"

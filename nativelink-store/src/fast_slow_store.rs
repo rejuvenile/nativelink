@@ -840,6 +840,17 @@ pub enum SelfRetryOutcome {
 // if data is in the buffer.
 #[derive(Debug, MetricsComponent)]
 pub struct FastSlowStore {
+    /// #37 Phase 2 (Q4): identification label for the FSS instance.
+    /// Set via `set_store_class("ac")` / `set_store_class("cas")` at
+    /// worker / server construction so the background slow-tier
+    /// failure log carries the AC-vs-CAS distinction (otherwise the
+    /// FSS-level `error!` at the slow-tier Err arm is unattributed).
+    /// Default `"unknown"` is the safe placeholder for the 169
+    /// existing constructor callers; production paths set it
+    /// explicitly via the worker construction site in
+    /// `local_worker.rs`. **Observability only** — does not affect
+    /// store behavior.
+    store_class: parking_lot::Mutex<&'static str>,
     #[metric(group = "fast_store")]
     fast_store: Store,
     fast_direction: StoreDirection,
@@ -1265,6 +1276,21 @@ fn push_stable_digests_via_arcs(
 }
 
 impl FastSlowStore {
+    /// #37 Phase 2 (Q4): tag the FSS instance with a static label
+    /// (`"ac"` / `"cas"`). Called once at worker construction; never
+    /// during request servicing. Observability only.
+    pub fn set_store_class(&self, class: &'static str) {
+        *self.store_class.lock() = class;
+    }
+
+    /// #37 Phase 2 (Q4): read the current store_class label. Used by
+    /// the background slow-tier failure log so operators can grep
+    /// `worker_slow_tier_async_fail{store_class=ac}` separately from
+    /// CAS failures.
+    pub fn store_class(&self) -> &'static str {
+        *self.store_class.lock()
+    }
+
     pub fn new(spec: &FastSlowSpec, fast_store: Store, slow_store: Store) -> Arc<Self> {
         let failed_slow_writes: Arc<Mutex<HashSet<DigestInfo>>> =
             Arc::new(Mutex::new(HashSet::new()));
@@ -1289,6 +1315,7 @@ impl FastSlowStore {
             failed_slow_writes.clone(),
         );
         let store = Arc::new_cyclic(|weak_self| Self {
+            store_class: parking_lot::Mutex::new("unknown"),
             fast_store,
             fast_direction: spec.fast_direction,
             slow_store,
@@ -2784,6 +2811,7 @@ impl FastSlowStore {
             shared.clone(),
         );
         let store = Arc::new_cyclic(|weak_self| Self {
+            store_class: parking_lot::Mutex::new("unknown"),
             fast_store,
             fast_direction: spec.fast_direction,
             slow_store,
@@ -5343,6 +5371,15 @@ impl StoreDriver for FastSlowStore {
         let slow_store = self.slow_store.clone();
         let key_for_bg = owned_key.clone();
         let spawn_instant = std::time::Instant::now();
+        // #37 Phase 2 (Q4): capture the FSS instance's store_class so
+        // the background-spawned task can tag its terminal log + the
+        // single AC-vs-CAS counter. Set once at worker construction.
+        let store_class = self.store_class();
+        // #37 Phase 2 (Q4): weak self-ref so the spawned task can
+        // increment `metrics.slow_tier_async_fail` on the Err arm
+        // without holding a strong reference back to the FSS (and
+        // perpetuating the cycle).
+        let weak_for_metric = self.weak_self.clone();
         debug!(
             ?key,
             bytes_sent, "FastSlowStore::update: background slow write spawned",
@@ -5513,11 +5550,17 @@ impl StoreDriver for FastSlowStore {
                         // eviction before the worker reconnects.
                         fast_store_ref.pin_digests(&[*digest]);
                     }
+                    if let Some(fss) = weak_for_metric.upgrade() {
+                        fss.metrics
+                            .slow_tier_async_fail
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     error!(
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
                         bytes_sent,
+                        store_class,
                         error = ?e,
                         "FastSlowStore::update: background slow write FAILED — \
                          blob pinned, will retry on reconnect",
@@ -5672,6 +5715,15 @@ impl StoreDriver for FastSlowStore {
         let slow_store = self.slow_store.clone();
         let key_for_bg = owned_key.clone();
         let spawn_instant = std::time::Instant::now();
+        // #37 Phase 2 (Q4): capture the FSS instance's store_class so
+        // the background-spawned task can tag its terminal log + the
+        // single AC-vs-CAS counter. Set once at worker construction.
+        let store_class = self.store_class();
+        // #37 Phase 2 (Q4): weak self-ref so the spawned task can
+        // increment `metrics.slow_tier_async_fail` on the Err arm
+        // without holding a strong reference back to the FSS (and
+        // perpetuating the cycle).
+        let weak_for_metric = self.weak_self.clone();
         debug!(
             ?key,
             data_len, "FastSlowStore::update_oneshot: background slow write spawned",
@@ -7274,6 +7326,13 @@ impl StoreDriver for FastSlowStore {
 
 #[derive(Debug, Default, MetricsComponent)]
 struct FastSlowStoreMetrics {
+    /// #37 Phase 2 (Q4): per-`store_class` slow-tier async failure
+    /// counter. Bumped in the spawned background slow-write task's
+    /// terminal Err arm in `update`. Tags allow operators to
+    /// distinguish AC vs CAS async write failures. See
+    /// `FastSlowStore::set_store_class`.
+    #[metric(help = "Slow-tier async write failures observed at the FSS spawn.")]
+    slow_tier_async_fail: AtomicU64,
     #[metric(help = "Hit count for the fast store")]
     fast_store_hit_count: AtomicU64,
     #[metric(help = "Downloaded bytes from the fast store")]
