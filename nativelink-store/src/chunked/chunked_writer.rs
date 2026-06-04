@@ -582,12 +582,20 @@ mod io_uring_impl {
                     .remove(&start_offset)
                     .expect("just observed");
                 let mut run_offset = start_offset;
-                let mut iovecs: Vec<libc::iovec> = Vec::new();
-                let mut buffers: Vec<Bytes> = Vec::new();
-                let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
+                // #47 b1 F3 (perf-optimizer re-cadre): allocate with
+                // capacity `IOV_MAX` up-front so per-SQE Vec growth does
+                // not incur the doubling-realloc cascade (0→4→8→...→1024
+                // = ~10 reallocs without hint). Each Vec is consumed by
+                // `system.writev(...)` (`iovecs`/`buffers`) or moved into
+                // the in-flight async block (`permits`/`chunks_meta`), so
+                // they cannot be hoisted/reused across iterations — the
+                // capacity hint is the realizable allocation reduction.
+                let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(IOV_MAX);
+                let mut buffers: Vec<Bytes> = Vec::with_capacity(IOV_MAX);
+                let mut permits: Vec<OwnedSemaphorePermit> = Vec::with_capacity(IOV_MAX);
                 // #47 b1 fix-up P1: per-chunk metadata for post-CQE pin
                 // populate. One entry per iovec, same order.
-                let mut chunks_meta: Vec<ChunkMeta> = Vec::new();
+                let mut chunks_meta: Vec<ChunkMeta> = Vec::with_capacity(IOV_MAX);
                 let mut earliest_enqueue = start_enqueue;
                 let mut run_bytes = 0usize;
 
