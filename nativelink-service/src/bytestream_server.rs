@@ -2149,6 +2149,16 @@ impl ByteStreamServer {
 
         // Register a streaming blob so readers can consume data
         // before the store write commits (read-while-write).
+        //
+        // #49 v2 note: this seam does NOT call
+        // `set_expected_size_on_store` because CAS upload-in-progress
+        // reads are content-addressed — `digest.size_bytes()` IS the
+        // on-store size by definition. The fallback to
+        // `digest.size_bytes()` in `expected_size_on_store()` is correct
+        // here. The AC case (where stored bytes ≠ declared digest size)
+        // only fires on the FastSlowStore populate path, which calls
+        // `set_expected_size_on_store` at `fast_slow_store.rs:3562`
+        // after reading the authoritative size from `slow_store.has()`.
         let streaming_blob_writer = if instance_info.streaming_read_while_write {
             if let Some((writer, _reader)) = instance_info
                 .in_flight_blobs
@@ -2568,6 +2578,14 @@ impl ByteStreamServer {
         // succeeds. Registering before the write would let readers see data
         // that might not persist if the write fails. The oneshot path has the
         // full blob in memory, so write it all at once and send EOF.
+        //
+        // #49 v2 note: this seam does NOT call
+        // `set_expected_size_on_store` because CAS upload-in-progress
+        // reads are content-addressed — `digest.size_bytes()` IS the
+        // on-store size by definition (and `final_data.len() ==
+        // digest.size_bytes()` by upload-write invariant). The fallback
+        // to `digest.size_bytes()` in `expected_size_on_store()` is
+        // correct here.
         if instance_info.streaming_read_while_write {
             if let Some((mut writer, _reader)) = instance_info
                 .in_flight_blobs

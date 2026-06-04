@@ -3558,6 +3558,17 @@ impl FastSlowStore {
         // bytes; 100% of recent events from `ac_server::get_action_result`.
         // Bursty because the producer path only fires on AC fast-tier
         // miss, which is rare after `MemoryStore(4GB/500K)` warms up.)
+        // EVENTUAL-CONSISTENCY NOTE: `n` was captured from
+        // `slow_store.has()` before the body fetch begins. If an
+        // `UpdateActionResult` races and replaces this digest's AC entry
+        // between the head and the body, `n` may be stale relative to the
+        // body bytes. `populating_digests` dedup means one producer per
+        // digest, and Redis RYW semantics mean `get_part` returns bytes
+        // matching `n` at snapshot time. Acceptable: the silent-short
+        // check fires correctly if `bytes_written` diverges from `n`,
+        // and benignly passes when they perfectly align (the value of
+        // `n` is from the same observation that produced the body bytes
+        // on the slow tier).
         if let UploadSizeInfo::ExactSize(n) = reader_stream_size {
             streaming_writer.set_expected_size_on_store(n);
         }
