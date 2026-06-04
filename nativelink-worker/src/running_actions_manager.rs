@@ -4055,6 +4055,11 @@ pub trait RunningActionsManager: Sync + Send + Sized + Unpin + 'static {
         action_digest: DigestInfo,
         action_result: &mut ActionResult,
         hasher: DigestHasherFunc,
+        // #37 Phase 2 (Q1): op_id + worker_id threaded through to AC
+        // publish failure-path logging at upload_ac_results so the
+        // operator can correlate a failed write back to the action.
+        op_id: &OperationId,
+        worker_id: &str,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
     fn kill_all(&self) -> impl Future<Output = ()> + Send;
@@ -4139,6 +4144,71 @@ pub struct ExecutionConfiguration {
     pub additional_environment: Option<HashMap<String, EnvironmentSource>>,
 }
 
+/// #37 Phase 2 (Q5): cap on the AC BIS-ack pending-acks observability
+/// map. See `UploadActionResults::ac_publish_pending_acks` doc-comment
+/// for the rationale. 100_000 entries × ~40 bytes = ~4 MB worst-case.
+const AC_PUBLISH_PENDING_ACKS_MAX: usize = 100_000;
+
+/// #37 Phase 2 (Q5): how often the BIS-ack timeout reaper walks the
+/// pending-acks map. Set to half the configured timeout so worst-case
+/// detection latency is 1.5 × timeout (one tick to observe + one tick
+/// of pre-existing age).
+const fn bis_ack_reaper_interval(timeout: Duration) -> Duration {
+    // Floor at 5 s to keep the tick from going pathologically frequent
+    // for very small (test-time) timeouts.
+    let half = timeout.as_secs() / 2;
+    if half < 5 {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(half)
+    }
+}
+
+/// #37 Phase 2 (Q5): spawn the BIS-ack timeout reaper task. Periodically
+/// scans `ac_publish_pending_acks` for entries older than `timeout`,
+/// emitting an `error!` log + `worker_bis_ack_missing` counter
+/// increment for each, then removes them (one-shot fire).
+fn spawn_bis_ack_timeout_reaper(
+    pending_acks: Arc<Mutex<HashMap<DigestInfo, Instant>>>,
+    metrics: Arc<Metrics>,
+    timeout: Duration,
+) {
+    let interval = bis_ack_reaper_interval(timeout);
+    background_spawn!("ac_bis_ack_timeout_reaper", async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            // Collect expired digests under the lock; emit/inc outside
+            // the lock to keep the critical section tight.
+            let expired: Vec<(DigestInfo, Duration)> = {
+                let mut guard = pending_acks.lock();
+                let expired: Vec<(DigestInfo, Duration)> = guard
+                    .iter()
+                    .filter_map(|(d, t)| {
+                        let age = now.saturating_duration_since(*t);
+                        (age >= timeout).then(|| (*d, age))
+                    })
+                    .collect();
+                for (digest, _) in &expired {
+                    guard.remove(digest);
+                }
+                expired
+            };
+            for (digest, age) in expired {
+                error!(
+                    ?digest,
+                    age_since_publish_ms = age.as_millis() as u64,
+                    "AC BIS-ack missing — publish landed locally but server never \
+                     confirmed stable-storage"
+                );
+                metrics.worker_bis_ack_missing.inc();
+            }
+        }
+    });
+}
+
 #[derive(Debug)]
 struct UploadActionResults {
     upload_ac_results_strategy: UploadCacheResultsStrategy,
@@ -4155,6 +4225,10 @@ struct UploadActionResults {
     historical_store: Store,
     success_message_template: Template,
     failure_message_template: Template,
+    /// #37 Phase 2: Shared metrics handle for AC publish counters
+    /// (per-Code failure, slow-publish, success). Cloned from the
+    /// owning `RunningActionsManagerImpl::metrics` at construction.
+    metrics: Arc<Metrics>,
 }
 
 impl UploadActionResults {
@@ -4163,6 +4237,7 @@ impl UploadActionResults {
         ac_store: Option<Store>,
         ac_mirror_target: Option<crate::local_worker::AcMirrorTarget>,
         historical_store: Store,
+        metrics: Arc<Metrics>,
     ) -> Result<Self, Error> {
         let upload_historical_results_strategy = config
             .upload_historical_results_strategy
@@ -4198,6 +4273,7 @@ impl UploadActionResults {
                     )
                 },
             )?,
+            metrics,
         })
     }
 
@@ -4259,6 +4335,8 @@ impl UploadActionResults {
         action_digest: DigestInfo,
         action_result: ProtoActionResult,
         hasher: DigestHasherFunc,
+        op_id: &OperationId,
+        worker_id: &str,
     ) -> Result<(), Error> {
         let Some(ac_store) = self.ac_store.as_ref() else {
             return Ok(());
@@ -4275,13 +4353,43 @@ impl UploadActionResults {
             };
             let size_bytes = update_action_request.encoded_len() as u64;
             let start = std::time::Instant::now();
-            grpc_store
+            // #37 Phase 2 (Q1+Q2+Q3): compute elapsed BEFORE the `?`
+            // propagation so the Err arm can log duration too.
+            let res = grpc_store
                 .update_action_result(Request::new(update_action_request))
                 .await
                 .map(|_| ())
-                .err_tip(|| "Caching ActionResult")?;
+                .err_tip(|| "Caching ActionResult");
             let elapsed = start.elapsed();
+            if let Err(err) = &res {
+                error!(
+                    %op_id,
+                    %worker_id,
+                    ?action_digest,
+                    size_bytes,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    code = ?err.code,
+                    err = %err,
+                    "AC write failed (sync path, grpc)",
+                );
+                self.metrics.worker_ac_publish_fail_by_code(err.code);
+                return res;
+            }
+            self.metrics.worker_ac_publish_success.inc();
+            if elapsed >= Duration::from_millis(500) {
+                self.metrics.worker_ac_publish_slow.inc();
+                warn!(
+                    %op_id,
+                    %worker_id,
+                    ?action_digest,
+                    size_bytes,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "AC write slow (>500ms, grpc)",
+                );
+            }
             info!(
+                %op_id,
+                %worker_id,
                 ?action_digest,
                 size_bytes,
                 elapsed_ms = elapsed.as_millis() as u64,
@@ -4302,6 +4410,19 @@ impl UploadActionResults {
             .update_oneshot(action_digest, store_data.split().freeze())
             .await;
         if let Err(err) = &res {
+            let elapsed = start.elapsed();
+            error!(
+                %op_id,
+                %worker_id,
+                ?action_digest,
+                size_bytes,
+                elapsed_ms = elapsed.as_millis() as u64,
+                code = ?err.code,
+                err = %err,
+                store_class = "ac",
+                "AC write failed (sync path)",
+            );
+            self.metrics.worker_ac_publish_fail_by_code(err.code);
             // Synchronous AC write failure (typically a fast-tier
             // failure since slow-tier is async-spawned). Defensive
             // failure-prune of the worker-local AC pin: in the
@@ -4326,13 +4447,44 @@ impl UploadActionResults {
             return Err(err.clone()).err_tip(|| "Caching ActionResult");
         }
         let elapsed = start.elapsed();
+        self.metrics.worker_ac_publish_success.inc();
+        if elapsed >= Duration::from_millis(500) {
+            self.metrics.worker_ac_publish_slow.inc();
+            warn!(
+                %op_id,
+                %worker_id,
+                ?action_digest,
+                size_bytes,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "AC write slow (>500ms)",
+            );
+        }
         info!(
+            %op_id,
+            %worker_id,
             ?action_digest,
             size_bytes,
             elapsed_ms = elapsed.as_millis() as u64,
             throughput_mbps = format!("{:.1}", throughput_mbps(size_bytes, elapsed)),
             "AC write completed",
         );
+        // #37 Phase 2 (Q5): record this digest in the AC mirror
+        // target's pending-acks map for BIS-ack delay observability.
+        // The map is capped at AC_PUBLISH_PENDING_ACKS_MAX; over-cap
+        // insertions skip with a warn (observability data loss only —
+        // durability lifecycle is independent, see field doc).
+        if let Some(target) = self.ac_mirror_target.as_ref() {
+            let mut guard = target.ac_publish_pending_acks.lock();
+            if guard.len() >= AC_PUBLISH_PENDING_ACKS_MAX {
+                warn!(
+                    ?action_digest,
+                    cap = AC_PUBLISH_PENDING_ACKS_MAX,
+                    "AC publish pending-acks map at cap; skipping insert (observability gap, no correctness impact)"
+                );
+            } else {
+                guard.insert(action_digest, Instant::now());
+            }
+        }
         // Record this AC entry as a worker-local pin so the worker's
         // BlobsAvailable loop advertises it to the server during the
         // slow-write window, via the dedicated proto field
@@ -4392,6 +4544,8 @@ impl UploadActionResults {
         action_info: DigestInfo,
         action_result: &mut ActionResult,
         hasher: DigestHasherFunc,
+        op_id: &OperationId,
+        worker_id: &str,
     ) -> Result<(), Error> {
         let should_upload_historical_results =
             Self::should_cache_result(self.upload_historical_results_strategy, action_result, true);
@@ -4456,7 +4610,7 @@ impl UploadActionResults {
 
         let ac_fut = async {
             if let Some(proto) = ac_result_proto {
-                self.upload_ac_results(action_info, proto, hasher).await
+                self.upload_ac_results(action_info, proto, hasher, op_id, worker_id).await
             } else {
                 Ok(())
             }
@@ -4497,6 +4651,16 @@ pub struct RunningActionsManagerArgs<'a> {
     pub max_upload_timeout: Duration,
     pub timeout_handled_externally: bool,
     pub directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    /// #37 Phase 2 (Q5): timeout for the AC BIS-ack missing-detection
+    /// reaper. From `LocalWorkerConfig::bis_ack_timeout_secs`. Default
+    /// 60s.
+    pub bis_ack_timeout: Duration,
+    /// #37 Phase 2: pre-constructed metrics handle. Cloned into
+    /// `AcMirrorTarget` before this struct is built, so the BIS-ack
+    /// receive site can share the same counter set as the publish
+    /// site. Treat as `None` for legacy/test callers; the
+    /// constructor will create a fresh Arc.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 struct CleanupGuard {
@@ -4571,25 +4735,40 @@ impl RunningActionsManagerImpl {
             .get_arc()
             .err_tip(|| "FilesystemStore's internal Arc was lost")?;
         let (action_done_tx, _) = watch::channel(());
+        let metrics = args.metrics.unwrap_or_else(|| Arc::new(Metrics::default()));
+        // #37 Phase 2 (Q5): spawn the BIS-ack timeout reaper iff there
+        // is an AC mirror target (which is the only path that
+        // populates `ac_publish_pending_acks`). The reaper walks the
+        // map at half the configured timeout and surfaces missing-ack
+        // entries via `error!` + `worker_bis_ack_missing` counter.
+        if let Some(target) = args.ac_mirror_target.as_ref() {
+            spawn_bis_ack_timeout_reaper(
+                target.ac_publish_pending_acks.clone(),
+                metrics.clone(),
+                args.bis_ack_timeout,
+            );
+        }
+        let upload_action_results = UploadActionResults::new(
+            args.upload_action_result_config,
+            args.ac_store,
+            args.ac_mirror_target,
+            args.historical_store,
+            metrics.clone(),
+        )
+        .err_tip(|| "During RunningActionsManagerImpl construction")?;
         Ok(Self {
             root_action_directory: args.root_action_directory,
             execution_configuration: args.execution_configuration,
             cas_store: args.cas_store,
             filesystem_store,
-            upload_action_results: UploadActionResults::new(
-                args.upload_action_result_config,
-                args.ac_store,
-                args.ac_mirror_target,
-                args.historical_store,
-            )
-            .err_tip(|| "During RunningActionsManagerImpl construction")?,
+            upload_action_results,
             max_action_timeout: args.max_action_timeout,
             max_upload_timeout: args.max_upload_timeout,
             timeout_handled_externally: args.timeout_handled_externally,
             running_actions: Mutex::new(HashMap::new()),
             action_done_tx,
             callbacks,
-            metrics: Arc::new(Metrics::default()),
+            metrics,
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
@@ -5545,6 +5724,8 @@ impl RunningActionsManager for RunningActionsManagerImpl {
         action_info: DigestInfo,
         action_result: &mut ActionResult,
         hasher: DigestHasherFunc,
+        op_id: &OperationId,
+        worker_id: &str,
     ) -> Result<(), Error> {
         self.metrics
             .cache_action_result
@@ -5552,6 +5733,8 @@ impl RunningActionsManager for RunningActionsManagerImpl {
                 action_info,
                 action_result,
                 hasher,
+                op_id,
+                worker_id,
             ))
             .await
     }
@@ -5642,6 +5825,11 @@ impl RunningActionsManager for RunningActionsManagerImpl {
 
 #[derive(Debug, Default, MetricsComponent)]
 pub struct Metrics {
+    // Note: most fields below are pub(crate)-visible by virtue of the
+    // struct itself being `pub` and the fields being inside this
+    // crate; the `Metrics` handle is cloned out via `Arc<Metrics>`
+    // (returned from `RunningActionsManagerImpl::metrics()` and
+    // exposed on `AcMirrorTarget` for #37 Phase 2 BIS-ack tracking).
     #[metric(help = "Stats about the create_and_add_action command.")]
     create_and_add_action: AsyncCounterWrapper,
     #[metric(help = "Stats about the cache_action_result command.")]
@@ -5688,6 +5876,73 @@ pub struct Metrics {
     upload_stderr: AsyncCounterWrapper,
     #[metric(help = "Total number of task timeouts.")]
     task_timeouts: CounterWithTime,
+    // #37 Phase 2 (Q1+Q2+Q3): worker AC publish observability counters.
+    // Hand-rolled per-Code field set (design v2 §2.4) — `MetricsComponent`
+    // derive does not support `HashMap<Code, Counter>` natively; the
+    // helper `worker_ac_publish_fail_by_code` dispatches to the right
+    // field via `match`.
+    #[metric(help = "Worker AC publish success count.")]
+    worker_ac_publish_success: CounterWithTime,
+    #[metric(help = "Worker AC publish fail count — Aborted.")]
+    worker_ac_publish_fail_aborted: CounterWithTime,
+    #[metric(help = "Worker AC publish fail count — Internal.")]
+    worker_ac_publish_fail_internal: CounterWithTime,
+    #[metric(help = "Worker AC publish fail count — NotFound.")]
+    worker_ac_publish_fail_not_found: CounterWithTime,
+    #[metric(help = "Worker AC publish fail count — ResourceExhausted.")]
+    worker_ac_publish_fail_resource_exhausted: CounterWithTime,
+    #[metric(help = "Worker AC publish fail count — Unavailable.")]
+    worker_ac_publish_fail_unavailable: CounterWithTime,
+    #[metric(help = "Worker AC publish fail count — DeadlineExceeded.")]
+    worker_ac_publish_fail_deadline_exceeded: CounterWithTime,
+    #[metric(help = "Worker AC publish fail count — Unknown.")]
+    worker_ac_publish_fail_unknown: CounterWithTime,
+    #[metric(help = "Worker AC publish fail count — all other codes.")]
+    worker_ac_publish_fail_other: CounterWithTime,
+    #[metric(help = "Worker AC publish events exceeding 500ms.")]
+    worker_ac_publish_slow: CounterWithTime,
+    // #37 Phase 2 (Q5): BIS-ack observability counters. `pub`
+    // because the BIS-ack receive site lives in `local_worker.rs`
+    // (different module) and increments via `target.metrics.<field>`.
+    #[metric(help = "Worker AC BIS-acks received from server (per-digest).")]
+    pub worker_bis_ack_received: CounterWithTime,
+    #[metric(help = "Worker AC BIS-acks confirmed missing after timeout.")]
+    pub worker_bis_ack_missing: CounterWithTime,
+    // #37 Phase 2 (Q4): slow-tier async failure per store_class.
+    #[metric(help = "Worker AC slow-tier async write fail count.")]
+    worker_slow_tier_async_fail_ac: CounterWithTime,
+    #[metric(help = "Worker CAS slow-tier async write fail count.")]
+    worker_slow_tier_async_fail_cas: CounterWithTime,
+    #[metric(help = "Worker slow-tier async write fail — unknown store class.")]
+    worker_slow_tier_async_fail_unknown: CounterWithTime,
+}
+
+impl Metrics {
+    /// Dispatch a failure increment for an AC publish error to the
+    /// matching per-Code field. Unmapped codes land in `other`.
+    /// See design v2 §2.4 and the hand-rolled field set above.
+    pub(crate) fn worker_ac_publish_fail_by_code(&self, code: Code) {
+        match code {
+            Code::Aborted => self.worker_ac_publish_fail_aborted.inc(),
+            Code::Internal => self.worker_ac_publish_fail_internal.inc(),
+            Code::NotFound => self.worker_ac_publish_fail_not_found.inc(),
+            Code::ResourceExhausted => self.worker_ac_publish_fail_resource_exhausted.inc(),
+            Code::Unavailable => self.worker_ac_publish_fail_unavailable.inc(),
+            Code::DeadlineExceeded => self.worker_ac_publish_fail_deadline_exceeded.inc(),
+            Code::Unknown => self.worker_ac_publish_fail_unknown.inc(),
+            _ => self.worker_ac_publish_fail_other.inc(),
+        }
+    }
+
+    /// Dispatch a slow-tier async failure increment per store_class label.
+    /// Unknown labels land in the `unknown` bucket.
+    pub(crate) fn worker_slow_tier_async_fail_by_class(&self, store_class: &str) {
+        match store_class {
+            "ac" => self.worker_slow_tier_async_fail_ac.inc(),
+            "cas" => self.worker_slow_tier_async_fail_cas.inc(),
+            _ => self.worker_slow_tier_async_fail_unknown.inc(),
+        }
+    }
 }
 
 #[cfg(test)]

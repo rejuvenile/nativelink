@@ -121,6 +121,8 @@ async fn setup_manager_and_action(
             max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
             timeout_handled_externally: false,
             directory_cache: None,
+            bis_ack_timeout: Duration::from_secs(60),
+            metrics: None,
         })?);
 
     let command = Command {
@@ -343,6 +345,8 @@ async fn cancel_then_cleanup_race_does_not_poison_ac() -> Result<(), Error> {
         max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
         timeout_handled_externally: false,
         directory_cache: None,
+        bis_ack_timeout: Duration::from_secs(60),
+        metrics: None,
     })?);
 
     let command = Command {
@@ -437,6 +441,8 @@ async fn cancel_then_cleanup_race_does_not_poison_ac() -> Result<(), Error> {
                 action_digest,
                 &mut action_result,
                 DigestHasherFunc::Sha256,
+                &nativelink_util::action_messages::OperationId::default(),
+                "test_worker",
             )
             .await
             .err_tip(|| "cache_action_result in §A3.3 test")?;

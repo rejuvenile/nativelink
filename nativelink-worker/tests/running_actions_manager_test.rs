@@ -988,6 +988,8 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1116,6 +1118,8 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1246,6 +1250,8 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1432,6 +1438,8 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1619,6 +1627,8 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1832,6 +1842,8 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1972,6 +1984,8 @@ mod tests {
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2180,6 +2194,8 @@ exit 0
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2361,6 +2377,8 @@ exit 0
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2536,6 +2554,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2625,6 +2645,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2666,7 +2688,7 @@ exit 1
             message: String::new(),
         };
         running_actions_manager
-            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
+            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256, &nativelink_util::action_messages::OperationId::default(), "test_worker")
             .await?;
 
         let retrieved_result =
@@ -2702,6 +2724,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2743,7 +2767,7 @@ exit 1
             message: String::new(),
         };
         running_actions_manager
-            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
+            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256, &nativelink_util::action_messages::OperationId::default(), "test_worker")
             .await?;
 
         let retrieved_result =
@@ -2785,6 +2809,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2826,7 +2852,7 @@ exit 1
             message: String::new(),
         };
         running_actions_manager
-            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
+            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256, &nativelink_util::action_messages::OperationId::default(), "test_worker")
             .await?;
 
         assert!(!action_result.message.is_empty(), "Message should be set");
@@ -2889,6 +2915,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2897,7 +2925,7 @@ exit 1
             ..Default::default()
         };
         running_actions_manager
-            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
+            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256, &nativelink_util::action_messages::OperationId::default(), "test_worker")
             .await?;
 
         assert!(
@@ -2937,6 +2965,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2946,7 +2976,7 @@ exit 1
             ..Default::default()
         };
         running_actions_manager
-            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
+            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256, &nativelink_util::action_messages::OperationId::default(), "test_worker")
             .await?;
 
         assert!(!action_result.message.is_empty(), "Message should be set");
@@ -3007,6 +3037,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3015,7 +3047,7 @@ exit 1
             ..Default::default()
         };
         running_actions_manager
-            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256)
+            .cache_action_result(action_digest, &mut action_result, DigestHasherFunc::Sha256, &nativelink_util::action_messages::OperationId::default(), "test_worker")
             .await?;
 
         assert!(!action_result.message.is_empty(), "Message should be set");
@@ -3128,6 +3160,8 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    bis_ack_timeout: Duration::from_secs(60),
+                    metrics: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3220,6 +3254,8 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    bis_ack_timeout: Duration::from_secs(60),
+                    metrics: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3312,6 +3348,8 @@ exit 1
                     max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                     timeout_handled_externally: false,
                     directory_cache: None,
+                    bis_ack_timeout: Duration::from_secs(60),
+                    metrics: None,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3401,6 +3439,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3560,6 +3600,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3742,6 +3784,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3844,6 +3888,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -3963,6 +4009,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4148,6 +4196,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4273,6 +4323,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         // Create a simple action
@@ -4419,6 +4471,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         // Create a simple action
@@ -5301,6 +5355,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -5477,6 +5533,12 @@ exit 1
                 ac_mirror_target: Some(AcMirrorTarget {
                     fss: ac_fss.clone(),
                     store_id: ac_store_id.clone(),
+                    ac_publish_pending_acks: std::sync::Arc::new(parking_lot::Mutex::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    metrics: std::sync::Arc::new(
+                        nativelink_worker::running_actions_manager::Metrics::default(),
+                    ),
                 }),
                 historical_store: Store::new(cas_store.clone()),
                 upload_action_result_config:
@@ -5489,6 +5551,8 @@ exit 1
                 max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
                 timeout_handled_externally: false,
                 directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
             })?);
 
         let action_digest = DigestInfo::new([0xACu8; 32], 32);
@@ -5542,6 +5606,8 @@ exit 1
                 action_digest,
                 &mut action_result,
                 DigestHasherFunc::Sha256,
+                &nativelink_util::action_messages::OperationId::default(),
+                "test_worker",
             ),
         )
         .await

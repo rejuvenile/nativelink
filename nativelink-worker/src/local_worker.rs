@@ -795,6 +795,25 @@ pub struct AcMirrorTarget {
     /// as the `store_id` field in `MirrorPinEntry` so the server-side
     /// AC pin registry keys correctly.
     pub store_id: Arc<str>,
+    /// #37 Phase 2 (Q5): per-digest publish-time map for AC BIS-ack
+    /// observability. Inserted on successful AC publish in
+    /// `UploadActionResults::upload_ac_results`; consumed here in the
+    /// BIS handler (`handle_blobs_in_stable_storage_for_store` AC arm)
+    /// to compute and log `ack_delay_ms` per digest, AND by the
+    /// background reaper task to surface missing BIS-acks past
+    /// timeout.
+    ///
+    /// CAPPED AT 100_000 entries: see
+    /// `running_actions_manager::AC_PUBLISH_PENDING_ACKS_MAX`. ~40 B
+    /// per entry → ~4 MB worst-case. Over-cap insertion skips (purely
+    /// observability — pin lifecycle in
+    /// `dispatched_mirror_pins` is independent).
+    pub ac_publish_pending_acks:
+        Arc<parking_lot::Mutex<std::collections::HashMap<DigestInfo, tokio::time::Instant>>>,
+    /// #37 Phase 2 (Q5): metrics handle so the BIS handler can
+    /// increment per-event counters. Clone of
+    /// `RunningActionsManagerImpl::metrics`.
+    pub metrics: Arc<crate::running_actions_manager::Metrics>,
 }
 
 /// Holds the FilesystemStore reference and change tracker needed for
@@ -1166,6 +1185,29 @@ pub fn handle_blobs_in_stable_storage_for_store(
     } else if let Some(target) = state.ac_mirror_target.as_ref() {
         if target.store_id.as_ref() == store_id {
             target.fss.remove_local_ac_pins(&acked_digests);
+            // #37 Phase 2 (Q5): per-digest BIS-ack info log with
+            // ack_delay_ms. Lookup-and-remove against the publish-time
+            // map populated in `UploadActionResults::upload_ac_results`.
+            // Digests not in the map (e.g. publish landed before
+            // worker restart) are skipped silently — no extra counter
+            // (the `worker_bis_ack_received` counter covers events
+            // observable to this worker; cross-restart correlation is
+            // not in scope for this phase).
+            {
+                let mut guard = target.ac_publish_pending_acks.lock();
+                for digest in &acked_digests {
+                    if let Some(start) = guard.remove(digest) {
+                        let ack_delay_ms = start.elapsed().as_millis() as u64;
+                        info!(
+                            ?digest,
+                            ack_delay_ms,
+                            store_id,
+                            "AC BIS-ack received",
+                        );
+                        target.metrics.worker_bis_ack_received.inc();
+                    }
+                }
+            }
             info!(
                 unpinned = decoded,
                 failed, digest_count, store_id, "BlobsInStableStorage AC: dropped local AC pins"
@@ -2666,7 +2708,11 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             let cancelled = action_for_publish.is_cancelled();
                                             if !cancelled {
                                                 if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) {
-                                                    if let Err(err) = running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher).await {
+                                                    // #37 Phase 2 (Q1): thread op_id + worker_id
+                                                    // to the AC publish path so the FSS-level
+                                                    // failure log carries action attribution.
+                                                    let op_id_for_publish = action_for_publish.get_operation_id();
+                                                    if let Err(err) = running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher, &op_id_for_publish, &self.worker_id).await {
                                                         error!(
                                                             ?err,
                                                             ?action_digest,
@@ -3134,6 +3180,18 @@ pub async fn new_local_worker(
     // Per the type-system invariant on `AcMirrorTarget`, both `fss`
     // and `store_id` are produced together — there is no "have one,
     // missing the other" half-Some shape.
+    // #37 Phase 2 (Q5): pre-construct Metrics + pending_acks here so
+    // both AcMirrorTarget (consumed at the BIS-ack receive site) and
+    // RunningActionsManagerImpl::metrics (consumed at the AC publish
+    // site) share the SAME Arc. Without this co-construction, the
+    // publish path would insert into one map while the BIS handler
+    // would observe a different (empty) map.
+    let ac_publish_metrics = std::sync::Arc::new(
+        crate::running_actions_manager::Metrics::default(),
+    );
+    let ac_publish_pending_acks = std::sync::Arc::new(parking_lot::Mutex::new(
+        std::collections::HashMap::new(),
+    ));
     let ac_mirror_target: Option<AcMirrorTarget> =
         match (ac_store.as_ref(), ac_store_name.as_deref()) {
             (Some(store), Some(name)) => {
@@ -3152,6 +3210,8 @@ pub async fn new_local_worker(
                         Some(AcMirrorTarget {
                             fss,
                             store_id: Arc::from(name),
+                            ac_publish_pending_acks: ac_publish_pending_acks.clone(),
+                            metrics: ac_publish_metrics.clone(),
                         })
                     }
                     None => {
@@ -3177,6 +3237,14 @@ pub async fn new_local_worker(
     // `ActionCache/GetActionResult` call (#463: 1503 warns/day since #277).
     let ac_store_for_listener = ac_store.clone();
     let ac_store_name_for_listener = ac_store_name.clone();
+    // #37 Phase 2 (Q5): pull the AC BIS-ack timeout from config (default
+    // 60s — see `LocalWorkerConfig::bis_ack_timeout_secs` doc).
+    let bis_ack_timeout_secs = if config.bis_ack_timeout_secs == 0 {
+        60
+    } else {
+        config.bis_ack_timeout_secs
+    };
+    let bis_ack_timeout = Duration::from_secs(bis_ack_timeout_secs);
     let running_actions_manager =
         Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
             root_action_directory: config.work_directory.clone(),
@@ -3193,6 +3261,8 @@ pub async fn new_local_worker(
             max_upload_timeout,
             timeout_handled_externally: config.timeout_handled_externally,
             directory_cache,
+            bis_ack_timeout,
+            metrics: Some(ac_publish_metrics.clone()),
         })?);
 
     // Set up BlobsAvailable reporting with drain-then-fire semantics.

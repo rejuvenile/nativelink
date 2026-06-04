@@ -1062,6 +1062,21 @@ pub struct LocalWorkerConfig {
     /// Default: 0 (disabled)
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub pprof_port: u16,
+
+    /// #37 Phase 2 (Q5): timeout in seconds for the AC BIS-ack
+    /// missing-detection reaper. When the worker publishes an AC
+    /// entry, it records the digest in a per-worker observability
+    /// map. If the matching `BlobsInStableStorage` ack from the
+    /// server does not arrive within this window, an `error!` log
+    /// is emitted and the `worker_bis_ack_missing` counter is
+    /// incremented. The map entry is then removed (one-shot fire).
+    /// **Observability only** — the actual durability pin in
+    /// `dispatched_mirror_pins` is managed separately by the
+    /// FastSlowStore eviction + worker reconnect paths.
+    ///
+    /// Default: 0 (uses built-in default of 60s).
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub bis_ack_timeout_secs: u64,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

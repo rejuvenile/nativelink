@@ -156,6 +156,8 @@ impl RunningActionsManager for MockRunningActionsManager {
         action_digest: DigestInfo,
         action_result: &mut ActionResult,
         digest_function: DigestHasherFunc,
+        _op_id: &OperationId,
+        _worker_id: &str,
     ) -> Result<(), Error> {
         self.tx_call
             .send(RunningActionManagerCalls::CacheActionResult(Box::new((
