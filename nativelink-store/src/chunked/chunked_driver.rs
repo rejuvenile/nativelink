@@ -1173,6 +1173,19 @@ async fn run_driver<Fe: FileEntry>(
             // happy-path (`ready_to_commit`) and EOF (post-recv-loop)
             // patterns at lines :1252-1262 and :1274-1283. Mirror those
             // explicit two-steps here.
+            //
+            // Note (cadre fix-up B1 mutation analysis): this drain is
+            // FORWARD-DEFENSIVE — the currently-reachable paths that
+            // hit `write_result = Err(write_err)` on Path A already
+            // drain writer_state in their match-arm (the Path A
+            // send-fail branch at chunked_driver.rs:~1098-1122 does
+            // `writer_state.take()` + `failed_handle.await` BEFORE
+            // surfacing `write_err`). If a future fix-forward adds a
+            // new error source on Path A that returns Err WITHOUT
+            // first taking writer_state, the explicit drain here
+            // catches it. Mutation: comment out this block; existing
+            // tests still pass because no current code path leaves
+            // writer_state populated when entering this error arm.
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             if let Some((chunk_tx, writer_handle)) = writer_state.take() {
                 drop(chunk_tx);
@@ -2512,11 +2525,15 @@ mod tests {
                 .await
                 .expect("send");
             }
-            // Wait for the driver to commit all N chunks to disk so the
-            // pin is fully populated (the pin update is sequenced
-            // AFTER the pwrite per the run_driver ordering).
+            // Wait for the pin to be fully populated. On Path A
+            // (io_uring writer task), pin populate fires from
+            // `process_completion` AFTER the writev CQE returns Ok
+            // (#47 b1 fix-up P1 LOAD-BEARING ORDERING). On Path B,
+            // pin populate is sequenced AFTER the spawn_blocking
+            // pwrite per the run_driver ordering. Polling on
+            // `pinned_chunk_count` is path-agnostic.
             loop {
-                if driver.chunks_committed() == N as u64 {
+                if driver.pinned_chunk_count() == N {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2596,9 +2613,11 @@ mod tests {
                 .await
                 .expect("send");
             }
-            // Wait for both committed.
+            // Wait for both chunks pinned (path-agnostic — Path A
+            // populates pin from `process_completion` post-CQE,
+            // Path B populates after spawn_blocking pwrite).
             loop {
-                if driver.chunks_committed() == 2 {
+                if driver.pinned_chunk_count() == 2 {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2666,8 +2685,10 @@ mod tests {
             })
             .await
             .expect("send");
+            // Wait for the chunk to be pinned (path-agnostic — Path A
+            // populates pin from `process_completion` post-CQE).
             loop {
-                if driver.chunks_committed() == 1 {
+                if driver.pinned_chunk_count() == 1 {
                     break;
                 }
                 tokio::task::yield_now().await;

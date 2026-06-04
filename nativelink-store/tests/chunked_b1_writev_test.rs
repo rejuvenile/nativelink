@@ -916,50 +916,55 @@ async fn b1_writev_error_mid_stream_drains_and_returns_permits() {
 /// =====================================================================
 ///
 /// LOAD-BEARING ORDERING (design §6.2 / §6.3 + cadre red-team P1):
-/// the in-memory pin must never advertise bytes whose writev later
-/// errors. Pre-fix, pin populate ran AFTER `chunk_tx.send().await` Ok
-/// but BEFORE the writev CQE returned — a concurrent reader's
-/// `try_get_chunk_from_pin` could surface bytes for chunks that the
-/// writer subsequently errored on.
+/// the in-memory pin must never advertise bytes whose writev has not
+/// yet completed. Pre-fix, pin populate ran AFTER
+/// `chunk_tx.send().await` returned Ok but BEFORE the writev CQE
+/// landed — a concurrent reader's `try_get_chunk_from_pin` could
+/// surface bytes for chunks whose writev was still in-flight (or had
+/// errored).
 ///
-/// Test setup:
-///   1. Inject `WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST[digest] = 0` so
-///      the writer errors BEFORE submitting its first writev. This
-///      forces the post-error drain path: no chunks ever reach
-///      `process_completion`'s Ok-arm.
-///   2. Send 4 × 1 MiB chunks. All chunks end up either (a) in the
-///      writer's `pending` BTreeMap (dropped on error per step 4) or
-///      (b) the driver's send-fail branch (chunk dropped on floor).
-///      NONE go through process_completion → NONE populate the pin.
-///   3. After await_completion returns Err, assert
-///      `driver.pinned_chunk_count() == 0` AND
-///      `driver.pinned_bytes() == 0` — the pin is EMPTY because no
-///      writev CQE returned Ok.
+/// Test setup uses `TEST_PRE_WRITE_DELAY_MS_BY_DIGEST` to wedge the
+/// writer's writev for 800 ms BEFORE submission. We observe the pin
+/// DURING that window (i.e. AFTER `chunk_tx.send` returned Ok but
+/// BEFORE the writev CQE could possibly have landed). The driver's
+/// post-loop `pin_state.chunks.clear()` runs only AFTER the driver
+/// task exits, so during the in-flight window we can probe pin state.
 ///
-/// MUTATION VERIFIED (2026-06-03): move the pin populate out of
+/// Sequence:
+///   1. Install 800 ms pre-write delay for `digest`.
+///   2. Send chunk 0; `tx.send` returns Ok the moment the writer's
+///      mpsc accepts the WriteJob (pre-CQE).
+///   3. Sleep 200 ms (between the writer task's pre-delay start and
+///      its writev submission). Observe pin state via
+///      `driver.pinned_chunk_count()` — MUST be 0 (writev has not
+///      submitted yet, let alone landed).
+///   4. Send chunks 1-3 (finish=true on the last) so the commit
+///      completes after the pre-delay elapses.
+///   5. `await_completion` returns Ok; final assertion on commit
+///      success.
+///
+/// MUTATION VERIFIED: move the pin populate out of
 /// `chunked_writer::process_completion` and back to the driver-send
-/// site (the buggy pre-fix ordering: `chunk_tx.send()` Ok → pin
-/// populate → no CQE wait). With that mutation, the test red-fails
-/// with the bespoke "pin advertised bytes before writev completed"
-/// message (the chunks that succeeded the mpsc send populate the
-/// pin even though their writev never completed).
-///
-/// Note: `driver.pinned_*` accessors are public on `ChunkedDriver`
-/// (already used by other tests).
+/// site (i.e. delete the `if !pin_populated_by_writer` gate in
+/// chunked_driver.rs so the driver always populates pre-CQE). With
+/// that mutation, the step-3 observation finds `pinned_chunk_count
+/// >= 1` and the test red-fails with the bespoke "pin advertised
+/// bytes before writev completed" message.
 #[nativelink_test]
 async fn b1_writev_pin_only_advertises_post_cqe_bytes() {
     if !skip_if_no_io_uring("b1_writev_pin_only_advertises_post_cqe_bytes").await {
         return;
     }
     let store = make_fs_store().await;
-    let (blob, digest, total) = make_blob_mib(4, 0xf1);
+    let (blob, digest, total) = make_blob_mib(4, 0xf2);
 
-    // Inject BEFORE the first writev: writer errors with writev count
-    // == 0 (n=0 → trigger fires on `writev_submit_count >= 0` which
-    // is true on the very first attempt). No CQE ever lands Ok.
-    nativelink_store::chunked::chunked_writer::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+    // Install pre-write delay so the writer's writev SQE waits 800 ms
+    // BEFORE submitting. The test thread observes pin state during
+    // that window. Same probe used by `driver_per_chunk_pwrite_*`
+    // tests — single source of truth for the delay map.
+    nativelink_store::chunked::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
         .lock()
-        .insert(digest, 0);
+        .insert(digest, 800);
 
     let budget = ChunkBudget::new();
     let (driver, tx) = ChunkedDriver::spawn_driver(
@@ -970,65 +975,85 @@ async fn b1_writev_pin_only_advertises_post_cqe_bytes() {
         PER_BLOB_MPSC_CAP,
     );
 
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        for i in 0..4 {
+    let send_first = async {
+        let permit = budget
+            .try_acquire_chunk()
+            .expect("ChunkBudget must have permits available");
+        tx.send(ChunkWork {
+            chunk_offset: 0,
+            chunk_bytes: Bytes::from(blob[0..CHUNK_SIZE].to_vec()),
+            finish: false,
+            _permit: permit,
+            _pin_permit: None,
+        })
+        .await
+        .expect("T9: first ChunkWork send must succeed");
+    };
+
+    // Step 1+2: send chunk 0; tx.send returns Ok pre-CQE.
+    tokio::time::timeout(Duration::from_secs(5), send_first)
+        .await
+        .expect("T9: send-first must complete within 5 s");
+
+    // Step 3: observe pin state. With the writer task wedged in its
+    // 800 ms pre-write delay, NO writev CQE has landed. The pin MUST
+    // be empty (post-fix); pre-fix the driver-site populate fired
+    // synchronously with `tx.send` Ok and would show `pinned_count
+    // >= 1` here.
+    //
+    // 200 ms sleep is well INSIDE the writer's 800 ms pre-delay
+    // window: the writer has popped chunk 0 from its mpsc and is
+    // waiting in `tokio::time::sleep(800ms)` at the top of step 5;
+    // the CQE has not happened. Tested at 200 ms vs 800 ms with the
+    // mutation: pin is consistently populated pre-fix (driver-side
+    // populate is synchronous with tx.send) and consistently empty
+    // post-fix (writer's pre-delay > test's sleep).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let pinned_count = driver.pinned_chunk_count();
+    let pinned_bytes = driver.pinned_bytes();
+    // LOAD-BEARING ASSERTION (cadre fix-up P1):
+    // Mutation: delete the `if !pin_populated_by_writer` gate in
+    // chunked_driver.rs so the driver always populates the pin
+    // synchronously with tx.send Ok. The 200 ms sleep then observes
+    // pinned_count == 1, pinned_bytes == 1 MiB; this assertion fires
+    // with the bespoke "pin advertised bytes before writev completed"
+    // message.
+    assert_eq!(
+        pinned_count, 0,
+        "T9: pin advertised bytes before writev completed — \
+         pinned_chunk_count = {pinned_count} (expected 0 during the \
+         pre-write delay window); LOAD-BEARING ORDERING violated; \
+         pinned_bytes = {pinned_bytes}",
+    );
+
+    // Step 4+5: send remaining chunks (must succeed AFTER the
+    // pre-delay elapses — the writev for chunk 0 completes, the
+    // writer drains the next chunks, the commit fires).
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        for i in 1..4 {
             let permit = budget
                 .try_acquire_chunk()
                 .expect("ChunkBudget must have permits available");
-            let send_result = tx
-                .send(ChunkWork {
-                    chunk_offset: (i * CHUNK_SIZE) as u64,
-                    chunk_bytes: Bytes::from(
-                        blob[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE].to_vec(),
-                    ),
-                    finish: i == 3,
-                    _permit: permit,
-                    _pin_permit: None,
-                })
-                .await;
-            if send_result.is_err() {
-                break;
-            }
+            tx.send(ChunkWork {
+                chunk_offset: (i * CHUNK_SIZE) as u64,
+                chunk_bytes: Bytes::from(blob[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE].to_vec()),
+                finish: i == 3,
+                _permit: permit,
+                _pin_permit: None,
+            })
+            .await
+            .expect("T9: ChunkWork send must succeed");
         }
         drop(tx);
         driver.await_completion().await
     })
     .await
-    .expect("T9: must not deadlock — pre-CQE error path must complete within 5 s");
+    .expect("T9: commit must complete within 10 s window (pre-delay 800 ms × 4 = 3.2 s)");
 
     // Cleanup.
-    nativelink_store::chunked::chunked_writer::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+    nativelink_store::chunked::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
         .lock()
         .remove(&digest);
 
-    let _err = result.expect_err("T9: writer-injected error must surface");
-
-    // LOAD-BEARING ASSERTION (cadre fix-up P1): pin is empty because
-    // no writev CQE returned Ok before the injection fired. If the
-    // pin populate were still at the driver send-site (the buggy
-    // pre-fix ordering), the chunks that succeeded the mpsc send
-    // would have populated the pin even though their writev never
-    // ran — pinned_chunk_count would be > 0 and this assertion would
-    // red-fail with the bespoke message naming the contract.
-    //
-    // Mutation: in chunked_writer.rs::process_completion, comment out
-    // the Ok-arm `pin_state.populate(...)` call inside `pin.lock()`
-    // — AND restore the driver-site populate (chunked_driver.rs
-    // ~line 1185 unconditional). Test red-fails with
-    // "pin advertised bytes before writev completed".
-    let pinned_count = driver.pinned_chunk_count();
-    let pinned_bytes = driver.pinned_bytes();
-    assert_eq!(
-        pinned_count, 0,
-        "T9: pin advertised bytes before writev completed — \
-         pinned_chunk_count = {pinned_count} (expected 0); \
-         LOAD-BEARING ORDERING violated, pin populate fired before \
-         writev CQE returned Ok; pinned_bytes = {pinned_bytes}",
-    );
-    assert_eq!(
-        pinned_bytes, 0,
-        "T9: pin advertised bytes before writev completed — \
-         pinned_bytes = {pinned_bytes} (expected 0); LOAD-BEARING \
-         ORDERING violated",
-    );
+    result.expect("T9: blob commit must succeed after pre-delay elapses");
 }

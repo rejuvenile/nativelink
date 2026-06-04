@@ -94,9 +94,19 @@ use crate::filesystem_store::digest_shard_prefix;
 /// deterministically. The map is keyed by `DigestInfo` so parallel
 /// tests never collide (each test uses a unique digest).
 ///
-/// Production builds compile out the lookup via the `#[cfg(test)]`
-/// block in `write_chunk_at_offset`; the symbol exists only under
-/// `#[cfg(test)]`.
+/// Production builds compile out the lookup via the `#[cfg(any(test,
+/// feature = "test-utils"))]` block in `write_chunk_at_offset` (Path B)
+/// and `chunked_writer::writer_task` (Path A); the symbol exists only
+/// under the same gate. The `feature = "test-utils"` disjunct is
+/// load-bearing for cross-crate integration tests in
+/// `tests/chunked_b1_writev_test.rs` — without it the static would be
+/// invisible to T9's pre-write-delay probe (integration tests compile
+/// the library WITHOUT cfg(test)).
+///
+/// HARNESS GATING audit (2026-06-03): `nativelink-store/Cargo.toml`
+/// `test-utils = []` is empty default; no production target enables
+/// the feature transitively (see `nativelink_store::chunked::
+/// chunked_writer` module doc for the full audit).
 ///
 /// Tests should clean up via `TEST_PRE_WRITE_DELAY_MS_BY_DIGEST.lock().remove(&digest)`
 /// or use a manual `Drop`-based scope guard so a panic doesn't leak
@@ -107,8 +117,8 @@ use crate::filesystem_store::digest_shard_prefix;
 /// so the `Option` unwrap dance disappears at the call site
 /// (matches the workspace idiom in `metrics.rs`, `pin_budget.rs`,
 /// `dedup_store.rs`, `worker_proxy_store.rs`).
-#[cfg(test)]
-pub(crate) static TEST_PRE_WRITE_DELAY_MS_BY_DIGEST: std::sync::LazyLock<
+#[cfg(any(test, feature = "test-utils"))]
+pub static TEST_PRE_WRITE_DELAY_MS_BY_DIGEST: std::sync::LazyLock<
     parking_lot::Mutex<HashMap<DigestInfo, u64>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
@@ -563,10 +573,13 @@ pub(crate) async fn write_chunk_at_offset(
     // `tokio::time::timeout(per_chunk_timeout, ...)`) can fire
     // deterministically. Per-digest scoping keeps parallel tests from
     // bleeding into each other. Production binaries compile this branch
-    // out via `#[cfg(test)]`.
-    #[cfg(test)]
+    // out via `#[cfg(any(test, feature = "test-utils"))]`.
+    // (#47 b1 fix-up: feature widened so T9 in
+    // tests/chunked_b1_writev_test.rs can drive the pre-write delay
+    // for the io_uring path probe parity.)
+    #[cfg(any(test, feature = "test-utils"))]
     let delay = TEST_PRE_WRITE_DELAY_MS_BY_DIGEST.lock().get(digest).copied();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     if let Some(delay_ms) = delay {
         if delay_ms > 0 {
             tokio::time::sleep(core::time::Duration::from_millis(delay_ms)).await;

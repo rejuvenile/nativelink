@@ -409,15 +409,69 @@ mod io_uring_impl {
             let mut hit_eof = false;
 
             // Blocking recv for the first job. EOF terminates the loop.
-            let first = match chunk_rx.recv().await {
-                Some(job) => job,
-                None => {
-                    hit_eof = true;
-                    // No more jobs and pending is empty — break the
-                    // outer loop after the in_flight drain below.
-                    break;
+            //
+            // #47 b1 fix-up P1 side-effect: when `in_flight` has
+            // outstanding writev SQEs, blocking PURELY on `chunk_rx.recv`
+            // means a CQE arriving during the wait does not wake the
+            // writer task — `process_completion` only fires when we
+            // call `in_flight.next()` again. Pre-fix that didn't matter
+            // because pin populate happened at the driver send-site;
+            // post-fix the pin populate IS in `process_completion`, so
+            // an idle CQE delays pin visibility. Race-on-test (lib
+            // unit tests `pin_accessor_*` send 1 chunk + poll
+            // `pinned_chunk_count`): writer submitted writev, blocked
+            // recv, never polled in_flight again → test wedged.
+            //
+            // Fix: when `in_flight` is non-empty, race the recv against
+            // the next completion via `tokio::select!`. The select
+            // picks whichever resolves first; if a CQE lands, we
+            // process it then loop back to retry the recv. If a job
+            // arrives, we take the job. When `in_flight` is empty
+            // there's nothing to race so we plain-await the recv.
+            let mut maybe_first: Option<WriteJob> = None;
+            if in_flight.is_empty() {
+                match chunk_rx.recv().await {
+                    Some(job) => maybe_first = Some(job),
+                    None => {
+                        hit_eof = true;
+                    }
                 }
-            };
+            } else {
+                // Race the recv against CQE completions so a pending
+                // writev's pin populate can fire while we wait for
+                // more chunks. Loop because a CQE wakes the select
+                // without producing a job.
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(wc) = in_flight.next() => {
+                            if let Err(e) = process_completion(wc, &pin) {
+                                if first_error.is_none() {
+                                    first_error = Some(e);
+                                }
+                            }
+                            // CQE processed; retry the select.
+                            continue;
+                        }
+                        maybe_job = chunk_rx.recv() => {
+                            match maybe_job {
+                                Some(job) => {
+                                    maybe_first = Some(job);
+                                    break;
+                                }
+                                None => {
+                                    hit_eof = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if hit_eof {
+                break;
+            }
+            let first = maybe_first.expect("either hit_eof or a job present");
             pending_bytes += first.bytes.len();
             pending.insert(
                 first.offset,
@@ -491,10 +545,14 @@ mod io_uring_impl {
                 // tests don't collide. Reuses the same static — single
                 // source of truth for the delay map.
                 //
-                // Production builds compile this out via `#[cfg(test)]`
+                // Production builds compile this out via
+                // `#[cfg(any(test, feature = "test-utils"))]`
                 // (matching the static's own gate at
-                // chunked_filesystem.rs:110).
-                #[cfg(test)]
+                // chunked_filesystem.rs:110). `feature = "test-utils"`
+                // disjunct lets integration tests in
+                // `tests/chunked_b1_writev_test.rs` (T9) drive the
+                // probe from a separate compilation unit.
+                #[cfg(any(test, feature = "test-utils"))]
                 {
                     let delay = super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
                         .lock()
