@@ -92,8 +92,13 @@ uuid = { version = "1.16.0", default-features = false, features = [
 failpoints = ["fail/failpoints"]
 # Enables `mirror_capacity_for_test` accessor on `WorkerProxyStore` so the
 # capacity-plumbing integration test can assert that BlobsAvailable
-# capacity fields reach the picker.
-test-utils = ["nativelink-store/test-utils"]
+# capacity fields reach the picker. #44 fix-up B3: also forwards to
+# `nativelink-util/test-utils` so the `StreamingBlobInner` Layer-A
+# bypass accessors (`bytes_written_atomic`, `append_chunk_for_test`,
+# `InFlightBlobMap::insert_for_test`) and the
+# `ByteStreamServer::in_flight_blobs_for_test` accessor link in for
+# the Layer B/C regression tests but stay OUT of production builds.
+test-utils = ["nativelink-store/test-utils", "nativelink-util/test-utils"]
 # #212 Phase 2.2/2.3: server-side `WriteChunked` RPC handler + per-blob
 # `ChunkedDriver` behavior. Default OFF; production data path does not
 # consume it yet. Forwarded to nativelink-store so the chunked module
@@ -252,3 +257,16 @@ required-features = ["chunked_fast_slow"]
 [[test]]
 name = "writer_site_logs_test"
 required-features = ["chunked_fast_slow", "test-utils"]
+
+# #44 Layer C — server-side `inner_read` unfold cap exercised at the
+# streaming-blob branch (`:1493`) by injecting a forged-overshoot inner
+# via the `_for_test` accessors gated behind `test-utils`.
+[[test]]
+name = "bytestream_inner_read_overshoot_cap_test"
+required-features = ["test-utils"]
+
+# #44 Layer C — server-side `inner_read` unfold cap exercised at the
+# AT-REST branch (`:1768`) — the production hot path for Bazel parallel
+# `Read(offset=N, limit=0)` reads against committed CAS blobs. Uses a
+# custom `OverdeliveringStore` and runs without `test-utils` because
+# the at-rest unfold cap does not depend on any `_for_test` accessor.

@@ -11,6 +11,15 @@ io-uring = ["dep:tokio-epoll-uring", "dep:io-uring"]
 pprof = ["dep:pprof", "dep:axum", "dep:serde_json"]
 quic = ["dep:tonic-h3", "dep:h3-util", "dep:quinn", "dep:h3-quinn", "dep:rustls", "dep:socket2"]
 failpoints = ["dep:fail", "fail/failpoints"]
+# #44 fix-up B3: gates `StreamingBlobInner::bytes_written_atomic`,
+# `append_chunk_for_test`, and `InFlightBlobMap::insert_for_test` so they
+# are NOT linked into production builds. These accessors bypass the
+# Layer A admission cap (which is the load-bearing OVERSHOOT defense
+# at the writer-side seam) and exist only to forge the bypass scenario
+# in #44 Layer B/C regression tests. Cfg-gating prevents accidental
+# production use of a primitive whose entire job is to violate the
+# `bytes_written <= expected_size_on_store` invariant.
+test-utils = []
 
 [dependencies]
 nativelink-config = { path = "../nativelink-config" }
@@ -146,6 +155,16 @@ tracing-test = { version = "0.2.5", default-features = false, features = [
 name = "fs_io_bench"
 harness = false
 required-features = ["io-uring"]
+
+# #44 Layer A/B symmetric overshoot defense tests. Uses the
+# `bytes_written_atomic` accessor (gated behind `test-utils`) to
+# forge a Layer-A bypass at the producer side and prove Layer B's
+# reader emission cap fires. Run with:
+#   `cargo test -p nativelink-util --features test-utils \
+#       --test streaming_blob_overshoot_defense_test`
+[[test]]
+name = "streaming_blob_overshoot_defense_test"
+required-features = ["test-utils"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-epoll-uring = { path = "../tokio-epoll-uring/tokio-epoll-uring", optional = true }

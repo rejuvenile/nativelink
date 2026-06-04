@@ -489,7 +489,13 @@ impl StreamingBlobInner {
     /// #44 Layer B tests to simulate a Layer-A bypass without going
     /// through `StreamingBlobWriter::send`. Production callers MUST
     /// use the writer/reader APIs.
+    ///
+    /// Cfg-gated behind `test-utils` so production builds do not link
+    /// a Layer-A-bypass accessor — the whole purpose of this method is
+    /// to violate the `bytes_written <= expected_size_on_store`
+    /// invariant the producer-side check enforces.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn bytes_written_atomic(&self) -> &AtomicU64 {
         &self.bytes_written
     }
@@ -501,7 +507,11 @@ impl StreamingBlobInner {
     /// bypass the Layer A admission cap, proving the server-side
     /// `inner_read` unfold cap is independently load-bearing.
     /// Production callers MUST use `StreamingBlobWriter::send`.
+    ///
+    /// Cfg-gated behind `test-utils` — production builds do not link
+    /// a method whose only purpose is to forge a Layer-A bypass.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn append_chunk_for_test(&self, chunk: Bytes) {
         let chunk_len = chunk.len() as u64;
         {
@@ -1438,7 +1448,12 @@ impl InFlightBlobMap {
     /// over-bytes (a Layer-A regression) so the server-side unfold
     /// cap can be exercised end-to-end. Production callers MUST use
     /// `register`.
+    ///
+    /// Cfg-gated behind `test-utils` — production callers must go
+    /// through `register`, which is the only entry point that respects
+    /// the writer-pinned uniqueness contract.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn insert_for_test(&self, digest: DigestInfo, inner: Arc<StreamingBlobInner>) {
         let mut map = self.map.write();
         map.insert(digest, inner);

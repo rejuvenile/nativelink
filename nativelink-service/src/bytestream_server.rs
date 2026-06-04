@@ -1000,7 +1000,12 @@ impl ByteStreamServer {
     /// past `digest.size_bytes()` (a Layer-A bypass scenario), so the
     /// server-side `inner_read` unfold cap is exercised end-to-end.
     /// Production callers MUST go through the ByteStream Write RPC.
+    ///
+    /// Cfg-gated behind `test-utils` — production builds cannot reach
+    /// the `InFlightBlobMap` directly. The Layer-A admission cap on the
+    /// writer side is the only legitimate path that mutates this map.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn in_flight_blobs_for_test(
         &self,
         instance_name: &str,
