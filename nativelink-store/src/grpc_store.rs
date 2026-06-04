@@ -1489,6 +1489,21 @@ impl GrpcStore {
                     // uncontended since write has returned.
                     let mut local_state_locked = local_state.lock();
 
+                    // #55: when the server returns Code::AlreadyExists
+                    // mid-stream the upstream `WriteRequestStreamWrapper`
+                    // (and the buf_channel reader behind it via
+                    // `GrpcStore::update`'s unfold) is left with bytes the
+                    // producer hasn't drained yet. Without consuming the
+                    // rest, the producer's next `tx.send` returns
+                    // `"Failed to write to data, receiver disconnected"`
+                    // and the wrapping `FastSlowStore::stream_file_to_store`
+                    // `(Ok, Err)` join arm surfaces that as the action-
+                    // level error (RCA:
+                    // `.claude/audits/51-dsym-receiver-disconnect-rca-2026-06-04.md`).
+                    // Set this flag here so the drain runs AFTER dropping
+                    // the parking_lot mutex (no `.await` while holding it).
+                    let mut drain_after_already_exists = false;
+
                     let result = local_state_locked
                         .take_read_stream_error()
                         .map(|err| RetryResult::Err(err.append("Where read_stream_error was set")))
@@ -1499,6 +1514,7 @@ impl GrpcStore {
                                 Err(ref err)
                                     if err.code == Code::AlreadyExists =>
                                 {
+                                    drain_after_already_exists = true;
                                     RetryResult::Ok(Response::new(WriteResponse {
                                         committed_size: 0,
                                     }))
@@ -1526,6 +1542,24 @@ impl GrpcStore {
                         });
 
                     drop(local_state_locked);
+
+                    // #55 drain: if AlreadyExists silenced to Ok above,
+                    // pull the rest of the upstream WriteRequest stream
+                    // (re-uses `WriteStateWrapper`'s lock-per-poll
+                    // discipline, so no `.await` happens while holding
+                    // the parking_lot Mutex). Each `.next()` polls the
+                    // wrapped `T` stream (in `GrpcStore::update`'s
+                    // legacy path, that's the `unfold` calling
+                    // `reader.recv()`), allowing the producer's
+                    // `tx.send` to complete instead of seeing
+                    // "receiver disconnected". We discard the messages —
+                    // the gRPC RPC has already returned, there's
+                    // nowhere to send them.
+                    if drain_after_already_exists {
+                        let mut drain_wrapper = WriteStateWrapper::new(local_state.clone());
+                        while drain_wrapper.next().await.is_some() {}
+                    }
+
                     Some((result, local_state))
                 }
             }))

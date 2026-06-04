@@ -231,10 +231,12 @@ where
     let port = listener.local_addr().unwrap().port();
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let handle = tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
-            .add_service(ByteStreamServer::new(server_impl))
-            .serve_with_incoming(incoming)
-            .await;
+        drop(
+            tonic::transport::Server::builder()
+                .add_service(ByteStreamServer::new(server_impl))
+                .serve_with_incoming(incoming)
+                .await,
+        );
     });
     (port, handle)
 }
@@ -261,6 +263,14 @@ where
 /// **Mutation:** comment out the drain loop in `grpc_store.rs:1500-1505`;
 /// this test red-fails on the `producer_res.expect(...)` line with the
 /// bespoke message below.
+///
+/// MUTATION VERIFIED (2026-06-04): commented out the
+/// `while drain_wrapper.next().await.is_some() {}` loop in
+/// `grpc_store.rs::write`'s AlreadyExists arm → red-fail with bespoke
+/// "GrpcStore::write left reader undrained on AlreadyExists — producer
+/// sees receiver disconnected (#55 symptom): Error { code: Internal,
+/// messages: [\"Failed to send chunk in stream_file_to_store: …
+/// receiver disconnected\"] }"; reverted, green again.
 #[nativelink_test]
 async fn grpc_store_write_drains_reader_on_already_exists() -> Result<(), Error> {
     let chunks_consumed = Arc::new(AtomicU64::new(0));
