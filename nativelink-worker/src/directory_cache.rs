@@ -1821,7 +1821,7 @@ impl DirectoryCache {
         digest: &DigestInfo,
         dest_path: &Path,
     ) -> Result<Option<CloneMethod>, Error> {
-        let (src_path, cached_size) = {
+        let (src_path, cached_size, _pin_guard) = {
             // Read lock is sufficient — ref_count and last_access are atomic.
             let cache = self.cache.read().await;
             let Some(metadata) = cache.get(digest) else {
@@ -1833,7 +1833,15 @@ impl DirectoryCache {
             };
             metadata.touch();
             metadata.ref_count.fetch_add(1, Ordering::Relaxed);
-            (metadata.path.clone(), metadata.size)
+            // The guard owns the matching fetch_sub(1) on Drop —
+            // including the cancellation path (try_join abort,
+            // JoinHandle::abort, panic-unwind). Replaces the prior
+            // manual fetch_sub below the await, which was unreachable
+            // from a dropped future. #50 v2 §3.
+            let pin_guard = DirectoryCachePinGuard::from_already_pinned(
+                Arc::clone(&metadata.ref_count),
+            );
+            (metadata.path.clone(), metadata.size, pin_guard)
         };
 
         debug!(
@@ -1846,13 +1854,10 @@ impl DirectoryCache {
         let result = hardlink_directory_tree(&src_path, dest_path).await;
         let hardlink_elapsed = hardlink_start.elapsed();
 
-        // Always decrement ref_count
-        {
-            let cache = self.cache.read().await;
-            if let Some(metadata) = cache.get(digest) {
-                metadata.ref_count.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
+        // `_pin_guard` Drop fires at end-of-scope (or cancellation
+        // unwind) and decrements ref_count synchronously. The explicit
+        // fetch_sub block previously here has been deleted — the guard
+        // is the only path that runs the matching decrement.
 
         match result {
             Ok(method) => {
