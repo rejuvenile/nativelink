@@ -98,14 +98,16 @@ pub static WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST: std::sync::LazyLock<
 
 /// Test-only coalesce-count probe for T2 (design §9). The writer task
 /// pushes `coalesce_count` (number of iovecs in the SQE) for every
-/// `writev` submission. Tests read the histogram after the writer task
+/// `writev` submission, keyed by digest so parallel tests don't
+/// collide. Tests read the per-digest histogram after the writer task
 /// completes to assert `sum == expected_chunks_total` (every chunk
 /// accounted for in some writev) AND
 /// `len <= ceil(blob_size / COALESCE_TARGET)` (coalescing actually
 /// amortized).
 #[cfg(any(test, feature = "test-utils"))]
-pub static COALESCE_HISTOGRAM: std::sync::LazyLock<parking_lot::Mutex<Vec<u32>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+pub static COALESCE_HISTOGRAM_BY_DIGEST: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<nativelink_util::common::DigestInfo, Vec<u32>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// Test-only per-blob first-writev timestamp probe for T4 (design §9).
 /// The writer task records the time it submits its FIRST writev SQE for
@@ -444,10 +446,13 @@ mod io_uring_impl {
                 // T2 probe (design §9): record coalesce_count for every
                 // writev SQE so the test can assert sum == expected
                 // chunks AND len <= ceil(blob_size / COALESCE_TARGET).
+                // Per-digest keyed so parallel tests do not collide.
                 #[cfg(any(test, feature = "test-utils"))]
                 {
-                    super::COALESCE_HISTOGRAM
+                    super::COALESCE_HISTOGRAM_BY_DIGEST
                         .lock()
+                        .entry(digest)
+                        .or_insert_with(Vec::new)
                         .push(coalesce_count as u32);
                 }
 

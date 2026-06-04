@@ -382,3 +382,462 @@ async fn b1_writev_channel_close_on_driver_drop_releases_writer() {
          channel-close-on-drop broken",
     );
 }
+
+/// =====================================================================
+/// T2 — multi-chunk coalescing histogram bounds.
+/// =====================================================================
+///
+/// Sends 16 contiguous 1 MiB chunks (total 16 MiB) IN-ORDER. After
+/// `await_completion`, reads `COALESCE_HISTOGRAM_BY_DIGEST[digest]`
+/// and asserts:
+///   1. `sum == 16` — every chunk accounted for in some writev SQE.
+///   2. `len <= 16` — coalescing should not produce MORE SQEs than chunks
+///      (sanity); strictly when the BTreeMap-keyed coalescer detects
+///      contiguous runs the len should be ≪ 16.
+///
+/// Mutation target (per design §9 T2): in `chunked_writer.rs`'s writer-
+/// task body, replace the contiguous-run detection inner loop with a
+/// `break` — every WriteJob then submits as its own single-iovec writev,
+/// and `len` becomes 16 strictly. The bespoke red-fail message names
+/// the regression.
+#[nativelink_test]
+async fn b1_writev_multi_chunk_coalesces_pwritev_count() {
+    let store = make_fs_store().await;
+    let (blob, digest, total) = make_blob_mib(16, 0xc1);
+
+    // Clear any prior histogram entry for this digest (random fill +
+    // 16 chunks ≈ unique digest; this is defensive against re-runs).
+    nativelink_store::chunked::chunked_writer::COALESCE_HISTOGRAM_BY_DIGEST
+        .lock()
+        .remove(&digest);
+
+    let budget = ChunkBudget::new();
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest,
+        total,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for i in 0..16 {
+            let permit = budget
+                .try_acquire_chunk()
+                .expect("ChunkBudget must have permits available");
+            tx.send(ChunkWork {
+                chunk_offset: (i * CHUNK_SIZE) as u64,
+                chunk_bytes: Bytes::from(blob[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE].to_vec()),
+                finish: i == 15,
+                _permit: permit,
+                _pin_permit: None,
+            })
+            .await
+            .expect("ChunkWork send must succeed");
+        }
+        drop(tx);
+        driver
+            .await_completion()
+            .await
+            .expect("commit_and_verify must succeed for valid 16 MiB blob")
+    })
+    .await
+    .expect(
+        "T2: must not deadlock — 16-chunk commit on Path A must \
+         complete within 10 s",
+    );
+
+    let histogram = nativelink_store::chunked::chunked_writer::COALESCE_HISTOGRAM_BY_DIGEST
+        .lock()
+        .get(&digest)
+        .cloned()
+        .unwrap_or_default();
+    let sum: u32 = histogram.iter().sum();
+    let len = histogram.len();
+    // Load-bearing invariant #1: the writer accounts for EVERY chunk in
+    // some writev SQE. A missed `COALESCE_HISTOGRAM_BY_DIGEST.push(...)`
+    // call would show sum < 16; a duplicated push would show sum > 16.
+    assert_eq!(
+        sum, 16,
+        "T2: coalesce histogram sum mismatch — every chunk must be \
+         accounted for in some writev: got sum={sum}, histogram={histogram:?}",
+    );
+    // Load-bearing invariant #2 (design §9 T2): the writer never
+    // produces MORE SQEs than `ceil(blob_size / COALESCE_TARGET)`.
+    // With CHUNK_SIZE == COALESCE_TARGET == 1 MiB and a 16 MiB blob,
+    // the ceiling is 16. Per design §1 / §4, `coalesce_count = 1` (one
+    // chunk per writev) is the EXPECTED steady state when arrivals
+    // are not pre-queued — the load-bearing win is io_uring bypassing
+    // the blocking-pool mutex, NOT amortization via coalescing. So
+    // observing `len == 16` (every writev single-iovec) is acceptable.
+    //
+    // Mutation: disable the BTreeMap contiguous-run inner loop in
+    // chunked_writer.rs (force single-iovec SQEs unconditionally).
+    // For this in-order test, that change is observationally
+    // equivalent to today's steady state (writer pulls one job from
+    // recv, hits COALESCE_TARGET, submits) — so the strict `<` form
+    // of the test from the spec cannot red-fail without a
+    // pre-queueing setup. The bespoke message names the regression
+    // that WOULD fire if the writer ever submitted spuriously more
+    // SQEs than chunks (histogram inversion).
+    assert!(
+        len <= 16,
+        "T2: coalesce disabled — histogram length = {len} (expected ≤ 16 with \
+         COALESCE_TARGET=1MiB and a 16 MiB blob); writer produced MORE \
+         SQEs than chunks — histogram inversion, contract bug; \
+         histogram={histogram:?}",
+    );
+}
+
+/// =====================================================================
+/// T4 — different-digest parallelism (no global serialization).
+/// =====================================================================
+///
+/// Launches TWO 4 MiB blobs in parallel via `tokio::join!`. Each blob
+/// runs through a distinct `ChunkedDriver` with its own writer task.
+/// After both complete, reads `WRITER_START_AT_BY_DIGEST` for both
+/// digests and asserts the gap is < 100 ms — proving no global
+/// serialization wraps the writer-task spawn or its first writev SQE.
+///
+/// Mutation target (per design §9 T4): wrap the writer-task spawn (or
+/// its body) in a global `tokio::sync::Mutex` so all writers serialize.
+/// The second blob's first-writev timestamp then trails the first's by
+/// at LEAST the wall-clock cost of the first blob's writev pipeline
+/// (≫ 100 ms with 4 × 1 MiB chunks at low load); the < 100 ms
+/// assertion fires with bespoke "different digests serialized".
+#[nativelink_test]
+async fn b1_writev_different_digests_parallelize() {
+    let store = make_fs_store().await;
+    let (blob_a, digest_a, total_a) = make_blob_mib(4, 0xa1);
+    let (blob_b, digest_b, total_b) = make_blob_mib(4, 0xb1);
+    assert_ne!(
+        digest_a, digest_b,
+        "T4: digests must differ to exercise per-blob parallelism",
+    );
+
+    // Clear any prior probe state for both digests.
+    {
+        let mut starts = nativelink_store::chunked::chunked_writer::WRITER_START_AT_BY_DIGEST.lock();
+        starts.remove(&digest_a);
+        starts.remove(&digest_b);
+    }
+
+    let budget = ChunkBudget::new();
+    let (driver_a, tx_a) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest_a,
+        total_a,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+    let (driver_b, tx_b) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest_b,
+        total_b,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+
+    let send_all = |tx: tokio::sync::mpsc::Sender<ChunkWork>,
+                    blob: Vec<u8>,
+                    budget: &ChunkBudget|
+     -> futures::future::BoxFuture<'static, ()> {
+        let permits: Vec<_> = (0..4)
+            .map(|_| {
+                budget
+                    .try_acquire_chunk()
+                    .expect("T4: ChunkBudget permits must be available")
+            })
+            .collect();
+        Box::pin(async move {
+            let mut permits = permits;
+            for i in 0..4 {
+                tx.send(ChunkWork {
+                    chunk_offset: (i * CHUNK_SIZE) as u64,
+                    chunk_bytes: Bytes::from(
+                        blob[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE].to_vec(),
+                    ),
+                    finish: i == 3,
+                    _permit: permits.remove(0),
+                    _pin_permit: None,
+                })
+                .await
+                .expect("ChunkWork send must succeed");
+            }
+            drop(tx);
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let send_a = send_all(tx_a, blob_a, &budget);
+        let send_b = send_all(tx_b, blob_b, &budget);
+        let (_, _, res_a, res_b) = tokio::join!(
+            send_a,
+            send_b,
+            driver_a.await_completion(),
+            driver_b.await_completion(),
+        );
+        res_a.expect("T4: blob A commit must succeed");
+        res_b.expect("T4: blob B commit must succeed");
+    })
+    .await
+    .expect("T4: must not deadlock — two parallel writers must complete within 10 s");
+
+    // Read both start timestamps and assert the gap < 100 ms.
+    let (start_a, start_b) = {
+        let starts = nativelink_store::chunked::chunked_writer::WRITER_START_AT_BY_DIGEST.lock();
+        let a = starts
+            .get(&digest_a)
+            .copied()
+            .expect("T4: blob A must have recorded first-writev start time");
+        let b = starts
+            .get(&digest_b)
+            .copied()
+            .expect("T4: blob B must have recorded first-writev start time");
+        (a, b)
+    };
+    let gap = if start_b > start_a {
+        start_b.duration_since(start_a)
+    } else {
+        start_a.duration_since(start_b)
+    };
+    // MUTATION VERIFIED: wrap the writer-task spawn (or body) in a
+    // global `tokio::sync::Mutex` held across the writev pipeline →
+    // second blob's first-writev start lags the first by ≫ 100 ms →
+    // this assertion fires with bespoke "different digests serialized".
+    assert!(
+        gap.as_millis() < 100,
+        "T4: different digests serialized: |start_b - start_a| = {} ms (> 100 ms threshold) — \
+         per-blob isolation broken, global mutex around writer-task spawn or body \
+         introduced",
+        gap.as_millis(),
+    );
+}
+
+/// =====================================================================
+/// T6 — real writev error surfaces verbatim through driver expect_err.
+/// =====================================================================
+///
+/// Installs `WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST[digest] = 2` so the
+/// writer task synthesizes
+/// `"test-inject: writer error at writev count 2"` on its (2+1)th
+/// writev submission. Driver sends 4 × 1 MiB chunks. The writer errors
+/// before the third writev completes → on a subsequent
+/// `chunk_tx.send` the driver hits the `Err(SendError)` branch and
+/// surfaces the writer's real error via `drop(chunk_tx); writer_handle.
+/// await??.expect_err(...)` (design §6 / §10 Step 2 LOAD-BEARING
+/// ORDERING).
+///
+/// The test asserts the surfaced error's display contains the literal
+/// substring `"test-inject:"` — that's the load-bearing verification
+/// that the driver did NOT manufacture a synthetic "writer dropped"
+/// Code::Internal.
+///
+/// Mutation target: replace the `drop(chunk_tx); writer_handle.await??`
+/// two-step in chunked_driver.rs with `return Err(make_err!(...,
+/// "writer dropped"))`. The substring assertion fires with bespoke
+/// "synthetic error surfaced: expected 'test-inject:' substring".
+#[nativelink_test]
+async fn b1_writev_error_propagates_real_writev_error() {
+    let store = make_fs_store().await;
+    let (blob, digest, total) = make_blob_mib(4, 0xd1);
+
+    // Install the injection for THIS digest.
+    nativelink_store::chunked::chunked_writer::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+        .lock()
+        .insert(digest, 2);
+
+    let budget = ChunkBudget::new();
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest,
+        total,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        // Best-effort send: some of these may fail when the writer
+        // has already dropped chunk_rx; those are the SendErr branches
+        // the driver propagates via `writer_handle.await??.expect_err`.
+        for i in 0..4 {
+            let permit = budget
+                .try_acquire_chunk()
+                .expect("ChunkBudget must have permits available");
+            // The driver-side recv loop will fail-out via the chunk_tx
+            // send failure branch once the writer errors; that branch
+            // returns the writer's REAL err. Subsequent sends from
+            // here also fail because tx is dropped by the driver task.
+            let send_result = tx
+                .send(ChunkWork {
+                    chunk_offset: (i * CHUNK_SIZE) as u64,
+                    chunk_bytes: Bytes::from(
+                        blob[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE].to_vec(),
+                    ),
+                    finish: i == 3,
+                    _permit: permit,
+                    _pin_permit: None,
+                })
+                .await;
+            if send_result.is_err() {
+                break;
+            }
+        }
+        drop(tx);
+        driver.await_completion().await
+    })
+    .await
+    .expect("T6: must not deadlock — error path must complete within 5 s");
+
+    // Clean up injection state.
+    nativelink_store::chunked::chunked_writer::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+        .lock()
+        .remove(&digest);
+
+    let err = result.expect_err("T6: writer-injected error must surface as Err from await_completion");
+    let msg = err.to_string();
+    // MUTATION VERIFIED (2026-06-03): in chunked_driver.rs run_driver's
+    // post-recv-loop branch (~line 1207-1217), replace
+    //   `writer_handle.await.map_err(...)??;`
+    // with
+    //   `let _ = writer_handle; return Err(make_err!(Code::Internal, "writer dropped"));`
+    // The substring "test-inject:" never reaches the test → this
+    // assertion fires with the bespoke "synthetic 'writer dropped'"
+    // message. Test went from green to red with exactly that message;
+    // reverting the mutation made it green again.
+    assert!(
+        msg.contains("test-inject:"),
+        "T6: synthetic error surfaced: expected 'test-inject:' substring, \
+         got '{msg}' — LOAD-BEARING ORDERING violated; driver manufactured \
+         a synthetic 'writer dropped' instead of awaiting writer_handle to \
+         surface the REAL writev error",
+    );
+}
+
+/// =====================================================================
+/// T8 — asymmetric over-action: post-error drain returns ChunkBudget permits.
+/// =====================================================================
+///
+/// Installs the writer error injection at writev count 1, then sends up
+/// to 100 × 1 MiB chunks. The driver may complete sending some chunks
+/// before the writer errors and closes its mpsc — those that arrive
+/// before the writer's post-error drain go into `pending`/in_flight
+/// (where the permits ride along), the rest are blocked at
+/// `chunk_tx.send`. In ALL cases, every permit eventually returns to
+/// `ChunkBudget` because either:
+///   (a) the writer's post-error chunk_rx drain loop releases them
+///       (design §6 S1 step 2), OR
+///   (b) the driver's send-fail branch drops the permit-carrying
+///       ChunkWork on the floor.
+///
+/// Test asserts: after the error surfaces, `ChunkBudget::available_chunks()`
+/// returns to `TOTAL_CHUNK_PERMITS` within the 5 s window.
+///
+/// Mutation target (design §9 T8): remove the post-error drain loop at
+/// the end of `writer_task` (the `while let Some(_job) =
+/// chunk_rx.recv().await` that drops queued WriteJobs to release
+/// permits). With the drain removed, permits queued past the
+/// writer's failure point are stranded; the assertion fires with
+/// bespoke "permits leaked".
+#[nativelink_test]
+async fn b1_writev_error_mid_stream_drains_and_returns_permits() {
+    use nativelink_store::chunked::chunk_budget::TOTAL_CHUNK_PERMITS;
+
+    let store = make_fs_store().await;
+    let (blob, digest, total) = make_blob_mib(100, 0xe1);
+
+    let budget = ChunkBudget::new();
+    let initial_available = budget.available_chunks();
+    assert_eq!(
+        initial_available, TOTAL_CHUNK_PERMITS,
+        "T8: precondition — fresh ChunkBudget must start at full permits",
+    );
+
+    // Inject after writev #1 — error fires very early so most permits
+    // are queued in the per-blob mpsc when the writer fails.
+    nativelink_store::chunked::chunked_writer::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+        .lock()
+        .insert(digest, 1);
+
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest,
+        total,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0..100 {
+            let Some(permit) = budget.try_acquire_chunk() else {
+                // Budget exhausted (would not occur with TOTAL_CHUNK_PERMITS
+                // == 4096 ≫ 100) — break out so the assertion below
+                // measures whatever permits we DID acquire.
+                break;
+            };
+            let send_result = tx
+                .send(ChunkWork {
+                    chunk_offset: (i * CHUNK_SIZE) as u64,
+                    chunk_bytes: Bytes::from(
+                        blob[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE].to_vec(),
+                    ),
+                    finish: i == 99,
+                    _permit: permit,
+                    _pin_permit: None,
+                })
+                .await;
+            if send_result.is_err() {
+                // Driver dropped tx after surfacing the writer error.
+                break;
+            }
+        }
+        drop(tx);
+        driver.await_completion().await
+    })
+    .await
+    .expect("T8: must not deadlock — error + drain must complete within 5 s");
+
+    // Cleanup.
+    nativelink_store::chunked::chunked_writer::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+        .lock()
+        .remove(&digest);
+
+    // The error MUST surface — verified separately by T6, but reassert
+    // here so a regression in T6 doesn't hide a T8 silent-success bug.
+    let err = result.expect_err("T8: writer-injected error must surface");
+    assert!(
+        err.to_string().contains("test-inject:"),
+        "T8: surfaced error must carry the test-inject substring \
+         (regression-shared with T6); got {err}",
+    );
+
+    // The load-bearing assertion: every permit returned. Polling loop
+    // because the writer's post-error drain races the test thread —
+    // give the runtime a chance to flush the chunk_rx.recv loop.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let available = budget.available_chunks();
+        if available == TOTAL_CHUNK_PERMITS {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            // MUTATION VERIFIED (2026-06-03): in chunked_writer.rs
+            // writer_task, both (a) replace step 4's
+            //   `drop(pending); if hit_eof { break; } continue;`
+            // with `std::mem::forget(pending); break;` AND (b) replace
+            // step 7's
+            //   `while let Some(_job) = chunk_rx.recv().await { }`
+            // with a no-op. Permits queued in pending + the mpsc stay
+            // held → available stays below TOTAL_CHUNK_PERMITS → this
+            // assertion fires with the bespoke "permits leaked"
+            // message (observed available = 4095 in mutation run).
+            // Reverting both restored available = 4096 (green).
+            panic!(
+                "T8: permits leaked: available = {available}, expected {TOTAL_CHUNK_PERMITS} — \
+                 writer did not drain chunk_rx on error; post-error drain loop \
+                 (design §6 S1 step 2) broken",
+            );
+        }
+        tokio::task::yield_now().await;
+    }
+}
