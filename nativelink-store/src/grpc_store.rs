@@ -1325,11 +1325,19 @@ impl GrpcStore {
 
         let write_start = std::time::Instant::now();
         let instance_name = self.instance_name.clone();
-        trace!(
+        // #59 instrumentation: promoted trace!→info! at GrpcStore::write
+        // entry. Per #56 RCA §8, the 1-46 ms worker-side `elapsed_ms`
+        // observed on `receiver disconnected` events is currently
+        // unobservable at info! level — we don't know whether
+        // GrpcStore::write even entered, nor which retrier branch fired.
+        // Observability-only; no behavior change.
+        info!(
             instance_name = %instance_name,
             progress_timeout_s = rpc_timeout.as_secs(),
             is_mirror,
-            "GrpcStore::write: starting ByteStream write",
+            is_worker,
+            arm_name = "entry",
+            "#59 GrpcStore::write: starting ByteStream write",
         );
         let mut attempt: u32 = 0;
         let result = self
@@ -1343,10 +1351,16 @@ impl GrpcStore {
                     // wrap it in a Mutex and retrieve it after the write
                     // has completed.  There is no way to get the value back
                     // from the client.
-                    trace!(
+                    // #59 instrumentation: per #56 RCA §8 rec 2, info! at
+                    // the top of the unfold closure with attempt + flags
+                    // surfaces which retrier iteration is in flight.
+                    info!(
                         instance_name = %instance_name,
                         attempt,
-                        "GrpcStore::write: requesting connection from pool",
+                        is_mirror,
+                        is_worker,
+                        arm_name = "attempt_start",
+                        "#59 GrpcStore::write: requesting connection from pool",
                     );
                     let conn_start = std::time::Instant::now();
                     let instance_for_rpc = instance_name.clone();
@@ -1394,10 +1408,12 @@ impl GrpcStore {
                                     conn_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                trace!(
+                                // #59 instrumentation: promoted to info!.
+                                info!(
                                     instance_name = %instance_for_rpc,
                                     conn_elapsed_ms,
-                                    "GrpcStore::write: got connection, starting ByteStream.Write RPC",
+                                    arm_name = "conn_acquired_tcp",
+                                    "#59 GrpcStore::write: got connection, starting ByteStream.Write RPC",
                                 );
                                 let rpc_start = std::time::Instant::now();
                                 let res = self.bs_client(channel)
@@ -1408,11 +1424,13 @@ impl GrpcStore {
                                     rpc_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                trace!(
+                                // #59 instrumentation: promoted to info!.
+                                info!(
                                     instance_name = %instance_for_rpc,
                                     rpc_elapsed_ms,
                                     success = res.is_ok(),
-                                    "GrpcStore::write: ByteStream.Write RPC returned",
+                                    arm_name = "rpc_returned_tcp",
+                                    "#59 GrpcStore::write: ByteStream.Write RPC returned",
                                 );
                                 res
                             }
@@ -1427,11 +1445,13 @@ impl GrpcStore {
                                     rpc_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                trace!(
+                                // #59 instrumentation: promoted to info!.
+                                info!(
                                     instance_name = %instance_for_rpc,
                                     rpc_elapsed_ms,
                                     success = res.is_ok(),
-                                    "GrpcStore::write: ByteStream.Write RPC returned (quic)",
+                                    arm_name = "rpc_returned_quic",
+                                    "#59 GrpcStore::write: ByteStream.Write RPC returned (quic)",
                                 );
                                 res
                             }
@@ -1446,10 +1466,12 @@ impl GrpcStore {
                                     conn_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                trace!(
+                                // #59 instrumentation: promoted to info!.
+                                info!(
                                     instance_name = %instance_for_rpc,
                                     conn_elapsed_ms,
-                                    "GrpcStore::write: got connection, starting ByteStream.Write RPC (dual/tcp)",
+                                    arm_name = "conn_acquired_dual",
+                                    "#59 GrpcStore::write: got connection, starting ByteStream.Write RPC (dual/tcp)",
                                 );
                                 let rpc_start = std::time::Instant::now();
                                 let res = self.bs_client(channel)
@@ -1460,11 +1482,13 @@ impl GrpcStore {
                                     rpc_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                trace!(
+                                // #59 instrumentation: promoted to info!.
+                                info!(
                                     instance_name = %instance_for_rpc,
                                     rpc_elapsed_ms,
                                     success = res.is_ok(),
-                                    "GrpcStore::write: ByteStream.Write RPC returned (dual/tcp)",
+                                    arm_name = "rpc_returned_dual",
+                                    "#59 GrpcStore::write: ByteStream.Write RPC returned (dual/tcp)",
                                 );
                                 res
                             }
@@ -1489,41 +1513,81 @@ impl GrpcStore {
                     // uncontended since write has returned.
                     let mut local_state_locked = local_state.lock();
 
-                    let result = local_state_locked
-                        .take_read_stream_error()
-                        .map(|err| RetryResult::Err(err.append("Where read_stream_error was set")))
-                        .unwrap_or_else(|| {
-                            // No stream error, handle the original result
-                            match result {
-                                Ok(response) => RetryResult::Ok(response),
-                                Err(ref err)
-                                    if err.code == Code::AlreadyExists =>
-                                {
-                                    RetryResult::Ok(Response::new(WriteResponse {
-                                        committed_size: 0,
-                                    }))
-                                }
-                                Err(ref err) => {
-                                    warn!(
-                                        instance_name = %instance_name,
-                                        attempt,
-                                        ?err,
-                                        can_resume = local_state_locked.can_resume(),
-                                        "GrpcStore::write: RPC failed",
-                                    );
-                                    // #147: belt-and-suspenders eviction.
-                                    self.evict_pool_on_transport_err(err);
-                                    if local_state_locked.can_resume() {
-                                        local_state_locked.resume();
-                                        RetryResult::Retry(err.clone())
-                                    } else {
-                                        RetryResult::Err(
-                                            err.clone().append("Retry is not possible"),
-                                        )
-                                    }
-                                }
+                    // #59 instrumentation: surface read_stream_error
+                    // arm-decision (otherwise it is silently masked into
+                    // RetryResult::Err with no log line at info! level).
+                    if let Some(err) = local_state_locked.take_read_stream_error() {
+                        info!(
+                            instance_name = %instance_name,
+                            attempt,
+                            ?err,
+                            arm_name = "read_stream_error",
+                            "#59 GrpcStore::write: read_stream_error set (per-chunk timer or resource-name parse)",
+                        );
+                        let result = RetryResult::Err(err.append("Where read_stream_error was set"));
+                        drop(local_state_locked);
+                        return Some((result, local_state));
+                    }
+                    let result = match result {
+                        Ok(response) => {
+                            // #59 instrumentation: per #56 RCA §4 O1 —
+                            // normal success path (producer sent EOF,
+                            // unfold returned None). This is the ONLY
+                            // non-AlreadyExists Ok-returning path.
+                            info!(
+                                instance_name = %instance_name,
+                                attempt,
+                                arm_name = "rpc_ok",
+                                "#59 GrpcStore::write: RPC returned Ok (normal success)",
+                            );
+                            RetryResult::Ok(response)
+                        }
+                        Err(ref err)
+                            if err.code == Code::AlreadyExists =>
+                        {
+                            // #59 instrumentation: per #56 RCA §4 O2 —
+                            // AlreadyExists silenced to Ok. The audit
+                            // REFUTED this as a production trigger
+                            // (zero AlreadyExists log entries in 12.85 h
+                            // of journal). If this fires in production,
+                            // the refutation is wrong.
+                            info!(
+                                instance_name = %instance_name,
+                                attempt,
+                                ?err,
+                                arm_name = "already_exists_silenced",
+                                "#59 GrpcStore::write: AlreadyExists silenced to Ok (committed_size=0)",
+                            );
+                            RetryResult::Ok(Response::new(WriteResponse {
+                                committed_size: 0,
+                            }))
+                        }
+                        Err(ref err) => {
+                            // #59 instrumentation: arm_name distinguishes
+                            // this from the silenced AlreadyExists branch
+                            // in journal queries; keep the pre-existing
+                            // warn! since it is the operator-facing alert
+                            // for unmasked RPC failures.
+                            warn!(
+                                instance_name = %instance_name,
+                                attempt,
+                                ?err,
+                                can_resume = local_state_locked.can_resume(),
+                                arm_name = "rpc_err",
+                                "#59 GrpcStore::write: RPC failed",
+                            );
+                            // #147: belt-and-suspenders eviction.
+                            self.evict_pool_on_transport_err(err);
+                            if local_state_locked.can_resume() {
+                                local_state_locked.resume();
+                                RetryResult::Retry(err.clone())
+                            } else {
+                                RetryResult::Err(
+                                    err.clone().append("Retry is not possible"),
+                                )
                             }
-                        });
+                        }
+                    };
 
                     drop(local_state_locked);
                     Some((result, local_state))
@@ -1533,10 +1597,13 @@ impl GrpcStore {
 
         let total_elapsed = write_start.elapsed();
         let total_elapsed_ms = u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX);
-        trace!(
+        // #59 instrumentation: total elapsed surfaces the 1-46 ms fast-
+        // fail vs full-RPC durations called out in #56 RCA §6 M3.
+        info!(
             instance_name = %self.instance_name,
             total_elapsed_ms,
-            "GrpcStore::write: completed successfully",
+            arm_name = "completed",
+            "#59 GrpcStore::write: completed successfully",
         );
         // The per-chunk progress timer hides whole-RPC duration from the
         // operator (the previous whole-RPC timeout used to surface it as
