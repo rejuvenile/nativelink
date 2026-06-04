@@ -4266,6 +4266,154 @@ mod tests {
         Ok(())
     }
 
+    /// #22 + #26 production-composition test (`directory_cache.rs:657-723`):
+    /// when `cache_root` is OVER-CAP at startup, `DirectoryCache::new` must
+    /// bleed the on-disk state AND the in-process map down to ≤ `max_size_bytes`
+    /// before returning.
+    ///
+    /// This is the sibling of
+    /// `nativelink-store/tests/filesystem_store_test.rs:1816` (#605 Bug A) for
+    /// the `DirectoryCache`'s independent startup-eviction path. The
+    /// `FilesystemStore` test exercises moka's
+    /// `run_pending_tasks_and_drain`; this one exercises the hand-rolled
+    /// sort-by-mtime + LRU loop at `directory_cache.rs:660-688`.
+    ///
+    /// Layout: pre-seed five digest-named subdirectories under `cache_root`,
+    /// each containing one file of `FILE_BYTES`. Cap is `MAX_SIZE_BYTES`
+    /// chosen so 5 entries exceed the cap and at most 2 may remain.
+    ///
+    /// Verifies (per CLAUDE.md `feedback_index_visibility_contract`):
+    /// 1. `DirectoryCache::new` returns within a 10s `tokio::time::timeout`
+    ///    (deadlock detector — the eviction loop must not wedge).
+    /// 2. The in-process visibility primitive
+    ///    (`cache.read().values().map(|m| m.size).sum::<u64>()`) is at-or-
+    ///    below the cap. This IS the cap-decision quantity the runtime
+    ///    `collect_evictions` uses; metadata read of disk would not catch a
+    ///    map-vs-disk drift bug.
+    /// 3. On-disk entry count under `cache_root` matches the in-process map
+    ///    size — i.e. evicted entries' directories are removed from disk.
+    ///
+    /// Mutation step (per CLAUDE.md TDD discipline): comment out the body of
+    /// the eviction loop at `directory_cache.rs:675-687` (the `if let Some(
+    /// meta) = initial_cache.remove(digest)` block). The
+    /// `initial_cache.values().map().sum() <= MAX_SIZE_BYTES` assertion below
+    /// MUST red-fail with "#22 startup over-cap not enforced — in-process map
+    /// stayed over the configured cap" because no entries are removed from
+    /// `initial_cache` and the post-construction sum equals the full
+    /// pre-seeded total.
+    #[nativelink_test]
+    async fn startup_over_cap_directory_cache_drained_to_cap() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+
+        // Pre-seed the format-version sentinel so `DirectoryCache::new` does
+        // not wipe the cache before our pre-seeded entries are loaded. Without
+        // this, the startup path at `directory_cache.rs:520-548` deletes
+        // every digest dir and the test exercises an empty cache.
+        std::fs::write(
+            cache_root.join(CACHE_VERSION_FILENAME),
+            format!("{CACHE_FORMAT_VERSION}\n"),
+        )
+        .unwrap();
+
+        // Each pre-seeded directory holds one FILE_BYTES-byte payload.
+        // 5 entries × ~10 KiB = ~50 KiB on a 20 KiB cap; at most 2 may remain.
+        const FILE_BYTES: usize = 10 * 1024;
+        const MAX_SIZE_BYTES: u64 = 20 * 1024;
+        const NUM_ENTRIES: usize = 5;
+        const HASHES: [&str; NUM_ENTRIES] = [
+            "0123456789abcdef000000000000000000010000000000000123456789abcdef",
+            "1123456789abcdef000000000000000000010000000000000123456789abcdef",
+            "2123456789abcdef000000000000000000010000000000000123456789abcdef",
+            "3123456789abcdef000000000000000000010000000000000123456789abcdef",
+            "4123456789abcdef000000000000000000010000000000000123456789abcdef",
+        ];
+
+        // Pre-seed digest-named subdirectories. Use the same name format as
+        // `parse_digest_from_dirname` expects (`{hash}-{size}`), which is
+        // `DigestInfo::to_string()`. Stagger mtimes via the sequence of
+        // creates so the LRU sort has deterministic input.
+        for hash in HASHES {
+            let digest = DigestInfo::try_new(hash, FILE_BYTES as i64)?;
+            let entry_path = cache_root.join(digest.to_string());
+            std::fs::create_dir_all(&entry_path).unwrap();
+            std::fs::write(entry_path.join("payload.bin"), vec![0u8; FILE_BYTES]).unwrap();
+        }
+
+        // Sanity: verify all five subdirs exist before construction.
+        let on_disk_before = std::fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count();
+        assert_eq!(
+            on_disk_before, NUM_ENTRIES,
+            "test fixture broken: expected {NUM_ENTRIES} pre-seeded entries on disk",
+        );
+
+        // Construct the cache. The startup load + one-shot eviction at
+        // `directory_cache.rs:657-723` must enforce MAX_SIZE_BYTES. Wrap
+        // under a tokio timeout: a regression that wedges the eviction loop
+        // red-fails as a deadlock detector rather than hanging the suite.
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let config = DirectoryCacheConfig {
+            max_entries: 100, // High enough that count-cap doesn't fire
+            max_size_bytes: MAX_SIZE_BYTES,
+            cache_root: cache_root.clone(),
+            direct_use_mode: false,
+        };
+        let cache = tokio::time::timeout(
+            Duration::from_secs(10),
+            DirectoryCache::new(config, store, None),
+        )
+        .await
+        .expect(
+            "DirectoryCache::new must not deadlock — \
+             #22 startup drain wedged the eviction loop",
+        )?;
+
+        // Visibility primitive #1: in-process map sum is the quantity the
+        // runtime `collect_evictions` uses for its cap decision. This is
+        // the "moka has_with_results" analogue for the directory_cache.
+        let in_process_sum: u64 = {
+            let map = cache.cache.read().await;
+            map.values().map(|m| m.size).sum()
+        };
+        let in_process_count = cache.cache.read().await.len();
+        assert!(
+            in_process_sum <= MAX_SIZE_BYTES,
+            "#22 startup over-cap not enforced — in-process map stayed over the \
+             configured cap: sum {} > max {} ({} entries remaining)",
+            in_process_sum,
+            MAX_SIZE_BYTES,
+            in_process_count,
+        );
+        assert!(
+            in_process_count < NUM_ENTRIES,
+            "#22 startup drain produced ZERO evictions in the in-process map — \
+             {NUM_ENTRIES} entries remained on a cap of {MAX_SIZE_BYTES} bytes",
+        );
+
+        // Visibility primitive #2: on-disk count must match in-process count.
+        // A drift (in-process map < on-disk count) would indicate
+        // `startup_evict_paths` cleanup at `directory_cache.rs:720-722` was
+        // skipped. We exclude the `.cache_version` file written by
+        // `DirectoryCache::new` at `:545`.
+        let on_disk_after = std::fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count();
+        assert_eq!(
+            on_disk_after, in_process_count,
+            "#22 in-process map and on-disk state diverged after startup drain — \
+             map has {in_process_count} entries, disk has {on_disk_after} directories",
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_merkle_tree_metadata_roundtrip() -> Result<(), Error> {
         // Test serialization/deserialization of MerkleTreeMetadata
