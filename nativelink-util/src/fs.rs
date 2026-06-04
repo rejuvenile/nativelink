@@ -47,8 +47,13 @@ static IO_URING_AVAILABLE: OnceLock<bool> = OnceLock::new();
 /// Check whether io_uring is available on this system. On first call,
 /// probes by launching a `tokio_epoll_uring::System`. The result is
 /// cached for the lifetime of the process.
+///
+/// Exposed as `pub` so external store implementations (e.g.
+/// `nativelink-store::chunked::chunked_driver`) can branch on the same
+/// runtime check used internally by `fs.rs`'s io_uring fast paths,
+/// avoiding a behavior split between `fs.rs` and out-of-crate callers.
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
-async fn is_io_uring_available() -> bool {
+pub async fn is_io_uring_available() -> bool {
     if let Some(&available) = IO_URING_AVAILABLE.get() {
         return available;
     }
