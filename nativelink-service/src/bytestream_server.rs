@@ -2589,6 +2589,23 @@ impl ByteStreamServer {
         // threshold so the streaming optimization is preserved for
         // larger blobs.
 
+        // #62 Phase 2 instrumentation: capture the WriteResponse the
+        // server sends to the chunked-write client. Per #56 RCA
+        // candidate (b), correlate worker-side
+        // `chunked_inner_truncated` (committed < expected) with
+        // server-side WriteResponse to decide whether the server
+        // actually reported committed_size < expected (would require
+        // a code change that doesn't exist today — `expected_size as
+        // i64` is unconditional here) or whether the client-side
+        // fabrication happens elsewhere.
+        info!(
+            %digest,
+            committed_size = expected_size as i64,
+            expected_size,
+            delta = 0_i64,
+            arm_name = "server_inner_write_terminal",
+            "#62 ByteStream::Write: server returning WriteResponse (chunked path)",
+        );
         Ok(Response::new(WriteResponse {
             committed_size: expected_size as i64,
         }))
@@ -2815,6 +2832,19 @@ impl ByteStreamServer {
 
         // Note: bytes_written_total is updated in the caller (bytestream_write) based on result
 
+        // #62 Phase 2 instrumentation: oneshot fast-path terminal.
+        // Per #62, log committed_size and arm_name so journal queries
+        // can distinguish chunked-path WriteResponse from oneshot
+        // WriteResponse (different upstream code paths in worker
+        // GrpcStore).
+        info!(
+            %digest,
+            committed_size = expected_size as i64,
+            expected_size,
+            delta = 0_i64,
+            arm_name = "server_inner_write_oneshot_terminal",
+            "#62 ByteStream::Write: server returning WriteResponse (oneshot path)",
+        );
         Ok(Response::new(WriteResponse {
             committed_size: expected_size as i64,
         }))
@@ -3047,6 +3077,20 @@ impl ByteStreamServer {
                 .metrics
                 .write_requests_success
                 .fetch_add(1, Ordering::Relaxed);
+            // #62 Phase 2 instrumentation: has()-short-circuit terminal.
+            // Server reports committed_size=expected without the
+            // worker actually streaming. If a worker sees Ok with no
+            // bytes transferred and #59 logs (Ok, Err) on a digest the
+            // server short-circuited here, that maps to a producer
+            // that never got its EOF acknowledged.
+            info!(
+                %digest,
+                committed_size = expected_size as i64,
+                expected_size,
+                delta = 0_i64,
+                arm_name = "server_has_short_circuit",
+                "#62 ByteStream::Write: server returning WriteResponse (already-exists short-circuit)",
+            );
             return Ok(Response::new(WriteResponse {
                 committed_size: expected_size as i64,
             }));
@@ -3111,6 +3155,19 @@ impl ByteStreamServer {
                         .metrics
                         .write_requests_success
                         .fetch_add(1, Ordering::Relaxed);
+                    // #62 Phase 2 instrumentation: dedup-coalesce terminal.
+                    // This RPC won the dedup race and the primary
+                    // writer's outcome was Ok — server reports
+                    // committed_size=expected without the worker
+                    // streaming any bytes on THIS RPC.
+                    info!(
+                        %digest,
+                        committed_size = expected_size as i64,
+                        expected_size,
+                        delta = 0_i64,
+                        arm_name = "server_dedup_coalesce_ok",
+                        "#62 ByteStream::Write: server returning WriteResponse (in-flight dedup coalesce)",
+                    );
                     return Ok(Response::new(WriteResponse {
                         committed_size: expected_size as i64,
                     }));
