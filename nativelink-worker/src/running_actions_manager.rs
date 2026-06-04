@@ -5880,27 +5880,28 @@ pub struct Metrics {
     // Hand-rolled per-Code field set (design v2 §2.4) — `MetricsComponent`
     // derive does not support `HashMap<Code, Counter>` natively; the
     // helper `worker_ac_publish_fail_by_code` dispatches to the right
-    // field via `match`.
+    // field via `match`. All `pub` so integration tests can read
+    // `.counter.load(Ordering::Acquire)` directly.
     #[metric(help = "Worker AC publish success count.")]
-    worker_ac_publish_success: CounterWithTime,
+    pub worker_ac_publish_success: CounterWithTime,
     #[metric(help = "Worker AC publish fail count — Aborted.")]
-    worker_ac_publish_fail_aborted: CounterWithTime,
+    pub worker_ac_publish_fail_aborted: CounterWithTime,
     #[metric(help = "Worker AC publish fail count — Internal.")]
-    worker_ac_publish_fail_internal: CounterWithTime,
+    pub worker_ac_publish_fail_internal: CounterWithTime,
     #[metric(help = "Worker AC publish fail count — NotFound.")]
-    worker_ac_publish_fail_not_found: CounterWithTime,
+    pub worker_ac_publish_fail_not_found: CounterWithTime,
     #[metric(help = "Worker AC publish fail count — ResourceExhausted.")]
-    worker_ac_publish_fail_resource_exhausted: CounterWithTime,
+    pub worker_ac_publish_fail_resource_exhausted: CounterWithTime,
     #[metric(help = "Worker AC publish fail count — Unavailable.")]
-    worker_ac_publish_fail_unavailable: CounterWithTime,
+    pub worker_ac_publish_fail_unavailable: CounterWithTime,
     #[metric(help = "Worker AC publish fail count — DeadlineExceeded.")]
-    worker_ac_publish_fail_deadline_exceeded: CounterWithTime,
+    pub worker_ac_publish_fail_deadline_exceeded: CounterWithTime,
     #[metric(help = "Worker AC publish fail count — Unknown.")]
-    worker_ac_publish_fail_unknown: CounterWithTime,
+    pub worker_ac_publish_fail_unknown: CounterWithTime,
     #[metric(help = "Worker AC publish fail count — all other codes.")]
-    worker_ac_publish_fail_other: CounterWithTime,
+    pub worker_ac_publish_fail_other: CounterWithTime,
     #[metric(help = "Worker AC publish events exceeding 500ms.")]
-    worker_ac_publish_slow: CounterWithTime,
+    pub worker_ac_publish_slow: CounterWithTime,
     // #37 Phase 2 (Q5): BIS-ack observability counters. `pub`
     // because the BIS-ack receive site lives in `local_worker.rs`
     // (different module) and increments via `target.metrics.<field>`.
@@ -5921,7 +5922,7 @@ impl Metrics {
     /// Dispatch a failure increment for an AC publish error to the
     /// matching per-Code field. Unmapped codes land in `other`.
     /// See design v2 §2.4 and the hand-rolled field set above.
-    pub(crate) fn worker_ac_publish_fail_by_code(&self, code: Code) {
+    pub fn worker_ac_publish_fail_by_code(&self, code: Code) {
         match code {
             Code::Aborted => self.worker_ac_publish_fail_aborted.inc(),
             Code::Internal => self.worker_ac_publish_fail_internal.inc(),
