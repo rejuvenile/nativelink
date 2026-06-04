@@ -215,6 +215,47 @@ impl CachedDirectoryMetadata {
     }
 }
 
+/// RAII guard that holds a +1 `ref_count` on a `DirectoryCache` entry for
+/// the lifetime of the in-flight hardlink operation. Decrements on Drop —
+/// including the cancellation path (`try_join` abort, `JoinHandle::abort`,
+/// panic-unwind).
+///
+/// Drop is purely synchronous: no async work, no runtime spawn, no cache
+/// HashMap lookup. This is what makes the guard runtime-shutdown-safe and
+/// closes the leak window that the prior manual `fetch_add` / await /
+/// `fetch_sub` pattern left open at `try_hardlink_cached`.
+///
+/// Composite-invariant contract: `gate ⇒ (pin OR ttl OR evict)`. For
+/// `DirectoryCache` the gate is soft (evict-first, admit-always), TTL is
+/// absent, evict is LRU-of-`ref_count == 0`. The pin corner is the only
+/// compensator; this guard is what makes the pin corner
+/// cancellation-safe. See #50 v2 §2.
+pub(crate) struct DirectoryCachePinGuard {
+    /// Direct handle to the entry's `ref_count`. Cloning the `Arc` is
+    /// cheap (one atomic increment) and lets Drop decrement without
+    /// re-acquiring any cache lock.
+    ref_count: Arc<AtomicUsize>,
+}
+
+impl DirectoryCachePinGuard {
+    /// Construct from an already-pinned metadata entry. Caller MUST have
+    /// already done `fetch_add(1)` on `ref_count` — this guard owns the
+    /// matching `fetch_sub(1)` on Drop.
+    pub(crate) fn from_already_pinned(ref_count: Arc<AtomicUsize>) -> Self {
+        Self { ref_count }
+    }
+}
+
+impl Drop for DirectoryCachePinGuard {
+    fn drop(&mut self) {
+        // LOAD-BEARING: sync fetch_sub on cancellation; restores the
+        // cache's pin-released-on-every-task-exit invariant per #50 v2 §2
+        // composite. NO spawn, NO await, NO HashMap lookup — this fires
+        // deterministically on every cancellation path.
+        self.ref_count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// High-performance directory cache that uses hardlinks to avoid repeated
 /// directory reconstruction from the CAS.
 ///
