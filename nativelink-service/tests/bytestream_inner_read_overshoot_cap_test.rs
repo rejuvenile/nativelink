@@ -25,11 +25,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use nativelink_config::stores::{
-    ByteStreamConfig, MemorySpec, MemoryStorageType, StoreSpec, WithInstanceName,
-};
+use nativelink_config::cas_server::{ByteStreamConfig, WithInstanceName};
+use nativelink_config::stores::{MemorySpec, StoreSpec};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::google::bytestream::ReadRequest;
+use nativelink_proto::google::bytestream::byte_stream_server::ByteStream;
 use nativelink_service::bytestream_server::ByteStreamServer;
 use nativelink_store::default_store_factory::store_factory;
 use nativelink_store::store_manager::StoreManager;
@@ -44,10 +44,7 @@ const HASH_OVERSHOOT: &str =
 async fn make_store_manager() -> Result<Arc<StoreManager>, Box<dyn core::error::Error>> {
     let store_manager = Arc::new(StoreManager::new());
     let memory_store = store_factory(
-        &StoreSpec::Memory(MemorySpec {
-            eviction_policy: None,
-            storage_type: MemoryStorageType::default(),
-        }),
+        &StoreSpec::Memory(MemorySpec::default()),
         &store_manager,
         None,
     )
@@ -93,21 +90,32 @@ pub async fn bytestream_inner_read_caps_at_digest_size_bytes()
 
     let digest = DigestInfo::try_new(HASH_OVERSHOOT, DECLARED_SIZE)?;
 
-    // Build a streaming inner with `expected_size_on_store` set to the
-    // declared size. Push DECLARED bytes through Layer A (permitted),
-    // then forge the OVERSHOOT chunk by appending directly to the inner
-    // (bypassing Layer A) — emulates the regression that Layer C must
-    // defend against.
+    // Set `expected_size_on_store` to the BUFFER total (DECLARED +
+    // OVERSHOOT) so Layer B's `bytes_written > expected_size` check
+    // does NOT fire — the streaming buffer holds bytes that match its
+    // own contract. The digest itself declares only DECLARED_SIZE,
+    // however, so Layer C MUST cap the response at the declared size
+    // even though the streaming inner is internally consistent.
+    //
+    // This is structurally the same mismatch the audit names: a
+    // streaming-blob buffer that legitimately holds N bytes (per its
+    // own producer's accounting) while the CAS digest declares a
+    // smaller size — Bazel's `Read(offset=0, limit=0)` request must
+    // stop at `digest.size_bytes()`, not at the buffer's terminal.
+    let total_in_buffer = DECLARED_SIZE + OVERSHOOT_BYTES;
     let inner = Arc::new(StreamingBlobInner::new(digest, 16 * 1024 * 1024));
-    inner.set_expected_size_on_store(DECLARED_SIZE);
+    inner.set_expected_size_on_store(total_in_buffer);
     {
         let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
         writer
             .send(Bytes::from(vec![0xAB; DECLARED_SIZE as usize]))
             .await
             .expect("baseline send within cap must succeed");
-        // Forge: append the OVERSHOOT bytes directly. Layer C in the
-        // server unfold is what must truncate them.
+        // Forge: append the OVERSHOOT bytes directly via the test
+        // helper that bypasses Layer A (the writer.send admission
+        // check). Layer C in the server unfold is what must truncate
+        // them at digest.size_bytes(), independent of the buffer
+        // contents.
         inner.append_chunk_for_test(Bytes::from(vec![0xCD; OVERSHOOT_BYTES as usize]));
         writer
             .send_eof()

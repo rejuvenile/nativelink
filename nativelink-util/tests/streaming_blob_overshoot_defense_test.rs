@@ -203,9 +203,12 @@ async fn reader_silent_overshoot_marker_fires_on_bypass() {
 
     // MUTATION VERIFIED (2026-06-04): comment out the
     // `bytes_written > expected_size` overshoot branch at the top
-    // of `next_chunk`'s loop → red-fail with bespoke "Layer B
-    // emission cap missing — reader served bytes past expected_size
-    // without surfacing silent_overshoot"; reverted, green again.
+    // of `next_chunk`'s loop → red-fail with bespoke "must not
+    // deadlock — Layer B is a synchronous check" panic via the
+    // 5-second tokio::time::timeout deadline detector (with the
+    // cap removed and no chunks buffered, the reader parks on
+    // notify_rx.changed() forever, which the timeout converts
+    // into the bespoke red-fail). Reverted, green again.
 }
 
 // =====================================================================

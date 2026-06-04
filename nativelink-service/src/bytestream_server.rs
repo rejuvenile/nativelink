@@ -994,6 +994,22 @@ impl ByteStreamServer {
         Ok(Self { instance_infos })
     }
 
+    /// **Test-only accessor** for the `InFlightBlobMap` belonging to
+    /// the named instance. Used by #44 Layer C tests to inject a
+    /// pre-populated `StreamingBlobInner` whose buffer holds bytes
+    /// past `digest.size_bytes()` (a Layer-A bypass scenario), so the
+    /// server-side `inner_read` unfold cap is exercised end-to-end.
+    /// Production callers MUST go through the ByteStream Write RPC.
+    #[doc(hidden)]
+    pub fn in_flight_blobs_for_test(
+        &self,
+        instance_name: &str,
+    ) -> Option<Arc<nativelink_util::streaming_blob::InFlightBlobMap>> {
+        self.instance_infos
+            .get(instance_name)
+            .map(|i| Arc::clone(&i.in_flight_blobs))
+    }
+
     pub fn new_with_timeout(
         config: &WithInstanceName<ByteStreamConfig>,
         store_manager: &StoreManager,
@@ -1457,6 +1473,18 @@ impl ByteStreamServer {
                 } else {
                     None
                 };
+                // #44 Layer C — emission cap at `digest.size_bytes()`.
+                // Bazel's parallel-chunk Read(offset=N, limit=0) shape
+                // (`fast_slow_store.rs:6709`) does NOT set `read_limit`,
+                // so the read_limit trim below cannot guard against an
+                // in-flight streaming buffer that holds more than the
+                // declared digest size. Layer A on the producer side
+                // closes the input; Layer C is the symmetric defense at
+                // the server-side unfold, so a Layer-A regression OR an
+                // alternate-producer path that pushed past the cap is
+                // truncated at the wire-shape boundary instead of
+                // bleeding `N + Δ` bytes to Bazel as pipeline-2487 did.
+                let digest_size = digest.size_bytes();
 
                 // State: (reader, bytes_sent, read_offset, read_limit, max_bytes, leftover)
                 // `leftover` carries the unconsumed tail of a chunk that was
@@ -1464,16 +1492,18 @@ impl ByteStreamServer {
                 // when splitting large streaming chunks into gRPC responses.
                 let stream = unfold(
                     (streaming_reader, 0u64, read_offset, read_limit, max_bytes, Bytes::new()),
-                    |(mut reader, mut bytes_sent, read_offset, read_limit, max_bytes, mut leftover)| async move {
-                        // Helper: given a usable Bytes slice, apply read_limit
-                        // and max_bytes trimming, update bytes_sent, and return
-                        // the response plus any leftover.
+                    move |(mut reader, mut bytes_sent, read_offset, read_limit, max_bytes, mut leftover)| async move {
+                        // Helper: given a usable Bytes slice, apply
+                        // read_limit, digest-size (#44 Layer C), and
+                        // max_bytes trimming, update bytes_sent, and
+                        // return the response plus any leftover.
                         #[inline]
                         fn emit(
                             mut data: Bytes,
                             bytes_sent: &mut u64,
                             read_offset: u64,
                             read_limit: Option<u64>,
+                            digest_size: u64,
                             max_bytes: usize,
                         ) -> (Bytes, Bytes) {
                             // Trim to read_limit if needed.
@@ -1482,6 +1512,21 @@ impl ByteStreamServer {
                                     (*bytes_sent + data.len() as u64) - read_offset;
                                 if new_effective > limit {
                                     let overshoot = (new_effective - limit) as usize;
+                                    data = data.slice(..data.len() - overshoot);
+                                }
+                            }
+
+                            // #44 Layer C — trim to digest.size_bytes()
+                            // if the chunk would extend the response
+                            // past the declared blob size.
+                            let projected_end =
+                                *bytes_sent + data.len() as u64;
+                            if projected_end > digest_size {
+                                let overshoot =
+                                    (projected_end - digest_size) as usize;
+                                if overshoot >= data.len() {
+                                    data = Bytes::new();
+                                } else {
                                     data = data.slice(..data.len() - overshoot);
                                 }
                             }
@@ -1497,6 +1542,14 @@ impl ByteStreamServer {
 
                             *bytes_sent += data.len() as u64;
                             (data, lo)
+                        }
+
+                        // #44 Layer C — fast-path cap: if a previous
+                        // iteration already filled the response to
+                        // `digest.size_bytes()`, end the stream cleanly
+                        // before consulting the reader/leftover.
+                        if bytes_sent >= digest_size && bytes_sent >= read_offset {
+                            return None;
                         }
 
                         // Skip bytes before read_offset.
@@ -1545,7 +1598,10 @@ impl ByteStreamServer {
                                         // Respect max_bytes_per_stream, carry leftover.
                                         // Reset bytes_sent to accurate position before emit.
                                         bytes_sent = read_offset;
-                                        let (data, lo) = emit(usable, &mut bytes_sent, read_offset, read_limit, max_bytes);
+                                        let (data, lo) = emit(usable, &mut bytes_sent, read_offset, read_limit, digest_size, max_bytes);
+                                        if data.is_empty() {
+                                            return None;
+                                        }
                                         let resp = ReadResponse { data };
                                         return Some((
                                             Ok(resp),
@@ -1591,7 +1647,7 @@ impl ByteStreamServer {
                         match chunk {
                             Ok(data) if data.is_empty() => None, // EOF
                             Ok(data) => {
-                                let (data, lo) = emit(data, &mut bytes_sent, read_offset, read_limit, max_bytes);
+                                let (data, lo) = emit(data, &mut bytes_sent, read_offset, read_limit, digest_size, max_bytes);
 
                                 if data.is_empty() {
                                     return None;
