@@ -4534,6 +4534,15 @@ impl FastSlowStore {
         // #59 instrumentation: entry log per #56 RCA §8 rec 3 so journal
         // queries can correlate (Ok, Err) match-arm fires below with the
         // entering digest + size + upload_size kind.
+        //
+        // #62 Phase 2: capture entry instant so the match-arm logs can
+        // emit `entry_to_join_completion_ms`. The (Ok, Err) candidate
+        // arm's elapsed window tells us whether the consumer
+        // (`store.update` → `update_via_chunked_inner`) returned Ok
+        // within ms (transport-fast-fail looks-like-Ok) or after a
+        // realistic upload duration (legitimate consumer Ok + late
+        // producer Err).
+        let t_entry = Instant::now();
         info!(
             ?key,
             ?upload_size,
@@ -4626,10 +4635,19 @@ impl FastSlowStore {
         // receiver-disconnect symptom maps to the (Ok, Err) arm with
         // UNIDENTIFIED producer; surfacing every arm with the digest +
         // size lets a future repro pinpoint the consumer-Ok path.
+        // #62 Phase 2: elapsed window between function entry and join!
+        // completion. For the (Ok, Err) candidate arm, this answers
+        // "did write_fut return early?" — a ~ms-scale value with a
+        // multi-hundred-MiB blob means the consumer signaled Ok before
+        // the producer was anywhere near EOF; a value matching
+        // realistic upload duration means the producer's Err landed
+        // after the consumer's legitimate Ok.
+        let entry_to_join_completion_ms = t_entry.elapsed().as_millis() as u64;
         match (write_res, forward_res) {
             (Ok(()), Ok(())) => {
                 debug!(
                     ?key,
+                    entry_to_join_completion_ms,
                     arm_name = "join_ok_ok",
                     "#59 stream_file_to_store: happy path",
                 );
@@ -4639,6 +4657,7 @@ impl FastSlowStore {
                 info!(
                     ?key,
                     ?write_err,
+                    entry_to_join_completion_ms,
                     arm_name = "join_err_ok",
                     "#59 stream_file_to_store: consumer Err but producer Ok",
                 );
@@ -4650,6 +4669,7 @@ impl FastSlowStore {
                 info!(
                     ?key,
                     ?forward_err,
+                    entry_to_join_completion_ms,
                     arm_name = "join_ok_err",
                     "#59 stream_file_to_store: consumer Ok but producer Err (#56 candidate)",
                 );
@@ -4660,6 +4680,7 @@ impl FastSlowStore {
                     ?key,
                     ?write_err,
                     forward_err = ?_forward_err,
+                    entry_to_join_completion_ms,
                     arm_name = "join_err_err",
                     "#59 stream_file_to_store: both Err",
                 );
