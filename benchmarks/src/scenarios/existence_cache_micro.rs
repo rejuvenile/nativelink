@@ -161,6 +161,7 @@ fn build_existence_cache() -> Result<
             max_count: 50_000_000,
             ..Default::default()
         }),
+        log_not_found_at_info: false,
     };
     let ecs = ExistenceCacheStore::new(&ecs_spec, inner_store);
     // Hand back two views of the same store: the typed Arc for direct
