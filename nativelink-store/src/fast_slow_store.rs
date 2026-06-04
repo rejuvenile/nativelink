@@ -4628,7 +4628,7 @@ impl FastSlowStore {
         // size lets a future repro pinpoint the consumer-Ok path.
         match (write_res, forward_res) {
             (Ok(()), Ok(())) => {
-                info!(
+                debug!(
                     ?key,
                     arm_name = "join_ok_ok",
                     "#59 stream_file_to_store: happy path",

@@ -65,7 +65,7 @@ use prost::Message;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tonic::{Code, IntoRequest, Request, Response, Status, Streaming};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 // This store is usually a pass-through store, but can also be used as a CAS store. Using it as an
@@ -1354,7 +1354,7 @@ impl GrpcStore {
                     // #59 instrumentation: per #56 RCA §8 rec 2, info! at
                     // the top of the unfold closure with attempt + flags
                     // surfaces which retrier iteration is in flight.
-                    info!(
+                    debug!(
                         instance_name = %instance_name,
                         attempt,
                         is_mirror,
@@ -1408,8 +1408,8 @@ impl GrpcStore {
                                     conn_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                // #59 instrumentation: promoted to info!.
-                                info!(
+                                // #59 instrumentation: demoted to debug! (hot-loop scaffolding).
+                                debug!(
                                     instance_name = %instance_for_rpc,
                                     conn_elapsed_ms,
                                     arm_name = "conn_acquired_tcp",
@@ -1424,8 +1424,8 @@ impl GrpcStore {
                                     rpc_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                // #59 instrumentation: promoted to info!.
-                                info!(
+                                // #59 instrumentation: demoted to debug! (hot-loop scaffolding).
+                                debug!(
                                     instance_name = %instance_for_rpc,
                                     rpc_elapsed_ms,
                                     success = res.is_ok(),
@@ -1445,8 +1445,8 @@ impl GrpcStore {
                                     rpc_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                // #59 instrumentation: promoted to info!.
-                                info!(
+                                // #59 instrumentation: demoted to debug! (hot-loop scaffolding).
+                                debug!(
                                     instance_name = %instance_for_rpc,
                                     rpc_elapsed_ms,
                                     success = res.is_ok(),
@@ -1466,8 +1466,8 @@ impl GrpcStore {
                                     conn_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                // #59 instrumentation: promoted to info!.
-                                info!(
+                                // #59 instrumentation: demoted to debug! (hot-loop scaffolding).
+                                debug!(
                                     instance_name = %instance_for_rpc,
                                     conn_elapsed_ms,
                                     arm_name = "conn_acquired_dual",
@@ -1482,8 +1482,8 @@ impl GrpcStore {
                                     rpc_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
-                                // #59 instrumentation: promoted to info!.
-                                info!(
+                                // #59 instrumentation: demoted to debug! (hot-loop scaffolding).
+                                debug!(
                                     instance_name = %instance_for_rpc,
                                     rpc_elapsed_ms,
                                     success = res.is_ok(),
