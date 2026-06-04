@@ -132,12 +132,24 @@ pub const STREAMING_BLOB_SILENT_SHORT_MARKER: &str = "streaming_blob_silent_shor
 /// — i.e. the OVERSHOOT direction of the #502 silent-short defense.
 ///
 /// Sibling of `STREAMING_BLOB_SILENT_SHORT_MARKER` (which catches the `<`
-/// direction). #44 closes the symmetric `>` direction at three layers:
-/// writer admission (Layer A, primary), reader emission (Layer B,
-/// defense-in-depth against a Layer-A bypass), and server-side unfold
-/// truncation at `bytestream_server.rs:inner_read` (Layer C, defends
-/// Bazel's parallel-chunk `Read(offset=N, limit=0)` shape independently
-/// of the streaming-blob primitive's contents).
+/// direction). #44 closes the symmetric `>` direction at three different
+/// seams (not three layers of redundancy — three different seams):
+///
+/// - **Layer C** — server-side unfold truncation at
+///   `bytestream_server.rs:inner_read`, BOTH the streaming branch
+///   (`:1493`) and the at-rest branch (`:1768`). PRIMARY wire-shape
+///   defense; defends Bazel's parallel-chunk `Read(offset=N, limit=0)`
+///   shape independently of the streaming-blob primitive's contents.
+///   Closes pipeline-2487 — the four corrupted reads ALL took the
+///   at-rest branch.
+/// - **Layer A** — writer admission cap at `StreamingBlobWriter::send`.
+///   Protects the IN-FLIGHT STREAMING-BUFFER CONSUMER from observing
+///   over-bytes. NOT the wire-shape defense — its Err is intentionally
+///   swallowed at the BS Write seam (`bytestream_server.rs:~2155`).
+/// - **Layer B** — reader emission cap at
+///   `StreamingBlobReader::next_chunk`. Catches a Layer-A bypass on the
+///   streaming-buffer reader side. Structurally pairs with #502's
+///   `silent_short` check at the same site.
 ///
 /// Stable substring contract: production journal greps
 /// (`grep streaming_blob_silent_overshoot`) trip on the same byte
@@ -567,18 +579,45 @@ impl StreamingBlobWriter {
     /// After appending, evicts the oldest chunks if the total
     /// buffered bytes exceed `max_buffer_bytes`.
     ///
-    /// **#44 Layer A — admission cap.** If the chunk would push
-    /// `bytes_written` past `expected_size_on_store_or_digest` (#49's
-    /// accessor: the producer-supplied authoritative size if set, else
+    /// **#44 Layer A — admission cap for the in-flight streaming
+    /// buffer.** If the chunk would push `bytes_written` past
+    /// `expected_size_on_store_or_digest` (#49's accessor: the
+    /// producer-supplied authoritative size if set, else
     /// `digest.size_bytes()`), the chunk is REJECTED — the over-bytes
     /// never enter the buffer, and no atomic state advances. Error
     /// carries the `STREAMING_BLOB_SILENT_OVERSHOOT_MARKER` substring
     /// for journal grep. Closes the OVERSHOOT direction of the silent-
     /// short class symmetrically with the #502 `<` check in
-    /// `StreamingBlobReader::next_chunk`. Pipeline-2487's
-    /// `Read(offset=N, limit=0) → N + Δ` shape is closed at this seam
-    /// (primary) with Layer B (reader emission cap) and Layer C
-    /// (server unfold cap) as defense-in-depth.
+    /// `StreamingBlobReader::next_chunk`.
+    ///
+    /// **Layer priorities, corrected post-pipeline-2487 audit
+    /// (`.claude/audits/45-pipeline-2487-overshoot-trigger-2026-06-04.md`):**
+    ///
+    /// - **Layer C** (server unfold caps at `bytestream_server.rs:1493`
+    ///   streaming-branch AND `:1768` at-rest branch) is the
+    ///   LOAD-BEARING WIRE-SHAPE defense. The four corrupted reads in
+    ///   pipeline-2487 ALL took the at-rest branch, where no Layer A
+    ///   exists (there is no streaming-buffer for committed-CAS reads).
+    ///   Layer C is the only defense that closes the wire-shape across
+    ///   ALL inner_read paths.
+    /// - **Layer A** (this method) protects the IN-FLIGHT READ-WHILE-
+    ///   WRITE STREAMING-BUFFER CONSUMER from observing over-bytes by
+    ///   never letting them into the buffer. It is NOT the wire-shape
+    ///   defense — Layer A's Err is intentionally swallowed at the BS
+    ///   Write seam (`bytestream_server.rs:~2155`) because the
+    ///   durability path (store + mirror) is decoupled from the
+    ///   streaming-buffer admission cap; the durability chain runs its
+    ///   own VerifyStore digest match.
+    /// - **Layer B** (reader emission cap at
+    ///   `StreamingBlobReader::next_chunk`) catches a Layer-A bypass on
+    ///   the streaming-buffer consumer side. Structurally pairs with
+    ///   #502's `<` silent_short check at the same site so both
+    ///   directions of the overshoot/short class surface uniformly to
+    ///   the read-while-write consumer.
+    ///
+    /// The three layers are NOT redundant — they cover three different
+    /// seams. Pipeline-2487 fires whenever Layer C is absent on any
+    /// inner_read branch, regardless of A/B state.
     pub async fn send(&self, chunk: Bytes) -> Result<(), Error> {
         if self.inner.is_terminal() {
             return Err(make_err!(

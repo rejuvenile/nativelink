@@ -2153,11 +2153,52 @@ impl ByteStreamServer {
 
                     // Append chunk to the streaming blob so concurrent readers
                     // can consume data before the store write completes.
+                    //
+                    // **#44 BS Write seam — Layer A Err is INTENTIONALLY
+                    // swallowed at this seam.** `sbw.send` is the producer
+                    // side of the in-flight streaming buffer; its Err return
+                    // (carrying `STREAMING_BLOB_SILENT_OVERSHOOT_MARKER`)
+                    // rejects bytes that would overshoot the
+                    // streaming-buffer's declared upper bound. That
+                    // rejection protects the streaming-buffer's
+                    // read-while-write CONSUMERS — it does NOT protect the
+                    // durability path. The durability path is the
+                    // `tx.send(data).await` below: those bytes flow into
+                    // `store.update(...)` and the mirror, both of which run
+                    // their own validation (`VerifyStore` digest check at
+                    // the slow tier; mirror's own `VerifyStore` at the
+                    // worker side). If a Layer A reject happens here we
+                    // log at `debug!` and fall through; the store +
+                    // mirror chain is the durability authority and will
+                    // independently reject a bad-byte upload at the digest
+                    // check, surfacing as a regular `update` Err to the
+                    // client.
+                    //
+                    // Architectural note (CLAUDE.md "no architectural
+                    // change without sign-off"): tightening Layer A's Err
+                    // into a tonic Status return would couple the
+                    // streaming-buffer admission cap to the
+                    // durability-write path's success/failure. Today
+                    // those are decoupled — the streaming buffer is best-
+                    // effort observability for in-flight readers, while
+                    // the store + mirror chain is the durability
+                    // authority. Keeping them decoupled means a
+                    // read-while-write reader can be denied over-bytes
+                    // (Layer A working) WITHOUT failing the durability
+                    // write, which would in turn fail a Bazel upload that
+                    // the durability chain would have accepted (the
+                    // bytes might be acceptable to the store after a
+                    // VerifyStore digest match).
                     if let Some(sbw) = streaming_blob_writer {
                         // Errors here are non-fatal — the streaming blob may
-                        // have been terminated by a previous error.
+                        // have been terminated by a previous error, OR Layer
+                        // A's OVERSHOOT cap (#44) rejected a chunk that
+                        // would have pushed `bytes_written` past
+                        // `expected_size_on_store_or_digest`. Either way,
+                        // continue to the durability `tx.send` below; the
+                        // store + mirror chain is the durability authority.
                         if let Err(e) = sbw.send(data.clone()).await {
-                            debug!(?e, "streaming blob send failed, continuing store write");
+                            debug!(?e, "streaming blob send failed (terminated, or #44 Layer A overshoot reject), continuing store write");
                         }
                     }
 
