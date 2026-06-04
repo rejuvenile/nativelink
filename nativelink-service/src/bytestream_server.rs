@@ -2598,7 +2598,7 @@ impl ByteStreamServer {
         // a code change that doesn't exist today — `expected_size as
         // i64` is unconditional here) or whether the client-side
         // fabrication happens elsewhere.
-        info!(
+        debug!(
             %digest,
             committed_size = expected_size as i64,
             expected_size,
@@ -2837,7 +2837,7 @@ impl ByteStreamServer {
         // can distinguish chunked-path WriteResponse from oneshot
         // WriteResponse (different upstream code paths in worker
         // GrpcStore).
-        info!(
+        debug!(
             %digest,
             committed_size = expected_size as i64,
             expected_size,

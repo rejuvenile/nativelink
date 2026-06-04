@@ -2739,7 +2739,7 @@ impl GrpcStore {
             Ok(committed_bytes) => {
                 let delta = expected_size as i64 - *committed_bytes as i64;
                 if delta == 0 {
-                    info!(
+                    debug!(
                         %digest,
                         committed_bytes = *committed_bytes,
                         expected_size,
