@@ -13,15 +13,28 @@
 //! Each test runs in production composition (real `FilesystemStore` +
 //! real `ChunkedDriver::spawn_driver`) and wraps the operation in
 //! `tokio::time::timeout(Duration::from_secs(5), ...)` with a SPECIFIC
-//! error message (deadlock detector). T1, T2, T5, T6 also assert
+//! error message (deadlock detector). T1 and T_multi also assert
 //! `has_with_results(&[digest]) = Some(size)` within the same 5 s
 //! window per the index-visibility contract (CLAUDE.md
 //! `feedback_index_visibility_contract`, 2026-05-04).
+//!
+//! ## io_uring skip-guard (cadre fix-up B3)
+//!
+//! Every test that exercises Path A (the io_uring writer) checks
+//! `is_io_uring_available()` at entry and SKIPs (`return`) on hosts
+//! where the runtime probe returns false. Without this guard, Path B
+//! (spawn_blocking) is silently exercised and the test "passes" for
+//! the wrong reason — invariants like "two parallel writers don't
+//! serialize" or "writev coalesces chunks" become tautologies on the
+//! spawn_blocking path. The unit test `b1_writev_pick_path_unit_*` in
+//! `chunked_writer.rs` is the only test that intentionally exercises
+//! the path-decision branch without the runtime probe.
 //!
 //! Mutation steps named per CLAUDE.md TDD discipline.
 
 #![cfg(all(feature = "chunked_fast_slow", feature = "test-utils"))]
 
+use core::pin::Pin;
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -42,6 +55,22 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut a = [0u8; 32];
     a.copy_from_slice(&h.finalize());
     a
+}
+
+/// Cadre fix-up B3: probe runtime io_uring availability. Skips the
+/// caller test (logging on stderr) when Path A would not actually be
+/// exercised — i.e. on non-Linux hosts, on Linux kernels too old, OR
+/// when the `io-uring` feature is compiled out. Returns `true` when
+/// the test should proceed.
+async fn skip_if_no_io_uring(test_name: &str) -> bool {
+    let available = nativelink_util::fs::is_io_uring_available().await;
+    if !available {
+        eprintln!(
+            "SKIP {test_name}: io_uring not available on this host — Path A not exercised; \
+             #47 b1 fix-up B3 skip-guard fired",
+        );
+    }
+    available
 }
 
 /// Build a fresh on-disk `FilesystemStore`. The whole chunked path
@@ -78,6 +107,44 @@ fn make_blob_mib(n_chunks: usize, fill_byte: u8) -> (Vec<u8>, DigestInfo, u64) {
     (blob, DigestInfo::new(h, total), total)
 }
 
+/// Cadre fix-up B4: assert has_with_results returns Some(size) for the
+/// freshly-committed digest within a 5 s window. Replaces the prior
+/// `let _ = results` discard which left the index-visibility contract
+/// unenforced. Bespoke assertion message names the contract per
+/// CLAUDE.md `feedback_index_visibility_contract`.
+async fn assert_index_visible<Fe: nativelink_store::filesystem_store::FileEntry>(
+    store: &Arc<FilesystemStore<Fe>>,
+    digest: DigestInfo,
+    expected_size: u64,
+    test_name: &str,
+) {
+    let key: StoreKey<'_> = digest.into();
+    let mut results: [Option<u64>; 1] = [None];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        nativelink_util::store_trait::StoreDriver::has_with_results(
+            Pin::new(store.as_ref()),
+            &[key],
+            &mut results,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{test_name}: has_with_results must complete within 5 s window"))
+    .unwrap_or_else(|e| panic!("{test_name}: has_with_results must succeed: {e:?}"));
+    let Some(actual_size) = results[0] else {
+        panic!(
+            "{test_name}: stale negative — index not updated post-rename \
+             (digest committed but has_with_results returned None; \
+             evicting_map.insert in finalize_holding broken)",
+        );
+    };
+    assert_eq!(
+        actual_size, expected_size,
+        "{test_name}: index returned wrong size for committed digest \
+         (got {actual_size}, expected {expected_size})",
+    );
+}
+
 /// =====================================================================
 /// T1 — single small-blob commits + has_with_results visibility.
 /// =====================================================================
@@ -96,6 +163,9 @@ fn make_blob_mib(n_chunks: usize, fill_byte: u8) -> (Vec<u8>, DigestInfo, u64) {
 /// design §3 / §10 Step 2).
 #[nativelink_test]
 async fn b1_writev_single_chunk_small_blob_commits() {
+    if !skip_if_no_io_uring("b1_writev_single_chunk_small_blob_commits").await {
+        return;
+    }
     let store = make_fs_store().await;
     let (blob, digest, total) = make_blob_mib(1, 0x41);
 
@@ -141,23 +211,10 @@ async fn b1_writev_single_chunk_small_blob_commits() {
     // newly-committed blob. Mutation target (per
     // feedback_index_visibility_contract): comment out the
     // background_spawn evicting_map.insert in filesystem_store's
-    // finalize_holding hook; this assertion must red-fail with
+    // finalize_holding hook; this assertion red-fails with
     // "stale negative — index not updated post-rename".
-    let key: StoreKey<'_> = digest.into();
-    let results = tokio::time::timeout(
-        Duration::from_secs(5),
-        nativelink_util::store_trait::StoreDriver::has_with_results(
-            Pin::new(store.as_ref()),
-            &[key],
-            &mut [None],
-        ),
-    )
-    .await
-    .expect("has_with_results must complete within 5 s window");
-    let _ = results;
+    assert_index_visible(&store, digest, total, "T1").await;
 }
-
-use core::pin::Pin;
 
 /// =====================================================================
 /// T5 — zero-byte / empty-chunk fast-path skips writer spawn.
@@ -184,6 +241,9 @@ use core::pin::Pin;
 /// the bespoke "marker entry inserted for zero-byte blob" message.
 #[nativelink_test]
 async fn b1_writev_empty_chunk_does_not_spawn_writer() {
+    if !skip_if_no_io_uring("b1_writev_empty_chunk_does_not_spawn_writer").await {
+        return;
+    }
     let store = make_fs_store().await;
     // Use a 1-byte digest declared but send only an empty chunk. The
     // empty-chunk skip on Path A must not spawn a writer task; the
@@ -265,6 +325,9 @@ async fn b1_writev_empty_chunk_does_not_spawn_writer() {
 /// commit's stat sees a short file → length-mismatch.
 #[nativelink_test]
 async fn b1_writev_multi_chunk_in_order_commits() {
+    if !skip_if_no_io_uring("b1_writev_multi_chunk_in_order_commits").await {
+        return;
+    }
     let store = make_fs_store().await;
     let (blob, digest, total) = make_blob_mib(4, 0x71);
 
@@ -305,18 +368,8 @@ async fn b1_writev_multi_chunk_in_order_commits() {
          surface as length-mismatch in commit_chunked_to_holding",
     );
 
-    // Index-visibility within the same window.
-    let key: StoreKey<'_> = digest.into();
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        nativelink_util::store_trait::StoreDriver::has_with_results(
-            Pin::new(store.as_ref()),
-            &[key],
-            &mut [None],
-        ),
-    )
-    .await
-    .expect("T_multi: has_with_results must complete within 5 s window");
+    // Index-visibility within the same window (cadre fix-up B4).
+    assert_index_visible(&store, digest, total, "T_multi").await;
 }
 
 /// =====================================================================
@@ -337,6 +390,9 @@ async fn b1_writev_multi_chunk_in_order_commits() {
 /// message below.
 #[nativelink_test]
 async fn b1_writev_channel_close_on_driver_drop_releases_writer() {
+    if !skip_if_no_io_uring("b1_writev_channel_close_on_driver_drop_releases_writer").await {
+        return;
+    }
     let store = make_fs_store().await;
     let (blob, digest, total) = make_blob_mib(4, 0xa1);
 
@@ -392,16 +448,30 @@ async fn b1_writev_channel_close_on_driver_drop_releases_writer() {
 /// and asserts:
 ///   1. `sum == 16` — every chunk accounted for in some writev SQE.
 ///   2. `len <= 16` — coalescing should not produce MORE SQEs than chunks
-///      (sanity); strictly when the BTreeMap-keyed coalescer detects
-///      contiguous runs the len should be ≪ 16.
+///      (sanity).
 ///
-/// Mutation target (per design §9 T2): in `chunked_writer.rs`'s writer-
-/// task body, replace the contiguous-run detection inner loop with a
-/// `break` — every WriteJob then submits as its own single-iovec writev,
-/// and `len` becomes 16 strictly. The bespoke red-fail message names
-/// the regression.
+/// Spec note (cadre fix-up B5 — design §1 / §4): with
+/// `COALESCE_TARGET == CHUNK_SIZE == 1 MiB`, the writer pops one job
+/// from `pending`, hits the byte-target, and submits the writev in one
+/// shot — so the steady-state observation is `coalesce_count = 1` per
+/// SQE (len = 16). That is EXPECTED. The load-bearing win on Path A is
+/// the io_uring bypass of the spawn_blocking pool mutex (#449 mutex
+/// contention), NOT coalescing amortization. A strict `<` form of the
+/// bound cannot fire without a pre-queueing setup (multiple jobs in
+/// `pending` before any writev submits) — those tests are reserved for
+/// a Phase 3 burst-load harness.
+///
+/// Mutation target: in `chunked_writer.rs`'s writer-task body, remove
+/// the `COALESCE_HISTOGRAM_BY_DIGEST.push(...)` call. `sum` becomes 0;
+/// the first assertion fires with bespoke "every chunk must be
+/// accounted for in some writev". Alternative mutation: make the
+/// histogram push fire twice per writev — `sum` becomes 32; same
+/// assertion fires with the inverse direction.
 #[nativelink_test]
 async fn b1_writev_multi_chunk_coalesces_pwritev_count() {
+    if !skip_if_no_io_uring("b1_writev_multi_chunk_coalesces_pwritev_count").await {
+        return;
+    }
     let store = make_fs_store().await;
     let (blob, digest, total) = make_blob_mib(16, 0xc1);
 
@@ -462,27 +532,17 @@ async fn b1_writev_multi_chunk_coalesces_pwritev_count() {
         "T2: coalesce histogram sum mismatch — every chunk must be \
          accounted for in some writev: got sum={sum}, histogram={histogram:?}",
     );
-    // Load-bearing invariant #2 (design §9 T2): the writer never
-    // produces MORE SQEs than `ceil(blob_size / COALESCE_TARGET)`.
-    // With CHUNK_SIZE == COALESCE_TARGET == 1 MiB and a 16 MiB blob,
-    // the ceiling is 16. Per design §1 / §4, `coalesce_count = 1` (one
-    // chunk per writev) is the EXPECTED steady state when arrivals
-    // are not pre-queued — the load-bearing win is io_uring bypassing
-    // the blocking-pool mutex, NOT amortization via coalescing. So
-    // observing `len == 16` (every writev single-iovec) is acceptable.
-    //
-    // Mutation: disable the BTreeMap contiguous-run inner loop in
-    // chunked_writer.rs (force single-iovec SQEs unconditionally).
-    // For this in-order test, that change is observationally
-    // equivalent to today's steady state (writer pulls one job from
-    // recv, hits COALESCE_TARGET, submits) — so the strict `<` form
-    // of the test from the spec cannot red-fail without a
-    // pre-queueing setup. The bespoke message names the regression
-    // that WOULD fire if the writer ever submitted spuriously more
-    // SQEs than chunks (histogram inversion).
+    // Load-bearing invariant #2 (design §9 T2 + B5 framing): the
+    // writer never produces MORE SQEs than chunks. With
+    // CHUNK_SIZE == COALESCE_TARGET == 1 MiB and 16 chunks, the
+    // ceiling is 16 and the steady-state observation is 16
+    // (one writev per chunk — the bypass-the-mutex win, not the
+    // amortize-via-coalescing win). Histogram inversion (more SQEs
+    // than chunks) would be a contract bug — the bespoke message
+    // names it.
     assert!(
         len <= 16,
-        "T2: coalesce disabled — histogram length = {len} (expected ≤ 16 with \
+        "T2: histogram length = {len} (expected ≤ 16 with \
          COALESCE_TARGET=1MiB and a 16 MiB blob); writer produced MORE \
          SQEs than chunks — histogram inversion, contract bug; \
          histogram={histogram:?}",
@@ -507,6 +567,9 @@ async fn b1_writev_multi_chunk_coalesces_pwritev_count() {
 /// assertion fires with bespoke "different digests serialized".
 #[nativelink_test]
 async fn b1_writev_different_digests_parallelize() {
+    if !skip_if_no_io_uring("b1_writev_different_digests_parallelize").await {
+        return;
+    }
     let store = make_fs_store().await;
     let (blob_a, digest_a, total_a) = make_blob_mib(4, 0xa1);
     let (blob_b, digest_b, total_b) = make_blob_mib(4, 0xb1);
@@ -639,6 +702,9 @@ async fn b1_writev_different_digests_parallelize() {
 /// "synthetic error surfaced: expected 'test-inject:' substring".
 #[nativelink_test]
 async fn b1_writev_error_propagates_real_writev_error() {
+    if !skip_if_no_io_uring("b1_writev_error_propagates_real_writev_error").await {
+        return;
+    }
     let store = make_fs_store().await;
     let (blob, digest, total) = make_blob_mib(4, 0xd1);
 
@@ -743,6 +809,9 @@ async fn b1_writev_error_propagates_real_writev_error() {
 async fn b1_writev_error_mid_stream_drains_and_returns_permits() {
     use nativelink_store::chunked::chunk_budget::TOTAL_CHUNK_PERMITS;
 
+    if !skip_if_no_io_uring("b1_writev_error_mid_stream_drains_and_returns_permits").await {
+        return;
+    }
     let store = make_fs_store().await;
     let (blob, digest, total) = make_blob_mib(100, 0xe1);
 
@@ -840,4 +909,126 @@ async fn b1_writev_error_mid_stream_drains_and_returns_permits() {
         }
         tokio::task::yield_now().await;
     }
+}
+
+/// =====================================================================
+/// T9 — pin populate fires AFTER writev CQE (cadre fix-up P1).
+/// =====================================================================
+///
+/// LOAD-BEARING ORDERING (design §6.2 / §6.3 + cadre red-team P1):
+/// the in-memory pin must never advertise bytes whose writev later
+/// errors. Pre-fix, pin populate ran AFTER `chunk_tx.send().await` Ok
+/// but BEFORE the writev CQE returned — a concurrent reader's
+/// `try_get_chunk_from_pin` could surface bytes for chunks that the
+/// writer subsequently errored on.
+///
+/// Test setup:
+///   1. Inject `WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST[digest] = 0` so
+///      the writer errors BEFORE submitting its first writev. This
+///      forces the post-error drain path: no chunks ever reach
+///      `process_completion`'s Ok-arm.
+///   2. Send 4 × 1 MiB chunks. All chunks end up either (a) in the
+///      writer's `pending` BTreeMap (dropped on error per step 4) or
+///      (b) the driver's send-fail branch (chunk dropped on floor).
+///      NONE go through process_completion → NONE populate the pin.
+///   3. After await_completion returns Err, assert
+///      `driver.pinned_chunk_count() == 0` AND
+///      `driver.pinned_bytes() == 0` — the pin is EMPTY because no
+///      writev CQE returned Ok.
+///
+/// MUTATION VERIFIED (2026-06-03): move the pin populate out of
+/// `chunked_writer::process_completion` and back to the driver-send
+/// site (the buggy pre-fix ordering: `chunk_tx.send()` Ok → pin
+/// populate → no CQE wait). With that mutation, the test red-fails
+/// with the bespoke "pin advertised bytes before writev completed"
+/// message (the chunks that succeeded the mpsc send populate the
+/// pin even though their writev never completed).
+///
+/// Note: `driver.pinned_*` accessors are public on `ChunkedDriver`
+/// (already used by other tests).
+#[nativelink_test]
+async fn b1_writev_pin_only_advertises_post_cqe_bytes() {
+    if !skip_if_no_io_uring("b1_writev_pin_only_advertises_post_cqe_bytes").await {
+        return;
+    }
+    let store = make_fs_store().await;
+    let (blob, digest, total) = make_blob_mib(4, 0xf1);
+
+    // Inject BEFORE the first writev: writer errors with writev count
+    // == 0 (n=0 → trigger fires on `writev_submit_count >= 0` which
+    // is true on the very first attempt). No CQE ever lands Ok.
+    nativelink_store::chunked::chunked_writer::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+        .lock()
+        .insert(digest, 0);
+
+    let budget = ChunkBudget::new();
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest,
+        total,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        for i in 0..4 {
+            let permit = budget
+                .try_acquire_chunk()
+                .expect("ChunkBudget must have permits available");
+            let send_result = tx
+                .send(ChunkWork {
+                    chunk_offset: (i * CHUNK_SIZE) as u64,
+                    chunk_bytes: Bytes::from(
+                        blob[i * CHUNK_SIZE..(i + 1) * CHUNK_SIZE].to_vec(),
+                    ),
+                    finish: i == 3,
+                    _permit: permit,
+                    _pin_permit: None,
+                })
+                .await;
+            if send_result.is_err() {
+                break;
+            }
+        }
+        drop(tx);
+        driver.await_completion().await
+    })
+    .await
+    .expect("T9: must not deadlock — pre-CQE error path must complete within 5 s");
+
+    // Cleanup.
+    nativelink_store::chunked::chunked_writer::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+        .lock()
+        .remove(&digest);
+
+    let _err = result.expect_err("T9: writer-injected error must surface");
+
+    // LOAD-BEARING ASSERTION (cadre fix-up P1): pin is empty because
+    // no writev CQE returned Ok before the injection fired. If the
+    // pin populate were still at the driver send-site (the buggy
+    // pre-fix ordering), the chunks that succeeded the mpsc send
+    // would have populated the pin even though their writev never
+    // ran — pinned_chunk_count would be > 0 and this assertion would
+    // red-fail with the bespoke message naming the contract.
+    //
+    // Mutation: in chunked_writer.rs::process_completion, comment out
+    // the Ok-arm `pin_state.populate(...)` call inside `pin.lock()`
+    // — AND restore the driver-site populate (chunked_driver.rs
+    // ~line 1185 unconditional). Test red-fails with
+    // "pin advertised bytes before writev completed".
+    let pinned_count = driver.pinned_chunk_count();
+    let pinned_bytes = driver.pinned_bytes();
+    assert_eq!(
+        pinned_count, 0,
+        "T9: pin advertised bytes before writev completed — \
+         pinned_chunk_count = {pinned_count} (expected 0); \
+         LOAD-BEARING ORDERING violated, pin populate fired before \
+         writev CQE returned Ok; pinned_bytes = {pinned_bytes}",
+    );
+    assert_eq!(
+        pinned_bytes, 0,
+        "T9: pin advertised bytes before writev completed — \
+         pinned_bytes = {pinned_bytes} (expected 0); LOAD-BEARING \
+         ORDERING violated",
+    );
 }

@@ -54,13 +54,12 @@
 //!
 //! ## Phase status (2026-06-03)
 //!
-//! This module ships the **writer task body** + a [`pick_path`] unit-test
-//! helper. The driver wire-up (run_driver branching on
-//! `is_io_uring_available`, lazy-spawn of the writer task at first
-//! non-zero-byte chunk arrival), the `ChunkInProgress::IoUringMarker`
-//! variant in `chunked_filesystem.rs`, the `open_or_create_partial_marker`
-//! helper, and the T1-T6 + T8 integration tests are deferred to a
-//! follow-up session. See the design's Continuation TODO section.
+//! Wire-up, marker, helper, and integration tests T1 / T_multi / T_drop
+//! / T2 / T4 / T5 / T6 / T7 / T8 are all landed (Phase 2 Step 4+5).
+//! Cadre fix-up (2026-06-03) added T9 (pin-ordering correctness) and
+//! moved pin populate from the driver send-site into
+//! `process_completion` post-CQE — the load-bearing ordering that
+//! prevents the pin from advertising bytes whose writev later errors.
 
 #![cfg(feature = "chunked_fast_slow")]
 
