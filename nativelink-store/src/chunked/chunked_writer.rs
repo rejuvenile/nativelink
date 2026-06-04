@@ -69,6 +69,56 @@ use std::sync::OnceLock;
 
 use tracing::info;
 
+// ---------------------------------------------------------------------
+// Test-only probes (T2, T4, T6, T8 — design §9)
+// ---------------------------------------------------------------------
+//
+// These probes are gated on `#[cfg(any(test, feature = "test-utils"))]`
+// so cross-crate integration tests in
+// `nativelink-store/tests/chunked_b1_writev_test.rs` (which enable the
+// `test-utils` feature via `[dev-dependencies]`) can read/write them.
+// Production binaries (no `test-utils`, no `cfg(test)`) compile these
+// branches out entirely — same pattern as
+// `chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST` (existing).
+
+/// Test-only error-injection probe for T6 + T8 (design §9). Tests insert
+/// a per-digest threshold `N`; the writer task synthesizes
+/// `Err(io::Error::other("test-inject: writer error at writev count N"))`
+/// on its (N+1)th writev submission for that digest. The error flows
+/// through the standard `first_error` → drain-rx → return-Err path, so
+/// T8's permits-returned assertion exercises real production drain
+/// behavior (not a special test-only path).
+///
+/// Production builds compile the lookup out via the `cfg(test)`
+/// `cfg(feature = "test-utils")` gates inside `writer_task`.
+#[cfg(any(test, feature = "test-utils"))]
+pub static WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<nativelink_util::common::DigestInfo, u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Test-only coalesce-count probe for T2 (design §9). The writer task
+/// pushes `coalesce_count` (number of iovecs in the SQE) for every
+/// `writev` submission. Tests read the histogram after the writer task
+/// completes to assert `sum == expected_chunks_total` (every chunk
+/// accounted for in some writev) AND
+/// `len <= ceil(blob_size / COALESCE_TARGET)` (coalescing actually
+/// amortized).
+#[cfg(any(test, feature = "test-utils"))]
+pub static COALESCE_HISTOGRAM: std::sync::LazyLock<parking_lot::Mutex<Vec<u32>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// Test-only per-blob first-writev timestamp probe for T4 (design §9).
+/// The writer task records the time it submits its FIRST writev SQE for
+/// each digest. T4 launches two blobs in parallel via `tokio::join!` and
+/// asserts the two timestamps fall within 100 ms — proving no global
+/// serialization across different digests.
+#[cfg(any(test, feature = "test-utils"))]
+pub static WRITER_START_AT_BY_DIGEST: std::sync::LazyLock<
+    parking_lot::Mutex<
+        std::collections::HashMap<nativelink_util::common::DigestInfo, std::time::Instant>,
+    >,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
 /// #47 b1 Phase 2 Step 4 / design §5 / I10: one-time activation probe.
 ///
 /// Cached value of `is_io_uring_available()` after first observation
@@ -134,6 +184,7 @@ mod io_uring_impl {
     use futures::FutureExt;
     use futures::stream::{FuturesUnordered, StreamExt};
     use nativelink_error::{Code, Error, make_err};
+    use nativelink_util::common::DigestInfo;
     use tokio::sync::mpsc;
     use tokio::sync::OwnedSemaphorePermit;
     use tracing::warn;
@@ -220,6 +271,7 @@ mod io_uring_impl {
     /// reference (besides whatever in-flight writev futures clone
     /// internally) and the fd closes when the task exits.
     pub async fn writer_task(
+        digest: DigestInfo,
         fd_arc: Arc<std::fs::File>,
         mut chunk_rx: mpsc::Receiver<WriteJob>,
     ) -> Result<(), Error> {
@@ -229,6 +281,13 @@ mod io_uring_impl {
             std::pin::Pin<Box<dyn std::future::Future<Output = WriteCompletion> + Send>>,
         > = FuturesUnordered::new();
         let mut first_error: Option<Error> = None;
+        // T2/T6/T8 probe support: number of writev SQEs submitted by this
+        // task so far. Used to (a) compute `WRITER_INJECT_ERROR_AFTER_N`
+        // trigger threshold, (b) push to `COALESCE_HISTOGRAM`, (c) decide
+        // whether we are submitting the FIRST writev for `WRITER_START_AT_BY_DIGEST`.
+        // Production builds don't reference the probes, but the counter
+        // itself is cheap (one local u64 increment per writev).
+        let mut writev_submit_count: u64 = 0;
 
         loop {
             // 1. Drain ready completions opportunistically (non-blocking).
@@ -381,6 +440,60 @@ mod io_uring_impl {
 
                 let coalesce_count = iovecs.len();
                 let submit_time = Instant::now();
+
+                // T2 probe (design §9): record coalesce_count for every
+                // writev SQE so the test can assert sum == expected
+                // chunks AND len <= ceil(blob_size / COALESCE_TARGET).
+                #[cfg(any(test, feature = "test-utils"))]
+                {
+                    super::COALESCE_HISTOGRAM
+                        .lock()
+                        .push(coalesce_count as u32);
+                }
+
+                // T4 probe (design §9): on the FIRST writev for this
+                // digest, record submission timestamp. T4 launches two
+                // blobs in parallel and asserts the two start times
+                // differ by < 100 ms — proves no global serialization.
+                #[cfg(any(test, feature = "test-utils"))]
+                if writev_submit_count == 0 {
+                    super::WRITER_START_AT_BY_DIGEST
+                        .lock()
+                        .insert(digest, submit_time);
+                }
+
+                // T6/T8 probe (design §9): if the per-digest threshold
+                // is reached, synthesize an Err that flows through the
+                // normal first_error → drain-rx path. This skips
+                // submitting THIS writev (and any subsequent writev)
+                // so the test can assert (T6) the substring survives
+                // through driver's `expect_err` and (T8) all permits
+                // return to ChunkBudget via the post-error drain.
+                #[cfg(any(test, feature = "test-utils"))]
+                {
+                    let trigger = super::WRITER_INJECT_ERROR_AFTER_N_BY_DIGEST
+                        .lock()
+                        .get(&digest)
+                        .copied();
+                    if let Some(n) = trigger {
+                        if writev_submit_count >= n {
+                            first_error = Some(make_err!(
+                                Code::Internal,
+                                "test-inject: writer error at writev count {n}",
+                            ));
+                            // Drop pending → permits drop. Skip the
+                            // submission so no further writev SQEs go
+                            // out; the outer loop's first_error check
+                            // will drain chunk_rx on subsequent
+                            // iterations.
+                            drop(pending);
+                            break;
+                        }
+                    }
+                }
+
+                writev_submit_count += 1;
+
                 let write_fut = system.writev(
                     Arc::clone(&fd_arc),
                     start_offset,

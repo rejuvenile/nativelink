@@ -958,7 +958,7 @@ async fn run_driver<Fe: FileEntry>(
                                 super::chunked_writer::WRITE_PIPELINE_DEPTH,
                             );
                             let handle = tokio::spawn(
-                                super::chunked_writer::writer_task(fd_arc, chunk_rx),
+                                super::chunked_writer::writer_task(digest, fd_arc, chunk_rx),
                             );
                             writer_state = Some((chunk_tx, handle));
                         }
