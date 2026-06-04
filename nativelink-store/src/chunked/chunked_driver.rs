@@ -395,8 +395,15 @@ struct SidecarState {
 /// `SidecarState`: every critical section is short (insert + return),
 /// never holds across an `.await`. The accessor builds the assembled
 /// range via successive `Bytes::slice` calls — also non-blocking.
+// #47 b1 fix-up P1: visibility narrowed to `pub(super)` so the
+// io_uring writer task (`super::chunked_writer`) can call
+// `populate` on the pin from inside `process_completion` AFTER
+// the writev CQE returns Ok. The driver-side fallback (Path B,
+// `write_chunk_at_offset`) still calls `populate` on the
+// success arm at chunked_driver.rs:~1185 once the chunked
+// adapter returns. Pin remains module-private to `chunked`.
 #[derive(Debug, Default)]
-struct ChunkPin {
+pub(super) struct ChunkPin {
     /// Map of byte-offset → chunk bytes. Memory cost = sum of chunk
     /// lengths held while the driver is in-flight. Bounded by the
     /// per-blob mpsc cap (`PER_BLOB_MPSC_CAP * CHUNK_SIZE = 256 MiB`)
@@ -420,6 +427,38 @@ struct ChunkPin {
     /// `tokio::sync::OwnedSemaphorePermit`); a `Vec` is simpler and
     /// amortizes to one `Arc` bump per chunk.
     pin_permits: Vec<OwnedSemaphorePermit>,
+}
+
+impl ChunkPin {
+    /// #47 b1 fix-up P1 (LOAD-BEARING ORDERING): insert a chunk's bytes
+    /// and adjust `total_bytes`, then push the optional `PinBudget`
+    /// permit. Called from the io_uring writer task's
+    /// `process_completion` ONLY AFTER `writev` CQE returns Ok(n) ==
+    /// expected length — preserves the design §6.2 / §6.3 contract that
+    /// the pin never advertises bytes that aren't on disk yet. Called
+    /// from the driver's Path B success arm directly (the
+    /// `write_chunk_at_offset` adapter has already awaited the
+    /// `spawn_blocking` pwrite, so disk-visibility holds).
+    ///
+    /// Replace semantics on duplicate offset: matches the prior
+    /// driver-site code path — a duplicate-offset arrival (already
+    /// warned about as a producer protocol violation) overwrites and
+    /// adjusts `total_bytes` so the cached total stays honest.
+    pub(super) fn populate(
+        &mut self,
+        offset: u64,
+        bytes: Bytes,
+        pin_permit: Option<OwnedSemaphorePermit>,
+    ) {
+        let bytes_len = bytes.len() as u64;
+        if let Some(prev) = self.chunks.insert(offset, bytes) {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.len() as u64);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(bytes_len);
+        if let Some(perm) = pin_permit {
+            self.pin_permits.push(perm);
+        }
+    }
 }
 
 /// Per-blob driver task handle.
@@ -923,6 +962,16 @@ async fn run_driver<Fe: FileEntry>(
         // `back_edge_ms` to reflect this.
         let bytes_for_write = chunk_bytes.clone();
         let pwrite_started_at = std::time::Instant::now();
+        // #47 b1 fix-up P1 (LOAD-BEARING ORDERING): on Path A non-empty
+        // chunks, pin populate moves into the writer task's
+        // `process_completion` post-CQE. The driver-side pin populate
+        // below (line ~1185) is then a no-op for those chunks. Path B
+        // and Path A empty-chunks still populate the pin from the
+        // driver site. `pin_permit_for_path_b_or_empty` retains the
+        // `_pin_permit` for those paths; on Path A non-empty the
+        // permit is moved into the `WriteJob`.
+        let mut pin_permit_for_path_b_or_empty: Option<OwnedSemaphorePermit> = _pin_permit;
+        let mut pin_populated_by_writer = false;
         let write_result: Result<(), Error> = {
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             {
@@ -957,8 +1006,22 @@ async fn run_driver<Fe: FileEntry>(
                             >(
                                 super::chunked_writer::WRITE_PIPELINE_DEPTH,
                             );
+                            // #47 b1 fix-up P1 (LOAD-BEARING ORDERING):
+                            // pass an Arc-clone of the pin to the writer
+                            // task so `process_completion` can populate
+                            // the pin AFTER each writev CQE returns Ok.
+                            // The driver retains its own Arc — the
+                            // post-driver `pin_state.chunks.clear()` at
+                            // chunked_driver.rs:587-591 still fires on
+                            // driver exit.
+                            let pin_for_writer = Arc::clone(&pin);
                             let handle = tokio::spawn(
-                                super::chunked_writer::writer_task(digest, fd_arc, chunk_rx),
+                                super::chunked_writer::writer_task(
+                                    digest,
+                                    fd_arc,
+                                    chunk_rx,
+                                    pin_for_writer,
+                                ),
                             );
                             writer_state = Some((chunk_tx, handle));
                         }
@@ -1012,11 +1075,21 @@ async fn run_driver<Fe: FileEntry>(
                                 }
                             }
                         }
+                        // #47 b1 fix-up P1: move the pin_permit INTO
+                        // the WriteJob so the writer task transfers it
+                        // into the `ChunkPin` AFTER the writev CQE
+                        // returns Ok. The driver-side pin populate
+                        // (line ~1185) sees `None` here and skips for
+                        // this chunk (`pin_populated_by_writer = true`
+                        // below).
+                        let pin_permit_for_writer = pin_permit_for_path_b_or_empty.take();
+                        pin_populated_by_writer = true;
                         let send_res = chunk_tx_clone
                             .send(super::chunked_writer::WriteJob {
                                 offset: chunk_offset,
                                 bytes: bytes_for_write,
                                 _permit,
+                                pin_permit: pin_permit_for_writer,
                                 enqueue_time: pwrite_started_at,
                             })
                             .await;
@@ -1089,6 +1162,30 @@ async fn run_driver<Fe: FileEntry>(
                 ?write_err,
                 "chunked driver: per-chunk pwrite failed; aborting blob",
             );
+            // #47 b1 fix-up B1: drain the Path A writer state BEFORE the
+            // discard so the writer task observes mpsc close and exits
+            // its post-error drain loop. Without this, `writer_state`
+            // leaks (the JoinHandle outlives this scope only via the
+            // task aborting later when the driver future returns), and
+            // any chunks queued past the writer's first-error point
+            // remain in the mpsc until the abort fires — permits do
+            // return via Drop, but the explicit drain matches the
+            // happy-path (`ready_to_commit`) and EOF (post-recv-loop)
+            // patterns at lines :1252-1262 and :1274-1283. Mirror those
+            // explicit two-steps here.
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            if let Some((chunk_tx, writer_handle)) = writer_state.take() {
+                drop(chunk_tx);
+                if let Err(join_err) = writer_handle.await {
+                    warn!(
+                        target: "nativelink_store::chunked",
+                        ?digest,
+                        ?join_err,
+                        "chunked writer task panicked during error-arm drain — \
+                         partial persists for prune sweep",
+                    );
+                }
+            }
             // Abort the blob: discard the partial. Best-effort;
             // discard errors are logged but not surfaced (the original
             // write error is the operator-actionable one).
@@ -1160,12 +1257,25 @@ async fn run_driver<Fe: FileEntry>(
         // failures already log loudly; outlier-on-success is the gap.
         let back_edge_ms = pwrite_started_at.elapsed().as_millis() as u64;
         if back_edge_ms > 50 {
+            // #47 b1 cadre fix-up C1: include `path` discriminator so
+            // dashboards can split Path A (io_uring) from Path B
+            // (spawn_blocking) without grep-by-message. This driver-
+            // site warn fires on BOTH paths but the path field
+            // disambiguates: on Path A this measures send-to-mpsc
+            // latency (sub-ms in healthy state); on Path B it measures
+            // the full spawn_blocking pool queue + mutex + pwrite chain.
+            // The writer-task `process_completion` warn (chunked_writer.rs
+            // ~line 640) emits `path = "io_uring"` for Path A with a
+            // genuine writev-pipeline decomposition. `use_io_uring` is
+            // false in non-io-uring builds (cfg'd above).
+            let path_field = if use_io_uring { "io_uring" } else { "spawn_blocking" };
             warn!(
                 target: "nativelink_store::chunked",
                 back_edge_ms,
                 ?digest,
                 offset = chunk_offset,
                 chunk_bytes = chunk_len,
+                path = path_field,
                 "per-chunk back-edge drain exceeded 50ms — investigate \
                  ZFS / mutex / spawn_blocking queue split (#413 \
                  (200-540 MB blob cascade after cap=64) Option A probe)",
@@ -1182,30 +1292,19 @@ async fn run_driver<Fe: FileEntry>(
         // looks the pin up while the slow-store rename is in flight will
         // see the bytes before the slow store does, but never the other
         // way around).
-        {
+        //
+        // #47 b1 fix-up P1 (LOAD-BEARING ORDERING): on Path A non-empty
+        // chunks, the writer task populates the pin from
+        // `process_completion` AFTER the writev CQE — `mpsc send Ok`
+        // does NOT mean disk visibility. The driver-side populate
+        // below is skipped when `pin_populated_by_writer = true`. Path B
+        // (spawn_blocking pwrite) and Path A empty-chunk still populate
+        // from here because the `write_chunk_at_offset` adapter has
+        // already awaited the sync pwrite (Path B), or there are no
+        // bytes to pin (Path A empty).
+        if !pin_populated_by_writer {
             let mut pin_state = pin.lock();
-            // BTreeMap::insert returns the previous value — on a
-            // duplicate offset (the producer-protocol violation already
-            // warned about below) we replace and adjust total_bytes
-            // accordingly to keep the cached total honest.
-            if let Some(prev) = pin_state
-                .chunks
-                .insert(chunk_offset, chunk_bytes.clone())
-            {
-                pin_state.total_bytes =
-                    pin_state.total_bytes.saturating_sub(prev.len() as u64);
-            }
-            pin_state.total_bytes =
-                pin_state.total_bytes.saturating_add(chunk_len as u64);
-            // #212 Phase 2.5/2.7 fixup B1: transfer the PinBudget permit
-            // (if any) from the ChunkWork into the pin. The permit
-            // remains held until the pin clears post-commit (driver
-            // exit, see `pin_for_task.lock().chunks.clear()`), at which
-            // point the Vec drops and the global pinned-bytes budget
-            // recovers.
-            if let Some(perm) = _pin_permit {
-                pin_state.pin_permits.push(perm);
-            }
+            pin_state.populate(chunk_offset, chunk_bytes.clone(), pin_permit_for_path_b_or_empty);
         }
 
         // Update the in-memory sidecar bitmap. parking_lot::Mutex

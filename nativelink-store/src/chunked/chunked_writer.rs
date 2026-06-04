@@ -73,6 +73,8 @@ use tracing::info;
 // Test-only probes (T2, T4, T6, T8 — design §9)
 // ---------------------------------------------------------------------
 //
+// HARNESS GATING (perf-optimizer F2 + cadre fix-up audit 2026-06-03):
+//
 // These probes are gated on `#[cfg(any(test, feature = "test-utils"))]`
 // so cross-crate integration tests in
 // `nativelink-store/tests/chunked_b1_writev_test.rs` (which enable the
@@ -80,6 +82,25 @@ use tracing::info;
 // Production binaries (no `test-utils`, no `cfg(test)`) compile these
 // branches out entirely — same pattern as
 // `chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST` (existing).
+//
+// Audit (workspace `grep -rn 'test-utils' Cargo.toml */Cargo.toml`):
+//   - `nativelink-store/Cargo.toml:145`: `test-utils = []` (empty
+//     default, no production dependent).
+//   - `nativelink-service/Cargo.toml:96`: `test-utils =
+//     ["nativelink-store/test-utils"]` — service crate's `test-utils`
+//     forwards to ours, also `[]` at definition; both are dev-only
+//     feature flags enabled by `cargo test --features test-utils`.
+//   - `nativelink-worker/Cargo.toml:16`: same shape, dev-only.
+//   - No `bin` target and no production crate enables `test-utils`
+//     transitively. The `release` build (`just deploy`'s
+//     `cargo build --release --features quic,pprof`) does NOT enable
+//     `test-utils`, so the probe lookups compile out entirely.
+//
+// `#[cfg(test)] only` was considered: integration tests under `tests/`
+// are compiled as separate crates that link the library WITHOUT
+// `cfg(test)`, so probe items gated solely on `cfg(test)` would not be
+// visible from `chunked_b1_writev_test.rs`. The `feature = "test-utils"`
+// disjunct is load-bearing for cross-crate test access.
 
 /// Test-only error-injection probe for T6 + T8 (design §9). Tests insert
 /// a per-digest threshold `N`; the writer task synthesizes
@@ -187,9 +208,12 @@ mod io_uring_impl {
     use futures::stream::{FuturesUnordered, StreamExt};
     use nativelink_error::{Code, Error, make_err};
     use nativelink_util::common::DigestInfo;
+    use parking_lot::Mutex;
     use tokio::sync::mpsc;
     use tokio::sync::OwnedSemaphorePermit;
     use tracing::warn;
+
+    use super::super::chunked_driver::ChunkPin;
 
     /// CAPPED AT 1024 jobs per blob (≤ 1024 × 1 MiB = 1 GiB worst-case
     /// per blob): matches `fs.rs::WRITE_PIPELINE_DEPTH`. Over-cap
@@ -229,28 +253,73 @@ mod io_uring_impl {
     /// and dropped ONLY by the writer task after the corresponding
     /// writev CQE is processed. This is the lifetime that satisfies
     /// design §8 I9 (aggregate channel-resident bytes ≤ 4 GiB).
+    ///
+    /// LOAD-BEARING DROP: `_permit` releases the
+    /// `ChunkBudget` semaphore on `WriteJob` drop. Underscore is the
+    /// Rust idiom for "unused name binding" — the field is NOT unused;
+    /// it is held until drop fires the semaphore release. Removing the
+    /// field would leak permits to the global aggregate cap (#47 b1
+    /// cadre fix-up C3 / code-reviewer F4).
     pub struct WriteJob {
         pub offset: u64,
         pub bytes: Bytes,
         /// See type-level doc above for permit-lifetime invariant.
         pub _permit: OwnedSemaphorePermit,
+        /// #212 Phase 2.5/2.7 fixup B1: optional `PinBudget` permit
+        /// moved from `ChunkWork` to `WriteJob` so the writer task can
+        /// transfer it into the `ChunkPin` AFTER the writev CQE returns
+        /// Ok — preserves the "pin never advertises bytes that aren't
+        /// on disk yet" contract (#47 b1 cadre fix-up P1).
+        pub pin_permit: Option<OwnedSemaphorePermit>,
         /// Time at which the driver's `chunk_tx.send(...)` STARTED.
         /// Used by the writer's slow-write warn (design §5) to compute
         /// `enqueue_ms`.
         pub enqueue_time: Instant,
     }
 
+    /// Per-chunk metadata accumulated alongside one writev SQE so that
+    /// `process_completion` can populate the pin (one entry per iovec)
+    /// AFTER the CQE returns Ok. `bytes` is the same `Bytes` whose ptr
+    /// became the `iovec.iov_base` — reusing it (rather than cloning
+    /// into a new Bytes) keeps pin population zero-copy.
+    pub(super) struct ChunkMeta {
+        pub offset: u64,
+        pub bytes: Bytes,
+        pub pin_permit: Option<OwnedSemaphorePermit>,
+    }
+
     /// Result envelope returned by each in-flight writev future. The
     /// `_permits` Vec is moved into the future and dropped after the
     /// CQE is processed, releasing all chunk_budget permits for the
     /// chunks coalesced into this writev (design §6 S1 step 2 + §8 I9).
+    ///
+    /// `chunks` (#47 b1 cadre fix-up P1): per-chunk metadata used by
+    /// `process_completion` to populate the in-memory pin AFTER the
+    /// writev CQE returns Ok. One entry per iovec in `coalesce_count`
+    /// order.
+    ///
+    /// `submit_started` (#47 b1 cadre fix-up C1/C2): wall-clock when
+    /// `pop-from-pending` started for the run (i.e. when the writer
+    /// began building the iovec batch). `submit_time` is when
+    /// `system.writev(...)` returned the future. `submit_ms =
+    /// submit_time - submit_started` measures the coalesce-build +
+    /// io_uring-SQE-submission cost — the real "submit_ms" that
+    /// dashboards expect (the previous hardcoded `submit_ms = 0` was
+    /// dead local).
     struct WriteCompletion {
         total_len: usize,
         coalesce_count: usize,
         enqueue_time_earliest: Instant,
+        submit_started: Instant,
         submit_time: Instant,
         result: Result<usize, tokio_epoll_uring::Error<std::io::Error>>,
+        // LOAD-BEARING DROP: `_permits` releases chunk_budget semaphore
+        // on drop after CQE processing (one permit per iovec, see
+        // `ChunkBudget` cap in `chunk_budget.rs:52`). The leading
+        // underscore signals "unused name binding" but the field IS
+        // load-bearing for permit lifetime.
         _permits: Vec<OwnedSemaphorePermit>,
+        chunks: Vec<ChunkMeta>,
     }
 
     /// The writer task body. Spawned by the driver via `tokio::spawn`
@@ -276,6 +345,12 @@ mod io_uring_impl {
         digest: DigestInfo,
         fd_arc: Arc<std::fs::File>,
         mut chunk_rx: mpsc::Receiver<WriteJob>,
+        // #47 b1 fix-up P1 (LOAD-BEARING ORDERING): pin is populated
+        // here, NOT at the driver send-site, so the pin never advertises
+        // bytes whose writev later errors. The driver's Path B fallback
+        // populates the pin from its own success arm (where the
+        // `spawn_blocking` pwrite has already returned Ok).
+        pin: Arc<Mutex<ChunkPin>>,
     ) -> Result<(), Error> {
         let system = tokio_epoll_uring::thread_local_system().await;
 
@@ -298,7 +373,7 @@ mod io_uring_impl {
             loop {
                 match in_flight.next().now_or_never() {
                     Some(Some(wc)) => {
-                        if let Err(e) = process_completion(wc) {
+                        if let Err(e) = process_completion(wc, &pin) {
                             if first_error.is_none() {
                                 first_error = Some(e);
                             }
@@ -312,7 +387,7 @@ mod io_uring_impl {
             //    accumulating more jobs.
             if in_flight.len() >= WRITE_PIPELINE_DEPTH {
                 if let Some(wc) = in_flight.next().await {
-                    if let Err(e) = process_completion(wc) {
+                    if let Err(e) = process_completion(wc, &pin) {
                         if first_error.is_none() {
                             first_error = Some(e);
                         }
@@ -323,7 +398,14 @@ mod io_uring_impl {
             // 3. Receive the next batch of WriteJobs.
             //    Coalescing accumulator: keyed by offset so contiguous
             //    runs can be detected by walking the BTreeMap.
-            let mut pending: BTreeMap<u64, (Bytes, OwnedSemaphorePermit, Instant)> = BTreeMap::new();
+            //    Per-entry value: (bytes, chunk_budget_permit,
+            //    enqueue_time, pin_permit). The pin_permit rides along
+            //    so `process_completion` can transfer it into the
+            //    `ChunkPin` AFTER the writev CQE returns Ok.
+            let mut pending: BTreeMap<
+                u64,
+                (Bytes, OwnedSemaphorePermit, Instant, Option<OwnedSemaphorePermit>),
+            > = BTreeMap::new();
             let mut pending_bytes: usize = 0;
             let mut hit_eof = false;
 
@@ -338,7 +420,10 @@ mod io_uring_impl {
                 }
             };
             pending_bytes += first.bytes.len();
-            pending.insert(first.offset, (first.bytes, first._permit, first.enqueue_time));
+            pending.insert(
+                first.offset,
+                (first.bytes, first._permit, first.enqueue_time, first.pin_permit),
+            );
 
             // Drain-until-empty: pull all immediately available jobs.
             // If still under the coalesce target, do one short blocking
@@ -347,7 +432,10 @@ mod io_uring_impl {
                 match chunk_rx.try_recv() {
                     Ok(job) => {
                         pending_bytes += job.bytes.len();
-                        pending.insert(job.offset, (job.bytes, job._permit, job.enqueue_time));
+                        pending.insert(
+                            job.offset,
+                            (job.bytes, job._permit, job.enqueue_time, job.pin_permit),
+                        );
                     }
                     Err(mpsc::error::TryRecvError::Empty) => {
                         // One short blocking recv.
@@ -361,7 +449,7 @@ mod io_uring_impl {
                                 pending_bytes += job.bytes.len();
                                 pending.insert(
                                     job.offset,
-                                    (job.bytes, job._permit, job.enqueue_time),
+                                    (job.bytes, job._permit, job.enqueue_time, job.pin_permit),
                                 );
                             }
                             Ok(None) => {
@@ -420,15 +508,29 @@ mod io_uring_impl {
                     }
                 }
 
+                // #47 b1 cadre fix-up C1/C2: record real submit_started
+                // = wall-clock the writer began popping from `pending`
+                // and building the iovec batch. `submit_time` is
+                // captured immediately before `system.writev(...)`
+                // submits the SQE, so
+                // `submit_ms = submit_time - submit_started` is the
+                // genuine coalesce-build + submission cost (the
+                // previous hardcoded `submit_ms = 0` was dead local
+                // per perf-optimizer F4 + code-reviewer F3).
+                let submit_started = Instant::now();
+
                 // Pop the lowest-offset entry as the run start.
                 let (&start_offset, _) = pending.iter().next().expect("non-empty");
-                let (start_bytes, start_permit, start_enqueue) = pending
+                let (start_bytes, start_permit, start_enqueue, start_pin_permit) = pending
                     .remove(&start_offset)
                     .expect("just observed");
                 let mut run_offset = start_offset;
                 let mut iovecs: Vec<libc::iovec> = Vec::new();
                 let mut buffers: Vec<Bytes> = Vec::new();
                 let mut permits: Vec<OwnedSemaphorePermit> = Vec::new();
+                // #47 b1 fix-up P1: per-chunk metadata for post-CQE pin
+                // populate. One entry per iovec, same order.
+                let mut chunks_meta: Vec<ChunkMeta> = Vec::new();
                 let mut earliest_enqueue = start_enqueue;
                 let mut run_bytes = 0usize;
 
@@ -439,6 +541,11 @@ mod io_uring_impl {
                 });
                 run_bytes += start_bytes.len();
                 run_offset += start_bytes.len() as u64;
+                chunks_meta.push(ChunkMeta {
+                    offset: start_offset,
+                    bytes: start_bytes.clone(),
+                    pin_permit: start_pin_permit,
+                });
                 buffers.push(start_bytes);
                 permits.push(start_permit);
 
@@ -450,7 +557,7 @@ mod io_uring_impl {
                     if next_off != run_offset {
                         break;
                     }
-                    let (next_bytes, next_permit, next_enqueue) = pending
+                    let (next_bytes, next_permit, next_enqueue, next_pin_permit) = pending
                         .remove(&next_off)
                         .expect("just observed");
                     iovecs.push(libc::iovec {
@@ -462,6 +569,11 @@ mod io_uring_impl {
                     if next_enqueue < earliest_enqueue {
                         earliest_enqueue = next_enqueue;
                     }
+                    chunks_meta.push(ChunkMeta {
+                        offset: next_off,
+                        bytes: next_bytes.clone(),
+                        pin_permit: next_pin_permit,
+                    });
                     buffers.push(next_bytes);
                     permits.push(next_permit);
                 }
@@ -539,9 +651,11 @@ mod io_uring_impl {
                         total_len,
                         coalesce_count,
                         enqueue_time_earliest: earliest_enqueue,
+                        submit_started,
                         submit_time,
                         result,
                         _permits: permits,
+                        chunks: chunks_meta,
                     }
                 }));
             }
@@ -553,7 +667,7 @@ mod io_uring_impl {
 
         // 6. Drain all in-flight completions before returning.
         while let Some(wc) = in_flight.next().await {
-            if let Err(e) = process_completion(wc) {
+            if let Err(e) = process_completion(wc, &pin) {
                 if first_error.is_none() {
                     first_error = Some(e);
                 }
@@ -575,15 +689,33 @@ mod io_uring_impl {
         Ok(())
     }
 
-    /// Process one writev completion: extract bytes-written, emit a
-    /// slow-write warn (design §5), and surface short-writes as errors
-    /// (matches `fs.rs:811-818` semantics, design §8 I4).
-    fn process_completion(wc: WriteCompletion) -> Result<(), Error> {
+    /// Process one writev completion: extract bytes-written, populate
+    /// the in-memory pin per chunk (LOAD-BEARING ORDERING for #47 b1
+    /// fix-up P1 — pin populate fires only AFTER writev CQE returns Ok),
+    /// emit a slow-write warn (design §5), and surface short-writes as
+    /// errors (matches `fs.rs:811-818` semantics, design §8 I4).
+    fn process_completion(
+        wc: WriteCompletion,
+        pin: &Arc<Mutex<ChunkPin>>,
+    ) -> Result<(), Error> {
         let n = match wc.result {
             Ok(n) => n,
-            Err(e) => return Err(uring_err_to_error(e, "chunked_writer writev")),
+            Err(e) => {
+                // LOAD-BEARING ORDERING (#47 b1 fix-up P1 / T9 mutation
+                // target): on writev Err, the `wc.chunks` Vec drops
+                // here — pin_permits go back to the global PinBudget,
+                // and the chunk bytes are NOT inserted into the pin.
+                // A concurrent reader's `try_get_chunk_from_pin` for
+                // these offsets returns None and falls through to the
+                // slow store, never seeing bytes whose writev errored.
+                return Err(uring_err_to_error(e, "chunked_writer writev"));
+            }
         };
         if n < wc.total_len {
+            // Same as the Err arm: do NOT populate the pin on short
+            // write — the partial bytes that DID land are not
+            // operator-visible via the pin; the blob will be
+            // retried by FastSlowStore.
             return Err(make_err!(
                 Code::Internal,
                 "io_uring partial writev: {n}/{} bytes (short write — \
@@ -592,14 +724,33 @@ mod io_uring_impl {
             ));
         }
 
+        // #47 b1 fix-up P1: writev Ok(n) == total_len → bytes are on
+        // disk. NOW populate the in-memory pin for each chunk so
+        // `ChunkedDriver::try_get_chunk_from_pin` may serve them. One
+        // lock acquisition for all chunks in this writev (rust-crate
+        // L2: amortize critical section).
+        {
+            let mut pin_state = pin.lock();
+            for meta in wc.chunks {
+                pin_state.populate(meta.offset, meta.bytes, meta.pin_permit);
+            }
+        }
+
         // Slow-write probe per design §5. Threshold matches
         // chunked_driver.rs:985's existing `back_edge_ms > 50` warn.
         let enqueue_ms = wc
-            .submit_time
+            .submit_started
             .saturating_duration_since(wc.enqueue_time_earliest)
             .as_millis() as u64;
+        // #47 b1 cadre fix-up C1/C2: real `submit_ms` measures the
+        // coalesce-build + io_uring-SQE-submission cost (the previous
+        // hardcoded `submit_ms = 0` was dead local — perf F4 +
+        // code-reviewer F3 + red-team A1 + distsys M6).
+        let submit_ms = wc
+            .submit_time
+            .saturating_duration_since(wc.submit_started)
+            .as_millis() as u64;
         let writev_ms = wc.submit_time.elapsed().as_millis() as u64;
-        let submit_ms: u64 = 0; // coalesce-build cost is sub-ms; folded into enqueue_ms here.
         let total_inner_ms = enqueue_ms + submit_ms + writev_ms;
         if total_inner_ms > 50 {
             warn!(
