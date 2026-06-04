@@ -136,49 +136,87 @@ pub(crate) static TEST_PRE_DISCARD_DELAY_MS_BY_DIGEST: std::sync::LazyLock<
 /// In-flight chunked-blob state held by the FilesystemStore for the
 /// lifetime of an in-progress chunked upload. One entry per digest.
 ///
-/// The `file` field is wrapped in a `tokio::sync::Mutex` (not
-/// `parking_lot::Mutex`) because callers acquire the lock and then
-/// immediately `.await` on a `spawn_blocking` join handle to do the
-/// actual `pwrite`. A `parking_lot::Mutex` cannot be held across an
-/// `.await` per CLAUDE.md ("Async & Concurrency"); a `tokio::sync::Mutex`
-/// can. Critical-section length is one `pwrite` syscall (~µs on local
-/// disk, ~ms worst-case under contention), short enough that the
-/// async-mutex overhead is negligible.
+/// **#47 b1 Phase 2 Step 3:** two variants share the same map. Both
+/// expose `path()` + `declared_size()` so the commit / discard code
+/// stays variant-agnostic (only the writer code-path differs):
 ///
-/// `try_clone` is NOT used to allow parallel pwrites — the design's
-/// per-blob lock invariant says concurrent chunks for the same blob
-/// serialize. Cross-blob parallelism is preserved by the `HashMap` key
-/// (different digests → different `ChunkInProgress` → no contention).
+/// - [`Self::SpawnBlocking`] — legacy fallback path. Holds an open
+///   `std::fs::File` wrapped in `tokio::sync::Mutex` because callers
+///   acquire the lock and then immediately `.await` on a
+///   `spawn_blocking` join handle to do the actual `pwrite`. A
+///   `parking_lot::Mutex` cannot be held across an `.await` per
+///   CLAUDE.md ("Async & Concurrency"); a `tokio::sync::Mutex` can.
+/// - [`Self::IoUringMarker`] — io_uring path. The fd lives in the
+///   per-blob writer task (`chunked_writer::writer_task`) instead of
+///   the map; this variant is just a marker that pins
+///   `(path, declared_size)` so commit / discard / `has_in_flight_chunked`
+///   continue working. NO async mutex (the writer task is a single
+///   FIFO consumer of an mpsc and serializes chunks naturally).
 ///
-/// `path` is held for `discard_chunked` (file removal) and
-/// `commit_chunked` (rename source). Stored as `PathBuf` rather than
-/// recomputing each call, both to centralize the layout decision and
-/// to avoid recomputing the shard prefix on every chunk.
-pub(crate) struct ChunkInProgress {
-    /// Absolute on-disk path to the partial temp file:
-    /// `<temp_path>/d/<XX>/<hash>-<size>.partial`. The shard prefix
-    /// matches the layout used by the rest of `FilesystemStore` so
-    /// recovery + tooling can reuse the existing directory walks.
-    path: PathBuf,
-    /// `std::fs::File` (not `tokio::fs::File`) because every operation
-    /// happens inside `spawn_blocking` and the std handle is what the
-    /// `std::os::unix::fs::FileExt::write_at` (Unix `pwrite`) call
-    /// requires. Wrapped in an async-mutex so concurrent `write_chunk_at_offset`
-    /// callers serialize cleanly without blocking a tokio worker.
-    file: AsyncMutex<std::fs::File>,
-    /// Pinned digest size copy. Not load-bearing for `write_chunk_at_offset`
-    /// (the caller passes `expected_size` to `commit_chunked`) but
-    /// useful for log messages.
-    declared_size: u64,
+/// Cross-blob parallelism is preserved by the `HashMap` key (different
+/// digests → different `ChunkInProgress` → no contention).
+pub(crate) enum ChunkInProgress {
+    /// Legacy spawn_blocking + per-chunk pwrite path. Used when
+    /// `is_io_uring_available()` returns false at driver-spawn time.
+    SpawnBlocking {
+        /// Absolute on-disk path to the partial temp file:
+        /// `<temp_path>/d/<XX>/<hash>-<size>.partial`.
+        path: PathBuf,
+        /// Open fd held in an async-mutex; serializes concurrent
+        /// same-digest pwrites at the in-process layer.
+        file: AsyncMutex<std::fs::File>,
+        /// Pinned digest size copy; not load-bearing for the write
+        /// path (the caller passes `expected_size` to commit) but
+        /// useful for log messages and the commit length-check.
+        declared_size: u64,
+    },
+    /// #47 b1 Phase 2 Step 3: io_uring writev coalescer marker. The
+    /// fd lives inside the per-blob `writer_task`; this entry only
+    /// pins the path + declared_size so the variant-agnostic commit
+    /// / discard code continues to work.
+    IoUringMarker {
+        /// Absolute on-disk path to the partial temp file (same shape
+        /// as `SpawnBlocking::path`).
+        path: PathBuf,
+        /// Pinned digest size copy; consumed by
+        /// [`commit_chunked_to_holding`]'s length-check.
+        declared_size: u64,
+    },
+}
+
+impl ChunkInProgress {
+    /// Variant-agnostic accessor for the on-disk `.partial` path.
+    pub(crate) fn path(&self) -> &PathBuf {
+        match self {
+            Self::SpawnBlocking { path, .. } | Self::IoUringMarker { path, .. } => path,
+        }
+    }
+
+    /// Variant-agnostic accessor for the declared blob size.
+    #[allow(dead_code, reason = "diagnostic + future commit-path use")]
+    pub(crate) fn declared_size(&self) -> u64 {
+        match self {
+            Self::SpawnBlocking { declared_size, .. }
+            | Self::IoUringMarker { declared_size, .. } => *declared_size,
+        }
+    }
 }
 
 impl Debug for ChunkInProgress {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("ChunkInProgress")
-            .field("path", &self.path)
-            .field("declared_size", &self.declared_size)
-            .field("file", &"<async-mutex<std::fs::File>>")
-            .finish()
+        match self {
+            Self::SpawnBlocking { path, declared_size, .. } => f
+                .debug_struct("ChunkInProgress::SpawnBlocking")
+                .field("path", path)
+                .field("declared_size", declared_size)
+                .field("file", &"<async-mutex<std::fs::File>>")
+                .finish(),
+            Self::IoUringMarker { path, declared_size } => f
+                .debug_struct("ChunkInProgress::IoUringMarker")
+                .field("path", path)
+                .field("declared_size", declared_size)
+                .finish(),
+        }
     }
 }
 
@@ -380,7 +418,7 @@ async fn open_or_create_partial(
         )
     })?;
 
-    let new_entry = Arc::new(ChunkInProgress {
+    let new_entry = Arc::new(ChunkInProgress::SpawnBlocking {
         path,
         file: AsyncMutex::new(opened),
         declared_size: digest.size_bytes(),
@@ -403,6 +441,80 @@ async fn open_or_create_partial(
     }
     guard.insert(digest, Arc::clone(&new_entry));
     Ok(new_entry)
+}
+
+/// #47 b1 Phase 2 Step 3: open the partial temp file AND insert the
+/// io_uring marker variant into the map. Returns the open
+/// `Arc<std::fs::File>` for the writer task to own. Unlike
+/// [`open_or_create_partial`], this helper does NOT keep the fd inside
+/// the map — the writer task is the sole owner of the fd; the map
+/// entry exists only to pin `(path, declared_size)` so the
+/// variant-agnostic commit / discard code keeps working.
+///
+/// Idempotency for the SAME digest is preserved (race-resolution drops
+/// the loser's fd) but in the io_uring path the driver guarantees
+/// single-spawn-per-blob via the `chunked_write_handler`'s
+/// `take_or_create_in_flight` lookup. Concurrent same-digest streams
+/// receive `Code::AlreadyExists` at handler admission.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub(crate) async fn open_or_create_partial_marker(
+    map: &ChunkedPartialsMap,
+    digest: DigestInfo,
+    temp_path_root: &str,
+) -> Result<Arc<std::fs::File>, Error> {
+    let path = partial_temp_path(temp_path_root, &digest);
+    let path_for_blocking = path.clone();
+    let opened = tokio::task::spawn_blocking(move || -> Result<std::fs::File, std::io::Error> {
+        // NO O_SYNC, NO O_DSYNC, NO O_DIRECT (CLAUDE.md hard rule).
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path_for_blocking)
+    })
+    .await
+    .map_err(|join_err| {
+        make_err!(
+            Code::Internal,
+            "spawn_blocking join error opening chunked partial (marker): {join_err:?}"
+        )
+    })?
+    .map_err(|io_err| {
+        make_err!(
+            Code::Internal,
+            "failed to open chunked partial temp file {} (marker): {io_err:?}",
+            path.display()
+        )
+    })?;
+
+    let fd_arc = Arc::new(opened);
+
+    // Insert the marker. The handler-side admission contract guarantees
+    // at-most-one driver per digest at a time, so a same-digest race
+    // here would be a contract bug; but be defensive — if a SpawnBlocking
+    // entry already exists (e.g. a previous fallback driver hasn't yet
+    // discarded), return an error rather than overwrite.
+    let mut guard = map.inner.lock();
+    if let Some(existing) = guard.get(&digest) {
+        let variant = match existing.as_ref() {
+            ChunkInProgress::SpawnBlocking { .. } => "SpawnBlocking",
+            ChunkInProgress::IoUringMarker { .. } => "IoUringMarker",
+        };
+        drop(guard);
+        return Err(make_err!(
+            Code::AlreadyExists,
+            "chunked partial entry already exists for {digest} (variant={variant}); \
+             open_or_create_partial_marker called while a driver is in flight"
+        ));
+    }
+    guard.insert(
+        digest,
+        Arc::new(ChunkInProgress::IoUringMarker {
+            path,
+            declared_size: digest.size_bytes(),
+        }),
+    );
+    Ok(fd_arc)
 }
 
 /// Write one chunk at the given byte offset into the sparse partial.
@@ -481,7 +593,21 @@ pub(crate) async fn write_chunk_at_offset(
     // sub-stage drives the tail before either #448 chmod-publish or
     // #449 full instrumentation are scoped.
     let mutex_started = Instant::now();
-    let file_guard = entry.file.lock().await;
+    // SpawnBlocking variant only: `write_chunk_at_offset` is the Path-B
+    // entry point. IoUringMarker entries never reach this function —
+    // the io_uring driver branch routes chunks through
+    // `chunked_writer::writer_task` instead. Defensive error if the
+    // wrong variant somehow lands here.
+    let file_guard = match entry.as_ref() {
+        ChunkInProgress::SpawnBlocking { file, .. } => file.lock().await,
+        ChunkInProgress::IoUringMarker { .. } => {
+            return Err(make_err!(
+                Code::Internal,
+                "write_chunk_at_offset called on IoUringMarker entry for {digest} — \
+                 contract bug: io_uring driver branch should not invoke fallback writer"
+            ));
+        }
+    };
     let mutex_acquire_us = mutex_started.elapsed().as_micros() as u64;
 
     // SAFETY of write_at: the `std::os::unix::fs::FileExt::write_at`
@@ -753,7 +879,7 @@ pub(crate) async fn commit_chunked_to_holding(
 
     // Stat the file to verify length. spawn_blocking because
     // `metadata()` is a syscall and on a slow pool can take ms.
-    let path_for_stat = entry.path.clone();
+    let path_for_stat = entry.path().clone();
     let actual_len = tokio::task::spawn_blocking(move || -> Result<u64, std::io::Error> {
         std::fs::metadata(&path_for_stat).map(|m| m.len())
     })
@@ -765,7 +891,7 @@ pub(crate) async fn commit_chunked_to_holding(
         make_err!(
             Code::Internal,
             "failed to stat chunked partial {} during commit_to_holding: {io_err:?}",
-            entry.path.display()
+            entry.path().display()
         )
     })?;
 
@@ -786,7 +912,7 @@ pub(crate) async fn commit_chunked_to_holding(
 
     // Length OK. Atomic rename to the holding path inside spawn_blocking
     // so we don't block a tokio worker on the rename syscall.
-    let from_path = entry.path.clone();
+    let from_path = entry.path().clone();
     let to_path_for_blocking = holding_path.clone();
     let rename_start = Instant::now();
     let syscall_ms = tokio::task::spawn_blocking(move || -> Result<u128, std::io::Error> {
@@ -802,7 +928,7 @@ pub(crate) async fn commit_chunked_to_holding(
         make_err!(
             Code::Internal,
             "failed to rename chunked partial {} -> {} (holding): {io_err:?}",
-            entry.path.display(),
+            entry.path().display(),
             holding_path.display()
         )
     })?;
@@ -972,7 +1098,12 @@ pub(crate) async fn discard_chunked(
         return Ok(());
     };
 
-    let path = entry.path.clone();
+    // Variant-agnostic: both `SpawnBlocking` and `IoUringMarker` expose
+    // `path()`. For SpawnBlocking, dropping `entry` closes the held fd.
+    // For IoUringMarker, no fd is held in the map (the writer task owns
+    // it); `unlink` succeeds either way (Linux semantic: delete-while-open
+    // defers inode reap to fd close).
+    let path = entry.path().clone();
     // Drop our reference to the entry BEFORE the spawn_blocking so the
     // file fd closes promptly (the spawn_blocking's `remove_file`
     // doesn't need the fd; closing it before unlink avoids holding
