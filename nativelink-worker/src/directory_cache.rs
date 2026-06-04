@@ -262,6 +262,19 @@ impl Drop for DirectoryCachePinGuard {
         // "happy path: ref_count failed to return to 0 — guard Drop
         // did not decrement" (left=1, right=0). Reverted, both green
         // again.
+        //
+        // MUTATION VERIFIED (2026-06-04, #57): same mutation also red-
+        // fails all four #57 tests:
+        // - direct_use_pin_releases_on_cancellation_at_a1: "baseline:
+        //   pin must have released after seed get_or_create_direct"
+        //   (left=1, right=0)
+        // - direct_use_pin_releases_on_state_drop: "post-handoff drop:
+        //   guard in state did not fire fetch_sub" (left=1, right=0)
+        // - direct_use_pin_releases_on_symlink_error: "T3 baseline:
+        //   ref_count must be 0 after seed guard drop" (left=1, right=0)
+        // - direct_use_happy_path_releases_exactly_once: "happy path A1:
+        //   ref_count failed to return to 0" (left=1, right=0)
+        // Reverted; all four green again.
         self.ref_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -6100,6 +6113,339 @@ mod tests {
             stats.in_use_entries, 0,
             "happy path: ref_count failed to return to 0 — guard Drop \
              did not decrement",
+        );
+
+        Ok(())
+    }
+
+    // =====================================================================
+    // #57 Phase 2 — DirectUseReleaseGuard merge tests (T1 / T2 / T3 / T4
+    // per #57 design §7).
+    //
+    // Composite invariant under test (DirectoryCache direct-use mode):
+    //   gate ⇒ (pin OR ttl OR evict)
+    // No TTL; evict-of-ref_count==0 only; pin alone is load-bearing. The
+    // guard's sync `Drop` is what makes the pin corner cancellation-safe
+    // at site A1 (`try_symlink_cached`) — the symmetric extension of
+    // #50's H-site coverage to direct-use mode.
+    // =====================================================================
+
+    /// T1 — A1 cancellation: drop the `try_symlink_cached` future
+    /// mid-await (after `fetch_add(1)`, before `Ok(Some((...)))` returns)
+    /// → guard's Drop must fire `fetch_sub(1)`, ref_count returns to 0.
+    ///
+    /// Without the guard, the manual `fetch_sub(1)` on the error path is
+    /// unreachable from a dropped future and ref_count is permanently
+    /// leaked at 1 — this is the bug #57 closes.
+    ///
+    /// Mutation guard (2026-06-04): mutate `impl Drop for
+    /// DirectoryCachePinGuard` body to a no-op `fn drop(&mut self) {}`
+    /// → T1 must red-fail with the bespoke "A1 cancellation: guard Drop
+    /// did not decrement ref_count" message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_use_pin_releases_on_cancellation_at_a1() -> Result<(), Error> {
+        use core::task::{Context, Poll, Waker};
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store().await;
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: true,
+        };
+        let cache = DirectoryCache::new(config, store, None).await?;
+        assert!(cache.is_direct_use_mode());
+
+        // Seed the cache so the next call hits the A1 fast-path (cache
+        // hit branch of try_symlink_cached, where fetch_add and the
+        // symlink-await window live).
+        let seed_dest = temp_dir.path().join("seed");
+        let (_seed_path, _seed_hit, seed_guard) =
+            cache.get_or_create_direct(dir_digest, &seed_dest).await?;
+        drop(seed_guard);
+        assert_eq!(
+            cache.stats().await.in_use_entries,
+            0,
+            "baseline: pin must have released after seed get_or_create_direct",
+        );
+
+        // Snapshot Arc<AtomicUsize> on the entry's ref_count so we can
+        // observe the value after the future is dropped.
+        let pin_arc = {
+            let map = cache.cache.read().await;
+            Arc::clone(&map.get(&dir_digest).unwrap().ref_count)
+        };
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            0,
+            "baseline: snapshot Arc must read 0 before the fetch_add",
+        );
+
+        // Build the future without spawning. Polling drives execution
+        // synchronously through cache.read().await, the fetch_add(1), and
+        // into the `fs::symlink(...).await` — at which point poll returns
+        // Pending. Dropping the future at this point is the exact
+        // "task cancelled mid-await" scenario for A1.
+        let victim_dest = temp_dir.path().join("victim");
+        let mut fut = Box::pin(cache.try_symlink_cached(&dir_digest, &victim_dest));
+        let waker = Waker::noop();
+        let mut ctx = Context::from_waker(waker);
+
+        // First poll must reach the await and return Pending.
+        let poll_result = fut.as_mut().poll(&mut ctx);
+        assert!(
+            matches!(poll_result, Poll::Pending),
+            "T1 precondition: future must Pending on first poll so we \
+             can drop it mid-await — got Ready (the await completed \
+             synchronously); test setup is wrong",
+        );
+
+        // Verify the fetch_add(1) ran.
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            1,
+            "T1 precondition: fetch_add(1) must have run before the \
+             first Pending; cache-hit branch was not taken",
+        );
+
+        // CANCELLATION: drop the future mid-await. With the guard wired,
+        // Drop fires synchronously and decrements ref_count.
+        drop(fut);
+
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            0,
+            "A1 cancellation: guard Drop did not decrement ref_count \
+             — composite invariant violated: pin leaked after cancellation",
+        );
+
+        let stats = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            cache.stats(),
+        )
+        .await
+        .expect("stats() wedged — should be near-instant");
+        assert_eq!(
+            stats.in_use_entries, 0,
+            "A1 cancellation: stats.in_use_entries > 0 with no in-flight \
+             task — composite invariant violated",
+        );
+
+        Ok(())
+    }
+
+    /// T2 — Post-handoff drop: simulate the action holding the guard in
+    /// `state.direct_use_pin` and then being dropped (action cancellation
+    /// after `try_symlink_cached` succeeded). The guard's Drop must fire
+    /// exactly once → ref_count returns to 0.
+    ///
+    /// This exercises the hand-off seam (#57 §4): the guard moves from
+    /// the async stack of `inner_prepare_action` into a long-lived
+    /// `Option<(DigestInfo, DirectoryCachePinGuard)>` slot, and the
+    /// owning struct's eventual Drop releases the pin.
+    ///
+    /// Mutation guard (2026-06-04): mutate `impl Drop for
+    /// DirectoryCachePinGuard` body to a no-op `fn drop(&mut self) {}`
+    /// → T2 must red-fail at "post-handoff drop: guard in state did not \
+    /// fire fetch_sub".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_use_pin_releases_on_state_drop() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store().await;
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: true,
+        };
+        let cache = DirectoryCache::new(config, store, None).await?;
+
+        // Run the full hand-off path: get_or_create_direct returns the
+        // guard, we move it into a long-lived Option slot (mirroring
+        // RunningActionImplState::direct_use_pin), then drop the slot.
+        let dest = temp_dir.path().join("dest");
+        let (_cache_path, was_hit, pin_guard) =
+            cache.get_or_create_direct(dir_digest, &dest).await?;
+        assert!(!was_hit, "T2 precondition: first access must be a miss");
+
+        // Snapshot the Arc so we can observe ref_count after drop.
+        let pin_arc = {
+            let map = cache.cache.read().await;
+            Arc::clone(&map.get(&dir_digest).unwrap().ref_count)
+        };
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            1,
+            "T2 precondition: pin must be held at ref_count == 1 before \
+             state-drop",
+        );
+
+        // Hand-off: move guard into a long-lived Option slot.
+        let mut state_slot: Option<(DigestInfo, DirectoryCachePinGuard)> =
+            Some((dir_digest, pin_guard));
+
+        // Action cancellation: take + drop the slot, simulating
+        // do_cleanup taking direct_use_pin and dropping it after the
+        // work-symlink removal completes.
+        let taken = state_slot.take();
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            1,
+            "T2 invariant: take() must not decrement (guard still owned \
+             by `taken`)",
+        );
+        drop(taken);
+
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            0,
+            "post-handoff drop: guard in state did not fire fetch_sub \
+             — composite invariant violated: pin leaked after action \
+             cleanup",
+        );
+
+        Ok(())
+    }
+
+    /// T3 — A1 symlink-error path: the destination exists, so
+    /// `fs::symlink` returns EEXIST → guard's Drop fires on the error
+    /// branch, ref_count returns to 0.
+    ///
+    /// T3a (sibling assertion): the guard fires EXACTLY once. The bug
+    /// the design §7-T3 calls out — restoring the deleted explicit
+    /// `fetch_sub` on the error branch — would over-fire: Drop +
+    /// explicit fetch_sub = ref_count drops from 1 to usize::MAX (wraps
+    /// under Relaxed subtraction). T3a's strict `assert_eq!(0)` after
+    /// drop catches that wrap.
+    ///
+    /// Mutation guard (2026-06-04): mutate `impl Drop for
+    /// DirectoryCachePinGuard` body to a no-op `fn drop(&mut self) {}`
+    /// → T3 must red-fail at "A1 symlink-error: guard Drop did not \
+    /// fire on symlink failure".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_use_pin_releases_on_symlink_error() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store().await;
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: true,
+        };
+        let cache = DirectoryCache::new(config, store, None).await?;
+
+        // Seed the cache so try_symlink_cached takes the cache-hit
+        // branch (where fetch_add + the symlink-await live).
+        let seed_dest = temp_dir.path().join("seed");
+        let (_seed_path, _seed_hit, seed_guard) =
+            cache.get_or_create_direct(dir_digest, &seed_dest).await?;
+        drop(seed_guard);
+
+        // Snapshot ref_count Arc.
+        let pin_arc = {
+            let map = cache.cache.read().await;
+            Arc::clone(&map.get(&dir_digest).unwrap().ref_count)
+        };
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            0,
+            "T3 baseline: ref_count must be 0 after seed guard drop",
+        );
+
+        // Pre-create the destination so fs::symlink fails with EEXIST.
+        let victim_dest = temp_dir.path().join("victim_already_exists");
+        fs::write(&victim_dest, b"blocker").await.unwrap();
+
+        // Call try_symlink_cached; it should fetch_add, hit EEXIST, drop
+        // the guard, and return Ok(None).
+        let res = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            cache.try_symlink_cached(&dir_digest, &victim_dest),
+        )
+        .await
+        .expect("try_symlink_cached wedged — should be near-instant");
+
+        let inner = res.expect("try_symlink_cached returned Err");
+        assert!(
+            inner.is_none(),
+            "T3 precondition: symlink to existing path must return \
+             Ok(None) (the fallback signal)",
+        );
+
+        // T3a: guard fired EXACTLY once → ref_count == 0.
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            0,
+            "A1 symlink-error: guard Drop did not fire on symlink \
+             failure — ref_count != 0 after fallback",
+        );
+
+        Ok(())
+    }
+
+    /// T4 — Happy path: full direct-use flow with drop-after-success
+    /// releases ref_count exactly once.
+    ///
+    /// Mutation guard (2026-06-04): mutate `impl Drop for
+    /// DirectoryCachePinGuard` body to a no-op `fn drop(&mut self) {}`
+    /// → T4 must red-fail at "happy path A1: ref_count failed to return \
+    /// to 0".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn direct_use_happy_path_releases_exactly_once() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store().await;
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: true,
+        };
+        let cache = DirectoryCache::new(config, store, None).await?;
+
+        // First access — cache miss + symlink + guard returned.
+        let dest = temp_dir.path().join("dest");
+        let (_cache_path, was_hit, pin_guard) =
+            cache.get_or_create_direct(dir_digest, &dest).await?;
+        assert!(!was_hit, "T4 precondition: first access must be a miss");
+
+        // Snapshot ref_count Arc.
+        let pin_arc = {
+            let map = cache.cache.read().await;
+            Arc::clone(&map.get(&dir_digest).unwrap().ref_count)
+        };
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            1,
+            "T4 precondition: ref_count must be 1 while guard held",
+        );
+
+        // Drop guard at end-of-scope (mirrors do_cleanup's final drop).
+        drop(pin_guard);
+
+        let stats = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            cache.stats(),
+        )
+        .await
+        .expect("stats() wedged — should be near-instant");
+        assert_eq!(
+            stats.in_use_entries, 0,
+            "happy path A1: ref_count failed to return to 0 — guard \
+             Drop did not decrement",
+        );
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            0,
+            "happy path A1: snapshot Arc ref_count != 0 after guard drop",
         );
 
         Ok(())
