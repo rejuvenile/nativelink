@@ -1471,6 +1471,30 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
         .await
     }
 
+    /// #47 b1 Phase 2 Step 2: open the partial fd AND insert the io_uring
+    /// marker variant into the in-process map. Returns the
+    /// `Arc<std::fs::File>` that the per-blob writer task will own. The
+    /// map entry only pins `(path, declared_size)` so the
+    /// variant-agnostic commit / discard code keeps working.
+    ///
+    /// Only available when `is_io_uring_available()` returns true at
+    /// driver-spawn time — the io_uring path bypasses the spawn_blocking
+    /// pool mutex (the dominant cost per FL-402 RCA). On non-io-uring
+    /// kernels, the driver continues to call [`Self::write_chunk_at_offset`]
+    /// per chunk (Path B / fallback; zero behavior change).
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub async fn open_chunked_partial_marker(
+        &self,
+        digest: DigestInfo,
+    ) -> Result<std::sync::Arc<std::fs::File>, Error> {
+        crate::chunked::chunked_filesystem::open_or_create_partial_marker(
+            &self.chunked_partials,
+            digest,
+            &self.shared_context.temp_path,
+        )
+        .await
+    }
+
     /// Read-only accessor for the content_path the store is rooted at.
     /// Used by the Phase 2.3 chunked driver to compute the final CAS
     /// path for end-to-end SHA-256 verification (re-reading the

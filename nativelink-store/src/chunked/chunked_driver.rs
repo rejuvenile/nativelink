@@ -819,6 +819,44 @@ async fn run_driver<Fe: FileEntry>(
     chunks_committed: Arc<AtomicU64>,
     per_chunk_timeout: core::time::Duration,
 ) -> Result<ChunkedCommitResult, Error> {
+    // #47 b1 Phase 2 Step 2: decide write path ONCE per driver. Monotonic
+    // per design §7 — `is_io_uring_available` is process-wide-cached
+    // (OnceLock in `nativelink_util::fs`) so the runtime probe runs once
+    // per process. Both paths emit the activation probe via
+    // `emit_activation_probe_once`; the OnceLock inside makes it a true
+    // one-shot info! at process startup.
+    //
+    // Lazy-init state for Path A: the writer task is spawned at the
+    // FIRST non-zero-byte chunk arrival (preserves I1 zero-byte
+    // fast-path; a true zero-byte blob → single empty `ChunkWork` →
+    // commit_and_verify's `!has_entry` gate fires).
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    let use_io_uring = {
+        let available = nativelink_util::fs::is_io_uring_available().await;
+        super::chunked_writer::emit_activation_probe_once(available);
+        available
+    };
+    #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+    let use_io_uring: bool = {
+        super::chunked_writer::emit_activation_probe_once(false);
+        false
+    };
+
+    // Path A state — populated lazily on the first non-empty chunk.
+    // `None` when (a) we're on Path B, OR (b) we're on Path A but haven't
+    // seen a non-empty chunk yet (zero-byte fast-path preserved).
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    let mut writer_state: Option<(
+        // CAPPED AT WRITE_PIPELINE_DEPTH jobs per blob (1024 × 1 MiB = 1 GiB
+        // worst-case per blob); aggregate ceiling across all writers is
+        // ChunkBudget's 4 GiB global semaphore at chunk_budget.rs:52
+        // (design §8 I9). Over-cap per blob: chunk_tx.send().await blocks
+        // the driver's recv loop, applying backpressure all the way back
+        // to the gRPC stream via ChunkBudget permit non-availability.
+        mpsc::Sender<super::chunked_writer::WriteJob>,
+        tokio::task::JoinHandle<Result<(), Error>>,
+    )> = None;
+
     while let Some(work) = rx.recv().await {
         chunks_received.fetch_add(1, Ordering::Relaxed);
         let ChunkWork {
@@ -884,9 +922,113 @@ async fn run_driver<Fe: FileEntry>(
         // actually pays, NOT just the syscall. The field is named
         // `back_edge_ms` to reflect this.
         let bytes_for_write = chunk_bytes.clone();
-        let write_fut = filesystem_store.write_chunk_at_offset(&digest, chunk_offset, bytes_for_write);
         let pwrite_started_at = std::time::Instant::now();
-        let write_result = write_fut.await;
+        let write_result: Result<(), Error> = {
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            {
+                if use_io_uring {
+                    // Path A: lazy-spawn writer task on first non-empty
+                    // chunk. Empty chunks are a no-op at the pwrite layer
+                    // (the SpawnBlocking path early-returns at
+                    // chunked_filesystem.rs:444); preserve the same
+                    // behavior on Path A by skipping the writer entirely
+                    // on empty payloads.
+                    if bytes_for_write.is_empty() {
+                        // No-op: chunk_offset still goes into the sidecar
+                        // bitmap + pin below; the writer task never sees
+                        // this offset.
+                        Ok(())
+                    } else {
+                        // Lazy-spawn the writer task on first non-empty
+                        // chunk (preserves I1: a true zero-byte blob
+                        // never spawns a writer task; no marker entry).
+                        if writer_state.is_none() {
+                            // open_or_create_partial_marker inserts the
+                            // IoUringMarker into the chunked_partials
+                            // map BEFORE spawning the writer task — so
+                            // commit_chunked_to_holding's lookup finds
+                            // the marker entry regardless of writer
+                            // task lifecycle.
+                            let fd_arc = filesystem_store
+                                .open_chunked_partial_marker(digest)
+                                .await?;
+                            let (chunk_tx, chunk_rx) = mpsc::channel::<
+                                super::chunked_writer::WriteJob,
+                            >(
+                                super::chunked_writer::WRITE_PIPELINE_DEPTH,
+                            );
+                            let handle = tokio::spawn(
+                                super::chunked_writer::writer_task(fd_arc, chunk_rx),
+                            );
+                            writer_state = Some((chunk_tx, handle));
+                        }
+                        // Cheap Sender::clone to satisfy the borrow
+                        // checker: `writer_state` holds the canonical
+                        // Sender; we clone it for this single send. The
+                        // clone is one Arc bump; tokio's mpsc Sender is
+                        // Clone-cheap. Move `_permit` (the
+                        // OwnedSemaphorePermit destructured from
+                        // ChunkWork) into the WriteJob — the writer task
+                        // drops the permit AFTER the writev CQE is
+                        // processed, satisfying I9 (aggregate
+                        // channel-resident bytes ≤ ChunkBudget cap).
+                        let chunk_tx_clone = writer_state
+                            .as_ref()
+                            .expect("just initialized")
+                            .0
+                            .clone();
+                        let send_res = chunk_tx_clone
+                            .send(super::chunked_writer::WriteJob {
+                                offset: chunk_offset,
+                                bytes: bytes_for_write,
+                                _permit,
+                                enqueue_time: pwrite_started_at,
+                            })
+                            .await;
+                        match send_res {
+                            Ok(()) => Ok(()),
+                            Err(_send_err) => {
+                                // Writer task has dropped chunk_rx — it
+                                // errored or panicked. LOAD-BEARING
+                                // ORDERING (T6 mutation target): drop
+                                // chunk_tx first, then await
+                                // writer_handle to surface the REAL
+                                // writev error. Do NOT manufacture a
+                                // "writer dropped" Code::Internal here.
+                                let (failed_tx, failed_handle) = writer_state
+                                    .take()
+                                    .expect("just spawned");
+                                drop(failed_tx);
+                                let real_err = failed_handle
+                                    .await
+                                    .map_err(|join_err| {
+                                        make_err!(
+                                            Code::Internal,
+                                            "chunked writer task panicked: {join_err:?}",
+                                        )
+                                    })?;
+                                Err(real_err.expect_err(
+                                    "writer task closed rx without errored result — \
+                                     contract bug in writer_task post-error drain",
+                                ))
+                            }
+                        }
+                    }
+                } else {
+                    // Path B fallback: existing per-chunk write call.
+                    filesystem_store
+                        .write_chunk_at_offset(&digest, chunk_offset, bytes_for_write)
+                        .await
+                }
+            }
+            #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+            {
+                let _ = use_io_uring;
+                filesystem_store
+                    .write_chunk_at_offset(&digest, chunk_offset, bytes_for_write)
+                    .await
+            }
+        };
         let pwrite_elapsed = pwrite_started_at.elapsed();
         if pwrite_elapsed >= per_chunk_timeout {
             warn!(
@@ -1064,7 +1206,45 @@ async fn run_driver<Fe: FileEntry>(
             state.finish_seen && state.landed_offsets.len() == expected_chunk_count
         };
         if ready_to_commit {
+            // #47 b1 Phase 2 Step 2 LOAD-BEARING ORDERING: drain writer
+            // task before stat-and-rename in commit_chunked_to_holding.
+            // If we don't await the writer's CQEs first, the rename
+            // races still-in-flight writev completions and the stat sees
+            // a short file → length-mismatch error. Mutation target for
+            // T1: comment out `writer_handle.await??` below; T1 must
+            // red-fail with "length mismatch".
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            if let Some((chunk_tx, writer_handle)) = writer_state.take() {
+                drop(chunk_tx);
+                writer_handle
+                    .await
+                    .map_err(|join_err| {
+                        make_err!(
+                            Code::Internal,
+                            "chunked writer task panicked: {join_err:?}",
+                        )
+                    })??;
+            }
             return commit_and_verify(&filesystem_store, &digest, expected_size).await;
+        }
+    }
+
+    // #47 b1 Phase 2 Step 2: receiver returned None (upstream sender
+    // closed). On Path A, drain the writer task so its post-error or
+    // post-EOF state surfaces before the error-arm below. This is
+    // best-effort — if the writer's result is Err it's still an
+    // operator-visible error class (slow-tier wedge mid-stream); log
+    // and continue to the existing "no finish observed" arm.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    if let Some((chunk_tx, writer_handle)) = writer_state.take() {
+        drop(chunk_tx);
+        if let Err(join_err) = writer_handle.await {
+            warn!(
+                target: "nativelink_store::chunked",
+                ?digest,
+                ?join_err,
+                "chunked writer task panicked during driver drain — partial left for prune sweep"
+            );
         }
     }
 
