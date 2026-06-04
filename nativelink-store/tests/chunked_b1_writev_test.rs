@@ -467,6 +467,16 @@ async fn b1_writev_channel_close_on_driver_drop_releases_writer() {
 /// accounted for in some writev". Alternative mutation: make the
 /// histogram push fire twice per writev — `sum` becomes 32; same
 /// assertion fires with the inverse direction.
+///
+/// MUTATION VERIFIED (2026-06-03): in chunked_writer.rs (~line 647-652),
+/// replaced
+///   `super::COALESCE_HISTOGRAM_BY_DIGEST.lock().entry(digest)
+///        .or_insert_with(Vec::new).push(coalesce_count as u32);`
+/// with a no-op (`let _ = digest; let _ = coalesce_count;`). The
+/// histogram stayed empty → `sum == 0` → this assertion fired with
+/// bespoke "T2: coalesce histogram sum mismatch — every chunk must
+/// be accounted for in some writev: got sum=0, histogram=[]".
+/// Reverting the mutation restored green.
 #[nativelink_test]
 async fn b1_writev_multi_chunk_coalesces_pwritev_count() {
     if !skip_if_no_io_uring("b1_writev_multi_chunk_coalesces_pwritev_count").await {
@@ -664,10 +674,18 @@ async fn b1_writev_different_digests_parallelize() {
     } else {
         start_a.duration_since(start_b)
     };
-    // MUTATION VERIFIED: wrap the writer-task spawn (or body) in a
-    // global `tokio::sync::Mutex` held across the writev pipeline →
-    // second blob's first-writev start lags the first by ≫ 100 ms →
-    // this assertion fires with bespoke "different digests serialized".
+    // MUTATION VERIFIED (2026-06-03): in chunked_driver.rs (~line
+    // 1018-1025), wrapped the writer-task spawn in
+    //   `static GLOBAL_WRITER_LOCK: tokio::sync::Mutex<()> =
+    //       tokio::sync::Mutex::const_new(());`
+    // acquired at the top of the spawned future and held across the
+    // writer_task body + a 300 ms post-completion sleep. Two parallel
+    // writers serialized → blob B's first-writev start lagged blob A's
+    // by ~303 ms → this assertion fired with bespoke "T4: different
+    // digests serialized: |start_b - start_a| = 303 ms (> 100 ms
+    // threshold) — per-blob isolation broken, global mutex around
+    // writer-task spawn or body introduced". Reverting the mutation
+    // restored green (gap < 100 ms).
     assert!(
         gap.as_millis() < 100,
         "T4: different digests serialized: |start_b - start_a| = {} ms (> 100 ms threshold) — \
@@ -943,13 +961,19 @@ async fn b1_writev_error_mid_stream_drains_and_returns_permits() {
 ///   5. `await_completion` returns Ok; final assertion on commit
 ///      success.
 ///
-/// MUTATION VERIFIED: move the pin populate out of
-/// `chunked_writer::process_completion` and back to the driver-send
-/// site (i.e. delete the `if !pin_populated_by_writer` gate in
-/// chunked_driver.rs so the driver always populates pre-CQE). With
-/// that mutation, the step-3 observation finds `pinned_chunk_count
-/// >= 1` and the test red-fails with the bespoke "pin advertised
-/// bytes before writev completed" message.
+/// MUTATION VERIFIED (2026-06-03): in chunked_driver.rs (~line 1318),
+/// removed the `if !pin_populated_by_writer` gate around
+///   `let mut pin_state = pin.lock();
+///    pin_state.populate(chunk_offset, chunk_bytes.clone(),
+///                       pin_permit_for_path_b_or_empty);`
+/// so the driver always populates pin synchronously with `tx.send Ok`
+/// (pre-CQE). The 200 ms observation window then saw pin populated
+/// (pinned_chunk_count = 1, pinned_bytes = 1048576) and this
+/// assertion fired with bespoke "T9: pin advertised bytes before
+/// writev completed — pinned_chunk_count = 1 (expected 0 during the
+/// pre-write delay window); LOAD-BEARING ORDERING violated;
+/// pinned_bytes = 1048576". Reverting (restoring the gate) restored
+/// green.
 #[nativelink_test]
 async fn b1_writev_pin_only_advertises_post_cqe_bytes() {
     if !skip_if_no_io_uring("b1_writev_pin_only_advertises_post_cqe_bytes").await {
