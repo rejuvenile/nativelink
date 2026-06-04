@@ -187,6 +187,51 @@ pub struct StreamingBlobInner {
     /// Digest for this blob.
     digest: DigestInfo,
 
+    /// Authoritative bytes-on-store size for the #502 silent-short check.
+    ///
+    /// The #502 check at `next_chunk` compares `bytes_written` against the
+    /// "expected bytes on the wire" to detect a producer that called
+    /// `send_eof` without delivering the full payload. For **CAS** reads
+    /// the upper bound is `digest.size_bytes()` (content-addressed
+    /// invariant: stored bytes == declared bytes). For **AC** reads the
+    /// declared `action_digest.size_bytes()` is the *Action* proto's
+    /// encoded size; the bytes actually stored under that key are the
+    /// *ActionResult* proto's encoded bytes, a different message
+    /// (`ac_server.rs:199-205`, `docs/ac-integrity-contract.md`). The two
+    /// sizes generally differ, so the digest-based bound is structurally
+    /// wrong for AC.
+    ///
+    /// Semantics:
+    /// - `OnceLock` set to `n` — authoritative bytes-on-store size from
+    ///   `slow_store.has()` returning `ExactSize(n)`. The #502 check
+    ///   compares `bytes_written < n` instead of `bytes_written <
+    ///   digest.size_bytes()`. Crucially, `n == 0` is a *legitimate*
+    ///   value (zero-byte AC entries exist) and does NOT collide with an
+    ///   "unset" sentinel — that collision was the v1 AtomicU64 bug.
+    /// - `OnceLock` unset — caller does not know the bytes-on-store size
+    ///   (e.g. `LazyExistenceOnSync` paths where `has()` returns
+    ///   `MaxSize(u64::MAX)`, or non-FastSlowStore construction sites).
+    ///   The #502 check falls back to `digest.size_bytes()`, preserving
+    ///   prior behavior.
+    ///
+    /// `OnceLock` enforces at-most-once write (the size on store does not
+    /// change for a given digest) and provides happens-before ordering
+    /// for the producer→reader handoff: the producer sets this BEFORE
+    /// sending any chunk; readers observe terminal state via the
+    /// `terminal` mutex which establishes the same happens-before edge.
+    ///
+    /// This becomes the basis for the OVERSHOOT direction in #44 too —
+    /// the same accessor identifies the upper bound that
+    /// `bytes_written > expected` would compare against.
+    ///
+    /// (Incident 2026-06-04: 288 silent_short events across two bursts on
+    /// `ac_server::get_action_result`, all on 217-byte Action digests
+    /// where the stored ActionResult was 203-215 bytes. Bazel retried
+    /// transient Code::Internal up to 10× per action — eventually a
+    /// permanent failure for actions that legitimately had ActionResults
+    /// shorter than the Action proto.)
+    expected_size_on_store: OnceLock<u64>,
+
     /// Maximum bytes to buffer before evicting old chunks.
     max_buffer_bytes: u64,
 
@@ -247,6 +292,13 @@ impl fmt::Debug for StreamingBlobInner {
 }
 
 impl StreamingBlobInner {
+    /// Construct with `expected_size_on_store` unset. The #502
+    /// silent-short check falls back to `digest.size_bytes()` for
+    /// readers of blobs constructed via this entry point. Producers
+    /// that obtain an authoritative bytes-on-store size from
+    /// `slow_store.has()` should call `set_expected_size_on_store`
+    /// before sending the first chunk; see
+    /// `FastSlowStore::run_producer`.
     pub fn new(digest: DigestInfo, max_buffer_bytes: u64) -> Self {
         // The receiver returned from `channel()` starts at
         // `Version::INITIAL` — we hold it as the pristine clone
@@ -262,6 +314,7 @@ impl StreamingBlobInner {
             notify_waiters_calls: AtomicU64::new(0),
             terminal: Mutex::new(None),
             digest,
+            expected_size_on_store: OnceLock::new(),
             max_buffer_bytes,
             earliest_chunk_idx: AtomicU64::new(0),
             created_at: Instant::now(),
@@ -371,6 +424,38 @@ impl StreamingBlobInner {
     pub fn digest(&self) -> &DigestInfo {
         &self.digest
     }
+
+    /// Record the authoritative bytes-on-store size for the #502
+    /// silent-short check. At-most-once: subsequent calls are no-ops
+    /// (the bytes-on-store size for a given digest does not change).
+    /// Producers that know the real size from `slow_store.has()` should
+    /// call this BEFORE sending the first chunk; readers observing
+    /// terminal state through the existing `terminal` mutex inherit the
+    /// happens-before edge from `OnceLock::set` → `OnceLock::get`.
+    ///
+    /// Accepts `0` legitimately — zero-byte AC entries exist and must
+    /// not be conflated with "unset" (the v1 AtomicU64 sentinel-0 bug).
+    ///
+    /// See the field doc on `expected_size_on_store` for rationale; in
+    /// short, AC reads expose `digest.size_bytes()` (the Action proto's
+    /// size) ≠ stored bytes (the ActionResult proto's size), so the
+    /// digest-derived bound is structurally wrong for AC, and producers
+    /// that know the real size from `has()` should plumb it through.
+    pub fn set_expected_size_on_store(&self, n: u64) {
+        let _ = self.expected_size_on_store.set(n);
+    }
+
+    /// Returns the expected upper bound used by the #502 silent-short
+    /// check. If `set_expected_size_on_store` recorded an authoritative
+    /// size, that value is returned; otherwise falls back to
+    /// `digest.size_bytes()` (the prior behavior). This accessor also
+    /// names the upper bound for the OVERSHOOT direction in #44.
+    fn expected_size_on_store(&self) -> u64 {
+        match self.expected_size_on_store.get() {
+            Some(&n) => n,
+            None => self.digest.size_bytes(),
+        }
+    }
 }
 
 /// Writer handle for a streaming blob.
@@ -398,6 +483,17 @@ impl StreamingBlobWriter {
             inner,
             eof_sent: false,
         }
+    }
+
+    /// #49: passthrough to `StreamingBlobInner::set_expected_size_on_store`.
+    /// Producers that know the authoritative bytes-on-store size from
+    /// `slow_store.has()` call this before pushing chunks so the #502
+    /// silent-short check compares against the right upper bound for AC
+    /// reads (where `digest.size_bytes()` is the Action proto's size, not
+    /// the stored ActionResult's size). No-op for CAS since the two are
+    /// equal by content-addressing invariant.
+    pub fn set_expected_size_on_store(&self, n: u64) {
+        self.inner.set_expected_size_on_store(n);
     }
 
     /// Append a chunk of data and notify waiting readers.
@@ -890,9 +986,30 @@ impl StreamingBlobReader {
                             // written=0), the check is a no-op (0 < 0 is
                             // false) and the original clean-EOF path is
                             // preserved.
+                            //
+                            // #49 (2026-06-04): use the producer-supplied
+                            // `expected_size_on_store` when set, falling
+                            // back to `digest.size_bytes()` otherwise. For
+                            // AC reads `digest.size_bytes()` is the
+                            // *Action* proto's size, NOT the stored
+                            // *ActionResult* bytes; comparing
+                            // `bytes_written` against the digest size
+                            // therefore false-fires on every AC read where
+                            // those sizes differ. The authoritative size
+                            // (recorded by `FastSlowStore::run_producer`
+                            // from `slow_store.has().Some(ExactSize(n))`)
+                            // is the real bytes-on-store count. For CAS
+                            // the two are equal by content-addressing
+                            // invariant, so the override is a no-op
+                            // there. For paths that cannot commit to a
+                            // size (`LazyExistenceOnSync`'s
+                            // `MaxSize(u64::MAX)`), the `OnceLock` stays
+                            // unset and the digest-based fallback
+                            // applies.
                             let bytes_written =
                                 self.inner.bytes_written.load(Ordering::Acquire);
-                            let expected_size = self.inner.digest.size_bytes();
+                            let expected_size =
+                                self.inner.expected_size_on_store();
                             if bytes_written < expected_size {
                                 error!(
                                     digest = %self.inner.digest,
@@ -2624,6 +2741,266 @@ mod tests {
             msg.contains(STREAMING_BLOB_SILENT_SHORT_MARKER),
             "#502: production-composition err message must include the \
              stable marker substring; got {msg}",
+        );
+    }
+
+    /// #49: AC reads must NOT trip the #502 silent-short check using
+    /// `digest.size_bytes()` as the expected-bytes upper bound. The
+    /// `action_digest` size_bytes is the *Action* proto's encoded size; the
+    /// bytes stored under that key in the AC backend are the *ActionResult*
+    /// proto's encoded bytes — a different message under the same key. The
+    /// AC integrity contract (`ac_server.rs:199-205`, `docs/ac-integrity-
+    /// contract.md`) explicitly says `H(store_data) != digest` for AC.
+    ///
+    /// Production 2026-06-04 05:55:13–15 PDT: 28 silent_short events fired
+    /// from `ac_server::get_action_result`, all on 217-byte Action digests
+    /// where ActionResult encoded_len() landed in 203-215 bytes. 100% of
+    /// events were AC reads. The check shipped a Code::Internal that Bazel
+    /// retried up to 10× (transient classification), but the underlying
+    /// inequality is structural, not transient — every cache-miss AC read
+    /// of an Action whose ActionResult is shorter than the Action would
+    /// fire forever.
+    ///
+    /// The fix: producers that know the actual bytes-on-store size (e.g.
+    /// `FastSlowStore::run_producer` after `slow_store.has()` returns
+    /// `ExactSize(n)`) call `set_expected_size_on_store(n)` to record the
+    /// authoritative upper bound for the silent-short check. For AC,
+    /// that's the Redis STRLEN (= ActionResult encoded_len). For CAS,
+    /// that's the file size (= digest.size_bytes by content-addressing
+    /// invariant — the override is a no-op there).
+    ///
+    /// Mutation: comment out `set_expected_size_on_store` below; this
+    /// test must red-fail with "AC read with declared size_bytes != stored
+    /// bytes must NOT trip #502 silent_short — bytes_written matches
+    /// stored size".
+    ///
+    /// MUTATION VERIFIED (2026-06-04): in `StreamingBlobInner::
+    /// set_expected_size_on_store` (~line 408-410), replaced
+    ///   `let _ = self.expected_size_on_store.set(n);`
+    /// with a no-op (`let _ = n;`). The `OnceLock` stayed unset → the
+    /// `expected_size_on_store()` accessor fell back to
+    /// `digest.size_bytes() = 217` → the silent-short check fired
+    /// because `bytes_written = 207 < expected_size = 217` → this
+    /// assertion fired with bespoke `Error { code: Internal, messages:
+    /// ["streaming_blob_silent_short: terminal=Ok but bytes_written=207
+    /// < expected_size=217 for digest 9797979797…-217"] }`. Reverting
+    /// the mutation restored green.
+    #[tokio::test]
+    async fn ac_read_with_size_override_does_not_trip_silent_short() {
+        // AC entry: action_digest declares 217 bytes (Action proto size);
+        // the stored ActionResult is 207 bytes (the value observed in
+        // production for digest 97fd1a58...-217 at 05:55:15.290 PDT).
+        const ACTION_DIGEST_SIZE: u64 = 217;
+        const ACTION_RESULT_BYTES: u64 = 207;
+        let digest = DigestInfo::new([0x97u8; 32], ACTION_DIGEST_SIZE);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 64 * 1024 * 1024));
+
+        // Producer knows the bytes-on-store size from `slow_store.has()`
+        // (in the AC case, Redis STRLEN). Plumb it through so the #502
+        // check compares against the right value.
+        inner.set_expected_size_on_store(ACTION_RESULT_BYTES);
+
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let mut reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+        // Producer ships the full ActionResult bytes.
+        let chunk = Bytes::from(vec![0xacu8; ACTION_RESULT_BYTES as usize]);
+        writer
+            .send(chunk)
+            .await
+            .expect("producer.send must succeed for the ActionResult bytes");
+        writer
+            .send_eof()
+            .expect("producer.send_eof must succeed");
+
+        // Reader drains the ActionResult chunk.
+        let c = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk must not deadlock on the ActionResult chunk")
+            .expect("ActionResult chunk must be Ok");
+        assert_eq!(c.len(), ACTION_RESULT_BYTES as usize);
+
+        // The #502 silent-short check MUST NOT fire on the terminal-Ok
+        // poll, because `bytes_written (207) == expected_size_on_store
+        // (207)` even though `bytes_written (207) < digest.size_bytes
+        // (217)`. AC bytes-on-store size is the authoritative upper bound,
+        // not the action_digest's declared size.
+        let eof = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk terminal-Ok must not deadlock")
+            .expect(
+                "AC read with declared size_bytes != stored bytes must NOT \
+                 trip #502 silent_short — bytes_written matches stored size",
+            );
+        assert!(
+            eof.is_empty(),
+            "#49: AC terminal poll must return clean EOF (empty Bytes); \
+             the producer wrote 207/207 bytes-on-store (despite \
+             digest.size_bytes=217 from the Action proto). Got {} bytes.",
+            eof.len(),
+        );
+    }
+
+    /// #49 negative: CAS reads (where digest IS content-addressed) keep
+    /// firing the #502 check on a genuine silent short. Setting the
+    /// `expected_size_on_store` to the digest's size_bytes (the default
+    /// behavior the producer derives from `slow_store.has()` returning
+    /// `ExactSize(N)` for a CAS FilesystemStore where N == digest.size_bytes)
+    /// must NOT suppress the original #502 protection.
+    #[tokio::test]
+    async fn cas_silent_short_still_trips_with_matching_override() {
+        const EXPECTED_BYTES: u64 = 47_291_739;
+        const TRUNCATED_BYTES: u64 = 7_881_957;
+        let digest = DigestInfo::new([0x5au8; 32], EXPECTED_BYTES);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 64 * 1024 * 1024));
+
+        // CAS: slow_store.has() returned ExactSize(EXPECTED_BYTES); the
+        // override matches digest.size_bytes (content-addressed invariant).
+        inner.set_expected_size_on_store(EXPECTED_BYTES);
+
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let mut reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+        let chunk = Bytes::from(vec![0xa5u8; TRUNCATED_BYTES as usize]);
+        writer.send(chunk).await.expect("send truncated chunk");
+        writer.send_eof().expect("send_eof must succeed");
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("drain truncated chunk")
+            .expect("truncated chunk Ok");
+
+        let err = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("terminal-Ok poll must not deadlock")
+            .expect_err(
+                "#502: CAS silent-short with matching override must STILL \
+                 surface as Err(Internal) — the override does not disable \
+                 the check, only redirects which size to compare against",
+            );
+        assert_eq!(err.code, Code::Internal);
+        assert!(
+            format!("{err:?}").contains(STREAMING_BLOB_SILENT_SHORT_MARKER),
+        );
+    }
+
+    /// #49 (v2 sentinel-collision regression): zero-byte AC entries are
+    /// a legitimate, observed value (an empty ActionResult under a
+    /// non-empty action_digest), and `expected_size_on_store = Some(0)`
+    /// must NOT collide with "unset" semantics. v1 used `AtomicU64` with
+    /// sentinel 0 as "unset", which would have meant the producer
+    /// recording `0` falls back to `digest.size_bytes()` — so a
+    /// 217-byte action_digest with a 0-byte ActionResult would have
+    /// false-fired the silent-short check (bytes_written=0 <
+    /// digest.size_bytes=217). v2 uses `OnceLock<u64>`, where `Some(0)`
+    /// is distinct from `None`.
+    ///
+    /// Mutation: revert to v1 sentinel-0 semantics (e.g. wrap
+    /// `set_expected_size_on_store(0)` as a no-op or store via
+    /// `AtomicU64::new(0)` + `n != 0` check); this test must red-fail
+    /// with "sentinel collision: zero-byte AC entry false-fires
+    /// silent_short".
+    ///
+    /// MUTATION VERIFIED (2026-06-04): in `StreamingBlobInner::
+    /// set_expected_size_on_store`, wrapped the body with
+    ///   `if n == 0 { return; }`
+    /// then `let _ = self.expected_size_on_store.set(n);` (the v1
+    /// AtomicU64-sentinel semantics). The `OnceLock` stayed unset →
+    /// `expected_size_on_store()` fell back to `digest.size_bytes() =
+    /// 217` → silent-short fired on the zero-byte ActionResult because
+    /// `bytes_written = 0 < expected_size = 217` → this assertion fired
+    /// with bespoke `Error { code: Internal, messages:
+    /// ["streaming_blob_silent_short: terminal=Ok but bytes_written=0
+    /// < expected_size=217 for digest 0e0e0e0e…-217"] }`. Reverting
+    /// the mutation restored green.
+    #[tokio::test]
+    async fn zero_byte_ac_entry_does_not_false_fire_silent_short() {
+        const ACTION_DIGEST_SIZE: u64 = 217;
+        const ACTION_RESULT_BYTES: u64 = 0;
+        let digest = DigestInfo::new([0x0eu8; 32], ACTION_DIGEST_SIZE);
+        let inner = Arc::new(StreamingBlobInner::new(digest, 64 * 1024 * 1024));
+
+        // Producer's `slow_store.has()` returned `ExactSize(0)` — a
+        // valid empty value, distinct from "unknown size".
+        inner.set_expected_size_on_store(ACTION_RESULT_BYTES);
+
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let mut reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+        // No data; producer sends EOF immediately.
+        writer.send_eof().expect("send_eof must succeed");
+
+        let eof = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("reader.next_chunk terminal-Ok must not deadlock")
+            .expect(
+                "sentinel collision: zero-byte AC entry false-fires \
+                 silent_short — expected_size_on_store=Some(0) must NOT \
+                 be conflated with the unset fallback to digest.size_bytes",
+            );
+        assert!(
+            eof.is_empty(),
+            "#49: zero-byte AC terminal poll must return clean EOF; \
+             got {} bytes",
+            eof.len(),
+        );
+    }
+
+    /// #49 (v2 unset-fallback): non-FastSlowStore construction sites
+    /// (e.g. `StreamingBlob::new`, `InFlightBlobMap::register`) leave
+    /// `expected_size_on_store` unset. For those, the #502 check falls
+    /// back to `digest.size_bytes()` — preserving prior behavior, which
+    /// is correct on the CAS path because the InFlightBlobMap is keyed
+    /// by content-addressed CAS digests where stored bytes ==
+    /// digest.size_bytes by construction.
+    ///
+    /// Mutation: change `expected_size_on_store()` to always return 0
+    /// when unset; this test must red-fail with "unset OnceLock did NOT
+    /// fall back to digest.size_bytes — sentinel/zero confusion".
+    ///
+    /// MUTATION VERIFIED (2026-06-04): in `StreamingBlobInner::
+    /// expected_size_on_store` accessor, replaced the `None` arm's
+    /// `self.digest.size_bytes()` fallback with the constant `0`. The
+    /// silent-short check then compared `bytes_written = 250_000 < 0`
+    /// which is false → check did NOT fire → terminal poll returned
+    /// `Ok(Bytes::new())` instead of `Err(Internal)` → this assertion
+    /// fired with bespoke "unset OnceLock did NOT fall back to
+    /// digest.size_bytes — sentinel/zero confusion: CAS silent-short
+    /// check must still trip when expected_size_on_store is unset"
+    /// (panic: `b""`). Reverting the mutation restored green.
+    #[tokio::test]
+    async fn cas_silent_short_trips_when_size_on_store_unset() {
+        const EXPECTED_BYTES: u64 = 1_000_000;
+        const TRUNCATED_BYTES: u64 = 250_000;
+        let digest = DigestInfo::new([0xcau8; 32], EXPECTED_BYTES);
+        // No `set_expected_size_on_store` call — represents an
+        // InFlightBlobMap / StreamingBlob::new construction site where
+        // the caller does not commit to a bytes-on-store size.
+        let inner = Arc::new(StreamingBlobInner::new(digest, 64 * 1024 * 1024));
+
+        let mut writer = StreamingBlobWriter::new(Arc::clone(&inner));
+        let mut reader = StreamingBlobReader::new(Arc::clone(&inner));
+
+        let chunk = Bytes::from(vec![0xcau8; TRUNCATED_BYTES as usize]);
+        writer.send(chunk).await.expect("send truncated chunk");
+        writer.send_eof().expect("send_eof must succeed");
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("drain truncated chunk")
+            .expect("truncated chunk Ok");
+
+        let err = tokio::time::timeout(Duration::from_secs(2), reader.next_chunk())
+            .await
+            .expect("terminal-Ok poll must not deadlock")
+            .expect_err(
+                "unset OnceLock did NOT fall back to digest.size_bytes \
+                 — sentinel/zero confusion: CAS silent-short check must \
+                 still trip when expected_size_on_store is unset",
+            );
+        assert_eq!(err.code, Code::Internal);
+        assert!(
+            format!("{err:?}").contains(STREAMING_BLOB_SILENT_SHORT_MARKER),
         );
     }
 }

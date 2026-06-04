@@ -3529,6 +3529,39 @@ impl FastSlowStore {
             }
         };
 
+        // #49 (2026-06-04): plumb the bytes-on-store size from
+        // `slow_store.has()` into the streaming buffer so the #502
+        // silent-short check at `StreamingBlobReader::next_chunk` compares
+        // against the right upper bound. For CAS the digest's size_bytes
+        // matches the file size (content-addressed invariant), so this is
+        // a no-op. For AC the action_digest's size_bytes is the *Action*
+        // proto's encoded size while the bytes stored under that key are
+        // the *ActionResult* proto's encoded bytes
+        // (`ac_server.rs:199-205`); the digest-based bound false-fires on
+        // every cache-miss AC read where those sizes differ. Only the
+        // `ExactSize` arm carries an authoritative size; `MaxSize` (set by
+        // the `LazyExistenceOnSync` short-circuit at `:3470`) leaves the
+        // `OnceLock` unset so the original `digest.size_bytes()` fallback
+        // applies — that path doesn't know the real size and can't do
+        // better. Production AC slow tier is RedisStore, which does NOT
+        // report `LazyExistenceOnSync`, so cache-miss AC reads always
+        // reach this branch.
+        //
+        // Recorded BEFORE the body fetch begins, so by the time any chunk
+        // is sent (let alone terminal-Ok set), the `OnceLock` is
+        // populated. Readers observe terminal state through the existing
+        // `terminal` mutex, which establishes the happens-before edge
+        // back to this `OnceLock::set`.
+        //
+        // (Incident 2026-06-04 05:55 PDT: 28 silent_short events on
+        // 217-byte Action digests whose ActionResult encoded to 203-215
+        // bytes; 100% of recent events from `ac_server::get_action_result`.
+        // Bursty because the producer path only fires on AC fast-tier
+        // miss, which is rare after `MemoryStore(4GB/500K)` warms up.)
+        if let UploadSizeInfo::ExactSize(n) = reader_stream_size {
+            streaming_writer.set_expected_size_on_store(n);
+        }
+
         let mut counted_hit = false;
 
         // Use 128 slots (~32MiB at 256KiB chunks) for dual-store
