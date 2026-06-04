@@ -5787,4 +5787,296 @@ mod tests {
             fail::cfg("directory_cache_failed_subtree_missing_in_tree", "off").ok();
         }
     }
+
+    // =====================================================================
+    // #50 Phase 2 — RAII pin guard tests (T1 / T2 / T3 per v2 design §4)
+    //
+    // Composite invariant under test:
+    //   gate ⇒ (pin OR ttl OR evict)
+    // For DirectoryCache the gate is soft (evict-first, admit-always),
+    // TTL is absent, evict is LRU-of-ref_count==0. Pin alone is
+    // load-bearing — the guard's Drop is what makes the pin corner
+    // cancellation-safe at site H (`try_hardlink_cached`).
+    //
+    // Test-only helper (manufactures the precondition for T2 — all
+    // entries pinned — by holding REAL pin guards across an over-cap
+    // insert; no production-code test seam).
+    // =====================================================================
+
+    /// Inserts a metadata entry directly into the cache HashMap (no
+    /// reconstruction), bumps `ref_count` by 1, and returns the digest
+    /// together with a `DirectoryCachePinGuard` whose Drop owns the
+    /// matching decrement.
+    ///
+    /// Used to manufacture the "all-entries-pinned" precondition in T2
+    /// without any production-code test seam: the guard is the same
+    /// type production uses, the bump is the same atomic, and dropping
+    /// the guard exercises exactly the production Drop path.
+    async fn insert_and_pin(
+        cache: &DirectoryCache,
+        digest: DigestInfo,
+        size: u64,
+    ) -> Result<DirectoryCachePinGuard, Error> {
+        let pin_arc = {
+            let mut cache_map = cache.cache.write().await;
+            // Evict if necessary so we exercise the soft-gate path.
+            let _evicted_paths = cache.collect_evictions(size, &mut cache_map);
+            let metadata = CachedDirectoryMetadata {
+                path: cache.config.cache_root.join(digest.to_string()),
+                size,
+                last_access_millis: AtomicU64::new(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                ),
+                ref_count: Arc::new(AtomicUsize::new(0)),
+            };
+            let pin_arc = Arc::clone(&metadata.ref_count);
+            cache_map.insert(digest, metadata);
+            // Bump ref_count under the lock so eviction-side observers
+            // see ref_count > 0 immediately.
+            pin_arc.fetch_add(1, Ordering::Relaxed);
+            pin_arc
+        };
+        Ok(DirectoryCachePinGuard::from_already_pinned(pin_arc))
+    }
+
+    /// T1 — Cancellation does not leak ref at H.
+    ///
+    /// Polls `try_hardlink_cached` once (deterministically advances it
+    /// past the `fetch_add(1)` on `ref_count` and into the first await
+    /// point — the `spawn_blocking` JoinHandle inside
+    /// `hardlink_directory_tree`), then DROPS the future without
+    /// polling further. This is the "task cancelled mid-await"
+    /// scenario in deterministic form.
+    ///
+    /// With the RAII guard wired at H, dropping the future runs the
+    /// guard's Drop and the matching `fetch_sub(1)` — `ref_count` is
+    /// back to 0.
+    ///
+    /// Without the guard (old manual `fetch_add` / await / `fetch_sub`
+    /// pattern), the `fetch_sub(1)` is unreachable from the dropped
+    /// future and `ref_count` is permanently leaked at 1.
+    ///
+    /// Mutation guards verified:
+    /// 1. Revert `try_hardlink_cached` to manual `fetch_add` /
+    ///    `fetch_sub` → T1 must red-fail with the bespoke "composite
+    ///    invariant violated: pin leaked after cancellation" message.
+    /// 2. Mutate `impl Drop for DirectoryCachePinGuard` body to no-op
+    ///    `fn drop(&mut self) {}` → T1 must also red-fail (proves Drop
+    ///    is the load-bearing line, not the binding alone).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pin_guard_releases_on_cancellation() -> Result<(), Error> {
+        use core::task::{Context, Poll, Waker};
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store().await;
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: false,
+        };
+        let cache = DirectoryCache::new(config, store, None).await?;
+
+        // Seed the cache so the next call hits the cache-hit branch
+        // (where the bump-await-drop window lives).
+        let seed_dest = temp_dir.path().join("seed");
+        cache.get_or_create(dir_digest, &seed_dest).await?;
+        assert_eq!(
+            cache.stats().await.in_use_entries,
+            0,
+            "baseline: pin must have released after seed get_or_create",
+        );
+
+        // Grab a snapshot Arc<AtomicUsize> on the entry's ref_count so
+        // we can observe it after the future is dropped.
+        let pin_arc = {
+            let map = cache.cache.read().await;
+            Arc::clone(&map.get(&dir_digest).unwrap().ref_count)
+        };
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            0,
+            "baseline: snapshot Arc must read 0 before the fetch_add",
+        );
+
+        // Build the future without spawning. Polling drives execution
+        // synchronously through the cache.read().await (no contention),
+        // the fetch_add(1), and into the spawn_blocking JoinHandle
+        // await of hardlink_directory_tree — at which point poll
+        // returns Pending. Dropping the future at this point is the
+        // exact "task cancelled mid-await" scenario.
+        let dest = temp_dir.path().join("victim");
+        let mut fut = Box::pin(cache.try_hardlink_cached(&dir_digest, &dest));
+        let waker = Waker::noop();
+        let mut ctx = Context::from_waker(waker);
+
+        // First poll must reach the await and return Pending.
+        let poll_result = fut.as_mut().poll(&mut ctx);
+        assert!(
+            matches!(poll_result, Poll::Pending),
+            "T1 precondition: future must Pending on first poll so we \
+             can drop it mid-await — got Ready (the await completed \
+             synchronously); test setup is wrong",
+        );
+
+        // Verify the fetch_add(1) ran by observing the snapshot Arc.
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            1,
+            "T1 precondition: fetch_add(1) must have run before the \
+             first Pending; cache-hit branch was not taken",
+        );
+
+        // CANCELLATION: drop the future mid-await. With the guard
+        // wired, Drop fires synchronously and decrements ref_count.
+        drop(fut);
+
+        assert_eq!(
+            pin_arc.load(Ordering::Relaxed),
+            0,
+            "composite invariant violated: pin leaked after cancellation \
+             — ref_count > 0 with no corresponding in-flight task",
+        );
+
+        // Also verify via the cache stats path that the entry is
+        // unpinned end-to-end.
+        let stats = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            cache.stats(),
+        )
+        .await
+        .expect("stats() wedged — should be near-instant");
+        assert_eq!(
+            stats.in_use_entries, 0,
+            "composite invariant violated: pin leaked after cancellation \
+             — stats.in_use_entries > 0 with no corresponding in-flight task",
+        );
+
+        Ok(())
+    }
+
+    /// T2 — Soft-gate + LRU + pin composite: pinned entries are
+    /// un-evictable (forces over-cap); releasing a pin lets LRU evict
+    /// and restores the cap.
+    ///
+    /// Falsification: if the LRU filter at `:3425` is mutated to
+    /// `.filter(|_| true)` (ignore ref_count), the "cap is breached
+    /// after 3 pinned inserts" assertion FALSELY succeeds with
+    /// entries == 2, proving the filter is the load-bearing line on
+    /// the LRU corner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pin_keeps_entries_unevictable() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let store = Store::new(MemoryStore::new(&MemorySpec::default()));
+
+        // Cap of 2 entries — very small max_size to make eviction
+        // attempts deterministic for size-loop too.
+        let config = DirectoryCacheConfig {
+            max_entries: 2,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: false,
+        };
+        let cache = Arc::new(DirectoryCache::new(config, store, None).await?);
+
+        let d_a = DigestInfo::try_new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            1,
+        )
+        .unwrap();
+        let d_b = DigestInfo::try_new(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            1,
+        )
+        .unwrap();
+        let d_c = DigestInfo::try_new(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            1,
+        )
+        .unwrap();
+        let d_d = DigestInfo::try_new(
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            1,
+        )
+        .unwrap();
+
+        // Insert + pin three entries past the cap-of-2. With every
+        // entry pinned, evict_lru_entry must return None and the
+        // soft-gate must admit anyway → cap BREACHED to 3.
+        let guard_a = insert_and_pin(&cache, d_a, 1).await?;
+        let _guard_b = insert_and_pin(&cache, d_b, 1).await?;
+        let _guard_c = insert_and_pin(&cache, d_c, 1).await?;
+
+        let stats = cache.stats().await;
+        assert_eq!(
+            stats.entries, 3,
+            "composite invariant violated: soft-gate must have admitted \
+             over-cap because all entries are pinned (LRU returned None)",
+        );
+        assert_eq!(
+            stats.in_use_entries, 3,
+            "all three entries must be pinned (precondition for the \
+             over-cap-admit branch)",
+        );
+
+        // Drop one guard. The pinned-count drops to 2 in-use; one
+        // entry now has ref_count == 0 and is evictable. Inserting a
+        // fourth entry must trigger LRU success and bring entries back
+        // to 3 (cap honored).
+        drop(guard_a);
+        let _guard_d = insert_and_pin(&cache, d_d, 1).await?;
+
+        let stats = cache.stats().await;
+        assert_eq!(
+            stats.entries, 3,
+            "composite invariant: after releasing guard_a, LRU must \
+             have evicted d_a on the next insert; cap honored at 3",
+        );
+
+        Ok(())
+    }
+
+    /// T3 — Happy path: normal hardlink completion drops the guard at
+    /// end-of-scope, ref_count returns to 0.
+    ///
+    /// Mutation guard: replace `impl Drop for DirectoryCachePinGuard`
+    /// with a no-op body → T3 must red-fail with the bespoke "happy
+    /// path: ref_count failed to return to 0" message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn happy_path_guard_releases_after_completion() -> Result<(), Error> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_root = temp_dir.path().join("cache");
+        let (store, dir_digest) = setup_test_store().await;
+
+        let config = DirectoryCacheConfig {
+            max_entries: 10,
+            max_size_bytes: 1024 * 1024,
+            cache_root,
+            direct_use_mode: false,
+        };
+        let cache = DirectoryCache::new(config, store, None).await?;
+
+        // Seed the cache so try_hardlink_cached takes the hit branch.
+        let seed_dest = temp_dir.path().join("seed");
+        cache.get_or_create(dir_digest, &seed_dest).await?;
+
+        let hit_dest = temp_dir.path().join("hit");
+        let res = cache.try_hardlink_cached(&dir_digest, &hit_dest).await?;
+        assert!(res.is_some(), "expected cache hit on second access");
+
+        let stats = cache.stats().await;
+        assert_eq!(
+            stats.in_use_entries, 0,
+            "happy path: ref_count failed to return to 0 — guard Drop \
+             did not decrement",
+        );
+
+        Ok(())
+    }
 }
