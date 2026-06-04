@@ -4164,6 +4164,30 @@ const fn bis_ack_reaper_interval(timeout: Duration) -> Duration {
     }
 }
 
+/// #37 Phase 2 (Q5 / F5): collect-and-remove expired entries from the
+/// pending-acks map under a single lock acquisition. Extracted so
+/// tests can drive the same filter logic the spawned reaper uses
+/// (rather than re-implementing it inline). Returns `(digest, age)`
+/// for each removed entry; the caller emits logs / bumps counters
+/// outside the lock to keep the critical section tight.
+pub(crate) fn collect_expired_bis_acks(
+    map: &mut HashMap<DigestInfo, Instant>,
+    now: Instant,
+    timeout: Duration,
+) -> Vec<(DigestInfo, Duration)> {
+    let expired: Vec<(DigestInfo, Duration)> = map
+        .iter()
+        .filter_map(|(d, t)| {
+            let age = now.saturating_duration_since(*t);
+            (age >= timeout).then(|| (*d, age))
+        })
+        .collect();
+    for (digest, _) in &expired {
+        map.remove(digest);
+    }
+    expired
+}
+
 /// #37 Phase 2 (Q5): spawn the BIS-ack timeout reaper task. Periodically
 /// scans `ac_publish_pending_acks` for entries older than `timeout`,
 /// emitting an `error!` log + `worker_bis_ack_missing` counter
@@ -4182,19 +4206,9 @@ fn spawn_bis_ack_timeout_reaper(
             let now = Instant::now();
             // Collect expired digests under the lock; emit/inc outside
             // the lock to keep the critical section tight.
-            let expired: Vec<(DigestInfo, Duration)> = {
+            let expired = {
                 let mut guard = pending_acks.lock();
-                let expired: Vec<(DigestInfo, Duration)> = guard
-                    .iter()
-                    .filter_map(|(d, t)| {
-                        let age = now.saturating_duration_since(*t);
-                        (age >= timeout).then(|| (*d, age))
-                    })
-                    .collect();
-                for (digest, _) in &expired {
-                    guard.remove(digest);
-                }
-                expired
+                collect_expired_bis_acks(&mut guard, now, timeout)
             };
             for (digest, age) in expired {
                 error!(

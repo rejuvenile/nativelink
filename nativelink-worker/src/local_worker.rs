@@ -36,7 +36,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
     ExecuteResult, GoingAwayRequest, KeepAliveRequest, MirrorPinEntry, PeerHintsChunk,
     UpdateForWorker, chunked_message, execute_result,
 };
-use nativelink_store::fast_slow_store::FastSlowStore;
+use nativelink_store::fast_slow_store::{FastSlowStore, SlowTierMetricSink};
 use nativelink_store::filesystem_store::FilesystemStore;
 use nativelink_util::action_messages::{ActionResult, ActionStage, OperationId};
 use nativelink_util::blob_locality_map::SharedBlobLocalityMap;
@@ -816,6 +816,25 @@ pub struct AcMirrorTarget {
     pub metrics: Arc<crate::running_actions_manager::Metrics>,
 }
 
+/// #37 Phase 2 (Q4 / F1): worker-side implementation of the
+/// `SlowTierMetricSink` trait declared in `nativelink-store`. The
+/// `FastSlowStore` invokes this on the spawned slow-tier Err arm to
+/// bump the per-`store_class` counter
+/// (`worker_slow_tier_async_fail_{ac,cas,unknown}`) on
+/// `RunningActionsManagerImpl::metrics`. Without this plumbing the
+/// per-class counters would be declared-but-never-incremented.
+#[derive(Debug)]
+struct WorkerSlowTierMetricSink {
+    metrics: Arc<crate::running_actions_manager::Metrics>,
+}
+
+impl SlowTierMetricSink for WorkerSlowTierMetricSink {
+    fn record_async_fail(&self, store_class: &str) {
+        self.metrics
+            .worker_slow_tier_async_fail_by_class(store_class);
+    }
+}
+
 /// Holds the FilesystemStore reference and change tracker needed for
 /// BlobsAvailable reporting with drain-then-fire semantics.
 #[derive(Clone, Debug)]
@@ -1193,20 +1212,29 @@ pub fn handle_blobs_in_stable_storage_for_store(
             // (the `worker_bis_ack_received` counter covers events
             // observable to this worker; cross-restart correlation is
             // not in scope for this phase).
-            {
+            //
+            // F7: collect (digest, ack_delay_ms) tuples under the
+            // lock, emit logs + bump counters AFTER the guard drops.
+            // The same critical-section discipline the reaper uses.
+            let acked_with_delays: Vec<(DigestInfo, u64)> = {
                 let mut guard = target.ac_publish_pending_acks.lock();
-                for digest in &acked_digests {
-                    if let Some(start) = guard.remove(digest) {
-                        let ack_delay_ms = start.elapsed().as_millis() as u64;
-                        info!(
-                            ?digest,
-                            ack_delay_ms,
-                            store_id,
-                            "AC BIS-ack received",
-                        );
-                        target.metrics.worker_bis_ack_received.inc();
-                    }
-                }
+                acked_digests
+                    .iter()
+                    .filter_map(|digest| {
+                        guard
+                            .remove(digest)
+                            .map(|start| (*digest, start.elapsed().as_millis() as u64))
+                    })
+                    .collect()
+            };
+            for (digest, ack_delay_ms) in acked_with_delays {
+                info!(
+                    ?digest,
+                    ack_delay_ms,
+                    store_id,
+                    "AC BIS-ack received",
+                );
+                target.metrics.worker_bis_ack_received.inc();
             }
             info!(
                 unpinned = decoded,
@@ -3063,6 +3091,9 @@ pub async fn new_local_worker(
     // worker_slow_tier_async_fail{store_class=cas} separately from
     // the AC tier (tagged below at AC FSS construction).
     effective_cas_store.set_store_class("cas");
+    // #37 Phase 2 (Q4 / F1): metric sink for the CAS FSS is installed
+    // below at the same site as the AC FSS sink (after `ac_publish_metrics`
+    // — the shared Metrics handle — is constructed).
 
     // Initialize directory cache if configured.
     // This is done after effective_cas_store is created so the cache can use
@@ -3198,6 +3229,15 @@ pub async fn new_local_worker(
     let ac_publish_pending_acks = std::sync::Arc::new(parking_lot::Mutex::new(
         std::collections::HashMap::new(),
     ));
+    // #37 Phase 2 (Q4 / F1): install the CAS FSS metric sink so the
+    // spawned slow-tier Err arm bumps
+    // `worker_slow_tier_async_fail_cas`. The AC FSS sink is installed
+    // below at the AC FSS construction site.
+    effective_cas_store.set_slow_tier_metric_sink(Arc::new(
+        WorkerSlowTierMetricSink {
+            metrics: ac_publish_metrics.clone(),
+        },
+    ));
     let ac_mirror_target: Option<AcMirrorTarget> =
         match (ac_store.as_ref(), ac_store_name.as_deref()) {
             (Some(store), Some(name)) => {
@@ -3215,6 +3255,14 @@ pub async fn new_local_worker(
                         // discriminator (paired with the CAS tag at
                         // effective_cas_store above).
                         fss.set_store_class("ac");
+                        // #37 Phase 2 (Q4 / F1): install the AC FSS
+                        // metric sink so the spawned slow-tier Err
+                        // arm bumps `worker_slow_tier_async_fail_ac`.
+                        fss.set_slow_tier_metric_sink(Arc::new(
+                            WorkerSlowTierMetricSink {
+                                metrics: ac_publish_metrics.clone(),
+                            },
+                        ));
                         info!(
                             ac_store_name = name,
                             "AC pin advertisement enabled — found FastSlowStore in AC chain"

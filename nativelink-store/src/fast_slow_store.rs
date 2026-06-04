@@ -21,7 +21,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-#[cfg(feature = "chunked_fast_slow")]
 use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
 use std::time::Instant;
@@ -834,6 +833,22 @@ pub enum SelfRetryOutcome {
     FastTierMiss,
 }
 
+/// #37 Phase 2 (Q4 / F1): cross-crate sink for the per-`store_class`
+/// slow-tier async-write failure counter. The worker installs an impl
+/// that dispatches to `Metrics::worker_slow_tier_async_fail_by_class`
+/// (in `nativelink-worker`), so the existing per-class counters fire
+/// when the FSS spawned slow-write Err arm runs. Implementations MUST
+/// be cheap (single atomic increment) — called once per slow-tier Err
+/// arm execution. Server-side and test callers leave the sink unset;
+/// the FSS-local `slow_tier_async_fail` counter still fires regardless
+/// via `self.metrics`.
+pub trait SlowTierMetricSink: core::fmt::Debug + Send + Sync + 'static {
+    /// Record a slow-tier async-write failure for the given store_class
+    /// label (`"ac"`, `"cas"`, or an unrecognized label which the impl
+    /// is expected to bucket as `"unknown"`).
+    fn record_async_fail(&self, store_class: &str);
+}
+
 // TODO(palfrey) We should consider copying the data in the background to allow the
 // client to hang up while the data is buffered. An alternative is to possibly make a
 // "BufferedStore" that could be placed on the "slow" store that would hang up early
@@ -845,12 +860,20 @@ pub struct FastSlowStore {
     /// worker / server construction so the background slow-tier
     /// failure log carries the AC-vs-CAS distinction (otherwise the
     /// FSS-level `error!` at the slow-tier Err arm is unattributed).
-    /// Default `"unknown"` is the safe placeholder for the 169
-    /// existing constructor callers; production paths set it
-    /// explicitly via the worker construction site in
-    /// `local_worker.rs`. **Observability only** — does not affect
-    /// store behavior.
-    store_class: parking_lot::Mutex<&'static str>,
+    /// `OnceLock` because the label is write-once-at-construction;
+    /// read on every spawned slow-write Err arm. Default (unset) is
+    /// rendered as `"unknown"` by `store_class()` so the 169 existing
+    /// constructor callers and tests that don't tag are safe.
+    /// **Observability only** — does not affect store behavior.
+    store_class: OnceLock<&'static str>,
+    /// #37 Phase 2 (Q4 / F1): cross-crate metrics sink for slow-tier
+    /// async-write failures. The worker installs an impl that
+    /// dispatches the increment to its per-store_class counter
+    /// (`Metrics::worker_slow_tier_async_fail_by_class`). Optional —
+    /// server-side and test callers leave it unset; the FSS-local
+    /// `slow_tier_async_fail` counter on `self.metrics` still fires
+    /// regardless. **Observability only.**
+    slow_tier_metric_sink: OnceLock<Arc<dyn SlowTierMetricSink>>,
     #[metric(group = "fast_store")]
     fast_store: Store,
     fast_direction: StoreDirection,
@@ -1278,17 +1301,30 @@ fn push_stable_digests_via_arcs(
 impl FastSlowStore {
     /// #37 Phase 2 (Q4): tag the FSS instance with a static label
     /// (`"ac"` / `"cas"`). Called once at worker construction; never
-    /// during request servicing. Observability only.
+    /// during request servicing. Subsequent calls are silently no-ops
+    /// (`OnceLock::set` returns `Err` on re-set). Observability only.
     pub fn set_store_class(&self, class: &'static str) {
-        *self.store_class.lock() = class;
+        let _ = self.store_class.set(class);
     }
 
     /// #37 Phase 2 (Q4): read the current store_class label. Used by
     /// the background slow-tier failure log so operators can grep
     /// `worker_slow_tier_async_fail{store_class=ac}` separately from
-    /// CAS failures.
+    /// CAS failures. Returns `"unknown"` if the label was never set
+    /// (server-side and test composition).
     pub fn store_class(&self) -> &'static str {
-        *self.store_class.lock()
+        self.store_class.get().copied().unwrap_or("unknown")
+    }
+
+    /// #37 Phase 2 (Q4 / F1): install a cross-crate sink for the
+    /// per-`store_class` slow-tier async-write failure counter.
+    /// Called once at worker construction (paired with
+    /// `set_store_class`); subsequent calls are silently no-ops.
+    /// Server-side and test callers leave it unset; the FSS-local
+    /// `slow_tier_async_fail` counter still fires regardless via
+    /// `self.metrics`.
+    pub fn set_slow_tier_metric_sink(&self, sink: Arc<dyn SlowTierMetricSink>) {
+        let _ = self.slow_tier_metric_sink.set(sink);
     }
 
     pub fn new(spec: &FastSlowSpec, fast_store: Store, slow_store: Store) -> Arc<Self> {
@@ -1315,7 +1351,8 @@ impl FastSlowStore {
             failed_slow_writes.clone(),
         );
         let store = Arc::new_cyclic(|weak_self| Self {
-            store_class: parking_lot::Mutex::new("unknown"),
+            store_class: OnceLock::new(),
+            slow_tier_metric_sink: OnceLock::new(),
             fast_store,
             fast_direction: spec.fast_direction,
             slow_store,
@@ -2811,7 +2848,8 @@ impl FastSlowStore {
             shared.clone(),
         );
         let store = Arc::new_cyclic(|weak_self| Self {
-            store_class: parking_lot::Mutex::new("unknown"),
+            store_class: OnceLock::new(),
+            slow_tier_metric_sink: OnceLock::new(),
             fast_store,
             fast_direction: spec.fast_direction,
             slow_store,
@@ -5554,6 +5592,12 @@ impl StoreDriver for FastSlowStore {
                         fss.metrics
                             .slow_tier_async_fail
                             .fetch_add(1, Ordering::Relaxed);
+                        // #37 Phase 2 (Q4 / F1): dispatch to the
+                        // cross-crate per-store_class counter on the
+                        // worker (no-op if no sink installed).
+                        if let Some(sink) = fss.slow_tier_metric_sink.get() {
+                            sink.record_async_fail(store_class);
+                        }
                     }
                     error!(
                         key = ?key_for_bg,
@@ -5825,11 +5869,24 @@ impl StoreDriver for FastSlowStore {
                         // Re-pin so the blob survives until reconnect retry.
                         fast_store_ref.pin_digests(&[*digest]);
                     }
+                    // #37 Phase 2 (Q4 / F2): mirror the update path's
+                    // metric+sink dispatch so the AC code path (which
+                    // uses update_oneshot) is not silent on slow-tier
+                    // async failure.
+                    if let Some(fss) = weak_for_metric.upgrade() {
+                        fss.metrics
+                            .slow_tier_async_fail
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(sink) = fss.slow_tier_metric_sink.get() {
+                            sink.record_async_fail(store_class);
+                        }
+                    }
                     error!(
                         key = ?key_for_bg,
                         schedule_delay_ms,
                         slow_ms,
                         data_len,
+                        store_class,
                         error = ?e,
                         "FastSlowStore::update_oneshot: background slow write FAILED — \
                          blob pinned, will retry on reconnect",
