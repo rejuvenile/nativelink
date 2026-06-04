@@ -4531,6 +4531,15 @@ impl FastSlowStore {
         key: StoreKey<'_>,
         upload_size: UploadSizeInfo,
     ) -> Result<(), Error> {
+        // #59 instrumentation: entry log per #56 RCA §8 rec 3 so journal
+        // queries can correlate (Ok, Err) match-arm fires below with the
+        // entering digest + size + upload_size kind.
+        info!(
+            ?key,
+            ?upload_size,
+            arm_name = "stream_file_to_store_entry",
+            "#59 stream_file_to_store: entering join!",
+        );
         let (mut tx, rx) = make_buf_channel_pair_with_size(128);
         let write_fut = store.update(key.borrow(), rx, upload_size);
 
@@ -4610,11 +4619,52 @@ impl FastSlowStore {
         // is redundant and the append text was calibrated for a
         // pre-Option-A world. `_forward_err` documents the observation
         // while marking the intentional discard.
+        //
+        // #59 instrumentation: per #56 RCA §8 rec 3, log which match-arm
+        // fires so journal queries can name the (Ok|Err, Ok|Err) tuple
+        // that produced the surface. Per #56 RCA §6, the dSYM
+        // receiver-disconnect symptom maps to the (Ok, Err) arm with
+        // UNIDENTIFIED producer; surfacing every arm with the digest +
+        // size lets a future repro pinpoint the consumer-Ok path.
         match (write_res, forward_res) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(write_err), Ok(())) => Err(write_err),
-            (Ok(()), Err(forward_err)) => Err(forward_err),
-            (Err(write_err), Err(_forward_err)) => Err(write_err),
+            (Ok(()), Ok(())) => {
+                info!(
+                    ?key,
+                    arm_name = "join_ok_ok",
+                    "#59 stream_file_to_store: happy path",
+                );
+                Ok(())
+            }
+            (Err(write_err), Ok(())) => {
+                info!(
+                    ?key,
+                    ?write_err,
+                    arm_name = "join_err_ok",
+                    "#59 stream_file_to_store: consumer Err but producer Ok",
+                );
+                Err(write_err)
+            }
+            (Ok(()), Err(forward_err)) => {
+                // #56 candidate arm — the UNIDENTIFIED mechanism that
+                // produces the production "receiver disconnected" surface.
+                info!(
+                    ?key,
+                    ?forward_err,
+                    arm_name = "join_ok_err",
+                    "#59 stream_file_to_store: consumer Ok but producer Err (#56 candidate)",
+                );
+                Err(forward_err)
+            }
+            (Err(write_err), Err(_forward_err)) => {
+                info!(
+                    ?key,
+                    ?write_err,
+                    forward_err = ?_forward_err,
+                    arm_name = "join_err_err",
+                    "#59 stream_file_to_store: both Err",
+                );
+                Err(write_err)
+            }
         }
     }
 

@@ -208,6 +208,19 @@ where
             // If the body is done and we couldn't decode, we're finished.
             if this.body_done {
                 if this.decoder.has_remaining() {
+                    // TODO(#59): per #56 RCA §6 M3, this Status::internal
+                    // path fires ~1487 times/day in production and is
+                    // suspected as the strongest unidentified candidate for
+                    // the dSYM `stream_file_to_store` receiver-disconnect
+                    // class — but the Status flows out via tonic Stream
+                    // without a log emit, so journal queries cannot
+                    // correlate to a digest. Adding tracing here requires a
+                    // tracing dep in nativelink-util/zero_copy_codec and a
+                    // way to surface the in-flight request context (digest
+                    // / resource_name) which the codec does not have
+                    // visibility into. Observability-only; deferred to a
+                    // follow-up that adds a tonic interceptor or extends
+                    // the codec with a context field.
                     return Poll::Ready(Some(Err(Status::internal(
                         "incomplete gRPC frame at end of body",
                     ))));
