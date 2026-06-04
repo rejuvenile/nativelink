@@ -252,6 +252,15 @@ impl Drop for DirectoryCachePinGuard {
         // cache's pin-released-on-every-task-exit invariant per #50 v2 §2
         // composite. NO spawn, NO await, NO HashMap lookup — this fires
         // deterministically on every cancellation path.
+        //
+        // MUTATION VERIFIED (2026-06-04): comment out the fetch_sub
+        // line above → T1 (pin_guard_releases_on_cancellation) red-
+        // fails at "baseline: pin must have released after seed
+        // get_or_create" (left=1, right=0); T3
+        // (happy_path_guard_releases_after_completion) red-fails at
+        // "happy path: ref_count failed to return to 0 — guard Drop
+        // did not decrement" (left=1, right=0). Reverted, both green
+        // again.
         self.ref_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -3465,6 +3474,14 @@ impl DirectoryCache {
     /// Removes the LRU entry with ref_count == 0 from the cache HashMap.
     /// Returns the evicted entry's (path, digest, size) for logging and disk
     /// cleanup, or `None` if no evictable entry exists.
+    ///
+    /// MUTATION VERIFIED (2026-06-04): mutate the ref_count filter
+    /// below to `.filter(|(_, _m)| true)` (ignore ref_count) →
+    /// T2 (pin_keeps_entries_unevictable) red-fails at "composite
+    /// invariant violated: soft-gate must have admitted over-cap
+    /// because all entries are pinned (LRU returned None)" (left=2,
+    /// right=3 — LRU evicted a pinned entry, breaching the
+    /// precondition). Reverted, green again.
     fn evict_lru_entry(
         &self,
         cache: &mut HashMap<DigestInfo, CachedDirectoryMetadata>,
