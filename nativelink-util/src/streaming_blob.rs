@@ -125,6 +125,34 @@ pub const SLIDING_WINDOW_EVICTION_MARKER: &str = "reader fell behind sliding win
 /// attempts — same end-state as `DataLoss`, just slower.
 pub const STREAMING_BLOB_SILENT_SHORT_MARKER: &str = "streaming_blob_silent_short";
 
+/// Substring marker emitted into the `Code::Internal` error message produced
+/// by `StreamingBlobWriter::send` (Layer A admission cap) and
+/// `StreamingBlobReader::next_chunk` (Layer B emission cap) when a writer
+/// or reader observes `bytes_written > expected_size_on_store_or_digest`
+/// — i.e. the OVERSHOOT direction of the #502 silent-short defense.
+///
+/// Sibling of `STREAMING_BLOB_SILENT_SHORT_MARKER` (which catches the `<`
+/// direction). #44 closes the symmetric `>` direction at three layers:
+/// writer admission (Layer A, primary), reader emission (Layer B,
+/// defense-in-depth against a Layer-A bypass), and server-side unfold
+/// truncation at `bytestream_server.rs:inner_read` (Layer C, defends
+/// Bazel's parallel-chunk `Read(offset=N, limit=0)` shape independently
+/// of the streaming-blob primitive's contents).
+///
+/// Stable substring contract: production journal greps
+/// (`grep streaming_blob_silent_overshoot`) trip on the same byte
+/// sequence in every release. The 1:1 shape parity with the `silent_short`
+/// marker is deliberate — operators with `streaming_blob_silent_short`
+/// pattern matchers can drop `_overshoot` in and get the same data shape.
+///
+/// (Incident pipeline-2487 2026-06-03 17:13:41 UTC: four
+/// `OutputDigestMismatchException`s clustered within 0.3 s; each Read
+/// returned `expected_size + delta` bytes. Audit
+/// `.claude/audits/streaming-blob-cross-talk-2026-06-03.md` traces the
+/// mechanism to the absence of a `>` check at the
+/// streaming-blob and unfold seams.)
+pub const STREAMING_BLOB_SILENT_OVERSHOOT_MARKER: &str = "streaming_blob_silent_overshoot";
+
 /// Inner shared state for a streaming blob.
 ///
 /// The writer appends `Bytes` chunks to the deque and notifies
@@ -456,6 +484,34 @@ impl StreamingBlobInner {
             None => self.digest.size_bytes(),
         }
     }
+
+    /// **Test-only accessor** for the `bytes_written` atomic. Used by
+    /// #44 Layer B tests to simulate a Layer-A bypass without going
+    /// through `StreamingBlobWriter::send`. Production callers MUST
+    /// use the writer/reader APIs.
+    #[doc(hidden)]
+    pub fn bytes_written_atomic(&self) -> &AtomicU64 {
+        &self.bytes_written
+    }
+
+    /// **Test-only accessor** to append a chunk to the buffer and
+    /// advance the `chunk_count` + `bytes_written` atomics WITHOUT
+    /// going through `StreamingBlobWriter::send`. Used by #44 Layer C
+    /// tests to seed a streaming inner with overshoot bytes that
+    /// bypass the Layer A admission cap, proving the server-side
+    /// `inner_read` unfold cap is independently load-bearing.
+    /// Production callers MUST use `StreamingBlobWriter::send`.
+    #[doc(hidden)]
+    pub fn append_chunk_for_test(&self, chunk: Bytes) {
+        let chunk_len = chunk.len() as u64;
+        {
+            let mut chunks = self.chunks.write();
+            chunks.push_back(chunk);
+        }
+        self.chunk_count.fetch_add(1, Ordering::Release);
+        self.bytes_written.fetch_add(chunk_len, Ordering::Release);
+        self.notify_tx.send_modify(|v| *v = v.wrapping_add(1));
+    }
 }
 
 /// Writer handle for a streaming blob.
@@ -500,6 +556,19 @@ impl StreamingBlobWriter {
     ///
     /// After appending, evicts the oldest chunks if the total
     /// buffered bytes exceed `max_buffer_bytes`.
+    ///
+    /// **#44 Layer A — admission cap.** If the chunk would push
+    /// `bytes_written` past `expected_size_on_store_or_digest` (#49's
+    /// accessor: the producer-supplied authoritative size if set, else
+    /// `digest.size_bytes()`), the chunk is REJECTED — the over-bytes
+    /// never enter the buffer, and no atomic state advances. Error
+    /// carries the `STREAMING_BLOB_SILENT_OVERSHOOT_MARKER` substring
+    /// for journal grep. Closes the OVERSHOOT direction of the silent-
+    /// short class symmetrically with the #502 `<` check in
+    /// `StreamingBlobReader::next_chunk`. Pipeline-2487's
+    /// `Read(offset=N, limit=0) → N + Δ` shape is closed at this seam
+    /// (primary) with Layer B (reader emission cap) and Layer C
+    /// (server unfold cap) as defense-in-depth.
     pub async fn send(&self, chunk: Bytes) -> Result<(), Error> {
         if self.inner.is_terminal() {
             return Err(make_err!(
@@ -511,6 +580,29 @@ impl StreamingBlobWriter {
         self.inner.record_producer_task_id();
 
         let chunk_len = chunk.len() as u64;
+
+        // #44 Layer A admission cap. Compute current bytes_written +
+        // chunk_len; reject if it would exceed
+        // `expected_size_on_store_or_digest`. NOTE: this is a
+        // CAS-style admission check, not a full atomic transaction —
+        // a concurrent producer (there should be at most one writer
+        // per inner; multiple writers is itself a misuse) could race
+        // past, but the reader-side Layer B catches that. Single-
+        // writer composition (the production case) is precise.
+        let current = self.inner.bytes_written.load(Ordering::Acquire);
+        let expected = self.inner.expected_size_on_store();
+        let new_total = current.saturating_add(chunk_len);
+        if new_total > expected {
+            return Err(make_err!(
+                Code::Internal,
+                "{}: send would push bytes_written={} to {} exceeding expected_size={} for digest {}",
+                STREAMING_BLOB_SILENT_OVERSHOOT_MARKER,
+                current,
+                new_total,
+                expected,
+                self.inner.digest,
+            ));
+        }
 
         {
             let mut chunks = self.inner.chunks.write();
@@ -829,6 +921,42 @@ impl StreamingBlobReader {
                     SLIDING_WINDOW_EVICTION_MARKER,
                     self.cursor_chunk_idx,
                     earliest
+                ));
+            }
+
+            // #44 Layer B — emission cap (defense-in-depth against a
+            // Layer A bypass). If `bytes_written > expected_size_on_store`
+            // somehow occurred (Layer A regression, alternate producer,
+            // direct atomic mutation), refuse to serve the over-bytes;
+            // surface `STREAMING_BLOB_SILENT_OVERSHOOT_MARKER` so the
+            // reader sees the same diagnostic class as a Layer A
+            // rejection on the producer side. Uses the same #49
+            // `expected_size_on_store()` accessor as the #502
+            // silent-short defense, so AC reads (where
+            // `digest.size_bytes()` ≠ stored size) use the
+            // producer-supplied size rather than the digest size.
+            let observed_bytes_written =
+                self.inner.bytes_written.load(Ordering::Acquire);
+            let expected_size_layer_b = self.inner.expected_size_on_store();
+            if observed_bytes_written > expected_size_layer_b {
+                error!(
+                    digest = %self.inner.digest,
+                    bytes_written = observed_bytes_written,
+                    expected_size = expected_size_layer_b,
+                    chunks_consumed = self.chunks_consumed,
+                    age_ms = self.inner.age_ms(),
+                    "{}: reader observed bytes_written > expected_size — \
+                     Layer A admission cap bypassed; refusing to emit \
+                     over-bytes",
+                    STREAMING_BLOB_SILENT_OVERSHOOT_MARKER,
+                );
+                return Err(make_err!(
+                    Code::Internal,
+                    "{}: bytes_written={} > expected_size={} for digest {}",
+                    STREAMING_BLOB_SILENT_OVERSHOOT_MARKER,
+                    observed_bytes_written,
+                    expected_size_layer_b,
+                    self.inner.digest,
                 ));
             }
 
@@ -1298,6 +1426,18 @@ impl InFlightBlobMap {
     /// Number of in-flight blobs currently registered.
     pub fn len(&self) -> usize {
         self.map.read().len()
+    }
+
+    /// **Test-only:** insert a pre-built `StreamingBlobInner` under
+    /// `digest`. Used by #44 Layer C tests to seed the bytestream
+    /// server's `InFlightBlobMap` with an inner whose buffer holds
+    /// over-bytes (a Layer-A regression) so the server-side unfold
+    /// cap can be exercised end-to-end. Production callers MUST use
+    /// `register`.
+    #[doc(hidden)]
+    pub fn insert_for_test(&self, digest: DigestInfo, inner: Arc<StreamingBlobInner>) {
+        let mut map = self.map.write();
+        map.insert(digest, inner);
     }
 
     /// Whether the map is empty.
