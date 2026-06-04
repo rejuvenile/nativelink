@@ -71,7 +71,6 @@ async fn make_test_store() -> Arc<FilesystemStore<FileEntryImpl>> {
         content_path,
         temp_path,
         eviction_policy: None,
-        log_not_found_at_info: false,
         block_size: 1,
         ..Default::default()
     })

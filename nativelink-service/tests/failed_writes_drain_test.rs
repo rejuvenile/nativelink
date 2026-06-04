@@ -1177,6 +1177,7 @@ async fn failed_slow_writes_v3_walker_descends_production_composition() -> Resul
                     max_count: 1024,
                     ..Default::default()
                 }),
+                log_not_found_at_info: false,
             },
             Store::new(verify),
         );

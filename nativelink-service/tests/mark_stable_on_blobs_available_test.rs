@@ -226,6 +226,7 @@ fn make_production_cas_store() -> (Store, Arc<StoreManager>, Store, Store) {
         &ExistenceCacheSpec {
             backend: StoreSpec::Memory(MemorySpec::default()),
             eviction_policy: None,
+            log_not_found_at_info: false,
         },
         size_part,
     ));

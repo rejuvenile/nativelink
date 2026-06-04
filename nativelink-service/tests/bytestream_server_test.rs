@@ -3654,6 +3654,7 @@ fn wrap_in_production_cas_chain(
         &ExistenceCacheSpec {
             backend: StoreSpec::Memory(MemorySpec::default()),
             eviction_policy: None,
+            log_not_found_at_info: false,
         },
         sp,
     ));
