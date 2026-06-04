@@ -3714,6 +3714,7 @@ name = "nativelink-worker"
 version = "1.0.0"
 dependencies = [
  "async-lock",
+ "async-trait",
  "bytes",
  "fail",
  "filetime",

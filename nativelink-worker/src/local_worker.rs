@@ -823,9 +823,13 @@ pub struct AcMirrorTarget {
 /// (`worker_slow_tier_async_fail_{ac,cas,unknown}`) on
 /// `RunningActionsManagerImpl::metrics`. Without this plumbing the
 /// per-class counters would be declared-but-never-incremented.
+///
+/// `pub` so the #37 Phase 2 T3 integration test can construct one
+/// in production composition and verify the end-to-end store_class
+/// label plumbing (FSS Err arm → sink → per-class counter).
 #[derive(Debug)]
-struct WorkerSlowTierMetricSink {
-    metrics: Arc<crate::running_actions_manager::Metrics>,
+pub struct WorkerSlowTierMetricSink {
+    pub metrics: Arc<crate::running_actions_manager::Metrics>,
 }
 
 impl SlowTierMetricSink for WorkerSlowTierMetricSink {

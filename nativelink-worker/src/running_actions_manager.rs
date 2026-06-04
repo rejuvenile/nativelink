@@ -4170,7 +4170,9 @@ const fn bis_ack_reaper_interval(timeout: Duration) -> Duration {
 /// (rather than re-implementing it inline). Returns `(digest, age)`
 /// for each removed entry; the caller emits logs / bumps counters
 /// outside the lock to keep the critical section tight.
-pub(crate) fn collect_expired_bis_acks(
+///
+/// `pub` so integration tests in `tests/` can reach it.
+pub fn collect_expired_bis_acks(
     map: &mut HashMap<DigestInfo, Instant>,
     now: Instant,
     timeout: Duration,
@@ -5923,13 +5925,16 @@ pub struct Metrics {
     pub worker_bis_ack_received: CounterWithTime,
     #[metric(help = "Worker AC BIS-acks confirmed missing after timeout.")]
     pub worker_bis_ack_missing: CounterWithTime,
-    // #37 Phase 2 (Q4): slow-tier async failure per store_class.
+    // #37 Phase 2 (Q4): slow-tier async failure per store_class. `pub`
+    // so integration tests in `tests/` can read
+    // `.counter.load(Ordering::Acquire)` to verify the cross-crate
+    // sink plumbed the increment end-to-end (T3).
     #[metric(help = "Worker AC slow-tier async write fail count.")]
-    worker_slow_tier_async_fail_ac: CounterWithTime,
+    pub worker_slow_tier_async_fail_ac: CounterWithTime,
     #[metric(help = "Worker CAS slow-tier async write fail count.")]
-    worker_slow_tier_async_fail_cas: CounterWithTime,
+    pub worker_slow_tier_async_fail_cas: CounterWithTime,
     #[metric(help = "Worker slow-tier async write fail — unknown store class.")]
-    worker_slow_tier_async_fail_unknown: CounterWithTime,
+    pub worker_slow_tier_async_fail_unknown: CounterWithTime,
 }
 
 impl Metrics {
@@ -5950,8 +5955,10 @@ impl Metrics {
     }
 
     /// Dispatch a slow-tier async failure increment per store_class label.
-    /// Unknown labels land in the `unknown` bucket.
-    pub(crate) fn worker_slow_tier_async_fail_by_class(&self, store_class: &str) {
+    /// Unknown labels land in the `unknown` bucket. `pub` so callers
+    /// outside the crate (sink impls, future server-side use) can
+    /// dispatch by label.
+    pub fn worker_slow_tier_async_fail_by_class(&self, store_class: &str) {
         match store_class {
             "ac" => self.worker_slow_tier_async_fail_ac.inc(),
             "cas" => self.worker_slow_tier_async_fail_cas.inc(),
