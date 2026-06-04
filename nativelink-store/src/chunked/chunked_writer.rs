@@ -394,6 +394,32 @@ mod io_uring_impl {
 
             // 5. Coalesce contiguous runs and submit one writev per run.
             while !pending.is_empty() {
+                // #47 b1 Phase 2: TEST_PRE_WRITE_DELAY probe parity for
+                // io_uring path. Mirrors the existing probe at
+                // `chunked_filesystem::write_chunk_at_offset`
+                // (chunked_filesystem.rs:567-574) so the
+                // `driver_per_chunk_pwrite_timeout_*` tests inject a
+                // pre-write wedge that applies to Path A as well as the
+                // spawn_blocking Path B. Per-digest scoped so parallel
+                // tests don't collide. Reuses the same static — single
+                // source of truth for the delay map.
+                //
+                // Production builds compile this out via `#[cfg(test)]`
+                // (matching the static's own gate at
+                // chunked_filesystem.rs:110).
+                #[cfg(test)]
+                {
+                    let delay = super::super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
+                        .lock()
+                        .get(&digest)
+                        .copied();
+                    if let Some(delay_ms) = delay {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(core::time::Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                }
+
                 // Pop the lowest-offset entry as the run start.
                 let (&start_offset, _) = pending.iter().next().expect("non-empty");
                 let (start_bytes, start_permit, start_enqueue) = pending

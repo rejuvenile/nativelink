@@ -977,6 +977,41 @@ async fn run_driver<Fe: FileEntry>(
                             .expect("just initialized")
                             .0
                             .clone();
+                        // #47 b1 Phase 2: TEST_PRE_WRITE_DELAY probe parity
+                        // for io_uring path. Mirrors the existing probe at
+                        // `chunked_filesystem::write_chunk_at_offset`
+                        // (chunked_filesystem.rs:567-574). On Path B the
+                        // probe sleep happens inside the spawn_blocking
+                        // call awaited as `write_result`, so `pwrite_elapsed`
+                        // observed at line ~1032 captures the wedge. Path A
+                        // hands the chunk off via `mpsc::Sender::send()`
+                        // which returns instantly while pipeline depth is
+                        // available — without this mirror the driver-side
+                        // `pwrite_elapsed` would only measure send latency
+                        // (sub-ms), the diagnostic counter would never
+                        // fire, and `driver_per_chunk_pwrite_timeout_*`
+                        // tests would red-fail on the io_uring path. Per-
+                        // digest scoped so parallel tests don't collide.
+                        // Reuses the same `TEST_PRE_WRITE_DELAY_MS_BY_DIGEST`
+                        // static — single source of truth for the delay map.
+                        // Production builds compile this out via `#[cfg(test)]`
+                        // (matching the static's own gate at
+                        // chunked_filesystem.rs:110).
+                        #[cfg(test)]
+                        {
+                            let delay = super::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
+                                .lock()
+                                .get(&digest)
+                                .copied();
+                            if let Some(delay_ms) = delay {
+                                if delay_ms > 0 {
+                                    tokio::time::sleep(
+                                        core::time::Duration::from_millis(delay_ms),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                         let send_res = chunk_tx_clone
                             .send(super::chunked_writer::WriteJob {
                                 offset: chunk_offset,
