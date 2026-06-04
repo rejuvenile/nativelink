@@ -375,3 +375,14 @@ required-features = ["test-utils", "chunked_fast_slow"]
 [[test]]
 name = "fast_slow_block_b_log_visibility_test"
 required-features = ["chunked_fast_slow"]
+
+# #47 b1 v2 Phase 2 Step 5: integration tests for the io_uring writev
+# coalescer (`chunked_writer.rs`). Production composition: real
+# `FilesystemStore` + real `ChunkedDriver::spawn_driver` + 5 s deadlock
+# detector; T1 + T_multi also assert `has_with_results = Some(size)`
+# (index-visibility contract). Requires `test-utils` because the
+# FilesystemStore fixture uses test-only helpers and the chunked path
+# is feature-gated.
+[[test]]
+name = "chunked_b1_writev_test"
+required-features = ["chunked_fast_slow", "test-utils"]
