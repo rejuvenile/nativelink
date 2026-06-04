@@ -592,7 +592,11 @@ impl StreamingBlobWriter {
         let current = self.inner.bytes_written.load(Ordering::Acquire);
         let expected = self.inner.expected_size_on_store();
         let new_total = current.saturating_add(chunk_len);
-        if new_total > expected {
+        // Named for mutation-hint clarity: a reviewer commenting out
+        // the rejection below can grep `would_overshoot` to find the
+        // sole condition guarding the OVERSHOOT direction at this seam.
+        let would_overshoot = new_total > expected;
+        if would_overshoot {
             return Err(make_err!(
                 Code::Internal,
                 "{}: send would push bytes_written={} to {} exceeding expected_size={} for digest {}",

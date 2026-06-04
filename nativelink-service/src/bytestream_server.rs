@@ -1721,6 +1721,22 @@ impl ByteStreamServer {
             rx: ExpectedDropRx,
             maybe_get_part_result: Option<Result<(), Error>>,
             get_part_fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
+            // #44 Layer C — at-rest unfold cap state.
+            // `bytes_sent_in_blob` tracks the absolute blob offset of
+            // the next byte we will emit. Initialized to
+            // `read_request.read_offset`; the store is invoked with the
+            // same `read_offset` so `state.rx.consume()` yields bytes
+            // starting at that absolute position. After each emission
+            // we advance by the chunk length and refuse to emit past
+            // `digest.size_bytes()` even if the underlying store
+            // wrapper retained leftover Δ bytes (pipeline-2487 shape:
+            // four `Read(offset=0, limit=0)` responses returned
+            // `expected_size + delta` bytes; the unfold MUST truncate
+            // at the digest size to close the wire-shape independently
+            // of upstream-store correctness). See
+            // `.claude/audits/45-pipeline-2487-overshoot-trigger-2026-06-04.md`.
+            bytes_sent_in_blob: u64,
+            digest_size: u64,
         }
 
         let read_limit = u64::try_from(read_request.read_limit)
@@ -1736,12 +1752,17 @@ impl ByteStreamServer {
             None
         };
 
+        let read_offset_u64 = u64::try_from(read_request.read_offset)
+            .err_tip(|| "Could not convert read_offset to u64")?;
+
         // This allows us to call a destructor when the the object is dropped.
         let store = instance.store.clone();
         let state = Some(ReaderState {
             rx: ExpectedDropRx(rx),
             max_bytes_per_stream: instance.max_bytes_per_stream,
             maybe_get_part_result: None,
+            bytes_sent_in_blob: read_offset_u64,
+            digest_size: digest.size_bytes(),
             get_part_fut: Box::pin(async move {
                 // Propagate the worker/non-worker distinction into the store
                 // layer so WorkerProxyStore can decide whether to proxy or
@@ -1752,8 +1773,7 @@ impl ByteStreamServer {
                             .get_part(
                                 digest,
                                 tx,
-                                u64::try_from(read_request.read_offset)
-                                    .err_tip(|| "Could not convert read_offset to u64")?,
+                                read_offset_u64,
                                 read_limit,
                             )
                             .await
@@ -1824,6 +1844,43 @@ impl ByteStreamServer {
                                         let err = make_err!(Code::Internal, "Returned store size was larger than read size");
                                         return Some((Err(err.into()), None));
                                     }
+                                    // #44 Layer C — at-rest unfold cap.
+                                    // Cap emission at `digest.size_bytes()`
+                                    // even if the underlying store wrapper
+                                    // retained Δ bytes past the declared
+                                    // blob size. Closes the at-rest path of
+                                    // the pipeline-2487 wire-shape
+                                    // independently of upstream-store
+                                    // correctness. Mirrors the streaming-
+                                    // branch unfold cap at `:1493`'s
+                                    // `emit()` digest-size trim. See
+                                    // `.claude/audits/45-pipeline-2487-overshoot-trigger-2026-06-04.md`.
+                                    let mut bytes = bytes;
+                                    let remaining = state.digest_size
+                                        .saturating_sub(state.bytes_sent_in_blob);
+                                    if (bytes.len() as u64) > remaining {
+                                        let keep = usize::try_from(remaining)
+                                            .unwrap_or(usize::MAX)
+                                            .min(bytes.len());
+                                        let dropped = bytes.len() - keep;
+                                        warn!(
+                                            %digest,
+                                            branch = "at_rest_overshoot_cap",
+                                            bytes_sent_in_blob = state.bytes_sent_in_blob,
+                                            digest_size = state.digest_size,
+                                            chunk_len = bytes.len(),
+                                            dropped,
+                                            "inner_read truncated at-rest store chunk to digest.size_bytes() (Layer C cap); upstream store retained Δ bytes past declared size",
+                                        );
+                                        bytes = bytes.slice(..keep);
+                                        if bytes.is_empty() {
+                                            // Already past digest boundary — end stream cleanly.
+                                            return None;
+                                        }
+                                    }
+                                    state.bytes_sent_in_blob =
+                                        state.bytes_sent_in_blob
+                                            .saturating_add(bytes.len() as u64);
                                     let bytes_len = bytes.len();
                                     response.data = bytes;
                                     trace!(response.data = format!("<redacted len({})>", response.data.len()));
