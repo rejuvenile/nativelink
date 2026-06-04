@@ -230,7 +230,8 @@ impl CachedDirectoryMetadata {
 /// absent, evict is LRU-of-`ref_count == 0`. The pin corner is the only
 /// compensator; this guard is what makes the pin corner
 /// cancellation-safe. See #50 v2 §2.
-pub(crate) struct DirectoryCachePinGuard {
+#[derive(Debug)]
+pub struct DirectoryCachePinGuard {
     /// Direct handle to the entry's `ref_count`. Cloning the `Arc` is
     /// cheap (one atomic increment) and lets Drop decrement without
     /// re-acquiring any cache lock.
@@ -827,24 +828,28 @@ impl DirectoryCache {
 
     /// Gets or creates a directory in the cache, then symlinks `dest_path` to
     /// the cache directory. The cache entry's `ref_count` is incremented for
-    /// the entire action lifetime (caller MUST call `release_direct_use` on
-    /// cleanup).
+    /// the entire action lifetime (caller MUST hold the returned guard until
+    /// cleanup; dropping it releases the pin synchronously).
     ///
     /// In direct-use mode, subtree reuse is done via symlinks from the new
     /// cache entry to already-cached subtree directories, instead of
     /// hardlinks/clonefiles.
     ///
     /// # Returns
-    /// * `Ok((cache_path, was_hit))` - The cache directory path and whether it was a hit.
+    /// * `Ok((cache_path, was_hit, pin_guard))` - The cache directory path,
+    ///   whether it was a hit, and a RAII guard owning the entry's
+    ///   `ref_count` decrement. Caller MUST hold the guard for the action's
+    ///   lifetime; dropping it releases the pin synchronously (including on
+    ///   cancellation paths).
     pub async fn get_or_create_direct(
         &self,
         digest: DigestInfo,
         dest_path: &Path,
-    ) -> Result<(PathBuf, bool), Error> {
+    ) -> Result<(PathBuf, bool, DirectoryCachePinGuard), Error> {
         let overall_start = Instant::now();
 
         // Fast path: check if already in cache (read lock only for the lookup)
-        if let Some(cache_path) = self.try_symlink_cached(&digest, dest_path).await? {
+        if let Some((cache_path, pin_guard)) = self.try_symlink_cached(&digest, dest_path).await? {
             let hits = self.hit_count.fetch_add(1, Ordering::Relaxed) + 1;
             let misses = self.miss_count.load(Ordering::Relaxed);
             let total = hits + misses;
@@ -857,7 +862,7 @@ impl DirectoryCache {
                 hit_rate = format!("{hit_rate:.1}%"),
                 "DirectoryCache DIRECT-USE HIT (symlinked to cache)",
             );
-            return Ok((cache_path, true));
+            return Ok((cache_path, true, pin_guard));
         }
 
         let misses = self.miss_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -906,8 +911,8 @@ impl DirectoryCache {
         // the cache. Symlink to our own dest_path via the same fast-path
         // helper as the cache-hit case above so ref_count is correctly
         // incremented for the action's lifetime.
-        if let Some(cache_path) = self.try_symlink_cached(&digest, dest_path).await? {
-            return Ok((cache_path, false));
+        if let Some((cache_path, pin_guard)) = self.try_symlink_cached(&digest, dest_path).await? {
+            return Ok((cache_path, false, pin_guard));
         }
         // Defensive: the entry should still be present immediately after
         // construction. If eviction raced between insertion and our
@@ -1282,15 +1287,26 @@ impl DirectoryCache {
         &self,
         digest: &DigestInfo,
         dest_path: &Path,
-    ) -> Result<Option<PathBuf>, Error> {
-        let src_path = {
+    ) -> Result<Option<(PathBuf, DirectoryCachePinGuard)>, Error> {
+        let (src_path, pin_guard) = {
             let cache = self.cache.read().await;
             let Some(metadata) = cache.get(digest) else {
                 return Ok(None);
             };
             metadata.touch();
             metadata.ref_count.fetch_add(1, Ordering::Relaxed);
-            metadata.path.clone()
+            // Guard owns the matching fetch_sub(1) on Drop — including the
+            // cancellation path (try_join abort, JoinHandle::abort,
+            // panic-unwind). Replaces the prior manual fetch_sub on the
+            // symlink-error branch + the cross-module `release_direct_use`
+            // call on action cleanup, both of which were unreachable from a
+            // dropped future between the await below and the
+            // `state.direct_use_guard = Some(...)` hand-off in
+            // `running_actions_manager.rs::inner_prepare_action`. #57 §3.
+            let pin_guard = DirectoryCachePinGuard::from_already_pinned(
+                Arc::clone(&metadata.ref_count),
+            );
+            (metadata.path.clone(), pin_guard)
         };
 
         // Create symlink: dest_path -> src_path
@@ -1307,14 +1323,14 @@ impl DirectoryCache {
                     dst = %dest_path.display(),
                     "DirectoryCache direct-use: symlink from cache succeeded",
                 );
-                Ok(Some(src_path))
+                Ok(Some((src_path, pin_guard)))
             }
             Err(e) => {
-                // Decrement ref_count on failure
-                let cache = self.cache.read().await;
-                if let Some(metadata) = cache.get(digest) {
-                    metadata.ref_count.fetch_sub(1, Ordering::Relaxed);
-                }
+                // `pin_guard` Drop fires at end-of-scope (sync fetch_sub).
+                // The explicit fetch_sub block previously here has been
+                // deleted — the guard is the only path that runs the
+                // matching decrement.
+                drop(pin_guard);
                 warn!(
                     hash = %&digest.packed_hash().to_string()[..12],
                     error = ?e,
@@ -1322,25 +1338,6 @@ impl DirectoryCache {
                 );
                 Ok(None)
             }
-        }
-    }
-
-    /// Releases a direct-use reference on a cache entry. Must be called once
-    /// per successful `get_or_create_direct()` call when the action completes.
-    pub async fn release_direct_use(&self, digest: &DigestInfo) {
-        let cache = self.cache.read().await;
-        if let Some(metadata) = cache.get(digest) {
-            let prev = metadata.ref_count.fetch_sub(1, Ordering::Relaxed);
-            debug!(
-                hash = %&digest.packed_hash().to_string()[..12],
-                prev_ref_count = prev,
-                "DirectoryCache direct-use: released ref_count",
-            );
-        } else {
-            warn!(
-                hash = %&digest.packed_hash().to_string()[..12],
-                "DirectoryCache direct-use: release_direct_use called but entry not in cache (evicted?)",
-            );
         }
     }
 
@@ -4726,7 +4723,8 @@ mod tests {
 
         // First access - cache miss
         let dest1 = temp_dir.path().join("dest1");
-        let (cache_path1, was_hit) = cache.get_or_create_direct(dir_digest, &dest1).await?;
+        let (cache_path1, was_hit, pin_guard1) =
+            cache.get_or_create_direct(dir_digest, &dest1).await?;
         assert!(!was_hit, "First access should be cache miss");
 
         // dest1 should be a symlink to the cache path
@@ -4746,7 +4744,8 @@ mod tests {
 
         // Second access - cache hit
         let dest2 = temp_dir.path().join("dest2");
-        let (_cache_path2, was_hit) = cache.get_or_create_direct(dir_digest, &dest2).await?;
+        let (_cache_path2, was_hit, pin_guard2) =
+            cache.get_or_create_direct(dir_digest, &dest2).await?;
         assert!(was_hit, "Second access should be cache hit");
 
         // dest2 should also be a symlink
@@ -4758,11 +4757,11 @@ mod tests {
         let stats = cache.stats().await;
         assert_eq!(stats.in_use_entries, 1, "Should still be 1 cache entry");
 
-        // Release first use
-        cache.release_direct_use(&dir_digest).await;
+        // Release first use (drop guard)
+        drop(pin_guard1);
 
-        // Release second use
-        cache.release_direct_use(&dir_digest).await;
+        // Release second use (drop guard)
+        drop(pin_guard2);
 
         // ref_count should be 0
         let stats = cache.stats().await;
@@ -4795,7 +4794,8 @@ mod tests {
 
         // Fill cache with digest_a and hold the ref_count
         let dest_a = temp_dir.path().join("dest_a");
-        let (_cache_path_a, was_hit) = cache.get_or_create_direct(digest_a, &dest_a).await?;
+        let (_cache_path_a, was_hit, pin_guard_a) =
+            cache.get_or_create_direct(digest_a, &dest_a).await?;
         assert!(!was_hit);
         assert_eq!(cache.stats().await.entries, 1);
         assert_eq!(cache.stats().await.in_use_entries, 1);
@@ -4803,18 +4803,19 @@ mod tests {
         // Try to insert digest_b -- should succeed but eviction is blocked
         // because digest_a is in use (ref_count > 0).
         let dest_b = temp_dir.path().join("dest_b");
-        let (_cache_path_b, was_hit) = cache.get_or_create_direct(digest_b, &dest_b).await?;
+        let (_cache_path_b, was_hit, pin_guard_b) =
+            cache.get_or_create_direct(digest_b, &dest_b).await?;
         assert!(!was_hit);
 
         // Both should be in cache now (eviction was blocked)
         let stats = cache.stats().await;
         assert_eq!(stats.entries, 2, "Both entries should exist (eviction blocked by ref_count)");
 
-        // Release digest_a
-        cache.release_direct_use(&digest_a).await;
+        // Release digest_a (drop guard)
+        drop(pin_guard_a);
 
-        // Release digest_b
-        cache.release_direct_use(&digest_b).await;
+        // Release digest_b (drop guard)
+        drop(pin_guard_b);
 
         // Cleanup symlinks
         fs::remove_file(&dest_a).await.unwrap();
@@ -4957,7 +4958,8 @@ mod tests {
 
         // First access - cache miss
         let dest = temp_dir.path().join("dest");
-        let (cache_path, was_hit) = cache.get_or_create_direct(dir_digest, &dest).await?;
+        let (cache_path, was_hit, pin_guard1) =
+            cache.get_or_create_direct(dir_digest, &dest).await?;
         assert!(!was_hit, "First access should be cache miss");
 
         // dest should be a symlink to the cache path
@@ -4994,7 +4996,8 @@ mod tests {
 
         // Second access - cache hit
         let dest2 = temp_dir.path().join("dest2");
-        let (_cache_path2, was_hit) = cache.get_or_create_direct(dir_digest, &dest2).await?;
+        let (_cache_path2, was_hit, pin_guard2) =
+            cache.get_or_create_direct(dir_digest, &dest2).await?;
         assert!(was_hit, "Second access should be cache hit");
 
         let zero_file_path2 = dest2.join("_bs.linksearchpaths");
@@ -5007,9 +5010,9 @@ mod tests {
             "Zero-digest file should have 0 bytes after cache hit"
         );
 
-        // Release refs
-        cache.release_direct_use(&dir_digest).await;
-        cache.release_direct_use(&dir_digest).await;
+        // Release refs (drop guards)
+        drop(pin_guard1);
+        drop(pin_guard2);
 
         // Cleanup symlinks
         fs::remove_file(&dest).await.unwrap();

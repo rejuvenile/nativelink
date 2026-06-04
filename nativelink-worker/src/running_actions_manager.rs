@@ -1919,9 +1919,11 @@ pub fn download_to_directory<'a>(
 /// # Returns
 /// * `Ok(None)` - Normal mode (hardlink or download). Caller should clean up
 ///   the work directory normally.
-/// * `Ok(Some(digest))` - Direct-use mode. The work directory is a symlink to
-///   the cache. Caller MUST call `release_direct_use(digest)` on cleanup and
-///   only remove the symlink, not the target directory.
+/// * `Ok(Some((digest, pin_guard)))` - Direct-use mode. The work directory is
+///   a symlink to the cache. Caller MUST hold the returned guard for the
+///   action's lifetime; dropping it releases the cache pin synchronously
+///   (including on cancellation paths). The digest is retained for the
+///   work-symlink cleanup logic in `do_cleanup`.
 pub async fn prepare_action_inputs(
     directory_cache: &Option<Arc<crate::directory_cache::DirectoryCache>>,
     cas_store: &FastSlowStore,
@@ -1930,7 +1932,7 @@ pub async fn prepare_action_inputs(
     work_directory: &str,
     pre_resolved_tree: Option<HashMap<DigestInfo, ProtoDirectory>>,
     server_missing_digests: Option<HashSet<DigestInfo>>,
-) -> Result<Option<DigestInfo>, Error> {
+) -> Result<Option<(DigestInfo, crate::directory_cache::DirectoryCachePinGuard)>, Error> {
     info!(?digest, work_directory, "prepare_action_inputs: entered");
     // Try cache first if available
     if let Some(cache) = directory_cache {
@@ -1947,7 +1949,7 @@ pub async fn prepare_action_inputs(
                 "prepare_action_inputs: directory_cache.get_or_create_direct returned"
             );
             match res {
-                Ok((_cache_path, _was_hit)) => {
+                Ok((_cache_path, _was_hit, pin_guard)) => {
                     info!(
                         ?digest,
                         work_directory,
@@ -1955,7 +1957,7 @@ pub async fn prepare_action_inputs(
                         cache_path = %_cache_path.display(),
                         "Successfully prepared inputs via directory cache (direct-use mode)",
                     );
-                    return Ok(Some(*digest));
+                    return Ok(Some((*digest, pin_guard)));
                 }
                 Err(e) => {
                     warn!(
@@ -2440,60 +2442,11 @@ async fn process_side_channel_file(
     }))
 }
 
-/// Drop guard that ensures `release_direct_use` is called even if the
-/// enclosing async task is cancelled between taking the digest and
-/// completing the release. On normal completion, call `defuse()` to
-/// prevent the redundant background release.
-struct DirectUseReleaseGuard {
-    cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
-    digest: Option<DigestInfo>,
-}
-
-impl DirectUseReleaseGuard {
-    fn new(
-        cache: Option<&Arc<crate::directory_cache::DirectoryCache>>,
-        digest: Option<DigestInfo>,
-    ) -> Self {
-        Self {
-            cache: digest
-                .as_ref()
-                .and_then(|_| cache.cloned()),
-            digest,
-        }
-    }
-
-    /// Disarm the guard after the release has been performed successfully.
-    fn defuse(&mut self) {
-        self.digest = None;
-    }
-}
-
-impl Drop for DirectUseReleaseGuard {
-    fn drop(&mut self) {
-        let Some(cache) = self.cache.take() else {
-            return;
-        };
-        let Some(digest) = self.digest.take() else {
-            return;
-        };
-        // Task was cancelled before release_direct_use completed.
-        // Spawn a last-resort background release so the ref_count
-        // does not leak permanently.
-        warn!(
-            hash = %&digest.packed_hash().to_string()[..12],
-            "DirectUseReleaseGuard: task cancelled, releasing ref_count in background"
-        );
-        background_spawn!("release_direct_use_guard", async move {
-            cache.release_direct_use(&digest).await;
-        });
-    }
-}
-
 async fn do_cleanup(
     running_actions_manager: &Arc<RunningActionsManagerImpl>,
     operation_id: &OperationId,
     action_directory: &str,
-    direct_use_digest: Option<DigestInfo>,
+    direct_use_pin: Option<(DigestInfo, crate::directory_cache::DirectoryCachePinGuard)>,
 ) -> Result<(), Error> {
     // Mark this operation as being cleaned up
     let Some(_cleaning_guard) = running_actions_manager.perform_cleanup(operation_id.clone())
@@ -2504,19 +2457,13 @@ async fn do_cleanup(
 
     debug!("Worker cleaning up");
 
-    // Guard ensures release_direct_use fires even if this task is cancelled.
-    let mut release_guard = DirectUseReleaseGuard::new(
-        running_actions_manager.directory_cache.as_ref(),
-        direct_use_digest.clone(),
-    );
-
-    // Release the directory cache ref_count if direct-use mode was active.
-    if let Some(digest) = &direct_use_digest {
-        if let Some(cache) = &running_actions_manager.directory_cache {
-            cache.release_direct_use(digest).await;
-            release_guard.defuse();
-        }
-    }
+    // The pin guard (if Some) owns the cache ref_count decrement via sync
+    // Drop. Holding it for the duration of this function preserves today's
+    // ordering: the directory-cache pin is released as the function
+    // returns, after the work-symlink and action-directory removals. The
+    // `is_direct_use` boolean is captured up-front so we can drive the
+    // symlink-removal branch below without re-inspecting the guard.
+    let is_direct_use = direct_use_pin.is_some();
 
     // Note: We need to be careful to keep trying to cleanup even if one of the steps fails.
     //
@@ -2527,7 +2474,7 @@ async fn do_cleanup(
     // Strategy: if direct-use is active, first remove the work symlink, then
     // remove the action directory normally (which now only contains non-symlink
     // artifacts like stdout/stderr files).
-    let remove_dir_result = if direct_use_digest.is_some() {
+    let remove_dir_result = if is_direct_use {
         let work_symlink = PathBuf::from(action_directory).join("work");
         // Remove the symlink itself (not its target). On unix, symlinks to
         // directories are removed with `remove_file`, not `remove_dir`.
@@ -2564,6 +2511,13 @@ async fn do_cleanup(
         }
         .err_tip(|| format!("Could not remove working directory {action_directory}"))
     };
+
+    // Explicit drop after the work-symlink + action-directory removals.
+    // Releases the directory-cache ref_count synchronously (sync fetch_sub)
+    // — see DirectoryCachePinGuard. If we returned early above on an
+    // unwind, the guard is dropped on the unwinding stack with identical
+    // semantics. #57 §3 Choice A.
+    drop(direct_use_pin);
 
     if let Err(err) = running_actions_manager.cleanup_action(operation_id) {
         error!(%operation_id, ?err, "Error cleaning up action");
@@ -2636,9 +2590,15 @@ struct RunningActionImplState {
     // that prevented the action from running, upload failures, timeouts, exc...
     // but we have (or could have) the action results (like stderr/stdout).
     error: Option<Error>,
-    /// When direct-use mode is active, stores the input root digest so the
-    /// cache ref_count can be released during cleanup. None means normal mode.
-    direct_use_digest: Option<DigestInfo>,
+    /// When direct-use mode is active, holds the input root digest and the
+    /// RAII pin guard that owns the cache ref_count. The digest drives the
+    /// work-symlink cleanup branch in `do_cleanup`; the guard's Drop
+    /// releases the pin synchronously on any exit path (success, error,
+    /// panic, cancellation), including before this slot is populated (the
+    /// guard lives on the async stack of `inner_prepare_action` from
+    /// fetch_add to the hand-off at `state.direct_use_pin = Some(...)`).
+    /// None means normal hardlink mode. #57 §2 hand-off seam.
+    direct_use_pin: Option<(DigestInfo, crate::directory_cache::DirectoryCachePinGuard)>,
 }
 
 #[derive(Debug)]
@@ -2703,7 +2663,7 @@ impl RunningActionImpl {
                 action_result: None,
                 execution_metadata,
                 error: None,
-                direct_use_digest: None,
+                direct_use_pin: None,
             }),
             // Always need to ensure that we're removed from the manager on Drop.
             has_manager_entry: AtomicBool::new(true),
@@ -2782,7 +2742,7 @@ impl RunningActionImpl {
             let server_missing_digests = self.server_missing_digests.lock().take();
             let op_id_for_inputs = operation_id.clone();
             info!(%operation_id, "inner_prepare_action: about to try_join(command_fut, prepare_action_inputs)");
-            let (command, direct_use_digest) = try_join(command_fut, async {
+            let (command, direct_use_pin) = try_join(command_fut, async {
                 info!(%op_id_for_inputs, "inner_prepare_action: prepare_action_inputs branch entered");
                 if !is_direct_use {
                     // Normal mode: create work directory first, then populate it.
@@ -2822,10 +2782,16 @@ impl RunningActionImpl {
             })
             .await?;
             info!(%operation_id, "inner_prepare_action: try_join complete");
-            // Store direct-use digest if active, for cleanup ref-count release.
-            if let Some(digest) = direct_use_digest {
+            // Hand-off seam (#57 §4): the guard moves from this async stack
+            // into `state.direct_use_pin`. There is no `.await` between
+            // `direct_use_pin` (the local) going out of scope and the
+            // assignment, so the ARMED guard is transferred atomically from
+            // any cancellation point. If `try_join` returned Err, the local
+            // never bound — the guard was dropped on the unwinding stack
+            // inside the `try_join` future, firing fetch_sub.
+            if let Some((digest, pin_guard)) = direct_use_pin {
                 let mut state = self.state.lock();
-                state.direct_use_digest = Some(digest);
+                state.direct_use_pin = Some((digest, pin_guard));
             }
             command
         };
@@ -3895,11 +3861,12 @@ impl Drop for RunningActionImpl {
         );
         let running_actions_manager = self.running_actions_manager.clone();
         let action_directory = self.action_directory.clone();
-        // Take the direct_use_digest from state so we can release the ref_count.
-        let direct_use_digest = self.state.lock().direct_use_digest.take();
+        // Take the direct_use_pin (digest + guard) from state so the guard's
+        // sync Drop releases the cache ref_count when do_cleanup completes.
+        let direct_use_pin = self.state.lock().direct_use_pin.take();
         background_spawn!("running_action_impl_drop", async move {
             let Err(err) =
-                do_cleanup(&running_actions_manager, &operation_id, &action_directory, direct_use_digest).await
+                do_cleanup(&running_actions_manager, &operation_id, &action_directory, direct_use_pin).await
             else {
                 return;
             };
@@ -4035,12 +4002,12 @@ impl RunningAction for RunningActionImpl {
             .clone()
             .cleanup
             .wrap(async move {
-                let direct_use_digest = self.state.lock().direct_use_digest.take();
+                let direct_use_pin = self.state.lock().direct_use_pin.take();
                 let result = do_cleanup(
                     &self.running_actions_manager,
                     &self.operation_id,
                     &self.action_directory,
-                    direct_use_digest,
+                    direct_use_pin,
                 )
                 .await;
                 self.has_manager_entry.store(false, Ordering::Release);
