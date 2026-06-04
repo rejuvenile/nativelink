@@ -72,6 +72,10 @@ hyper-rustls = { version = "0.27.5", default-features = false, features = [
 ] }
 hyper-util = { version = "0.1.11", default-features = false }
 itertools = { version = "0.14.0", default-features = false }
+# #47 b1: chunked_writer.rs needs `libc::iovec` for io_uring writev
+# iovec construction. Always-on (negligible at zero use), matches
+# `nativelink-util`'s libc dep.
+libc = { version = "0.2.177", default-features = false }
 lz4_flex = { version = "0.11.3", default-features = false }
 mongodb = { version = "3", features = [
   "compat-3-0-0",
@@ -113,6 +117,11 @@ tokio = { version = "1.44.1", features = [
 tokio-stream = { version = "0.1.17", features = [
   "fs",
 ], default-features = false }
+# #47 b1 Phase 2: chunked_writer.rs uses tokio_epoll_uring::SystemHandle::writev
+# directly so the writer task can keep its own fd-Arc and submit writev
+# SQEs without bouncing through nativelink-util. Gated on the same
+# `io-uring` feature so non-Linux / no-io-uring builds compile out.
+tokio-epoll-uring = { path = "../tokio-epoll-uring/tokio-epoll-uring", optional = true }
 tokio-util = { version = "0.7.14", default-features = false }
 tonic = { version = "0.14.5", features = [
   "tls-aws-lc",
@@ -126,7 +135,7 @@ uuid = { version = "1.16.0", default-features = false, features = [
 ] }
 
 [features]
-io-uring = ["nativelink-util/io-uring"]
+io-uring = ["nativelink-util/io-uring", "dep:tokio-epoll-uring"]
 quic = ["nativelink-util/quic"]
 failpoints = ["dep:fail", "fail/failpoints", "nativelink-util/failpoints"]
 # Test-only hooks (e.g. `set_mirror_blobs_max_bytes_for_test`). Must be
