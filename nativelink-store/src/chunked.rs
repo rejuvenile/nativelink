@@ -41,6 +41,7 @@ pub mod chunked_client;
 pub mod chunked_driver;
 pub mod chunked_filesystem;
 pub mod chunked_race_state;
+pub mod chunked_writer;
 pub mod chunked_read_registry;
 pub mod pin_budget;
 
