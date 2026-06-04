@@ -65,6 +65,30 @@
 #![cfg(feature = "chunked_fast_slow")]
 
 use core::fmt::Debug;
+use std::sync::OnceLock;
+
+use tracing::info;
+
+/// #47 b1 Phase 2 Step 4 / design §5 / I10: one-time activation probe.
+///
+/// Cached value of `is_io_uring_available()` after first observation
+/// by [`emit_activation_probe_once`]. Emits `info!(io_uring_active = bool)`
+/// at populate time so post-deploy operators can verify which path is
+/// live without inferring from per-write probes.
+static IO_URING_PATH_ACTIVE: OnceLock<bool> = OnceLock::new();
+
+/// Idempotent activation probe — emits `info!` the first time a chunked
+/// driver decides between Path A (io_uring) and Path B (spawn_blocking).
+/// Subsequent calls with the same value are no-ops.
+pub fn emit_activation_probe_once(io_uring_active: bool) {
+    if IO_URING_PATH_ACTIVE.set(io_uring_active).is_ok() {
+        info!(
+            target: "nativelink_store::chunked",
+            io_uring_active,
+            "chunked writer path decision",
+        );
+    }
+}
 
 /// Decision for which write path to take per blob.
 ///

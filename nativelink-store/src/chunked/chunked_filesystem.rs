@@ -774,6 +774,9 @@ pub(crate) async fn write_chunk_at_offset(
             pwrite_ms = pwrite_us / 1000,
             closure_to_resume_ms = closure_to_resume_us / 1000,
             total_inner_ms = total_inner_us / 1000,
+            // #47 b1 Phase 2 Step 4 / design §5: path discriminator so
+            // dashboards can partition fallback vs io_uring tail-warns.
+            path = "spawn_blocking",
             "per-chunk back-edge decomposed (#449 inline-split): mutex/dispatch/pwrite",
         );
     }
