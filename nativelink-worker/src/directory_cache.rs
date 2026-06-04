@@ -198,8 +198,11 @@ struct CachedDirectoryMetadata {
     size: u64,
     /// Last access time as duration-since-EPOCH in millis (atomic for read-lock access)
     last_access_millis: AtomicU64,
-    /// Reference count (number of active hardlink operations in flight)
-    ref_count: AtomicUsize,
+    /// Reference count (number of active hardlink operations in flight).
+    /// Held in an `Arc` so RAII pin guards (`DirectoryCachePinGuard`) can
+    /// drop a +1 ref synchronously even if the entry is paradoxically
+    /// removed before Drop runs — guard decrements its private clone.
+    ref_count: Arc<AtomicUsize>,
 }
 
 impl CachedDirectoryMetadata {
@@ -636,7 +639,7 @@ impl DirectoryCache {
                         path: entry_path,
                         size,
                         last_access_millis: AtomicU64::new(mtime_millis),
-                        ref_count: AtomicUsize::new(0),
+                        ref_count: Arc::new(AtomicUsize::new(0)),
                     },
                 );
                 loaded_count += 1;
@@ -1189,7 +1192,7 @@ impl DirectoryCache {
                             .unwrap_or_default()
                             .as_millis() as u64,
                     ),
-                    ref_count: AtomicUsize::new(0),
+                    ref_count: Arc::new(AtomicUsize::new(0)),
                 },
             );
             let total_size: u64 = cache.values().map(|m| m.size).sum();
@@ -1734,7 +1737,7 @@ impl DirectoryCache {
                             .unwrap_or_default()
                             .as_millis() as u64,
                     ),
-                    ref_count: AtomicUsize::new(0),
+                    ref_count: Arc::new(AtomicUsize::new(0)),
                 },
             );
             let total_size: u64 = cache.values().map(|m| m.size).sum();
