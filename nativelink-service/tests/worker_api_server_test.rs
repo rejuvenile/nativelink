@@ -2805,6 +2805,148 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
 }
 
 // =====================================================================
+// #168 follow-up A2: field-16 fold into consolidated locality_map.write()
+// =====================================================================
+//
+// Pre-fold, `handle_blobs_available` took `locality_map.write()` twice
+// when a BlobsAvailable carried BOTH field-13 (`digests` /
+// `pinned_mirror_digests`) AND field-16 (`pinned_mirror_entries`)
+// payloads. The standalone field-16 block also fired
+// `broadcast_pinned_mirror_ack` BEFORE the consolidated block ran, so
+// a reader racing the ack could observe (a) pin released without
+// locality entry, OR (b) locality entry written while pin still held —
+// the "register BEFORE ack" invariant was structurally OK because the
+// standalone block ordered field-16-locality before its own ack, but
+// the FIELD-13 register-blobs-iter ran AFTER the field-16 ack, leaving
+// a window where field-13 digests were absent from locality while the
+// dispatcher believed every advertised peer had stable view.
+//
+// Post-fold, a SINGLE consolidated `register_blobs_iter` chains
+// field-13 digests + field-13 `pinned_mirror_digests` + field-16
+// entry digests; `broadcast_pinned_mirror_ack` fires strictly AFTER
+// `drop(map)`. This test exercises the merged path with a notification
+// carrying BOTH field-13 and field-16 payloads simultaneously and
+// asserts:
+//
+//   (T1) Field-16 digests are registered in locality_map (under-action
+//        of the locality side: same coverage as the pre-existing
+//        `handle_blobs_available_pinned_mirror_entries_register_in_locality_map_test`
+//        but additionally validates the chained iterator preserves
+//        field-16 registration when field-13 is ALSO present — the
+//        merged-iterator boundary case).
+//
+//   (T2) The dispatcher pin set's pre-pinned entries are removed by
+//        the ack call (ack fired). Together with (T1) this exercises
+//        BOTH side-effects of the merged exit path.
+//
+//   (T3) Field-13 digests are ALSO registered in locality_map (the
+//        chained iterator preserves the field-13 registration when
+//        field-16 is also present).
+//
+// Mutation falsification:
+//   - Comment out the
+//     `.chain(pinned_mirror_field16_digests.iter().copied())` clause
+//     in `worker_api_server.rs` → (T1) red-fails with bespoke
+//     "field-16 fold: merged register_blobs_iter dropped field-16".
+//   - Comment out EITHER of the two
+//     `dispatcher.broadcast_pinned_mirror_ack(entries)` calls inside
+//     the consolidated-block exits → (T2) red-fails with bespoke
+//     "field-16 fold: ack not fired post-fold; pin entries still held".
+#[nativelink_test]
+pub async fn handle_blobs_available_a2_fold_merged_field13_and_field16_test()
+-> Result<(), Box<dyn core::error::Error>> {
+    use nativelink_store::small_blob_dispatcher::EphemeralServerSidePin;
+
+    let cas_endpoint = "grpc://192.168.1.51:50081";
+    let ctx = setup_api_server_with_locality_and_dispatcher(cas_endpoint, 4243u64).await?;
+
+    // Field-16 (pinned_mirror_entries) digests. Pre-pin them so we can
+    // observe ack removing them.
+    let d16_a = DigestInfo::new([0xA1u8; 32], 1024);
+    let d16_b = DigestInfo::new([0xA2u8; 32], 2048);
+    // Field-13 (digests) — chained into the same consolidated
+    // register_blobs_iter call post-fold.
+    let d13_a = DigestInfo::new([0xB1u8; 32], 512);
+
+    // Pre-pin the field-16 entries in the cas pin set so we can detect
+    // when the ack call removes them.
+    let cas_pin: Arc<EphemeralServerSidePin> = ctx._cas_pin.clone();
+    cas_pin.insert(d16_a, Bytes::from_static(&[0u8; 1024]))?;
+    cas_pin.insert(d16_b, Bytes::from_static(&[0u8; 2048]))?;
+    assert!(cas_pin.contains(&d16_a), "pre-condition: d16_a pinned");
+    assert!(cas_pin.contains(&d16_b), "pre-condition: d16_b pinned");
+
+    // Send ONE BlobsAvailable carrying BOTH field-13 digests AND
+    // field-16 pinned_mirror_entries. This is the merged path the
+    // A2 fold collapses into a single locality_map.write().
+    ctx.worker_stream
+        .send(Update::BlobsAvailable(BlobsAvailableNotification {
+            worker_cas_endpoint: String::new(),
+            digests: vec![d13_a.into()],
+            is_full_snapshot: false,
+            evicted_digests: vec![],
+            digest_infos: vec![],
+            cpu_load_pct: 0,
+            cached_directory_digests: vec![],
+            added_subtree_digests: vec![],
+            removed_subtree_digests: vec![],
+            is_full_subtree_snapshot: false,
+            p_core_load_pct: 0,
+            e_core_load_pct: 0,
+            pinned_mirror_digests: vec![],
+            mirror_used_bytes: 0,
+            mirror_max_bytes: 0,
+            pinned_mirror_entries: vec![
+                MirrorPinEntry {
+                    digest: Some(d16_a.into()),
+                    store_id: "cas".to_string(),
+                },
+                MirrorPinEntry {
+                    digest: Some(d16_b.into()),
+                    store_id: "cas".to_string(),
+                },
+            ],
+            pinned_ac_mirror_entries: Vec::new(),
+        }))
+        .await
+        .map_err(|e| make_err!(tonic::Code::Internal, "Error sending blobs available: {e}"))?;
+
+    // Bounded poll: BOTH the locality_map MUST contain all three
+    // digests (d13_a + d16_a + d16_b) AND the pin set MUST have
+    // released d16_a, d16_b (ack fired). 2s deadline shared with the
+    // sibling under-action test below.
+    let locality_map = ctx.locality_map.clone();
+    let cas_pin_poll = cas_pin.clone();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let map = locality_map.read();
+            let has_d13 = !map.lookup_workers(&d13_a).is_empty();
+            let has_d16a = !map.lookup_workers(&d16_a).is_empty();
+            let has_d16b = !map.lookup_workers(&d16_b).is_empty();
+            drop(map);
+            let pin_released =
+                !cas_pin_poll.contains(&d16_a) && !cas_pin_poll.contains(&d16_b);
+            if has_d13 && has_d16a && has_d16b && pin_released {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect(
+        "#168 A2 fold: merged register_blobs_iter dropped field-16 \
+         OR ack not fired post-fold; pin entries still held. \
+         Within 2s the consolidated locality_map.write() must register \
+         BOTH field-13 (`digests`) AND field-16 (`pinned_mirror_entries`) \
+         digests; broadcast_pinned_mirror_ack must fire strictly AFTER \
+         drop(map) so the pin set releases the pre-pinned field-16 \
+         entries.",
+    );
+
+    Ok(())
+}
+
+// =====================================================================
 // #387: worker-flap detection on rapid boot_epoch reconnects
 // =====================================================================
 //

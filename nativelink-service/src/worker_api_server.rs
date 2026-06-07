@@ -1467,58 +1467,46 @@ impl WorkerConnection {
         // releases the pin) so any concurrent reader sees locality
         // before the pin is released. Skipped when no `locality_map`
         // is configured (test contexts without WorkerProxyStore).
-        // #168 perf-optimizer MINOR: this block currently takes
-        // `locality_map.write()` SEPARATELY from the consolidated
-        // block at line ~1252 below — two write-locks per
-        // BlobsAvailable notification carrying both
-        // `pinned_mirror_entries` and `digests` / `pinned_mirror_digests`.
-        // Folding into the consolidated block would save one write-lock
-        // per tick (bounded by ~10 workers × ~10 ticks/sec = ~100
-        // acquisitions/sec saved), but requires moving the
-        // `broadcast_pinned_mirror_ack` call too while preserving the
-        // "register BEFORE pin release" ordering invariant. The
-        // intervening mirror-pull async work (lines ~1300-1339) makes
-        // a clean fold structurally awkward — deferred with this TODO
-        // because the perf cost is small and the contract is subtle.
-        // TODO(#168 follow-up): fold locality_map.write() into the
-        // consolidated block and move broadcast_pinned_mirror_ack
-        // after the consolidated write so the "register BEFORE ack"
-        // invariant is preserved.
-        if !notification.pinned_mirror_entries.is_empty() {
-            if let Some(ref locality_map) = self.locality_map {
-                let endpoint = if notification.worker_cas_endpoint.is_empty() {
-                    self.cas_endpoint.as_str()
-                } else {
-                    notification.worker_cas_endpoint.as_str()
-                };
-                // (Spoof-check audit log was hoisted to function entry;
-                // it covers ALL sinks of `worker_cas_endpoint`, not just
-                // this one.)
-                if !endpoint.is_empty() {
-                    let digests: Vec<DigestInfo> = notification
-                        .pinned_mirror_entries
-                        .iter()
-                        .filter_map(|e| {
-                            e.digest
-                                .as_ref()
-                                .and_then(|d| DigestInfo::try_from(d.clone()).ok())
-                        })
-                        .collect();
-                    if !digests.is_empty() {
-                        debug!(
-                            worker_id=?self.worker_id,
-                            endpoint,
-                            count=digests.len(),
-                            "BlobsAvailable: registering dispatcher-pushed pinned_mirror_entries in locality_map (#168 item K)"
-                        );
-                        locality_map.write().register_blobs(endpoint, &digests);
-                    }
-                }
-            }
-            if let Some(ref dispatcher) = self.small_blob_dispatcher {
-                dispatcher.broadcast_pinned_mirror_ack(&notification.pinned_mirror_entries);
-            }
-        }
+        //
+        // #168 follow-up (A2): folded into the consolidated
+        // `locality_map.write()` block below — saves one write-lock
+        // per BlobsAvailable tick carrying both `pinned_mirror_entries`
+        // and `digests` / `pinned_mirror_digests`. We extract field-16
+        // digests up-front (the only locality-relevant payload of the
+        // entries) so the consolidated `register_blobs_iter` call can
+        // chain them; the `broadcast_pinned_mirror_ack` call is
+        // deferred to AFTER the consolidated write's `drop(map)` so
+        // the "register BEFORE ack" invariant is preserved.
+        // `pinned_mirror_ack_entries` is `Some` iff this tick carries
+        // a non-empty field-16 payload; the ack fires at EVERY
+        // exit path below (the two early returns at `no_locality_map`
+        // / `empty_endpoint`, the consolidated-block spawn return,
+        // and the fall-through) so semantics for the
+        // ack-when-locality-skipped paths are preserved.
+        let pinned_mirror_field16_digests: Vec<DigestInfo> = if notification
+            .pinned_mirror_entries
+            .is_empty()
+        {
+            Vec::new()
+        } else {
+            notification
+                .pinned_mirror_entries
+                .iter()
+                .filter_map(|e| {
+                    e.digest
+                        .as_ref()
+                        .and_then(|d| DigestInfo::try_from(d.clone()).ok())
+                })
+                .collect()
+        };
+        let pinned_mirror_ack_entries: Option<&[_]> = if notification
+            .pinned_mirror_entries
+            .is_empty()
+        {
+            None
+        } else {
+            Some(notification.pinned_mirror_entries.as_slice())
+        };
 
         // AC pin advertisement (proto field 17, Option A) — kept in a
         // SEPARATE branch from the CAS field above so the AC entries
@@ -1706,6 +1694,14 @@ impl WorkerConnection {
         }
 
         let Some(ref locality_map) = self.locality_map else {
+            // A2 fold: field-16 ack still fires when locality_map is
+            // unset (pre-fold the standalone block did the ack before
+            // these early-return checks; preserve that semantic).
+            if let Some(entries) = pinned_mirror_ack_entries {
+                if let Some(ref dispatcher) = self.small_blob_dispatcher {
+                    dispatcher.broadcast_pinned_mirror_ack(entries);
+                }
+            }
             let handle_blobs_available_elapsed_ms =
                 handle_blobs_available_start.elapsed().as_millis() as u64;
             debug!(
@@ -1721,6 +1717,13 @@ impl WorkerConnection {
             &notification.worker_cas_endpoint
         };
         if endpoint.is_empty() {
+            // A2 fold: same semantics as the no_locality_map exit above —
+            // ack the dispatcher even though we cannot register locality.
+            if let Some(entries) = pinned_mirror_ack_entries {
+                if let Some(ref dispatcher) = self.small_blob_dispatcher {
+                    dispatcher.broadcast_pinned_mirror_ack(entries);
+                }
+            }
             let handle_blobs_available_elapsed_ms =
                 handle_blobs_available_start.elapsed().as_millis() as u64;
             debug!(
@@ -1811,25 +1814,33 @@ impl WorkerConnection {
             map.evict_blobs(endpoint, &evicted);
         }
 
-        // Collapse generic + pinned-mirror registrations into a single
-        // `register_blobs_iter` call so we allocate the endpoint `Arc<str>`
-        // once per tick instead of twice (10 workers × 100ms = ~200
-        // alloc/sec saved). The iterator form chains both slices without
-        // building an intermediate `Vec`. Pinned-mirror digests still take
-        // a SEPARATE mirror-pull code path below — combining the locality
-        // registration does not merge their backfill scheduling.
-        if !digests.is_empty() || !pinned_mirror.is_empty() {
+        // Collapse generic + pinned-mirror + field-16-pinned-mirror-entries
+        // registrations into a single `register_blobs_iter` call so we
+        // allocate the endpoint `Arc<str>` once per tick instead of three
+        // times (10 workers × 100ms = ~300 alloc/sec saved). The iterator
+        // form chains all slices without building an intermediate `Vec`.
+        // Pinned-mirror digests still take a SEPARATE mirror-pull code
+        // path below — combining the locality registration does not
+        // merge their backfill scheduling. Field-16 entries are also
+        // ack'd via `broadcast_pinned_mirror_ack` AFTER `drop(map)` to
+        // preserve the "register BEFORE ack" invariant (#168 A2 fold).
+        if !digests.is_empty() || !pinned_mirror.is_empty() || !pinned_mirror_field16_digests.is_empty() {
             debug!(
                 worker_id=?self.worker_id,
                 endpoint,
                 count=digests.len(),
                 pinned_mirror_count=pinned_mirror.len(),
+                pinned_mirror_field16_count=pinned_mirror_field16_digests.len(),
                 is_full_snapshot,
                 "Registering blobs available from worker"
             );
             map.register_blobs_iter(
                 endpoint,
-                digests.iter().copied().chain(pinned_mirror.iter().copied()),
+                digests
+                    .iter()
+                    .copied()
+                    .chain(pinned_mirror.iter().copied())
+                    .chain(pinned_mirror_field16_digests.iter().copied()),
             );
         }
 
@@ -1910,6 +1921,16 @@ impl WorkerConnection {
                 let metrics = self.metrics.clone();
                 // Drop the locality map write lock before spawning.
                 drop(map);
+                // A2 fold: ack field-16 entries strictly AFTER the
+                // consolidated `locality_map.write()` guard drops, so
+                // any reader that takes the read lock observing the
+                // pin-release also observes the just-registered
+                // locality entries (register BEFORE ack).
+                if let Some(entries) = pinned_mirror_ack_entries {
+                    if let Some(ref dispatcher) = self.small_blob_dispatcher {
+                        dispatcher.broadcast_pinned_mirror_ack(entries);
+                    }
+                }
                 background_spawn!(
                     "blobs_available_mark_stable_and_backfill",
                     async move {
@@ -1936,6 +1957,18 @@ impl WorkerConnection {
             }
         }
 
+        // A2 fold: fall-through path — drop the consolidated write guard
+        // by name BEFORE acking so the "register BEFORE ack" invariant
+        // holds. `map` was bound at the top of the consolidated block;
+        // if control reached here without taking the
+        // `background_backfill_spawned` early return above, the guard
+        // is still held. Explicit `drop(map)` documents the ordering.
+        drop(map);
+        if let Some(entries) = pinned_mirror_ack_entries {
+            if let Some(ref dispatcher) = self.small_blob_dispatcher {
+                dispatcher.broadcast_pinned_mirror_ack(entries);
+            }
+        }
         let handle_blobs_available_elapsed_ms =
             handle_blobs_available_start.elapsed().as_millis() as u64;
         debug!(
