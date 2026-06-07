@@ -44,6 +44,7 @@ use nativelink_util::buf_channel::{
 use nativelink_util::common::{DigestInfo, make_precondition_failure_any};
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
+use nativelink_util::metrics_utils::CounterWithTime;
 use nativelink_util::store_trait::{
     IS_MIRROR_REQUEST, IS_WORKER_REQUEST, ItemCallback, MarkStableDelegation, PinDelegation,
     REDIRECT_PREFIX, StableDigestDelegation, Store, StoreDriver, StoreKey, StoreLike,
@@ -149,6 +150,12 @@ pub struct WorkerProxyStore {
     /// (forward `Err`), causing the forward loop to drop `cache_tx`
     /// and abandon the cache-tee.
     cdn_tee_cache_abandoned_consumer_eof_total: Arc<AtomicU64>,
+    /// #58 — counter incremented every time the peer-fetch error path at
+    /// `:1650` fires (`WorkerProxyStore: peer fetch failed` with writer
+    /// not pipe-broken). Lets `#35 OQ-8` preflight check the rate
+    /// without journal grep. Observed 4 events / 7 d in production
+    /// pre-counter (Phase 5 audit `2026-06-04`).
+    worker_proxy_peer_fetch_notfound_total: CounterWithTime,
     /// #130 — singleflight/dedup map for concurrent same-digest peer
     /// fetches. Collapses the "N callers, same digest, ms apart" cohort
     /// pattern into 1 leader peer-fetch + N-1 waiters that re-read from
@@ -379,6 +386,15 @@ impl MetricsComponent for WorkerProxyStore {
             self.cdn_tee_cache_abandoned_consumer_eof_total.as_ref(),
             MetricKind::Counter,
             "CDN-tee writes abandoned because Bazel consumer disconnected mid-blob"
+        );
+        publish!(
+            "worker_proxy_peer_fetch_notfound_total",
+            &self.worker_proxy_peer_fetch_notfound_total,
+            MetricKind::Counter,
+            "Peer-fetch errors logged at the non-derivative error! site \
+             (writer still open). Per #35 OQ-8: production population for \
+             Phase 5 BlobsAvailable; lets future preflights read rate \
+             without journal grep"
         );
 
         // Snapshot per-endpoint state under a brief read lock, then publish
@@ -637,6 +653,7 @@ impl WorkerProxyStore {
             cdn_tee_cache_completed_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_full_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
+            worker_proxy_peer_fetch_notfound_total: CounterWithTime::default(),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -667,6 +684,7 @@ impl WorkerProxyStore {
             cdn_tee_cache_completed_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_full_total: Arc::new(AtomicU64::new(0)),
             cdn_tee_cache_abandoned_consumer_eof_total: Arc::new(AtomicU64::new(0)),
+            worker_proxy_peer_fetch_notfound_total: CounterWithTime::default(),
             singleflight: SingleflightMap::new(),
         })
     }
@@ -1647,6 +1665,7 @@ impl WorkerProxyStore {
                              pipe broken (derivative)"
                         );
                     } else {
+                        self.worker_proxy_peer_fetch_notfound_total.inc();
                         error!(
                             ?digest,
                             endpoint = %endpoint,
@@ -5060,6 +5079,80 @@ mod tests {
 
         let result = store.get_part_unchunked(digest, 0, None).await?;
         assert_eq!(result.as_ref(), value);
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // #58 (2026-06-07 mutation stamp): peer-fetch NotFound counter
+    //
+    // Production composition: server-side WorkerProxyStore (race_peers=OFF,
+    // non-IS_WORKER_REQUEST caller). Inner store empty, peer registered in
+    // locality but its MemoryStore is empty so peer.get_part returns
+    // NotFound. The non-derivative error! branch at the `:1650-style` site
+    // (now `WorkerProxyStore: peer fetch failed` with writer still open)
+    // must fire and increment `worker_proxy_peer_fetch_notfound_total`.
+    //
+    // Per #35 OQ-8 preflight (`.claude/audits/35-phase5-blobs-available-
+    // design-2026-06-04.md`): production 4 events / 7d, all
+    // `code: NotFound` + `evicted_locality: true`. Counter lets future
+    // preflights skip journal grep.
+    //
+    // Mutation guard: comment out the `self.worker_proxy_peer_fetch_
+    // notfound_total.inc();` line; this test red-fails with
+    //   "counter must increment when peer-fetch error site fires".
+    // ---------------------------------------------------------------
+    #[nativelink_test]
+    async fn test_peer_fetch_notfound_counter_increments_on_error_site()
+        -> Result<(), Error>
+    {
+        let inner = Store::new(MemoryStore::new(&MemorySpec::default()));
+        let locality_map = new_shared_blob_locality_map();
+        let proxy_arc =
+            WorkerProxyStore::new(inner, locality_map.clone());
+        // race_peers OFF (server-side); IS_WORKER_REQUEST is false by default.
+        let store = Store::new(proxy_arc.clone());
+
+        let digest = DigestInfo::try_new(VALID_HASH1, 100)?;
+
+        // Empty peer MemoryStore: peer.get_part will return NotFound,
+        // taking the non-derivative error! branch in try_read_from_worker.
+        let peer_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+        proxy_arc
+            .inject_worker_connection("grpc://peer:50071", peer_store);
+        locality_map
+            .write()
+            .register_blobs("grpc://peer:50071", &[digest]);
+
+        let before = proxy_arc
+            .worker_proxy_peer_fetch_notfound_total
+            .counter
+            .load(Ordering::Relaxed);
+        assert_eq!(before, 0, "counter must start at zero");
+
+        // Bound the call with a deadlock detector; if the writer-
+        // termination contract regresses, this surfaces as Elapsed
+        // rather than a hang.
+        let result = tokio::time::timeout(
+            core::time::Duration::from_secs(5),
+            store.get_part_unchunked(digest, 0, None),
+        )
+        .await
+        .expect("must not deadlock — get_part_unchunked completes within 5s");
+
+        assert!(
+            result.is_err(),
+            "expected NotFound when inner+peer both miss"
+        );
+
+        let after = proxy_arc
+            .worker_proxy_peer_fetch_notfound_total
+            .counter
+            .load(Ordering::Relaxed);
+        assert!(
+            after >= 1,
+            "counter must increment when peer-fetch error site fires; got {after}"
+        );
 
         Ok(())
     }
