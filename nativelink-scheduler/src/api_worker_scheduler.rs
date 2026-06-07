@@ -898,16 +898,26 @@ impl ApiWorkerSchedulerImpl {
                         if !worker_is_viable(wid) {
                             continue;
                         }
-                        // Sum bytes and files for each of the action's directory
-                        // digests that this worker has cached.
-                        let (cached_bytes, cached_files): (u64, u64) = tree.dir_digests.iter()
-                            .filter(|d| w.cached_subtree_digests.contains(d))
-                            .fold((0u64, 0u64), |(ab, af), d| {
-                                (
-                                    ab + tree.subtree_bytes.get(d).copied().unwrap_or(0),
-                                    af + tree.subtree_files.get(d).copied().unwrap_or(0),
-                                )
-                            });
+                        // #52 (option b2) numerator: sum DIRECT (non-
+                        // recursive) bytes/files for each unique cached
+                        // dir digest. `dir_digests` is a `HashSet` so
+                        // each digest is counted once; `dir_direct_*` is
+                        // disjoint across directories. The resulting
+                        // `cached_score` is bounded by `total_score`
+                        // (max coverage_pct == 100) AND retains
+                        // partial-match resolution so workers with 30 %
+                        // vs 70 % of subtree bytes are distinguished.
+                        // See `compute_dedup_cached_score` doc-comment
+                        // and `.claude/audits/52-scheduler-subtree-
+                        // overload-rca-2026-06-04.md` (pre-fix p95 =
+                        // 466 %).
+                        let (cached_bytes, cached_files): (u64, u64) =
+                            compute_dedup_cached_score(
+                                &tree.dir_digests,
+                                &w.cached_subtree_digests,
+                                &tree.dir_direct_bytes,
+                                &tree.dir_direct_files,
+                            );
                         let cached_score = cached_bytes + cached_files * PER_FILE_WEIGHT;
                         if cached_score == 0 {
                             continue;
@@ -3435,6 +3445,17 @@ struct ResolvedTree {
     /// have higher per-file I/O cost (hardlinks, clonefile) than fewer
     /// large files at the same total byte count.
     subtree_files: HashMap<DigestInfo, u64>,
+    /// #52: Direct (non-recursive) file bytes attributed to each directory
+    /// digest — only the files referenced by that directory's own
+    /// `files` list, NOT its subdirectories. Sum over all entries equals
+    /// `subtree_bytes[root]`, partitioned per directory. Used by
+    /// `compute_dedup_cached_score` so the numerator is a disjoint sum
+    /// across cached directories (no double-counting via nesting); the
+    /// resulting `coverage_pct` is bounded in [0, 100].
+    dir_direct_bytes: HashMap<DigestInfo, u64>,
+    /// #52: Direct (non-recursive) file count per directory digest;
+    /// see `dir_direct_bytes` doc-comment.
+    dir_direct_files: HashMap<DigestInfo, u64>,
     /// Decoded Directory protos keyed by their digest. Forwarded to workers
     /// in StartExecute so they can skip the redundant GetTree RPC.
     directories: HashMap<DigestInfo, Directory>,
@@ -3450,9 +3471,13 @@ impl ResolvedTree {
             * size_of::<(DigestInfo, u64)>();
         // HashSet<DigestInfo>: ~72 bytes per entry (key + hash bucket).
         let dir_set_bytes = self.dir_digests.len() * 72;
-        // HashMap<DigestInfo, u64>: ~80 bytes per entry.
-        let subtree_map_bytes =
-            (self.subtree_bytes.len() + self.subtree_files.len()) * 80;
+        // HashMap<DigestInfo, u64>: ~80 bytes per entry. Covers
+        // subtree_bytes + subtree_files + dir_direct_bytes + dir_direct_files.
+        let subtree_map_bytes = (self.subtree_bytes.len()
+            + self.subtree_files.len()
+            + self.dir_direct_bytes.len()
+            + self.dir_direct_files.len())
+            * 80;
         // HashMap<DigestInfo, Directory>: key overhead + proto encoded size.
         let dir_proto_bytes: usize = self
             .directories
@@ -3474,6 +3499,97 @@ impl ResolvedTree {
             dirs.push(directory.clone());
         }
         (dirs, digests)
+    }
+}
+
+/// #52 (option b2): Compute the worker's cached score for an action's
+/// input subtree as the sum of DIRECT (non-recursive) bytes/files for
+/// every unique directory digest the worker has cached. Because
+/// `dir_digests` is already a `HashSet` and each directory's
+/// `dir_direct_bytes[d]` contribution is disjoint from every other
+/// directory's, the resulting `(cached_bytes, cached_files)` cannot
+/// exceed `(subtree_bytes[root], subtree_files[root])`. The downstream
+/// `coverage_pct = cached_score * 100 / total_score` is therefore
+/// bounded in `[0, 100]` while still distinguishing partial-coverage
+/// workers (30 % vs 70 % of subtree bytes).
+///
+/// The pre-fix numerator iterated `tree.dir_digests` and summed
+/// `subtree_bytes[d]` (RECURSIVE) for each `d` the worker had cached.
+/// `subtree_bytes[root]` already includes every child's bytes, so
+/// caching root + any child double-counted the child's bytes — once in
+/// the parent's recursive total, once on its own. Denominator
+/// (`total_score`) is `subtree_bytes[root]` only, so `coverage_pct`
+/// could exceed 100 % (production distribution n=214, p50=187 %,
+/// p95=466 %, max=466 %). See
+/// `.claude/audits/52-scheduler-subtree-overload-rca-2026-06-04.md`.
+///
+/// Telemetry-only: the selection inside `inner_find_and_reserve_worker`
+/// uses `cached_score` directly (not the percentage), so this change
+/// affects the WARN/DEBUG log fields, not routing. Partial-match
+/// scoring is preserved — tier 2 still distinguishes "worker has 30 %
+/// of subtree bytes" from "worker has 80 %", unlike a root-only
+/// collapse which would kill tier 2 (every dir-cache match also wins
+/// tier 1 at `:822` above).
+fn compute_dedup_cached_score(
+    dir_digests: &HashSet<DigestInfo>,
+    cached_subtree_digests: &HashSet<DigestInfo>,
+    dir_direct_bytes: &HashMap<DigestInfo, u64>,
+    dir_direct_files: &HashMap<DigestInfo, u64>,
+) -> (u64, u64) {
+    dir_digests
+        .iter()
+        .filter(|d| cached_subtree_digests.contains(d))
+        .fold((0u64, 0u64), |(ab, af), d| {
+            (
+                ab + dir_direct_bytes.get(d).copied().unwrap_or(0),
+                af + dir_direct_files.get(d).copied().unwrap_or(0),
+            )
+        })
+}
+
+/// #52 OLD pre-fix numerator (kept ONLY as a mutation-test fixture so
+/// the regression scenario can be exercised). Sums `subtree_bytes[d]`
+/// and `subtree_files[d]` for every directory digest the worker has
+/// cached. Double-counts nested subtrees because `subtree_bytes` is
+/// recursive — `subtree_bytes[root]` already includes every cached
+/// child's bytes. DO NOT call from production paths.
+#[cfg(test)]
+fn compute_old_buggy_cached_score(
+    dir_digests: &HashSet<DigestInfo>,
+    cached_subtree_digests: &HashSet<DigestInfo>,
+    subtree_bytes: &HashMap<DigestInfo, u64>,
+    subtree_files: &HashMap<DigestInfo, u64>,
+) -> (u64, u64) {
+    dir_digests
+        .iter()
+        .filter(|d| cached_subtree_digests.contains(d))
+        .fold((0u64, 0u64), |(ab, af), d| {
+            (
+                ab + subtree_bytes.get(d).copied().unwrap_or(0),
+                af + subtree_files.get(d).copied().unwrap_or(0),
+            )
+        })
+}
+
+/// #52 (b1) helper kept ONLY as a mutation fixture for T3 — proves
+/// the over-collapse regression (root-only numerator kills tier 2's
+/// partial-match signal). Returns `(total_bytes, total_files)` iff the
+/// worker has the action's `input_root_digest` cached; `(0, 0)`
+/// otherwise. Because Tier 1 already wins on a root match, this form
+/// gives every partial-cache worker a score of 0 — workers are
+/// indistinguishable. DO NOT call from production paths.
+#[cfg(test)]
+#[allow(dead_code)]
+fn compute_root_only_cached_score(
+    cached_subtree_digests: &HashSet<DigestInfo>,
+    input_root_digest: &DigestInfo,
+    total_bytes: u64,
+    total_files: u64,
+) -> (u64, u64) {
+    if cached_subtree_digests.contains(input_root_digest) {
+        (total_bytes, total_files)
+    } else {
+        (0, 0)
     }
 }
 
@@ -3765,6 +3881,8 @@ async fn resolve_tree_from_cas(
         dir_digests: seen_dirs,
         subtree_bytes,
         subtree_files,
+        dir_direct_bytes,
+        dir_direct_files,
         directories,
     })
 }
@@ -4464,6 +4582,283 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    // -----------------------------------------------------------------
+    // #52 (option b2, 2026-06-07 mutation stamp): subtree-coverage
+    // `coverage_pct` must (a) never exceed 100 %, (b) remain >0 for
+    // partial-match workers (so tier 2 still distinguishes between
+    // candidates that have part of the subtree cached).
+    //
+    // Fixture matches the pre-fix production WARN log
+    // (`.claude/audits/52-scheduler-subtree-overload-rca-2026-06-04.md`,
+    // §3: distribution n=214, p50=187 %, p95=466 %, max=466 %). A
+    // worker has the action's root AND a nested child subtree both in
+    // `cached_subtree_digests`; the OLD numerator iterated
+    // `tree.dir_digests` and summed `subtree_bytes[d]` (recursive),
+    // double-counting the child's bytes inside root's recursive total.
+    //
+    // NEW numerator: `compute_dedup_cached_score` iterates the
+    // `HashSet<DigestInfo>` of `dir_digests` (already deduped) and sums
+    // each cached directory's DIRECT (non-recursive) bytes/files. The
+    // direct contributions are disjoint across directories, so the
+    // numerator is bounded by `subtree_bytes[root]` and partial matches
+    // produce intermediate `coverage_pct` values in `(0, 100)`.
+    //
+    // Mutation guards:
+    //   - Revert helper to `compute_old_buggy_cached_score`:
+    //     test red-fails with
+    //     "coverage_pct >100% — partial match double-counts via
+    //      recursive subtree_bytes".
+    //   - Use `compute_root_only_cached_score` (b1 over-collapse):
+    //     T3 red-fails with
+    //     "tier 2 partial-match signal lost — workers indistinguishable".
+    // -----------------------------------------------------------------
+    #[test]
+    fn test_coverage_pct_never_exceeds_100_under_nested_subtree_match() {
+        const PER_FILE_WEIGHT: u64 = 100 * 1024;
+
+        // Action tree: root with two nested children, mirroring the
+        // pre-fix 466 % production case (audit §3 distribution n=214,
+        // p50=187 %, p95=466 %, max=466 %).
+        let root = DigestInfo::new([0xAAu8; 32], 100);
+        let child_a = DigestInfo::new([0xBBu8; 32], 50);
+        let child_b = DigestInfo::new([0xCCu8; 32], 50);
+
+        let mut dir_digests: HashSet<DigestInfo> = HashSet::new();
+        dir_digests.insert(root);
+        dir_digests.insert(child_a);
+        dir_digests.insert(child_b);
+
+        // Direct (non-recursive) per-dir contributions — disjoint by
+        // construction, summing to root's recursive total.
+        //   root direct      = 100k bytes / 10 files
+        //   child_a direct   = 700k bytes / 70 files
+        //   child_b direct   = 200k bytes / 20 files
+        //   sum (root subtree) = 1M bytes / 100 files
+        let mut dir_direct_bytes: HashMap<DigestInfo, u64> = HashMap::new();
+        dir_direct_bytes.insert(root, 100_000);
+        dir_direct_bytes.insert(child_a, 700_000);
+        dir_direct_bytes.insert(child_b, 200_000);
+
+        let mut dir_direct_files: HashMap<DigestInfo, u64> = HashMap::new();
+        dir_direct_files.insert(root, 10);
+        dir_direct_files.insert(child_a, 70);
+        dir_direct_files.insert(child_b, 20);
+
+        // Recursive subtree_bytes (denominator + b1-mutation fixture).
+        // (Sum of subtree_bytes across all dirs = 1.9M, which is what
+        // the old numerator counted — 190 % of the 1M denominator.)
+        let mut subtree_bytes: HashMap<DigestInfo, u64> = HashMap::new();
+        subtree_bytes.insert(root, 1_000_000);
+        subtree_bytes.insert(child_a, 700_000);
+        subtree_bytes.insert(child_b, 200_000);
+
+        let mut subtree_files: HashMap<DigestInfo, u64> = HashMap::new();
+        subtree_files.insert(root, 100);
+        subtree_files.insert(child_a, 70);
+        subtree_files.insert(child_b, 20);
+
+        let total_bytes = *subtree_bytes.get(&root).unwrap();
+        let total_files = *subtree_files.get(&root).unwrap();
+        let total_score = total_bytes + total_files * PER_FILE_WEIGHT;
+
+        // Worker has cached the full root subtree AND has nested
+        // entries — the realistic production shape that triggered
+        // the OLD double-count.
+        let mut cached: HashSet<DigestInfo> = HashSet::new();
+        cached.insert(root);
+        cached.insert(child_a);
+        cached.insert(child_b);
+
+        // --- OLD form (must overflow >100 %) — proves the bug existed. ---
+        let (old_bytes, old_files) = compute_old_buggy_cached_score(
+            &dir_digests, &cached, &subtree_bytes, &subtree_files,
+        );
+        let old_score = old_bytes + old_files * PER_FILE_WEIGHT;
+        let old_pct = if total_score > 0 {
+            old_score * 100 / total_score
+        } else {
+            0
+        };
+        assert!(
+            old_pct > 100,
+            "fixture must reproduce the pre-fix bug (got old_pct={old_pct} \
+             — fixture didn't trigger the >100% case; tighten it)"
+        );
+
+        // --- NEW form (the actual production code) must be ≤ 100 %
+        //     AND must equal exactly 100 % under full-subtree caching. ---
+        let (new_bytes, new_files) = compute_dedup_cached_score(
+            &dir_digests, &cached, &dir_direct_bytes, &dir_direct_files,
+        );
+        let new_score = new_bytes + new_files * PER_FILE_WEIGHT;
+        let new_pct = if total_score > 0 {
+            new_score * 100 / total_score
+        } else {
+            0
+        };
+        assert!(
+            new_pct <= 100,
+            "coverage_pct >100% — partial match double-counts via \
+             recursive subtree_bytes (new_pct={new_pct}, \
+             new_score={new_score}, total_score={total_score})"
+        );
+        assert_eq!(
+            new_pct, 100,
+            "full subtree cached ⇒ pct must be exactly 100 \
+             (got {new_pct})",
+        );
+
+        // --- Partial match (worker has child_a only): >0 AND <100. ---
+        let mut partial: HashSet<DigestInfo> = HashSet::new();
+        partial.insert(child_a);
+        let (pb, pf) = compute_dedup_cached_score(
+            &dir_digests, &partial, &dir_direct_bytes, &dir_direct_files,
+        );
+        let partial_score = pb + pf * PER_FILE_WEIGHT;
+        let partial_pct = if total_score > 0 {
+            partial_score * 100 / total_score
+        } else {
+            0
+        };
+        assert!(
+            partial_pct > 0 && partial_pct < 100,
+            "partial match must produce intermediate coverage_pct in \
+             (0, 100) (got partial_pct={partial_pct}, \
+             partial_score={partial_score}, total_score={total_score})"
+        );
+
+        // --- Nothing cached ⇒ 0 %. ---
+        let empty: HashSet<DigestInfo> = HashSet::new();
+        let (eb, ef) = compute_dedup_cached_score(
+            &dir_digests, &empty, &dir_direct_bytes, &dir_direct_files,
+        );
+        let empty_pct = if total_score > 0 {
+            (eb + ef * PER_FILE_WEIGHT) * 100 / total_score
+        } else {
+            0
+        };
+        assert_eq!(empty_pct, 0, "nothing cached ⇒ pct must be 0");
+    }
+
+    // -----------------------------------------------------------------
+    // #52 T3 (option b2 partial-match resolution guard): worker A
+    // (30 % of subtree bytes cached) and worker B (70 % cached) must
+    // produce STRICTLY ORDERED coverage_pct values so tier-2 selection
+    // routes to worker B. Guards against an (b1)-style "root-only
+    // collapse" regression where every non-root match scores 0 and
+    // tier 2 becomes dead.
+    //
+    // Fixture: 4 nested children under root with disjoint direct
+    // contributions (300k / 200k / 200k / 200k = 900k subtree; root
+    // direct 100k). Worker A caches child_a (30 % of total subtree).
+    // Worker B caches child_b + child_c + child_d (70 %).
+    //
+    // Mutation guard: swap `compute_dedup_cached_score` for the
+    // root-only `compute_root_only_cached_score` (the (b1) form); A
+    // and B both score 0 and the strict inequality red-fails with
+    //   "tier 2 partial-match signal lost — workers indistinguishable".
+    // -----------------------------------------------------------------
+    #[test]
+    fn test_coverage_pct_distinguishes_partial_matches() {
+        const PER_FILE_WEIGHT: u64 = 100 * 1024;
+
+        let root = DigestInfo::new([0x11u8; 32], 100);
+        let child_a = DigestInfo::new([0x22u8; 32], 50);
+        let child_b = DigestInfo::new([0x33u8; 32], 50);
+        let child_c = DigestInfo::new([0x44u8; 32], 50);
+        let child_d = DigestInfo::new([0x55u8; 32], 50);
+
+        let mut dir_digests: HashSet<DigestInfo> = HashSet::new();
+        dir_digests.insert(root);
+        dir_digests.insert(child_a);
+        dir_digests.insert(child_b);
+        dir_digests.insert(child_c);
+        dir_digests.insert(child_d);
+
+        // Disjoint direct contributions: root 100k + 4×children = 900k
+        // root_subtree = 1_000_000 bytes, 100 files. Direct
+        // partitions: A=300k/30 files, B=200k/20, C=200k/20, D=200k/20.
+        let mut dir_direct_bytes: HashMap<DigestInfo, u64> = HashMap::new();
+        dir_direct_bytes.insert(root, 100_000);
+        dir_direct_bytes.insert(child_a, 300_000);
+        dir_direct_bytes.insert(child_b, 200_000);
+        dir_direct_bytes.insert(child_c, 200_000);
+        dir_direct_bytes.insert(child_d, 200_000);
+
+        let mut dir_direct_files: HashMap<DigestInfo, u64> = HashMap::new();
+        dir_direct_files.insert(root, 10);
+        dir_direct_files.insert(child_a, 30);
+        dir_direct_files.insert(child_b, 20);
+        dir_direct_files.insert(child_c, 20);
+        dir_direct_files.insert(child_d, 20);
+
+        let mut subtree_bytes: HashMap<DigestInfo, u64> = HashMap::new();
+        subtree_bytes.insert(root, 1_000_000);
+        let mut subtree_files: HashMap<DigestInfo, u64> = HashMap::new();
+        subtree_files.insert(root, 100);
+        let total_bytes = *subtree_bytes.get(&root).unwrap();
+        let total_files = *subtree_files.get(&root).unwrap();
+        let total_score = total_bytes + total_files * PER_FILE_WEIGHT;
+
+        // Worker A: caches child_a only (300k direct bytes = 30 %).
+        let mut worker_a_cached: HashSet<DigestInfo> = HashSet::new();
+        worker_a_cached.insert(child_a);
+
+        // Worker B: caches child_b + child_c + child_d (600k = 60 %
+        // of subtree bytes; >A but <root).
+        let mut worker_b_cached: HashSet<DigestInfo> = HashSet::new();
+        worker_b_cached.insert(child_b);
+        worker_b_cached.insert(child_c);
+        worker_b_cached.insert(child_d);
+
+        let (a_bytes, a_files) = compute_dedup_cached_score(
+            &dir_digests,
+            &worker_a_cached,
+            &dir_direct_bytes,
+            &dir_direct_files,
+        );
+        let a_score = a_bytes + a_files * PER_FILE_WEIGHT;
+        let a_pct = if total_score > 0 {
+            a_score * 100 / total_score
+        } else {
+            0
+        };
+
+        let (b_bytes, b_files) = compute_dedup_cached_score(
+            &dir_digests,
+            &worker_b_cached,
+            &dir_direct_bytes,
+            &dir_direct_files,
+        );
+        let b_score = b_bytes + b_files * PER_FILE_WEIGHT;
+        let b_pct = if total_score > 0 {
+            b_score * 100 / total_score
+        } else {
+            0
+        };
+
+        // Both partial-match workers must produce a non-zero score,
+        // otherwise tier 2 cannot distinguish them from a cache-cold
+        // worker.
+        assert!(
+            a_score > 0 && b_score > 0,
+            "tier 2 partial-match signal lost — workers indistinguishable \
+             (a_score={a_score}, b_score={b_score})"
+        );
+
+        // Worker B has strictly more cached than worker A.
+        assert!(
+            b_score > a_score && b_pct > a_pct,
+            "tier 2 partial-match ordering lost — A and B must be \
+             strictly ordered by cached volume \
+             (a_pct={a_pct}, b_pct={b_pct}, \
+              a_score={a_score}, b_score={b_score})"
+        );
+
+        // Both are bounded ≤100 %.
+        assert!(a_pct <= 100 && b_pct <= 100, "pcts in range");
     }
 
     #[test]
