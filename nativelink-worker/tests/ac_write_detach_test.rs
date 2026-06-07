@@ -53,7 +53,7 @@ use nativelink_util::action_messages::{
 use nativelink_util::common::{DigestInfo, encode_stream_proto};
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use tokio::sync::Notify;
-use utils::local_worker_test_utils::setup_local_worker;
+use utils::local_worker_test_utils::{setup_local_worker, setup_local_worker_with_ac_cap};
 use utils::mock_running_actions_manager::MockRunningAction;
 
 const INSTANCE_NAME: &str = "foo";
@@ -397,18 +397,23 @@ async fn cancel_during_detached_ac_write_suppresses() -> Result<(), Error> {
 /// error! level and does NOT poison the publish closure. The closure
 /// returned Ok before the spawn body ran; an AC-write failure must
 /// not propagate to the closure result. Seam: closure → spawn →
-/// cache_action_result Err → error! macro.
+/// cache_action_result Err → error! macro at `local_worker.rs:~2806`.
 ///
-/// Mutation: swap `error!` for `debug!` inside the spawn body at
-/// `local_worker.rs:~2810`. This test must red-fail with the bespoke
-/// "AC write error not logged at error! level" panic. (Depends on
-/// tracing_test capture filter being at error level by default.)
+/// Fix-up (2026-06-07): driven via
+/// `MockRunningActionsManager::set_cache_action_result_err` so the
+/// mock returns Err and the spawn body's actual `error!` site fires.
+/// The assertion checks both `logs_contain("Error saving action in
+/// store")` (the literal message string) AND
+/// `logs_contain("ac_write_action_digest")` (a field emitted only on
+/// the error! path) to bind the assertion to the real production log
+/// site rather than any incidental debug log.
 ///
-/// We use the gate to ensure the error log lands BEFORE we assert.
-/// Without the gate, the test would race the spawn's tokio scheduling.
+/// Mutation stamp 2026-06-07: swap `error!` → `debug!` at
+/// `local_worker.rs:~2806`. This test must red-fail with the bespoke
+/// "AC write Err did not log at error! level" panic.
 #[nativelink_test]
 async fn error_inside_detached_task_logs_at_error_level() -> Result<(), Error> {
-    use core::sync::atomic::Ordering;
+    use nativelink_error::{Code, make_err};
 
     tokio::time::timeout(Duration::from_secs(5), async {
         let mut test_context = setup_local_worker(HashMap::new()).await;
@@ -432,6 +437,15 @@ async fn error_inside_detached_task_logs_at_error_level() -> Result<(), Error> {
             .await
             .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
 
+        // Install a known Err BEFORE the publish closure spawns the
+        // AC-write task. The spawn body sees `cache_action_result`
+        // return Err and must hit the `error!` log site.
+        let injected_err = make_err!(Code::Internal, "T4 injected ac-write failure");
+        test_context
+            .actions_manager
+            .set_cache_action_result_err(Some(injected_err))
+            .await;
+
         let action_info = make_action_info(0x50);
         send_start_action(&tx_stream, &worker_id, &action_info, "o15-op-t4").await?;
         let running_action = Arc::new(MockRunningAction::new());
@@ -444,40 +458,177 @@ async fn error_inside_detached_task_logs_at_error_level() -> Result<(), Error> {
             .await?;
         test_context.client.expect_execution_response(Ok(())).await;
 
-        // expect_cache_action_result resolves when the mock's
-        // cache_action_result is called by the spawn body. The mock
-        // returns Ok — to drive the error path we'd need a different
-        // mock. Since MockRunningActionsManager always returns Ok,
-        // assert instead that the spawn body invoked
-        // cache_action_result (the closure successfully delegated to
-        // it, and the closure itself returned cleanly via the
-        // execution_response above). This combined with the
-        // "closure did not error out" path proves that even if the
-        // AC write WERE to error, the closure result is independent.
+        // Drain the recorded cache_action_result call so we know the
+        // spawn body ran and the Err propagated through the mock.
+        // The mock records the call BEFORE returning Err, so this
+        // resolves regardless of the injected error.
         let _ = test_context
             .actions_manager
             .expect_cache_action_result()
             .await;
-        // The spawn body ran without poisoning the closure.
-        assert!(
-            test_context.actions_manager.cache_action_result_invocations() >= 1,
-            "AC write error not logged at error! level (could not \
-             prove spawn body ran): spawn must invoke cache_action_result \
-             even on error paths so failures are visible"
-        );
 
-        // Sanity: the publish closure successfully returned Ok via
-        // execution_response, independent of the AC write result.
-        // No additional drain — the worker is idle.
-        let _ = Ordering::Acquire; // keep import live
+        // Poll for the required log fragments. All three must be
+        // present on the error! branch in local_worker.rs:~2806:
+        //   - "Error saving action in store" (message literal)
+        //   - "ac_write_action_digest" (field emitted only on err
+        //     branch)
+        //   - "ERROR" (level prefix from `tracing_test::traced_test`
+        //     formatter — `tracing_test` emits the level uppercase
+        //     in each captured line; mutating error! → debug! drops
+        //     this prefix to "DEBUG" and the assertion red-fails).
+        let mut attempts = 0;
+        loop {
+            let got_msg = logs_contain("Error saving action in store");
+            let got_field = logs_contain("ac_write_action_digest");
+            let got_level = logs_contain("ERROR");
+            if got_msg && got_field && got_level {
+                break;
+            }
+            attempts += 1;
+            if attempts > 300 {
+                panic!(
+                    "AC write Err did not log at error! level: T4 \
+                     closure-detach error-path contract violated — \
+                     expected (msg=\"Error saving action in store\", \
+                     field=\"ac_write_action_digest\", level=\"ERROR\") \
+                     within 3s after spawn body returned Err but got \
+                     (msg={got_msg}, field={got_field}, level={got_level}). \
+                     error! site at local_worker.rs:~2806 must fire on \
+                     cache_action_result Err with the \
+                     ac_write_action_digest field at error! level (NOT \
+                     debug!/warn!/info!/trace!)."
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         Ok::<_, Error>(())
     })
     .await
     .unwrap_or_else(|_| panic!(
-        "AC write error not logged at error! level: T4 closure-detach \
-         contract violated — spawn body at local_worker.rs:~2790-2820 \
-         must (a) call cache_action_result, (b) log Err at error! level, \
-         (c) not poison the publish closure result"
+        "AC write Err did not log at error! level: T4 closure-detach \
+         contract violated within 5s — spawn body at local_worker.rs:~2790-2820 \
+         must (a) call cache_action_result, (b) log Err at error! level \
+         with ac_write_action_digest field, (c) not poison the publish closure result"
+    ))?;
+    Ok(())
+}
+
+/// #O15 T5 fix-up (2026-06-07): cap-saturated path logs warn and
+/// skips the AC write synchronously. F1 over-cap behavior: when
+/// `try_acquire_owned` fails on the
+/// `AC_WRITE_DETACHED_INFLIGHT_CAP` semaphore, the publish closure
+/// must log
+/// `warn!(operation_id, "AC write detached-spawn cap reached; AC
+/// entry will be retried on next action ingress via cache-miss
+/// recovery")` AND skip the `tokio::spawn` entirely — graceful
+/// degradation, no closure-blocking acquire.
+///
+/// Forced saturation: `setup_local_worker_with_ac_cap(.., 0)`
+/// installs `Semaphore::new(0)`, so the first action's publish
+/// closure hits the over-cap branch on the very first attempt.
+///
+/// Mutation stamp 2026-06-07: remove the
+/// `Arc::clone(&self.ac_write_semaphore).try_acquire_owned()` guard
+/// at `local_worker.rs:~2780` (replace with unconditional spawn).
+/// This test must red-fail with the bespoke "cap-saturated path did
+/// not warn or did not skip the AC write" panic.
+#[nativelink_test]
+async fn cap_saturated_logs_warn_and_skips_ac_write() -> Result<(), Error> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // Force the cap to 0 so the very first detached AC write hits
+        // the over-cap branch.
+        let mut test_context = setup_local_worker_with_ac_cap(HashMap::new(), 0).await;
+        let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+        test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+
+        let worker_id = "o15_t5_worker".to_string();
+        let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+
+        let action_info = make_action_info(0x60);
+        send_start_action(&tx_stream, &worker_id, &action_info, "o15-op-t5").await?;
+        let running_action = Arc::new(MockRunningAction::new());
+        test_context
+            .actions_manager
+            .expect_create_and_add_action(Ok(running_action.clone()))
+            .await;
+        running_action
+            .simple_expect_get_finished_result(Ok(ActionResult::default()))
+            .await?;
+        test_context.client.expect_execution_response(Ok(())).await;
+
+        // Drive a SECOND action to synchronize: by the time
+        // expect_create_and_add_action for #2 returns, the worker has
+        // pulled the next Update::StartAction off the stream, which
+        // means #1's publish closure has already run its body
+        // (including the cap-saturation log + skip). #2 will also
+        // hit the over-cap branch, so its AC write should ALSO be
+        // skipped — which we use to confirm `cache_action_result`
+        // was never called.
+        let action_info2 = make_action_info(0x61);
+        send_start_action(&tx_stream, &worker_id, &action_info2, "o15-op-t5b").await?;
+        let running_action2 = Arc::new(MockRunningAction::new());
+        test_context
+            .actions_manager
+            .expect_create_and_add_action(Ok(running_action2.clone()))
+            .await;
+        running_action2
+            .simple_expect_get_finished_result(Ok(ActionResult::default()))
+            .await?;
+        test_context.client.expect_execution_response(Ok(())).await;
+
+        // Assertion 1: the over-cap warn fired.
+        let mut attempts = 0;
+        while !logs_contain("AC write detached-spawn cap reached") {
+            attempts += 1;
+            if attempts > 300 {
+                panic!(
+                    "cap-saturated path did not warn or did not skip the \
+                     AC write: T5 over-cap log absent within 3s — \
+                     publish closure at local_worker.rs:~2780 must call \
+                     `try_acquire_owned()` on the AC-write semaphore and \
+                     emit warn!(\"AC write detached-spawn cap reached; \
+                     AC entry will be retried on next action ingress via \
+                     cache-miss recovery\") when the cap is saturated."
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Assertion 2: cache_action_result was NEVER invoked because
+        // BOTH actions hit the over-cap skip. (cap=0 makes both #1
+        // and #2 fail try_acquire_owned.)
+        let invocations = test_context
+            .actions_manager
+            .cache_action_result_invocations();
+        assert_eq!(
+            invocations, 0,
+            "cap-saturated path did not warn or did not skip the AC write: \
+             invocations counter = {invocations}, expected 0 (cap=0 must \
+             skip ALL AC writes). publish closure must `return` after the \
+             warn! without spawning the AC-write task."
+        );
+        Ok::<_, Error>(())
+    })
+    .await
+    .unwrap_or_else(|_| panic!(
+        "cap-saturated path did not warn or did not skip the AC write: \
+         T5 over-cap contract violated within 5s — publish closure must \
+         `try_acquire_owned()` BEFORE spawn, log warn! on Err, and skip \
+         the AC write synchronously without blocking the closure."
     ))?;
     Ok(())
 }

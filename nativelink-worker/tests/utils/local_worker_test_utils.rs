@@ -388,10 +388,22 @@ pub(crate) fn setup_grpc_stream() -> (
 pub(crate) async fn setup_local_worker_with_config(
     local_worker_config: LocalWorkerConfig,
 ) -> TestContext {
+    setup_local_worker_with_config_and_ac_cap(local_worker_config, None).await
+}
+
+/// #O15 fix-up (2026-06-07): same as `setup_local_worker_with_config` but
+/// allows the caller to override the detached-AC-write semaphore cap before
+/// the worker is spawned. `None` keeps the production default. T5 passes
+/// `Some(0)` to force cap saturation on the first action.
+#[allow(dead_code, reason = "consumed by #O15 fix-up T5")]
+pub(crate) async fn setup_local_worker_with_config_and_ac_cap(
+    local_worker_config: LocalWorkerConfig,
+    ac_write_cap: Option<usize>,
+) -> TestContext {
     let mock_worker_api_client = MockWorkerApiClient::new();
     let mock_worker_api_client_clone = mock_worker_api_client.clone();
     let actions_manager = Arc::new(MockRunningActionsManager::new());
-    let worker = LocalWorker::new_with_connection_factory_and_actions_manager(
+    let mut worker = LocalWorker::new_with_connection_factory_and_actions_manager(
         Arc::new(local_worker_config),
         actions_manager.clone(),
         Box::new(move || {
@@ -403,6 +415,9 @@ pub(crate) async fn setup_local_worker_with_config(
         Vec::new(), // No CAS server guards in tests
         None, // No CAS shutdown signal in tests
     );
+    if let Some(cap) = ac_write_cap {
+        worker.set_ac_write_semaphore_for_test(cap);
+    }
     let (shutdown_tx_test, _) = broadcast::channel::<ShutdownGuard>(BROADCAST_CAPACITY);
 
     let drop_guard = spawn!("local_worker_spawn", async move {
@@ -434,6 +449,26 @@ pub(crate) async fn setup_local_worker(
         ..Default::default()
     };
     setup_local_worker_with_config(local_worker_config).await
+}
+
+/// #O15 fix-up (2026-06-07): convenience wrapper around
+/// `setup_local_worker_with_config_and_ac_cap` for tests that just need
+/// the cap override (T5).
+#[allow(dead_code, reason = "consumed by #O15 fix-up T5")]
+pub(crate) async fn setup_local_worker_with_ac_cap(
+    platform_properties: HashMap<String, WorkerProperty>,
+    ac_write_cap: usize,
+) -> TestContext {
+    const ARBITRARY_LARGE_TIMEOUT: f32 = 10000.;
+    let local_worker_config = LocalWorkerConfig {
+        platform_properties,
+        worker_api_endpoint: EndpointConfig {
+            timeout: Some(ARBITRARY_LARGE_TIMEOUT),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    setup_local_worker_with_config_and_ac_cap(local_worker_config, Some(ac_write_cap)).await
 }
 
 /// (#97) Same as [`setup_local_worker_with_config`] but plumbs through

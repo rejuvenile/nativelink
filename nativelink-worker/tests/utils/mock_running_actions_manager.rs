@@ -56,6 +56,10 @@ pub(crate) struct MockRunningActionsManager {
     // suppression tests to assert the spawn body returned early
     // without calling cache_action_result.
     cache_action_result_invocations: Arc<std::sync::atomic::AtomicU64>,
+    // #O15 fix-up (2026-06-07): when set, `cache_action_result` clones
+    // and returns this Err in lieu of Ok. Allows T4 to drive the
+    // error! log path inside the detached AC-write spawn body.
+    cache_action_result_err: Mutex<Option<Error>>,
 }
 
 impl Default for MockRunningActionsManager {
@@ -82,6 +86,7 @@ impl MockRunningActionsManager {
             metrics: Arc::new(Metrics::default()),
             cache_action_result_gate: Mutex::new(None),
             cache_action_result_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cache_action_result_err: Mutex::new(None),
         }
     }
 
@@ -105,6 +110,18 @@ impl MockRunningActionsManager {
     pub(crate) fn cache_action_result_invocations(&self) -> u64 {
         self.cache_action_result_invocations
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// #O15 fix-up (2026-06-07): install an Err that
+    /// `cache_action_result` will clone-and-return in lieu of Ok.
+    /// `None` reverts to Ok-by-default. Used by T4 to drive the
+    /// detached spawn body's `error!` path so the assertion on
+    /// `logs_contain("Error saving action in store")` exercises the
+    /// real production log site rather than the trivial-Ok branch.
+    #[allow(dead_code, reason = "consumed by #O15 fix-up T4")]
+    pub(crate) async fn set_cache_action_result_err(&self, err: Option<Error>) {
+        let mut slot = self.cache_action_result_err.lock().await;
+        *slot = err;
     }
 }
 
@@ -212,6 +229,12 @@ impl RunningActionsManager for MockRunningActionsManager {
                 digest_function,
             ))))
             .expect("Could not send request to mpsc");
+        // #O15 fix-up: if an Err was installed via
+        // set_cache_action_result_err, clone-return it so the spawn
+        // body hits its error! log path.
+        if let Some(err) = self.cache_action_result_err.lock().await.clone() {
+            return Err(err);
+        }
         Ok(())
     }
 

@@ -139,3 +139,9 @@ required-features = ["test-utils"]
 # feature gate as the other utils-using tests above.
 name = "blobs_available_chunked_handler_test"
 required-features = ["test-utils"]
+
+[[test]]
+# (#O15) Pulls in `tests/utils/local_worker_test_utils.rs`; gated
+# behind `test-utils` like the other utils-using tests above.
+name = "ac_write_detach_test"
+required-features = ["test-utils"]

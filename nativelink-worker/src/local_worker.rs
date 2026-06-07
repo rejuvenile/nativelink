@@ -779,6 +779,40 @@ pub const WORKER_API_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_ACTION_TIMEOUT: Duration = Duration::from_secs(1200); // 20 mins.
 const DEFAULT_MAX_UPLOAD_TIMEOUT: Duration = Duration::from_secs(600); // 10 mins.
 
+// CAPPED AT 256: per-worker limit on detached AC-write inflight tasks
+// spawned by the #O15 publish-closure detach. Justification: workers
+// run ~16 concurrent actions; 256 = 16 actions × 16x tail multiple,
+// bounded but not artificially tight. Protects against AC-store
+// stall × unbounded `tokio::spawn` accumulation; OOM-class regression
+// guard per the 2026-05-08 `in_flight_slow_writes` incident
+// (`.claude/audits/debacle-2026-05-08-rca/`). Over-cap behavior:
+// `Semaphore::try_acquire_owned` returns `Err`; the publish closure
+// logs `warn!(operation_id, "AC write detached-spawn cap reached; AC
+// entry will be retried on next action ingress via cache-miss
+// recovery")` and skips the AC write synchronously (graceful
+// degradation: better to lose 1 AC entry — Bazel re-executes — than
+// to wedge worker threads under AC-store stall). Falsification:
+// synthetic 1000-action burst with paused AC store must NOT OOM
+// within test budget. T5 `cap_saturated_logs_warn_and_skips_ac_write`
+// exercises the over-cap path.
+const AC_WRITE_DETACHED_INFLIGHT_CAP: usize = 256;
+
+/// #O15 (2026-06-07): RAII decrement of the detached-AC-write inflight
+/// gauge. Holds the semaphore permit for the spawn-body lifetime so the
+/// cap is honored even if the body panics. The `_permit` field releases
+/// the permit when the guard drops.
+struct AcWriteInflightGuard {
+    inflight_count: Arc<core::sync::atomic::AtomicI64>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for AcWriteInflightGuard {
+    fn drop(&mut self) {
+        self.inflight_count
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Couples the worker's AC `FastSlowStore` handle with its configured
 /// store-id name. The Some-iff-Some invariant — both fields are present
 /// only when the worker's AC store is wired as a `FastSlowStore` — is
@@ -1437,6 +1471,17 @@ struct LocalWorkerImpl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsM
     peer_locality_map: Option<SharedBlobLocalityMap>,
     /// Reference to the CAS server shutdown signal for graceful shutdown.
     cas_shutdown_tx: &'a Option<tokio::sync::watch::Sender<bool>>,
+    /// #O15 (2026-06-07): semaphore capping detached AC-write inflight
+    /// tasks. Cloned in from the outer `LocalWorker` so the cap persists
+    /// across scheduler reconnects (each reconnect rebuilds
+    /// `LocalWorkerImpl`). See `AC_WRITE_DETACHED_INFLIGHT_CAP`.
+    ac_write_semaphore: Arc<Semaphore>,
+    /// #O15 (2026-06-07): inflight gauge for detached AC writes. Cloned
+    /// from the outer `LocalWorker` (and surfaced via
+    /// `Metrics::ac_write_detached_inflight_count`). Incremented when a
+    /// permit is acquired; decremented when the spawn body exits (RAII
+    /// `InflightGuard`).
+    ac_write_detached_inflight_count: Arc<core::sync::atomic::AtomicI64>,
 }
 
 pub async fn preconditions_met<H: BuildHasher + Sync>(
@@ -1500,6 +1545,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         blobs_available_state: Option<BlobsAvailableState>,
         peer_locality_map: Option<SharedBlobLocalityMap>,
         cas_shutdown_tx: &'a Option<tokio::sync::watch::Sender<bool>>,
+        ac_write_semaphore: Arc<Semaphore>,
+        ac_write_detached_inflight_count: Arc<core::sync::atomic::AtomicI64>,
     ) -> Self {
         Self {
             config,
@@ -1515,6 +1562,8 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             blobs_available_state,
             peer_locality_map,
             cas_shutdown_tx,
+            ac_write_semaphore,
+            ac_write_detached_inflight_count,
         }
     }
 
@@ -2770,48 +2819,88 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             //    The check moves INSIDE the spawn so a
                                             //    kill arriving while the spawn is queued
                                             //    still suppresses the write.
-                                            let ac_write_action_digest = action_digest.clone();
-                                            let ac_write_running_actions_manager = running_actions_manager.clone();
-                                            let ac_write_worker_id = self.worker_id.clone();
-                                            let ac_write_action_for_publish = action_for_publish.clone();
-                                            tokio::spawn(async move {
-                                                // Re-check cancel INSIDE the spawn so a
-                                                // kill arriving between closure return
-                                                // and AC write still suppresses.
-                                                if ac_write_action_for_publish.is_cancelled() {
-                                                    nativelink_util::metrics::CANCEL
-                                                        .ac_writes_suppressed_due_to_cancel
-                                                        .add(1, &[]);
-                                                    warn!(
-                                                        operation_id = %ac_write_action_for_publish.get_operation_id(),
-                                                        "AC write suppressed: action was cancelled in residual window"
-                                                    );
-                                                    return;
+                                            //
+                                            //    Hoist the DigestInfo try_into OUTSIDE
+                                            //    the spawn so an early-None exit avoids
+                                            //    the spawn allocation entirely.
+                                            let ac_write_digest_info: Option<DigestInfo> =
+                                                action_digest.as_ref().and_then(|d| d.clone().try_into().ok());
+                                            if let Some(digest_info) = ac_write_digest_info {
+                                                // Non-blocking permit acquire: at-cap
+                                                // saturation must NOT block the publish
+                                                // closure (would defeat the whole
+                                                // detach). Closure returns synchronously
+                                                // on cap-reached; the AC entry is lost,
+                                                // Bazel re-executes on next miss.
+                                                match Arc::clone(&self.ac_write_semaphore).try_acquire_owned() {
+                                                    Ok(permit) => {
+                                                        let ac_write_action_digest = action_digest.clone();
+                                                        let ac_write_running_actions_manager = running_actions_manager.clone();
+                                                        let ac_write_worker_id = self.worker_id.clone();
+                                                        let ac_write_action_for_publish = action_for_publish.clone();
+                                                        let inflight_count = Arc::clone(&self.ac_write_detached_inflight_count);
+                                                        // Increment AT permit acquire;
+                                                        // decrement on spawn-body exit
+                                                        // via RAII guard. Holds the
+                                                        // permit alive for the whole
+                                                        // body so the cap is honored.
+                                                        inflight_count.fetch_add(
+                                                            1,
+                                                            core::sync::atomic::Ordering::AcqRel,
+                                                        );
+                                                        let guard = AcWriteInflightGuard {
+                                                            inflight_count: Arc::clone(&inflight_count),
+                                                            _permit: permit,
+                                                        };
+                                                        tokio::spawn(async move {
+                                                            let _guard = guard;
+                                                            // Re-check cancel INSIDE the
+                                                            // spawn so a kill arriving
+                                                            // between closure return and
+                                                            // AC write still suppresses.
+                                                            if ac_write_action_for_publish.is_cancelled() {
+                                                                nativelink_util::metrics::CANCEL
+                                                                    .ac_writes_suppressed_due_to_cancel
+                                                                    .add(1, &[]);
+                                                                warn!(
+                                                                    operation_id = %ac_write_action_for_publish.get_operation_id(),
+                                                                    "AC write suppressed: action was cancelled in residual window"
+                                                                );
+                                                                return;
+                                                            }
+                                                            // #37 Phase 2 (Q1): thread op_id + worker_id
+                                                            // to the AC publish path so the FSS-level
+                                                            // failure log carries action attribution.
+                                                            let op_id_for_publish = ac_write_action_for_publish.get_operation_id().clone();
+                                                            let started = std::time::Instant::now();
+                                                            if let Err(err) = ac_write_running_actions_manager.cache_action_result(
+                                                                digest_info,
+                                                                &mut action_result,
+                                                                digest_hasher,
+                                                                &op_id_for_publish,
+                                                                &ac_write_worker_id,
+                                                            ).await {
+                                                                error!(
+                                                                    ?err,
+                                                                    ac_write_action_digest = ?ac_write_action_digest,
+                                                                    op_id = %op_id_for_publish,
+                                                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                                                    "Error saving action in store",
+                                                                );
+                                                            }
+                                                        });
+                                                    }
+                                                    Err(_) => {
+                                                        // Cap saturated: AC-store stall
+                                                        // ×  burst. Skip synchronously;
+                                                        // closure must not block.
+                                                        warn!(
+                                                            operation_id = %action_for_publish.get_operation_id(),
+                                                            "AC write detached-spawn cap reached; AC entry will be retried on next action ingress via cache-miss recovery"
+                                                        );
+                                                    }
                                                 }
-                                                let Some(digest_info): Option<DigestInfo> = ac_write_action_digest.clone().and_then(|d| d.try_into().ok()) else {
-                                                    return;
-                                                };
-                                                // #37 Phase 2 (Q1): thread op_id + worker_id
-                                                // to the AC publish path so the FSS-level
-                                                // failure log carries action attribution.
-                                                let op_id_for_publish = ac_write_action_for_publish.get_operation_id().clone();
-                                                let started = std::time::Instant::now();
-                                                if let Err(err) = ac_write_running_actions_manager.cache_action_result(
-                                                    digest_info,
-                                                    &mut action_result,
-                                                    digest_hasher,
-                                                    &op_id_for_publish,
-                                                    &ac_write_worker_id,
-                                                ).await {
-                                                    error!(
-                                                        ?err,
-                                                        ?ac_write_action_digest,
-                                                        op_id = %op_id_for_publish,
-                                                        elapsed_ms = started.elapsed().as_millis() as u64,
-                                                        "Error saving action in store",
-                                                    );
-                                                }
-                                            });
+                                            }
                                             // #O15 (2026-06-07): probe marking publish-closure
                                             // body return. The parallel
                                             // `publish_closure_total_ms` timing wrapper
@@ -2998,6 +3087,15 @@ pub struct LocalWorker<T: WorkerApiClientTrait + 'static, U: RunningActionsManag
     /// Signals the worker CAS server to stop accepting connections during
     /// graceful shutdown. Sent `true` when the worker receives SIGTERM.
     cas_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// #O15 (2026-06-07): semaphore capping detached AC-write inflight
+    /// tasks at `AC_WRITE_DETACHED_INFLIGHT_CAP`. Lives on `LocalWorker`
+    /// (not `LocalWorkerImpl`) so the cap persists across scheduler
+    /// reconnects.
+    ac_write_semaphore: Arc<Semaphore>,
+    /// #O15 (2026-06-07): inflight gauge for detached AC writes. Same
+    /// `Arc<AtomicI64>` is registered into `Metrics` so scrapes see the
+    /// live count.
+    ac_write_detached_inflight_count: Arc<core::sync::atomic::AtomicI64>,
 }
 
 impl<
@@ -3832,9 +3930,13 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
         cas_server_guards: Vec<JoinHandleDropGuard<Result<(), Error>>>,
         cas_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Self {
-        let metrics = Arc::new(Metrics::new(Arc::downgrade(
-            running_actions_manager.metrics(),
-        )));
+        let ac_write_detached_inflight_count =
+            Arc::new(core::sync::atomic::AtomicI64::new(0));
+        let metrics = Arc::new(Metrics::new(
+            Arc::downgrade(running_actions_manager.metrics()),
+            Arc::clone(&ac_write_detached_inflight_count),
+        ));
+        let ac_write_semaphore = Arc::new(Semaphore::new(AC_WRITE_DETACHED_INFLIGHT_CAP));
         Self {
             config,
             running_actions_manager,
@@ -3845,7 +3947,19 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             peer_locality_map,
             _cas_server_guards: cas_server_guards,
             cas_shutdown_tx,
+            ac_write_semaphore,
+            ac_write_detached_inflight_count,
         }
+    }
+
+    /// #O15 fix-up (2026-06-07): test-only override of the detached-AC-
+    /// write semaphore cap. T5 (`cap_saturated_logs_warn_and_skips_ac_write`)
+    /// installs `cap=0` to force `try_acquire_owned` to fail and exercise
+    /// the over-cap log+skip path. Gated behind `test-utils` so production
+    /// callers can't accidentally pick the wrong cap.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_ac_write_semaphore_for_test(&mut self, cap: usize) {
+        self.ac_write_semaphore = Arc::new(Semaphore::new(cap));
     }
 
     #[allow(
@@ -3959,6 +4073,8 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
                         self.blobs_available_state.clone(),
                         self.peer_locality_map.clone(),
                         &self.cas_shutdown_tx,
+                        Arc::clone(&self.ac_write_semaphore),
+                        Arc::clone(&self.ac_write_detached_inflight_count),
                     ),
                     update_for_worker_stream,
                 ),
@@ -4021,18 +4137,30 @@ pub struct Metrics {
         reason = "TODO Fix this. Triggers on nightly"
     )]
     running_actions_manager_metrics: Weak<RunningActionManagerMetrics>,
+    /// #O15 (2026-06-07): live count of detached AC-write tasks the
+    /// publish closure has spawned that have not yet exited. Should
+    /// track the tail of AC-store update latency under load; pinning
+    /// near `AC_WRITE_DETACHED_INFLIGHT_CAP` indicates AC-store stall.
+    #[metric(
+        help = "Count of currently-in-flight detached AC writes spawned by O15; should track tail of AC-store update latency."
+    )]
+    ac_write_detached_inflight_count: Arc<core::sync::atomic::AtomicI64>,
 }
 
 impl RootMetricsComponent for Metrics {}
 
 impl Metrics {
-    fn new(running_actions_manager_metrics: Weak<RunningActionManagerMetrics>) -> Self {
+    fn new(
+        running_actions_manager_metrics: Weak<RunningActionManagerMetrics>,
+        ac_write_detached_inflight_count: Arc<core::sync::atomic::AtomicI64>,
+    ) -> Self {
         Self {
             start_actions_received: CounterWithTime::default(),
             disconnects_received: CounterWithTime::default(),
             keep_alives_received: CounterWithTime::default(),
             preconditions: AsyncCounterWrapper::default(),
             running_actions_manager_metrics,
+            ac_write_detached_inflight_count,
         }
     }
 }
