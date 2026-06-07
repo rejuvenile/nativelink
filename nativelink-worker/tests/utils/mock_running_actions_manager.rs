@@ -46,6 +46,16 @@ pub(crate) struct MockRunningActionsManager {
     rx_kill_operation: Mutex<mpsc::UnboundedReceiver<OperationId>>,
     tx_kill_operation: mpsc::UnboundedSender<OperationId>,
     metrics: Arc<Metrics>,
+
+    // #O15 (2026-06-07): when set, `cache_action_result` awaits this
+    // Notify BEFORE recording the call into `tx_call`. Allows tests to
+    // verify the publish closure returns BEFORE the AC write completes
+    // (closure-detach contract).
+    cache_action_result_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    // #O15: counter of cache_action_result invocations. Used by
+    // suppression tests to assert the spawn body returned early
+    // without calling cache_action_result.
+    cache_action_result_invocations: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for MockRunningActionsManager {
@@ -70,7 +80,31 @@ impl MockRunningActionsManager {
             rx_kill_operation: Mutex::new(rx_kill_operation),
             tx_kill_operation,
             metrics: Arc::new(Metrics::default()),
+            cache_action_result_gate: Mutex::new(None),
+            cache_action_result_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// #O15 (2026-06-07): install a `Notify` that `cache_action_result`
+    /// will await BEFORE recording its call into the call channel.
+    /// Triggering the Notify releases the AC write. Used by the
+    /// closure-detach contract test.
+    #[allow(dead_code, reason = "consumed by #O15 closure-detach test")]
+    pub(crate) async fn set_cache_action_result_gate(
+        &self,
+        gate: Arc<tokio::sync::Notify>,
+    ) {
+        let mut slot = self.cache_action_result_gate.lock().await;
+        *slot = Some(gate);
+    }
+
+    /// #O15 (2026-06-07): read the number of times `cache_action_result`
+    /// has been invoked (counted at the start of the call, BEFORE the
+    /// gate await). Cancel-suppression tests assert this stays 0.
+    #[allow(dead_code, reason = "consumed by #O15 closure-detach test")]
+    pub(crate) fn cache_action_result_invocations(&self) -> u64 {
+        self.cache_action_result_invocations
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -159,6 +193,18 @@ impl RunningActionsManager for MockRunningActionsManager {
         _op_id: &OperationId,
         _worker_id: &str,
     ) -> Result<(), Error> {
+        // #O15 (2026-06-07): count BEFORE the gate so cancel-suppression
+        // tests can distinguish "spawn body entered cache_action_result"
+        // from "spawn body returned early on cancel".
+        self.cache_action_result_invocations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        // #O15: if a gate is installed, await it. This lets the test
+        // observe that the publish closure has returned (e.g. a second
+        // action got accepted) BEFORE the AC write completes.
+        let gate = self.cache_action_result_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         self.tx_call
             .send(RunningActionManagerCalls::CacheActionResult(Box::new((
                 action_digest,
@@ -224,6 +270,13 @@ pub(crate) struct MockRunningAction {
 
     rx_resp: Mutex<mpsc::UnboundedReceiver<RunningActionReturns>>,
     tx_resp: mpsc::UnboundedSender<RunningActionReturns>,
+
+    // #O15 (2026-06-07): controllable cancel flag. The publish closure
+    // reads `is_cancelled()` INSIDE the spawned AC-write task; tests
+    // that exercise the cancel-during-AC-write contract toggle this
+    // and verify the spawn body returns early without calling
+    // cache_action_result.
+    cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl Default for MockRunningAction {
@@ -241,7 +294,19 @@ impl MockRunningAction {
             tx_call,
             rx_resp: Mutex::new(rx_resp),
             tx_resp,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// #O15 (2026-06-07): toggle the cancel flag. Mirrors the
+    /// Release-store side of
+    /// `RunningActionsManagerImpl::kill_operation` so the publish
+    /// closure's spawned AC-write task sees `is_cancelled() == true`
+    /// via Acquire load.
+    #[allow(dead_code, reason = "consumed by #O15 closure-detach test")]
+    pub(crate) fn set_cancelled(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) async fn simple_expect_get_finished_result(
@@ -371,6 +436,10 @@ impl RunningAction for MockRunningAction {
         // initialized once.
         static OPERATION_ID: std::sync::OnceLock<OperationId> = std::sync::OnceLock::new();
         OPERATION_ID.get_or_init(OperationId::default)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn prepare_action(self: Arc<Self>) -> Result<Arc<Self>, Error> {

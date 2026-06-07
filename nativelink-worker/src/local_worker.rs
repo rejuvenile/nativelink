@@ -2736,10 +2736,23 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             // 3. Free the worker for new actions.
                                             drop(grpc_client.execution_complete(complete).await);
 
-                                            // 4. AC write — needs &mut action_result so
-                                            //    runs after the tree expansion (which
-                                            //    borrows immutably) and after the
-                                            //    locality-critical sends.
+                                            // 4. CAS upload — fire-and-forget; peers can
+                                            //    already serve the blobs directly. Per v2
+                                            //    §A1.2: AC-only suppression — CAS upload
+                                            //    remains UNCONDITIONAL because CAS is
+                                            //    content-addressed and uploaded blobs
+                                            //    cannot poison. Reordered before Step 5
+                                            //    (#O15) so we can move `action_result`
+                                            //    into the detached AC-write task without
+                                            //    a redundant clone here.
+                                            running_actions_manager.spawn_upload_to_remote(&action_result);
+
+                                            // 5. AC write — detached into a background
+                                            //    task (#O15) so the closure returns as
+                                            //    soon as execution_complete + CAS
+                                            //    dispatch have fired. The closure's
+                                            //    wall-clock is no longer bounded by the
+                                            //    AC write tail.
                                             //
                                             //    AC-poisoning fix residual-window guard
                                             //    (composite invariant Phase D of base
@@ -2754,39 +2767,64 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             //    `.then(spawn(cleanup))` chain so
                                             //    cleanup removing the running_actions
                                             //    map entry cannot race with this read.
-                                            let cancelled = action_for_publish.is_cancelled();
-                                            if !cancelled {
-                                                if let Some(digest_info) = action_digest.clone().and_then(|action_digest| action_digest.try_into().ok()) {
-                                                    // #37 Phase 2 (Q1): thread op_id + worker_id
-                                                    // to the AC publish path so the FSS-level
-                                                    // failure log carries action attribution.
-                                                    let op_id_for_publish = action_for_publish.get_operation_id();
-                                                    if let Err(err) = running_actions_manager.cache_action_result(digest_info, &mut action_result, digest_hasher, &op_id_for_publish, &self.worker_id).await {
-                                                        error!(
-                                                            ?err,
-                                                            ?action_digest,
-                                                            "Error saving action in store",
-                                                        );
-                                                    }
+                                            //    The check moves INSIDE the spawn so a
+                                            //    kill arriving while the spawn is queued
+                                            //    still suppresses the write.
+                                            let ac_write_action_digest = action_digest.clone();
+                                            let ac_write_running_actions_manager = running_actions_manager.clone();
+                                            let ac_write_worker_id = self.worker_id.clone();
+                                            let ac_write_action_for_publish = action_for_publish.clone();
+                                            tokio::spawn(async move {
+                                                // Re-check cancel INSIDE the spawn so a
+                                                // kill arriving between closure return
+                                                // and AC write still suppresses.
+                                                if ac_write_action_for_publish.is_cancelled() {
+                                                    nativelink_util::metrics::CANCEL
+                                                        .ac_writes_suppressed_due_to_cancel
+                                                        .add(1, &[]);
+                                                    warn!(
+                                                        operation_id = %ac_write_action_for_publish.get_operation_id(),
+                                                        "AC write suppressed: action was cancelled in residual window"
+                                                    );
+                                                    return;
                                                 }
-                                            } else {
-                                                nativelink_util::metrics::CANCEL
-                                                    .ac_writes_suppressed_due_to_cancel
-                                                    .add(1, &[]);
-                                                warn!(
-                                                    operation_id = %action_for_publish.get_operation_id(),
-                                                    "AC write suppressed: action was cancelled in residual window"
-                                                );
-                                            }
-
-                                            // 5. Upload output blobs from local CAS to remote
-                                            //    CAS in the background. This is fire-and-forget;
-                                            //    peers can already serve the blobs directly.
-                                            //    Per v2 §A1.2: AC-only suppression — CAS
-                                            //    upload remains UNCONDITIONAL because
-                                            //    CAS is content-addressed and uploaded
-                                            //    blobs cannot poison.
-                                            running_actions_manager.spawn_upload_to_remote(&action_result);
+                                                let Some(digest_info): Option<DigestInfo> = ac_write_action_digest.clone().and_then(|d| d.try_into().ok()) else {
+                                                    return;
+                                                };
+                                                // #37 Phase 2 (Q1): thread op_id + worker_id
+                                                // to the AC publish path so the FSS-level
+                                                // failure log carries action attribution.
+                                                let op_id_for_publish = ac_write_action_for_publish.get_operation_id().clone();
+                                                let started = std::time::Instant::now();
+                                                if let Err(err) = ac_write_running_actions_manager.cache_action_result(
+                                                    digest_info,
+                                                    &mut action_result,
+                                                    digest_hasher,
+                                                    &op_id_for_publish,
+                                                    &ac_write_worker_id,
+                                                ).await {
+                                                    error!(
+                                                        ?err,
+                                                        ?ac_write_action_digest,
+                                                        op_id = %op_id_for_publish,
+                                                        elapsed_ms = started.elapsed().as_millis() as u64,
+                                                        "Error saving action in store",
+                                                    );
+                                                }
+                                            });
+                                            // #O15 (2026-06-07): probe marking publish-closure
+                                            // body return. The parallel
+                                            // `publish_closure_total_ms` timing wrapper
+                                            // emits at the same wall-clock point; this
+                                            // debug! gives the closure-detach contract
+                                            // test a stable hook to assert the closure
+                                            // returned within bounded time even when
+                                            // the AC write is artificially gated.
+                                            debug!(
+                                                tag = "publish_closure_returned",
+                                                operation_id = %action_for_publish.get_operation_id(),
+                                                "publish closure body returned; ac write detached"
+                                            );
                                         },
                                         Err(e) => {
                                             // Still notify completion on error so the worker
