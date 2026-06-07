@@ -48,7 +48,7 @@ use nativelink_util::store_trait::{
 use nativelink_util::streaming_blob::{
     SLIDING_WINDOW_EVICTION_MARKER, StreamingBlobInner, StreamingBlobWriter,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, trace, warn};
 
@@ -972,7 +972,7 @@ pub struct FastSlowStore {
     ///
     /// Lock acquisition order: `mirror_blobs` BEFORE `mirror_changes`. See
     /// the comment on `mirror_changes` for the deadlock rationale.
-    mirror_blobs: Mutex<HashMap<DigestInfo, (Bytes, Instant)>>,
+    mirror_blobs: RwLock<HashMap<DigestInfo, (Bytes, Instant)>>,
     /// Parallel `(store_id, digest)`-keyed index of dispatcher-pushed
     /// pins (task #168 item 5; partial Plan B5). The values carry no
     /// payload — the bytes still live in `mirror_blobs` keyed by
@@ -1035,6 +1035,20 @@ pub struct FastSlowStore {
     dispatched_mirror_pins: Mutex<BTreeMap<(Arc<str>, DigestInfo), ()>>,
     /// Total bytes currently held in `mirror_blobs`. Tracked separately to
     /// enforce `mirror_blobs_max_bytes` without iterating the map.
+    ///
+    /// **Atomic ordering (#54 RwLock conversion note):** all accesses use
+    /// `Ordering::Relaxed`. The counter is purely-observational and
+    /// monotonic-on-load semantics are not required:
+    /// - Cap-check load (`insert_mirror_blob`) happens INSIDE the
+    ///   `mirror_blobs.write()` guard, so the corresponding update under
+    ///   the same write guard already establishes a happens-before via
+    ///   the RwLock — no separate atomic fence is needed.
+    /// - Observability load (`mirror_blobs_used_bytes`) is reported to
+    ///   the server's mirror picker for capacity advertisement; brief
+    ///   staleness across the relaxed counter is acceptable and matches
+    ///   the existing pattern for other monotonic counters in this
+    ///   struct (e.g. `populate_spawn_count`,
+    ///   `mirror_blobs_cap_exceeded_total`).
     mirror_blobs_total_bytes: AtomicU64,
     /// Cap on aggregate mirror bytes; defaults to
     /// `DEFAULT_MIRROR_BLOBS_MAX_BYTES`. Mutable only via the
@@ -1369,7 +1383,7 @@ impl FastSlowStore {
             stable_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             failed_slow_writes,
-            mirror_blobs: Mutex::new(HashMap::new()),
+            mirror_blobs: RwLock::new(HashMap::new()),
             dispatched_mirror_pins: Mutex::new(BTreeMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
@@ -2235,7 +2249,7 @@ impl FastSlowStore {
     pub fn test_insert_mirror_blob_unchecked(&self, digest: DigestInfo, data: Bytes) {
         let now = Instant::now();
         let data_len = data.len() as u64;
-        let mut blobs = self.mirror_blobs.lock();
+        let mut blobs = self.mirror_blobs.write();
         if let Some((old, _)) = blobs.insert(digest, (data, now)) {
             let old_len = old.len() as u64;
             if data_len > old_len {
@@ -2259,6 +2273,16 @@ impl FastSlowStore {
     #[doc(hidden)]
     pub fn populate_spawn_count(&self) -> u64 {
         self.metrics.populate_spawn_count.load(Ordering::Acquire)
+    }
+
+    /// #34: cumulative count of `insert_mirror_blob` calls rejected
+    /// because the configured `mirror_blobs_max_bytes` cap would be
+    /// exceeded. Bumped exactly once per rejection. Public so tests and
+    /// operators can observe rate-of-change without scraping `/metrics`.
+    pub fn mirror_blobs_cap_exceeded_total(&self) -> u64 {
+        self.metrics
+            .mirror_blobs_cap_exceeded_total
+            .load(Ordering::Relaxed)
     }
 
     /// #325 (option D.1) diagnostic / test counter: every populator-caller
@@ -2866,7 +2890,7 @@ impl FastSlowStore {
             stable_notify: Arc::new(Notify::new()),
             shutting_down: AtomicBool::new(false),
             failed_slow_writes: shared,
-            mirror_blobs: Mutex::new(HashMap::new()),
+            mirror_blobs: RwLock::new(HashMap::new()),
             dispatched_mirror_pins: Mutex::new(BTreeMap::new()),
             mirror_blobs_total_bytes: AtomicU64::new(0),
             mirror_blobs_max_bytes: AtomicU64::new(DEFAULT_MIRROR_BLOBS_MAX_BYTES),
@@ -2986,7 +3010,7 @@ impl FastSlowStore {
         // a coherent view of pin map vs change tracker (no torn state where
         // a digest is removed from `mirror_blobs` but the `removed` delta has
         // not been recorded yet).
-        let mut blobs = self.mirror_blobs.lock();
+        let mut blobs = self.mirror_blobs.write();
         let mut changes = self.mirror_changes.lock();
         let mut freed = 0u64;
         let mut any_removed = false;
@@ -3044,7 +3068,7 @@ impl FastSlowStore {
 
     /// Current number of mirror blobs held in memory.
     pub fn mirror_blob_count(&self) -> usize {
-        self.mirror_blobs.lock().len()
+        self.mirror_blobs.read().len()
     }
 
     /// Current total bytes held in `mirror_blobs`. Used by
@@ -3082,7 +3106,7 @@ impl FastSlowStore {
     /// touching deltas.
     // O(N) under lock — N is bounded by `mirror_blobs_max_bytes / blob_size`.
     pub fn mirror_blob_digests(&self) -> Vec<DigestInfo> {
-        let guard = self.mirror_blobs.lock();
+        let guard = self.mirror_blobs.read();
         guard.keys().copied().collect()
     }
 
@@ -3111,7 +3135,7 @@ impl FastSlowStore {
         // order here would AB/BA-deadlock with concurrent inserters under
         // load (regression test:
         // `lock_ordering_no_deadlock_under_contention`).
-        let blobs_guard = self.mirror_blobs.lock();
+        let blobs_guard = self.mirror_blobs.read();
         let mut changes_guard = self.mirror_changes.lock();
         let drained = core::mem::take(&mut *changes_guard);
         let snapshot: Vec<DigestInfo> = blobs_guard.keys().copied().collect();
@@ -3167,11 +3191,17 @@ impl FastSlowStore {
         // Single critical section across blobs + change tracker so an
         // intervening drain/snapshot cannot split the bookkeeping for one
         // logical insert.
-        let mut blobs = self.mirror_blobs.lock();
+        let mut blobs = self.mirror_blobs.write();
         let current = self.mirror_blobs_total_bytes.load(Ordering::Relaxed);
         let cap = self.mirror_blobs_max_bytes.load(Ordering::Relaxed);
         if current + data_len > cap {
             drop(blobs);
+            // #34: observability — bump the cap-exceeded counter so
+            // operators can alert on the rate-of-change rather than
+            // grepping logs for the warn! below.
+            self.metrics
+                .mirror_blobs_cap_exceeded_total
+                .fetch_add(1, Ordering::Relaxed);
             // warn (not debug) — silent drops here mean the cap is being
             // exercised under real load; we want this in operator logs.
             warn!(
@@ -4264,7 +4294,7 @@ impl FastSlowStore {
         let digest = key.borrow().into_digest();
         let maybe_data = self
             .mirror_blobs
-            .lock()
+            .read()
             .get(&digest)
             .map(|(d, _)| d.clone());
         let Some(data) = maybe_data else {
@@ -4865,7 +4895,7 @@ impl StoreDriver for FastSlowStore {
             }
             {
                 let lock_start = Instant::now();
-                let mirror = self.mirror_blobs.lock();
+                let mirror = self.mirror_blobs.read();
                 let lock_acquire_ms = lock_start.elapsed().as_millis();
                 if lock_acquire_ms > 5 {
                     warn!(
@@ -4967,7 +4997,7 @@ impl StoreDriver for FastSlowStore {
         // Check mirror blobs for any still-missing digests.
         {
             let lock_start = Instant::now();
-            let mirror = self.mirror_blobs.lock();
+            let mirror = self.mirror_blobs.read();
             let lock_acquire_ms = lock_start.elapsed().as_millis();
             if lock_acquire_ms > 5 {
                 warn!(
@@ -6107,7 +6137,7 @@ impl StoreDriver for FastSlowStore {
             let digest = key.borrow().into_digest();
             let maybe_data = self
                 .mirror_blobs
-                .lock()
+                .read()
                 .get(&digest)
                 .map(|(d, _)| d.clone());
             if let Some(data) = maybe_data {
@@ -7459,6 +7489,17 @@ struct FastSlowStoreMetrics {
         help = "Count of streaming-buffer waiter (non-populator) readers that fell behind the sliding window and spliced into a fresh slow-store read"
     )]
     streaming_buffer_reader_fallback_to_direct_waiter_total: AtomicU64,
+    /// #34: number of `insert_mirror_blob` invocations rejected because
+    /// the configured `mirror_blobs_max_bytes` cap would be exceeded.
+    /// Bumped at the cap-exceeded early return; size-mismatch rejects do
+    /// NOT bump this counter (those are a separate invariant violation,
+    /// not a capacity signal). Per-process counter — operators alert on
+    /// rate-of-change > 0 to detect that the server is pushing mirror
+    /// blobs faster than the worker can acknowledge or evict.
+    #[metric(
+        help = "Count of insert_mirror_blob calls rejected because the mirror_blobs byte cap would be exceeded"
+    )]
+    mirror_blobs_cap_exceeded_total: AtomicU64,
 }
 
 impl Drop for FastSlowStore {

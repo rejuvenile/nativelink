@@ -673,3 +673,220 @@ async fn lock_ordering_no_deadlock_under_contention() {
         }
     }
 }
+
+// ============================================================================
+// #54 + #34: mirror_blobs Mutex → RwLock conversion + cap-exceeded counter.
+//
+// T1 (#54): concurrent readers of the `mirror_blobs` lock MUST NOT serialize.
+//           Spawn N parallel readers each calling `mirror_blob_count()` (which
+//           acquires the read guard) in a tight loop for a measurable
+//           duration. A `Mutex` serializes readers (total ≈ N × dur); an
+//           `RwLock.read()` allows parallelism (total ≈ dur).
+//
+// T2 (#34): when `insert_mirror_blob` returns `Code::ResourceExhausted`
+//           because the byte cap would be exceeded, the
+//           `mirror_blobs_cap_exceeded_total` counter MUST increment by 1.
+//           No bump on a successful insert.
+//
+// Mutation stamps (2026-06-07):
+// - T1: revert field type to `Mutex<...>` and the 8 call-site `.read()`
+//       / `.write()` back to `.lock()`. Total elapsed jumps from ≈
+//       per-reader to ≈ N × per-reader; assertion red-fails with
+//       "RwLock conversion broken — readers serialized".
+// - T2: comment out the `fetch_add(1, ...)` line in the cap-exceeded
+//       path of `insert_mirror_blob`. Counter stays 0; assertion
+//       red-fails with "cap-exceeded counter did not increment".
+// ============================================================================
+
+/// T1 (#54): concurrent readers of `mirror_blobs` MUST NOT block each
+/// other. Seeds a large map (50k entries) so each `mirror_blob_digests`
+/// call holds the read lock for a measurable duration (a few ms — long
+/// enough that 8× serialization is detectable). Spawns 8 parallel
+/// reader threads each performing `READS_PER_THREAD` iterations.
+///
+/// Speedup model:
+/// - With `parking_lot::Mutex.lock()`: each reader's call serializes;
+///   total wall ≈ N × single-thread time.
+/// - With `parking_lot::RwLock.read()`: readers run in parallel;
+///   total wall ≈ single-thread time × (1 / cores) plus jitter.
+///
+/// We measure single-thread baseline AFTER a warm-up of the same
+/// workload (red-team R1: cold-baseline-first inflates baseline_ms
+/// from page-faults / branch-predictor / cache-fill that the warm
+/// parallel run benefits from). Then 8-thread elapsed.
+///
+/// CI fragility guard (red-team R1): skip on hosts with ≤2 logical
+/// cores — `parallel * 2 < serial_estimate` can't be observed with
+/// insufficient parallelism (best case on 2 cores is 2× speedup, but
+/// reader-lock contention overhead on `parking_lot::RwLock`'s
+/// `read_count` atomic can eat that on contended hot paths).
+///
+/// Assert `parallel * 2 < serial_estimate` — loosened from `* 3` per
+/// R1: this proves "not fully serialized" without claiming any specific
+/// scaling factor. A fully serialized run is 8× the baseline; a
+/// parallel run on ≥4 cores is ≤4× the baseline; the 2× threshold sits
+/// safely between.
+///
+/// Production composition: real `FastSlowStore` via `new()`.
+/// Deadlock detector: `tokio::time::timeout(60s)` — generous because
+/// the 50k-entry snapshot is a few ms per call and the serialized
+/// variant takes several seconds.
+/// Bespoke red-fail message: "RwLock conversion broken — readers
+/// serialized".
+#[nativelink_test]
+async fn mirror_blobs_concurrent_readers_do_not_serialize() -> Result<(), Error> {
+    use core::time::Duration;
+    use std::time::Instant;
+
+    // R1: skip on ≤2 logical cores. With only 2 cores the best-case
+    // parallel speedup is 2× over single-threaded, but `RwLock.read()`
+    // contention on the read-counter atomic can close that gap to the
+    // point where `parallel * 2 < serial_estimate` fails on a non-broken
+    // RwLock. Test design cannot observe meaningful parallelism here.
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    if cores <= 2 {
+        eprintln!(
+            "skipping T1 (concurrent readers): {cores} logical cores < 3 \
+             required to observe parallelism above RwLock contention noise"
+        );
+        return Ok(());
+    }
+
+    let fss = make_fss();
+    // Seed 50k entries so each `mirror_blob_digests` call iterates &
+    // clones a large key set, making the lock hold-time measurable.
+    const SEED_ENTRIES: usize = 50_000;
+    for i in 0..SEED_ENTRIES {
+        let mut h = [0u8; 32];
+        h[0] = u8::try_from(i & 0xff).unwrap();
+        h[1] = u8::try_from((i >> 8) & 0xff).unwrap();
+        h[2] = u8::try_from((i >> 16) & 0xff).unwrap();
+        let digest = DigestInfo::new(h, 8);
+        fss.test_insert_mirror_blob_unchecked(digest, Bytes::from(vec![0u8; 8]));
+    }
+    assert_eq!(
+        fss.mirror_blob_count(),
+        SEED_ENTRIES,
+        "seed precondition: all {SEED_ENTRIES} entries must be in map"
+    );
+
+    const READER_COUNT: usize = 8;
+    const READS_PER_THREAD: usize = 20;
+
+    // R1: warm-up the workload BEFORE timing the baseline. Cold-first
+    // baseline inflates the serialized estimate from page-fault / cache
+    // / branch-predictor effects that the later parallel run avoids,
+    // giving a falsely-easy assertion (which still passes a broken
+    // implementation if the speedup is purely warm-up artifact).
+    const WARMUP_ITERS: usize = 5;
+    for _ in 0..WARMUP_ITERS {
+        let _ = fss.mirror_blob_digests();
+    }
+
+    // Baseline: single-threaded N reads (post-warmup).
+    let baseline_start = Instant::now();
+    for _ in 0..READS_PER_THREAD {
+        let _ = fss.mirror_blob_digests();
+    }
+    let baseline = baseline_start.elapsed();
+
+    // Concurrent: 8 threads × N reads each.
+    let parallel_start = Instant::now();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let mut handles = Vec::with_capacity(READER_COUNT);
+        for _ in 0..READER_COUNT {
+            let fss = fss.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                for _ in 0..READS_PER_THREAD {
+                    let _ = fss.mirror_blob_digests();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("reader task panicked");
+        }
+    })
+    .await
+    .expect("must not deadlock — mirror_blobs concurrent-readers test wedged");
+    let parallel = parallel_start.elapsed();
+
+    // Speedup: how much faster did 8 parallel readers (same total work
+    // each) complete vs the single-thread baseline doing N reads?
+    //
+    // - Serialized (Mutex): 8× as much work, serialized → ~8× slower
+    //   than baseline. Speedup ratio ≈ 0.125.
+    // - Parallel (RwLock): 8× as much work, parallel → similar wall
+    //   time. Speedup ratio ≈ 1.0 on an 8+-core host.
+    //
+    // R1: assert `parallel * 2 < serial_estimate` — loosened from `* 3`
+    // so the test only claims "not fully serialized", not any specific
+    // scaling factor. Robust against noisy hosts and the RwLock
+    // read-counter contention overhead.
+    let parallel_ms = parallel.as_millis();
+    let baseline_ms = baseline.as_millis();
+    let serial_estimate_ms =
+        baseline_ms * u128::try_from(READER_COUNT).unwrap();
+    assert!(
+        parallel_ms * 2 < serial_estimate_ms,
+        "RwLock conversion broken — readers serialized: \
+         baseline (1 thread, {READS_PER_THREAD} reads) = {baseline_ms}ms; \
+         parallel ({READER_COUNT} threads × {READS_PER_THREAD} reads) = \
+         {parallel_ms}ms; serial estimate (baseline × {READER_COUNT}) = \
+         {serial_estimate_ms}ms; cores = {cores}. Parallel must be < \
+         serial_estimate / 2 to prove readers run concurrently."
+    );
+    Ok(())
+}
+
+/// T2 (#34): when `insert_mirror_blob` rejects an entry because the
+/// byte cap would be exceeded, the `mirror_blobs_cap_exceeded_total`
+/// counter on the FSS metrics MUST increment by 1. Successful inserts
+/// MUST NOT bump it.
+///
+/// Production composition: real `FastSlowStore` via `new()`.
+/// Deadlock detector: `tokio::time::timeout(5s)`.
+/// Bespoke red-fail message: "cap-exceeded counter did not increment".
+#[nativelink_test]
+async fn mirror_blobs_cap_exceeded_increments_counter() -> Result<(), Error> {
+    use core::time::Duration;
+
+    let fss = make_fss();
+    // Cap at 16 bytes so a single 16-byte blob fits and a second
+    // 16-byte blob is rejected.
+    fss.set_mirror_blobs_max_bytes_for_test(16);
+
+    let d_ok = d(0x11, 16);
+    let d_reject = d(0x22, 16);
+
+    let count_before = fss.mirror_blobs_cap_exceeded_total();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // First insert fits: cap-exceeded counter MUST NOT bump.
+        fss.insert_dispatched_mirror_blob("cas", d_ok, Bytes::from(vec![0u8; 16]))
+            .expect("first insert must succeed within cap");
+
+        // Second insert exceeds: cap-exceeded counter MUST bump.
+        let err = fss
+            .insert_dispatched_mirror_blob("cas", d_reject, Bytes::from(vec![1u8; 16]))
+            .expect_err("second insert must return ResourceExhausted");
+        assert_eq!(
+            err.code,
+            Code::ResourceExhausted,
+            "cap-exceeded must return Code::ResourceExhausted; got {err:?}"
+        );
+    })
+    .await
+    .expect("must not deadlock — cap-exceeded test wedged");
+
+    let count_after = fss.mirror_blobs_cap_exceeded_total();
+    assert_eq!(
+        count_after,
+        count_before + 1,
+        "cap-exceeded counter did not increment: before={count_before}, \
+         after={count_after}; insert_mirror_blob's cap-exceeded path must \
+         bump `mirror_blobs_cap_exceeded_total` exactly once per rejection"
+    );
+    Ok(())
+}
