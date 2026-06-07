@@ -2695,6 +2695,22 @@ impl RunningActionImpl {
         Box::pin(async move {
         let operation_id = self.operation_id.clone();
         info!(%operation_id, "inner_prepare_action: entered");
+        // #36 Phase 6 §6 Phase 0 probe P-WORKER-FETCH-START: mark the
+        // wall-clock at which this action's input-fetch begins, in the
+        // same epoch-micros format as P-WORKER-BOUNDARY. Together the
+        // pair lets a log scan compute (worker, op_id_n, op_id_n+1) →
+        // boundary-to-fetch-start latency, which is the wall-clock Phase 6
+        // would hide. Observability only, no behaviour change.
+        let phase6_fetch_start_at_us = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        info!(
+            tag = "phase6_input_fetch_start",
+            op_id = %operation_id,
+            fetch_start_at_us = phase6_fetch_start_at_us,
+            "phase6 input fetch starting"
+        );
         {
             let mut state = self.state.lock();
             state.execution_metadata.input_fetch_start_timestamp =

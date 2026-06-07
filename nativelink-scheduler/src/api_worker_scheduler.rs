@@ -1234,6 +1234,24 @@ impl ApiWorkerSchedulerImpl {
                 action_info: action_info.clone(),
             },
         );
+        // #36 Phase 6 §6 Phase 0 probe P-SCHED-DISPATCH: mark the
+        // wall-clock at which the scheduler dispatches a StartAction to a
+        // worker. Paired with P-SCHED-COMPLETE-RECV; the gap = scheduler
+        // critical-section latency between previous-action-completion and
+        // next-action-dispatch. Per op_id, a log scan correlates
+        // op_id_n+1 here with op_id_n from the recv probe on the same
+        // worker. Observability only, no behaviour change.
+        let phase6_dispatch_at_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        info!(
+            tag = "phase6_scheduler_dispatch",
+            op_id_n_plus_1 = %operation_id,
+            worker_id = ?worker_id,
+            dispatch_at_us = phase6_dispatch_at_us,
+            "phase6 scheduler dispatching StartAction"
+        );
         Some((tx, msg))
     }
 

@@ -2220,3 +2220,112 @@ async fn bis_chunked_dispatch_arm_round_trips_ack() -> Result<(), Error> {
 
     Ok(())
 }
+
+// #36 Phase 6 §6 Phase 0 probe TB1: P-WORKER-BOUNDARY fires after the
+// worker's execution_response returns tonic-Ok for action N.
+//
+// The probe is wired at local_worker.rs in the publish closure, AFTER the
+// `grpc_client.execution_response(...).await` succeeds and BEFORE
+// `execution_complete`. So if the worker reaches the cache_action_result
+// step (which the harness awaits), the probe must have fired first.
+//
+// Mutation: remove the `info!(tag = "phase6_worker_action_boundary", ...)`
+// from local_worker.rs. This test must red-fail with the bespoke
+// "phase6 worker action boundary probe absent 2026-06-07" panic message.
+#[nativelink_test]
+async fn phase6_probe_p_worker_boundary_fires_on_tonic_ok() -> Result<(), Error> {
+    let mut test_context = setup_local_worker(HashMap::new()).await;
+    let streaming_response = test_context.maybe_streaming_response.take().unwrap();
+
+    {
+        let props = test_context
+            .client
+            .expect_connect_worker(Ok(streaming_response))
+            .await;
+        assert_default_connect_request(props);
+    }
+
+    let expected_worker_id = "phase6_boundary_worker".to_string();
+    let tx_stream = test_context.maybe_tx_stream.take().unwrap();
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::ConnectionResult(ConnectionResult {
+                        worker_id: expected_worker_id.clone(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let action_digest = DigestInfo::new([42u8; 32], 10);
+    let action_info = ActionInfo {
+        command_digest: DigestInfo::new([1u8; 32], 10),
+        input_root_digest: DigestInfo::new([2u8; 32], 10),
+        timeout: Duration::from_secs(1),
+        platform_properties: HashMap::new(),
+        priority: 0,
+        load_timestamp: SystemTime::UNIX_EPOCH,
+        insert_timestamp: SystemTime::UNIX_EPOCH,
+        unique_qualifier: ActionUniqueQualifier::Uncacheable(ActionUniqueKey {
+            instance_name: INSTANCE_NAME.to_string(),
+            digest_function: DigestHasherFunc::Sha256,
+            digest: action_digest,
+        }),
+    };
+
+    {
+        tx_stream
+            .send(Frame::data(
+                encode_stream_proto(&UpdateForWorker {
+                    update: Some(Update::StartAction(StartExecute {
+                        execute_request: Some((&action_info).into()),
+                        operation_id: "phase6-op-N".to_string(),
+                        queued_timestamp: None,
+                        platform: Some(Platform::default()),
+                        worker_id: expected_worker_id.clone(),
+                        resolved_directories: Vec::new(),
+                        resolved_directory_digests: Vec::new(),
+                        missing_digests: Vec::new(),
+                    })),
+                })
+                .unwrap(),
+            ))
+            .await
+            .map_err(|e| make_input_err!("Could not send : {:?}", e))?;
+    }
+
+    let running_action = Arc::new(MockRunningAction::new());
+    test_context
+        .actions_manager
+        .expect_create_and_add_action(Ok(running_action.clone()))
+        .await;
+    running_action
+        .simple_expect_get_finished_result(Ok(ActionResult::default()))
+        .await?;
+
+    // Drain the execution_response — this advances the worker past the
+    // probe site (the probe fires after this await returns Ok inside the
+    // publish closure). Once the worker is also past `execution_complete`,
+    // the structured log event is guaranteed to be in the captured buffer.
+    let _execution_response = test_context.client.expect_execution_response(Ok(())).await;
+
+    // `expect_cache_action_result` resolves only after the worker reaches
+    // step 4 in the publish closure — which is AFTER the boundary probe at
+    // line 2717. So the probe must already have logged by the time this
+    // await returns.
+    let (_stored_digest, _stored_result, _digest_hasher) = test_context
+        .actions_manager
+        .expect_cache_action_result()
+        .await;
+
+    assert!(
+        logs_contain("phase6_worker_action_boundary"),
+        "phase6 worker action boundary probe absent 2026-06-07"
+    );
+
+    Ok(())
+}

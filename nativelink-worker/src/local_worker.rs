@@ -2706,6 +2706,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             //    output digests as a redundant safety net
                                             //    (worker_api_server.rs:518).
                                             let action_stage = ActionStage::Completed(action_result.clone());
+                                            // #36 Phase 6 §6 Phase 0 probe P-WORKER-BOUNDARY:
+                                            // capture op_id_n BEFORE move into ExecuteResult so we
+                                            // can emit the action-boundary log AFTER the tonic-Ok
+                                            // await returns. This marks the wall-clock point at
+                                            // which Phase 6 would dispatch PreemptInputFetch(N+1).
+                                            // No behaviour change — observability only.
+                                            let phase6_op_id_n = operation_id.clone();
                                             grpc_client.execution_response(
                                                 ExecuteResult{
                                                     instance_name,
@@ -2715,6 +2722,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             )
                                             .await
                                             .err_tip(|| "Error while calling execution_response")?;
+                                            let phase6_tonic_ok_at_us = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_micros() as u64)
+                                                .unwrap_or(0);
+                                            info!(
+                                                tag = "phase6_worker_action_boundary",
+                                                op_id_n = %phase6_op_id_n,
+                                                tonic_ok_at_us = phase6_tonic_ok_at_us,
+                                                "phase6 worker action boundary (tonic-Ok returned for action N)"
+                                            );
 
                                             // 3. Free the worker for new actions.
                                             drop(grpc_client.execution_complete(complete).await);

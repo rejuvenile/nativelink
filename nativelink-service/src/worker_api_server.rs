@@ -1346,6 +1346,22 @@ impl WorkerConnection {
                     exit_code,
                     "action completed by worker"
                 );
+                // #36 Phase 6 §6 Phase 0 probe P-SCHED-COMPLETE-RECV: mark
+                // the wall-clock at which the scheduler receives action N's
+                // completion. Paired with P-SCHED-DISPATCH at
+                // prepare_worker_run_action; the gap = the server-leg
+                // component of the action-boundary latency Phase 6 would
+                // hide. Observability only, no behaviour change.
+                let phase6_recv_at_us = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_micros() as u64)
+                    .unwrap_or(0);
+                info!(
+                    tag = "phase6_scheduler_complete_recv",
+                    op_id_n = %operation_id,
+                    recv_at_us = phase6_recv_at_us,
+                    "phase6 scheduler received action-N completion"
+                );
                 self.scheduler
                     .update_action(
                         &self.worker_id,

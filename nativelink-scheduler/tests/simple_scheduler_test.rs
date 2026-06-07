@@ -4437,3 +4437,60 @@ async fn malformed_minimum_value_rejects_action() -> Result<(), Error> {
 
     Ok(())
 }
+
+// #36 Phase 6 §6 Phase 0 probe TB2: P-SCHED-DISPATCH fires when the
+// scheduler hands an action to a worker via prepare_worker_run_action.
+//
+// The probe is wired at api_worker_scheduler.rs near the `Some((tx, msg))`
+// return so it captures every successful dispatch. This test exercises
+// the public scheduler path: add worker → add action → do_try_match →
+// assert the probe's structured log fired.
+//
+// Mutation: remove the `info!(tag = "phase6_scheduler_dispatch", ...)` from
+// api_worker_scheduler.rs. This test must red-fail with the bespoke
+// "phase6 scheduler dispatch probe absent 2026-06-07" panic message.
+#[nativelink_test]
+async fn phase6_probe_p_sched_dispatch_fires_on_action_assignment() -> Result<(), Error> {
+    let worker_id = WorkerId("phase6_dispatch_worker".to_string());
+
+    let task_change_notify = Arc::new(Notify::new());
+    let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+        &SimpleSpec::default(),
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify.clone(),
+            MockInstantWrapped::default,
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+        None, // cas_store
+        None, // locality_map
+        None, // worker_tls_config
+    );
+    let action_digest = DigestInfo::new([7u8; 32], 256);
+
+    let mut rx_from_worker =
+        setup_new_worker(&scheduler, worker_id.clone(), PlatformProperties::default()).await?;
+    let insert_timestamp = make_system_time(1);
+    let _action_listener =
+        setup_action(&scheduler, action_digest, HashMap::new(), insert_timestamp)
+            .await
+            .unwrap();
+
+    // Drain the StartAction message to ensure dispatch actually happened.
+    // (The probe fires inside prepare_worker_run_action on the same path that
+    // produces this message — receiving it guarantees the probe code ran.)
+    let _msg_for_worker = rx_from_worker
+        .recv()
+        .await
+        .expect("worker must receive StartAction — Phase 6 dispatch probe is on this path");
+
+    assert!(
+        logs_contain("phase6_scheduler_dispatch"),
+        "phase6 scheduler dispatch probe absent 2026-06-07"
+    );
+
+    Ok(())
+}
