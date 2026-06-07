@@ -4839,15 +4839,39 @@ impl RunningActionsManagerImpl {
         // over every output folder's Tree decode. Lives on the worker
         // post-action publish critical path so latency is attributable
         // to this step when locality-hint emission lags.
+        //
+        // (#A4 2026-06-07) Decode all output_folders' Tree protos in
+        // parallel via `FuturesUnordered`. Disk reads + protobuf decodes
+        // are independent per folder, so the prior sequential loop
+        // walled N folders × per-folder latency on the publish path.
+        // Concurrency is bounded by `output_folders.len()` (an
+        // ActionResult-level bound; output trees are produced by the
+        // just-finished action and are typically O(1..10)). Decode
+        // failures are still logged-and-skipped (same semantics as the
+        // pre-fix loop) so a single corrupt tree does not fail the
+        // whole expansion.
         let expand_tree_start = Instant::now();
-        let mut file_digests = Vec::new();
         let folder_count = action_result.output_folders.len();
-        for folder in &action_result.output_folders {
-            let tree_digest = folder.tree_digest;
-            if tree_digest.size_bytes() == 0 {
-                continue;
-            }
-            match get_and_decode_digest::<ProtoTree>(fast_store, tree_digest.into()).await {
+        let decodes: FuturesUnordered<_> = action_result
+            .output_folders
+            .iter()
+            .filter(|folder| folder.tree_digest.size_bytes() > 0)
+            .map(|folder| {
+                let tree_digest = folder.tree_digest;
+                async move {
+                    let res = get_and_decode_digest::<ProtoTree>(
+                        fast_store,
+                        tree_digest.into(),
+                    )
+                    .await;
+                    (tree_digest, res)
+                }
+            })
+            .collect();
+        let results: Vec<_> = decodes.collect().await;
+        let mut file_digests = Vec::new();
+        for (tree_digest, res) in results {
+            match res {
                 Ok(tree) => {
                     let digests: Vec<DigestInfo> = tree
                         .children

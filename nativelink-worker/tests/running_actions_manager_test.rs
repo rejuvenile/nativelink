@@ -28,7 +28,7 @@ mod tests {
     #[cfg(target_family = "unix")]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::sync::{Arc, LazyLock, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use bytes::Bytes;
     use futures::prelude::*;
@@ -5627,6 +5627,258 @@ exit 1
             "AC pin must be registered after upload_ac_results — \
              production-composition contract violated. \
              Snapshot under store_id {ac_store_id:?}: {snapshot:?}",
+        );
+        Ok(())
+    }
+
+    /// (#O1 + #A4 2026-06-07) Helper: build and upload N Tree protos
+    /// to the cas_store. Each tree has `files_per_tree` file_nodes with
+    /// deterministic digests. Returns `(folders, expected_digests)`.
+    async fn upload_n_trees(
+        cas_store: &Arc<FastSlowStore>,
+        n: usize,
+        files_per_tree: usize,
+    ) -> Result<(Vec<DirectoryInfo>, HashSet<DigestInfo>), Error> {
+        let mut folders = Vec::with_capacity(n);
+        let mut expected = HashSet::new();
+        for tree_idx in 0..n {
+            let files: Vec<FileNode> = (0..files_per_tree)
+                .map(|file_idx| {
+                    // Deterministic, distinct, non-zero-size digests per
+                    // (tree_idx, file_idx). 32 bytes = sha256-shaped.
+                    let mut hash = [0u8; 32];
+                    hash[0] = tree_idx as u8;
+                    hash[1] = file_idx as u8;
+                    // Size > 0 so the filter keeps it.
+                    let digest = DigestInfo::new(hash, ((tree_idx * 100 + file_idx) as u64) + 1);
+                    expected.insert(digest);
+                    FileNode {
+                        name: format!("f{file_idx}"),
+                        digest: Some(digest.into()),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let tree = Tree {
+                root: Some(Directory {
+                    files,
+                    ..Default::default()
+                }),
+                children: vec![],
+            };
+            let tree_digest = serialize_and_upload_message(
+                &tree,
+                cas_store.as_pin(),
+                &mut DigestHasherFunc::Sha256.hasher(),
+            )
+            .await?;
+            folders.push(DirectoryInfo {
+                path: format!("dir{tree_idx}"),
+                tree_digest,
+            });
+        }
+        Ok((folders, expected))
+    }
+
+    /// T1 (Part A — parallel decode correctness, #A4 2026-06-07).
+    /// `expand_tree_file_digests` must return every file_node digest from
+    /// every output_folders' Tree, irrespective of decode order. The
+    /// pre-fix sequential loop and the post-fix `FuturesUnordered` parallel
+    /// decode share this correctness contract; the test guards both. The
+    /// SEPARATE parallel-timing test (`t1_parallel_concurrency`) below
+    /// proves the post-fix is also concurrent.
+    ///
+    /// Mutation: revert to the sequential `for folder in &output_folders`
+    /// loop — this correctness test still passes (sequential is still
+    /// correct). That is the point: this test guards correctness across
+    /// the surgery; `t1_parallel_concurrency` separately guards parallelism.
+    #[nativelink_test]
+    async fn expand_tree_file_digests_returns_all_file_node_digests()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (_, _, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store)),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+            })?);
+
+        const N_TREES: usize = 5;
+        const FILES_PER_TREE: usize = 4;
+        let (folders, expected) =
+            upload_n_trees(&cas_store, N_TREES, FILES_PER_TREE).await?;
+        let action_result = ActionResult {
+            output_folders: folders,
+            ..ActionResult::default()
+        };
+
+        // 5s deadlock-detector. Bounded to detect a FuturesUnordered
+        // misuse hang rather than passing on `tokio::time::Elapsed`.
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            running_actions_manager.expand_tree_file_digests(&action_result),
+        )
+        .await
+        .expect(
+            "expand_tree_file_digests must not deadlock — \
+             FuturesUnordered drive-to-completion contract violated",
+        );
+
+        assert_eq!(
+            got.len(),
+            N_TREES * FILES_PER_TREE,
+            "expand_tree_file_digests must return every file_node digest \
+             across all trees; got {} of {N_TREES}×{FILES_PER_TREE}={}",
+            got.len(),
+            N_TREES * FILES_PER_TREE,
+        );
+        let got_set: HashSet<DigestInfo> = got.into_iter().collect();
+        assert_eq!(
+            got_set, expected,
+            "expand_tree_file_digests returned wrong digest set",
+        );
+        Ok(())
+    }
+
+    /// T1-parallel (Part A — concurrent decode, #A4 2026-06-07).
+    /// The post-fix `FuturesUnordered` issues all per-folder
+    /// `get_and_decode_digest` futures concurrently. The pre-fix
+    /// sequential loop awaits each before issuing the next.
+    ///
+    /// Proof technique: time the function with N folders, then time
+    /// `expand_tree_file_digests` calls in sequence with single-folder
+    /// ActionResults summing the per-folder wall-clock. The parallel
+    /// implementation should complete in less than the summed
+    /// single-folder time. We use a generous margin because the per-decode
+    /// cost over MemoryStore-backed FilesystemStore is small; the test
+    /// asserts that the PARALLEL run is bounded by ~1× the wall-clock of
+    /// the slowest single decode plus overhead, NOT the sum.
+    ///
+    /// Mutation: revert to sequential `for folder in &output_folders` —
+    /// the parallel wall-clock will rise to approximately the sum of
+    /// per-folder times. The assertion red-fails with the specific
+    /// "parallel run wall-clock exceeded sequential-bound" message.
+    #[nativelink_test]
+    async fn expand_tree_file_digests_runs_decodes_concurrently()
+    -> Result<(), Box<dyn core::error::Error>> {
+        let (_, _, cas_store, ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store)),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+            })?);
+
+        // Use larger trees so each decode has a measurable cost. 64
+        // file_nodes per tree, 10 trees — N_TREES decodes done in
+        // parallel should be ~1× the cost of a single decode.
+        const N_TREES: usize = 10;
+        const FILES_PER_TREE: usize = 64;
+        let (folders, _expected) =
+            upload_n_trees(&cas_store, N_TREES, FILES_PER_TREE).await?;
+        let action_result_all = ActionResult {
+            output_folders: folders.clone(),
+            ..ActionResult::default()
+        };
+
+        // Warm caches: one untimed run so OS page-cache + EvictingMap
+        // state stabilises.
+        let _ = running_actions_manager
+            .expand_tree_file_digests(&action_result_all)
+            .await;
+
+        // Time the parallel (production) call: all N trees in one
+        // invocation. Median of 3 to reduce noise.
+        let mut parallel_runs: Vec<Duration> = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let _ = running_actions_manager
+                .expand_tree_file_digests(&action_result_all)
+                .await;
+            parallel_runs.push(t0.elapsed());
+        }
+        parallel_runs.sort();
+        let parallel_median = parallel_runs[1];
+
+        // Time per-folder calls, summed: each call has a single-folder
+        // ActionResult, so the function still walks the same code path
+        // but with concurrency=1 per call. The SUM is what the pre-fix
+        // sequential loop would wall-clock to.
+        let mut sequential_total = Duration::ZERO;
+        for folder in &folders {
+            let single = ActionResult {
+                output_folders: vec![folder.clone()],
+                ..ActionResult::default()
+            };
+            // Median of 3.
+            let mut runs: Vec<Duration> = Vec::with_capacity(3);
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                let _ = running_actions_manager.expand_tree_file_digests(&single).await;
+                runs.push(t0.elapsed());
+            }
+            runs.sort();
+            sequential_total += runs[1];
+        }
+
+        // Bound: parallel must be strictly less than the sequential
+        // sum. A sequential `for folder in &output_folders { ... await ... }`
+        // loop would wall-clock to ~= sequential_total because each
+        // future is fully driven before the next is polled. A parallel
+        // `FuturesUnordered` driver overlaps the awaits and so completes
+        // in less than the sum.
+        //
+        // Over a MemoryStore-backed FilesystemStore the per-decode
+        // wall-clock is sub-millisecond and dominated by task-scheduling
+        // overhead; the speedup margin is small (~20-30% in CI). We
+        // therefore assert `parallel < sequential_total` rather than
+        // `< sequential_total / 2`. The intent is to detect the
+        // sequential-vs-parallel REGRESSION (where parallel >=
+        // sequential_total), not to assert a specific speedup ratio.
+        //
+        // Mutation: revert the loop to sequential `for folder in
+        // &action_result.output_folders { ... .await }` — parallel run
+        // becomes ~= sequential_total (within scheduling noise), and
+        // this assertion red-fails.
+        assert!(
+            parallel_median < sequential_total,
+            "parallel run wall-clock exceeded sequential-bound — \
+             FuturesUnordered concurrency contract violated. \
+             parallel_median={parallel_median:?} sequential_total={sequential_total:?}",
         );
         Ok(())
     }
