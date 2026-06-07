@@ -2894,6 +2894,9 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                         // Cap saturated: AC-store stall
                                                         // ×  burst. Skip synchronously;
                                                         // closure must not block.
+                                                        nativelink_util::metrics::CANCEL
+                                                            .ac_writes_dropped_due_to_cap
+                                                            .add(1, &[]);
                                                         warn!(
                                                             operation_id = %action_for_publish.get_operation_id(),
                                                             "AC write detached-spawn cap reached; AC entry will be retried on next action ingress via cache-miss recovery"

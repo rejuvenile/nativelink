@@ -656,6 +656,12 @@ pub static CANCEL: LazyLock<CancelMetrics> = LazyLock::new(|| {
                 "Cancel arrived but the operation was not present in any worker's running_action_infos (already-finished, never-started, OR routing-bug failed lookup — distinguish via paired observation of execute timing)",
             )
             .build(),
+        ac_writes_dropped_due_to_cap: meter
+            .u64_counter("execution.cancel.ac_writes_dropped_due_to_cap")
+            .with_description(
+                "AC writes skipped because the O15 detached-spawn Semaphore cap (AC_WRITE_DETACHED_INFLIGHT_CAP=256) was saturated. Operators alarm on non-zero rate during active builds — indicates AC-store stall × burst; recovery is via Bazel cache-miss re-execute on subsequent build.",
+            )
+            .build(),
     }
 });
 
@@ -679,6 +685,14 @@ pub struct CancelMetrics {
     /// active builds, then triage via `cancel_routing_e2e_test` and
     /// the ac_writes_suppressed counter.
     pub no_target_worker: metrics::Counter<u64>,
+    /// AC writes skipped because the O15 detached-spawn Semaphore cap
+    /// (`AC_WRITE_DETACHED_INFLIGHT_CAP` = 256) was saturated. The
+    /// closure logs a warn and continues; the AC entry is recoverable
+    /// via Bazel cache-miss re-execute on the next build referencing
+    /// that action. Operators alarm on non-zero rate during active
+    /// builds — indicates the worker is shedding AC writes under
+    /// AC-store stall × burst load.
+    pub ac_writes_dropped_due_to_cap: metrics::Counter<u64>,
 }
 
 /// Helper function to create attributes for execution metrics
