@@ -3424,6 +3424,11 @@ impl RunningActionImpl {
         };
 
         let digest_uploaders = Arc::new(Mutex::new(HashMap::new()));
+        // #O3/O13: Reference to the manager so the Tree-proto write sites
+        // below can populate the manager's `tree_proto_cache`, letting
+        // `expand_tree_file_digests` / `spawn_upload_to_remote` skip the
+        // storage-layer re-read of the same Tree proto.
+        let manager = &*self.running_actions_manager;
         for entry in output_paths {
             let full_path = OsString::from(if command_proto.working_directory.is_empty() {
                 format!("{}/{}", self.work_directory, entry)
@@ -3497,6 +3502,11 @@ impl RunningActionImpl {
                             )
                             .await
                             .err_tip(|| format!("While processing {entry}"))?;
+                            // #O3/O13: cache the just-written Tree so the
+                            // publish-side readers can skip the storage
+                            // re-decode. Move `tree` in — neither this
+                            // closure nor `DirectoryInfo` needs it again.
+                            manager.cache_tree_proto(tree_digest, tree);
                             Ok(DirectoryInfo {
                                 path: entry,
                                 tree_digest,
@@ -3544,6 +3554,10 @@ impl RunningActionImpl {
                                             )
                                             .await
                                             .err_tip(|| format!("While processing {entry}"))?;
+                                            // #O3/O13: cache the just-written
+                                            // Tree (symlinked-dir variant)
+                                            // for the publish-side readers.
+                                            manager.cache_tree_proto(tree_digest, tree);
                                             Ok(DirectoryInfo {
                                                 path: entry,
                                                 tree_digest,
@@ -4740,7 +4754,34 @@ pub struct RunningActionsManagerImpl {
     /// Optional directory cache for improving performance by caching reconstructed
     /// input directories and using hardlinks.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    /// Cache of Tree protos just written by `inner_upload_results` so the
+    /// `expand_tree_file_digests` + `spawn_upload_to_remote` paths can read
+    /// them from memory instead of going back through the storage layer
+    /// (FilesystemStore decode + read). Populated immediately after the
+    /// `serialize_and_upload_message` write; consumed by both readers via
+    /// `take_cached_tree_proto` which removes the entry on read so the map
+    /// self-drains. A cache miss is a correctness-safe fallback: the readers
+    /// re-read from CAS via `get_and_decode_digest` as before.
+    ///
+    /// CAPPED AT TREE_PROTO_CACHE_MAX_ENTRIES: bounded by the number of
+    /// concurrent in-flight action `output_folders` on this worker.
+    /// `output_folders` per action is typically 0-10 (Bazel `output_paths`
+    /// hint); concurrent actions per worker bounded by scheduler-side
+    /// concurrency. Insert-side over-cap behavior: drop the new entry
+    /// silently (read side falls back to CAS re-decode). Self-draining via
+    /// `take` semantics in the readers means steady-state size is the size
+    /// of one in-flight publish path, not cumulative.
+    tree_proto_cache: Mutex<HashMap<DigestInfo, ProtoTree>>,
 }
+
+/// Hard cap on the number of Tree protos held in `tree_proto_cache` at any
+/// instant. 1024 entries × typical Tree-proto size (a few KiB per output
+/// directory) bounds the cache at single-digit MiB worst-case. Reached only
+/// if every in-flight action emits hundreds of output directories AND none
+/// of the readers drain them — readers drain on every read, so steady-state
+/// is far below the cap. Over-cap insert drops the new entry (read falls
+/// back to CAS).
+const TREE_PROTO_CACHE_MAX_ENTRIES: usize = 1024;
 
 impl RunningActionsManagerImpl {
     /// Maximum time to wait for a cleanup operation to complete before timing out.
@@ -4804,6 +4845,7 @@ impl RunningActionsManagerImpl {
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
+            tree_proto_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -4815,6 +4857,40 @@ impl RunningActionsManagerImpl {
                 sleep_fn: |duration| Box::pin(tokio::time::sleep(duration)),
             },
         )
+    }
+
+    /// Cache a Tree proto just written to CAS so the post-upload readers
+    /// (`expand_tree_file_digests`, `spawn_upload_to_remote`) can skip
+    /// the storage-layer round trip. Bounded by `TREE_PROTO_CACHE_MAX_ENTRIES`;
+    /// over-cap inserts drop the entry (read-side fallback re-decodes from
+    /// CAS, preserving correctness).
+    #[doc(hidden)]
+    pub fn cache_tree_proto(&self, digest: DigestInfo, tree: ProtoTree) {
+        let mut cache = self.tree_proto_cache.lock();
+        if cache.len() >= TREE_PROTO_CACHE_MAX_ENTRIES {
+            return;
+        }
+        cache.insert(digest, tree);
+    }
+
+    /// Clone a previously-cached Tree proto from the cache without removing
+    /// it. Used by `expand_tree_file_digests`, which runs before
+    /// `spawn_upload_to_remote` on the same action and so must leave the
+    /// entry for the second reader. Returns `None` on miss; callers MUST
+    /// fall back to `get_and_decode_digest` to preserve correctness.
+    #[doc(hidden)]
+    pub fn peek_cached_tree_proto(&self, digest: &DigestInfo) -> Option<ProtoTree> {
+        self.tree_proto_cache.lock().get(digest).cloned()
+    }
+
+    /// Take a previously-cached Tree proto from the cache, removing the
+    /// entry so the cache self-drains after the last reader. Used by
+    /// `spawn_upload_to_remote`, which is the second / final reader.
+    /// Returns `None` on miss; callers MUST fall back to
+    /// `get_and_decode_digest` to preserve correctness.
+    #[doc(hidden)]
+    pub fn take_cached_tree_proto(&self, digest: &DigestInfo) -> Option<ProtoTree> {
+        self.tree_proto_cache.lock().remove(digest)
     }
 
     /// Expand Tree protos from output folders and return the contained file
@@ -4852,18 +4928,25 @@ impl RunningActionsManagerImpl {
         // whole expansion.
         let expand_tree_start = Instant::now();
         let folder_count = action_result.output_folders.len();
+        // #O3/O13 × #A4: prefer the in-memory cache populated by
+        // `inner_upload_results` for each folder; cache hits short-circuit
+        // the storage read entirely (no future spawned). Cache misses
+        // become async decodes that run concurrently via
+        // `FuturesUnordered`. Both paths produce `(tree_digest, Result)`
+        // tuples so the post-loop match handles them uniformly.
         let decodes: FuturesUnordered<_> = action_result
             .output_folders
             .iter()
             .filter(|folder| folder.tree_digest.size_bytes() > 0)
             .map(|folder| {
                 let tree_digest = folder.tree_digest;
+                let cached = self.peek_cached_tree_proto(&tree_digest);
                 async move {
-                    let res = get_and_decode_digest::<ProtoTree>(
-                        fast_store,
-                        tree_digest.into(),
-                    )
-                    .await;
+                    let res: Result<ProtoTree, Error> = if let Some(tree) = cached {
+                        Ok(tree)
+                    } else {
+                        get_and_decode_digest::<ProtoTree>(fast_store, tree_digest.into()).await
+                    };
                     (tree_digest, res)
                 }
             })
@@ -5017,6 +5100,10 @@ impl RunningActionsManagerImpl {
         );
 
         let cas_store = self.cas_store.clone();
+        // #O3/O13: capture the manager so the in-task Tree-decode loop can
+        // consume (and drain) Tree protos cached by `inner_upload_results`
+        // instead of re-decoding them through the storage layer.
+        let manager = Arc::clone(self);
         tokio::spawn(async move {
             let slow_store = cas_store.slow_store();
             let start = std::time::Instant::now();
@@ -5073,7 +5160,15 @@ impl RunningActionsManagerImpl {
             // fast_store directly would silently lose the tree if the
             // pin race fired between completion and this task.
             for tree_digest in &tree_digests {
-                let tree_result = if let Some(data) = preread_data.get(tree_digest) {
+                // #O3/O13: prefer the in-memory cache populated by
+                // `inner_upload_results`. `take_cached_tree_proto` drains
+                // the entry — this is the last Tree reader on the publish
+                // path, so the cache self-drains. Cache miss falls back
+                // to pre-read data, then to a storage-layer re-decode
+                // (correctness-safe).
+                let tree_result = if let Some(tree) = manager.take_cached_tree_proto(tree_digest) {
+                    Ok(tree)
+                } else if let Some(data) = preread_data.get(tree_digest) {
                     ProtoTree::decode(data.clone())
                         .map_err(|e| make_err!(Code::Internal, "Failed to decode Tree proto: {e}"))
                 } else {
