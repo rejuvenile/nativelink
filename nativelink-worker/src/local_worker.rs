@@ -968,10 +968,23 @@ pub(crate) fn apply_periodic_tick_memo_resets(
 /// of the bandwidth savings to bound divergence at ≤6 s.
 ///
 /// Composite invariant (updated): the worker's `last_sent_ac_pin_set`
-/// reflects the server's `ac_pin_registry` set for this endpoint
-/// within ≤60 tick intervals (≤6 seconds), even when the server
-/// mutates the set out-of-band via AcProxy NotFound-eviction, BIS-ack
-/// sweep, or cap-truncation.
+/// re-converges with the server's `ac_pin_registry` set within ≤60
+/// tick intervals (≤6 seconds) for drain paths that an idempotent
+/// re-PUT actually heals:
+///   - BIS-ack sweep (`remove_digests_for_endpoint_in_store`): the
+///     heartbeat's full snapshot re-inserts the swept digests →
+///     converges within ≤6 s.
+///   - AcProxy NotFound peer-fetch (`ac_proxy_store.rs:367`): the
+///     re-send re-asserts the worker's intent; whether the server
+///     re-accepts depends on the peer-fetch retry path, NOT on the
+///     heartbeat alone. Bounded observability cadence, not convergence.
+///   - Cap-truncation at `worker_api_server.rs:1567` (over
+///     `DEFAULT_MAX_AC_PINS_PER_ENDPOINT`): the heartbeat re-sends an
+///     identical (or larger) snapshot; the server applies the SAME
+///     deterministic truncation, dropping the same N entries. The
+///     heartbeat does NOT converge this class — over-cap divergence
+///     persists until the worker's local AC pin set drops below the
+///     cap OR a separate over-cap design ships (tracked as #81).
 ///
 /// `pub(crate)` so the heartbeat coverage test (T7) can assert the
 /// value at the declaration site without re-deriving the cadence.
