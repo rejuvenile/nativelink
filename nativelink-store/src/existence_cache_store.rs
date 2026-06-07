@@ -15,7 +15,7 @@
 use core::pin::Pin;
 use std::borrow::Cow;
 use std::sync::{Arc, Weak};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -415,10 +415,17 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         // have fired yet). Trusting the cache here would skip the upload,
         // causing Bazel's "Lost inputs no longer available remotely" error.
         let mut exists = [None];
+        // (Probe #6) Wall-clock for the bypass-cache inner has-check.
+        // Surfaces in the existing slow-log paths below so we can
+        // separate inner-has latency from inner-update latency when
+        // the update step shows up as slow.
+        let inner_has_start = Instant::now();
         self.inner_store
             .has_with_results(&[digest.into()], &mut exists)
             .await
             .err_tip(|| "In ExistenceCacheStore::update")?;
+        let existence_cache_inner_has_elapsed_us =
+            inner_has_start.elapsed().as_micros() as u64;
         if exists[0].is_some() {
             // Blob genuinely exists in the inner store — safe to skip.
             reader
@@ -507,6 +514,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             error!(
                 ?digest,
                 elapsed_ms,
+                existence_cache_inner_has_elapsed_us,
                 ?err,
                 "ExistenceCacheStore::update: inner store write failed",
             );
@@ -514,6 +522,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             info!(
                 ?digest,
                 elapsed_ms,
+                existence_cache_inner_has_elapsed_us,
                 "ExistenceCacheStore::update: inner store write slow",
             );
         }

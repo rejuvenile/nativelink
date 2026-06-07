@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::process::Stdio;
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use futures::future::{BoxFuture, OptionFuture};
 use futures::stream::FuturesUnordered;
@@ -873,6 +874,47 @@ impl SlowTierMetricSink for WorkerSlowTierMetricSink {
     }
 }
 
+/// Counts how many AC-pin digests have been added (in `current` but not
+/// `last`) and removed (in `last` but not `current`). Pure function so
+/// unit tests can exercise the delta primitive without spinning up the
+/// full `send_periodic_blobs_available` machinery. Used by
+/// [`should_skip_blobs_available_tick`].
+#[inline]
+fn compute_ac_pin_delta_counts(
+    current: &HashSet<DigestInfo>,
+    last: &HashSet<DigestInfo>,
+) -> (usize, usize) {
+    let added = current.difference(last).count();
+    let removed = last.difference(current).count();
+    (added, removed)
+}
+
+/// (A1 fix) The pre-fix gate predicate read `pinned_ac_mirror_count == 0`,
+/// which failed permanently once steady-state AC pins existed →
+/// re-broadcast of an unchanged snapshot every 100 ms. The new
+/// predicate keys on the delta vs the last-sent set.
+///
+/// Returns `true` iff `send_periodic_blobs_available` should skip
+/// emitting this tick. Reconnect (`is_first=true`) ALWAYS sends.
+#[inline]
+fn should_skip_blobs_available_tick(
+    is_first: bool,
+    new_or_touched_count: usize,
+    evicted_count: usize,
+    added_subtree_count: usize,
+    removed_subtree_count: usize,
+    pinned_mirror_count: usize,
+    ac_pin_delta_empty: bool,
+) -> bool {
+    !is_first
+        && new_or_touched_count == 0
+        && evicted_count == 0
+        && added_subtree_count == 0
+        && removed_subtree_count == 0
+        && pinned_mirror_count == 0
+        && ac_pin_delta_empty
+}
+
 /// Holds the FilesystemStore reference and change tracker needed for
 /// BlobsAvailable reporting with drain-then-fire semantics.
 #[derive(Clone, Debug)]
@@ -912,6 +954,22 @@ pub struct BlobsAvailableState {
     /// `worker_instance_token` makes this safe — the server's
     /// accumulator keys on `(broadcast_id, worker_instance_token)`).
     next_broadcast_id: Arc<AtomicU64>,
+    /// (A1 fix) Last AC-pin set we successfully advertised to the
+    /// server. `send_periodic_blobs_available` compares the current
+    /// `dispatched_ac_pin_snapshot_for_store` result against this
+    /// set; if added+removed are both empty (and no other deltas
+    /// fired) the tick is suppressed. Cleared on `is_first=true`
+    /// (reconnect) so the next tick re-sends the full snapshot.
+    /// `parking_lot::Mutex` is sync-only — only held briefly in the
+    /// send path, never across `.await`.
+    last_sent_ac_pin_set: Arc<Mutex<HashSet<DigestInfo>>>,
+    /// (Probe #3) Counter of empty-tick BlobsAvailable suppressions
+    /// at the `send_periodic_blobs_available` skip-gate. Incremented
+    /// each time the gate fires; persists across reconnects so a
+    /// chronic empty-tick storm is visible without comparing to a
+    /// baseline. `Relaxed` is sufficient — read for diagnostics, not
+    /// load-bearing.
+    blobs_available_skipped_counter: Arc<AtomicU64>,
 }
 
 /// Test-only builder for [`BlobsAvailableState`]. Lets each test set only
@@ -975,6 +1033,8 @@ impl BlobsAvailableState {
             // identity assertions work without unwrapping random state.
             worker_instance_token: 0xA5A5_A5A5_A5A5_A5A5,
             next_broadcast_id: Arc::new(AtomicU64::new(0)),
+            last_sent_ac_pin_set: Arc::new(Mutex::new(HashSet::new())),
+            blobs_available_skipped_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1779,6 +1839,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         running_actions_manager: &Arc<U>,
         is_first: bool,
     ) -> Result<(), Error> {
+        // (A1 fix) On reconnect / first tick, clear the AC-pin "last
+        // sent" memo so the next computation reports every current pin
+        // as `added`. The server's per-endpoint AC pin set was wiped
+        // by the disconnect; replaying the full snapshot is the only
+        // way to restore parity. Without this, after a reconnect we
+        // would silently fall back to delta semantics against a
+        // stale-from-previous-session memo.
+        if is_first {
+            state.last_sent_ac_pin_set.lock().clear();
+        }
         let (digest_infos, evicted_digests, pinned_mirror_digests) = if is_first {
             // Full snapshot: scan everything once.
             let all = state.fs_store.get_all_digests_with_timestamps();
@@ -1880,35 +1950,72 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // method filters by store_id; AC entries on a different store_id
         // would never reach this loop anyway under the type-system
         // invariants on `AcMirrorTarget`.
-        let pinned_ac_mirror_entries: Vec<MirrorPinEntry> = state
+        //
+        // (A1 fix + probe #7) Take the snapshot, then compute the delta
+        // against `state.last_sent_ac_pin_set` so the skip-gate fires
+        // when AC pins exist but the set is unchanged tick-to-tick.
+        // Pre-fix the gate read `pinned_ac_mirror_count == 0`, which
+        // failed permanently once any AC pin landed in steady state →
+        // 100 ms re-broadcast of an unchanged snapshot → empty-tick
+        // storm on the server's `handle_blobs_available`. `ac_pin_scan`
+        // wraps the snapshot call so we can attribute scan cost.
+        let ac_pin_scan_start = Instant::now();
+        let current_ac_pin_digests: Vec<DigestInfo> = state
             .ac_mirror_target
             .as_ref()
             .map(|target| {
                 target
                     .fss
                     .dispatched_ac_pin_snapshot_for_store(target.store_id.as_ref())
-                    .into_iter()
+            })
+            .unwrap_or_default();
+        let ac_pin_scan_elapsed_us = ac_pin_scan_start.elapsed().as_micros() as u64;
+        let pinned_ac_mirror_count = current_ac_pin_digests.len();
+
+        // Compute add/remove vs last successfully-sent set.
+        let current_ac_pin_set: HashSet<DigestInfo> =
+            current_ac_pin_digests.iter().copied().collect();
+        let (ac_pin_added_count, ac_pin_removed_count) = {
+            let last = state.last_sent_ac_pin_set.lock();
+            compute_ac_pin_delta_counts(&current_ac_pin_set, &*last)
+        };
+        let ac_pin_delta_empty = ac_pin_added_count == 0 && ac_pin_removed_count == 0;
+
+        // Skip sending if there are truly no changes at all.
+        if should_skip_blobs_available_tick(
+            is_first,
+            new_or_touched_count,
+            evicted_count,
+            added_subtree_count,
+            removed_subtree_count,
+            pinned_mirror_count,
+            ac_pin_delta_empty,
+        ) {
+            state
+                .blobs_available_skipped_counter
+                .fetch_add(1, Ordering::Relaxed);
+            trace!(
+                pinned_ac_mirror_count,
+                ac_pin_scan_elapsed_us,
+                "BlobsAvailable: no changes since last tick, skipping"
+            );
+            return Ok(());
+        }
+
+        // Build the wire entries from the digests captured above.
+        let pinned_ac_mirror_entries: Vec<MirrorPinEntry> = state
+            .ac_mirror_target
+            .as_ref()
+            .map(|target| {
+                current_ac_pin_digests
+                    .iter()
                     .map(|digest| MirrorPinEntry {
-                        digest: Some(digest.into()),
+                        digest: Some((*digest).into()),
                         store_id: target.store_id.to_string(),
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let pinned_ac_mirror_count = pinned_ac_mirror_entries.len();
-
-        // Skip sending if there are truly no changes at all.
-        if !is_first
-            && new_or_touched_count == 0
-            && evicted_count == 0
-            && added_subtree_count == 0
-            && removed_subtree_count == 0
-            && pinned_mirror_count == 0
-            && pinned_ac_mirror_count == 0
-        {
-            trace!("BlobsAvailable: no changes since last tick, skipping");
-            return Ok(());
-        }
 
         let load = get_cpu_load_pct();
         let p_load = get_p_core_load_pct();
@@ -2061,11 +2168,22 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 added_subtree_count,
                 removed_subtree_count,
                 pinned_mirror_count,
+                pinned_ac_mirror_count,
+                ac_pin_added_count,
+                ac_pin_removed_count,
+                ac_pin_scan_elapsed_us,
                 is_first,
                 broadcast_id,
                 chunk_count,
                 "Sent chunked BlobsAvailable (#99 path)"
             );
+            // (A1 fix) Successful send → memo the snapshot so the next
+            // tick's delta is computed against what the server now
+            // believes the worker holds. Chunked path is wire-equivalent
+            // to the single-message path (server reassembles before
+            // calling `handle_blobs_available`), so the memo update is
+            // identical.
+            *state.last_sent_ac_pin_set.lock() = current_ac_pin_set;
         } else if let Err(err) = grpc_client.blobs_available(notification).await {
             warn!(
                 ?err,
@@ -2075,6 +2193,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 added_subtree_count,
                 removed_subtree_count,
                 pinned_mirror_count,
+                pinned_ac_mirror_count,
+                ac_pin_added_count,
+                ac_pin_removed_count,
+                ac_pin_scan_elapsed_us,
                 is_first,
                 "Failed to send periodic BlobsAvailable"
             );
@@ -2090,9 +2212,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 added_subtree_count,
                 removed_subtree_count,
                 pinned_mirror_count,
+                pinned_ac_mirror_count,
+                ac_pin_added_count,
+                ac_pin_removed_count,
+                ac_pin_scan_elapsed_us,
                 is_first,
                 "Sent periodic BlobsAvailable"
             );
+            // (A1 fix) Successful send → memo the snapshot so the next
+            // tick's delta is computed against what the server now
+            // believes the worker holds.
+            *state.last_sent_ac_pin_set.lock() = current_ac_pin_set;
         }
         Ok(())
     }
@@ -2638,6 +2768,16 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                 // the `RunningAction` trait so test stubs don't
                                 // have to implement it.
                                 move |res: Result<(ActionResult, Arc<U::RunningAction>), Error>| async move {
+                                    // (Probe #2) Total wall-clock time spent inside the
+                                    // post-action publish closure (tree expansion +
+                                    // BlobsAvailable + execution_response + execution_complete
+                                    // + cache_action_result + spawn_upload_to_remote).
+                                    // Captures the worker-side latency the scheduler waits on
+                                    // between action completion and "worker free" so the
+                                    // critical path is attributable when post-action work
+                                    // queues up. Logged at the closure exit alongside the
+                                    // existing phase6 boundary.
+                                    let publish_closure_start = Instant::now();
                                     // Sample CPU at completion time, not action start time.
                                     let exec_load = get_cpu_load_pct();
                                     let exec_p_load = get_p_core_load_pct();
@@ -2963,6 +3103,17 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             }
                                         },
                                     }
+                                    // (Probe #2) Closure exit boundary — total ms spent
+                                    // inside this publish closure across both Ok and Err
+                                    // arms. Single emission point catches every successful
+                                    // exit; `?`-propagated errors inside the arms are rare
+                                    // and skip this log intentionally.
+                                    let publish_closure_total_ms =
+                                        publish_closure_start.elapsed().as_millis() as u64;
+                                    info!(
+                                        publish_closure_total_ms,
+                                        "publish closure complete"
+                                    );
                                     Ok(())
                                 }
                             };
@@ -3558,6 +3709,8 @@ pub async fn new_local_worker(
                     if t == 0 { 1 } else { t }
                 },
                 next_broadcast_id: Arc::new(AtomicU64::new(0)),
+                last_sent_ac_pin_set: Arc::new(Mutex::new(HashSet::new())),
+                blobs_available_skipped_counter: Arc::new(AtomicU64::new(0)),
             })
         } else {
             warn!(
@@ -4183,6 +4336,198 @@ mod tests {
     use nativelink_util::store_trait::StoreKey;
 
     use super::*;
+
+    /// (A1 fix) T1 — empty-tick suppression. Stable steady state with
+    /// N AC pins, no other deltas: the gate predicate MUST be true so
+    /// the tick is suppressed.
+    ///
+    /// Mutation: change the gate predicate to use
+    /// `pinned_mirror_count == 0 && pinned_ac_mirror_count == 0`
+    /// (i.e. revert to absolute snapshot check). After mutation, this
+    /// test must red-fail with the bespoke message below because
+    /// `pinned_ac_mirror_count` (5) is non-zero so the gate would
+    /// fire BlobsAvailable every tick.
+    #[test]
+    fn ac_pin_delta_t1_empty_tick_suppression() {
+        let d1 = DigestInfo::new([1u8; 32], 100);
+        let d2 = DigestInfo::new([2u8; 32], 100);
+        let d3 = DigestInfo::new([3u8; 32], 100);
+        let d4 = DigestInfo::new([4u8; 32], 100);
+        let d5 = DigestInfo::new([5u8; 32], 100);
+
+        let stable: HashSet<DigestInfo> = [d1, d2, d3, d4, d5].into_iter().collect();
+        // Same set both ticks.
+        let (added, removed) = compute_ac_pin_delta_counts(&stable, &stable);
+        assert_eq!(added, 0, "no adds when current == last");
+        assert_eq!(removed, 0, "no removes when current == last");
+
+        // With ac_pin_delta_empty=true and all other counts zero and is_first=false,
+        // the gate MUST skip.
+        let skip = should_skip_blobs_available_tick(
+            /* is_first */ false,
+            /* new_or_touched_count */ 0,
+            /* evicted_count */ 0,
+            /* added_subtree_count */ 0,
+            /* removed_subtree_count */ 0,
+            /* pinned_mirror_count */ 0,
+            /* ac_pin_delta_empty */ true,
+        );
+        assert!(
+            skip,
+            "empty-tick suppression failed: gate did NOT skip a stable-state tick with 5 AC pins unchanged"
+        );
+    }
+
+    /// (A1 fix) T2 — add-pin fires (over-action symmetry). Stable
+    /// state with N pins; one new pin is added. The gate predicate
+    /// MUST return false (fire the tick).
+    ///
+    /// Mutation: short-circuit `current.difference(last)` to always
+    /// return an empty iterator. After mutation, `added=0` →
+    /// `ac_pin_delta_empty=true` → gate skips → test red-fails.
+    #[test]
+    fn ac_pin_delta_t2_add_pin_fires() {
+        let d1 = DigestInfo::new([1u8; 32], 100);
+        let d2 = DigestInfo::new([2u8; 32], 100);
+        let d3 = DigestInfo::new([3u8; 32], 100);
+        let d4 = DigestInfo::new([4u8; 32], 100);
+        let d5 = DigestInfo::new([5u8; 32], 100);
+        let d6 = DigestInfo::new([6u8; 32], 100);
+
+        let last: HashSet<DigestInfo> = [d1, d2, d3, d4, d5].into_iter().collect();
+        let current: HashSet<DigestInfo> = [d1, d2, d3, d4, d5, d6].into_iter().collect();
+
+        let (added, removed) = compute_ac_pin_delta_counts(&current, &last);
+        assert_eq!(
+            added, 1,
+            "add-pin tick suppressed: expected added=1 (new digest d6), got added={added}"
+        );
+        assert_eq!(removed, 0, "no removes expected");
+
+        let skip = should_skip_blobs_available_tick(
+            false, 0, 0, 0, 0, 0,
+            /* ac_pin_delta_empty */ added == 0 && removed == 0,
+        );
+        assert!(
+            !skip,
+            "add-pin tick suppressed: gate skipped a tick that added 1 new AC pin (expected 1 RPC with N+1 pins)"
+        );
+    }
+
+    /// (A1 fix) T3 — remove-pin fires. Stable state; one pin removed.
+    /// The gate predicate MUST return false.
+    ///
+    /// Mutation: short-circuit `last.difference(current)` to always
+    /// return an empty iterator. After mutation, `removed=0` →
+    /// `ac_pin_delta_empty=true` → gate skips → test red-fails.
+    #[test]
+    fn ac_pin_delta_t3_remove_pin_fires() {
+        let d1 = DigestInfo::new([1u8; 32], 100);
+        let d2 = DigestInfo::new([2u8; 32], 100);
+        let d3 = DigestInfo::new([3u8; 32], 100);
+        let d4 = DigestInfo::new([4u8; 32], 100);
+        let d5 = DigestInfo::new([5u8; 32], 100);
+
+        let last: HashSet<DigestInfo> = [d1, d2, d3, d4, d5].into_iter().collect();
+        let current: HashSet<DigestInfo> = [d1, d2, d3, d4].into_iter().collect();
+
+        let (added, removed) = compute_ac_pin_delta_counts(&current, &last);
+        assert_eq!(added, 0, "no adds expected");
+        assert_eq!(
+            removed, 1,
+            "remove-pin tick suppressed: expected removed=1 (d5 unpinned), got removed={removed}"
+        );
+
+        let skip = should_skip_blobs_available_tick(
+            false, 0, 0, 0, 0, 0,
+            /* ac_pin_delta_empty */ added == 0 && removed == 0,
+        );
+        assert!(
+            !skip,
+            "remove-pin tick suppressed: gate skipped a tick that removed 1 AC pin (expected 1 RPC with N-1 pins)"
+        );
+    }
+
+    /// (A1 fix) T4 — reconnect re-sends snapshot. `is_first=true`
+    /// MUST bypass the gate regardless of `last_sent` state. Verifies
+    /// the public contract: the constructor / `from_test_args`
+    /// initializes `last_sent_ac_pin_set` empty AND
+    /// `send_periodic_blobs_available` clears it at function entry
+    /// when `is_first=true`.
+    ///
+    /// Mutation: remove the `if is_first { state.last_sent_ac_pin_set.lock().clear(); }`
+    /// line at the function head. With a populated last-sent set and
+    /// matching current snapshot, `(added, removed) = (0, 0)`, but
+    /// `is_first=true` means `should_skip_blobs_available_tick`
+    /// returns false anyway — so we'd ship the tick (good); the
+    /// mutation surfaces on the FOLLOWING tick when the server has
+    /// been wiped: last_sent set still claims it sent the pins, but
+    /// the server lost them, so a silent delta-skip would orphan
+    /// them. Test asserts:
+    /// (a) `is_first=true` always returns false from the gate, AND
+    /// (b) after explicit clear, current vs cleared set reports all
+    /// pins as added (the snapshot-replay invariant).
+    #[test]
+    fn ac_pin_delta_t4_reconnect_resends_snapshot() {
+        // (a) is_first=true bypasses the gate even when delta would suppress.
+        let skip_on_first = should_skip_blobs_available_tick(
+            /* is_first */ true,
+            0,
+            0,
+            0,
+            0,
+            0,
+            /* ac_pin_delta_empty */ true,
+        );
+        assert!(
+            !skip_on_first,
+            "reconnect did not re-send full snapshot: is_first=true was not allowed past the gate"
+        );
+
+        // (b) After clearing last_sent_ac_pin_set, current snapshot's
+        // every digest is reported as added — the snapshot replay.
+        let d1 = DigestInfo::new([1u8; 32], 100);
+        let d2 = DigestInfo::new([2u8; 32], 100);
+        let d3 = DigestInfo::new([3u8; 32], 100);
+        let current: HashSet<DigestInfo> = [d1, d2, d3].into_iter().collect();
+        let cleared_last: HashSet<DigestInfo> = HashSet::new();
+        let (added, removed) = compute_ac_pin_delta_counts(&current, &cleared_last);
+        assert_eq!(
+            added, 3,
+            "reconnect did not re-send full snapshot: last_sent retained — expected 3 adds, got {added}"
+        );
+        assert_eq!(removed, 0, "no removes when last is empty");
+    }
+
+    /// Sanity coverage on the gate's other corners: a fast-store
+    /// eviction or pinned-mirror activity must fire the tick even if
+    /// AC pin delta is empty. Without this we'd suppress legitimate
+    /// CAS-side changes alongside the AC fix.
+    #[test]
+    fn gate_does_not_swallow_non_ac_corners() {
+        // pinned_mirror_count > 0 → tick fires.
+        assert!(!should_skip_blobs_available_tick(
+            false, 0, 0, 0, 0,
+            /* pinned_mirror_count */ 1,
+            true,
+        ));
+        // evicted_count > 0 → tick fires.
+        assert!(!should_skip_blobs_available_tick(
+            false, 0, 1, 0, 0, 0, true,
+        ));
+        // new_or_touched_count > 0 → tick fires.
+        assert!(!should_skip_blobs_available_tick(
+            false, 1, 0, 0, 0, 0, true,
+        ));
+        // added_subtree_count > 0 → tick fires.
+        assert!(!should_skip_blobs_available_tick(
+            false, 0, 0, 1, 0, 0, true,
+        ));
+        // removed_subtree_count > 0 → tick fires.
+        assert!(!should_skip_blobs_available_tick(
+            false, 0, 0, 0, 1, 0, true,
+        ));
+    }
 
     #[test]
     fn test_blob_change_tracker_eviction_collects_and_swaps() {

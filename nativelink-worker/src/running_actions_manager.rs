@@ -4835,7 +4835,13 @@ impl RunningActionsManagerImpl {
         // trip for a blob that is supposed to be local.
         #[allow(clippy::disallowed_methods)]
         let fast_store = self.cas_store.fast_store();
+        // (Probe #1) Total wall-clock for the tree-expansion loop, summed
+        // over every output folder's Tree decode. Lives on the worker
+        // post-action publish critical path so latency is attributable
+        // to this step when locality-hint emission lags.
+        let expand_tree_start = Instant::now();
         let mut file_digests = Vec::new();
+        let folder_count = action_result.output_folders.len();
         for folder in &action_result.output_folders {
             let tree_digest = folder.tree_digest;
             if tree_digest.size_bytes() == 0 {
@@ -4867,6 +4873,13 @@ impl RunningActionsManagerImpl {
                 }
             }
         }
+        let expand_tree_total_ms = expand_tree_start.elapsed().as_millis() as u64;
+        info!(
+            folder_count,
+            file_digest_count = file_digests.len(),
+            expand_tree_total_ms,
+            "expand_tree_file_digests complete",
+        );
         file_digests
     }
 

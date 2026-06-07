@@ -1395,6 +1395,13 @@ impl WorkerConnection {
         &self,
         notification: nativelink_proto::com::github::trace_machina::nativelink::remote_execution::BlobsAvailableNotification,
     ) -> Result<(), Error> {
+        // (Probe #4) Total wall-clock spent inside handle_blobs_available
+        // — server-side reception cost per BlobsAvailable tick. Emits at
+        // each of the three return points below so per-tick cost is
+        // attributable across the three exit paths (no-locality-map,
+        // empty-endpoint, normal). Pairs with the worker-side
+        // `ac_pin_scan_elapsed_us` to bound the empty-tick storm.
+        let handle_blobs_available_start = Instant::now();
         // #168 security MEDIUM Q2 (hoisted from the field-16 block to
         // function entry per second-pass review): a worker self-reports
         // its own `worker_cas_endpoint` in BlobsAvailable. The notification
@@ -1699,6 +1706,13 @@ impl WorkerConnection {
         }
 
         let Some(ref locality_map) = self.locality_map else {
+            let handle_blobs_available_elapsed_ms =
+                handle_blobs_available_start.elapsed().as_millis() as u64;
+            debug!(
+                handle_blobs_available_elapsed_ms,
+                exit_path = "no_locality_map",
+                "handle_blobs_available complete"
+            );
             return Ok(());
         };
         let endpoint = if notification.worker_cas_endpoint.is_empty() {
@@ -1707,6 +1721,13 @@ impl WorkerConnection {
             &notification.worker_cas_endpoint
         };
         if endpoint.is_empty() {
+            let handle_blobs_available_elapsed_ms =
+                handle_blobs_available_start.elapsed().as_millis() as u64;
+            debug!(
+                handle_blobs_available_elapsed_ms,
+                exit_path = "empty_endpoint",
+                "handle_blobs_available complete"
+            );
             return Ok(());
         }
 
@@ -1904,10 +1925,24 @@ impl WorkerConnection {
                         .await;
                     }
                 );
+                let handle_blobs_available_elapsed_ms =
+                    handle_blobs_available_start.elapsed().as_millis() as u64;
+                debug!(
+                    handle_blobs_available_elapsed_ms,
+                    exit_path = "background_backfill_spawned",
+                    "handle_blobs_available complete"
+                );
                 return Ok(());
             }
         }
 
+        let handle_blobs_available_elapsed_ms =
+            handle_blobs_available_start.elapsed().as_millis() as u64;
+        debug!(
+            handle_blobs_available_elapsed_ms,
+            exit_path = "fall_through",
+            "handle_blobs_available complete"
+        );
         Ok(())
     }
 
