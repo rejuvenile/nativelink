@@ -2843,7 +2843,7 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
 //        chained iterator preserves the field-13 registration when
 //        field-16 is also present).
 //
-// Mutation falsification:
+// Mutation falsification (2026-06-07, matching #44/#49/#50/#55/#57/#37 format):
 //   - Comment out the
 //     `.chain(pinned_mirror_field16_digests.iter().copied())` clause
 //     in `worker_api_server.rs` → (T1) red-fails with bespoke
@@ -2852,6 +2852,12 @@ pub async fn handle_blobs_available_pinned_mirror_entries_register_in_locality_m
 //     `dispatcher.broadcast_pinned_mirror_ack(entries)` calls inside
 //     the consolidated-block exits → (T2) red-fails with bespoke
 //     "field-16 fold: ack not fired post-fold; pin entries still held".
+//   - Comment out the
+//     `.chain(pinned_mirror_entries_digests.iter().copied())` clause
+//     (field-13 path) in the same merged `register_blobs_iter` call
+//     in `worker_api_server.rs` → (T3) red-fails with bespoke
+//     "field-16 fold: merged register_blobs_iter dropped field-13
+//     pinned_mirror_entries digests".
 #[nativelink_test]
 pub async fn handle_blobs_available_a2_fold_merged_field13_and_field16_test()
 -> Result<(), Box<dyn core::error::Error>> {
