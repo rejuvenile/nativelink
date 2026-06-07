@@ -5733,7 +5733,7 @@ exit 1
         // misuse hang rather than passing on `tokio::time::Elapsed`.
         let got = tokio::time::timeout(
             Duration::from_secs(5),
-            running_actions_manager.expand_tree_file_digests(&action_result),
+            running_actions_manager.expand_tree_file_digests(&action_result, None),
         )
         .await
         .expect(
@@ -5818,7 +5818,7 @@ exit 1
         // Warm caches: one untimed run so OS page-cache + EvictingMap
         // state stabilises.
         let _ = running_actions_manager
-            .expand_tree_file_digests(&action_result_all)
+            .expand_tree_file_digests(&action_result_all, None)
             .await;
 
         // Time the parallel (production) call: all N trees in one
@@ -5827,7 +5827,7 @@ exit 1
         for _ in 0..3 {
             let t0 = Instant::now();
             let _ = running_actions_manager
-                .expand_tree_file_digests(&action_result_all)
+                .expand_tree_file_digests(&action_result_all, None)
                 .await;
             parallel_runs.push(t0.elapsed());
         }
@@ -5848,7 +5848,7 @@ exit 1
             let mut runs: Vec<Duration> = Vec::with_capacity(3);
             for _ in 0..3 {
                 let t0 = Instant::now();
-                let _ = running_actions_manager.expand_tree_file_digests(&single).await;
+                let _ = running_actions_manager.expand_tree_file_digests(&single, None).await;
                 runs.push(t0.elapsed());
             }
             runs.sort();

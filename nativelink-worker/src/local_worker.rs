@@ -2991,7 +2991,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                                 // tree file blobs until the background
                                                 // upload completes.
                                                 let tree_file_digests = running_actions_manager
-                                                    .expand_tree_file_digests(&action_result)
+                                                    .expand_tree_file_digests(
+                                                        &action_result,
+                                                        Some(&action_for_publish),
+                                                    )
                                                     .await;
                                                 output_digests.extend(tree_file_digests.into_iter().map(Into::into));
 
@@ -3087,7 +3090,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             //    (#O15) so we can move `action_result`
                                             //    into the detached AC-write task without
                                             //    a redundant clone here.
-                                            running_actions_manager.spawn_upload_to_remote(&action_result);
+                                            running_actions_manager.spawn_upload_to_remote(&action_result, Some(&action_for_publish));
 
                                             // 5. AC write — detached into a background
                                             //    task (#O15) so the closure returns as
