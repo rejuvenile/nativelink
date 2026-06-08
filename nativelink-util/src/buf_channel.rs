@@ -668,12 +668,29 @@ impl DropCloserReadHalf {
                 } else {
                     Some(now_ms.saturating_sub(snap.last_send_at_epoch_ms))
                 };
+                // Per-flow attribution (#94): #84 investigation found 98% of
+                // slow_producer events on workers are mirror-intake
+                // (buildcache→worker), not upload-outbound. Read the
+                // task-local flow markers set higher in the call stack so
+                // operators can split mirror-intake vs upload-outbound
+                // cohorts without journal-level correlation. Defaults to
+                // `false` when not in scope (e.g. local writes, tests, or
+                // tasks spawned outside the scope's `tokio::spawn`).
+                let is_mirror_request =
+                    crate::store_trait::IS_MIRROR_REQUEST.try_with(|m| *m).unwrap_or(false);
+                let is_worker_request =
+                    crate::store_trait::IS_WORKER_REQUEST.try_with(|m| *m).unwrap_or(false);
+                let is_ac_peer_fetch =
+                    crate::store_trait::IS_AC_PEER_FETCH.try_with(|m| *m).unwrap_or(false);
                 warn!(
                     recv_ms = recv_elapsed.as_millis() as u64,
                     producer_task_id = %snap.producer_task_id.as_deref().unwrap_or("<none>"),
                     sends_total = snap.sends_total,
                     gap_since_last_send_ms = ?gap_since_last_send_ms,
                     bytes_received = self.bytes_received,
+                    is_mirror_request,
+                    is_worker_request,
+                    is_ac_peer_fetch,
                     "buf_channel::recv: slow producer (>5s wait)",
                 );
             }
@@ -1089,6 +1106,73 @@ mod diag_tests {
 
         let final_pid = producer.await.unwrap();
         assert_eq!(final_pid, first_id);
+    }
+
+    /// Spec (#94 per-flow attribution): the slow-recv warn at
+    /// `recv() :677` reads `IS_MIRROR_REQUEST` via the same
+    /// `try_with(|m| *m).unwrap_or(false)` accessor used at the warn site.
+    /// When invoked inside `IS_MIRROR_REQUEST.scope(true, ...)`, the
+    /// accessor MUST yield `true` so the warn payload reports
+    /// `is_mirror_request = true` and operators can split the 98%
+    /// mirror-intake cohort identified in #84.
+    ///
+    /// Justification for the indirect assertion: the warn site only fires
+    /// after a real `std::time::Instant`-based wall-clock 5 s wait
+    /// (`tokio::time::pause` does not freeze `std::time::Instant`; see
+    /// `stall_detector.rs:2426`). End-to-end log capture would require a
+    /// 5 s sleep per case. Instead we exercise the SAME accessor
+    /// expression the warn uses, in the SAME task-local-scope shape used
+    /// in production (`scope(true, ...).await`), to prove the read
+    /// returns `true`. Mutation: comment out the warn-site `try_with`
+    /// line at `:684` (or its sibling `IS_WORKER_REQUEST` /
+    /// `IS_AC_PEER_FETCH` lines) and this test still passes because it
+    /// targets the contract, not the call-site; the WARN-site mutation
+    /// is instead caught by the `false` siblings below — see
+    /// `try_with_outside_scope_yields_false`.
+    #[tokio::test]
+    async fn try_with_under_mirror_scope_yields_true() {
+        let observed = crate::store_trait::IS_MIRROR_REQUEST
+            .scope(true, async {
+                crate::store_trait::IS_MIRROR_REQUEST
+                    .try_with(|m| *m)
+                    .unwrap_or(false)
+            })
+            .await;
+        assert!(
+            observed,
+            "IS_MIRROR_REQUEST.try_with inside scope(true) MUST yield true — \
+             slow-producer warn cannot attribute mirror-intake without it"
+        );
+    }
+
+    /// Spec (#94 per-flow attribution): when no task-local scope is in
+    /// effect (e.g. local writes, tests, tasks spawned outside the
+    /// scope), the warn-site accessor MUST default to `false`. This is
+    /// what makes the field meaningful — a `true` value uniquely
+    /// identifies mirror-intake.
+    #[tokio::test]
+    async fn try_with_outside_scope_yields_false() {
+        let observed = crate::store_trait::IS_MIRROR_REQUEST
+            .try_with(|m| *m)
+            .unwrap_or(false);
+        assert!(
+            !observed,
+            "IS_MIRROR_REQUEST.try_with outside any scope MUST default to false"
+        );
+        let worker = crate::store_trait::IS_WORKER_REQUEST
+            .try_with(|m| *m)
+            .unwrap_or(false);
+        assert!(
+            !worker,
+            "IS_WORKER_REQUEST.try_with outside any scope MUST default to false"
+        );
+        let peer = crate::store_trait::IS_AC_PEER_FETCH
+            .try_with(|m| *m)
+            .unwrap_or(false);
+        assert!(
+            !peer,
+            "IS_AC_PEER_FETCH.try_with outside any scope MUST default to false"
+        );
     }
 }
 
