@@ -1910,6 +1910,196 @@ pub fn download_to_directory<'a>(
     .boxed()
 }
 
+/// Prepare a single output file's parent directory.
+///
+/// Fast path: just `create_dir_all` and confirm the directory is writable.
+///
+/// Slow path (lock-serialized): walk the parent-path components, replacing
+/// any read-only symlink-into-cache with a writable shallow-copy directory
+/// AND chmod'ing any read-only-but-not-symlink directory to writable. This
+/// is required because the worker's input-fetch hardlink mode marks the
+/// input root + its sub-trees read-only to preserve cache integrity, but
+/// bazel requires the output-file's parent to be writable.
+///
+/// `lock` serializes the slow-path symlink replacement to avoid concurrent
+/// tasks racing on the same symlink (EEXIST / ENOENT).
+///
+/// `metrics` is updated on every lock acquire (denominator) and on every
+/// slow-path entry (numerator); #86 instrumentation driving the #83 O14
+/// (`Mutex` → `RwLock`) decision. Both counters are `pub` so integration
+/// tests can read `.counter.load(Ordering::Acquire)`.
+///
+/// **Contract (asymmetric):**
+/// - Under-action: increment MUST fire on slow-path entry. Verified by
+///   `symlink_fix_slow_path_increments_on_slow_path_entry` (T1).
+/// - Over-action: increment MUST NOT fire on fast-path early-return.
+///   Verified by `symlink_fix_slow_path_does_not_increment_on_fast_path`
+///   (T2).
+#[doc(hidden)]
+pub async fn prepare_output_directory(
+    work_dir: &str,
+    working_directory: &str,
+    output_file: &str,
+    lock: &tokio::sync::Mutex<()>,
+    metrics: &Metrics,
+) -> Result<(), Error> {
+    let full_output_path = if working_directory.is_empty() {
+        format!("{work_dir}/{output_file}")
+    } else {
+        format!("{work_dir}/{working_directory}/{output_file}")
+    };
+    let full_parent_path = Path::new(&full_output_path)
+        .parent()
+        .err_tip(|| format!("Parent path for {full_output_path} has no parent"))?;
+
+    // Fast path: create_dir_all and verify the directory is writable.
+    // create_dir_all succeeds even if the directory is read-only
+    // (it already exists), but rustc needs write access for outputs.
+    if fs::create_dir_all(full_parent_path).await.is_ok() {
+        let mut dir_writable = true;
+        #[cfg(target_family = "unix")]
+        if let Ok(m) = fs::metadata(full_parent_path).await {
+            dir_writable = m.mode() & 0o200 != 0;
+        }
+        if dir_writable {
+            return Ok(());
+        }
+        // Directory exists but is not writable (likely through
+        // a symlink to the read-only cache). Fall through to fix.
+    }
+
+    // Slow path: serialize to avoid concurrent symlink replacement races.
+    let _guard = lock.lock().await;
+    // #86: every acquire (denominator for slow-path rate).
+    metrics.symlink_fix_lock_acquires_total.inc();
+
+    // Re-check under lock — another task may have already fixed it.
+    if fs::create_dir_all(full_parent_path).await.is_ok() {
+        let mut dir_writable = true;
+        #[cfg(target_family = "unix")]
+        if let Ok(m) = fs::metadata(full_parent_path).await {
+            dir_writable = m.mode() & 0o200 != 0;
+        }
+        if dir_writable {
+            return Ok(());
+        }
+    }
+    // #86: numerator — true slow-path entry (under-lock fast-path
+    // re-check failed, real symlink fix-up work is about to run).
+    metrics.symlink_fix_slow_path_entries_total.inc();
+
+    // Walk the path and replace blocking symlinks with writable
+    // shallow-copy directories that preserve access to all
+    // original entries via absolute symlinks.
+    let work_root = Path::new(work_dir);
+    let relative = full_parent_path.strip_prefix(work_root).map_err(|_| {
+        make_err!(
+            Code::Internal,
+            "Output path {} not under work dir {}",
+            full_parent_path.display(),
+            work_root.display()
+        )
+    })?;
+
+    let mut current = work_root.to_path_buf();
+    for component in relative.components() {
+        let component_name = component.as_os_str();
+        let next = current.join(component_name);
+
+        match fs::symlink_metadata(&next).await {
+            Ok(meta) => {
+                #[cfg(target_family = "unix")]
+                if meta.is_symlink() {
+                    // Check if resolved target is a read-only directory
+                    let needs_replace = match fs::canonicalize(&next).await {
+                        Ok(resolved) => match fs::metadata(&resolved).await {
+                            Ok(m) => m.is_dir() && (m.mode() & 0o200 == 0),
+                            Err(_) => false,
+                        },
+                        Err(_) => false,
+                    };
+
+                    if needs_replace {
+                        let resolved = fs::canonicalize(&next).await.err_tip(|| {
+                            format!("Failed to resolve: {}", next.display())
+                        })?;
+
+                        // Replace symlink with a writable shallow-copy directory.
+                        // Each entry in the original target gets an absolute symlink,
+                        // except for self-referential entries (e.g., bazel-out -> .).
+                        fs::remove_file(&next).await.err_tip(|| {
+                            format!("Failed to remove symlink: {}", next.display())
+                        })?;
+                        fs::create_dir(&next).await.err_tip(|| {
+                            format!("Failed to create dir: {}", next.display())
+                        })?;
+
+                        let rd = fs::read_dir(&resolved).await.err_tip(|| {
+                            format!("Failed to read dir: {}", resolved.display())
+                        })?;
+                        let (_permit, mut inner_rd) = rd.into_inner();
+                        while let Some(entry) = inner_rd.next_entry().await.err_tip(|| {
+                            format!("Failed to iterate: {}", resolved.display())
+                        })? {
+                            let entry_name = entry.file_name();
+                            // Skip self-referential entries (bazel-out -> . creates
+                            // an entry pointing back to the replaced dir itself).
+                            if entry_name == component_name {
+                                continue;
+                            }
+                            let abs_target = resolved.join(&entry_name);
+                            let link = next.join(&entry_name);
+                            if let Err(e) = fs::symlink(&abs_target, &link).await {
+                                warn!(
+                                    link = %link.display(),
+                                    target = %abs_target.display(),
+                                    ?e,
+                                    "prepare_output_dirs: failed to create shallow-copy symlink",
+                                );
+                            }
+                        }
+
+                        // Retry — the fix at this level may be sufficient.
+                        if fs::create_dir_all(full_parent_path).await.is_ok() {
+                            return Ok(());
+                        }
+                    }
+                }
+
+                #[cfg(target_family = "unix")]
+                if meta.is_dir() && (meta.mode() & 0o200 == 0) {
+                    // Read-only directory in the work tree (not through symlink).
+                    // Safe to make writable since work dirs are independent copies.
+                    let mut perms = meta.permissions();
+                    perms.set_mode(meta.mode() | 0o200);
+                    drop(fs::set_permissions(&next, perms).await);
+                }
+            }
+            Err(_) => {
+                // Path doesn't exist — create remaining dirs.
+                fs::create_dir_all(full_parent_path).await.err_tip(|| {
+                    format!(
+                        "Error creating output directory {}",
+                        full_parent_path.display()
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+
+        current = next;
+    }
+
+    // Final attempt after all fixes applied.
+    fs::create_dir_all(full_parent_path).await.err_tip(|| {
+        format!(
+            "Error creating output directory {} (after symlink fixes)",
+            full_parent_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 /// Prepares action inputs by first trying the directory cache (if available),
 /// then falling back to traditional `download_to_directory`.
 ///
@@ -2864,158 +3054,27 @@ impl RunningActionImpl {
             // Mutex serializes the slow-path symlink replacement to avoid
             // concurrent tasks racing on the same symlink (EEXIST / ENOENT).
             let symlink_fix_lock = Arc::new(tokio::sync::Mutex::new(()));
-            let prepare_output_directories = |output_file| {
+            // #86: observability for #83 O14 (Mutex→RwLock) decision. Counts
+            // every lock acquire (denominator) and every slow-path entry
+            // (numerator). Operator computes slow_path_entries / lock_acquires
+            // to decide whether RwLock conversion is justified.
+            let metrics_for_output = self.metrics().clone();
+            let working_directory_for_output = command.working_directory.clone();
+            let prepare_output_directories = |output_file: &String| {
                 let work_dir = work_dir_for_output.clone();
                 let lock = symlink_fix_lock.clone();
-                let full_output_path = if command.working_directory.is_empty() {
-                    format!("{}/{}", work_dir, output_file)
-                } else {
-                    format!(
-                        "{}/{}/{}",
-                        work_dir, command.working_directory, output_file
-                    )
-                };
+                let metrics = metrics_for_output.clone();
+                let working_directory = working_directory_for_output.clone();
+                let output_file = output_file.clone();
                 async move {
-                    let full_parent_path = Path::new(&full_output_path)
-                        .parent()
-                        .err_tip(|| format!("Parent path for {full_output_path} has no parent"))?;
-
-                    // Fast path: create_dir_all and verify the directory is writable.
-                    // create_dir_all succeeds even if the directory is read-only
-                    // (it already exists), but rustc needs write access for outputs.
-                    if fs::create_dir_all(full_parent_path).await.is_ok() {
-                        let mut dir_writable = true;
-                        #[cfg(target_family = "unix")]
-                        if let Ok(m) = fs::metadata(full_parent_path).await {
-                            dir_writable = m.mode() & 0o200 != 0;
-                        }
-                        if dir_writable {
-                            return Result::<(), Error>::Ok(());
-                        }
-                        // Directory exists but is not writable (likely through
-                        // a symlink to the read-only cache). Fall through to fix.
-                    }
-
-                    // Slow path: serialize to avoid concurrent symlink replacement races.
-                    let _guard = lock.lock().await;
-
-                    // Re-check under lock — another task may have already fixed it.
-                    if fs::create_dir_all(full_parent_path).await.is_ok() {
-                        let mut dir_writable = true;
-                        #[cfg(target_family = "unix")]
-                        if let Ok(m) = fs::metadata(full_parent_path).await {
-                            dir_writable = m.mode() & 0o200 != 0;
-                        }
-                        if dir_writable {
-                            return Result::<(), Error>::Ok(());
-                        }
-                    }
-
-                    // Walk the path and replace blocking symlinks with writable
-                    // shallow-copy directories that preserve access to all
-                    // original entries via absolute symlinks.
-                    let work_root = Path::new(&work_dir);
-                    let relative = full_parent_path.strip_prefix(work_root)
-                        .map_err(|_| make_err!(
-                            Code::Internal,
-                            "Output path {} not under work dir {}",
-                            full_parent_path.display(),
-                            work_root.display()
-                        ))?;
-
-                    let mut current = work_root.to_path_buf();
-                    for component in relative.components() {
-                        let component_name = component.as_os_str();
-                        let next = current.join(component_name);
-
-                        match fs::symlink_metadata(&next).await {
-                            Ok(meta) => {
-                                #[cfg(target_family = "unix")]
-                                if meta.is_symlink() {
-                                    // Check if resolved target is a read-only directory
-                                    let needs_replace = match fs::canonicalize(&next).await {
-                                        Ok(resolved) => {
-                                            match fs::metadata(&resolved).await {
-                                                Ok(m) => m.is_dir() && (m.mode() & 0o200 == 0),
-                                                Err(_) => false,
-                                            }
-                                        }
-                                        Err(_) => false,
-                                    };
-
-                                    if needs_replace {
-                                        let resolved = fs::canonicalize(&next).await
-                                            .err_tip(|| format!("Failed to resolve: {}", next.display()))?;
-
-                                        // Replace symlink with a writable shallow-copy directory.
-                                        // Each entry in the original target gets an absolute symlink,
-                                        // except for self-referential entries (e.g., bazel-out -> .).
-                                        fs::remove_file(&next).await
-                                            .err_tip(|| format!("Failed to remove symlink: {}", next.display()))?;
-                                        fs::create_dir(&next).await
-                                            .err_tip(|| format!("Failed to create dir: {}", next.display()))?;
-
-                                        let rd = fs::read_dir(&resolved).await
-                                            .err_tip(|| format!("Failed to read dir: {}", resolved.display()))?;
-                                        let (_permit, mut inner_rd) = rd.into_inner();
-                                        while let Some(entry) = inner_rd.next_entry().await
-                                            .err_tip(|| format!("Failed to iterate: {}", resolved.display()))?
-                                        {
-                                            let entry_name = entry.file_name();
-                                            // Skip self-referential entries (bazel-out -> . creates
-                                            // an entry pointing back to the replaced dir itself).
-                                            if entry_name == component_name {
-                                                continue;
-                                            }
-                                            let abs_target = resolved.join(&entry_name);
-                                            let link = next.join(&entry_name);
-                                            if let Err(e) = fs::symlink(&abs_target, &link).await {
-                                                warn!(
-                                                    link = %link.display(),
-                                                    target = %abs_target.display(),
-                                                    ?e,
-                                                    "prepare_output_dirs: failed to create shallow-copy symlink",
-                                                );
-                                            }
-                                        }
-
-                                        // Retry — the fix at this level may be sufficient.
-                                        if fs::create_dir_all(full_parent_path).await.is_ok() {
-                                            return Ok(());
-                                        }
-                                    }
-                                }
-
-                                #[cfg(target_family = "unix")]
-                                if meta.is_dir() && (meta.mode() & 0o200 == 0) {
-                                    // Read-only directory in the work tree (not through symlink).
-                                    // Safe to make writable since work dirs are independent copies.
-                                    let mut perms = meta.permissions();
-                                    perms.set_mode(meta.mode() | 0o200);
-                                    drop(fs::set_permissions(&next, perms).await);
-                                }
-                            }
-                            Err(_) => {
-                                // Path doesn't exist — create remaining dirs.
-                                fs::create_dir_all(full_parent_path).await
-                                    .err_tip(|| format!(
-                                        "Error creating output directory {}",
-                                        full_parent_path.display()
-                                    ))?;
-                                return Ok(());
-                            }
-                        }
-
-                        current = next;
-                    }
-
-                    // Final attempt after all fixes applied.
-                    fs::create_dir_all(full_parent_path).await
-                        .err_tip(|| format!(
-                            "Error creating output directory {} (after symlink fixes)",
-                            full_parent_path.display()
-                        ))?;
-                    Result::<(), Error>::Ok(())
+                    prepare_output_directory(
+                        &work_dir,
+                        &working_directory,
+                        &output_file,
+                        &lock,
+                        &metrics,
+                    )
+                    .await
                 }
             };
             self.metrics()
@@ -6140,6 +6199,18 @@ pub struct Metrics {
     pub worker_slow_tier_async_fail_cas: CounterWithTime,
     #[metric(help = "Worker slow-tier async write fail — unknown store class.")]
     pub worker_slow_tier_async_fail_unknown: CounterWithTime,
+    // #86: observability for #83 O14 (symlink_fix_lock Mutex→RwLock) decision.
+    // `pub` so integration tests can read `.counter.load(Ordering::Acquire)`
+    // to verify the increment fires on slow-path entry but NOT on fast-path
+    // early-return.
+    #[metric(
+        help = "Count of symlink_fix_lock acquires (fast-path skips this; every slow-path entry bumps it). Denominator for slow-path rate."
+    )]
+    pub symlink_fix_lock_acquires_total: CounterWithTime,
+    #[metric(
+        help = "Count of symlink_fix_lock slow-path entries (where output-dir prep needs to remove+recreate a symlink). Drives #83 O14 RwLock conversion decision: if <0.1% of output_files-action rate, revert to Mutex; if >1%, RwLock is justified."
+    )]
+    pub symlink_fix_slow_path_entries_total: CounterWithTime,
 }
 
 impl Metrics {

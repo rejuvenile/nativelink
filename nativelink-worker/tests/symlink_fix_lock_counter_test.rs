@@ -1,0 +1,192 @@
+// Copyright 2024 The NativeLink Authors. All rights reserved.
+//
+// Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future License (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    See LICENSE file for details
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! #86: counter wiring for `symlink_fix_lock` slow-path entries vs total
+//! acquires. Drives the #83 O14 (`Mutex` → `RwLock`) decision; without
+//! empirical slow-path-rate data, the conversion may be unjustified
+//! overhead.
+//!
+//! Asymmetric contract on `Metrics::symlink_fix_slow_path_entries_total`:
+//! - **Under-action (T1):** when the under-lock fast-path re-check fails
+//!   and the closure proceeds to walk the symlink tree, the counter MUST
+//!   increment exactly once. Verified by
+//!   `symlink_fix_slow_path_increments_on_slow_path_entry`.
+//! - **Over-action (T2):** when the fast-path early-return succeeds (no
+//!   lock acquired), the counter MUST stay at zero. Verified by
+//!   `symlink_fix_slow_path_does_not_increment_on_fast_path`.
+//!
+//! Both tests invoke the same `prepare_output_directory` helper that the
+//! production composition (`RunningActionImpl::inner_prepare_action`)
+//! calls per-output-file inside `try_join_all`, so behavior is exercised
+//! in production-shape — not a mock.
+
+#![cfg(target_family = "unix")]
+
+use core::sync::atomic::Ordering;
+use std::os::unix::fs::PermissionsExt;
+
+use nativelink_macro::nativelink_test;
+use nativelink_util::common::fs;
+use nativelink_worker::running_actions_manager::{Metrics, prepare_output_directory};
+use pretty_assertions::assert_eq;
+use rand::Rng;
+
+fn make_temp_path(data: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        std::env::var("TEST_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_str().unwrap().to_string()),
+        rand::rng().random::<u64>(),
+        data
+    )
+}
+
+/// T1 (under-action): when the parent directory pre-exists as a read-only
+/// directory (mode 0o555), the fast-path `create_dir_all` succeeds but
+/// `dir_writable=false` — we fall into the slow path. Counter MUST
+/// increment exactly once (one output file = one slow-path entry).
+///
+/// Mutation 2026-06-07: comment out
+/// `metrics.symlink_fix_slow_path_entries_total.inc()` in
+/// `running_actions_manager.rs::prepare_output_directory` → this test
+/// MUST red-fail with bespoke "symlink_fix_slow_path_entries counter did
+/// NOT increment on slow-path entry".
+#[nativelink_test]
+async fn symlink_fix_slow_path_increments_on_slow_path_entry()
+-> Result<(), Box<dyn core::error::Error>> {
+    let work_dir = make_temp_path("work_dir_t1");
+    fs::create_dir_all(&work_dir).await?;
+
+    // Pre-create the read-only parent directory so the fast-path
+    // create_dir_all succeeds (no-op, dir already exists) but the
+    // writability check fails. This drives the closure into the slow
+    // path, which (after the under-lock re-check) bumps the
+    // slow-path-entries counter.
+    let parent_dir = format!("{work_dir}/readonly_parent");
+    fs::create_dir(&parent_dir).await?;
+    let perms = std::fs::Permissions::from_mode(0o555);
+    fs::set_permissions(&parent_dir, perms).await?;
+
+    let metrics = Metrics::default();
+    let lock = tokio::sync::Mutex::new(());
+
+    // Production composition: same helper called by RunningActionImpl
+    // for every output file.
+    let res = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        prepare_output_directory(
+            &work_dir,
+            "",
+            "readonly_parent/out.txt",
+            &lock,
+            &metrics,
+        ),
+    )
+    .await
+    .expect(
+        "must not deadlock — prepare_output_directory slow-path lock contract violated",
+    );
+    res?;
+
+    // The slow-path walk should have chmod'd readonly_parent back to
+    // writable (0o200 | 0o555 = 0o755), so the operation succeeds AND
+    // the counter increments.
+    let slow_entries = metrics
+        .symlink_fix_slow_path_entries_total
+        .counter
+        .load(Ordering::Acquire);
+    assert_eq!(
+        slow_entries, 1,
+        "symlink_fix_slow_path_entries counter did NOT increment on slow-path entry (got {slow_entries}, expected 1)",
+    );
+    // Denominator: lock was acquired exactly once.
+    let acquires = metrics
+        .symlink_fix_lock_acquires_total
+        .counter
+        .load(Ordering::Acquire);
+    assert_eq!(
+        acquires, 1,
+        "symlink_fix_lock_acquires counter did NOT increment on lock acquire (got {acquires}, expected 1)",
+    );
+    Ok::<(), Box<dyn core::error::Error>>(())
+}
+
+/// T2 (over-action): when the output file's parent does NOT pre-exist
+/// (or is normally writable), the fast-path `create_dir_all` succeeds
+/// and the writability check passes — the closure returns immediately
+/// without acquiring the lock. Counter MUST stay at zero.
+///
+/// Mutation 2026-06-07: move
+/// `metrics.symlink_fix_slow_path_entries_total.inc()` from the
+/// post-re-check slow-path entry point to fire on every acquire (e.g.
+/// place it next to `symlink_fix_lock_acquires_total.inc()`), or remove
+/// the `if dir_writable { return Ok(()); }` fast-path early-return →
+/// this test MUST red-fail with bespoke "fast-path early-return
+/// spuriously incremented slow-path counter".
+#[nativelink_test]
+async fn symlink_fix_slow_path_does_not_increment_on_fast_path()
+-> Result<(), Box<dyn core::error::Error>> {
+    let work_dir = make_temp_path("work_dir_t2");
+    fs::create_dir_all(&work_dir).await?;
+
+    let metrics = Metrics::default();
+    let lock = tokio::sync::Mutex::new(());
+
+    // Fast path: parent doesn't exist yet, `create_dir_all` creates it
+    // (writable by default), the closure returns Ok before the lock is
+    // touched.
+    let res = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        prepare_output_directory(
+            &work_dir,
+            "",
+            "fresh_parent/out.txt",
+            &lock,
+            &metrics,
+        ),
+    )
+    .await
+    .expect(
+        "must not deadlock — prepare_output_directory fast-path contract violated",
+    );
+    res?;
+
+    // Confirm the parent was actually created (proves the fast path ran).
+    assert!(
+        fs::metadata(format!("{work_dir}/fresh_parent")).await.is_ok(),
+        "fast-path create_dir_all did not create fresh_parent",
+    );
+
+    // Slow-path counter MUST stay at zero.
+    let slow_entries = metrics
+        .symlink_fix_slow_path_entries_total
+        .counter
+        .load(Ordering::Acquire);
+    assert_eq!(
+        slow_entries, 0,
+        "fast-path early-return spuriously incremented slow-path counter (got {slow_entries}, expected 0)",
+    );
+    // Lock-acquire counter MUST also stay at zero (fast path never
+    // acquires the lock).
+    let acquires = metrics
+        .symlink_fix_lock_acquires_total
+        .counter
+        .load(Ordering::Acquire);
+    assert_eq!(
+        acquires, 0,
+        "fast-path early-return spuriously incremented lock-acquires counter (got {acquires}, expected 0)",
+    );
+    Ok::<(), Box<dyn core::error::Error>>(())
+}
+
