@@ -1991,7 +1991,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         ) {
             PeriodicTickMemoReset::None | PeriodicTickMemoReset::ReconnectClear => {}
             PeriodicTickMemoReset::HeartbeatResync { tick } => {
-                debug!(
+                // info! (not debug!) so the heartbeat fires-event survives the
+                // workspace's `release_max_level_info` pin on `tracing`
+                // (Cargo.toml:107) in release builds. As `debug!` it was
+                // compile-eliminated and the heartbeat invisible on workers
+                // despite the mechanism firing every 60 ticks (#93).
+                info!(
                     tag = "ac_pin_heartbeat_resync",
                     tick,
                     interval = AC_PIN_FULL_SNAPSHOT_EVERY_N_TICKS,
