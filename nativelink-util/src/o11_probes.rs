@@ -21,11 +21,14 @@
 //!
 //! The five probes:
 //!
-//! - **P1** `worker_upload_semaphore_*` — inflight + waiters gauges on
-//!   the `MAX_CONCURRENT_UPLOADS = 32` semaphore in
-//!   `LocalWorkerImpl::handle_upload_missing_blobs`. Falsification: if
-//!   peak `waiters > 0` sustained for >=1 minute during a build, the
-//!   32-permit cap IS being hit and O11's framing was wrong.
+//! - **P1** `worker_upload_semaphore_*` — process-wide aggregate
+//!   inflight + waiters counters summed across all concurrent
+//!   `LocalWorkerImpl::handle_upload_missing_blobs` invocations. The
+//!   underlying `Semaphore::new(MAX_CONCURRENT_UPLOADS = 32)` is
+//!   constructed PER CALL (pre-#85 semantics); the counters here
+//!   purely OBSERVE. Falsification: if peak `waiters > 0` sustained
+//!   for >=1 minute during a build, the per-call 32-permit cap IS
+//!   being hit and O11's framing was wrong.
 //! - **P2** `worker_actions_in_flight` — gauge for the
 //!   currently-private `actions_in_flight: AtomicU64` counter in
 //!   `LocalWorkerImpl::run`. No behavior change: just exposes what's
@@ -47,7 +50,7 @@ use std::sync::{Arc, OnceLock};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Latency histogram bucket boundaries (ms) for P3 (ByteStream::write
 /// elapsed) and P5 (EvictingMap lock-held). Per task #85 P3 spec:
@@ -136,119 +139,140 @@ impl O11LatencyHistogram {
 }
 
 // =====================================================================
-// P1 — MAX_CONCURRENT_UPLOADS semaphore inflight + waiters gauge
+// P1 — MAX_CONCURRENT_UPLOADS observation-only inflight + waiters
 // =====================================================================
 
-/// Worker-process-global upload semaphore + inflight/waiters gauges.
-///
-/// Lives at process-singleton scope (not per-`handle_upload_missing_blobs`
-/// invocation) so two simultaneous UploadMissingBlobs messages share
-/// the same 32-permit budget — matching what production already does
-/// when the function is called twice in flight on the same connection.
-/// Pre-#85 every call constructed its own `Arc<Semaphore>`, so the
-/// effective cap was 32 per call — not 32 worker-wide. The probe makes
-/// the cap explicit and worker-wide; that IS a behavior change for
-/// concurrent invocations, but the change is observability-required
-/// (a per-call semaphore cannot be polled for waiters).
-pub struct UploadSemaphoreMetrics {
-    /// 32-permit semaphore shared across all
-    /// `handle_upload_missing_blobs` calls in this worker process.
-    pub semaphore: Arc<Semaphore>,
-    /// Configured permit count (= `MAX_CONCURRENT_UPLOADS`). Constant.
-    pub max_permits: u64,
-    /// Live count of acquired permits = `max_permits - available_permits()`.
-    /// Exposed as a gauge under
-    /// `nativelink_worker_upload_semaphore_inflight`.
-    /// Derived live from `available_permits()` at publish time;
-    /// no separate atomic needed.
-    /// Live count of tasks blocked inside `acquire().await` waiting
-    /// for a permit. Manually maintained by the wrapper helper
-    /// `acquire_with_metrics` below — tokio's `Semaphore` does NOT
-    /// expose pending-waiter count, so the gauge is best-effort
-    /// (incremented before `.acquire().await`, decremented after).
-    pub waiters: Arc<AtomicI64>,
-}
-
-/// #85 P1: process-wide max-concurrent-uploads cap. Mirrors the prior
-/// per-call constant in `LocalWorkerImpl::handle_upload_missing_blobs`.
+/// #85 P1: per-call max-concurrent-uploads cap. The `Semaphore` itself
+/// is constructed per `handle_upload_missing_blobs` invocation (pre-#85
+/// semantics, preserved); this constant is exposed here only so callers
+/// + tests share the same cap value. The process-wide gauges below sum
+/// across ALL concurrent invocations.
 pub const MAX_CONCURRENT_UPLOADS: usize = 32;
 
-impl UploadSemaphoreMetrics {
-    fn new() -> Self {
+/// Worker-process-global observation-only inflight + waiters counters.
+///
+/// Pre-#85 every `handle_upload_missing_blobs` call constructed its own
+/// `Arc<Semaphore::new(MAX_CONCURRENT_UPLOADS)>` (per-call cap of 32).
+/// That semantics is RESTORED — the per-call `Semaphore` lives inside
+/// `handle_upload_missing_blobs` exactly as before. The counters here
+/// are PURELY OBSERVATIONAL: they sum across all concurrent invocations
+/// so an operator can see the aggregate inflight + waiters from a
+/// single scrape.
+///
+/// **Operator semantics**: `inflight` = total permits held across ALL
+/// concurrent `handle_upload_missing_blobs` invocations × all permits
+/// within each. `waiters` = total tasks currently blocked inside
+/// `.acquire().await` across all calls. Operator alarm: sustained
+/// `waiters > 0` indicates the per-call 32-permit cap is hit.
+///
+/// `MAX_CONCURRENT_UPLOADS = 32` applies PER-CALL (not as a global
+/// budget across calls) — two simultaneous invocations can together
+/// run up to 64 in-flight uploads.
+#[derive(Debug)]
+pub struct UploadInflightCounters {
+    /// Live count of acquired permits across all concurrent calls.
+    /// Incremented after `.acquire().await` returns, decremented when
+    /// the RAII `UploadInflightGuard` drops.
+    pub inflight: AtomicI64,
+    /// Live count of tasks blocked inside `.acquire().await` across
+    /// all concurrent calls. Incremented before `.acquire().await`,
+    /// decremented after.
+    pub waiters: AtomicI64,
+}
+
+/// RAII guard returned by [`UploadInflightCounters::acquire`]. Owns
+/// the underlying `OwnedSemaphorePermit` and decrements `inflight` on
+/// drop. The permit is released when the guard drops.
+#[must_use = "drop the guard to release the upload-semaphore permit"]
+pub struct UploadInflightGuard<'a> {
+    _permit: OwnedSemaphorePermit,
+    inflight: &'a AtomicI64,
+}
+
+impl Drop for UploadInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Decrement-on-drop guard for `waiters`. Used so that if the
+/// `.acquire().await` future is cancelled (dropped) while it is
+/// awaiting a permit, the waiters gauge does not leak.
+struct WaiterGuard<'a> {
+    waiters: &'a AtomicI64,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl UploadInflightCounters {
+    const fn new() -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS)),
-            max_permits: MAX_CONCURRENT_UPLOADS as u64,
-            waiters: Arc::new(AtomicI64::new(0)),
+            inflight: AtomicI64::new(0),
+            waiters: AtomicI64::new(0),
         }
     }
 
-    /// Acquire one permit while keeping the `waiters` gauge correct.
-    /// Returns the permit; drop to release.
+    /// Acquire one permit from the caller-supplied PER-CALL semaphore
+    /// while keeping the worker-wide `inflight` + `waiters` gauges
+    /// correct. The semaphore is the caller's local
+    /// `Arc<Semaphore::new(MAX_CONCURRENT_UPLOADS)>` (pre-#85
+    /// semantics); these counters only OBSERVE.
     ///
-    /// Caller MUST hold the returned `OwnedSemaphorePermit` for the
-    /// duration of the upload — releasing it (by drop) frees the
-    /// permit. The `inflight` gauge derives from `available_permits()`
-    /// at publish time, so the inflight number is automatically
-    /// correct without needing a manual decrement.
-    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+    /// `waiters` increments before the `.await`, decrements after.
+    /// `inflight` increments after acquire returns; the returned
+    /// `UploadInflightGuard` decrements it on drop.
+    pub async fn acquire<'a>(
+        &'a self,
+        sem: &Arc<Semaphore>,
+    ) -> UploadInflightGuard<'a> {
         self.waiters.fetch_add(1, Ordering::Relaxed);
-        let permit = Arc::clone(&self.semaphore)
+        // RAII so a cancelled `.await` (future dropped before
+        // acquire_owned() returns) does NOT leak `waiters`.
+        let waiter_guard = WaiterGuard { waiters: &self.waiters };
+        let permit = Arc::clone(sem)
             .acquire_owned()
             .await
             .expect("upload semaphore should never be closed");
-        self.waiters.fetch_sub(1, Ordering::Relaxed);
-        permit
+        drop(waiter_guard);
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        UploadInflightGuard {
+            _permit: permit,
+            inflight: &self.inflight,
+        }
     }
 }
 
-impl core::fmt::Debug for UploadSemaphoreMetrics {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("UploadSemaphoreMetrics")
-            .field("max_permits", &self.max_permits)
-            .field("waiters", &self.waiters.load(Ordering::Relaxed))
-            .field(
-                "available_permits",
-                &self.semaphore.available_permits(),
-            )
-            .finish()
-    }
-}
-
-impl MetricsComponent for UploadSemaphoreMetrics {
+impl MetricsComponent for UploadInflightCounters {
     fn publish(
         &self,
         _kind: MetricKind,
         _field_metadata: MetricFieldData,
     ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
-        let available = self.semaphore.available_permits() as u64;
-        let inflight = self.max_permits.saturating_sub(available);
+        let inflight = self.inflight.load(Ordering::Relaxed).max(0) as u64;
         let waiters = self.waiters.load(Ordering::Relaxed).max(0) as u64;
 
         nativelink_metric::publish!(
             "upload_semaphore_inflight",
             &inflight,
             MetricKind::Default,
-            "#85 P1: live count of acquired permits on the worker-wide \
-             MAX_CONCURRENT_UPLOADS semaphore (= max_permits - \
-             available_permits). Cap == 32; this gauge near the cap with \
-             waiters > 0 means the cap is binding."
+            "#85 P1: aggregate count of acquired permits across ALL \
+             concurrent handle_upload_missing_blobs invocations. \
+             MAX_CONCURRENT_UPLOADS=32 applies PER-CALL, so this gauge \
+             can exceed 32 when two invocations overlap."
         );
         nativelink_metric::publish!(
             "upload_semaphore_waiters",
             &waiters,
             MetricKind::Default,
             "#85 P1: best-effort count of tasks blocked inside \
-             acquire().await on the worker-wide \
-             MAX_CONCURRENT_UPLOADS semaphore. Falsification: if \
-             sustained > 0 for >=1 minute during a build, the 32-permit \
-             cap IS the limit — O11's framing was wrong."
-        );
-        nativelink_metric::publish!(
-            "upload_semaphore_max_permits",
-            &self.max_permits,
-            MetricKind::Default,
-            "#85 P1: configured cap on concurrent uploads \
-             (MAX_CONCURRENT_UPLOADS, constant)."
+             acquire().await across ALL concurrent invocations. \
+             Falsification: if sustained > 0 for >=1 minute during a \
+             build, the per-call 32-permit cap IS the limit — O11's \
+             framing was wrong."
         );
 
         Ok(MetricPublishKnownKindData::Component)
@@ -389,15 +413,18 @@ const fn bs_decode(idx: usize) -> (BsDirection, BsSizeBucket) {
     (direction, size)
 }
 
-/// Histograms of `ByteStream::write` / `ByteStream::read` end-to-end
+/// Histograms of `ByteStream::write` AND `ByteStream::read` end-to-end
 /// elapsed_ms, stratified by direction × size. One observation per RPC
-/// completion (success or error).
+/// completion (success or error). Named `Rpc` (not `Write`) because the
+/// struct emits histograms for BOTH upload and download cells — a
+/// `Write`-only name would mislead operators reading the
+/// `bytestream_download_elapsed_ms_*` gauges.
 #[derive(Debug)]
-pub struct BytestreamWriteHistograms {
+pub struct BytestreamRpcHistograms {
     histograms: [O11LatencyHistogram; BS_HISTOGRAM_COUNT],
 }
 
-impl BytestreamWriteHistograms {
+impl BytestreamRpcHistograms {
     fn new() -> Self {
         Self {
             histograms: [
@@ -428,7 +455,7 @@ impl BytestreamWriteHistograms {
     }
 }
 
-impl MetricsComponent for BytestreamWriteHistograms {
+impl MetricsComponent for BytestreamRpcHistograms {
     fn publish(
         &self,
         _kind: MetricKind,
@@ -507,37 +534,53 @@ impl MetricsComponent for EvictingMapLockHistogram {
 // Process-global singletons
 // =====================================================================
 
-static UPLOAD_SEMAPHORE_METRICS: OnceLock<Arc<UploadSemaphoreMetrics>> = OnceLock::new();
-static WORKER_ACTIONS_IN_FLIGHT: OnceLock<Arc<WorkerActionsInFlight>> = OnceLock::new();
-static BYTESTREAM_WRITE_HISTOGRAMS: OnceLock<Arc<BytestreamWriteHistograms>> = OnceLock::new();
-static EVICTING_MAP_LOCK_HISTOGRAM: OnceLock<Arc<EvictingMapLockHistogram>> = OnceLock::new();
+/// P1: process-wide observation-only inflight + waiters counters. The
+/// per-call `Semaphore` lives at the call site (pre-#85 semantics).
+static UPLOAD_INFLIGHT_COUNTERS: UploadInflightCounters = UploadInflightCounters::new();
 
-fn upload_semaphore_metrics_inner() -> &'static Arc<UploadSemaphoreMetrics> {
-    UPLOAD_SEMAPHORE_METRICS.get_or_init(|| Arc::new(UploadSemaphoreMetrics::new()))
-}
+static WORKER_ACTIONS_IN_FLIGHT: OnceLock<Arc<WorkerActionsInFlight>> = OnceLock::new();
+static BYTESTREAM_RPC_HISTOGRAMS: OnceLock<Arc<BytestreamRpcHistograms>> = OnceLock::new();
+static EVICTING_MAP_LOCK_HISTOGRAM: OnceLock<Arc<EvictingMapLockHistogram>> = OnceLock::new();
 
 fn worker_actions_in_flight_inner() -> &'static Arc<WorkerActionsInFlight> {
     WORKER_ACTIONS_IN_FLIGHT.get_or_init(|| Arc::new(WorkerActionsInFlight::new()))
 }
 
-fn bytestream_write_histograms_inner() -> &'static Arc<BytestreamWriteHistograms> {
-    BYTESTREAM_WRITE_HISTOGRAMS.get_or_init(|| Arc::new(BytestreamWriteHistograms::new()))
+fn bytestream_rpc_histograms_inner() -> &'static Arc<BytestreamRpcHistograms> {
+    BYTESTREAM_RPC_HISTOGRAMS.get_or_init(|| Arc::new(BytestreamRpcHistograms::new()))
 }
 
 fn evicting_map_lock_histogram_inner() -> &'static Arc<EvictingMapLockHistogram> {
     EVICTING_MAP_LOCK_HISTOGRAM.get_or_init(|| Arc::new(EvictingMapLockHistogram::new()))
 }
 
-/// P1: worker-wide upload-semaphore singleton.
+/// P1: worker-wide observation-only inflight + waiters counters.
 #[must_use]
-pub fn upload_semaphore_metrics() -> &'static UploadSemaphoreMetrics {
-    upload_semaphore_metrics_inner().as_ref()
+pub fn upload_inflight_counters() -> &'static UploadInflightCounters {
+    &UPLOAD_INFLIGHT_COUNTERS
 }
 
-/// P1: `Arc` to the same singleton — register with `MetricsRegistry`.
+/// P1: `Arc` wrapper for metrics registration. The counters live in a
+/// `static`; the `Arc` carries a thin wrapper that re-publishes the
+/// same static.
 #[must_use]
-pub fn upload_semaphore_metrics_arc() -> Arc<UploadSemaphoreMetrics> {
-    Arc::clone(upload_semaphore_metrics_inner())
+pub fn upload_inflight_counters_arc() -> Arc<UploadInflightCountersHandle> {
+    Arc::new(UploadInflightCountersHandle)
+}
+
+/// Zero-sized handle so `MetricsRegistry::register` can take an `Arc<T:
+/// MetricsComponent>` for the static-backed P1 counters.
+#[derive(Debug)]
+pub struct UploadInflightCountersHandle;
+
+impl MetricsComponent for UploadInflightCountersHandle {
+    fn publish(
+        &self,
+        kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        UPLOAD_INFLIGHT_COUNTERS.publish(kind, field_metadata)
+    }
 }
 
 /// P2: worker actions-in-flight singleton.
@@ -552,16 +595,16 @@ pub fn worker_actions_in_flight_arc() -> Arc<WorkerActionsInFlight> {
     Arc::clone(worker_actions_in_flight_inner())
 }
 
-/// P3: bytestream-write histograms singleton.
+/// P3: bytestream-rpc histograms singleton (both upload + download).
 #[must_use]
-pub fn bytestream_write_histograms() -> &'static BytestreamWriteHistograms {
-    bytestream_write_histograms_inner().as_ref()
+pub fn bytestream_rpc_histograms() -> &'static BytestreamRpcHistograms {
+    bytestream_rpc_histograms_inner().as_ref()
 }
 
 /// P3: `Arc` for metrics registration.
 #[must_use]
-pub fn bytestream_write_histograms_arc() -> Arc<BytestreamWriteHistograms> {
-    Arc::clone(bytestream_write_histograms_inner())
+pub fn bytestream_rpc_histograms_arc() -> Arc<BytestreamRpcHistograms> {
+    Arc::clone(bytestream_rpc_histograms_inner())
 }
 
 /// P5: evicting-map lock-held histogram singleton.
@@ -629,10 +672,12 @@ fn read_loadavg() -> (f64, f64, f64) {
 }
 
 /// Read available memory (MB) on macOS via `sysctlbyname`. Sums
-/// `vm.page_free_count`, `vm.page_speculative_count`, and
-/// `vm.page_inactive_count` (the same composition `vm_stat` reports as
-/// "available") times the page size from `hw.pagesize`. Returns 0 on
-/// any syscall failure (best-effort observability).
+/// `vm.page_free_count` + `vm.page_speculative_count` (a reasonable
+/// approximation of "memory available without paging" — inactive
+/// pages are intentionally NOT included because reclaiming them
+/// requires writeback). Multiplied by the page size from
+/// `hw.pagesize`. Returns 0 on any syscall failure (best-effort
+/// observability).
 #[cfg(target_os = "macos")]
 fn read_mem_available_mb() -> u64 {
     let page_size = sysctl_u64(c"hw.pagesize").unwrap_or(4096);
@@ -690,72 +735,180 @@ fn sysctl_u64(name: &core::ffi::CStr) -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// #85 P1 (test stamp 2026-06-07): UploadSemaphoreMetrics exposes
-    /// the three named metric fields. Mutation: rename `waiters` to
-    /// `_waiters_renamed` — this test red-fails because
-    /// `acquire_with_metrics` no longer maintains the gauge under that
-    /// path. (Field rename is the canonical mutation per CLAUDE.md.)
-    #[test]
-    fn p1_upload_semaphore_metric_fields_present() {
-        let m = UploadSemaphoreMetrics::new();
-        assert_eq!(m.max_permits, MAX_CONCURRENT_UPLOADS as u64);
-        assert_eq!(m.waiters.load(Ordering::Relaxed), 0);
+    /// #85 P1 (test stamp 2026-06-08): single-acquire path. Drives
+    /// the per-call Semaphore + observation-only counter path.
+    /// Tests use a LOCAL `UploadInflightCounters` instance for
+    /// isolation (the production singleton is `&'static`; the
+    /// `acquire` method is lifetime-parameterized so both work).
+    #[tokio::test]
+    async fn p1_acquire_increments_inflight_and_releases_on_drop() {
+        let counters = UploadInflightCounters::new();
+
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
+        let guard = counters.acquire(&sem).await;
         assert_eq!(
-            m.semaphore.available_permits(),
-            MAX_CONCURRENT_UPLOADS
+            sem.available_permits(),
+            MAX_CONCURRENT_UPLOADS - 1,
+            "per-call semaphore must lose one permit after acquire"
+        );
+        assert_eq!(
+            counters.inflight.load(Ordering::Relaxed),
+            1,
+            "inflight gauge must be 1 after acquire returns"
+        );
+        // waiters returns to 0 (we did not contend).
+        assert_eq!(
+            counters.waiters.load(Ordering::Relaxed),
+            0,
+            "waiters must be 0 once acquire returns",
+        );
+
+        drop(guard);
+        assert_eq!(
+            sem.available_permits(),
+            MAX_CONCURRENT_UPLOADS,
+            "per-call semaphore must regain permit when guard drops"
+        );
+        assert_eq!(
+            counters.inflight.load(Ordering::Relaxed),
+            0,
+            "inflight gauge must be 0 after guard drops"
         );
     }
 
-    /// #85 P1 (2026-06-07): acquire raises waiters during contention.
-    /// Drives the path that `acquire_with_metrics` would actually run.
+    /// #85 P1 (2026-06-08): SATURATION test — `MAX_CONCURRENT_UPLOADS`
+    /// concurrent acquires MUST hold all permits; one more MUST block.
+    /// Bespoke message: "P1 saturation: 33rd acquire did not block
+    /// when 32 permits held".
+    ///
+    /// Asserts `MAX_CONCURRENT_UPLOADS == 32` first so a mutation that
+    /// raises the constant (e.g. to u32::MAX) red-fails on the
+    /// hard-coded assertion BEFORE the saturation check — making the
+    /// mutation visible without timing out.
     #[tokio::test]
-    async fn p1_upload_semaphore_acquire_metric() {
-        let m = UploadSemaphoreMetrics::new();
-        let permit = m.acquire().await;
-        assert_eq!(m.semaphore.available_permits(), MAX_CONCURRENT_UPLOADS - 1);
-        // waiters should be 0 once acquire returns
-        assert_eq!(m.waiters.load(Ordering::Relaxed), 0);
-        drop(permit);
-        assert_eq!(m.semaphore.available_permits(), MAX_CONCURRENT_UPLOADS);
+    async fn p1_acquire_saturated_blocks_33rd() {
+        assert_eq!(
+            MAX_CONCURRENT_UPLOADS, 32,
+            "P1 saturation: MAX_CONCURRENT_UPLOADS must remain 32 — \
+             if intentionally changed, update this saturation test too"
+        );
+        let counters = UploadInflightCounters::new();
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
+
+        // Hold all 32 permits.
+        let mut guards = Vec::with_capacity(MAX_CONCURRENT_UPLOADS);
+        for _ in 0..MAX_CONCURRENT_UPLOADS {
+            guards.push(counters.acquire(&sem).await);
+        }
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "all MAX_CONCURRENT_UPLOADS=32 permits must be held"
+        );
+        assert_eq!(
+            counters.inflight.load(Ordering::Relaxed),
+            MAX_CONCURRENT_UPLOADS as i64,
+            "P1 saturation: inflight must equal MAX_CONCURRENT_UPLOADS when all permits held"
+        );
+
+        // 33rd acquire MUST block. Race it against a short timer; the
+        // timer MUST win. If the acquire wins, the cap is broken.
+        // Scope the future so it is dropped (cancelled) at end of
+        // block — that drop releases the waiter-guard, decrementing
+        // `waiters`.
+        {
+            let sem_for_third = Arc::clone(&sem);
+            let acquire_fut = counters.acquire(&sem_for_third);
+            let timer = tokio::time::sleep(core::time::Duration::from_millis(100));
+            tokio::select! {
+                _ = acquire_fut => panic!(
+                    "P1 saturation: 33rd acquire did not block when 32 permits held"
+                ),
+                () = timer => {}
+            }
+        }
+
+        assert_eq!(
+            counters.waiters.load(Ordering::Relaxed),
+            0,
+            "waiters must return to 0 after the 33rd acquire future is dropped"
+        );
+        drop(guards);
+        assert_eq!(
+            sem.available_permits(),
+            MAX_CONCURRENT_UPLOADS,
+            "all permits must be returned after guards drop"
+        );
+        assert_eq!(
+            counters.inflight.load(Ordering::Relaxed),
+            0,
+            "inflight must be 0 after all guards drop"
+        );
     }
 
-    /// #85 P2 (2026-06-07): WorkerActionsInFlight exposes the
+    /// #85 P2 (2026-06-08): WorkerActionsInFlight exposes the
     /// `counter` field. Mutation: rename `counter` to `_counter_x` →
     /// type no longer compiles (struct member rename); the test
     /// red-fails.
     #[test]
     fn p2_actions_in_flight_field_present() {
         let m = WorkerActionsInFlight::new();
-        assert_eq!(m.counter.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            m.counter.load(Ordering::Relaxed),
+            0,
+            "P2: WorkerActionsInFlight::counter must initialize to 0"
+        );
         m.counter.fetch_add(3, Ordering::Relaxed);
-        assert_eq!(m.counter.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            m.counter.load(Ordering::Relaxed),
+            3,
+            "P2: counter must reflect producer-side fetch_add"
+        );
     }
 
-    /// #85 P3 (2026-06-07): histograms record observations on the
+    /// #85 P3 (2026-06-08): histograms record observations on the
     /// correct (direction, size) cell. Mutation: swap
     /// `BsSizeBucket::Small` → `BsSizeBucket::Large` in the `observe`
     /// call → counts shift cells, test red-fails.
     #[test]
     fn p3_bytestream_histograms_cell_routing() {
-        let h = BytestreamWriteHistograms::new();
+        let h = BytestreamRpcHistograms::new();
         // 512 KiB upload → Small
         h.observe(BsDirection::Upload, 512 * 1024, 10);
-        assert_eq!(h.cell_count(BsDirection::Upload, BsSizeBucket::Small), 1);
+        assert_eq!(
+            h.cell_count(BsDirection::Upload, BsSizeBucket::Small),
+            1,
+            "P3: 512 KiB upload must route to Upload×Small cell"
+        );
         // 10 MiB download → Medium
         h.observe(BsDirection::Download, 10 * (1 << 20), 100);
         assert_eq!(
             h.cell_count(BsDirection::Download, BsSizeBucket::Medium),
-            1
+            1,
+            "P3: 10 MiB download must route to Download×Medium cell"
         );
         // 100 MiB upload → Large
         h.observe(BsDirection::Upload, 100 * (1 << 20), 5000);
-        assert_eq!(h.cell_count(BsDirection::Upload, BsSizeBucket::Large), 1);
+        assert_eq!(
+            h.cell_count(BsDirection::Upload, BsSizeBucket::Large),
+            1,
+            "P3: 100 MiB upload must route to Upload×Large cell"
+        );
         // Other cells remain zero.
-        assert_eq!(h.cell_count(BsDirection::Download, BsSizeBucket::Small), 0);
-        assert_eq!(h.cell_count(BsDirection::Upload, BsSizeBucket::Medium), 0);
+        assert_eq!(
+            h.cell_count(BsDirection::Download, BsSizeBucket::Small),
+            0,
+            "P3: Download×Small must remain zero — no observation routed there"
+        );
+        assert_eq!(
+            h.cell_count(BsDirection::Upload, BsSizeBucket::Medium),
+            0,
+            "P3: Upload×Medium must remain zero — no observation routed there"
+        );
         assert_eq!(
             h.cell_count(BsDirection::Download, BsSizeBucket::Large),
-            0
+            0,
+            "P3: Download×Large must remain zero — no observation routed there"
         );
     }
 
@@ -779,22 +932,30 @@ mod tests {
         );
     }
 
-    /// #85 P5 (2026-06-07): EvictingMapLockHistogram records via
+    /// #85 P5 (2026-06-08): EvictingMapLockHistogram records via
     /// `observe`. Mutation: rename `observe` body to no-op → count
     /// stays 0, test red-fails on the `1` assertion.
     #[test]
     fn p5_evicting_map_lock_histogram_observe() {
         let h = EvictingMapLockHistogram::new();
-        assert_eq!(h.total_count(), 0);
+        assert_eq!(
+            h.total_count(),
+            0,
+            "P5: EvictingMapLockHistogram must initialize to 0 observations"
+        );
         h.observe(10);
         h.observe(75);
         h.observe(1500);
-        assert_eq!(h.total_count(), 3);
+        assert_eq!(
+            h.total_count(),
+            3,
+            "P5: total_count must reflect every observation through `observe`"
+        );
         // 10 ms goes into le_10, le_25, ..., le_30000 buckets.
         assert_eq!(
             h.histogram.buckets[2].load(Ordering::Relaxed),
             1,
-            "10 ms must land in le_10 bucket"
+            "P5: 10 ms must land in le_10 bucket"
         );
     }
 
@@ -819,7 +980,7 @@ mod tests {
         assert!(h.inf_bucket.load(Ordering::Relaxed) >= prev);
     }
 
-    /// #85 P4 (2026-06-07): on non-macOS the sampler is a no-op
+    /// #85 P4 (2026-06-08): on non-macOS the sampler is a no-op
     /// (compile-time guarantee). On macOS we cannot assert the
     /// tracing line from a unit test without a subscriber, so the
     /// test just exercises the spawn under a runtime.
@@ -829,5 +990,33 @@ mod tests {
         // Calling on non-macOS must not panic and must return
         // immediately (the cfg-noop body).
         spawn_system_metrics_sampler();
+    }
+
+    /// #85 P4 (2026-06-08): macOS smoke test for the two sysctl
+    /// readers — `read_loadavg` and `read_mem_available_mb`. Asserts
+    /// they do not panic and return bounded values.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn p4_macos_sysctl_readers_smoke() {
+        let (l1, l5, l15) = read_loadavg();
+        // Load averages are non-negative; on a healthy macOS host all
+        // three are < 10_000. The (0, 0, 0) fallback is also allowed
+        // (best-effort observability).
+        assert!(
+            (0.0..10_000.0).contains(&l1)
+                && (0.0..10_000.0).contains(&l5)
+                && (0.0..10_000.0).contains(&l15),
+            "P4: read_loadavg must return finite non-negative values (got {l1}, {l5}, {l15})"
+        );
+
+        let mem_mb = read_mem_available_mb();
+        // A non-zero return means sysctl succeeded; zero is the
+        // documented fallback. Either is acceptable — we only assert
+        // that the function did not panic and the value is bounded
+        // by a sane upper limit (10 TiB ≈ 10_485_760 MB).
+        assert!(
+            mem_mb < 10_485_760,
+            "P4: read_mem_available_mb returned unreasonable value {mem_mb} MB"
+        );
     }
 }

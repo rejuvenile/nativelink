@@ -1812,20 +1812,29 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             "UploadMissingBlobs: uploading blobs to server"
         );
 
-        // #85 P1 (2026-06-07): use the process-wide upload-semaphore
-        // singleton so `nativelink_worker_upload_semaphore_{inflight,
-        // waiters}` reflects the real cap. Cap value
-        // (`MAX_CONCURRENT_UPLOADS = 32`) lives at the singleton.
-        let upload_metrics =
-            ::nativelink_util::o11_probes::upload_semaphore_metrics();
+        // #85 P1 (2026-06-08): per-call `Semaphore::new(MAX_CONCURRENT_UPLOADS)`
+        // (pre-#85 semantics, restored). The
+        // `handle_upload_missing_blobs` call has two spawn sites
+        // (`:2520` reconnect retry + `:2777` server-driven push) that
+        // CAN overlap, so a process-singleton would narrow the effective
+        // cap from N×32 → 32 — that is an architectural change requiring
+        // explicit sign-off. The observation-only counters in
+        // `upload_inflight_counters()` SUM across all concurrent calls so
+        // the aggregate inflight + waiters is still scrapeable.
+        let upload_sem = Arc::new(Semaphore::new(
+            ::nativelink_util::o11_probes::MAX_CONCURRENT_UPLOADS,
+        ));
+        let upload_counters =
+            ::nativelink_util::o11_probes::upload_inflight_counters();
 
         let mut uploads: FuturesUnordered<_> = present
             .iter()
             .map(|&digest| {
                 let cas_store_wrapped = cas_store_wrapped.clone();
                 let slow_store = slow_store.clone();
+                let upload_sem = Arc::clone(&upload_sem);
                 async move {
-                    let _permit = upload_metrics.acquire().await;
+                    let _permit = upload_counters.acquire(&upload_sem).await;
                     // Use in-memory transfer for small blobs, streaming for
                     // large ones to avoid OOM on multi-GB blobs. Reads go
                     // through the FastSlowStore wrapper so mirror_blobs

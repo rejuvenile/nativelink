@@ -3382,7 +3382,7 @@ impl ByteStreamServer {
         // outcomes.
         #[allow(clippy::cast_possible_truncation)]
         let p3_elapsed_ms = start_time.elapsed().as_millis() as u64;
-        ::nativelink_util::o11_probes::bytestream_write_histograms().observe(
+        ::nativelink_util::o11_probes::bytestream_rpc_histograms().observe(
             ::nativelink_util::o11_probes::BsDirection::Upload,
             expected_size,
             p3_elapsed_ms,
@@ -3730,7 +3730,7 @@ impl ByteStream for ByteStreamServer {
         // (download) × size_bucket.
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = start_time.elapsed().as_millis() as u64;
-        ::nativelink_util::o11_probes::bytestream_write_histograms().observe(
+        ::nativelink_util::o11_probes::bytestream_rpc_histograms().observe(
             ::nativelink_util::o11_probes::BsDirection::Download,
             expected_size,
             elapsed_ms,
