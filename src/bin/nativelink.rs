@@ -646,6 +646,27 @@ async fn inner_main(
         nativelink_util::phase0_metrics::server_phase0_metrics_arc(),
     );
 
+    // #85 (2026-06-07): 5 observability-only probes from the O11
+    // investigation. All five singletons registered unconditionally:
+    // the binary serves both worker and server scrapes, and the
+    // gauges read live state from whichever role is producing.
+    metrics_registry.register(
+        "o11_upload_semaphore",
+        nativelink_util::o11_probes::upload_semaphore_metrics_arc(),
+    );
+    metrics_registry.register(
+        "o11_actions_in_flight",
+        nativelink_util::o11_probes::worker_actions_in_flight_arc(),
+    );
+    metrics_registry.register(
+        "o11_bytestream_write",
+        nativelink_util::o11_probes::bytestream_write_histograms_arc(),
+    );
+    metrics_registry.register(
+        "o11_evicting_map_lock",
+        nativelink_util::o11_probes::evicting_map_lock_histogram_arc(),
+    );
+
     metrics_registry.register(
         "grpc_stream",
         nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),

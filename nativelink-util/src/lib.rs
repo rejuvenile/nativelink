@@ -38,6 +38,7 @@ pub mod known_platform_property_provider;
 pub mod metrics;
 pub mod metrics_publisher;
 pub mod metrics_utils;
+pub mod o11_probes;
 pub mod operation_state_manager;
 pub mod origin_event;
 pub mod origin_event_publisher;

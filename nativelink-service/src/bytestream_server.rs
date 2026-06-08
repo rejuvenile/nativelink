@@ -3375,6 +3375,19 @@ impl ByteStreamServer {
             .write_duration_ns
             .fetch_add(elapsed_ns, Ordering::Relaxed);
 
+        // #85 P3 (2026-06-07): record once per ByteStream::write
+        // completion (success OR error), stratified by direction
+        // (upload) × size_bucket. Observed once per RPC regardless
+        // of result variant so the histogram reflects ALL RPC
+        // outcomes.
+        #[allow(clippy::cast_possible_truncation)]
+        let p3_elapsed_ms = start_time.elapsed().as_millis() as u64;
+        ::nativelink_util::o11_probes::bytestream_write_histograms().observe(
+            ::nativelink_util::o11_probes::BsDirection::Upload,
+            expected_size,
+            p3_elapsed_ms,
+        );
+
         match &result {
             Ok(_) => {
                 let elapsed = start_time.elapsed();
@@ -3711,6 +3724,17 @@ impl ByteStream for ByteStreamServer {
             .metrics
             .read_duration_ns
             .fetch_add(elapsed_ns, Ordering::Relaxed);
+
+        // #85 P3 (2026-06-07): record once per ByteStream::read
+        // completion (success OR error), stratified by direction
+        // (download) × size_bucket.
+        #[allow(clippy::cast_possible_truncation)]
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        ::nativelink_util::o11_probes::bytestream_write_histograms().observe(
+            ::nativelink_util::o11_probes::BsDirection::Download,
+            expected_size,
+            elapsed_ms,
+        );
 
         match &resp {
             Ok(_) => {

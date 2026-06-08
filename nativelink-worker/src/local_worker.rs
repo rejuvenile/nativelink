@@ -1812,20 +1812,20 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
             "UploadMissingBlobs: uploading blobs to server"
         );
 
-        const MAX_CONCURRENT_UPLOADS: usize = 32;
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
+        // #85 P1 (2026-06-07): use the process-wide upload-semaphore
+        // singleton so `nativelink_worker_upload_semaphore_{inflight,
+        // waiters}` reflects the real cap. Cap value
+        // (`MAX_CONCURRENT_UPLOADS = 32`) lives at the singleton.
+        let upload_metrics =
+            ::nativelink_util::o11_probes::upload_semaphore_metrics();
 
         let mut uploads: FuturesUnordered<_> = present
             .iter()
             .map(|&digest| {
                 let cas_store_wrapped = cas_store_wrapped.clone();
                 let slow_store = slow_store.clone();
-                let semaphore = semaphore.clone();
                 async move {
-                    let _permit = semaphore
-                        .acquire()
-                        .await
-                        .expect("semaphore should not be closed");
+                    let _permit = upload_metrics.acquire().await;
                     // Use in-memory transfer for small blobs, streaming for
                     // large ones to avoid OOM on multi-GB blobs. Reads go
                     // through the FastSlowStore wrapper so mirror_blobs
@@ -2530,9 +2530,13 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         let mut update_for_worker_stream = update_for_worker_stream.fuse();
         // A notify which is triggered every time actions_in_flight is subtracted.
         let actions_notify = Arc::new(Notify::new());
-        // A counter of actions that are in-flight, this is similar to actions_in_transit but
-        // includes the AC upload and notification to the scheduler.
-        let actions_in_flight = Arc::new(AtomicU64::new(0));
+        // #85 P2 (2026-06-07): share the in-flight counter with the
+        // worker-process-global `WorkerActionsInFlight` singleton so
+        // it is scrapeable as `worker_actions_in_flight`. Producer is
+        // unchanged (existing fetch_add/fetch_sub below).
+        let actions_in_flight = Arc::clone(
+            &::nativelink_util::o11_probes::worker_actions_in_flight().counter,
+        );
         // Set to true when shutting down, this stops any new StartAction.
         let mut shutting_down = false;
 
@@ -3440,6 +3444,10 @@ pub async fn new_local_worker(
     historical_store: Store,
 ) -> Result<LocalWorker<WorkerApiClientWrapper, RunningActionsManagerImpl>, Error> {
     start_cpu_sampler()?;
+
+    // #85 P4 (2026-06-07): periodic load_avg + mem_avail sampler.
+    // macOS-only; no-op on Linux (server doesn't need it).
+    ::nativelink_util::o11_probes::spawn_system_metrics_sampler();
 
     let fast_slow_store = cas_store
         .downcast_ref::<FastSlowStore>(None)

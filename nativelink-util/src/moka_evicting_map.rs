@@ -1369,6 +1369,10 @@ where
         self.cache.run_pending_tasks();
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
+        // #85 P5 (2026-06-07): histogram-export the same elapsed_ms
+        // already measured here so contention BELOW the 50 ms warn
+        // is visible. Observation-only; no behavior change.
+        crate::o11_probes::evicting_map_lock_histogram().observe(elapsed_ms);
         if iter_truncated || elapsed_ms > 50 {
             warn!(
                 evicted_count,
