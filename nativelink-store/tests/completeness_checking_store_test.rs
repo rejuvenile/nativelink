@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use nativelink_config::stores::MemorySpec;
-use nativelink_error::Error;
+use nativelink_error::{Code, Error};
 use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ActionResult as ProtoActionResult, Directory, DirectoryNode, FileNode, OutputDirectory,
@@ -242,6 +243,118 @@ async fn verify_completeness_get() -> Result<(), Error> {
             ".get() should fail with item missing in CAS",
         );
     }
+
+    Ok(())
+}
+
+/// Test A — under-action direction: incomplete branch MUST emit warn! with
+/// the exact message and the missing CAS digest's hex hash.
+///
+/// Derives assertions from the SPEC (#1: CCS get_part incomplete-branch warn,
+/// closing #40 RCA §5(1) observability gap). The warn! is NOT present in the
+/// unmodified production code, so this test is expected to FAIL (red) until
+/// the instrumentation is added.
+///
+/// Timeout = deadlock detector: the error path in get_and_verify_single must
+/// terminate; a hang here means the error path is blocking.
+#[nativelink_test]
+async fn get_part_incomplete_emits_warn_with_missing_digest() -> Result<(), Error> {
+    let (ac_store, cas_store, action_result_digest) = setup().await?;
+
+    // Remove OUTPUT_FILE from CAS so the completeness check detects an
+    // incomplete ActionResult on the get_part path.
+    cas_store.remove_entry(OUTPUT_FILE.into()).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        ac_store.get_part_unchunked(action_result_digest, 0, None),
+    )
+    .await
+    .expect("must not deadlock — CCS get_part error path must terminate");
+
+    // The error code and stable substring must both hold.
+    let err = result.expect_err(
+        "expected Err(NotFound) when referenced CAS digest is missing from CAS",
+    );
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "CCS get_part incomplete path must return Code::NotFound, got {:?}",
+        err.code,
+    );
+    assert!(
+        err.messages.iter().any(|m| m.contains("not all parts were found")),
+        "error message must contain stable substring 'not all parts were found'; \
+         got messages: {:?}",
+        err.messages,
+    );
+
+    // Message assertion — the exact string the SPEC mandates.
+    // This is the primary guard: if the warn! is absent entirely, this fails
+    // with the bespoke "#40 §5(1) instrumentation absent" message.
+    assert!(
+        logs_contain("ActionResult incomplete — referenced CAS digest(s) missing (get_part path)"),
+        "missing-digest warn did not fire on CCS get_part incomplete path — \
+         #40 §5(1) instrumentation absent",
+    );
+
+    // Same-line compound check (canonical pattern:
+    // fast_slow_block_b_log_visibility_test.rs:239): the WARN level, the
+    // ac_key + missing_digests fields, and the missing digest's hex hash
+    // (OUTPUT_FILE = DigestInfo::new([4u8; 32], 0)) must all appear on ONE
+    // captured line. A bare `logs_contain("0404…")` would false-positive on
+    // the DEBUG-level MemoryStore setup lines that also contain the hex, and
+    // a bare `logs_contain("WARN")` would false-positive on any unrelated
+    // warn — the same-line conjunction is immune to both AND catches a
+    // warn!→debug! level mutation.
+    logs_assert(|lines: &[&str]| {
+        let n = lines
+            .iter()
+            .filter(|l| {
+                l.contains(" WARN ")
+                    && l.contains(
+                        "ActionResult incomplete — referenced CAS digest(s) missing (get_part path)",
+                    )
+                    && l.contains("ac_key=")
+                    && l.contains("missing_digests=")
+                    && l.contains("0404040404040404")
+            })
+            .count();
+        if n == 0 {
+            Err("missing-digest warn must fire at WARN level with ac_key + \
+                 missing_digests fields and the missing digest's hash on one \
+                 line — per-digest attribution is the whole point of #40 §5(1)"
+                .to_string())
+        } else {
+            Ok(())
+        }
+    });
+
+    Ok(())
+}
+
+/// Test B — over-action direction: a COMPLETE ActionResult must NOT trigger
+/// the incomplete-branch warn!.
+///
+/// Falsification: if the warn fires unconditionally (not just on the
+/// incomplete branch), this test red-fails with bespoke message.
+#[nativelink_test]
+async fn get_part_complete_emits_no_incomplete_warn() -> Result<(), Error> {
+    let (ac_store, _cas_store, action_result_digest) = setup().await?;
+
+    // Nothing deleted — all CAS blobs present; completeness check must pass.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ac_store.get_part_unchunked(action_result_digest, 0, None),
+    )
+    .await
+    .expect("must not deadlock — CCS get_part complete path must terminate")
+    .expect("get_part must succeed when all CAS digests are present");
+
+    assert!(
+        !logs_contain("ActionResult incomplete — referenced CAS digest(s) missing (get_part path)"),
+        "incomplete warn fired on a COMPLETE ActionResult — over-action contract violation",
+    );
 
     Ok(())
 }

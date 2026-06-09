@@ -467,14 +467,38 @@ impl CompletenessCheckingStore {
             // existence check still gates the AC entry's completeness;
             // missing CAS digests still surface as `Code::NotFound` so
             // callers fall back to a full re-execute.
-            for r in has_results.iter() {
-                if r.is_none() {
-                    self.incomplete_entries_counter.inc();
-                    return Err(make_err!(
-                        Code::NotFound,
-                        "Digest found, but not all parts were found in CompletenessCheckingStore::get_part"
-                    ));
-                }
+            //
+            // #40 §5(1): collect every missing digest so operators get
+            // per-digest evidence (which AC entry, which CAS digest) —
+            // the counter alone produced 10K+ ticks with zero log trace,
+            // blocking slow-tier-eviction vs mirror-write-loss
+            // attribution.
+            let missing_digests: Vec<&StoreKey<'_>> = digest_infos
+                .iter()
+                .zip(has_results.iter())
+                .filter_map(|(digest, r)| r.is_none().then_some(digest))
+                .collect();
+            if !missing_digests.is_empty() {
+                self.incomplete_entries_counter.inc();
+                // Cap the logged list — a tree-heavy ActionResult can
+                // reference thousands of files; missing_count carries
+                // the full total.
+                const MAX_LOGGED_MISSING: usize = 10;
+                warn!(
+                    ac_key = ?key,
+                    missing_count = missing_digests.len(),
+                    total_count = digest_infos.len(),
+                    missing_digests =
+                        ?&missing_digests[..missing_digests.len().min(MAX_LOGGED_MISSING)],
+                    "ActionResult incomplete — referenced CAS digest(s) missing (get_part path)"
+                );
+                return Err(make_err!(
+                    Code::NotFound,
+                    "Digest found, but not all parts were found in CompletenessCheckingStore::get_part (missing {} of {} referenced CAS digests; first missing: {:?})",
+                    missing_digests.len(),
+                    digest_infos.len(),
+                    missing_digests[0]
+                ));
             }
         }
 
