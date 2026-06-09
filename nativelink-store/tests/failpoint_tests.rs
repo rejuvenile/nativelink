@@ -482,11 +482,37 @@ async fn streaming_blob_reader_failpoint_returns_error() -> Result<(), Error> {
     assert_eq!(chunk2.len(), 256, "should get second chunk");
     assert_eq!(chunk2[0], 0xBB, "second chunk should be 0xBB");
 
+    // Deliver the REMAINING declared bytes before EOF. The digest declares
+    // 1024 bytes; #502 (8e6be6d7) added a silent-short defense that turns
+    // `send_eof` with bytes_written < expected_size into Err(Internal) at
+    // the reader — which is correct production behavior, exercised by
+    // nativelink-util's own tests. This test's contract is failpoint
+    // RECOVERY → clean EOF, so the writer must deliver all declared bytes.
+    // (#5 fix 2026-06-09: #502 scoped its caller analysis to
+    // nativelink-util; this cross-crate test was outside that scope and
+    // was red on main since 2026-05-16.)
+    writer.send(Bytes::from(vec![0xCC; 256])).await.unwrap();
+    writer.send(Bytes::from(vec![0xDD; 256])).await.unwrap();
+
+    let chunk3 = reader.next_chunk().await.unwrap();
+    assert_eq!(chunk3.len(), 256, "should get third chunk");
+    assert_eq!(chunk3[0], 0xCC, "third chunk should be 0xCC");
+
+    let chunk4 = reader.next_chunk().await.unwrap();
+    assert_eq!(chunk4.len(), 256, "should get fourth chunk");
+    assert_eq!(chunk4[0], 0xDD, "fourth chunk should be 0xDD");
+
     // Clean up the writer.
     let mut writer = writer;
     writer.send_eof().unwrap();
 
-    let eof = reader.next_chunk().await.unwrap();
+    let eof = tokio::time::timeout(std::time::Duration::from_secs(5), reader.next_chunk())
+        .await
+        .expect("must not deadlock — clean EOF after full delivery must resolve promptly")
+        .expect(
+            "#5: clean EOF after full 1024-byte delivery must not be converted to Err — \
+             check bytes_written vs expected_size_on_store at send_eof time",
+        );
     assert!(eof.is_empty(), "should get EOF");
 
     Ok(())
