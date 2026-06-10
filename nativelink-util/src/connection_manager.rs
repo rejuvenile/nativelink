@@ -143,6 +143,22 @@ enum ConnectionRequest {
         endpoint_uri: Option<String>,
         reason: String,
     },
+    /// Caller-driven eviction of a SPECIFIC channel identified by its
+    /// `(endpoint_index, connection_index)` pair obtained from
+    /// `Connection::channel_id_for_log`. Unlike `EvictIdle` (which targets
+    /// one ARBITRARY idle channel per endpoint), this evicts exactly the
+    /// channel that produced the observed error.
+    ///
+    /// Dedup key: `"ch:{endpoint_index}:{connection_index}"` — distinct
+    /// from the URI-based keys used by `EvictIdle`, so two callers
+    /// reporting the SAME dead channel within `EVICT_DEDUP_WINDOW` are
+    /// collapsed to one eviction (avoiding double-reconnect), while N
+    /// DISTINCT dead channels each get their own dedup key and are each
+    /// evicted independently.
+    EvictChannel {
+        identifier: ChannelIdentifier,
+        reason: String,
+    },
 }
 
 /// The result of a Future that connects to a given Endpoint.  This is a tuple
@@ -183,12 +199,26 @@ struct ConnectionManagerWorker {
     /// The retry configuration for connecting to an Endpoint, on failure will
     /// restart the retrier after a 1 second delay.
     retrier: Retrier,
-    /// Per-endpoint last-eviction timestamp used to dedup `EvictIdle`
-    /// requests within `EVICT_DEDUP_WINDOW`. Without this, a GOAWAY storm
-    /// produces N concurrent retries each posting EvictIdle, evicting up
-    /// to N healthy channels and causing thundering-herd reconnect (#147).
-    /// Key is the endpoint URI string from `EvictIdle.endpoint_uri`, or
-    /// `""` for "any endpoint" requests.
+    /// Per-eviction-key last-eviction timestamp used to dedup `EvictIdle`
+    /// and `EvictChannel` requests within `EVICT_DEDUP_WINDOW`. Without this,
+    /// a GOAWAY / latch storm produces N concurrent retries each posting an
+    /// eviction, causing thundering-herd reconnect (#147).
+    ///
+    /// Key classes:
+    ///   EvictIdle: endpoint URI string from `EvictIdle.endpoint_uri`, or
+    ///     `""` for "any endpoint" requests. Bounded by `endpoints.len()`
+    ///     (typically 1–4 in production).
+    ///   EvictChannel: `"ch:{endpoint_index}:{connection_index}"` strings.
+    ///     `connection_index` is monotonically increasing — each latch episode
+    ///     adds new keys that are never removed. Growth: ~64 bytes/entry ×
+    ///     (episodes × channels_per_ep); at 5 episodes/day × 32 channels ×
+    ///     365 days ≈ 58 K entries ≈ 3.7 MB worst-case on a long-lived
+    ///     worker process.
+    ///
+    // UNBOUNDED-OK: the ch: key space grows O(reconnect_events) but is NOT
+    // attacker-controlled — the server is a trusted LAN peer and all
+    // channel identifiers originate from this worker's own pool. Growth
+    // rate is KB/day; not an OOM risk on any realistic uptime.
     last_evict_at: HashMap<String, Instant>,
 }
 
@@ -309,6 +339,38 @@ impl ConnectionManager {
             .connection_tx
             .send(ConnectionRequest::EvictIdle {
                 endpoint_uri,
+                reason: reason.into(),
+            });
+    }
+
+    /// Evict the SPECIFIC channel identified by
+    /// `(endpoint_index, connection_index)` (obtained from
+    /// `Connection::channel_id_for_log`). Unlike `evict_idle_channel` —
+    /// which targets one arbitrary idle channel — this names the exact
+    /// channel that produced the observed transport error, so N distinct
+    /// latched channels are each evicted independently instead of being
+    /// collapsed by the per-endpoint dedup window.
+    ///
+    /// The dedup key is `"ch:{endpoint_index}:{connection_index}"` which
+    /// is distinct from `EvictIdle`'s URI-based keys. Duplicate reports
+    /// for the SAME channel within `EVICT_DEDUP_WINDOW` are collapsed
+    /// (still prevents double-reconnect storms for a single dead channel);
+    /// reports for DISTINCT channels use distinct keys and are not
+    /// collapsed.
+    pub fn evict_channel_by_id(
+        &self,
+        endpoint_index: usize,
+        connection_index: usize,
+        reason: impl Into<String>,
+    ) {
+        let identifier = ChannelIdentifier {
+            endpoint_index,
+            connection_index,
+        };
+        let _ = self
+            .connection_tx
+            .send(ConnectionRequest::EvictChannel {
+                identifier,
                 reason: reason.into(),
             });
     }
@@ -525,7 +587,39 @@ impl ConnectionManagerWorker {
         match request {
             ConnectionRequest::Dropped(maybe_channel) => {
                 if let Some(channel) = maybe_channel {
-                    self.available_channels.push_back(channel);
+                    // #2 Fix-A: if this channel was recently targeted by
+                    // `evict_channel_by_id` (its dedup key is still warm),
+                    // discard it and spawn a fresh connection rather than
+                    // returning it to the idle pool. This handles the
+                    // race where the eviction request arrives before the
+                    // Dropped message (e.g. caller drops without making an
+                    // RPC after reporting a latch). Without this check the
+                    // channel would silently re-enter the pool and the
+                    // eviction would have had no effect.
+                    let dedup_key = format!(
+                        "ch:{}:{}",
+                        channel.identifier.endpoint_index,
+                        channel.identifier.connection_index
+                    );
+                    let eviction_pending = self.last_evict_at.get(&dedup_key).is_some_and(
+                        |prev| Instant::now().duration_since(*prev) < EVICT_DEDUP_WINDOW,
+                    );
+                    if eviction_pending {
+                        info!(
+                            endpoint_index = channel.identifier.endpoint_index,
+                            connection_index = channel.identifier.connection_index,
+                            "ConnectionManager: Dropped channel was pending eviction — \
+                             spawning fresh connection instead of returning to idle pool \
+                             (#2 Fix-A)"
+                        );
+                        // Pass `None` for immediate reconnect with fresh connection_index
+                        // (no backoff — eviction is deliberate replacement, not a failure).
+                        self.connect_endpoint(channel.identifier.endpoint_index, None);
+                        // Fall through to increment available_connections and
+                        // re-check waiting_connections.
+                    } else {
+                        self.available_channels.push_back(channel);
+                    }
                 }
                 self.available_connections += 1;
                 self.maybe_available_connection();
@@ -615,6 +709,66 @@ impl ConnectionManagerWorker {
                         ?endpoint_uri,
                         available_channels = self.available_channels.len(),
                         "ConnectionManager: EvictIdle requested but no matching idle channel (#147 trace)"
+                    );
+                }
+            }
+            // See `ConnectionManager::evict_channel_by_id` doc.
+            ConnectionRequest::EvictChannel { identifier, reason } => {
+                // Dedup key is channel-specific so distinct latched channels
+                // each get independent dedup clocks. Same-channel duplicate
+                // reports within the window are still collapsed (prevents
+                // double-reconnect on a single dead channel).
+                let dedup_key =
+                    format!("ch:{}:{}", identifier.endpoint_index, identifier.connection_index);
+                let now = Instant::now();
+                if let Some(prev) = self.last_evict_at.get(&dedup_key)
+                    && now.duration_since(*prev) < EVICT_DEDUP_WINDOW
+                {
+                    info!(
+                        %reason,
+                        endpoint_index = identifier.endpoint_index,
+                        connection_index = identifier.connection_index,
+                        "ConnectionManager: EvictChannel deduped within window \
+                         (same channel reported multiple times — only one reconnect needed)"
+                    );
+                    return;
+                }
+                // Remove the specific channel from the idle pool if it is
+                // currently idle. If it is checked-out (in-flight RPC), the
+                // `ConnectionRequest::Error` path (fired by `ResponseFuture::poll`)
+                // handles it; we only need to handle the idle case here.
+                let victim_pos = self
+                    .available_channels
+                    .iter()
+                    .position(|c| c.identifier == identifier);
+                if let Some(pos) = victim_pos {
+                    let victim = self.available_channels.remove(pos)
+                        .expect("pos was just found via .position() on the same VecDeque — cannot be None");
+                    let endpoint_index = victim.identifier.endpoint_index;
+                    let connection_index = victim.identifier.connection_index;
+                    drop(victim);
+                    self.last_evict_at.insert(dedup_key, now);
+                    warn!(
+                        %reason,
+                        ?endpoint_index,
+                        ?connection_index,
+                        "ConnectionManager: evicting specific latched channel by id (#2 Fix-A)"
+                    );
+                    // Pass `None` so the reconnect gets a fresh connection_index
+                    // and connects immediately (no backoff sleep). Backoff is for
+                    // transport failures; eviction is a deliberate replacement.
+                    self.connect_endpoint(endpoint_index, None);
+                } else {
+                    // Channel is checked-out: the `Error` path handles it,
+                    // or the channel already reconnected. Record the timestamp
+                    // so duplicate reports are still deduped.
+                    self.last_evict_at.insert(dedup_key, now);
+                    info!(
+                        %reason,
+                        endpoint_index = identifier.endpoint_index,
+                        connection_index = identifier.connection_index,
+                        "ConnectionManager: EvictChannel for id not in idle pool \
+                         (checked-out or already reconnected — Error path handles it)"
                     );
                 }
             }
@@ -1007,6 +1161,13 @@ mod tests {
     /// validated independently of "no more idle channels to evict";
     /// without dedup, the first 4 storm requests would each pop a
     /// healthy channel and queue 4 reconnects.
+    ///
+    /// **Behavior note (#2 Fix-A):** `evict_idle_channel(None, ...)` uses a
+    /// single shared dedup key `""` for all "any-endpoint" requests, so N
+    /// requests still collapse to 1. The NEW `evict_channel_by_id` uses
+    /// per-channel keys so DISTINCT dead channels are each evicted — that
+    /// is tested separately in `evict_channel_storm_distinct_channels_all_evicted`.
+    /// This test verifies the LEGACY dedup semantics are UNCHANGED.
     #[tokio::test]
     async fn evict_idle_storm_dedups_to_single_eviction() {
         let (port, accept_count, accept_task) = bind_counting_listener().await;
@@ -1128,13 +1289,396 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Endpoint A must NOT have been touched.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let a_after = accepts_a.load(std::sync::atomic::Ordering::SeqCst);
+        // Endpoint A must NOT have been touched. Poll for up to 1s to detect
+        // any straggler reconnect; fail immediately on first straggler.
+        let straggler_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let a_now = accepts_a.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                a_now, base_a,
+                "targeted eviction leaked across endpoints — endpoint A was \
+                 reconnected when only endpoint B was evicted \
+                 (base_a={base_a}, now={a_now})"
+            );
+            if tokio::time::Instant::now() > straggler_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        task_a.abort();
+        task_b.abort();
+    }
+
+    /// #2 Fix-A test 1: a channel that produced a transport-shaped error is
+    /// evicted by identity. After acquiring a connection (recording its
+    /// `channel_id_for_log`), returning it to the pool, then calling
+    /// `evict_channel_by_id` with that identity, a NEW TCP accept must
+    /// happen — proving the exact channel was replaced, not an arbitrary one.
+    ///
+    /// Mutation step: comment out `self.connect_endpoint(...)` in the
+    /// `EvictChannel` arm of `handle_connection`. This test must panic with
+    /// "eviction did not target the failing channel — no reconnect observed".
+    #[tokio::test]
+    async fn evict_channel_by_id_targets_failing_channel() {
+        let (port, accept_count, accept_task) = bind_counting_listener().await;
+        let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .expect("valid endpoint")
+            .connect_timeout(Duration::from_secs(2));
+        let cm = ConnectionManager::new(
+            std::iter::once(endpoint),
+            /* connections_per_endpoint */ 1,
+            /* max_concurrent_requests */ 1,
+            Retry { max_retries: 0, delay: 0.0, jitter: 0.0, ..Default::default() },
+            Arc::new(|d| d),
+        );
+
+        // Wait for the initial connection to land in the pool.
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if accept_count.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+            if tokio::time::Instant::now() > initial_deadline {
+                panic!("initial TCP accept did not happen within 3s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let baseline = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Acquire a connection to read its identity, then return it to the
+        // pool by dropping it. `channel_id_for_log` gives us the
+        // (endpoint_index, connection_index) pair that identifies this
+        // specific channel.
+        let conn = cm
+            .connection("test-acquire".to_string())
+            .await
+            .expect("connection must be available after initial dial");
+        let (ep_idx, conn_idx) = conn.channel_id_for_log();
+        drop(conn); // Return to pool.
+
+        // Brief yield so the Dropped message is processed and the channel
+        // is back in available_channels before we send EvictChannel.
+        tokio::task::yield_now().await;
+
+        // Evict by identity. This MUST evict exactly the channel we just
+        // returned — not a random idle channel.
+        cm.evict_channel_by_id(ep_idx, conn_idx, "test: latched channel eviction by id");
+
+        // Wait for the reconnect TCP dial (~1s ± jitter).
+        let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let now = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+            if now > baseline {
+                break;
+            }
+            if tokio::time::Instant::now() > reconnect_deadline {
+                panic!(
+                    "eviction did not target the failing channel — no reconnect observed \
+                     after evict_channel_by_id(ep={ep_idx}, conn={conn_idx}); \
+                     accept_count stuck at {now} (baseline {baseline})"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        accept_task.abort();
+    }
+
+    /// #2 Fix-A test 2 (storm): N distinct channels latch and all report
+    /// errors within `EVICT_DEDUP_WINDOW`. With `evict_channel_by_id` each
+    /// uses a distinct dedup key, so ALL N must be evicted / reconnecting
+    /// instead of being collapsed to a single eviction.
+    ///
+    /// Uses a 4-channel pool (connections_per_endpoint=4). All 4 channels
+    /// are acquired to obtain their identities, then returned. Then 4
+    /// `evict_channel_by_id` calls are issued within the dedup window.
+    /// Expect 4 NEW accepts (one per evicted channel), not 1.
+    ///
+    /// Mutation step: replace `EvictChannel` handling with the old
+    /// `EvictIdle`-style dedup (single dedup_key for all requests).
+    /// This test must panic with "storm dedup collapsed distinct dead
+    /// channels — expected 4 reconnects".
+    #[tokio::test]
+    async fn evict_channel_storm_distinct_channels_all_evicted() {
+        let (port, accept_count, accept_task) = bind_counting_listener().await;
+        let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .expect("valid endpoint")
+            .connect_timeout(Duration::from_secs(2));
+        let cm = ConnectionManager::new(
+            std::iter::once(endpoint),
+            /* connections_per_endpoint */ 4,
+            /* max_concurrent_requests */ 4,
+            Retry { max_retries: 0, delay: 0.0, jitter: 0.0, ..Default::default() },
+            Arc::new(|d| d),
+        );
+
+        // Wait for all 4 initial connections to land.
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if accept_count.load(std::sync::atomic::Ordering::SeqCst) >= 4 {
+                break;
+            }
+            if tokio::time::Instant::now() > initial_deadline {
+                panic!(
+                    "expected 4 initial accepts in 5s, got {}",
+                    accept_count.load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let baseline = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Acquire all 4 channels to record their identities, then return them.
+        let mut ids = Vec::new();
+        let mut conns = Vec::new();
+        for _ in 0..4 {
+            let conn = cm
+                .connection("test-acquire".to_string())
+                .await
+                .expect("channel must be available");
+            ids.push(conn.channel_id_for_log());
+            conns.push(conn);
+        }
+        // Drop all connections to return them to the pool.
+        drop(conns);
+
+        // Yield enough times for all 4 Dropped messages to be processed by
+        // the ConnectionManager worker. Each tokio::select! iteration processes
+        // one message; with 4 channels we need at least 4 yields. Use 8 to
+        // absorb any scheduler jitter.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Evict all 4 by identity within the dedup window. With per-channel
+        // dedup keys, each eviction has its own clock — all 4 fire.
+        for (ep_idx, conn_idx) in &ids {
+            cm.evict_channel_by_id(
+                *ep_idx,
+                *conn_idx,
+                format!("storm: latched ch ({ep_idx},{conn_idx})"),
+            );
+        }
+
+        // Wait for all 4 reconnects. Each has ~1s backoff ± jitter, so
+        // allow 5s for all 4 to land.
+        let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+            if now >= baseline + 4 {
+                break;
+            }
+            if tokio::time::Instant::now() > reconnect_deadline {
+                let now = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+                panic!(
+                    "storm dedup collapsed distinct dead channels — expected 4 reconnects \
+                     (baseline {baseline} + 4 = {}), got {} accepts total; \
+                     without per-channel dedup keys, all 4 eviction requests share the same \
+                     dedup window and only 1 reconnect fires",
+                    baseline + 4,
+                    now
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        accept_task.abort();
+    }
+
+    /// #2 Fix-A: same-channel duplicate `evict_channel_by_id` reports within
+    /// `EVICT_DEDUP_WINDOW` are still collapsed to one eviction (prevents
+    /// double-reconnect for a single dead channel — the dedup-within-channel
+    /// invariant is preserved even with per-channel keys).
+    ///
+    /// Mutation step: remove the `last_evict_at` check in the `EvictChannel`
+    /// arm. This test must panic with
+    /// "same-channel duplicate evictions were not deduped — expected exactly
+    /// 1 reconnect".
+    #[tokio::test]
+    async fn evict_channel_same_channel_duplicates_deduped() {
+        let (port, accept_count, accept_task) = bind_counting_listener().await;
+        let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .expect("valid endpoint")
+            .connect_timeout(Duration::from_secs(2));
+        // 4-channel pool so dedup is not confused with "no more idle channels".
+        let cm = ConnectionManager::new(
+            std::iter::once(endpoint),
+            /* connections_per_endpoint */ 4,
+            /* max_concurrent_requests */ 4,
+            Retry { max_retries: 0, delay: 0.0, jitter: 0.0, ..Default::default() },
+            Arc::new(|d| d),
+        );
+
+        // Wait for all 4 initial connections.
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if accept_count.load(std::sync::atomic::Ordering::SeqCst) >= 4 {
+                break;
+            }
+            if tokio::time::Instant::now() > initial_deadline {
+                panic!(
+                    "expected 4 initial accepts in 5s, got {}",
+                    accept_count.load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let baseline = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Acquire ONE channel to record its identity, then return it.
+        let conn = cm
+            .connection("test-acquire".to_string())
+            .await
+            .expect("channel must be available");
+        let (ep_idx, conn_idx) = conn.channel_id_for_log();
+        drop(conn);
+        tokio::task::yield_now().await;
+
+        // Send 8 eviction requests for the SAME channel within the window.
+        for i in 0..8 {
+            cm.evict_channel_by_id(ep_idx, conn_idx, format!("same-ch-dup-{i}"));
+        }
+
+        // Wait for exactly ONE reconnect to land.
+        let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let now = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+            if now > baseline {
+                break;
+            }
+            if tokio::time::Instant::now() > reconnect_deadline {
+                panic!(
+                    "no reconnect observed for same-channel dedup test; \
+                     accept_count stuck at baseline {baseline}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Poll past the dedup window to detect any straggler reconnects.
+        // Fail immediately if a straggler arrives rather than sleeping the
+        // full window before asserting.
+        let straggler_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(500)
+            + EVICT_DEDUP_WINDOW;
+        loop {
+            let now = accept_count.load(std::sync::atomic::Ordering::SeqCst);
+            let extra = now - baseline;
+            assert_eq!(
+                extra, 1,
+                "same-channel duplicate evictions were not deduped — expected \
+                 exactly 1 reconnect from 8 duplicate evict_channel_by_id calls \
+                 for the same channel (ep={ep_idx}, conn={conn_idx}); got \
+                 {extra} reconnects. Without intra-channel dedup 8 reconnects \
+                 would fire (extra straggler observed at this poll)."
+            );
+            if tokio::time::Instant::now() > straggler_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        accept_task.abort();
+    }
+
+    /// #2 Fix-A over-action test: evicting channel A by identity must NOT
+    /// evict channel B from the same pool. Uses a 2-endpoint pool (1 conn
+    /// each) with separate counting listeners so we can assert per-channel
+    /// reconnect counts independently.
+    ///
+    /// The contract: `evict_channel_by_id(A)` evicts EXACTLY one channel —
+    /// the named one — and leaves all others untouched.
+    ///
+    /// Mutation step: replace the `position(|c| c.identifier == identifier)`
+    /// lookup in the `EvictChannel` arm with `pop_front()` (arbitrary eviction).
+    /// This test must panic with "wrong channel was evicted — channel B was
+    /// reconnected when only channel A should have been evicted".
+    #[tokio::test]
+    async fn evict_channel_by_id_does_not_evict_sibling_channel() {
+        // Two separate listeners so we can track each channel independently.
+        let (port_a, accepts_a, task_a) = bind_counting_listener().await;
+        let (port_b, accepts_b, task_b) = bind_counting_listener().await;
+        let ep_a = Endpoint::from_shared(format!("http://127.0.0.1:{port_a}"))
+            .expect("ep a")
+            .connect_timeout(Duration::from_secs(2));
+        let ep_b = Endpoint::from_shared(format!("http://127.0.0.1:{port_b}"))
+            .expect("ep b")
+            .connect_timeout(Duration::from_secs(2));
+
+        // 1 connection per endpoint so we have exactly one channel per
+        // listener. 2 concurrent requests to allow acquiring both at once.
+        let cm = ConnectionManager::new(
+            [ep_a, ep_b],
+            /* connections_per_endpoint */ 1,
+            /* max_concurrent_requests */ 2,
+            Retry { max_retries: 0, delay: 0.0, jitter: 0.0, ..Default::default() },
+            Arc::new(|d| d),
+        );
+
+        // Wait for both endpoints to complete their initial dial.
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let a = accepts_a.load(std::sync::atomic::Ordering::SeqCst);
+            let b = accepts_b.load(std::sync::atomic::Ordering::SeqCst);
+            if a >= 1 && b >= 1 {
+                break;
+            }
+            if tokio::time::Instant::now() > initial_deadline {
+                panic!(
+                    "initial dials did not complete in 5s (a={a}, b={b})"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let baseline_a = accepts_a.load(std::sync::atomic::Ordering::SeqCst);
+        let baseline_b = accepts_b.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Acquire both connections to read their identities, then return them.
+        let conn_a = cm
+            .connection("test-acquire-a".to_string())
+            .await
+            .expect("conn A must be available");
+        let conn_b = cm
+            .connection("test-acquire-b".to_string())
+            .await
+            .expect("conn B must be available");
+        let (ep_a_idx, conn_a_idx) = conn_a.channel_id_for_log();
+        drop(conn_a);
+        drop(conn_b);
+        // Let both Dropped messages be processed.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Evict ONLY channel A by identity.
+        cm.evict_channel_by_id(ep_a_idx, conn_a_idx, "test: evict A only".to_string());
+
+        // Wait for channel A to reconnect (proves the eviction worked on A).
+        let deadline_a = tokio::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            let a = accepts_a.load(std::sync::atomic::Ordering::SeqCst);
+            if a > baseline_a {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline_a {
+                panic!(
+                    "channel A reconnect not observed after targeted eviction; \
+                     accepts_a stuck at {a} (baseline {baseline_a})"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Channel B must NOT have been evicted — its accept count must equal
+        // the baseline (no reconnect triggered).
+        let b_after = accepts_b.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            a_after, base_a,
-            "endpoint A's accept count changed (base={base_a}, now={a_after}); \
-             targeted eviction leaked across endpoints"
+            b_after, baseline_b,
+            "wrong channel was evicted — channel B was reconnected when only \
+             channel A should have been evicted (baseline_b={baseline_b}, \
+             b_after={b_after}); evict_channel_by_id must target by identity \
+             via position(), not via pop_front()"
         );
 
         task_a.abort();

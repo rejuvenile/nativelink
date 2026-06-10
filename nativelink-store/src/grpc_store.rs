@@ -181,6 +181,55 @@ fn looks_like_dead_channel(err: &Error) -> bool {
     }
 }
 
+/// Maximum elapsed time (ms) for an attempt to be classified as an
+/// instant-fail latched-pool hit. tower-Buffer's `ServiceError` surfaces
+/// synchronously (the buffer's worker holds the latch in RAM and returns
+/// immediately), so genuine latched-pool attempts complete in <5ms.
+/// We use 50ms to give ample headroom for scheduler jitter while still
+/// being far below the minimum genuine transport RTT (~100ms LAN, ~1ms loopback).
+const LATCHED_POOL_INSTANT_FAIL_MS: u64 = 50;
+
+/// Number of consecutive instant latched-pool failures required before
+/// aborting retries early. N=2 ensures we do not abort on a single
+/// coincidentally-fast transient; after Fix-A, the first failure evicts
+/// the dead channel — if the SECOND attempt (drawing a fresh or still-idle
+/// channel from a pool of 32) also instant-fails, the pool is systemically
+/// latched and further retries will not help within the retry budget.
+const LATCHED_POOL_ABORT_THRESHOLD: u32 = 2;
+
+/// Returns `true` if `err` is the tower-Buffer ServiceError that appears
+/// when a channel's internal service worker panics or is dropped — the
+/// "latched pool" signature. This is distinct from `looks_like_dead_channel`
+/// (which covers GOAWAY, broken pipe, etc. and is used for eviction);
+/// this predicate is ONLY used to decide whether to abort retries early
+/// (#2 Fix-C).
+///
+/// **Why message matching:** tonic wraps the tower `BoxError` as
+/// `Status::Unknown` with no typed discriminator; the only way to
+/// distinguish it from other Unknown errors is the message text. The
+/// message `"buffered service failed: ..."` is stable — it is the
+/// `Display` impl of `tower::buffer::error::ServiceError` (see
+/// <https://docs.rs/tower/latest/tower/buffer/error/struct.ServiceError.html>).
+/// We deliberately match a SUBSTRING rather than an exact prefix to be
+/// robust against upstream tonic/tower message composition changes.
+fn looks_like_latched_pool(err: &Error, elapsed_ms: u64) -> bool {
+    #[cfg(feature = "failpoints")]
+    // Allow tests to bypass the timing gate so they don't depend on
+    // loopback RTT being below LATCHED_POOL_INSTANT_FAIL_MS.
+    fail::fail_point!("latched_pool_bypass_timing", |_| {
+        return err.code == Code::Unknown
+            && err.messages.iter().any(|m| m.contains("buffered service"));
+    });
+    if elapsed_ms > LATCHED_POOL_INSTANT_FAIL_MS {
+        return false; // Not instant — genuine transport RTT, not a latch.
+    }
+    err.code == Code::Unknown
+        && err
+            .messages
+            .iter()
+            .any(|m| m.contains("buffered service"))
+}
+
 /// Pure-function classifier for `get_part_parallel`'s per-chunk attempt
 /// loop. Encapsulated so it can be unit-tested without standing up a
 /// real gRPC bytestream server. Inputs:
@@ -1150,11 +1199,42 @@ impl GrpcStore {
         Ok(request)
     }
 
+    /// Returns `(stream, channel_id)` where `channel_id` is
+    /// `Some((endpoint_index, connection_index))` for TCP channels and
+    /// `None` for QUIC. The id is used by callers to evict the specific
+    /// failing channel via `evict_channel_by_id` (#2 Fix-A).
+    /// Returns `(stream, channel_id, post_conn_instant)` on success, or
+    /// `(err, channel_id, post_conn_instant)` on error.
+    ///
+    /// `channel_id` is `Some(ep_idx, conn_idx)` if a connection was acquired
+    /// before the failure — the caller uses it for targeted Fix-A eviction on
+    /// pre-stream errors (item #2 fix-up). If connection acquisition itself
+    /// fails, `channel_id` is `None`.
+    ///
+    /// `post_conn_instant` is captured right after `cm.connection()` returns,
+    /// BEFORE the `.read()` RPC call. K2 fix: callers compute `elapsed_ms` from
+    /// this instant — excluding connection-acquire queue wait — so the
+    /// `looks_like_latched_pool` 50ms gate is not defeated by saturation-induced
+    /// queue delays. If connection acquisition failed (no channel acquired),
+    /// `post_conn_instant` is set at the moment of failure; elapsed from it will
+    /// be ~0ms and will not affect the latched-pool classifier (those errors have
+    /// `channel_id = None` and take a different eviction path).
+    ///
+    // NOTE: channel_id is Some only for Transport::Tcp and
+    // Transport::Dual+prefer_tcp=true. For QUIC and Dual+prefer_tcp=false,
+    // channel identity is not tracked; those arms return None.
     async fn read_internal(
         &self,
         request: ReadRequest,
         prefer_tcp: bool,
-    ) -> Result<impl Stream<Item = Result<ReadResponse, Status>> + use<>, Error> {
+    ) -> Result<
+        (
+            impl Stream<Item = Result<ReadResponse, Status>> + use<>,
+            Option<(usize, usize)>,
+            std::time::Instant,
+        ),
+        (Error, Option<(usize, usize)>, std::time::Instant),
+    > {
         let _ = prefer_tcp; // Used only in the Dual transport arm (quic feature)
         let mut grpc_request = Request::new(request);
         if IS_WORKER_REQUEST.try_with(|v| *v).unwrap_or(false) {
@@ -1168,13 +1248,17 @@ impl GrpcStore {
         // for resource Y" — the same resource_name appears in
         // get_part_single_stream's logs, providing a join key.
         let resource_for_log = grpc_request.get_ref().resource_name.clone();
-        let mut response = match &self.transport {
+        let (mut response, channel_id, post_conn_instant) = match &self.transport {
             Transport::Tcp(cm) => {
                 let channel = cm
                     .connection("bytestream_read".into())
                     .await
-                    .err_tip(|| "in read_internal")?;
+                    .err_tip(|| "in read_internal")
+                    .map_err(|e| (e, None, std::time::Instant::now()))?;
                 let (ep_idx, conn_idx) = channel.channel_id_for_log();
+                // K2 fix: clock starts AFTER channel acquisition so the
+                // elapsed used in looks_like_latched_pool excludes queue wait.
+                let post_conn = std::time::Instant::now();
                 info!(
                     resource_name = %resource_for_log,
                     transport = "tcp",
@@ -1182,24 +1266,29 @@ impl GrpcStore {
                     connection_index = conn_idx,
                     "GrpcStore::read_internal channel acquired (#147 trace)",
                 );
-                self.bs_client(channel)
+                let resp = self.bs_client(channel)
                     .read(grpc_request)
                     .await
-                    .err_tip(|| "in GrpcStore::read")?
-                    .into_inner()
+                    .err_tip(|| "in GrpcStore::read")
+                    .map_err(|e| (e, Some((ep_idx, conn_idx)), post_conn))?
+                    .into_inner();
+                (resp, Some((ep_idx, conn_idx)), post_conn)
             }
             #[cfg(feature = "quic")]
             Transport::Quic(ch) => {
+                let post_conn = std::time::Instant::now();
                 info!(
                     resource_name = %resource_for_log,
                     transport = "quic",
                     "GrpcStore::read_internal channel acquired (#147 trace)",
                 );
-                self.bs_client(ch.clone())
+                let resp = self.bs_client(ch.clone())
                     .read(grpc_request)
                     .await
-                    .err_tip(|| "in GrpcStore::read (quic)")?
-                    .into_inner()
+                    .err_tip(|| "in GrpcStore::read (quic)")
+                    .map_err(|e| (e, None, post_conn))?
+                    .into_inner();
+                (resp, None, post_conn)
             }
             #[cfg(feature = "quic")]
             Transport::Dual { tcp, quic } => {
@@ -1209,8 +1298,10 @@ impl GrpcStore {
                     let channel = tcp
                         .connection("bytestream_read".into())
                         .await
-                        .err_tip(|| "in read_internal (dual/tcp)")?;
+                        .err_tip(|| "in read_internal (dual/tcp)")
+                        .map_err(|e| (e, None, std::time::Instant::now()))?;
                     let (ep_idx, conn_idx) = channel.channel_id_for_log();
+                    let post_conn = std::time::Instant::now();
                     info!(
                         resource_name = %resource_for_log,
                         transport = "dual/tcp",
@@ -1218,30 +1309,36 @@ impl GrpcStore {
                         connection_index = conn_idx,
                         "GrpcStore::read_internal channel acquired (#147 trace)",
                     );
-                    self.bs_client(channel)
+                    let resp = self.bs_client(channel)
                         .read(grpc_request)
                         .await
-                        .err_tip(|| "in GrpcStore::read (dual/tcp)")?
-                        .into_inner()
+                        .err_tip(|| "in GrpcStore::read (dual/tcp)")
+                        .map_err(|e| (e, Some((ep_idx, conn_idx)), post_conn))?
+                        .into_inner();
+                    (resp, Some((ep_idx, conn_idx)), post_conn)
                 } else {
                     // Single-stream reads: prefer QUIC (2.6x faster)
+                    let post_conn = std::time::Instant::now();
                     info!(
                         resource_name = %resource_for_log,
                         transport = "dual/quic",
                         "GrpcStore::read_internal channel acquired (#147 trace)",
                     );
-                    self.bs_client(quic.clone())
+                    let resp = self.bs_client(quic.clone())
                         .read(grpc_request)
                         .await
-                        .err_tip(|| "in GrpcStore::read (dual/quic)")?
-                        .into_inner()
+                        .err_tip(|| "in GrpcStore::read (dual/quic)")
+                        .map_err(|e| (e, None, post_conn))?
+                        .into_inner();
+                    (resp, None, post_conn)
                 }
             }
         };
         let first_response = response
             .message()
             .await
-            .err_tip(|| "Fetching first chunk in GrpcStore::read()")?;
+            .err_tip(|| "Fetching first chunk in GrpcStore::read()")
+            .map_err(|e| (e, channel_id, post_conn_instant))?;
         // #479: wrap the response stream so SREs can observe per-chunk
         // arrival pacing (process-wide GRPC_READ_SLOW_CHUNK_TOTAL counter
         // + rate-limited warn) on EVERY single-stream read. The
@@ -1249,9 +1346,13 @@ impl GrpcStore {
         // and never aborts the stream. The label disambiguates this
         // path from `get_part_parallel`'s parallel chunk reads in
         // journal greps.
-        Ok(ReadProgressObserver::new(
-            "GrpcStore::read_internal",
-            FirstStream::new(first_response, response),
+        Ok((
+            ReadProgressObserver::new(
+                "GrpcStore::read_internal",
+                FirstStream::new(first_response, response),
+            ),
+            channel_id,
+            post_conn_instant,
         ))
     }
 
@@ -1269,7 +1370,11 @@ impl GrpcStore {
 
         let request = self.get_read_request(grpc_request.into_request().into_inner())?;
         self.perform_request(request, |request| async move {
+            // Discard channel_id and post_conn_instant — the public `read` API
+            // does not expose them; targeted eviction is internal to retry loops.
             self.read_internal(request, false).await
+                .map(|(s, _, _)| s)
+                .map_err(|(e, _, _)| e)
         })
         .await
     }
@@ -1890,6 +1995,13 @@ impl GrpcStore {
             /// stream attempt without per-chunk noise.
             last_frame_at: std::time::Instant,
             attempt: u32,
+            /// #2 Fix-C: consecutive instant-fail latched-pool attempts.
+            /// When this reaches `LATCHED_POOL_ABORT_THRESHOLD` we abort
+            /// retries immediately via `RetryResult::Err` so the FSS
+            /// `run_producer` writes a streaming-entry terminal error and
+            /// readers fall back (slow-store / peer-fetch) within seconds
+            /// instead of burning the full 30s notify timeout.
+            consecutive_latched_fails: u32,
         }
 
         let local_state = LocalState {
@@ -1901,12 +2013,12 @@ impl GrpcStore {
             bytes_received_this_stream: 0,
             last_frame_at: std::time::Instant::now(),
             attempt: 0,
+            consecutive_latched_fails: 0,
         };
 
         let result = self.retrier
             .retry(unfold(local_state, move |mut local_state| async move {
                 local_state.attempt += 1;
-                let attempt_start = std::time::Instant::now();
                 info!(
                     resource_name = %local_state.resource_name,
                     attempt = local_state.attempt,
@@ -1918,25 +2030,80 @@ impl GrpcStore {
                     read_offset: local_state.read_offset,
                     read_limit: local_state.read_limit,
                 };
-                let mut stream = match self
+                let (mut stream, channel_id) = match self
                     .read_internal(request, false)
                     .await
-                    .err_tip(|| "in GrpcStore::get_part()")
                 {
-                    Ok(stream) => stream,
-                    Err(err) => {
+                    Ok((stream, channel_id, _post_conn)) => (stream, channel_id),
+                    Err((err, channel_id_opt, post_conn)) => {
+                        // K2 fix: `post_conn` is set inside read_internal right
+                        // after channel acquisition (before the .read() call).
+                        // Using post_conn.elapsed() excludes the connection-acquire
+                        // queue wait — so the latched-pool 50ms gate is not defeated
+                        // by saturation-induced cm.connection() delays.
+                        let attempt_elapsed_ms = post_conn.elapsed().as_millis() as u64;
+                        let err = err.append("in GrpcStore::get_part()");
                         info!(
                             resource_name = %local_state.resource_name,
                             attempt = local_state.attempt,
-                            attempt_elapsed_ms = attempt_start.elapsed().as_millis() as u64,
+                            attempt_elapsed_ms,
                             code = ?err.code,
                             "GrpcStore::get_part_single_stream read_internal failed",
                         );
-                        // #147: post-GOAWAY pool may hold dead clones; evict.
-                        self.evict_pool_on_transport_err(&err);
+                        // #2 Fix-A fix-up (item 2): if a channel was acquired before
+                        // the pre-stream error, evict it by identity. The latch
+                        // class (tower-Buffer ServiceError) fires after channel
+                        // acquisition — channel_id_opt is Some for Tcp transport.
+                        // For connection-acquisition failures, channel_id_opt is None
+                        // and we fall back to legacy any-channel eviction.
+                        if let Some((ep_idx, conn_idx)) = channel_id_opt {
+                            match &self.transport {
+                                Transport::Tcp(cm) => cm.evict_channel_by_id(
+                                    ep_idx, conn_idx,
+                                    format!("pre-stream err: code={:?} (#2 Fix-A)", err.code),
+                                ),
+                                #[cfg(feature = "quic")]
+                                Transport::Dual { tcp, .. } => tcp.evict_channel_by_id(
+                                    ep_idx, conn_idx,
+                                    format!("pre-stream err: code={:?} (#2 Fix-A)", err.code),
+                                ),
+                                #[cfg(feature = "quic")]
+                                Transport::Quic(_) => {}
+                            }
+                        } else {
+                            // No channel identity (connection acquisition failed or
+                            // QUIC transport) — use legacy any-channel eviction.
+                            self.evict_pool_on_transport_err(&err);
+                        }
+                        // #2 Fix-C: if every attempt is an instant-fail
+                        // latched-pool hit, abort retries early so FSS
+                        // run_producer writes terminal immediately and readers
+                        // fall back within seconds (not 30s).
+                        // Note: for pre-stream errors, the tower-Buffer ServiceError
+                        // fires synchronously after channel acquisition, so elapsed
+                        // is ~0ms and look_like_latched_pool correctly classifies it.
+                        if looks_like_latched_pool(&err, attempt_elapsed_ms) {
+                            local_state.consecutive_latched_fails += 1;
+                        } else {
+                            local_state.consecutive_latched_fails = 0;
+                        }
+                        if local_state.consecutive_latched_fails >= LATCHED_POOL_ABORT_THRESHOLD {
+                            warn!(
+                                resource_name = %local_state.resource_name,
+                                attempt = local_state.attempt,
+                                consecutive_latched_fails = local_state.consecutive_latched_fails,
+                                "GrpcStore: aborting retries — pool is systemically latched \
+                                 (all attempts are instant-fail tower-buffer ServiceError); \
+                                 FSS run_producer will set terminal immediately so readers \
+                                 fall back instead of burning the 30s notify timeout (#2 Fix-C)"
+                            );
+                            return Some((RetryResult::Err(err), local_state));
+                        }
                         return Some((RetryResult::Retry(err), local_state))
                     }
                 };
+                // A successful read_internal means the pool is not latched.
+                local_state.consecutive_latched_fails = 0;
 
                 // Reset per-stream counter so we detect empty responses even
                 // when retrying at a non-zero read_offset.
@@ -1950,8 +2117,34 @@ impl GrpcStore {
                         Some(Ok(message)) => message.data,
                         Some(Err(status)) => {
                             // #147: streaming-body errs bypass ResponseFuture::poll; evict here.
+                            // #2 Fix-A: evict the specific channel that produced this error.
+                            // channel_id is Some for Transport::Tcp and Dual+prefer_tcp=true
+                            // (single-stream uses QUIC arm which returns None — falls through
+                            // to the legacy any-channel eviction in the else branch).
                             let err: Error = status.into();
-                            self.evict_pool_on_transport_err(&err);
+                            if let Some((ep_idx, conn_idx)) = channel_id {
+                                match &self.transport {
+                                    Transport::Tcp(cm) => cm.evict_channel_by_id(
+                                        ep_idx, conn_idx,
+                                        format!(
+                                            "streaming-body transport err: code={:?} (#2 Fix-A)",
+                                            err.code
+                                        ),
+                                    ),
+                                    #[cfg(feature = "quic")]
+                                    Transport::Dual { tcp, .. } => tcp.evict_channel_by_id(
+                                        ep_idx, conn_idx,
+                                        format!(
+                                            "streaming-body transport err: code={:?} (#2 Fix-A)",
+                                            err.code
+                                        ),
+                                    ),
+                                    #[cfg(feature = "quic")]
+                                    Transport::Quic(_) => {}
+                                }
+                            } else {
+                                self.evict_pool_on_transport_err(&err);
+                            }
                             return Some((
                                 RetryResult::Retry(
                                     err.append(
@@ -2286,15 +2479,18 @@ impl GrpcStore {
                                                 read_offset: read_offset_i64,
                                                 read_limit: read_limit_i64,
                                             };
-                                            let mut stream = match self
+                                            let (mut stream, _chunk_channel_id) = match self
                                                 .read_internal(
                                                     request, true,
                                                 )
                                                 .await
                                             {
-                                                Ok(s) => s,
-                                                Err(err) => {
+                                                Ok((stream, id, _)) => (stream, id),
+                                                Err((err, _, _)) => {
                                                     // #147: same as single-stream path.
+                                                    // #2 Fix-A covers the single-stream path; parallel
+                                                    // chunks use shorter per-chunk retry budgets and the
+                                                    // legacy any-channel eviction is sufficient here.
                                                     self.evict_pool_on_transport_err(&err);
                                                     return Some((
                                                         RetryResult::Retry(err.append(format!(
@@ -3175,7 +3371,10 @@ default_health_status_indicator!(GrpcStore);
 mod tests {
     use nativelink_error::{Code, Error, make_err};
 
-    use super::{ChunkAttemptOutcome, classify_chunk_attempt, looks_like_dead_channel};
+    use super::{
+        ChunkAttemptOutcome, LATCHED_POOL_ABORT_THRESHOLD, LATCHED_POOL_INSTANT_FAIL_MS,
+        classify_chunk_attempt, looks_like_dead_channel, looks_like_latched_pool,
+    };
 
     /// #548 Phase 1 Seam 3: the `ChunkedClientOptions` that
     /// `GrpcStore::update_via_chunked_inner` hands to the worker-side
@@ -3432,5 +3631,103 @@ mod tests {
         // overrun + clean_eof: not Complete (== fails), and clean_eof
         // path returns CleanShort.
         assert_eq!(outcome, ChunkAttemptOutcome::CleanShort);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2 Fix-C: `looks_like_latched_pool` classifier unit tests.
+    //
+    // The tower-Buffer ServiceError message is the only discriminator for
+    // the latched-pool signature. The function gates Fix-C early-abort;
+    // wrong classification either burns the full retry budget (false
+    // negative) or prematurely aborts on genuine transport errors (false
+    // positive). Both directions are tested below.
+    // -----------------------------------------------------------------------
+
+    /// True positive: Unknown code + "buffered service" substring + elapsed
+    /// within the instant-fail threshold → `looks_like_latched_pool` returns
+    /// `true`.
+    ///
+    /// **Mutation step:** flip the return value of `looks_like_latched_pool`
+    /// to always `false`. This test must red-fail with
+    /// "latched-pool true-positive: must detect the buffered-service signature".
+    #[test]
+    fn latched_pool_classifier_true_positive() {
+        let err = make_err!(
+            Code::Unknown,
+            "Service was not ready: buffered service failed: timed out"
+        );
+        // elapsed within threshold
+        assert!(
+            looks_like_latched_pool(&err, LATCHED_POOL_INSTANT_FAIL_MS - 1),
+            "latched-pool true-positive: must detect the buffered-service signature \
+             for Unknown+instant-fail — Fix-C early-abort will not fire without it"
+        );
+    }
+
+    /// False positive guard 1: correct message but elapsed ABOVE threshold.
+    /// A real transport error that happens to contain "buffered service" in
+    /// a log context and takes >50ms must NOT be classified as latched.
+    ///
+    /// **Mutation step:** remove the `elapsed_ms > LATCHED_POOL_INSTANT_FAIL_MS`
+    /// early-return. This test must red-fail with
+    /// "latched-pool false-positive: must not match when elapsed > threshold".
+    #[test]
+    fn latched_pool_classifier_false_positive_high_elapsed() {
+        let err = make_err!(
+            Code::Unknown,
+            "Service was not ready: buffered service failed: timed out"
+        );
+        assert!(
+            !looks_like_latched_pool(&err, LATCHED_POOL_INSTANT_FAIL_MS + 1),
+            "latched-pool false-positive: must not match when elapsed > threshold \
+             ({LATCHED_POOL_INSTANT_FAIL_MS}ms) — would prematurely abort retries \
+             on slow-but-real transport errors"
+        );
+    }
+
+    /// False positive guard 2: instant failure but different status code
+    /// (e.g. `Unavailable`). Must NOT be classified as latched.
+    #[test]
+    fn latched_pool_classifier_false_positive_wrong_code() {
+        let err = make_err!(
+            Code::Unavailable,
+            "Service was not ready: buffered service failed: timed out"
+        );
+        assert!(
+            !looks_like_latched_pool(&err, 0),
+            "latched-pool false-positive: Unavailable code must not match — \
+             latched-pool is exclusively Code::Unknown"
+        );
+    }
+
+    /// False positive guard 3: instant failure + Unknown code but message
+    /// does NOT contain "buffered service" — plain transport unknown error.
+    #[test]
+    fn latched_pool_classifier_false_positive_unrelated_message() {
+        let err = make_err!(Code::Unknown, "transport error: connection reset");
+        assert!(
+            !looks_like_latched_pool(&err, 0),
+            "latched-pool false-positive: Unknown+instant without 'buffered service' \
+             substring must not match — would abort retries on unrelated transport resets"
+        );
+    }
+
+    /// Constant sanity check: the abort threshold must be ≥ 2. Lower values
+    /// would abort on a single coincidentally-fast transient (false positive);
+    /// Fix-A evicts on the first failure so the second attempt draws a
+    /// fresh channel — N=2 is the minimum meaningful sample.
+    ///
+    /// **Mutation step:** set `LATCHED_POOL_ABORT_THRESHOLD = 1`. This test
+    /// must red-fail with "LATCHED_POOL_ABORT_THRESHOLD must be exactly 2 ...".
+    #[test]
+    fn latched_pool_abort_threshold_is_at_least_two() {
+        assert_eq!(
+            LATCHED_POOL_ABORT_THRESHOLD, 2,
+            "LATCHED_POOL_ABORT_THRESHOLD must be exactly 2 — the doc-comment \
+             at its declaration explains why N=2 is the minimum meaningful value; \
+             values > 2 would delay Fix-C abort against a fully-latched pool. \
+             Changing this constant requires updating the doc-comment reasoning \
+             AND re-verifying Fix-A's single-evict assumption (#2 Fix-C)"
+        );
     }
 }

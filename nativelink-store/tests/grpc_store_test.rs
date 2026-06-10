@@ -1183,3 +1183,256 @@ async fn chunked_v2_writes_enabled_runtime_toggle() -> Result<(), Error> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// #2 Fix-C: latched-pool abort tests.
+//
+// A tower-Buffer whose internal worker panicked or is dropped returns
+// `Code::Unknown "Service was not ready: buffered service failed: …"` for
+// every subsequent RPC almost instantaneously (the latch is in-process —
+// the buffer worker returns without hitting the network). If the retrier
+// keeps retrying a latched pool with a long backoff schedule it burns the
+// full retry budget (~28s at 1+2+3+7+14s) before `run_producer` sets a
+// streaming-blob terminal, leaving readers to time out at 30s instead of
+// falling back within seconds.
+//
+// Fix-C adds a `consecutive_latched_fails` counter in the retry state.
+// After `LATCHED_POOL_ABORT_THRESHOLD` consecutive instant-fail
+// "buffered service" errors the retrier returns `RetryResult::Err`
+// immediately — `run_producer` sets terminal, readers fall back.
+//
+// **Test strategy:** stand up an in-process gRPC server that returns the
+// latched-pool message from every `read()` call without delay. Set the
+// GrpcStore retry config to a high max_retries and a significant delay
+// (0.5 s × max_retries=5 = ~16 s full budget). Fix-C should abort after 2
+// attempts. Assert (a) get_part returns an error and (b) the call
+// completes within a tight time budget (3 s) — far faster than the full
+// retry schedule.
+//
+// **Mutation step:** comment out the
+// `if local_state.consecutive_latched_fails >= LATCHED_POOL_ABORT_THRESHOLD`
+// early-return block in `get_part_single_stream`. The outer
+// `tokio::time::timeout(3s, …)` fires and the test panics with the bespoke
+// "Fix-C abort contract violated — get_part burned the full retry budget
+// on a latched pool" message.
+// ---------------------------------------------------------------------------
+
+/// In-process ByteStream server that returns the latched-pool error
+/// signature for every `read()` request. Simulates a worker whose h2
+/// channel's tower-Buffer has latched.
+struct LatchedPoolByteStream;
+
+#[tonic::async_trait]
+impl ByteStream for LatchedPoolByteStream {
+    type ReadStream = futures::stream::Empty<Result<ReadResponse, tonic::Status>>;
+
+    async fn read(
+        &self,
+        _request: tonic::Request<ReadRequest>,
+    ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+        // tower-Buffer ServiceError message — the exact text that
+        // `looks_like_latched_pool` matches on.
+        Err(tonic::Status::unknown(
+            "Service was not ready: buffered service failed: timed out",
+        ))
+    }
+
+    async fn write(
+        &self,
+        _request: tonic::Request<tonic::Streaming<WriteRequest>>,
+    ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used in Fix-C test"))
+    }
+
+    async fn query_write_status(
+        &self,
+        _request: tonic::Request<QueryWriteStatusRequest>,
+    ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used in Fix-C test"))
+    }
+}
+
+/// #2 Fix-C under-action test: `get_part` against a latched-pool server
+/// (all `read()` RPCs return the buffered-service error message instantly)
+/// must abort after `LATCHED_POOL_ABORT_THRESHOLD` consecutive instant
+/// failures and return an error — NOT burn the full retry budget.
+///
+/// The test uses the `latched_pool_bypass_timing` failpoint to bypass the
+/// `elapsed_ms < LATCHED_POOL_INSTANT_FAIL_MS` timing gate so the test
+/// doesn't flake when loopback RTT spikes above 50ms under scheduler load.
+///
+/// The test sets `delay: 0.5, max_retries: 5` (full budget ~16 s via
+/// exponential backoff). Without Fix-C the test times out at 3 s; with
+/// Fix-C it completes in < 2 s (2 roundtrips + 1 retry delay).
+///
+/// **Mutation step:** comment out the consecutive-latched-fails early-return
+/// block (`if local_state.consecutive_latched_fails >= …`) in
+/// `get_part_single_stream`. The outer `timeout(3 s, …)` fires and the test
+/// panics with "Fix-C abort contract violated — get_part burned the full
+/// retry budget on a latched pool instead of aborting early".
+#[cfg(feature = "failpoints")]
+#[serial_test::serial(failpoints)]
+#[nativelink_test]
+async fn fix_c_latched_pool_abort_returns_error_fast() -> Result<(), Error> {
+    // RAII guard: disarms the failpoint even if the test panics, so the
+    // serial(failpoints) group is not left with a poisoned failpoint state.
+    struct FailpointGuard;
+    impl Drop for FailpointGuard {
+        fn drop(&mut self) {
+            let _ = fail::cfg("latched_pool_bypass_timing", "off");
+        }
+    }
+    // Bypass the timing gate — prevents flakes when loopback RTT > 50ms.
+    fail::cfg("latched_pool_bypass_timing", "return").unwrap();
+    let _fp_guard = FailpointGuard;
+
+    // Bind on a free port and start the in-process latched-pool server.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ByteStreamServer::new(LatchedPoolByteStream))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    // GrpcStore with a 5-retry schedule and 0.5 s base delay.
+    // Full budget without Fix-C: 0.5 + 1 + 2 + 4 + 8 ≈ 16 s.
+    // With Fix-C: 2 latched roundtrips + ~1 retry delay ≈ < 2 s.
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.rpc_timeout_s = 0; // no per-RPC deadline — let Fix-C fire
+    spec.retry = Retry {
+        max_retries: 5,
+        delay: 0.5,
+        jitter: 0.0,
+        ..Default::default()
+    };
+    let store = GrpcStore::new(&spec).await?;
+
+    let digest = DigestInfo::try_new(&"0".repeat(64), 4096).unwrap();
+    let (mut tx, rx) = make_buf_channel_pair();
+
+    // Run get_part with a 3 s outer timeout.  Without Fix-C this deadline
+    // fires and the test panics.  With Fix-C the call returns an error
+    // (from the retrier) long before the deadline.
+    let get_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        store.get_part(StoreKey::Digest(digest), &mut tx, 0, None),
+    )
+    .await
+    .expect(
+        "Fix-C abort contract violated — get_part burned the full retry budget \
+         on a latched pool instead of aborting early; consecutive_latched_fails \
+         >= LATCHED_POOL_ABORT_THRESHOLD must trigger RetryResult::Err (#2 Fix-C)",
+    );
+
+    server_handle.abort();
+
+    // get_part must return Err, not Ok — the pool is permanently latched.
+    // Explicitly match instead of is_err() to capture the Ok value for
+    // diagnostics if Fix-C ever stops firing.
+    match get_result {
+        Err(_) => {} // expected
+        Ok(()) => panic!(
+            "Fix-C: get_part must return Err when pool is latched, got Ok(()) — \
+             the early-abort path in get_part_single_stream is not firing; \
+             check consecutive_latched_fails increment and LATCHED_POOL_ABORT_THRESHOLD"
+        ),
+    }
+    // Drop rx after assertion: keep the read half alive until we are done
+    // inspecting the write-half's result.
+    drop(rx);
+
+    Ok(())
+}
+
+/// #2 Fix-C over-action test: `get_part` against a server whose `read()`
+/// returns `Code::Unknown` but with a DIFFERENT message (not "buffered
+/// service") must NOT abort early via Fix-C. With zero retries the test
+/// completes immediately (no backoff to burn); the key assertion is that
+/// the call returns without hanging — the Fix-C abort path must NOT fire
+/// for non-latched Unknown errors.
+///
+/// Documents the over-action direction: `looks_like_latched_pool` must
+/// NOT match on `Code::Unknown` alone — the "buffered service" substring
+/// is the discriminator.
+#[nativelink_test]
+async fn fix_c_non_latched_unknown_does_not_misclassify() -> Result<(), Error> {
+    struct TransportUnknownByteStream;
+
+    #[tonic::async_trait]
+    impl ByteStream for TransportUnknownByteStream {
+        type ReadStream = futures::stream::Empty<Result<ReadResponse, tonic::Status>>;
+
+        async fn read(
+            &self,
+            _request: tonic::Request<ReadRequest>,
+        ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+            Err(tonic::Status::unknown("transport error: connection reset"))
+        }
+
+        async fn write(
+            &self,
+            _request: tonic::Request<tonic::Streaming<WriteRequest>>,
+        ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+
+        async fn query_write_status(
+            &self,
+            _request: tonic::Request<QueryWriteStatusRequest>,
+        ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ByteStreamServer::new(TransportUnknownByteStream))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    // Zero retries so the test completes immediately — we are not testing
+    // retry exhaustion speed, just that a non-buffered-service Unknown
+    // error does not trigger the Fix-C abort counter.
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.rpc_timeout_s = 0;
+    spec.retry = Retry {
+        max_retries: 0,
+        delay: 0.0,
+        jitter: 0.0,
+        ..Default::default()
+    };
+    let store = GrpcStore::new(&spec).await?;
+
+    let digest = DigestInfo::try_new(&"0".repeat(64), 4096).unwrap();
+    let (mut tx, rx) = make_buf_channel_pair();
+
+    let get_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        store.get_part(StoreKey::Digest(digest), &mut tx, 0, None),
+    )
+    .await
+    .expect("non-latched Unknown must complete within 3 s (0 retries) — must not hang");
+    drop(rx);
+
+    assert!(
+        get_result.is_err(),
+        "non-latched-pool get_part must return Err when server always errors"
+    );
+
+    server_handle.abort();
+    Ok(())
+}
