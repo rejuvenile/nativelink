@@ -22,6 +22,7 @@ use bytes::Bytes;
 use tracing::{debug, error, info, trace};
 
 use nativelink_config::stores::{EvictionPolicy, ExistenceCacheSpec};
+use nativelink_util::metrics_utils::CounterWithTime;
 
 // DEBUG INSTRUMENTATION (remove after wedge root cause confirmed):
 // Targets the cover.o wedge digest to expose which path repopulates
@@ -151,8 +152,35 @@ pub struct ExistenceCacheStore<I: InstantWrapper> {
     /// hostile to operator-driven flag-flips. CLAUDE.md "Never panic
     /// in library code" + "Mechanism, not operator" demand a
     /// recoverable signal.
-    #[metric(help = "1 if register_item_callback failed at construction (stale positives self-correct via get_part/update bypass, but eager invalidation is gone)")]
+    /// #11 (2026-06-10): the metric description was previously "1 if
+    /// register_item_callback failed at construction", which described the
+    /// wrong condition (registration failure is a post-gate asymmetry, not
+    /// what latches this field). The actual meaning: construction-time
+    /// `supports_removal_callbacks()==false` → eager invalidation disabled.
+    /// "register_item_callback failed" is a different (post-gate) failure
+    /// path that doesn't set this field (see the error! log at lines 291-306).
+    #[metric(help = "1 if supports_removal_callbacks()==false at construction; \
+                     eager invalidation disabled — stale positives self-correct \
+                     via get_part/update bypass but the stale-positive window \
+                     expands to the next read/write touch. To fix: ensure the \
+                     inner store supports callbacks (RedisStore: set \
+                     enable_keyspace_notifications=true).")]
     vulnerable_mode: bool,
+
+    /// #11 Item 3 (2026-06-10): counts eviction callbacks that actually fired
+    /// from the inner store and removed an existence cache entry. Operator
+    /// signal: "callbacks registered but fired==0 over a long window" means
+    /// the callback chain is dead (registered but never fires — possible when
+    /// inner store reports support but keyspace notifications are misconfigured
+    /// at the server level). Zero fired over a long window with active writes
+    /// is the dead-chain signal.
+    #[metric(help = "eviction callbacks fired from any registered tier (fast-tier LRU \
+                     churn AND slow-tier evictions both increment this counter); \
+                     nonzero does NOT prove the slow-tier chain is alive — fast-tier \
+                     evictions fire callbacks even when slow tier still holds the blob; \
+                     zero-over-a-churn-window with active writes is the meaningful \
+                     dead-chain signal")]
+    invalidation_callbacks_fired: CounterWithTime,
 
     /// When `true`, fire `info!` for every `NotFound` returned to the
     /// caller (inner_has slot=None + get_part Err path). Operator-set
@@ -181,6 +209,10 @@ impl<I: InstantWrapper> ItemCallback for ExistenceCacheStore<I> {
             }
             let deleted_key = self.existence_cache.remove(&digest).await;
             if deleted_key {
+                // #11 Item 3 (2026-06-10): count callbacks that actually removed an
+                // entry. fired==0 over a long window with active writes is the
+                // operator's dead-chain signal (see metric help text).
+                self.invalidation_callbacks_fired.inc();
                 debug!(%digest, "ExistenceCacheStore: eviction callback removed key from cache");
             } else {
                 debug!(%digest, "ExistenceCacheStore: eviction callback key not in cache (already removed or never cached)");
@@ -233,6 +265,20 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
         self.vulnerable_mode
     }
 
+    /// Test accessor for the `invalidation_callbacks_fired` counter.
+    ///
+    /// Guards the #11 Item 3 invariant: callbacks registered via
+    /// `register_item_callback` must actually fire when the inner store
+    /// evicts an entry. `fired==0` over a long window with active writes
+    /// is the dead-chain signal. Production code observes via the metric;
+    /// tests assert the counter directly.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn invalidation_callbacks_fired(&self) -> u64 {
+        self.invalidation_callbacks_fired
+            .counter
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new_with_time(
         spec: &ExistenceCacheSpec,
         inner_store: Store,
@@ -281,6 +327,7 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
             inner_store,
             existence_cache,
             vulnerable_mode: !supports_callbacks,
+            invalidation_callbacks_fired: CounterWithTime::default(),
             log_not_found_at_info: spec.log_not_found_at_info,
         });
         if supports_callbacks {

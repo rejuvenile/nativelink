@@ -14,7 +14,9 @@
 
 use core::cell::UnsafeCell;
 use core::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Weak;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -52,7 +54,18 @@ pub struct RefStore {
     name: String,
     store_manager: Weak<StoreManager>,
     inner: StoreReference,
+    // UNBOUNDED-OK: bounded O(wrapper-depth) at construction; not attacker-controlled
     item_callbacks: Mutex<Vec<Arc<dyn ItemCallback>>>,
+    /// #11 (2026-06-10): counts register_item_callback replay failures during
+    /// get_store() cell publication. A non-zero value means this RefStore was
+    /// resolved successfully but at least one pre-queued callback could not be
+    /// forwarded to the inner store. The store is usable (cell is written,
+    /// all ops succeed) but eager-invalidation callbacks from those registrations
+    /// will not fire. Operator-visible via `error!` log at replay time and via
+    /// this metric. (#11 Item 5 — cell-write-before-replay contract.)
+    #[metric(help = "register_item_callback replay failures during cell publication; \
+                     store resolved but pre-queued callbacks lost (degraded, no panic)")]
+    callback_replay_failures: AtomicU64,
 }
 
 impl RefStore {
@@ -65,6 +78,7 @@ impl RefStore {
                 cell: AlignedStoreCell(UnsafeCell::new(None)),
             },
             item_callbacks: Mutex::new(vec![]),
+            callback_replay_failures: AtomicU64::new(0),
         })
     }
 
@@ -102,11 +116,36 @@ impl RefStore {
             .err_tip(|| "Store manager is gone")?;
         if let Some(store) = store_manager.get_store(&self.name) {
             let item_callbacks = self.item_callbacks.lock().clone();
-            for callback in item_callbacks {
-                store.register_item_callback(callback)?;
-            }
+            // #11 Item 5 (2026-06-10): write the cell BEFORE replaying callbacks.
+            // Pre-fix: `store.register_item_callback(callback)?` inside the loop
+            // returned Err WITHOUT writing the cell, permanently bricking the
+            // RefStore — every subsequent op re-entered the slow path, tried to
+            // replay again, failed again, and all ops through this RefStore failed
+            // forever. The fix: publish the cell first, then replay; on replay Err:
+            // log + increment counter, but treat resolution as succeeded (degraded
+            // to no-eager-invalidation, NOT bricked). Callers that triggered
+            // `get_store()` via a normal op (has/update/get_part) will proceed
+            // normally even if some callbacks failed to register.
             unsafe {
                 *ref_store = Some(store);
+            }
+            // Replay queued callbacks against the newly resolved store. Errors are
+            // degradations, not failures: the resolution already succeeded above.
+            let resolved_store = unsafe { (*ref_store).as_ref().unwrap() };
+            for callback in item_callbacks {
+                if let Err(err) = resolved_store.register_item_callback(callback) {
+                    self.callback_replay_failures.fetch_add(1, Ordering::Relaxed);
+                    error!(
+                        ?err,
+                        name = %self.name,
+                        "RefStore: register_item_callback replay failed during cell publication; \
+                         resolution succeeded but this callback will not fire on evictions. \
+                         Store is usable in degraded mode (no-eager-invalidation for this \
+                         callback). (#11 Item 5)"
+                    );
+                }
+            }
+            unsafe {
                 return Ok((*ref_store).as_ref().unwrap());
             }
         }

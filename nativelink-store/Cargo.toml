@@ -367,6 +367,17 @@ required-features = ["chunked_fast_slow"]
 name = "existence_cache_ref_store_registration_test"
 required-features = ["test-utils"]
 
+# #10 + #11: capability-query honesty and callback-chain correctness across
+# ECS / FastSlow / RefStore compositions. Covers:
+#   - FastSlow::new() with ref-wrapped slow → BIS listener registered (#10)
+#   - FastSlow::supports_removal_callbacks() honesty (#11)
+#   - RefStore::get_store() cell-write-before-replay (#11 Item 5)
+#   - ECS(RefStore→FastSlow) slow-tier eviction propagation (#11 Item 6)
+#   - invalidation_callbacks_fired counter (#11 Item 3)
+[[test]]
+name = "capability_query_callback_chain_test"
+required-features = ["test-utils"]
+
 [[test]]
 name = "completeness_checking_pin_accumulation_test"
 required-features = ["test-utils", "chunked_fast_slow"]

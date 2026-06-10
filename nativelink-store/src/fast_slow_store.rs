@@ -753,6 +753,14 @@ fn register_slow_eviction_stable_set_listener(
         stable_digests,
         failed_slow_writes,
     });
+    // #10 (2026-06-10): resolve any RefStore wrapping the slow store BEFORE
+    // querying supports_removal_callbacks(). RefStore::supports_removal_callbacks
+    // returns false for an unresolved cell (commit cd980946, #367 — deliberate
+    // contract), so calling it before resolution would log a false warn and
+    // skip registration. Direct FastSlowStore::new() callers are vulnerable;
+    // new_validated() accidentally resolves via its own inner_store(None) call
+    // at :1445, but that call-order luck is not a contract.
+    let _resolved = slow_store.inner_store(None::<StoreKey<'_>>);
     let supports_removal = slow_store.supports_removal_callbacks();
     let registration = slow_store.register_item_callback(listener);
     match (supports_removal, registration) {
@@ -7354,6 +7362,38 @@ impl StoreDriver for FastSlowStore {
 
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
         self
+    }
+
+    /// #11 (2026-06-10): Only slow-tier evictions can create ECS stale positives.
+    /// When the fast tier evicts a blob that is still held by the slow tier, the ECS
+    /// callback fires (removing the cache entry) but the blob is still present — this
+    /// is a false negative (one extra has() round-trip), not a stale positive.
+    /// Stale positives arise only when the slow tier evicts and ECS is not notified.
+    /// Therefore `slow.supports()` alone is sufficient for ECS stale-positive prevention.
+    ///
+    /// We return `fast.supports() && slow.supports()` (AND) as defense-in-depth:
+    /// this is over-conservative for the stale-positive invariant but ensures ECS
+    /// does not claim eager-invalidation support unless BOTH tiers can actually fire
+    /// callbacks. A future fast tier that returns `supports=false` (e.g. a
+    /// `WorkerProxyStore`-fronted fast tier) would cause FSS to report `false` and
+    /// put ECS in `vulnerable_mode=true` unnecessarily; revisit the rule then.
+    ///
+    /// Pre-fix: the trait default `true` was inherited unconditionally, meaning
+    /// ECS(FastSlow{*, GrpcStore}) would report `supports=true`, register a dead
+    /// callback path, and never fire on GrpcStore-side removals — operator sees
+    /// vulnerable_mode=false while eager invalidation is silently absent.
+    ///
+    /// NOTE: This method is side-effecting — it calls `inner_store(None)` on both
+    /// tiers to resolve any RefStore wrappers (cell write + callback replay) as a
+    /// prerequisite to the capability query. This is a one-time O(1) operation
+    /// contracted for construction-time use; do not call on hot paths.
+    fn supports_removal_callbacks(&self) -> bool {
+        // Resolve any RefStore wrappers before querying, so an unresolved cell
+        // doesn't silently return false (RefStore::supports_removal_callbacks
+        // returns false when the cell is empty — deliberate contract per cd980946).
+        self.fast_store.inner_store(None::<StoreKey<'_>>);
+        self.slow_store.inner_store(None::<StoreKey<'_>>);
+        self.fast_store.supports_removal_callbacks() && self.slow_store.supports_removal_callbacks()
     }
 
     fn register_item_callback(
