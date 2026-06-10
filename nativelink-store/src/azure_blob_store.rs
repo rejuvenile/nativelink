@@ -87,7 +87,7 @@ enum BufferedBodyState {
     Empty,
 }
 
-struct RequestComponents {
+pub(crate) struct RequestComponents {
     method: Method,
     uri: Uri,
     version: http::Version,
