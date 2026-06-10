@@ -361,6 +361,15 @@ impl MemoryStore {
 
 #[async_trait]
 impl StoreDriver for MemoryStore {
+    async fn remove(self: Pin<&Self>, key: StoreKey<'_>) -> Result<(), Error> {
+        let removed = self.remove_entry(key).await;
+        if removed {
+            Ok(())
+        } else {
+            Err(make_err!(Code::NotFound, "Key not found in MemoryStore::remove"))
+        }
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],

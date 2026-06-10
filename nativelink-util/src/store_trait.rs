@@ -723,6 +723,7 @@ impl Store {
     pub fn reinsert_failed_digests(&self, digests: &[DigestInfo]) {
         self.inner.reinsert_failed_digests(digests);
     }
+
 }
 
 impl StoreLike for Store {
@@ -844,6 +845,27 @@ pub trait StoreLike: Send + Sync + Sized + Unpin + 'static {
     ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
         self.as_store_driver_pin()
             .update(digest.into(), reader, upload_size)
+    }
+
+    /// Remove the entry for `key` from the store.
+    ///
+    /// Returns `Ok(())` if the entry was present and removed, or if the
+    /// store considers an absent key a no-op (idempotent). Returns
+    /// `Err(Code::NotFound)` from stores that distinguish "was never there"
+    /// from "was removed" (behavior varies by implementation — composite
+    /// stores such as `FastSlowStore` absorb both-tiers-absent into
+    /// `Ok(())`). Returns `Err(Code::Unimplemented)` for stores that do
+    /// not implement removal (the default for all store types that have not
+    /// opted in — see `StoreDriver::remove`).
+    ///
+    /// The primary caller is `CompletenessCheckingStore::get_and_verify_single`
+    /// (delete-on-detection for dangling AC entries, #40 §2).
+    #[inline]
+    fn remove<'a>(
+        &'a self,
+        key: impl Into<StoreKey<'a>>,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'a {
+        self.as_store_driver_pin().remove(key.into())
     }
 
     /// Any optimizations the store might want to expose to the callers.
@@ -987,6 +1009,33 @@ pub trait StoreDriver:
         Err(make_err!(
             Code::Unimplemented,
             "Store::list() not implemented for this store"
+        ))
+    }
+
+    /// Remove the entry for `key` from the store. Called by
+    /// `CompletenessCheckingStore` when it detects a dangling AC entry
+    /// (#40 §2 delete-on-detection).
+    ///
+    /// **Default returns `Err(Code::Unimplemented, "<StoreName>")`.** This is
+    /// intentionally NOT a silent no-op: a silent default would let a missed
+    /// implementation in a chain layer (e.g. `FastSlowStore` forgetting to
+    /// remove from fast tier, red-team P2) go undetected at runtime. An `Err`
+    /// bubbles up to the CCS caller which logs it as a `warn!` and does not
+    /// propagate it to the client (the `NotFound` to Bazel stands regardless).
+    ///
+    /// Stores that implement removal: `MemoryStore`, `RedisStore`,
+    /// `FastSlowStore`, `ExistenceCacheStore`, `RefStore`.
+    ///
+    /// Stores that inherit the `Unimplemented` default (no removal needed in
+    /// their production compositions as AC chain layers): `FilesystemStore`,
+    /// `GrpcStore`, `VerifyStore`, `CompressionStore`, `DedupStore`,
+    /// `ShardStore`, `SizePartitioningStore` — none appear in the AC chain
+    /// path that CCS's delete-on-detection targets.
+    async fn remove(self: Pin<&Self>, _key: StoreKey<'_>) -> Result<(), Error> {
+        Err(make_err!(
+            Code::Unimplemented,
+            "Store::remove() not implemented for {}",
+            self.get_name(),
         ))
     }
 

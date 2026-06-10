@@ -4815,6 +4815,60 @@ impl FastSlowStore {
 
 #[async_trait]
 impl StoreDriver for FastSlowStore {
+    /// Remove the entry from BOTH fast and slow tiers (#40 §2 delete-on-detection).
+    ///
+    /// Returns `Ok(())` if the entry is guaranteed absent from the fast tier
+    /// after this call — either actively removed or already absent. `Ok` does
+    /// NOT guarantee anything was actively deleted, and does NOT guarantee
+    /// slow-tier removal if the slow tier failed (the slow entry may survive
+    /// and be re-promoted via populate; the next detection cycle retries). A
+    /// fast-tier `NotFound` with a slow-tier `Unimplemented` also returns
+    /// `Ok` — the slow delete never ran.
+    ///
+    /// `Err` is returned only when BOTH tiers failed with something other than
+    /// `Code::NotFound`. When `fast_ok && !slow_ok` (e.g. Redis timeout), the
+    /// fast-tier entry is gone but the slow-tier key may survive; a subsequent
+    /// `get_part` will re-populate the fast tier from the slow tier
+    /// (resurrection). The resurrection is self-dampening: each detection
+    /// cycle retries the remove, and the rate is bounded by Redis failure rate.
+    /// This partial-failure case is warn-logged so operators can detect it.
+    async fn remove(self: Pin<&Self>, key: StoreKey<'_>) -> Result<(), Error> {
+        let fast_result = self.fast_store.remove(key.borrow()).await;
+        let slow_result = self.slow_store.remove(key.borrow()).await;
+        let fast_ok = fast_result.as_ref().map_or_else(|e| e.code == Code::NotFound, |_| true);
+        let slow_ok = slow_result.as_ref().map_or_else(|e| e.code == Code::NotFound, |_| true);
+        if fast_ok && !slow_ok {
+            // Fast tier cleared but slow tier returned a real error (e.g. Redis
+            // timeout); the slow entry may survive and be re-promoted. Log so a
+            // Redis timeout storm is findable in logs.
+            if let Err(ref slow_err) = slow_result {
+                warn!(
+                    ?key,
+                    ?slow_err,
+                    "slow-tier remove failed; entry may be resurrected until next detection cycle"
+                );
+            }
+            return Ok(());
+        }
+        if !fast_ok && slow_ok {
+            // Slow tier deleted but fast tier returned a real error; log it.
+            if let Err(ref fast_err) = fast_result {
+                warn!(
+                    ?key,
+                    ?fast_err,
+                    "fast-tier remove failed; entry removed from slow tier only"
+                );
+            }
+            return Ok(());
+        }
+        if fast_ok || slow_ok {
+            return Ok(());
+        }
+        // Both tiers returned a real error — surface the slow-tier one
+        // (slow tier is authoritative for durability).
+        slow_result.err_tip(|| "FastSlowStore::remove both tiers failed")
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         key: &[StoreKey<'_>],

@@ -136,6 +136,10 @@ impl StoreDriver for RefStore {
         self.get_store()?.update(key, reader, size_info).await
     }
 
+    async fn remove(self: Pin<&Self>, key: StoreKey<'_>) -> Result<(), Error> {
+        self.get_store()?.remove(key).await
+    }
+
     async fn get_part(
         self: Pin<&Self>,
         key: StoreKey<'_>,

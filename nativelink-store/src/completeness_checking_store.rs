@@ -492,6 +492,19 @@ impl CompletenessCheckingStore {
                         ?&missing_digests[..missing_digests.len().min(MAX_LOGGED_MISSING)],
                     "ActionResult incomplete — referenced CAS digest(s) missing (get_part path)"
                 );
+                // #40 §2 delete-on-detection: remove the dangling AC entry so
+                // the next lookup is a clean ECS miss rather than a repeated
+                // expensive CCS decode + has_with_results + warn cycle
+                // (measured 1.18× repeat rate before this fix). Failure to
+                // remove is non-fatal — the NotFound to Bazel stands regardless;
+                // log a warn so operators can detect a broken remove path.
+                if let Err(remove_err) = self.ac_store.remove(key.borrow()).await {
+                    warn!(
+                        ac_key = ?key,
+                        ?remove_err,
+                        "ActionResult incomplete — delete-on-detection remove failed"
+                    );
+                }
                 return Err(make_err!(
                     Code::NotFound,
                     "Digest found, but not all parts were found in CompletenessCheckingStore::get_part (missing {} of {} referenced CAS digests; first missing: {:?})",
@@ -509,6 +522,12 @@ impl CompletenessCheckingStore {
 
 #[async_trait]
 impl StoreDriver for CompletenessCheckingStore {
+    /// Delegate remove to the AC store (#40 §2). CCS itself holds no state
+    /// for the AC key — the state lives in the AC chain (ECS + FSS).
+    async fn remove(self: Pin<&Self>, key: StoreKey<'_>) -> Result<(), Error> {
+        self.ac_store.remove(key).await
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         keys: &[StoreKey<'_>],

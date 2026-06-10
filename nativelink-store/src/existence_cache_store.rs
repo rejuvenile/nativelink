@@ -414,6 +414,27 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
 
 #[async_trait]
 impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
+    /// Remove the entry: clear the moka existence cache then delegate to
+    /// the inner store (#40 §2 delete-on-detection). Clearing the moka
+    /// entry first prevents a brief window where `has_with_results` would
+    /// return a stale positive from the in-process cache while the inner
+    /// store's `remove` is in flight.
+    ///
+    /// Note: between the moka clear (step 1) and the inner-store delete
+    /// (step 2) a concurrent `has_with_results` can re-populate moka with
+    /// a stale positive. For the Redis-backed production AC chain the
+    /// Valkey keyspace `DEL` event fires a second `existence_cache.remove`
+    /// callback (~ms later), self-correcting the stale positive. For
+    /// `MemoryStore` slow-tier configurations (tests, non-production), no
+    /// keyspace event fires; the stale positive persists until TTL expiry
+    /// or the `get_part` `NotFound` self-correction path clears it. A
+    /// double-`remove` on the moka cache is a benign no-op.
+    async fn remove(self: Pin<&Self>, key: StoreKey<'_>) -> Result<(), Error> {
+        let digest = key.into_digest();
+        self.existence_cache.remove(&digest).await;
+        self.inner_store.remove(StoreKey::from(digest)).await
+    }
+
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],

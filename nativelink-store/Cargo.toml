@@ -371,6 +371,13 @@ required-features = ["test-utils"]
 name = "completeness_checking_pin_accumulation_test"
 required-features = ["test-utils", "chunked_fast_slow"]
 
+# #40 §2: StoreDriver::remove full-chain + CCS delete-on-detection tests.
+# test-utils gate matches crate integration test convention; constructor
+# APIs are public under that feature.
+[[test]]
+name = "store_remove_test"
+required-features = ["test-utils"]
+
 # #247/#477 BLOCK-B log-visibility regression tests. File-level
 # `#![cfg(feature = "chunked_fast_slow")]` would silently skip the file
 # on missing features (auditor MAJOR; cargo otherwise reports "0 tests");

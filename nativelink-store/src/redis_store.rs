@@ -2709,6 +2709,42 @@ where
         results
     }
 
+    /// Delete the key from Redis via a `DEL` command. Uses the same
+    /// `encode_key` path as `update` so the key form is consistent.
+    /// Returns `Ok(())` if one or more keys were deleted, `Code::NotFound`
+    /// if Redis reports 0 deleted keys (key was absent).
+    async fn remove(self: Pin<&Self>, key: StoreKey<'_>) -> Result<(), Error> {
+        if is_zero_digest(key.borrow()) {
+            return Ok(());
+        }
+        let encoded = self.encode_key(&key);
+        let mut client = self
+            .get_client()
+            .await
+            .err_tip(|| "RedisStore::remove get_client")?;
+        let deleted: u64 = timeout(
+            self.command_timeout,
+            client.connection_manager.del::<_, u64>(encoded.as_ref()),
+        )
+        .await
+        .map_err(|_| {
+            make_err!(
+                Code::Unavailable,
+                "RedisStore::remove DEL timed out for key {}",
+                encoded,
+            )
+        })?
+        .err_tip(|| format!("RedisStore::remove DEL failed for key {encoded}"))?;
+        if deleted == 0 {
+            return Err(make_err!(
+                Code::NotFound,
+                "RedisStore::remove: key not found in Redis: {}",
+                encoded,
+            ));
+        }
+        Ok(())
+    }
+
     fn inner_store(&self, _digest: Option<StoreKey>) -> &dyn StoreDriver {
         self
     }

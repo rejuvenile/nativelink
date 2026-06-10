@@ -2396,3 +2396,59 @@ async fn verify_store_around_redis_does_not_deadlock_on_get_part_notfound()
 
     Ok(())
 }
+
+// ─── RedisStore::remove ───────────────────────────────────────────────────────
+
+/// `remove` on an existing key issues `DEL` and returns `Ok(())`.
+///
+/// Mutation: returning `Ok(())` early without issuing `DEL` causes the
+/// mock harness to panic on the unconsumed expected `DEL` command, confirming
+/// this test guards the DEL dispatch path.
+#[nativelink_test]
+async fn remove_existing_key_issues_del_and_returns_ok() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(VALID_HASH1, 2)?;
+    let real_key = format!("{digest}");
+
+    let commands = vec![MockCmd::new(
+        redis::cmd("DEL").arg(real_key.clone()),
+        // DEL returns the count of deleted keys; 1 = key existed and was deleted.
+        Ok(Value::Int(1)),
+    )];
+    let store = make_mock_store(commands).await;
+
+    store
+        .remove(digest)
+        .await
+        .expect("remove of existing key must return Ok(()) — DEL issued and key deleted");
+
+    Ok(())
+}
+
+/// `remove` when the key is absent (DEL returns 0) returns `Code::NotFound`.
+///
+/// Mutation: returning `Ok(())` unconditionally instead of checking the
+/// deleted count causes this test to fail with "expected NotFound, got Ok".
+#[nativelink_test]
+async fn remove_absent_key_returns_not_found() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(VALID_HASH1, 2)?;
+    let real_key = format!("{digest}");
+
+    let commands = vec![MockCmd::new(
+        redis::cmd("DEL").arg(real_key.clone()),
+        // DEL returns 0 when no keys were deleted (key was absent).
+        Ok(Value::Int(0)),
+    )];
+    let store = make_mock_store(commands).await;
+
+    let err = store
+        .remove(digest)
+        .await
+        .expect_err("remove of absent key must return Err — DEL returned 0 deleted keys");
+    assert_eq!(
+        err.code,
+        Code::NotFound,
+        "remove of absent key must return Code::NotFound; got: {err:?}"
+    );
+
+    Ok(())
+}
