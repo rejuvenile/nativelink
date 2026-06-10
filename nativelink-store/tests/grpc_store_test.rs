@@ -1,7 +1,7 @@
 use core::time::Duration;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use nativelink_config::stores::{GrpcEndpoint, GrpcSpec, Retry, StoreType};
@@ -1435,4 +1435,768 @@ async fn fix_c_non_latched_unknown_does_not_misclassify() -> Result<(), Error> {
 
     server_handle.abort();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #7 Fix-C extension: latched-pool abort for `get_part_parallel` (≥8 MiB path)
+//
+// The existing `fix_c_latched_pool_abort_returns_error_fast` test only
+// exercises `get_part_single_stream` (blobs below `parallel_chunk_read_threshold`).
+// The assumption-auditor (claim #7) confirmed that `get_part_parallel` had
+// NO `looks_like_latched_pool` logic — large blobs burned the full 30s notify
+// timeout on a latched pool.
+//
+// Fix-C is extended to the parallel path via a per-request shared
+// `Arc<AtomicU32>` (`parallel_latched_fails`) that spans all chunk retriers
+// for a single `get_part_parallel` invocation. When any chunk's attempt hits
+// LATCHED_POOL_ABORT_THRESHOLD, it returns `RetryResult::Err` — which
+// propagates out through `try_for_each` short-circuiting all sibling fetches
+// and terminating the parallel read fast.
+//
+// Counter scope is per-request (NOT per-chunk) because the pool is shared:
+// N chunks instant-failing simultaneously is ONE latched-pool signal.  Per-chunk
+// counters would require N×THRESHOLD attempts before aborting, delaying abort
+// on a fully-latched pool.
+//
+// **Mutation step (under-action):** comment out the
+// `if latched_fails >= LATCHED_POOL_ABORT_THRESHOLD` block in
+// `get_part_parallel`. The outer `timeout(3 s, …)` fires and the test panics
+// with "Fix-C parallel under-action violated — get_part_parallel burned the
+// full retry budget on a latched pool instead of aborting early".
+//
+// **Over-action test:** healthy parallel reads complete without abort; a
+// non-buffered-service Unknown error does not trigger the abort counter.
+// ---------------------------------------------------------------------------
+
+/// #7 Fix-C under-action: `get_part` on a blob ≥ `parallel_chunk_read_threshold`
+/// against a latched-pool server must abort after `LATCHED_POOL_ABORT_THRESHOLD`
+/// consecutive instant failures and return error within 3 s — NOT burn the full
+/// retry budget (~16 s at 5 retries × 0.5 s base).
+///
+/// Routing: blob_size = 16 MiB, threshold = 1 byte → parallel path IS entered
+/// regardless of actual size, guaranteeing the test exercises `get_part_parallel`
+/// rather than `get_part_single_stream`.
+///
+/// **Mutation step:** comment out the latched-fails threshold abort in
+/// `get_part_parallel`. The outer `timeout(3 s)` fires and panics with the
+/// bespoke "Fix-C parallel under-action violated" message.
+#[cfg(feature = "failpoints")]
+#[serial_test::serial(failpoints)]
+#[nativelink_test]
+async fn fix_c_latched_pool_abort_parallel_path_returns_error_fast() -> Result<(), Error> {
+    struct FailpointGuard;
+    impl Drop for FailpointGuard {
+        fn drop(&mut self) {
+            let _ = fail::cfg("latched_pool_bypass_timing", "off");
+        }
+    }
+    // Bypass the timing gate so the test does not depend on loopback RTT.
+    fail::cfg("latched_pool_bypass_timing", "return").unwrap();
+    let _fp_guard = FailpointGuard;
+
+    // Counting variant of LatchedPoolByteStream: one increment per `read()` RPC.
+    // After abort, `server_rpc_count <= LATCHED_POOL_ABORT_THRESHOLD` proves the
+    // shared counter fires on 2 TOTAL latched attempts (not 2 per-chunk), binding
+    // the "one latched signal per request" contract (#7 testing-czar NIT).
+    let server_rpc_count = Arc::new(AtomicU32::new(0));
+    let counter_for_server = server_rpc_count.clone();
+
+    struct CountingLatchedByteStream {
+        counter: Arc<AtomicU32>,
+    }
+    #[tonic::async_trait]
+    impl ByteStream for CountingLatchedByteStream {
+        type ReadStream = futures::stream::Empty<Result<ReadResponse, tonic::Status>>;
+        async fn read(
+            &self,
+            _request: tonic::Request<ReadRequest>,
+        ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            Err(tonic::Status::unknown(
+                "Service was not ready: buffered service failed: timed out",
+            ))
+        }
+        async fn write(
+            &self,
+            _request: tonic::Request<tonic::Streaming<WriteRequest>>,
+        ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+        async fn query_write_status(
+            &self,
+            _request: tonic::Request<QueryWriteStatusRequest>,
+        ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ByteStreamServer::new(CountingLatchedByteStream {
+                counter: counter_for_server,
+            }))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    // Route into get_part_parallel: threshold = 1 byte so any non-empty blob
+    // takes the parallel path.  parallel_chunk_count = 4; full budget without
+    // Fix-C: 0.5 + 1 + 2 + 4 + 8 ≈ 16 s.
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.rpc_timeout_s = 0;
+    spec.parallel_chunk_read_threshold = 1; // route everything into parallel
+    spec.parallel_chunk_count = 4;
+    spec.retry = Retry {
+        max_retries: 5,
+        delay: 0.5,
+        jitter: 0.0,
+        ..Default::default()
+    };
+    let store = GrpcStore::new(&spec).await?;
+
+    // 16 MiB blob so parallel_chunk_read_threshold=1 routes it to the parallel path.
+    const BLOB_SIZE: u64 = 16 * 1024 * 1024;
+    let digest = DigestInfo::try_new(&"1".repeat(64), BLOB_SIZE).unwrap();
+    let (mut tx, rx) = make_buf_channel_pair();
+
+    let get_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        store.get_part(StoreKey::Digest(digest), &mut tx, 0, None),
+    )
+    .await
+    .expect(
+        "Fix-C parallel under-action violated — get_part_parallel burned the full \
+         retry budget on a latched pool instead of aborting early; the shared \
+         parallel_latched_fails counter must reach LATCHED_POOL_ABORT_THRESHOLD \
+         and return RetryResult::Err (#7 Fix-C extension for get_part_parallel)",
+    );
+
+    server_handle.abort();
+
+    match get_result {
+        Err(_) => {} // expected: parallel path aborted on latched pool
+        Ok(()) => panic!(
+            "Fix-C parallel: get_part must return Err when pool is latched, got Ok(()) — \
+             the parallel latched-pool abort path is not firing; \
+             check parallel_latched_fails increment and LATCHED_POOL_ABORT_THRESHOLD \
+             in get_part_parallel (#7)"
+        ),
+    }
+
+    // Per-request shared counter: abort fires after LATCHED_POOL_ABORT_THRESHOLD (=2)
+    // TOTAL increments across ALL chunks, not 2 per-chunk.  On a fully-latched pool
+    // with 4 chunks, per-chunk counters would allow up to 4×2=8 attempts; the shared
+    // counter must fire within at most LATCHED_POOL_ABORT_THRESHOLD RPCs per request.
+    // We allow up to parallel_chunk_count (=4) because chunks dispatch concurrently
+    // and two chunks may both hit attempt 1 before the abort propagates.
+    let rpc_count = server_rpc_count.load(Ordering::Relaxed);
+    assert!(
+        rpc_count <= 4, // parallel_chunk_count — not max_retries × chunk_count (=20)
+        "Fix-C parallel: shared counter contract violated — {rpc_count} RPCs fired \
+         at abort but expected ≤ parallel_chunk_count (4); per-chunk counters would \
+         allow up to max_retries×chunk_count RPCs before aborting, far more than the \
+         shared counter's LATCHED_POOL_ABORT_THRESHOLD (#7 testing-czar NIT)"
+    );
+
+    drop(rx);
+    Ok(())
+}
+
+/// #7 Fix-C over-action: a healthy parallel read against a server that
+/// actually serves data must complete without spurious abort.
+///
+/// Uses a tiny payload served over the parallel path (threshold=1 byte) to
+/// confirm the Fix-C abort counter does NOT fire for successful reads.
+#[nativelink_test]
+async fn fix_c_parallel_healthy_read_completes_without_abort() -> Result<(), Error> {
+    // A tiny ByteStream server that returns real data.
+    struct SmallPayloadByteStream;
+    const SMALL_PAYLOAD: &[u8] = b"hello from parallel path";
+
+    #[tonic::async_trait]
+    impl ByteStream for SmallPayloadByteStream {
+        type ReadStream = futures::stream::Once<
+            futures::future::Ready<Result<ReadResponse, tonic::Status>>,
+        >;
+
+        async fn read(
+            &self,
+            _request: tonic::Request<ReadRequest>,
+        ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+            Ok(tonic::Response::new(futures::stream::once(futures::future::ready(Ok(
+                ReadResponse {
+                    data: bytes::Bytes::from_static(SMALL_PAYLOAD),
+                },
+            )))))
+        }
+
+        async fn write(
+            &self,
+            _request: tonic::Request<tonic::Streaming<WriteRequest>>,
+        ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+
+        async fn query_write_status(
+            &self,
+            _request: tonic::Request<QueryWriteStatusRequest>,
+        ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used"))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ByteStreamServer::new(SmallPayloadByteStream))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.rpc_timeout_s = 0;
+    spec.parallel_chunk_read_threshold = 1; // route into parallel
+    spec.parallel_chunk_count = 2;
+    spec.retry = Retry {
+        max_retries: 0,
+        delay: 0.0,
+        jitter: 0.0,
+        ..Default::default()
+    };
+    let store = GrpcStore::new(&spec).await?;
+
+    let digest = DigestInfo::try_new(
+        &"2".repeat(64),
+        SMALL_PAYLOAD.len() as u64,
+    )
+    .unwrap();
+    let (writer, mut reader) = make_buf_channel_pair();
+
+    let store_clone = store.clone();
+    let key_owned: StoreKey<'static> = StoreKey::Digest(digest);
+    let get_part_fut = async move {
+        let mut writer_mut = writer;
+        store_clone.get_part(key_owned, &mut writer_mut, 0, None).await
+    };
+    let collect_fut = async move {
+        let mut total = bytes::BytesMut::new();
+        loop {
+            let chunk = reader.consume(Some(4096)).await?;
+            if chunk.is_empty() {
+                break;
+            }
+            total.extend_from_slice(&chunk);
+        }
+        Ok::<bytes::Bytes, Error>(total.freeze())
+    };
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        async move { tokio::join!(get_part_fut, collect_fut) },
+    )
+    .await
+    .expect("healthy parallel read must complete within 5 s — must not abort spuriously");
+
+    server_handle.abort();
+
+    let (get_res, collect_res) = outcome;
+    // Assert get_part itself returned Ok — a Fix-C spurious abort would return
+    // Err here even if some bytes had already flowed, catching partial-abort
+    // scenarios that a collect_res-only assertion would miss (#7 distsys m3).
+    //
+    // NOTE: `collect_res` may contain more bytes than SMALL_PAYLOAD because the
+    // mock serves the full payload for EVERY chunk (ignoring range params), and
+    // parallel_chunk_count=2 issues 2 read RPCs.  We assert the payload is
+    // non-empty and starts with SMALL_PAYLOAD rather than checking exact equality.
+    get_res.expect(
+        "Fix-C over-action violated — healthy parallel get_part returned Err; \
+         the Fix-C abort counter must NOT fire on successful reads (#7)"
+    );
+    let received = collect_res.expect(
+        "Fix-C over-action violated — healthy parallel read failed to deliver data; \
+         the Fix-C abort counter must NOT fire on successful reads (#7)"
+    );
+    assert!(
+        !received.is_empty() && received.starts_with(SMALL_PAYLOAD),
+        "Fix-C over-action: data mismatch — parallel read returned unexpected bytes; \
+         expected payload starting with SMALL_PAYLOAD, got {received:?} (#7 distsys m3)"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #8 Fix-C extension: latched-pool abort for `GrpcStore::write`
+//
+// `GrpcStore::write` is the incident's TRIGGER path (write stalls created the
+// pool latch) and also a victim: workers uploading action outputs against a
+// latched pool burned the full ~28s retry budget (backoff 0.5+1+2+4+8+16s).
+//
+// Fix-C is extended to the write path via a `consecutive_latched_fails: u32`
+// counter captured in the unfold closure's captured environment, mirroring
+// `get_part_single_stream`'s `LocalState::consecutive_latched_fails`.
+//
+// Timing for write: the tower-Buffer ServiceError fires synchronously when
+// tonic calls `poll_ready` on the acquired channel, AFTER channel acquisition.
+// A post-connection Instant (`rpc_start`) is recorded inside `rpc_fut` after
+// channel acquisition; the elapsed at RPC error is used as the timing gate.
+//
+// **Durability analysis:** fast-aborting a write on a latched pool does NOT
+// widen the durability hole. The latched pool means every attempt returns
+// instantly with ServiceError — no bytes are sent to the server in any attempt.
+// After `LATCHED_POOL_ABORT_THRESHOLD` attempts, all retries in the budget
+// would also instant-fail (pool still latched; Fix-A takes one eviction/attempt
+// but needs multiple seconds for reconnect). The fast-abort produces the same
+// outcome as budget exhaustion: write returns Err. The caller (FSS slow-tier
+// async write → slow_tier_async_fail accounting, or worker's upload_to_remote)
+// handles the Err identically either way. The ≥2-replica invariant is not
+// affected: a write that fails fast on a latched pool was never going to
+// succeed within the budget anyway.
+//
+// **Mutation step (under-action):** comment out the
+// `if consecutive_latched_fails >= LATCHED_POOL_ABORT_THRESHOLD` block in
+// `GrpcStore::write`. The outer `timeout(3 s)` fires and panics with the bespoke
+// "Fix-C write under-action violated" message.
+//
+// **Over-action test:** a non-latched transient write error (Code::Unavailable
+// with a non-"buffered service" message) must still retry and NOT abort early.
+// ---------------------------------------------------------------------------
+
+/// #8 Fix-C under-action: `GrpcStore::write` against a latched-pool server
+/// must abort after `LATCHED_POOL_ABORT_THRESHOLD` consecutive instant
+/// failures and return error within 3 s.
+///
+/// **Mutation step:** comment out the consecutive-latched-fails abort in
+/// `GrpcStore::write`'s `rpc_err` arm. The outer `timeout(3 s)` fires and
+/// panics with "Fix-C write under-action violated — GrpcStore::write burned
+/// the full retry budget on a latched pool".
+#[cfg(feature = "failpoints")]
+#[serial_test::serial(failpoints)]
+#[nativelink_test]
+async fn fix_c_write_latched_pool_aborts_fast() -> Result<(), Error> {
+    // LatchedPoolByteStream's `write()` handler returns unimplemented —
+    // we need a server that returns the latched-pool message from `write`.
+    struct LatchedWriteByteStream;
+
+    #[tonic::async_trait]
+    impl ByteStream for LatchedWriteByteStream {
+        type ReadStream = futures::stream::Empty<Result<ReadResponse, tonic::Status>>;
+
+        async fn read(
+            &self,
+            _request: tonic::Request<ReadRequest>,
+        ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in write test"))
+        }
+
+        async fn write(
+            &self,
+            _request: tonic::Request<tonic::Streaming<WriteRequest>>,
+        ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+            // tower-Buffer ServiceError message — what `looks_like_latched_pool` matches.
+            Err(tonic::Status::unknown(
+                "Service was not ready: buffered service failed: timed out",
+            ))
+        }
+
+        async fn query_write_status(
+            &self,
+            _request: tonic::Request<QueryWriteStatusRequest>,
+        ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in write test"))
+        }
+    }
+
+    struct FailpointGuard;
+    impl Drop for FailpointGuard {
+        fn drop(&mut self) {
+            let _ = fail::cfg("latched_pool_bypass_timing", "off");
+        }
+    }
+    fail::cfg("latched_pool_bypass_timing", "return").unwrap();
+    let _fp_guard = FailpointGuard;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let server_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(ByteStreamServer::new(LatchedWriteByteStream))
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    // 5 retries × 0.5 s base → full budget ~16 s without Fix-C.
+    // With Fix-C: 2 roundtrips + ~1 retry delay ≈ < 2 s.
+    let mut spec = make_test_spec();
+    spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+    spec.rpc_timeout_s = 0;
+    spec.retry = Retry {
+        max_retries: 5,
+        delay: 0.5,
+        jitter: 0.0,
+        ..Default::default()
+    };
+    let store = GrpcStore::new(&spec).await?;
+
+    // Build a minimal write stream: one tiny chunk.
+    let (unbounded_tx, unbounded_rx) = tokio::sync::mpsc::unbounded_channel::<
+        Result<WriteRequest, Error>,
+    >();
+    let stream = UnboundedReceiverStream::new(unbounded_rx);
+
+    // Send one chunk with finish_write=true then drop the sender so the
+    // channel closes.  Without drop, the UnboundedReceiverStream returns
+    // Poll::Pending forever and the h2 stream never sends END_STREAM, so
+    // tonic's streaming write hangs awaiting more chunks.
+    unbounded_tx
+        .send(Ok(WriteRequest {
+            resource_name: format!(
+                "/uploads/{uuid}/blobs/{hash}/{size}",
+                uuid = uuid_str(),
+                hash = "a".repeat(64),
+                size = 4,
+            ),
+            write_offset: 0,
+            finish_write: true,
+            data: bytes::Bytes::from_static(b"test"),
+        }))
+        .ok();
+    // Drop sender so the stream closes after the first chunk.
+    drop(unbounded_tx);
+
+    let write_stream = WriteRequestStreamWrapper::from(stream).await?;
+    let write_result = tokio::time::timeout(
+        Duration::from_secs(3),
+        store.write(write_stream),
+    )
+    .await
+    .expect(
+        "Fix-C write under-action violated — GrpcStore::write burned the full \
+         retry budget on a latched pool instead of aborting early; \
+         consecutive_latched_fails >= LATCHED_POOL_ABORT_THRESHOLD must trigger \
+         RetryResult::Err in the write rpc_err arm (#8 Fix-C extension for write)",
+    );
+
+    server_handle.abort();
+
+    match write_result {
+        Err(ref e) => {
+            // #8 Fix-C: verify the error is the latched-pool classifier error
+            // (contains "buffered service") — not some other failure mode.
+            // The timeout above is the discriminator between Fix-C fast-abort
+            // and budget exhaustion (budget exhaustion takes ~16 s; Fix-C < 2 s).
+            // This message assertion binds the abort to the specific error class,
+            // so a mutation changing the write server to return e.g. Unavailable
+            // (which Fix-C would NOT classify) would fail here even if the abort
+            // fires via a different path.
+            //
+            // **Mutation step for this assertion:** change LatchedWriteByteStream to
+            // return `Status::unavailable("transient")` instead of the buffered-service
+            // message.  Fix-C no longer fires (classifier returns false), the outer 3-s
+            // timeout fires, and the test panics with the "Fix-C write under-action
+            // violated" message — NOT this assertion.  This assertion is only reached
+            // when Fix-C fires AND returns the wrong error kind.
+            assert!(
+                e.to_string().contains("buffered service"),
+                "Fix-C write: expected abort error to contain 'buffered service' \
+                 (the latched-pool classifier error) but got: {e:?} — \
+                 the abort must originate from looks_like_latched_pool firing on \
+                 the tower-Buffer ServiceError (#8 convergent finding: red-team + testing-czar)"
+            );
+        }
+        Ok(_) => panic!(
+            "Fix-C write: GrpcStore::write must return Err when pool is latched, \
+             got Ok — the write latched-pool abort is not firing; \
+             check consecutive_latched_fails in GrpcStore::write's rpc_err arm (#8)"
+        ),
+    }
+    Ok(())
+}
+
+/// #8 Fix-C over-action: non-latched write errors must NOT abort early.
+///
+/// Covers two over-action variants mirroring the read-side sibling
+/// (`fix_c_non_latched_unknown_does_not_misclassify`):
+///
+/// **Variant A — Code::Unavailable**: `looks_like_latched_pool` requires
+/// `Code::Unknown`; `Unavailable` does not match, so Fix-C counter stays 0 and
+/// all `max_retries` attempts are consumed.
+///
+/// **Variant B — Code::Unknown + wrong message**: the code matches but the
+/// `"buffered service"` substring does NOT.  Fix-C counter must also stay 0
+/// and all retries consumed.  This is the "almost looks like a latch" case.
+///
+/// Both variants use an `Arc<AtomicU32>` RPC counter.  After the write
+/// completes, the counter must equal `1 + max_retries` (= 3).  This kills the
+/// surviving mutation (removing the reset-branch `store(0, Relaxed)` for
+/// non-latched errors): without the reset, errors accumulate in
+/// `write_latched_fails`, reach `LATCHED_POOL_ABORT_THRESHOLD` at attempt 2,
+/// and abort early with `count == 2 ≠ 3` → assertion fails.
+///
+/// **Mutation step:** remove the `else { write_latched_fails.store(0, …) }`
+/// reset branch in `GrpcStore::write`'s `rpc_err` arm.  With
+/// `Code::Unavailable` and `max_retries=2` the counter reaches 2 at attempt 2
+/// and aborts early; `server_rpc_count` will be 2, not 3.  The assertion
+/// `assert_eq!(count, 3, "…")` then fails with:
+/// "Fix-C over-action: reset-branch removed — Fix-C fired on non-latched
+///  Unavailable error at attempt 2; expected 3 RPCs (all retries consumed)"
+#[nativelink_test]
+async fn fix_c_write_non_latched_unknown_does_not_abort_early() -> Result<(), Error> {
+    // Shared RPC counter (reset between variants).
+    let rpc_counter = Arc::new(AtomicU32::new(0));
+
+    // -----------------------------------------------------------------------
+    // Variant A: Code::Unavailable — code does not match `looks_like_latched_pool`.
+    // -----------------------------------------------------------------------
+    {
+        let counter_a = rpc_counter.clone();
+
+        struct TransientWriteByteStream {
+            counter: Arc<AtomicU32>,
+        }
+
+        #[tonic::async_trait]
+        impl ByteStream for TransientWriteByteStream {
+            type ReadStream = futures::stream::Empty<Result<ReadResponse, tonic::Status>>;
+
+            async fn read(
+                &self,
+                _request: tonic::Request<ReadRequest>,
+            ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used"))
+            }
+
+            async fn write(
+                &self,
+                _request: tonic::Request<tonic::Streaming<WriteRequest>>,
+            ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+                self.counter.fetch_add(1, Ordering::Relaxed);
+                // Variant A: Unavailable — must not trigger Fix-C abort.
+                Err(tonic::Status::unavailable("transient: connection reset"))
+            }
+
+            async fn query_write_status(
+                &self,
+                _request: tonic::Request<QueryWriteStatusRequest>,
+            ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used"))
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(ByteStreamServer::new(TransientWriteByteStream {
+                    counter: counter_a,
+                }))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        // max_retries=2 → 1 initial + 2 retries = 3 total RPCs consumed.
+        let mut spec = make_test_spec();
+        spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+        spec.rpc_timeout_s = 0;
+        spec.retry = Retry {
+            max_retries: 2,
+            delay: 0.1,
+            jitter: 0.0,
+            ..Default::default()
+        };
+        let store = GrpcStore::new(&spec).await?;
+
+        let (unbounded_tx, unbounded_rx) = tokio::sync::mpsc::unbounded_channel::<
+            Result<WriteRequest, Error>,
+        >();
+        let stream = UnboundedReceiverStream::new(unbounded_rx);
+        unbounded_tx
+            .send(Ok(WriteRequest {
+                resource_name: format!(
+                    "/uploads/{uuid}/blobs/{hash}/{size}",
+                    uuid = uuid_str(),
+                    hash = "b".repeat(64),
+                    size = 4,
+                ),
+                write_offset: 0,
+                finish_write: true,
+                data: bytes::Bytes::from_static(b"over"),
+            }))
+            .ok();
+        drop(unbounded_tx);
+
+        let write_stream = WriteRequestStreamWrapper::from(stream).await?;
+        let write_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.write(write_stream),
+        )
+        .await
+        .expect(
+            "Fix-C over-action (Unavailable): non-latched transient write must complete \
+             within 5 s — must NOT hang or abort early (#8)",
+        );
+
+        server_handle.abort();
+
+        assert!(
+            write_result.is_err(),
+            "Fix-C over-action (Unavailable): write must return Err after retries; \
+             Fix-C must NOT convert a non-latched Unavailable error into Ok (#8)"
+        );
+        let count_a = rpc_counter.load(Ordering::Relaxed);
+        assert_eq!(
+            count_a, 3,
+            "Fix-C over-action: reset-branch removed — Fix-C fired on non-latched \
+             Unavailable error at attempt 2; expected 3 RPCs (1 + max_retries=2, all \
+             retries consumed) but got {count_a}; \
+             check write_latched_fails.store(0) in rpc_err else branch (#8)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Variant B: Code::Unknown + wrong message.
+    // Code matches but "buffered service" substring absent — must not classify
+    // as latched.  Mirrors `fix_c_non_latched_unknown_does_not_misclassify`.
+    // -----------------------------------------------------------------------
+    {
+        rpc_counter.store(0, Ordering::Relaxed);
+        let counter_b = rpc_counter.clone();
+
+        struct UnknownWrongMsgByteStream {
+            counter: Arc<AtomicU32>,
+        }
+
+        #[tonic::async_trait]
+        impl ByteStream for UnknownWrongMsgByteStream {
+            type ReadStream = futures::stream::Empty<Result<ReadResponse, tonic::Status>>;
+
+            async fn read(
+                &self,
+                _request: tonic::Request<ReadRequest>,
+            ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used"))
+            }
+
+            async fn write(
+                &self,
+                _request: tonic::Request<tonic::Streaming<WriteRequest>>,
+            ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+                self.counter.fetch_add(1, Ordering::Relaxed);
+                // Variant B: Unknown code but no "buffered service" substring.
+                // `looks_like_latched_pool` requires BOTH code AND substring.
+                Err(tonic::Status::unknown("transport error: peer connection reset"))
+            }
+
+            async fn query_write_status(
+                &self,
+                _request: tonic::Request<QueryWriteStatusRequest>,
+            ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used"))
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let server_handle = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(ByteStreamServer::new(UnknownWrongMsgByteStream {
+                    counter: counter_b,
+                }))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let mut spec = make_test_spec();
+        spec.endpoints[0].address = format!("http://127.0.0.1:{port}");
+        spec.rpc_timeout_s = 0;
+        spec.retry = Retry {
+            max_retries: 2,
+            delay: 0.1,
+            jitter: 0.0,
+            ..Default::default()
+        };
+        let store = GrpcStore::new(&spec).await?;
+
+        let (unbounded_tx, unbounded_rx) = tokio::sync::mpsc::unbounded_channel::<
+            Result<WriteRequest, Error>,
+        >();
+        let stream = UnboundedReceiverStream::new(unbounded_rx);
+        unbounded_tx
+            .send(Ok(WriteRequest {
+                resource_name: format!(
+                    "/uploads/{uuid}/blobs/{hash}/{size}",
+                    uuid = uuid_str(),
+                    hash = "c".repeat(64),
+                    size = 4,
+                ),
+                write_offset: 0,
+                finish_write: true,
+                data: bytes::Bytes::from_static(b"over"),
+            }))
+            .ok();
+        drop(unbounded_tx);
+
+        let write_stream = WriteRequestStreamWrapper::from(stream).await?;
+        let write_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.write(write_stream),
+        )
+        .await
+        .expect(
+            "Fix-C over-action (Unknown+wrong-msg): non-latched write must complete \
+             within 5 s — must NOT abort early on Unknown without 'buffered service' (#8)",
+        );
+
+        server_handle.abort();
+
+        assert!(
+            write_result.is_err(),
+            "Fix-C over-action (Unknown+wrong-msg): write must return Err; \
+             Fix-C must NOT fire on Unknown without 'buffered service' substring (#8)"
+        );
+        let count_b = rpc_counter.load(Ordering::Relaxed);
+        assert_eq!(
+            count_b, 3,
+            "Fix-C over-action (Unknown+wrong-msg): expected 3 RPCs (1 + max_retries=2) \
+             but got {count_b}; Fix-C must not classify Unknown+wrong-message as a latch \
+             (#8 code-reviewer NIT-3 / testing-czar SHOULD)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Helper: generate a UUID-shaped string for write resource names.
+fn uuid_str() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    format!("{t:08x}-0000-0000-0000-000000000000")
 }

@@ -1445,11 +1445,18 @@ impl GrpcStore {
             "#59 GrpcStore::write: starting ByteStream write",
         );
         let mut attempt: u32 = 0;
+        // #8 Fix-C: consecutive instant-fail latched-pool attempts.
+        // Arc<AtomicU32> (not mut u32) because the counter is accessed only
+        // inside the inner `async move` block; a plain `mut u32` would be
+        // moved into the first future and the outer FnMut closure would lose
+        // ownership — resetting to 0 on every attempt.
+        let write_latched_fails = Arc::new(AtomicU32::new(0));
         let result = self
             .retrier
             .retry(unfold(local_state, move |local_state| {
                 attempt += 1;
                 let instance_name = instance_name.clone();
+                let write_latched_fails = write_latched_fails.clone();
                 async move {
                     // The client write may occur on a separate thread and
                     // therefore in order to share the state with it we have to
@@ -1468,6 +1475,16 @@ impl GrpcStore {
                         "#59 GrpcStore::write: requesting connection from pool",
                     );
                     let conn_start = std::time::Instant::now();
+                    // #8 Fix-C: record how many ms elapsed from conn_start when the
+                    // channel was acquired (i.e., after acquire_write_channel returns).
+                    // rpc_elapsed_ms = conn_start.elapsed() - channel_acquire_offset_ms
+                    // excludes the connection-acquire queue wait (K2 lesson).
+                    // u64::MAX means "channel not yet acquired" (Quic path sets it to 0).
+                    // Plain AtomicU64 (not Arc): `rpc_fut` is `async { }` (non-move),
+                    // so it borrows `channel_acquire_offset_ms` by shared reference
+                    // from this `async move` scope. The outer error arm reads it after
+                    // `rpc_fut.await` — same task, sequential, no concurrent access.
+                    let channel_acquire_offset_ms = AtomicU64::new(u64::MAX);
                     let instance_for_rpc = instance_name.clone();
                     let local_state_for_rpc = local_state.clone();
 
@@ -1513,6 +1530,10 @@ impl GrpcStore {
                                     conn_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
+                                // #8 Fix-C: record ms-since-conn_start at channel acquisition.
+                                // rpc_elapsed = total - this_value excludes queue wait (K2).
+                                channel_acquire_offset_ms
+                                    .store(conn_elapsed_ms, Ordering::Relaxed);
                                 // #59 instrumentation: demoted to debug! (hot-loop scaffolding).
                                 debug!(
                                     instance_name = %instance_for_rpc,
@@ -1541,6 +1562,9 @@ impl GrpcStore {
                             }
                             #[cfg(feature = "quic")]
                             Transport::Quic(ch) => {
+                                // QUIC has no separate acquire_write_channel;
+                                // set conn_elapsed to 0 so rpc_elapsed ≈ total elapsed.
+                                channel_acquire_offset_ms.store(0, Ordering::Relaxed);
                                 let rpc_start = std::time::Instant::now();
                                 let res = self.bs_client(ch.clone())
                                     .write(make_write_request(local_state_for_rpc, is_mirror, is_worker))
@@ -1571,6 +1595,9 @@ impl GrpcStore {
                                     conn_start.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
+                                // #8 Fix-C: record ms-since-conn_start at channel acquisition.
+                                channel_acquire_offset_ms
+                                    .store(conn_elapsed_ms, Ordering::Relaxed);
                                 // #59 instrumentation: demoted to debug! (hot-loop scaffolding).
                                 debug!(
                                     instance_name = %instance_for_rpc,
@@ -1668,6 +1695,21 @@ impl GrpcStore {
                             }))
                         }
                         Err(ref err) => {
+                            // #8 Fix-C: compute elapsed since channel acquisition
+                            // (excludes queue wait, per K2 lesson).
+                            // channel_acquire_offset_ms == u64::MAX means channel
+                            // was never acquired (acquire_write_channel error); use
+                            // total conn_start elapsed as a safe fallback.
+                            let rpc_elapsed_ms = {
+                                let total_ms = conn_start.elapsed().as_millis() as u64;
+                                let conn_ms = channel_acquire_offset_ms
+                                    .load(Ordering::Relaxed);
+                                if conn_ms == u64::MAX {
+                                    total_ms
+                                } else {
+                                    total_ms.saturating_sub(conn_ms)
+                                }
+                            };
                             // #59 instrumentation: arm_name distinguishes
                             // this from the silenced AlreadyExists branch
                             // in journal queries; keep the pre-existing
@@ -1677,12 +1719,36 @@ impl GrpcStore {
                                 instance_name = %instance_name,
                                 attempt,
                                 ?err,
+                                rpc_elapsed_ms,
                                 can_resume = local_state_locked.can_resume(),
                                 arm_name = "rpc_err",
                                 "#59 GrpcStore::write: RPC failed",
                             );
                             // #147: belt-and-suspenders eviction.
                             self.evict_pool_on_transport_err(err);
+                            // #8 Fix-C: if every attempt is an instant-fail
+                            // latched-pool hit, abort retries early.
+                            let consecutive_latched_fails =
+                                if looks_like_latched_pool(err, rpc_elapsed_ms) {
+                                    write_latched_fails.fetch_add(1, Ordering::Relaxed) + 1
+                                } else {
+                                    write_latched_fails.store(0, Ordering::Relaxed);
+                                    0
+                                };
+                            if consecutive_latched_fails >= LATCHED_POOL_ABORT_THRESHOLD {
+                                warn!(
+                                    instance_name = %instance_name,
+                                    attempt,
+                                    consecutive_latched_fails,
+                                    "GrpcStore: aborting write retries — pool is \
+                                     systemically latched (all write attempts are \
+                                     instant-fail tower-buffer ServiceError); \
+                                     callers fall back instead of burning the ~28s \
+                                     retry budget (#8 Fix-C)"
+                                );
+                                drop(local_state_locked);
+                                return Some((RetryResult::Err(err.clone()), local_state));
+                            }
                             if local_state_locked.can_resume() {
                                 local_state_locked.resume();
                                 RetryResult::Retry(err.clone())
@@ -2354,6 +2420,23 @@ impl GrpcStore {
 
         let actual_chunk_count = chunks.len();
 
+        // #7 Fix-C: per-request consecutive-latched-pool-fail counter.
+        // Shared (Arc) across all chunk retriers so that N chunks
+        // instant-failing simultaneously counts as ONE latched signal,
+        // not N independent signals.  Per-chunk counters would require
+        // N × LATCHED_POOL_ABORT_THRESHOLD attempts before aborting —
+        // on a fully-latched 32-channel pool, chunks abort in parallel
+        // so the shared counter reaches the threshold in 2 total
+        // attempts regardless of chunk_count.
+        //
+        // NOTE: resets on ANY successful channel acquisition (not just the
+        // chunk that previously incremented it).  In a mixed-health pool,
+        // one healthy chunk completing its first acquire resets the counter
+        // to 0, preventing a spurious abort.  This is the intended
+        // reset-wins behavior: if ANY chunk can acquire a healthy channel,
+        // the pool is not fully latched.
+        let parallel_latched_fails = Arc::new(AtomicU32::new(0));
+
         // Create a bounded channel per chunk. Fetch tasks push data
         // into their channel as it arrives from the gRPC stream;
         // the writer drains channels sequentially (ch0 then ch1 …).
@@ -2373,6 +2456,8 @@ impl GrpcStore {
                 .map(
                     |(idx, ((chunk_offset, chunk_length), tx))| {
                         let resource_name = resource_name.to_string();
+                        let parallel_latched_fails =
+                            parallel_latched_fails.clone();
                         async move {
                             // Per-chunk early-EOF retry: when the
                             // server's stream yields `None` (or an
@@ -2430,6 +2515,9 @@ impl GrpcStore {
                                         let attempt_counter =
                                             attempt_counter_inner
                                                 .clone();
+                                        let parallel_latched_fails =
+                                            parallel_latched_fails
+                                                .clone();
                                         async move {
                                             state.attempt += 1;
                                             attempt_counter.store(
@@ -2485,13 +2573,50 @@ impl GrpcStore {
                                                 )
                                                 .await
                                             {
-                                                Ok((stream, id, _)) => (stream, id),
-                                                Err((err, _, _)) => {
+                                                Ok((stream, id, _post_conn)) => {
+                                                    // Successful channel acquisition → pool not latched;
+                                                    // reset the shared counter so a healthy attempt
+                                                    // after a transient failure does not carry stale count.
+                                                    parallel_latched_fails.store(0, Ordering::Relaxed);
+                                                    (stream, id)
+                                                }
+                                                Err((err, _, post_conn)) => {
                                                     // #147: same as single-stream path.
-                                                    // #2 Fix-A covers the single-stream path; parallel
-                                                    // chunks use shorter per-chunk retry budgets and the
-                                                    // legacy any-channel eviction is sufficient here.
+                                                    // #7 Fix-C: check for latched-pool signature.
+                                                    // `post_conn` is set inside read_internal right
+                                                    // after channel acquisition (K2 fix) so elapsed
+                                                    // excludes the connection-acquire queue wait.
+                                                    let attempt_elapsed_ms =
+                                                        post_conn.elapsed().as_millis() as u64;
                                                     self.evict_pool_on_transport_err(&err);
+                                                    if looks_like_latched_pool(&err, attempt_elapsed_ms) {
+                                                        // Atomic add; another chunk racing here may
+                                                        // also increment — first one to reach the
+                                                        // threshold wins and both abort.
+                                                        let fails = parallel_latched_fails
+                                                            .fetch_add(1, Ordering::Relaxed)
+                                                            + 1;
+                                                        if fails >= LATCHED_POOL_ABORT_THRESHOLD {
+                                                            warn!(
+                                                                chunk_idx = idx,
+                                                                attempt = state.attempt,
+                                                                consecutive_latched_fails = fails,
+                                                                "GrpcStore: aborting parallel retries — \
+                                                                 pool is systemically latched (all \
+                                                                 chunk attempts are instant-fail \
+                                                                 tower-buffer ServiceError); \
+                                                                 callers fall back instead of burning \
+                                                                 the 30s notify timeout (#7 Fix-C)"
+                                                            );
+                                                            return Some((RetryResult::Err(err), state));
+                                                        }
+                                                    } else {
+                                                        // Non-latched failure: reset consecutive
+                                                        // counter so a single coincidentally-fast
+                                                        // transient does not accumulate.
+                                                        parallel_latched_fails
+                                                            .store(0, Ordering::Relaxed);
+                                                    }
                                                     return Some((
                                                         RetryResult::Retry(err.append(format!(
                                                             "in GrpcStore::get_part_parallel chunk {idx} (attempt {})",
