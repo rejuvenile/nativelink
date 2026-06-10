@@ -364,6 +364,10 @@ required-features = ["chunked_fast_slow"]
 # so the composite invariant the second test exercises is only
 # observable with that feature enabled.
 [[test]]
+name = "existence_cache_ref_store_registration_test"
+required-features = ["test-utils"]
+
+[[test]]
 name = "completeness_checking_pin_accumulation_test"
 required-features = ["test-utils", "chunked_fast_slow"]
 

@@ -222,6 +222,17 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
         &self.inner_store
     }
 
+    /// Test accessor for the `vulnerable_mode` flag.
+    ///
+    /// Guards the #9 invariant: an ECS over a ref-wrapped registered backend
+    /// must NOT enter vulnerable_mode. Production code observes this via the
+    /// metric; tests need a direct accessor to assert the construction-time
+    /// state.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn is_vulnerable_mode(&self) -> bool {
+        self.vulnerable_mode
+    }
+
     pub fn new_with_time(
         spec: &ExistenceCacheSpec,
         inner_store: Store,
@@ -248,6 +259,23 @@ impl<I: InstantWrapper> ExistenceCacheStore<I> {
         // The eager invalidation from `register_item_callback` is what's
         // missing — the stale-positive window expands from "fired
         // immediately" to "next read/write touch."
+        //
+        // #9 RefStore-resolution asymmetry: `RefStore::supports_removal_callbacks`
+        // deliberately returns `false` for an unresolved cell (commit cd980946,
+        // #367) — this fires the operator-visible warn for genuinely-unregistered
+        // refs. For the AC_INNER case the inner IS a registered RefStore whose
+        // cell happens to be empty at construction time (store_factory wires the
+        // StoreManager entries sequentially, so the ECS constructor runs before
+        // `get_store()` has been called). Calling `inner_store(None)` here
+        // triggers `RefStore::get_store()`, populating the cell; the subsequent
+        // `supports_removal_callbacks()` then queries the resolved inner and
+        // returns its actual value (true for MemoryStore/FilesystemStore/Redis-
+        // with-notifications). If the ref target is NOT registered (missing name),
+        // `get_store()` returns Err, `inner_store` returns `self` (the RefStore
+        // itself), and `supports_removal_callbacks()` still returns `false` for
+        // the unresolved cell — preserving cd980946's graceful-degradation
+        // semantics (no panic, vulnerable_mode=true, loud error! at boot).
+        let _resolved = inner_store.inner_store(None::<StoreKey<'_>>);
         let supports_callbacks = inner_store.supports_removal_callbacks();
         let existence_cache_store = Arc::new(Self {
             inner_store,

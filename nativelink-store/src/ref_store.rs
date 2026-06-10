@@ -212,6 +212,13 @@ impl StoreDriver for RefStore {
     /// callbacks. Returning `true` here would silently suppress the
     /// warn for the most common production composition (DSR M2 finding,
     /// 2026-05-11).
+    // GUARD (#9, 2026-06-10): do NOT "clean this up" to auto-resolve the cell
+    // via get_store() — false-for-unresolved is a deliberate contract
+    // (cd980946/#367): a ref to a store missing from the StoreManager must
+    // degrade to vulnerable_mode with an operator-visible error, never panic
+    // or self-resolve at query time. Callers that can guarantee the target is
+    // registered must resolve explicitly (inner_store(None)) BEFORE querying,
+    // as ExistenceCacheStore::new_with_time now does.
     fn supports_removal_callbacks(&self) -> bool {
         let ref_store = self.inner.cell.0.get();
         unsafe {
