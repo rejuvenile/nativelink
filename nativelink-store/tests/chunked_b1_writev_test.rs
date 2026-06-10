@@ -1081,3 +1081,101 @@ async fn b1_writev_pin_only_advertises_post_cqe_bytes() {
 
     result.expect("T9: blob commit must succeed after pre-delay elapses");
 }
+
+/// =====================================================================
+/// T10 — warn! fields include `cqe_kernel_ms` and `cqe_dispatch_ms` (#3).
+/// =====================================================================
+///
+/// Verifies that when the slow-write threshold is crossed the warn! line
+/// emitted by `ChunkedWriter::process_completion` contains BOTH the new
+/// `cqe_kernel_ms` (SQE-submit → CQE-reap) and `cqe_dispatch_ms`
+/// (CQE-reap → future-resume) structured fields introduced by #3
+/// (cqe-reap-timestamp).
+///
+/// A 100 ms pre-write delay is injected via
+/// `TEST_PRE_WRITE_DELAY_MS_BY_DIGEST` so that `enqueue_ms ≥ 100` and
+/// `total_inner_ms > 50` — the condition that gates the `warn!`.
+///
+/// Mutation: if the `warn!` macro invocation is edited to remove either
+/// `cqe_kernel_ms` or `cqe_dispatch_ms` (or if the fields are computed
+/// but not passed to `warn!`), this test red-fails with bespoke message.
+///
+/// Skips when io_uring is unavailable (Path B / spawn_blocking does not
+/// use the writev timestamp path and would not emit these fields).
+#[nativelink_test]
+async fn b1_writev_warn_contains_cqe_split_fields() {
+    if !skip_if_no_io_uring("b1_writev_warn_contains_cqe_split_fields").await {
+        return;
+    }
+    let store = make_fs_store().await;
+    // One chunk: minimal blob that completes in a single writev.
+    let (blob, digest, total) = make_blob_mib(1, 0xd3);
+
+    // Install 100 ms pre-write delay so total_inner_ms > 50 → warn fires.
+    nativelink_store::chunked::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
+        .lock()
+        .insert(digest, 100);
+
+    let budget = ChunkBudget::new();
+    let (driver, tx) = ChunkedDriver::spawn_driver(
+        Arc::clone(&store),
+        digest,
+        total,
+        CHUNK_SIZE,
+        PER_BLOB_MPSC_CAP,
+    );
+
+    let permit = budget
+        .try_acquire_chunk()
+        .expect("T10: ChunkBudget must have permits available");
+    tx.send(ChunkWork {
+        chunk_offset: 0,
+        chunk_bytes: Bytes::from(blob),
+        finish: true,
+        _permit: permit,
+        _pin_permit: None,
+    })
+    .await
+    .expect("T10: ChunkWork send must succeed");
+    drop(tx);
+
+    tokio::time::timeout(Duration::from_secs(10), driver.await_completion())
+        .await
+        .expect("T10: commit must complete within 10 s (deadlock detector)")
+        .expect("T10: blob commit must succeed");
+
+    // Cleanup.
+    nativelink_store::chunked::chunked_filesystem::TEST_PRE_WRITE_DELAY_MS_BY_DIGEST
+        .lock()
+        .remove(&digest);
+
+    // The warn! is emitted inside `process_completion` when total_inner_ms > 50.
+    // Both new fields must appear in the structured warn output.
+    logs_assert(|lines: &[&str]| {
+        let has_kernel = lines.iter().any(|l| {
+            l.contains(" WARN ") && l.contains("cqe_kernel_ms")
+        });
+        let has_dispatch = lines.iter().any(|l| {
+            // NOTE (testing-czar, cqe-split review): verifies field NAME
+            // presence only. A mutation swapping the kernel/dispatch
+            // computation FORMULAS (keeping both names) survives this test;
+            // the fork's dispatch_window_guard covers the capture-point
+            // semantics but not the warn labeling. Closing this needs a
+            // structured-log VALUE assertion — follow-up filed.
+            l.contains(" WARN ") && l.contains("cqe_dispatch_ms")
+        });
+        match (has_kernel, has_dispatch) {
+            (true, true) => Ok(()),
+            (false, _) => Err(
+                "T10: cqe_kernel_ms missing from warn! (#3 cqe-reap-timestamp field not emitted) \
+                 — mutation: remove cqe_kernel_ms from process_completion warn! to reproduce"
+                    .to_string(),
+            ),
+            (true, false) => Err(
+                "T10: cqe_dispatch_ms missing from warn! (#3 cqe-reap-timestamp field not emitted) \
+                 — mutation: remove cqe_dispatch_ms from process_completion warn! to reproduce"
+                    .to_string(),
+            ),
+        }
+    });
+}

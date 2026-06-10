@@ -311,6 +311,12 @@ mod io_uring_impl {
         enqueue_time_earliest: Instant,
         submit_started: Instant,
         submit_time: Instant,
+        /// Wall-clock when the poller loop consumed the CQE from the
+        /// io_uring completion ring. Populated from the fork's new
+        /// `reaped_at` return value. The gap `reaped_at - submit_time` is
+        /// pure kernel I/O time; the gap `resume_now - reaped_at` is the
+        /// tokio dispatch delay (eventfd→epoll→io-driver→waker hops).
+        reaped_at: Instant,
         result: Result<usize, tokio_epoll_uring::Error<std::io::Error>>,
         // LOAD-BEARING DROP: `_permits` releases chunk_budget semaphore
         // on drop after CQE processing (one permit per iovec, see
@@ -711,13 +717,14 @@ mod io_uring_impl {
 
                 let total_len = run_bytes;
                 in_flight.push(Box::pin(async move {
-                    let (_fd, result) = write_fut.await;
+                    let (_fd, reaped_at, result) = write_fut.await;
                     WriteCompletion {
                         total_len,
                         coalesce_count,
                         enqueue_time_earliest: earliest_enqueue,
                         submit_started,
                         submit_time,
+                        reaped_at,
                         result,
                         _permits: permits,
                         chunks: chunks_meta,
@@ -815,7 +822,25 @@ mod io_uring_impl {
             .submit_time
             .saturating_duration_since(wc.submit_started)
             .as_millis() as u64;
+        // Legacy field: kept unchanged for baseline continuity.
+        // `writev_ms` spans SQE-submit → future-resume; it conflates
+        // kernel I/O time with tokio dispatch delay. The two new fields
+        // below split it cleanly (#3 cqe-reap-timestamp).
         let writev_ms = wc.submit_time.elapsed().as_millis() as u64;
+        // `cqe_kernel_ms`: time from SQE submit → CQE reap by the
+        // poller loop. Pure kernel/io_uring time (inc. io-wq offload).
+        let cqe_kernel_ms = wc
+            .reaped_at
+            .saturating_duration_since(wc.submit_time)
+            .as_millis() as u64;
+        // `cqe_dispatch_ms`: time from CQE reap → this function running
+        // (eventfd→epoll→tokio-io-driver→waker→scheduler hops). When
+        // PSI stalls are active, this component dominates and was
+        // previously indistinguishable from storage latency.
+        let cqe_dispatch_ms = wc
+            .reaped_at
+            .elapsed()
+            .as_millis() as u64;
         let total_inner_ms = enqueue_ms + submit_ms + writev_ms;
         if total_inner_ms > 50 {
             warn!(
@@ -824,11 +849,19 @@ mod io_uring_impl {
                 enqueue_ms,
                 submit_ms,
                 writev_ms,
+                // #3 cqe-reap-timestamp split: kernel time vs dispatch time.
+                cqe_kernel_ms,
+                cqe_dispatch_ms,
                 coalesce_count = wc.coalesce_count,
                 path = "io_uring",
                 // LEGACY mapped fields (design §5 table):
                 mutex_acquire_ms = 0u64,
-                dispatch_ms = enqueue_ms + submit_ms,
+                // Renamed from `dispatch_ms` (code-reviewer, cqe-split review):
+                // that key collided semantically with the new `cqe_dispatch_ms`
+                // — this one is PRE-SQE time (enqueue + coalesce/submit build),
+                // the cqe_ one is POST-CQE reap→resume. Same warn line must
+                // not carry two opposite-phase "dispatch" keys.
+                pre_sqe_ms = enqueue_ms + submit_ms,
                 pwrite_ms = writev_ms,
                 closure_to_resume_ms = 0u64,
                 total_inner_ms,

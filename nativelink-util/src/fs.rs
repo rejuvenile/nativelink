@@ -956,7 +956,7 @@ pub async fn write_file_from_channel(
 
         in_flight.push(Box::pin(async move {
             let submit_time = std::time::Instant::now();
-            let (_fd, result) = write_fut.await;
+            let (_fd, _reaped_at, result) = write_fut.await;
             WriteCompletion {
                 chunk_len: total_len,
                 enqueue_time,
