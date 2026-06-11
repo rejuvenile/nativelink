@@ -78,3 +78,9 @@ split-debuginfo = "unpacked"
 [profile.test]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
+
+[net]
+# cargo's libgit2 cannot auth to gitforge over ssh; builder macs already have
+# working system ssh (they pull this repo). Shell out to git for git deps
+# (the user/hyper [patch.crates-io] fork). Added 2026-06-11, #15 deploy fix.
+git-fetch-with-cli = true
