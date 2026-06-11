@@ -47,7 +47,7 @@ use nativelink_service::health_server::HealthServer;
 use nativelink_service::push_server::PushServer;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_util::blob_locality_map;
-use nativelink_store::completeness_checking_store::CompletenessCheckingStore;
+use nativelink_store::completeness_checking_store::inject_h4_pending_registry_into_ac_chains;
 use nativelink_store::store_manager::{StoreManager, build_store_manager};
 use nativelink_util::common::fs::set_open_file_limit;
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
@@ -687,11 +687,6 @@ async fn inner_main(
         "grpc_stream",
         nativelink_util::proto_stream_utils::grpc_stream_counters_arc(),
     );
-
-    // First-listener-wins guard: when more than one ServerConfig hosts
-    // a worker_api block, the SECOND construction would register the
-    // same metrics tree under the same prefix and double every line.
-    let mut worker_api_metrics_registered = false;
 
     // Periodically log tokio runtime metrics to detect thread pool exhaustion.
     // Requires tokio_unstable cfg for blocking thread metrics.
@@ -1456,6 +1451,106 @@ async fn inner_main(
     #[cfg(target_family = "unix")]
     let mut drain_receivers: Vec<oneshot::Receiver<()>> = Vec::new();
 
+    // (#12 H4 cross-entry scoping fix) PRE-PASS: scan ALL server entries to build
+    // WorkerApiServer ONCE and extract liveness_checker BEFORE the per-entry loop.
+    //
+    // Root cause of the original bug: the old code built `pre_built_worker_api`
+    // and extracted `liveness_checker` INSIDE the per-entry loop. Production
+    // config has AC services on :50051/:50071/:50072 and worker_api ONLY on :50061.
+    // Each AC entry got `liveness_checker = None` (no worker_api on that entry),
+    // so the CCS injection block at the bottom of that iteration was silently
+    // skipped. The worker_api entry had `liveness_checker = Some(...)` but
+    // `services.ac = None`, so the injection block was also skipped there.
+    //
+    // Fix: hoist WorkerApiServer construction here — after `ac_store_names`,
+    // `unwrapped_cas_stores`, `worker_proxy_stores`, `locality_map`,
+    // `worker_schedulers`, `small_blob_dispatcher`, `ac_pin_registry`, and
+    // `pending_output_locality_registry` are all available — so the single
+    // `liveness_checker` is shared across all subsequent per-entry iterations.
+    //
+    // The WorkerApiServer is stored in `pre_built_worker_api_holder` (an
+    // `Option`). The per-entry loop takes from this option when it encounters
+    // the worker_api entry, preserving the original "served on its own listener"
+    // contract. Only construction ordering moves; serving ordering is unchanged.
+    let pre_built_worker_api_holder: Option<WorkerApiServer> = server_cfgs
+        .iter()
+        .find_map(|sc| sc.services.as_ref()?.worker_api.as_ref().map(|cfg| {
+            let backfill_cas = cas_store_names
+                .iter()
+                .next()
+                .and_then(|name| unwrapped_cas_stores.get(name).cloned());
+            let worker_proxy = cas_store_names
+                .iter()
+                .next()
+                .and_then(|name| worker_proxy_stores.get(name).cloned());
+            WorkerApiServer::new(
+                cfg,
+                &worker_schedulers,
+                Some(locality_map.clone()),
+                backfill_cas,
+                worker_proxy,
+                small_blob_dispatcher.clone(),
+                Some(ac_pin_registry.clone()),
+                Some(pending_output_locality_registry.clone()),
+            )
+        }))
+        .transpose()
+        .err_tip(|| "Could not create WorkerApi service")?;
+
+    // Extract liveness_checker from the pre-built server (None if no worker_api entry).
+    let global_liveness_checker: Option<SharedLivenessChecker> =
+        pre_built_worker_api_holder.as_ref().map(|s| s.liveness_checker());
+
+    // Register WorkerApi metrics (first-listener-wins; construction is pre-loop; at most one server built — a second worker_api entry in config would be unserved (production has exactly one),
+    // now guaranteed to run at most once since construction is pre-loop).
+    if let Some(ref server) = pre_built_worker_api_holder {
+        metrics_registry.register("worker_api", server.metrics());
+    }
+
+    // Note on test coverage: `inject_h4_pending_registry_into_ac_chains` is
+        // unit-tested via `split_topology_ac_ccs_receives_registry`. The
+        // nativelink.rs call site itself (config parse -> store_manager build ->
+        // this pre-pass) is not covered by an integration test. The startup
+        // info! log "H4 phase 3: pending-registry injected..." is the
+        // compensating control - post-deploy, grep for it to confirm injection.
+        // (#12 H4 phase 3) Inject the pending-output registry + liveness checker
+    // into every CompletenessCheckingStore in the AC store chains ONCE, using
+    // the full cross-entry `ac_store_names` set (populated from ALL server
+    // entries above). Previously this ran inside the per-entry loop, gated on
+    // `if let (Some(ac_cfgs), Some(checker))` — meaning it only fired for
+    // entries that had BOTH ac AND worker_api, which is never true in production.
+    //
+    // MUST run before any listener binds (the loop below); pre-injection
+    // requests see consult-absent = pre-H4 behavior (benign).
+    if let Some(checker) = global_liveness_checker.as_ref() {
+        let injected_count = inject_h4_pending_registry_into_ac_chains(
+            &ac_store_names,
+            &store_manager,
+            &pending_output_locality_registry,
+            checker,
+        );
+        if injected_count == 0 {
+            if ac_store_names.is_empty() {
+                info!("H4 phase 3: no AC store configured — pending-registry consult not applicable");
+            } else {
+                warn!(
+                    "H4 phase 3: no CompletenessCheckingStore found in any AC chain \
+                     — pending-registry consult INACTIVE; H4 rescues will not fire; \
+                     check AC store chain configuration"
+                );
+            }
+        } else {
+            info!(injected_count, "H4 phase 3: pending-registry injected into CCS chains");
+        }
+    } else if !ac_store_names.is_empty() {
+        info!(
+            "H4 phase 3: no worker_api service configured — pending-registry consult not applicable"
+        );
+    }
+
+    // Move into an Option so the per-entry loop can `.take()` it exactly once.
+    let mut pre_built_worker_api_holder = pre_built_worker_api_holder;
+
     for server_cfg in server_cfgs {
         let services = server_cfg
             .services
@@ -1576,133 +1671,19 @@ async fn inner_main(
             .transpose()
             .err_tip(|| "Could not create Execution service")?;
 
-        // (#12 H4 phase 2) Pre-build WorkerApiServer so we can extract its
-        // `liveness_checker` before constructing AcServer.  AcServer must be
-        // constructed first in the tonic Routes chain (ordered by proto service),
-        // but it needs the checker from WorkerApiServer to validate
-        // `cas_endpoint` on incoming UpdateActionResult RPCs.
-        //
-        // The pre-build pattern works because the tonic Routes builder assembles
-        // services from pre-built values; order-of-construction and
-        // order-of-registration are independent.  The server is moved into
-        // `svc_setup!` exactly as it was before; no behaviour change other than
-        // construction happening earlier.
-        let worker_api_cfg = services.worker_api;
-        let pre_built_worker_api: Option<WorkerApiServer> = worker_api_cfg
-            .as_ref()
-            .map(|cfg| {
-                let backfill_cas = cas_store_names
-                    .iter()
-                    .next()
-                    .and_then(|name| unwrapped_cas_stores.get(name).cloned());
-                let worker_proxy = cas_store_names
-                    .iter()
-                    .next()
-                    .and_then(|name| worker_proxy_stores.get(name).cloned());
-                WorkerApiServer::new(
-                    cfg,
-                    &worker_schedulers,
-                    Some(locality_map.clone()),
-                    backfill_cas,
-                    worker_proxy,
-                    small_blob_dispatcher.clone(),
-                    Some(ac_pin_registry.clone()),
-                    // (#12 H4 phase 2) activate the pending-output registry.
-                    Some(pending_output_locality_registry.clone()),
-                )
-            })
-            .transpose()
-            .err_tip(|| "Could not create WorkerApi service")?;
-
-        // Extract the liveness checker BEFORE pre_built_worker_api is moved
-        // into the tonic chain. The checker captures the same `endpoint_state`
-        // Arc that `connect_worker` mutates, so it reflects the live worker
-        // set without additional synchronisation.
-        let liveness_checker: Option<SharedLivenessChecker> =
-            pre_built_worker_api.as_ref().map(|s| s.liveness_checker());
-
-        // Register WorkerApi metrics here (same first-listener-wins guard as
-        // before, moved out of the tonic chain closure so it can refer to
-        // `pre_built_worker_api` by reference before the move).
-        if let Some(ref server) = pre_built_worker_api {
-            if !worker_api_metrics_registered {
-                metrics_registry.register("worker_api", server.metrics());
-                worker_api_metrics_registered = true;
-            }
-        }
-
-        // (#12 H4 phase 3) Inject the pending-output registry + liveness checker
-        // into every CompletenessCheckingStore in the AC store chains. CCS is
-        // constructed by default_store_factory with `new()` (no registry) because
-        // the registry is not yet available at store-factory time. We walk the AC
-        // store chains now — after the WorkerApiServer is built and `liveness_checker`
-        // is extracted — and call `inject_pending_registry` on each CCS found.
-        //
-        // Pattern: iterate AC configs, look up each store by name, walk the
-        // chain via `inner_store(None)`, and attempt a downcast at every layer.
-        // OnceLock inside CCS silently ignores a second call (belt-and-braces
-        // for the multi-instance case, though one server entry maps to one CCS).
-        // MUST run before any listener binds (~line 2057) — requests arriving
-        // pre-injection see consult-absent = pre-H4 behavior (benign); do not
-        // move this below the bind.
-        if let (Some(ac_cfgs), Some(checker)) = (services.ac.as_ref(), liveness_checker.as_ref()) {
-            use nativelink_util::store_trait::StoreDriver;
-
-            fn try_inject_into_chain(
-                driver: &dyn StoreDriver,
-                registry: &nativelink_util::ac_pin_registry::SharedAcPinRegistry,
-                checker: &SharedLivenessChecker,
-                depth: usize,
-            ) -> bool {
-                if depth > 16 {
-                    return false; // guard against deep or cyclic chains
-                }
-                if let Some(ccs) = driver.as_any().downcast_ref::<CompletenessCheckingStore>() {
-                    ccs.inject_pending_registry(registry.clone(), checker.clone());
-                    return true; // CCS found; no need to descend further
-                }
-                // Try walking deeper via inner_store(None). The same
-                // fat-pointer equality guard used by `find_fast_slow_via_chain`
-                // in wrapper_walker.rs detects self-returning wrappers (e.g.
-                // MemoryStore, SizePartitioningStore) and terminates the walk.
-                let inner = driver.inner_store(None::<nativelink_util::store_trait::StoreKey<'_>>);
-                if core::ptr::eq(
-                    inner as *const dyn StoreDriver,
-                    driver as *const dyn StoreDriver,
-                ) {
-                    return false;
-                }
-                try_inject_into_chain(inner, registry, checker, depth + 1)
-            }
-
-            let mut injected_count = 0usize;
-            for config in ac_cfgs {
-                let store_name = &config.config.ac_store;
-                if let Some(store) = store_manager.get_store(store_name) {
-                    let driver: &dyn StoreDriver = store.inner_store(None::<nativelink_util::store_trait::StoreKey<'_>>);
-                    if try_inject_into_chain(
-                        driver,
-                        &pending_output_locality_registry,
-                        checker,
-                        0,
-                    ) {
-                        injected_count += 1;
-                    }
-                }
-            }
-            if injected_count == 0 {
-                warn!(
-                    "H4 phase 3: no CompletenessCheckingStore found in any AC chain \
-                     — pending-registry consult INACTIVE; H4 rescues will not fire; \
-                     check AC store chain configuration"
-                );
-            } else {
-                info!(injected_count, "H4 phase 3: pending-registry injected into CCS chains");
-            }
-        }
+        // (#12 H4 cross-entry scoping fix) WorkerApiServer was pre-built before
+        // this loop. Take it from the holder for the entry that hosts worker_api.
+        // On entries without worker_api, `services.worker_api` is None and
+        // `pre_built_worker_api_holder` is either None (no worker_api anywhere)
+        // or still contains the pre-built server (taken by the worker_api entry).
+        let pre_built_worker_api: Option<WorkerApiServer> = if services.worker_api.is_some() {
+            pre_built_worker_api_holder.take()
+        } else {
+            None
+        };
 
         // Extract the AC config early so we can build AcServer with the
-        // liveness_checker obtained above.
+        // global liveness_checker obtained before the loop.
         let ac_cfg = services.ac;
         let pre_built_ac: Option<_> = ac_cfg
             .map(|cfg| {
@@ -1710,7 +1691,7 @@ async fn inner_main(
                     &cfg,
                     &store_manager,
                     Some(pending_output_locality_registry.clone()),
-                    liveness_checker.clone(),
+                    global_liveness_checker.clone(),
                 )
             })
             .transpose()
@@ -1822,9 +1803,8 @@ async fn inner_main(
                 .err_tip(|| "Could not create Capabilities service")?
                 .map(|v| svc_setup!(v)),
             )
-            // (#12 H4 phase 2) WorkerApiServer was pre-built above so we
-            // could extract its liveness_checker for AcServer. Metrics were
-            // also registered above (first-listener-wins, same guard).
+            // (#12 H4 cross-entry fix) WorkerApiServer was pre-built before the
+            // loop; taken from the holder above for the entry with worker_api.
             .add_optional_service(
                 pre_built_worker_api.map(|v| svc_setup!(v)),
             )

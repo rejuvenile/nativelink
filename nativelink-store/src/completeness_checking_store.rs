@@ -15,6 +15,7 @@
 use core::pin::Pin;
 use core::{iter, mem};
 use core::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -881,3 +882,58 @@ impl StoreDriver for CompletenessCheckingStore {
 }
 
 default_health_status_indicator!(CompletenessCheckingStore);
+
+/// Walk every AC store named in `ac_store_names`, locate the first
+/// `CompletenessCheckingStore` in each chain via `inner_store`, and call
+/// `inject_pending_registry` on it.
+///
+/// Returns the number of CCS instances that received the injection.
+///
+/// Extracted from `nativelink.rs`'s per-entry injection block so that it
+/// can be unit-tested with a split-topology config (AC on one server entry,
+/// `worker_api` on another) — the topology that the original per-loop
+/// scoping bug silently broke. (#12 H4 cross-entry scoping fix.)
+///
+/// # Mutation guidance
+///
+/// Comment out the `inject_pending_registry` call inside `walk`:
+/// → `split_topology_ac_ccs_receives_registry` red-fails:
+///   "H4 wiring inert under split ac/worker_api topology — CCS registry
+///    not injected; split-topology regression"
+pub fn inject_h4_pending_registry_into_ac_chains(
+    ac_store_names: &HashSet<String>,
+    store_manager: &crate::store_manager::StoreManager,
+    registry: &SharedAcPinRegistry,
+    checker: &SharedLivenessChecker,
+) -> usize {
+    fn walk(
+        driver: &dyn StoreDriver,
+        registry: &SharedAcPinRegistry,
+        checker: &SharedLivenessChecker,
+        depth: usize,
+    ) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        if let Some(ccs) = driver.as_any().downcast_ref::<CompletenessCheckingStore>() {
+            ccs.inject_pending_registry(registry.clone(), checker.clone());
+            return true;
+        }
+        let inner = driver.inner_store(None::<StoreKey<'_>>);
+        if core::ptr::eq(inner as *const dyn StoreDriver, driver as *const dyn StoreDriver) {
+            return false;
+        }
+        walk(inner, registry, checker, depth + 1)
+    }
+
+    let mut injected = 0usize;
+    for store_name in ac_store_names {
+        if let Some(store) = store_manager.get_store(store_name) {
+            let driver = store.inner_store(None::<StoreKey<'_>>);
+            if walk(driver, registry, checker, 0) {
+                injected += 1;
+            }
+        }
+    }
+    injected
+}

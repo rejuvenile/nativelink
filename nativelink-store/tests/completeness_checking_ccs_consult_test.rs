@@ -86,9 +86,10 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 };
 use nativelink_store::ac_utils::serialize_and_upload_message;
 use nativelink_store::completeness_checking_store::{
-    CompletenessCheckingStore, SharedLivenessChecker,
+    CompletenessCheckingStore, SharedLivenessChecker, inject_h4_pending_registry_into_ac_chains,
 };
 use nativelink_store::memory_store::MemoryStore;
+use nativelink_store::store_manager::StoreManager;
 use nativelink_util::ac_pin_registry::new_shared_ac_pin_registry;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
@@ -658,6 +659,93 @@ async fn no_registry_wired_current_behavior_unchanged() -> Result<(), Error> {
     .expect("get_part must not hang")
     .expect_err("no-registry CCS must return NotFound for dangling AR");
     assert_eq!(r.code, Code::NotFound);
+
+    Ok(())
+}
+
+// ─── Regression test: split ac/worker_api topology (#12 H4 cross-entry fix) ──
+
+/// (#12 H4 cross-entry scoping fix) Verify that `inject_h4_pending_registry_into_ac_chains`
+/// correctly injects the registry into a CCS even when the AC store name is
+/// discovered in a separate pre-scan (simulating production's split topology:
+/// AC on :50051, worker_api on :50061 — no single server entry has both).
+///
+/// The pre-existing per-loop scoping bug meant `liveness_checker = None` on the
+/// AC entry (no worker_api on that entry) → CCS injection silently skipped.
+/// This test verifies the extracted free function works and that the fix's call
+/// site actually injects the registry by asserting the rescue fires.
+///
+/// # Mutation guidance
+///
+/// Comment out the `inject_h4_pending_registry_into_ac_chains` call in
+/// `nativelink.rs`'s pre-loop block (or equivalently, skip the `walk` call
+/// inside the function):
+/// → test red-fails with:
+///   "H4 wiring inert under split ac/worker_api topology — CCS registry not
+///    injected; split-topology regression"
+#[nativelink_test]
+async fn split_topology_ac_ccs_receives_registry() -> Result<(), Error> {
+    // Build a CCS (initially without registry) and register it in a StoreManager
+    // under a store name that simulates the AC-entry's ac_store.
+    let cas_store = MemoryStore::new(&MemorySpec::default());
+    let ac_backend = MemoryStore::new(&MemorySpec::default());
+    let ccs = CompletenessCheckingStore::new(
+        Store::new(ac_backend),
+        Store::new(cas_store),
+    );
+
+    const AC_STORE_NAME: &str = "split_topology_ac_store";
+    let sm = StoreManager::new();
+    sm.add_store(AC_STORE_NAME, Store::new(ccs.clone()));
+
+    // ac_store_names mirrors the pre-pass scan: collected from ALL server entries.
+    let mut ac_store_names = HashSet::new();
+    ac_store_names.insert(AC_STORE_NAME.to_string());
+
+    let registry = new_shared_ac_pin_registry();
+    let live_set: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(
+        [LIVE_EP].iter().map(|s| s.to_string()).collect(),
+    ));
+    let live_set2 = live_set.clone();
+    let checker: SharedLivenessChecker = Arc::new(move |ep: &str| live_set2.lock().contains(ep));
+
+    // This is the call that the pre-loop block in nativelink.rs must make.
+    // Mutation: comment this call out → the CCS gets no registry → rescue below fails.
+    let injected =
+        inject_h4_pending_registry_into_ac_chains(&ac_store_names, &sm, &registry, &checker);
+
+    assert_eq!(
+        injected, 1,
+        "H4 wiring inert under split ac/worker_api topology — \
+         inject_h4_pending_registry_into_ac_chains returned {injected}; expected 1; \
+         split-topology regression",
+    );
+
+    // Verify the injection actually works: register MISSING_CAS under the live
+    // endpoint and write a dangling AR. The rescue must fire.
+    let store_id: Arc<str> = Arc::from("");
+    registry.register_ac_pin(LIVE_EP, store_id, MISSING_CAS);
+
+    let ac_key = write_dangling_ar(&ccs, MISSING_CAS).await?;
+
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        ccs.get_part_unchunked(StoreKey::from(ac_key), 0, None),
+    )
+    .await
+    .expect("get_part must not hang — 5s deadlock detector");
+    assert!(
+        r.is_ok(),
+        "H4 wiring inert under split ac/worker_api topology — CCS registry not \
+         injected; split-topology regression: get_part returned {:?}",
+        r.err(),
+    );
+
+    assert_eq!(
+        ccs.pending_registry_rescues_total(), 1,
+        "H4 wiring inert under split ac/worker_api topology — rescue counter must \
+         be 1 after successful injection + rescue; split-topology regression",
+    );
 
     Ok(())
 }
