@@ -278,6 +278,14 @@ name = "pending_output_locality_registry_test"
 [[test]]
 name = "ac_server_h4_registration_test"
 
+# #12 H4 invariant phase 3/3 deliverable (d): real-tonic-boundary seam
+# test for IS_WORKER_REQUEST → x-nativelink-worker header → AcServer
+# extraction → pending_output_locality_registry registration.
+# Detects header-name divergence between GrpcStore injection site and
+# AcServer extraction site (component-level unit tests cannot detect this).
+[[test]]
+name = "ac_server_h4_seam_test"
+
 # #44 Layer C — server-side `inner_read` unfold cap exercised at the
 # AT-REST branch (`:1768`) — the production hot path for Bazel parallel
 # `Read(offset=N, limit=0)` reads against committed CAS blobs. Uses a

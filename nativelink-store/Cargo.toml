@@ -389,6 +389,14 @@ required-features = ["test-utils", "chunked_fast_slow"]
 name = "store_remove_test"
 required-features = ["test-utils"]
 
+# #12 H4 invariant phase 3/3: CCS pending-registry consult.
+# Tests the rescue path (missing-from-CAS + registry-live → present),
+# dead-endpoint direction (no rescue), composite invariant (no delete on
+# rescue), and CAS-plane boundary (registry does not bleed into CAS has()).
+[[test]]
+name = "completeness_checking_ccs_consult_test"
+required-features = ["test-utils"]
+
 # #247/#477 BLOCK-B log-visibility regression tests. File-level
 # `#![cfg(feature = "chunked_fast_slow")]` would silently skip the file
 # on missing features (auditor MAJOR; cargo otherwise reports "0 tests");

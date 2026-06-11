@@ -47,6 +47,7 @@ use nativelink_service::health_server::HealthServer;
 use nativelink_service::push_server::PushServer;
 use nativelink_service::worker_api_server::WorkerApiServer;
 use nativelink_util::blob_locality_map;
+use nativelink_store::completeness_checking_store::CompletenessCheckingStore;
 use nativelink_store::store_manager::{StoreManager, build_store_manager};
 use nativelink_util::common::fs::set_open_file_limit;
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
@@ -1627,6 +1628,76 @@ async fn inner_main(
             if !worker_api_metrics_registered {
                 metrics_registry.register("worker_api", server.metrics());
                 worker_api_metrics_registered = true;
+            }
+        }
+
+        // (#12 H4 phase 3) Inject the pending-output registry + liveness checker
+        // into every CompletenessCheckingStore in the AC store chains. CCS is
+        // constructed by default_store_factory with `new()` (no registry) because
+        // the registry is not yet available at store-factory time. We walk the AC
+        // store chains now — after the WorkerApiServer is built and `liveness_checker`
+        // is extracted — and call `inject_pending_registry` on each CCS found.
+        //
+        // Pattern: iterate AC configs, look up each store by name, walk the
+        // chain via `inner_store(None)`, and attempt a downcast at every layer.
+        // OnceLock inside CCS silently ignores a second call (belt-and-braces
+        // for the multi-instance case, though one server entry maps to one CCS).
+        // MUST run before any listener binds (~line 2057) — requests arriving
+        // pre-injection see consult-absent = pre-H4 behavior (benign); do not
+        // move this below the bind.
+        if let (Some(ac_cfgs), Some(checker)) = (services.ac.as_ref(), liveness_checker.as_ref()) {
+            use nativelink_util::store_trait::StoreDriver;
+
+            fn try_inject_into_chain(
+                driver: &dyn StoreDriver,
+                registry: &nativelink_util::ac_pin_registry::SharedAcPinRegistry,
+                checker: &SharedLivenessChecker,
+                depth: usize,
+            ) -> bool {
+                if depth > 16 {
+                    return false; // guard against deep or cyclic chains
+                }
+                if let Some(ccs) = driver.as_any().downcast_ref::<CompletenessCheckingStore>() {
+                    ccs.inject_pending_registry(registry.clone(), checker.clone());
+                    return true; // CCS found; no need to descend further
+                }
+                // Try walking deeper via inner_store(None). The same
+                // fat-pointer equality guard used by `find_fast_slow_via_chain`
+                // in wrapper_walker.rs detects self-returning wrappers (e.g.
+                // MemoryStore, SizePartitioningStore) and terminates the walk.
+                let inner = driver.inner_store(None::<nativelink_util::store_trait::StoreKey<'_>>);
+                if core::ptr::eq(
+                    inner as *const dyn StoreDriver,
+                    driver as *const dyn StoreDriver,
+                ) {
+                    return false;
+                }
+                try_inject_into_chain(inner, registry, checker, depth + 1)
+            }
+
+            let mut injected_count = 0usize;
+            for config in ac_cfgs {
+                let store_name = &config.config.ac_store;
+                if let Some(store) = store_manager.get_store(store_name) {
+                    let driver: &dyn StoreDriver = store.inner_store(None::<nativelink_util::store_trait::StoreKey<'_>>);
+                    if try_inject_into_chain(
+                        driver,
+                        &pending_output_locality_registry,
+                        checker,
+                        0,
+                    ) {
+                        injected_count += 1;
+                    }
+                }
+            }
+            if injected_count == 0 {
+                warn!(
+                    "H4 phase 3: no CompletenessCheckingStore found in any AC chain \
+                     — pending-registry consult INACTIVE; H4 rescues will not fire; \
+                     check AC store chain configuration"
+                );
+            } else {
+                info!(injected_count, "H4 phase 3: pending-registry injected into CCS chains");
             }
         }
 

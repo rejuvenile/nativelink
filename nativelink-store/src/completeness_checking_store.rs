@@ -14,7 +14,8 @@
 
 use core::pin::Pin;
 use core::{iter, mem};
-use std::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -25,6 +26,7 @@ use nativelink_metric::MetricsComponent;
 use nativelink_proto::build::bazel::remote::execution::v2::{
     ActionResult as ProtoActionResult, OutputDirectory as ProtoOutputDirectory, Tree as ProtoTree,
 };
+use nativelink_util::ac_pin_registry::SharedAcPinRegistry;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
@@ -36,7 +38,27 @@ use nativelink_util::store_trait::{
 use parking_lot::Mutex;
 use prost::Message;
 use tokio::sync::Notify;
-use tracing::warn;
+use tracing::{debug, warn};
+
+/// Callable returning `true` iff the given `cas_endpoint` is currently
+/// connected. Mirrors `SharedLivenessChecker` in `ac_server.rs` (defined
+/// separately to avoid a circular dep between nativelink-store and
+/// nativelink-service).
+///
+/// `None` in CCS = kill-switch: all consults are skipped → current behavior.
+pub type SharedLivenessChecker = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Newtype wrapper around `SharedLivenessChecker` that provides a trivial
+/// `Debug` impl so the parent struct can derive `Debug` without a blanket
+/// `impl Debug for dyn Fn` (which Rust does not provide). The wrapper is
+/// transparent at runtime — all operations delegate to the inner checker.
+struct LivenessCheckerDebug(SharedLivenessChecker);
+
+impl core::fmt::Debug for LivenessCheckerDebug {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LivenessChecker").finish_non_exhaustive()
+    }
+}
 
 use crate::ac_utils::{get_and_decode_digest, get_size_and_decode_digest};
 
@@ -122,16 +144,174 @@ pub struct CompletenessCheckingStore {
     incomplete_entries_counter: CounterWithTime,
     #[metric(help = "Complete entries hit in CompletenessCheckingStore")]
     complete_entries_counter: CounterWithTime,
+    /// (#12 H4 phase 3) Optional registry for pending worker-output locality.
+    ///
+    /// When `Some` and CAS `has_with_results` reports a digest MISSING, the
+    /// consult checks this registry: if any endpoint holds the digest AND that
+    /// endpoint passes `liveness_checker`, the digest is treated as PRESENT
+    /// (fetchable via `WorkerProxyStore` peer-fetch at actual read time).
+    ///
+    /// `None` = kill-switch: all consults are skipped → current behavior.
+    ///
+    /// SHORT-CIRCUIT BOUNDARY: the consult lives ONLY in the completeness gate
+    /// (after CAS reports missing) — NOT in any general `has_with_results`
+    /// path that bytestream/batch-update upload-dedup consults. CCS wraps the
+    /// AC store; the CAS store is queried independently. Proof: the consult
+    /// fires only inside `get_and_verify_single` (the `get_part` path) and
+    /// inside `check_existence_fut` (the `has_with_results` path), BOTH of
+    /// which are reachable only after decoding an AC entry — a code path that
+    /// bytestream/batch-update never takes.
+    /// Set once at startup by `inject_pending_registry` after the store
+    /// chain is fully constructed. `OnceLock` gives a lock-free fast path
+    /// (no mutex on reads). Not set = kill-switch: consult is skipped.
+    pending_output_locality_registry: OnceLock<SharedAcPinRegistry>,
+    /// Liveness checker companion. Set at the same time as the registry.
+    /// Wrapped in `LivenessCheckerDebug` so the struct can derive `Debug`.
+    /// Not set = kill-switch.
+    liveness_checker: OnceLock<LivenessCheckerDebug>,
+    // CAPPED AT 1: single monotonically-increasing u64; no bounding needed.
+    /// (#12 H4 phase 3) Count of CCS completeness verdicts flipped from
+    /// "missing" → "present" by the pending-registry consult. Non-zero rate
+    /// is the H4-fix effectiveness gauge: each increment represents an H4-class
+    /// false-dangling event (AR published before large blob was server-visible)
+    /// that was rescued instead of triggering a re-execute.
+    ///
+    /// Sustained zero after phase 3 lands = pending registry not populated
+    /// (phase 2 wiring not active) or no H4 events in this window. Sustained
+    /// non-zero = H4 events still occurring but now rescued instead of failing.
+    #[metric(help = "CCS completeness verdicts rescued by pending-registry consult (H4 fix gauge)")]
+    ccs_pending_registry_rescues_total: CounterWithTime,
+    /// Raw atomic for the same counter — exposed as `pending_registry_rescues_total()`
+    /// for test assertions. Incremented from both `get_and_verify_single` and
+    /// `inner_has_with_results` paths; `CounterWithTime` carries a parking_lot
+    /// `Mutex` for the timestamp, so the atomic is the fast path for callers
+    /// that only need the count.
+    pending_registry_rescues_raw: Arc<AtomicU64>,
 }
 
 impl CompletenessCheckingStore {
     pub fn new(ac_store: Store, cas_store: Store) -> Arc<Self> {
-        Arc::new(Self {
+        Self::new_with_pending_registry(ac_store, cas_store, None, None)
+    }
+
+    /// Construct with optional `pending_output_locality_registry` and
+    /// `liveness_checker` (H4 phase 3 consult). Called from `nativelink.rs`
+    /// after the store chain is built, mirroring the `AcServer`
+    /// `new_with_pending_registry` injection pattern.
+    ///
+    /// `registry = None` or `liveness_checker = None` → kill-switch: consult
+    /// is skipped entirely, preserving current behavior.
+    pub fn new_with_pending_registry(
+        ac_store: Store,
+        cas_store: Store,
+        pending_output_locality_registry: Option<SharedAcPinRegistry>,
+        liveness_checker: Option<SharedLivenessChecker>,
+    ) -> Arc<Self> {
+        let rescues_raw = Arc::new(AtomicU64::new(0));
+        let store = Arc::new(Self {
             cas_store,
             ac_store,
             incomplete_entries_counter: CounterWithTime::default(),
             complete_entries_counter: CounterWithTime::default(),
-        })
+            pending_output_locality_registry: OnceLock::new(),
+            liveness_checker: OnceLock::new(),
+            ccs_pending_registry_rescues_total: CounterWithTime::default(),
+            pending_registry_rescues_raw: rescues_raw,
+        });
+        if let (Some(reg), Some(chk)) = (pending_output_locality_registry, liveness_checker) {
+            // Errors only if already set — impossible on a freshly-constructed Arc.
+            let _ = store.pending_output_locality_registry.set(reg);
+            let _ = store.liveness_checker.set(LivenessCheckerDebug(chk));
+        }
+        store
+    }
+
+    /// Post-construction injection for deployments where the registry and
+    /// liveness checker are available only after the store chain is built
+    /// (i.e. `default_store_factory` builds CCS before `nativelink.rs` has
+    /// constructed `WorkerApiServer`). Safe to call at most once — silently
+    /// ignored if the OnceLock is already populated.
+    pub fn inject_pending_registry(
+        &self,
+        registry: SharedAcPinRegistry,
+        liveness_checker: SharedLivenessChecker,
+    ) {
+        let _ = self.pending_output_locality_registry.set(registry);
+        let _ = self.liveness_checker.set(LivenessCheckerDebug(liveness_checker));
+    }
+
+    /// Returns the cumulative count of completeness verdicts rescued by the
+    /// pending-registry consult (H4 phase 3 effectiveness gauge).
+    pub fn pending_registry_rescues_total(&self) -> u64 {
+        self.pending_registry_rescues_raw.load(Ordering::Acquire)
+    }
+
+    /// Consult the pending-output-locality registry for a single CAS `digest`
+    /// that the cas_store reported MISSING. Returns `true` iff the registry
+    /// holds the digest under an endpoint that currently passes the liveness
+    /// check — meaning the blob is fetchable from that worker via
+    /// `WorkerProxyStore` peer-fetch when actually read.
+    ///
+    /// Fires the rescue counter and a `debug!` log on a successful rescue so
+    /// operators can track H4 event rates without the noise of the incomplete
+    /// warn that would otherwise fire.
+    ///
+    /// # Short-circuit boundary
+    ///
+    /// This method is called ONLY from the "digest missing from CAS" branch in
+    /// `get_and_verify_single` and `inner_has_with_results`. It is NEVER called
+    /// from general `has_with_results` (which bytestream/batch-update use for
+    /// upload dedup) — those paths never decode AC entries and never reach this
+    /// code.
+    /// NOTE: a successful rescue does NOT guarantee the blob is immediately
+    /// peer-fetchable. The actual fetch path (WPS::get_part) consults
+    /// `BlobLocalityMap` (populated from BlobsAvailable ticks, ~100ms period).
+    /// A rescue may fire within one tick of UpdateActionResult, before the blob
+    /// appears in locality_map. In that window the Bazel client receives a
+    /// successful AC response but a subsequent NotFound on the output blob. A
+    /// retry within one BlobsAvailable period succeeds. Configure
+    /// `--remote_retries` to handle this window.
+    fn consult_pending_registry(
+        &self,
+        ac_key: &StoreKey<'_>,
+        digest: &DigestInfo,
+    ) -> bool {
+        let (Some(registry), Some(checker)) = (
+            self.pending_output_locality_registry.get(),
+            self.liveness_checker.get(),
+        ) else {
+            return false;
+        };
+
+        // Walk the per-endpoint sets in the registry. For each endpoint that
+        // holds this digest, re-check liveness (endpoint may have disconnected
+        // after publishing; wipe_endpoint races are possible). First live hit
+        // wins.
+        //
+        // The inner map is read under RwLock::read() inside the registry; we
+        // iterate with `endpoint_holds_digest` which takes one read lock per
+        // endpoint. We use `endpoint_counts()` to enumerate endpoints once
+        // and then query per-endpoint — allocates one Vec per call (bounded
+        // by worker count, ~10 in production).
+        let endpoints: Vec<String> = registry.endpoint_counts().keys().cloned().collect();
+        for endpoint in &endpoints {
+            if registry.endpoint_holds_digest(endpoint, digest) && (checker.0)(endpoint.as_str()) {
+                // Rescued: this digest is present on a live worker and
+                // fetchable via WorkerProxyStore peer-fetch at read time.
+                self.ccs_pending_registry_rescues_total.inc();
+                self.pending_registry_rescues_raw
+                    .fetch_add(1, Ordering::AcqRel);
+                debug!(
+                    %ac_key,
+                    ?digest,
+                    %endpoint,
+                    "CCS pending-registry rescue: digest missing from CAS but present \
+                     on live worker endpoint (H4 invariant — blob fetchable via peer-fetch)",
+                );
+                return true;
+            }
+        }
+        false
     }
 
     /// AC-side backing store accessor. Used by the `#168` startup
@@ -318,11 +498,39 @@ impl CompletenessCheckingStore {
                 // in any case vestigial: the FilesystemStore slow tier
                 // covers a fast-tier eviction transparently for any
                 // CAS read in the check-to-fetch window.
+                //
+                // (#12 H4 phase 3) For each digest the CAS store reports
+                // MISSING, consult the pending-output-locality registry.
+                // If the digest is present on a live worker endpoint,
+                // do NOT clear results[index] — treat as present.
+                //
+                // SHORT-CIRCUIT BOUNDARY: this consult fires only here,
+                // inside the completeness gate after an AC entry decode —
+                // bytestream/batch-update upload-dedup never reaches this
+                // code path (they call has_with_results directly on the
+                // CAS store, bypassing CCS entirely).
                 {
+                    // Synthetic AC key placeholder for the debug log in
+                    // consult_pending_registry. The exact AC key isn't
+                    // threaded into the check_existence_fut closure (the
+                    // inner futures only queue digests, not AC keys), so
+                    // we use a zero digest. The log is best-effort
+                    // observability; the counter is the primary metric.
+                    let placeholder_key = StoreKey::Digest(DigestInfo::new([0u8; 32], 0));
                     let mut state = state_mux.lock();
-                    for (r, index) in has_results.iter().zip(indexes) {
+                    for (r, (digest, index)) in
+                        has_results.iter().zip(digests.iter().zip(indexes))
+                    {
                         if r.is_none() {
-                            state.results[index] = None;
+                            // CAS reports missing — consult pending registry.
+                            let rescued = if let StoreKey::Digest(digest_info) = digest.borrow() {
+                                self.consult_pending_registry(&placeholder_key, &digest_info)
+                            } else {
+                                false
+                            };
+                            if !rescued {
+                                state.results[index] = None;
+                            }
                         }
                     }
                 }
@@ -473,10 +681,43 @@ impl CompletenessCheckingStore {
             // the counter alone produced 10K+ ticks with zero log trace,
             // blocking slow-tier-eviction vs mirror-write-loss
             // attribution.
+            //
+            // (#12 H4 phase 3) SHORT-CIRCUIT BOUNDARY: before treating any
+            // missing digest as incomplete, consult the pending-output-locality
+            // registry. A worker publishes its AC entry before the large blob
+            // is server-visible (H4 window); the registry holds a hint that
+            // the blob is present on the worker's CAS and fetchable via peer-
+            // fetch. If ALL missing digests are rescued by the registry, the
+            // AC entry is complete — do NOT warn, do NOT delete.
+            //
+            // gate(delete) ⇒ consult-first:
+            //   1. CAS reports missing
+            //   2. Registry consult: if rescued → treat as present → no incomplete
+            //   3. Only genuinely-missing digests (not rescued) reach the
+            //      delete-on-detection branch.
+            //
+            // Composite invariant: a registry-resident digest must NEVER trigger
+            // delete-on-detection. The consult precedes the delete-on-detection
+            // branch structurally (missing_digests is built from the post-consult
+            // result), so this invariant is enforced by construction.
             let missing_digests: Vec<&StoreKey<'_>> = digest_infos
                 .iter()
                 .zip(has_results.iter())
-                .filter_map(|(digest, r)| r.is_none().then_some(digest))
+                .filter_map(|(digest, r)| {
+                    if r.is_some() {
+                        // Present in CAS — no consult needed.
+                        return None;
+                    }
+                    // CAS reports missing. Consult the pending registry.
+                    // If any live endpoint holds this digest, treat as present.
+                    if let StoreKey::Digest(digest_info) = digest.borrow() {
+                        if self.consult_pending_registry(&key, &digest_info) {
+                            // Rescued — treat as present.
+                            return None;
+                        }
+                    }
+                    Some(digest)
+                })
                 .collect();
             if !missing_digests.is_empty() {
                 self.incomplete_entries_counter.inc();
