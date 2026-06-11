@@ -1029,6 +1029,8 @@ async fn t_grpc_store_propagates_is_worker_header_on_update_action_result()
         action_result: Some(ActionResult::default()),
         results_cache_policy: None,
         digest_function: digest_function::Value::Sha256.into(),
+        // (#12 H4) Not populated in this test — phase 1 only.
+        cas_endpoint: String::new(),
     };
 
     let _resp = IS_WORKER_REQUEST

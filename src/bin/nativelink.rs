@@ -1672,6 +1672,9 @@ async fn inner_main(
                             worker_proxy,
                             small_blob_dispatcher.clone(),
                             Some(ac_pin_registry.clone()),
+                            // (#12 H4 phase 1) registry infrastructure lands here;
+                            // actual registry creation wires in phase 2.
+                            None,
                         )
                         .map(|v| {
                             // #160 Phase 1: register the WorkerApiMetrics

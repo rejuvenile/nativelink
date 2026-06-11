@@ -2025,6 +2025,11 @@ impl GrpcStore {
                 .map_or_else(default_digest_hasher_func, |v| *v)
                 .proto_digest_func()
                 .into(),
+            // (#12 H4) Populated in phase 2 when the server-side
+            // registration path is wired. Empty here — this code path
+            // is GrpcStore's internal AC proxy, not a worker-originated
+            // write.
+            cas_endpoint: String::new(),
         };
         self.update_action_result(Request::new(update_action_request))
             .await

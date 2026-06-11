@@ -4522,6 +4522,11 @@ impl UploadActionResults {
                 action_result: Some(action_result),
                 results_cache_policy: None,
                 digest_function: hasher.proto_digest_func().into(),
+                // (#12 H4) Populated in phase 2 when the worker wires
+                // its cas_endpoint into the request. Empty in phase 1 —
+                // the proto field exists but the server-side registration
+                // path is not yet wired.
+                cas_endpoint: String::new(),
             };
             let size_bytes = update_action_request.encoded_len() as u64;
             let start = std::time::Instant::now();

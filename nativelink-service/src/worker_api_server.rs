@@ -89,7 +89,48 @@ pub struct WorkerApiServer {
     /// path that consults this registry directly. With no consumer
     /// today, the registry's purpose is purely to validate the wire
     /// channel end-to-end.
+    // CAPPED: AcPinRegistry enforces DEFAULT_MAX_AC_PINS_PER_ENDPOINT = 1_000_000 internally.
     ac_pin_registry: Option<SharedAcPinRegistry>,
+    /// (#12 H4 invariant — phase 1/3) Pending output locality registry.
+    ///
+    /// Tracks which output digests are EXPECTED to become server-visible
+    /// before the AC entry referencing them is published. Phase 2 wires
+    /// the registration from `UpdateActionResult` (worker sets
+    /// `cas_endpoint` on the request; server inserts output digests here
+    /// BEFORE committing the AC entry). Phase 3 wires CCS consult so the
+    /// completeness check treats these digests as present.
+    ///
+    /// INTENTIONALLY a SECOND `AcPinRegistry` instance — NOT the CAS
+    /// `locality_map`. Routing pending-output entries into `locality_map`
+    /// would weaponize the CAS upload short-circuit:
+    /// `WorkerProxyStore::has_with_results` reads from `locality_map`;
+    /// a hit there causes `bytestream_server::write` and
+    /// `cas_server::batch_update_blobs` to SKIP the upload of the
+    /// corresponding bytes. The Action proto digest IS by REAPI design
+    /// the same as the `action_digest` key in CAS — routing AC-related
+    /// digests through the CAS locality map would silently drop Action
+    /// proto uploads, producing permanent data loss.
+    ///
+    ///   ╔══════════════════════════════════════════════════════════════╗
+    ///   ║ SHORT-CIRCUIT GUARD: this registry MUST NEVER be consulted  ║
+    ///   ║ by any `has_with_results` path. The upload short-circuit     ║
+    ///   ║ lives in `WorkerProxyStore::has_with_results` which only     ║
+    ///   ║ reads `locality_map`. Keep these two data structures         ║
+    ///   ║ structurally separated so no future refactor accidentally    ║
+    ///   ║ merges them.                                                  ║
+    ///   ╚══════════════════════════════════════════════════════════════╝
+    ///
+    /// Lifecycle: wipe_endpoint fires on worker disconnect AND on
+    /// boot-epoch change — same hooks as `ac_pin_registry` and
+    /// `locality_map`. `None` for tests / standalone runs without the
+    /// H4 invariant enforcement.
+    ///
+    /// Note: the deleted `register_action_result_digests` approach (cited at
+    /// the BlobsAvailable handler ~:1431) was removed for an mpsc::channel(1)
+    /// eviction race; this registry is fed server-side at AC publish time
+    /// (phase 2) and never shares that channel.
+    // CAPPED: AcPinRegistry enforces DEFAULT_MAX_AC_PINS_PER_ENDPOINT = 1_000_000 internally.
+    pending_output_locality_registry: Option<SharedAcPinRegistry>,
     /// CAS store for checking blob existence during backfill requests.
     cas_store: Option<Store>,
     /// Optional handle on the `WorkerProxyStore` so we can plumb
@@ -247,6 +288,22 @@ pub struct WorkerApiMetrics {
     )]
     pub worker_flap_warns_total: AtomicU64,
 
+    /// (#12 H4 invariant) Total registrations into
+    /// `pending_output_locality_registry`. Incremented once per
+    /// `UpdateActionResult` RPC that carries a live `cas_endpoint`
+    /// and at least one output digest. Sustained increase = workers
+    /// are publishing ARs with valid endpoint attribution; sustained
+    /// zero after phase 2 lands = wire not connected or liveness
+    /// check always failing.
+    #[metric(
+        help = "[Phase 1: always 0 — increment wired in phase 2] \
+                Total registrations into pending_output_locality_registry \
+                (one per UpdateActionResult with a live cas_endpoint). \
+                Sustained zero after phase 2 lands = wire not connected or \
+                liveness check always failing."
+    )]
+    pub pending_output_registrations_total: AtomicU64,
+
     /// (#99 S1 code-reviewer follow-up) Per-reason BlobsAvailable
     /// chunk-drop counters (`ChunkDropCounts`). Shared via Arc with
     /// every per-connection `BlobsAvailableAccumulator` so all
@@ -349,6 +406,8 @@ impl WorkerApiServer {
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
         ac_pin_registry: Option<SharedAcPinRegistry>,
+        // (#12 H4 phase 1) See `pending_output_locality_registry` field doc.
+        pending_output_locality_registry: Option<SharedAcPinRegistry>,
     ) -> Result<Self, Error> {
         let node_id = {
             let mut out = [0; 6];
@@ -396,6 +455,7 @@ impl WorkerApiServer {
             worker_proxy,
             small_blob_dispatcher,
             ac_pin_registry,
+            pending_output_locality_registry,
         )
     }
 
@@ -411,6 +471,7 @@ impl WorkerApiServer {
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
         ac_pin_registry: Option<SharedAcPinRegistry>,
+        pending_output_locality_registry: Option<SharedAcPinRegistry>,
     ) -> Result<Self, Error> {
         let scheduler = schedulers
             .get(&config.scheduler)
@@ -447,6 +508,7 @@ impl WorkerApiServer {
             node_id,
             locality_map,
             ac_pin_registry,
+            pending_output_locality_registry,
             cas_store,
             worker_proxy,
             small_blob_dispatcher,
@@ -480,6 +542,34 @@ impl WorkerApiServer {
     /// context.
     pub fn endpoint_state_is_empty_for_testing(&self, endpoint: &str) -> bool {
         !self.endpoint_state.lock().contains_key(endpoint)
+    }
+
+    /// (#12 H4 invariant) Liveness check for `pending_output_locality_registry`
+    /// registration. Returns `true` iff `endpoint` is currently present in the
+    /// `endpoint_state` map — i.e. there is an active worker connection
+    /// claiming that endpoint.
+    ///
+    /// Used by the `UpdateActionResult` handler (phase 2) to validate the
+    /// worker-supplied `cas_endpoint` field before registering output digests.
+    /// An endpoint not in `endpoint_state` is either spoofed, stale, or a
+    /// typo — silently ignored to prevent phantom entries in the registry.
+    ///
+    /// Exposed as `pub` so tests can assert the check is wired.
+    pub fn pending_output_endpoint_is_live(&self, endpoint: &str) -> bool {
+        self.endpoint_state.lock().contains_key(endpoint)
+    }
+
+    /// (#12 H4 invariant) Test/diagnostic accessor: returns a clone of the
+    /// `pending_output_locality_registry` handle, if configured.
+    pub fn pending_output_locality_registry(&self) -> Option<SharedAcPinRegistry> {
+        self.pending_output_locality_registry.clone()
+    }
+
+    /// Test accessor: returns a clone of the `ac_pin_registry` handle, if configured.
+    /// Used in Test 6 as a positive tripwire to confirm the BlobsAvailable background
+    /// task processed a tick before asserting the pending registry is unaffected.
+    pub fn ac_pin_registry_for_testing(&self) -> Option<SharedAcPinRegistry> {
+        self.ac_pin_registry.clone()
     }
 
     pub fn into_service(self) -> Server<Self> {
@@ -679,6 +769,14 @@ impl WorkerApiServer {
                 if let Some(ref ac_pin_registry) = self.ac_pin_registry {
                     ac_pin_registry.wipe_endpoint(&worker_cas_endpoint);
                 }
+                // (#12 H4) Sibling wipe for pending_output_locality_registry:
+                // the new boot_epoch means a fresh worker process; any
+                // pending output locality pins from the prior process are
+                // stale and must be dropped so phase-2 re-advertisements
+                // start from a clean slate.
+                if let Some(ref pending) = self.pending_output_locality_registry {
+                    pending.wipe_endpoint(&worker_cas_endpoint);
+                }
                 // #174: boot-epoch wipe dispatcher leak. When a worker
                 // reconnects with a new boot_epoch BEFORE OLD's
                 // disconnect-cleanup task runs, OLD's
@@ -870,6 +968,7 @@ impl WorkerApiServer {
             worker_id.clone(),
             self.locality_map.clone(),
             self.ac_pin_registry.clone(),
+            self.pending_output_locality_registry.clone(),
             self.cas_store.clone(),
             self.worker_proxy.clone(),
             self.small_blob_dispatcher.clone(),
@@ -956,7 +1055,18 @@ struct WorkerConnection {
     locality_map: Option<SharedBlobLocalityMap>,
     /// AC pin registry (separate from `locality_map`); see
     /// `WorkerApiServer::ac_pin_registry` for design.
+    // CAPPED: AcPinRegistry enforces DEFAULT_MAX_AC_PINS_PER_ENDPOINT = 1_000_000 internally.
     ac_pin_registry: Option<SharedAcPinRegistry>,
+    /// (#12 H4) Pending output locality registry — second AcPinRegistry
+    /// instance, separate from `ac_pin_registry`. Wiped on disconnect and
+    /// boot-epoch change via the same ownership-check guard as `ac_pin_registry`.
+    ///
+    /// SHORT-CIRCUIT GUARD: NEVER consult this registry from
+    /// `has_with_results` or any path reachable from it.  See
+    /// `WorkerApiServer::pending_output_locality_registry` for the full
+    /// design note.
+    // CAPPED: AcPinRegistry enforces DEFAULT_MAX_AC_PINS_PER_ENDPOINT = 1_000_000 internally.
+    pending_output_locality_registry: Option<SharedAcPinRegistry>,
     /// CAS store for checking blob existence during backfill.
     cas_store: Option<Store>,
     /// WorkerProxyStore handle for plumbing per-endpoint mirror
@@ -1012,6 +1122,7 @@ impl WorkerConnection {
         worker_id: WorkerId,
         locality_map: Option<SharedBlobLocalityMap>,
         ac_pin_registry: Option<SharedAcPinRegistry>,
+        pending_output_locality_registry: Option<SharedAcPinRegistry>,
         cas_store: Option<Store>,
         worker_proxy: Option<Arc<nativelink_store::worker_proxy_store::WorkerProxyStore>>,
         small_blob_dispatcher: Option<Arc<SmallBlobDispatcher>>,
@@ -1026,6 +1137,7 @@ impl WorkerConnection {
             scheduler,
             now_fn,
             ac_pin_registry,
+            pending_output_locality_registry,
             worker_id,
             locality_map,
             cas_store,
@@ -1231,6 +1343,13 @@ impl WorkerConnection {
                     // advertised them.
                     if let Some(ref ac_pin_registry) = instance.ac_pin_registry {
                         ac_pin_registry.wipe_endpoint(&instance.cas_endpoint);
+                    }
+                    // (#12 H4) Sibling wipe for pending_output_locality_registry:
+                    // any pending output pins from this now-disconnected worker
+                    // are stale; phase 2 will re-register on the next
+                    // UpdateActionResult from the reconnected worker.
+                    if let Some(ref pending) = instance.pending_output_locality_registry {
+                        pending.wipe_endpoint(&instance.cas_endpoint);
                     }
                     // task #168 (item 6 + unpin_on_disconnect refactor):
                     //

@@ -265,6 +265,13 @@ required-features = ["chunked_fast_slow", "test-utils"]
 name = "bytestream_inner_read_overshoot_cap_test"
 required-features = ["test-utils"]
 
+# #12 H4 invariant phase 1/3: pending_output_locality_registry lifecycle
+# (construction, disconnect-wipe, boot-epoch-wipe, liveness check,
+# short-circuit guard). Uses the `pending_output_endpoint_is_live`
+# accessor on `WorkerApiServer` (not gated by any feature flag).
+[[test]]
+name = "pending_output_locality_registry_test"
+
 # #44 Layer C — server-side `inner_read` unfold cap exercised at the
 # AT-REST branch (`:1768`) — the production hot path for Bazel parallel
 # `Read(offset=N, limit=0)` reads against committed CAS blobs. Uses a

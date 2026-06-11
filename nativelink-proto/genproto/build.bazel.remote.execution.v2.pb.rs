@@ -1210,6 +1210,27 @@ pub struct UpdateActionResultRequest {
     /// in the server's capabilities.
     #[prost(enumeration = "digest_function::Value", tag = "5")]
     pub digest_function: i32,
+    /// NativeLink-proprietary extension — not in upstream bazelbuild/remote-apis
+    /// REAPI schema (upstream fields end at 5; vendor range >=50000 chosen to
+    /// survive upstream syncs). External clients send empty string (default);
+    /// server treats empty = ignored. DO NOT drop or renumber on upstream sync.
+    ///
+    /// (#12 H4 invariant) Worker-side CAS gRPC endpoint, set ONLY when the
+    /// request originates from a worker (i.e. when `x-nativelink-worker` is
+    /// present). The server uses this to register the output digests in the
+    /// `pending_output_locality_registry` (a separate `AcPinRegistry` instance)
+    /// BEFORE committing the AC entry — ensuring the locality-visible(outputs)
+    /// happens-before AC-publish invariant.
+    ///
+    /// Format: "grpc://host:port" (same as `ConnectWorkerRequest.cas_endpoint`).
+    /// Empty string means "not from a worker" and MUST be ignored by the server.
+    ///
+    /// CRITICAL: this field is intentionally ABSENT from the CAS
+    /// `BlobLocalityMap` path. The server validates the claimed endpoint against
+    /// the live registered-worker set before inserting; an unknown endpoint is
+    /// silently ignored (spoof/typo case) and logged at `warn!`.
+    #[prost(string, tag = "50001")]
+    pub cas_endpoint: ::prost::alloc::string::String,
 }
 /// A request message for
 /// [ContentAddressableStorage.FindMissingBlobs][build.bazel.remote.execution.v2.ContentAddressableStorage.FindMissingBlobs].
