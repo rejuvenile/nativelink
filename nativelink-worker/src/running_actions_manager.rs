@@ -71,7 +71,9 @@ use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_dig
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
 use nativelink_util::phase0_metrics::worker_phase0_metrics;
 use nativelink_util::buf_channel::make_buf_channel_pair;
-use nativelink_util::store_trait::{Store, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo};
+use nativelink_util::store_trait::{
+    IS_WORKER_REQUEST, Store, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+};
 use nativelink_util::log_utils::throughput_mbps;
 use nativelink_util::{background_spawn, spawn, spawn_blocking};
 use parking_lot::Mutex;
@@ -4401,6 +4403,16 @@ struct UploadActionResults {
     /// (per-Code failure, slow-publish, success). Cloned from the
     /// owning `RunningActionsManagerImpl::metrics` at construction.
     metrics: Arc<Metrics>,
+    /// (#12 H4 phase 2) The worker's own CAS advertised endpoint
+    /// (e.g. `grpc://worker1.local:50081`). Populated by
+    /// `RunningActionsManagerArgs::cas_endpoint` (sourced from
+    /// `local_worker.rs:cas_advertised_endpoint`). Set on every
+    /// `UpdateActionResultRequest` so the server's AC handler can
+    /// pre-register output locality BEFORE committing the AC entry.
+    ///
+    /// Empty when the worker has no `cas_server_port` (no peer-blob
+    /// sharing) — the server skips registration when empty.
+    cas_endpoint: String,
 }
 
 impl UploadActionResults {
@@ -4410,6 +4422,7 @@ impl UploadActionResults {
         ac_mirror_target: Option<crate::local_worker::AcMirrorTarget>,
         historical_store: Store,
         metrics: Arc<Metrics>,
+        cas_endpoint: String,
     ) -> Result<Self, Error> {
         let upload_historical_results_strategy = config
             .upload_historical_results_strategy
@@ -4446,6 +4459,7 @@ impl UploadActionResults {
                 },
             )?,
             metrics,
+            cas_endpoint,
         })
     }
 
@@ -4522,18 +4536,31 @@ impl UploadActionResults {
                 action_result: Some(action_result),
                 results_cache_policy: None,
                 digest_function: hasher.proto_digest_func().into(),
-                // (#12 H4) Populated in phase 2 when the worker wires
-                // its cas_endpoint into the request. Empty in phase 1 —
-                // the proto field exists but the server-side registration
-                // path is not yet wired.
-                cas_endpoint: String::new(),
+                // (#12 H4 phase 2) Worker's CAS endpoint so the server's
+                // AC handler can pre-register output locality BEFORE
+                // committing the AC entry (H4 invariant: locality-visible
+                // happens-before AC-publish). Propagated by GrpcStore as
+                // the `x-nativelink-worker` header via IS_WORKER_REQUEST
+                // scope below. Empty when no peer CAS endpoint is
+                // configured (server skips registration).
+                cas_endpoint: self.cas_endpoint.clone(),
             };
             let size_bytes = update_action_request.encoded_len() as u64;
             let start = std::time::Instant::now();
             // #37 Phase 2 (Q1+Q2+Q3): compute elapsed BEFORE the `?`
             // propagation so the Err arm can log duration too.
-            let res = grpc_store
-                .update_action_result(Request::new(update_action_request))
+            //
+            // (#12 H4 phase 2) Wrap with IS_WORKER_REQUEST=true so
+            // GrpcStore propagates the `x-nativelink-worker` header to the
+            // server's AC handler. The server extracts this header to gate
+            // the pending_output_locality_registry registration path.
+            // Revision 4 (auditor): this was the missing server-side wiring
+            // point — IS_WORKER was dead on the AC path without this scope.
+            let res = IS_WORKER_REQUEST
+                .scope(
+                    true,
+                    grpc_store.update_action_result(Request::new(update_action_request)),
+                )
                 .await
                 .map(|_| ())
                 .err_tip(|| "Caching ActionResult");
@@ -4838,6 +4865,13 @@ pub struct RunningActionsManagerArgs<'a> {
     /// site. Treat as `None` for legacy/test callers; the
     /// constructor will create a fresh Arc.
     pub metrics: Option<Arc<Metrics>>,
+    /// (#12 H4 phase 2) Worker's advertised CAS endpoint for
+    /// pending-output locality pre-registration (e.g.
+    /// `grpc://worker1.local:50081`). Set from
+    /// `local_worker::cas_advertised_endpoint`. Empty string when
+    /// `cas_server_port` is not configured (peer-blob sharing
+    /// disabled); the server skips registration on empty.
+    pub cas_endpoint: String,
 }
 
 struct CleanupGuard {
@@ -4931,6 +4965,7 @@ impl RunningActionsManagerImpl {
             args.ac_mirror_target,
             args.historical_store,
             metrics.clone(),
+            args.cas_endpoint,
         )
         .err_tip(|| "During RunningActionsManagerImpl construction")?;
         Ok(Self {
@@ -4960,6 +4995,15 @@ impl RunningActionsManagerImpl {
                 sleep_fn: |duration| Box::pin(tokio::time::sleep(duration)),
             },
         )
+    }
+
+    /// (#12 H4 phase 2) Test accessor: returns the `cas_endpoint` stored in
+    /// `upload_action_results`. Verifies the arg chain
+    /// `RunningActionsManagerArgs::cas_endpoint` → `UploadActionResults::new`
+    /// → `upload_ac_results` `UpdateActionResultRequest.cas_endpoint` is intact.
+    #[doc(hidden)]
+    pub fn cas_endpoint_for_test(&self) -> &str {
+        &self.upload_action_results.cas_endpoint
     }
 
     /// Expand Tree protos from output folders and return the contained file

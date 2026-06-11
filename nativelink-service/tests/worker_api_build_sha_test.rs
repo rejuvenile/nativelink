@@ -136,6 +136,7 @@ fn build_server(
         None,
         None,
         None,
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "build_server: WorkerApiServer::new_with_now_fn")?;
 

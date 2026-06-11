@@ -193,6 +193,7 @@ async fn setup_api_server_with_locality(
         None,
         None,
         None,
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 

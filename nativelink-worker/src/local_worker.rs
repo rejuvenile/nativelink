@@ -3794,6 +3794,14 @@ pub async fn new_local_worker(
         config.bis_ack_timeout_secs
     };
     let bis_ack_timeout = Duration::from_secs(bis_ack_timeout_secs);
+    // (#12 H4 phase 2) Compute the worker's advertised CAS endpoint so it can
+    // be set on UpdateActionResultRequest. The server uses this to pre-register
+    // output locality in pending_output_locality_registry BEFORE committing the
+    // AC entry (H4 invariant). Empty when cas_server_port is not configured.
+    let running_actions_cas_endpoint = config
+        .cas_server_port
+        .map(|port| cas_advertised_endpoint(port, use_tls))
+        .unwrap_or_default();
     let running_actions_manager =
         Arc::new(RunningActionsManagerImpl::new(RunningActionsManagerArgs {
             root_action_directory: config.work_directory.clone(),
@@ -3812,6 +3820,7 @@ pub async fn new_local_worker(
             directory_cache,
             bis_ack_timeout,
             metrics: Some(ac_publish_metrics.clone()),
+            cas_endpoint: running_actions_cas_endpoint,
         })?);
 
     // Set up BlobsAvailable reporting with drain-then-fire semantics.

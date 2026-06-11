@@ -188,6 +188,7 @@ async fn setup_api_server_with_task_limit(
         None,
         None,
         None,
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -705,6 +706,7 @@ async fn setup_api_server_with_locality(
         None,
         None,
         None,
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -824,6 +826,7 @@ async fn setup_api_server_with_mirror_proxy(
         Some(worker_proxy.clone()),
         None,
         None,
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -1564,6 +1567,7 @@ async fn setup_multi_connect() -> Result<MultiConnectContext, Error> {
         None,
         None,
         None,
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -2072,6 +2076,7 @@ async fn setup_api_server_with_dispatcher(
         None, // no worker_proxy
         Some(dispatcher.clone()),
         None, // no ac_pin_registry
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -2272,6 +2277,7 @@ async fn setup_dispatcher_with_mirror_enabled(
         None, // no worker_proxy
         Some(dispatcher.clone()),
         None, // no ac_pin_registry
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -2627,6 +2633,7 @@ async fn setup_api_server_with_locality_and_dispatcher(
         None, // no worker_proxy
         Some(dispatcher.clone()),
         None, // no ac_pin_registry
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -3060,6 +3067,7 @@ async fn setup_multi_connect_with_clock(
         None,
         None,
         None,
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
     Ok((worker_api_server, clock))

@@ -272,6 +272,12 @@ required-features = ["test-utils"]
 [[test]]
 name = "pending_output_locality_registry_test"
 
+# #12 H4 invariant phase 2/3: AcServer pending_output_locality_registry
+# registration path — live endpoint registers digests + counter, empty/dead
+# endpoint/no-header cases, 256-byte guard, BIS drain API.
+[[test]]
+name = "ac_server_h4_registration_test"
+
 # #44 Layer C — server-side `inner_read` unfold cap exercised at the
 # AT-REST branch (`:1768`) — the production hot path for Bazel parallel
 # `Read(offset=N, limit=0)` reads against committed CAS blobs. Uses a

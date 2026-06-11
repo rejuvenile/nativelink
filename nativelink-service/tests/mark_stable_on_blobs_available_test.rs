@@ -314,6 +314,7 @@ async fn setup_context(cas_endpoint: &str) -> Result<TestContext, Error> {
         None,
         None,
         None,
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 

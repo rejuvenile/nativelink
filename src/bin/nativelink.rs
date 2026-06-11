@@ -36,7 +36,7 @@ use nativelink_config::cas_server::{
 use nativelink_config::stores::ConfigDigestHashFunction;
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_scheduler::default_scheduler_factory::scheduler_factory;
-use nativelink_service::ac_server::AcServer;
+use nativelink_service::ac_server::{AcServer, SharedLivenessChecker};
 use nativelink_service::bep_server::BepServer;
 use nativelink_service::bytestream_server::ByteStreamServer;
 use nativelink_service::capabilities_server::CapabilitiesServer;
@@ -286,6 +286,21 @@ async fn inner_main(
     // collisions. No read-side consumer in this commit (advertisement
     // channel only).
     let ac_pin_registry =
+        nativelink_util::ac_pin_registry::new_shared_ac_pin_registry();
+
+    // (#12 H4 phase 2) Output-locality registry: populated by `AcServer`'s
+    // `UpdateActionResult` handler BEFORE the AC entry is committed so that
+    // the H4 invariant (locality-visible(outputs) happens-before AC-publish)
+    // is satisfied server-side. Distinct from `ac_pin_registry` (which holds
+    // server-side AC pin hints) to prevent output-locality entries from
+    // being misrouted through the AC pin sweep. BIS-drain below removes
+    // entries when the corresponding CAS digests reach stable storage.
+    // UNBOUNDED-OK: entries are keyed by DigestInfo; each worker writes at most
+    // one entry per output digest per action; entries are drained by the BIS
+    // loop on every 500 ms tick. Steady-state bound = (worker count × max
+    // concurrent actions × max outputs per action) — measured < 50 K entries
+    // at peak fleet load. No byte payloads stored; only a string endpoint key.
+    let pending_output_locality_registry =
         nativelink_util::ac_pin_registry::new_shared_ac_pin_registry();
 
     // Build TLS config for server-to-worker connections (used by both the
@@ -1107,6 +1122,12 @@ async fn inner_main(
             // `BlobsAvailable` tick arrives the registry and the
             // worker's pin map agree.
             let registry_for_loop = ac_pin_registry.clone();
+            // (#12 H4 phase 2) Companion drain for the pending output locality
+            // registry. When a CAS digest reaches stable storage (BIS-acked),
+            // the pending entry is no longer needed: the blob is durable and CCS
+            // phase 3 will consult the permanent locality_map instead. Draining
+            // here keeps registry memory bounded at steady state.
+            let pending_registry_for_loop = pending_output_locality_registry.clone();
 
             background_spawn!("blobs_in_stable_storage_loop", async move {
                 loop {
@@ -1205,6 +1226,28 @@ async fn inner_main(
                         for endpoint in &endpoints {
                             registry_for_loop
                                 .remove_digests_for_endpoint_batch(endpoint, &drains_for_batch);
+                        }
+                    }
+
+                    // (#12 H4 phase 2) Drain pending-output-locality entries for
+                    // every CAS digest that just reached stable storage. The
+                    // registry stores output digests keyed by store_id="" (the
+                    // PENDING_STORE_ID constant in ac_server.rs). Once stable,
+                    // the pending locality hint is no longer needed — CCS phase 3
+                    // will consult the permanent locality_map instead.
+                    // Walk `batches` for the CAS entry (store_id == "").
+                    if let Some((_, cas_stable_digests)) = batches.iter().find(|(id, _)| id.is_empty()) {
+                        if !cas_stable_digests.is_empty() {
+                            let pending_drains: [(std::sync::Arc<str>, &[nativelink_util::common::DigestInfo]); 1] = [(
+                                std::sync::Arc::<str>::from(""),
+                                cas_stable_digests.as_slice(),
+                            )];
+                            let pending_endpoints: Vec<String> =
+                                pending_registry_for_loop.endpoint_counts().keys().cloned().collect();
+                            for endpoint in &pending_endpoints {
+                                pending_registry_for_loop
+                                    .remove_digests_for_endpoint_batch(endpoint, &pending_drains);
+                            }
                         }
                     }
 
@@ -1532,17 +1575,80 @@ async fn inner_main(
             .transpose()
             .err_tip(|| "Could not create Execution service")?;
 
+        // (#12 H4 phase 2) Pre-build WorkerApiServer so we can extract its
+        // `liveness_checker` before constructing AcServer.  AcServer must be
+        // constructed first in the tonic Routes chain (ordered by proto service),
+        // but it needs the checker from WorkerApiServer to validate
+        // `cas_endpoint` on incoming UpdateActionResult RPCs.
+        //
+        // The pre-build pattern works because the tonic Routes builder assembles
+        // services from pre-built values; order-of-construction and
+        // order-of-registration are independent.  The server is moved into
+        // `svc_setup!` exactly as it was before; no behaviour change other than
+        // construction happening earlier.
+        let worker_api_cfg = services.worker_api;
+        let pre_built_worker_api: Option<WorkerApiServer> = worker_api_cfg
+            .as_ref()
+            .map(|cfg| {
+                let backfill_cas = cas_store_names
+                    .iter()
+                    .next()
+                    .and_then(|name| unwrapped_cas_stores.get(name).cloned());
+                let worker_proxy = cas_store_names
+                    .iter()
+                    .next()
+                    .and_then(|name| worker_proxy_stores.get(name).cloned());
+                WorkerApiServer::new(
+                    cfg,
+                    &worker_schedulers,
+                    Some(locality_map.clone()),
+                    backfill_cas,
+                    worker_proxy,
+                    small_blob_dispatcher.clone(),
+                    Some(ac_pin_registry.clone()),
+                    // (#12 H4 phase 2) activate the pending-output registry.
+                    Some(pending_output_locality_registry.clone()),
+                )
+            })
+            .transpose()
+            .err_tip(|| "Could not create WorkerApi service")?;
+
+        // Extract the liveness checker BEFORE pre_built_worker_api is moved
+        // into the tonic chain. The checker captures the same `endpoint_state`
+        // Arc that `connect_worker` mutates, so it reflects the live worker
+        // set without additional synchronisation.
+        let liveness_checker: Option<SharedLivenessChecker> =
+            pre_built_worker_api.as_ref().map(|s| s.liveness_checker());
+
+        // Register WorkerApi metrics here (same first-listener-wins guard as
+        // before, moved out of the tonic chain closure so it can refer to
+        // `pre_built_worker_api` by reference before the move).
+        if let Some(ref server) = pre_built_worker_api {
+            if !worker_api_metrics_registered {
+                metrics_registry.register("worker_api", server.metrics());
+                worker_api_metrics_registered = true;
+            }
+        }
+
+        // Extract the AC config early so we can build AcServer with the
+        // liveness_checker obtained above.
+        let ac_cfg = services.ac;
+        let pre_built_ac: Option<_> = ac_cfg
+            .map(|cfg| {
+                AcServer::new_with_pending_registry(
+                    &cfg,
+                    &store_manager,
+                    Some(pending_output_locality_registry.clone()),
+                    liveness_checker.clone(),
+                )
+            })
+            .transpose()
+            .err_tip(|| "Could not create AC service")?
+            .map(|v| svc_setup!(v));
+
         let tonic_services = Routes::builder()
             .routes()
-            .add_optional_service(
-                services
-                    .ac
-                    .map_or(Ok(None), |cfg| {
-                        AcServer::new(&cfg, &store_manager)
-                            .map(|v| Some(svc_setup!(v)))
-                    })
-                    .err_tip(|| "Could not create AC service")?,
-            )
+            .add_optional_service(pre_built_ac)
             .add_optional_service(
                 services
                     .cas
@@ -1645,53 +1751,11 @@ async fn inner_main(
                 .err_tip(|| "Could not create Capabilities service")?
                 .map(|v| svc_setup!(v)),
             )
+            // (#12 H4 phase 2) WorkerApiServer was pre-built above so we
+            // could extract its liveness_checker for AcServer. Metrics were
+            // also registered above (first-listener-wins, same guard).
             .add_optional_service(
-                services
-                    .worker_api
-                    .map_or(Ok(None), |cfg| {
-                        // Pick the first unwrapped CAS store for backfill existence
-                        // checks. Using the unwrapped store ensures has_with_results
-                        // goes directly to the real store, bypassing WorkerProxyStore
-                        // which would report blobs on other workers as "present".
-                        let backfill_cas = cas_store_names
-                            .iter()
-                            .next()
-                            .and_then(|name| unwrapped_cas_stores.get(name).cloned());
-                        // Pass the matching WorkerProxyStore Arc so the
-                        // server can plumb mirror capacity reports
-                        // (review #1) into the picker's pre-check.
-                        let worker_proxy = cas_store_names
-                            .iter()
-                            .next()
-                            .and_then(|name| worker_proxy_stores.get(name).cloned());
-                        WorkerApiServer::new(
-                            &cfg,
-                            &worker_schedulers,
-                            Some(locality_map.clone()),
-                            backfill_cas,
-                            worker_proxy,
-                            small_blob_dispatcher.clone(),
-                            Some(ac_pin_registry.clone()),
-                            // (#12 H4 phase 1) registry infrastructure lands here;
-                            // actual registry creation wires in phase 2.
-                            None,
-                        )
-                        .map(|v| {
-                            // #160 Phase 1: register the WorkerApiMetrics
-                            // tree (which transitively walks
-                            // ChunkDropCounts via #99-fixup-2) before
-                            // `into_service()` consumes the server.
-                            // First-listener wins per registry semantics
-                            // (the metrics tree is process-wide).
-                            if !worker_api_metrics_registered {
-                                metrics_registry
-                                    .register("worker_api", v.metrics());
-                                worker_api_metrics_registered = true;
-                            }
-                            Some(svc_setup!(v))
-                        })
-                    })
-                    .err_tip(|| "Could not create WorkerApi service")?,
+                pre_built_worker_api.map(|v| svc_setup!(v)),
             )
             .add_optional_service(
                 services

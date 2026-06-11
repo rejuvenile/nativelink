@@ -572,6 +572,17 @@ impl WorkerApiServer {
         self.ac_pin_registry.clone()
     }
 
+    /// (#12 H4 phase 2) Returns a `SharedLivenessChecker` that delegates to
+    /// `endpoint_state` — used by `AcServer` to validate `cas_endpoint` on
+    /// `UpdateActionResult` before registering output digests into
+    /// `pending_output_locality_registry`. Captures the same `Arc` that
+    /// `connect_worker` / `inner_connect_worker` mutate, so it reflects the
+    /// live worker set without any additional synchronization.
+    pub fn liveness_checker(&self) -> crate::ac_server::SharedLivenessChecker {
+        let state = self.endpoint_state.clone();
+        std::sync::Arc::new(move |endpoint: &str| state.lock().contains_key(endpoint))
+    }
+
     pub fn into_service(self) -> Server<Self> {
         Server::new(self)
     }

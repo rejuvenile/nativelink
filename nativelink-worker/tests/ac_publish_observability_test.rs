@@ -163,6 +163,7 @@ async fn build_manager() -> (
         directory_cache: None,
         bis_ack_timeout: Duration::from_secs(60),
         metrics: Some(metrics.clone()),
+        cas_endpoint: String::new(),
     };
     let manager = Arc::new(RunningActionsManagerImpl::new(args).expect("manager build"));
     (manager, metrics, mirror_target)
@@ -618,6 +619,7 @@ async fn build_manager_with_ac_fss(
         directory_cache: None,
         bis_ack_timeout: Duration::from_secs(60),
         metrics: Some(metrics.clone()),
+        cas_endpoint: String::new(),
     };
     let manager = Arc::new(RunningActionsManagerImpl::new(args).expect("manager build"));
     (manager, mirror_target)
@@ -802,6 +804,66 @@ async fn t4_slow_publish_warn_fires() -> Result<(), Box<dyn core::error::Error>>
     assert!(
         logs_contain("AC write slow"),
         "T4: expected warn log 'AC write slow' on slow publish"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// (#12 H4 phase 2) Test (vi): worker-side publish path stores cas_endpoint
+//
+// Verifies that `RunningActionsManagerArgs::cas_endpoint` is correctly
+// threaded into `UploadActionResults` and is accessible (not discarded)
+// after construction. This is the structural guard that ensures
+// `upload_ac_results` will have the non-empty endpoint available when it
+// builds `UpdateActionResultRequest.cas_endpoint`.
+//
+// Mutation: change `UploadActionResults::new` to always set `cas_endpoint =
+// String::new()` regardless of the arg → `cas_endpoint_for_test` returns ""
+// and the assertion fires with "vi: cas_endpoint must be stored in
+// UploadActionResults — arg not threaded through to GrpcStore path".
+// ---------------------------------------------------------------------------
+#[nativelink_test]
+async fn t7_cas_endpoint_stored_in_upload_action_results() -> Result<(), Box<dyn core::error::Error>> {
+    let metrics = Arc::new(Metrics::default());
+    let cas_fss = build_cas_fss().await;
+    let ac_fss = build_ac_fss();
+    let temp_path = std::env::temp_dir()
+        .join(format!("nl37-vi-{}", rand::random::<u64>()))
+        .to_string_lossy()
+        .into_owned();
+    tokio::fs::create_dir_all(&temp_path).await.unwrap();
+    let upload_cfg = UploadActionResultConfig {
+        upload_ac_results_strategy:
+            nativelink_config::cas_server::UploadCacheResultsStrategy::Everything,
+        upload_historical_results_strategy: Some(
+            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+        ),
+        ..Default::default()
+    };
+    const TEST_ENDPOINT: &str = "grpc://worker-h4-test.local:50081";
+    let args = RunningActionsManagerArgs {
+        root_action_directory: temp_path,
+        execution_configuration: Default::default(),
+        cas_store: cas_fss,
+        ac_store: Some(Store::new(ac_fss.clone())),
+        ac_mirror_target: None,
+        historical_store: Store::new(ac_fss),
+        upload_action_result_config: &upload_cfg,
+        max_action_timeout: Duration::from_secs(60),
+        max_upload_timeout: Duration::from_secs(60),
+        timeout_handled_externally: false,
+        directory_cache: None,
+        bis_ack_timeout: Duration::from_secs(60),
+        metrics: Some(metrics.clone()),
+        cas_endpoint: TEST_ENDPOINT.to_string(),
+    };
+    let manager = RunningActionsManagerImpl::new(args).expect("manager build");
+
+    assert_eq!(
+        manager.cas_endpoint_for_test(),
+        TEST_ENDPOINT,
+        "vi: cas_endpoint must be stored in UploadActionResults — arg not threaded \
+         through to GrpcStore path"
     );
     Ok(())
 }

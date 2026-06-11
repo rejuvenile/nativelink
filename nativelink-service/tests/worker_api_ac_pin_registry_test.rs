@@ -252,6 +252,7 @@ async fn setup_with_ac_registry(cas_endpoint: &str) -> Result<AcRegistryContext,
         None,
         None,
         Some(ac_pin_registry.clone()),
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 
@@ -684,6 +685,7 @@ async fn setup_multi_connect_ac() -> Result<AcMultiConnectContext, Error> {
         None,
         None,
         Some(ac_pin_registry.clone()),
+        None, // no pending_output_locality_registry
     )
     .err_tip(|| "Error creating WorkerApiServer")?;
 

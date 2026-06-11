@@ -990,6 +990,7 @@ mod tests {
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1120,6 +1121,7 @@ mod tests {
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1252,6 +1254,7 @@ mod tests {
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1440,6 +1443,7 @@ mod tests {
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1629,6 +1633,7 @@ mod tests {
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1844,6 +1849,7 @@ mod tests {
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1986,6 +1992,7 @@ mod tests {
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2196,6 +2203,7 @@ exit 0
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2379,6 +2387,7 @@ exit 0
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2556,6 +2565,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2647,6 +2657,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2726,6 +2737,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2811,6 +2823,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2917,6 +2930,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2967,6 +2981,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3039,6 +3054,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3162,6 +3178,7 @@ exit 1
                     directory_cache: None,
                     bis_ack_timeout: Duration::from_secs(60),
                     metrics: None,
+                cas_endpoint: String::new(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3256,6 +3273,7 @@ exit 1
                     directory_cache: None,
                     bis_ack_timeout: Duration::from_secs(60),
                     metrics: None,
+                cas_endpoint: String::new(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3350,6 +3368,7 @@ exit 1
                     directory_cache: None,
                     bis_ack_timeout: Duration::from_secs(60),
                     metrics: None,
+                cas_endpoint: String::new(),
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3441,6 +3460,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3602,6 +3622,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3786,6 +3807,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3890,6 +3912,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -4011,6 +4034,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4198,6 +4222,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4325,6 +4350,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         // Create a simple action
@@ -4473,6 +4499,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         // Create a simple action
@@ -5357,6 +5384,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -5553,6 +5581,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         let action_digest = DigestInfo::new([0xACu8; 32], 32);
@@ -5718,6 +5747,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         const N_TREES: usize = 5;
@@ -5801,6 +5831,7 @@ exit 1
                 directory_cache: None,
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
+                cas_endpoint: String::new(),
             })?);
 
         // Use larger trees so each decode has a measurable cost. 64
