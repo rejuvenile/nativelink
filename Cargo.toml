@@ -270,3 +270,7 @@ unused_self = { level = "allow", priority = 1 }
 gcloud-storage = { git = "https://github.com/yoshidan/google-cloud-rust", rev = "e0e790b9d4de1fbd7085dc98fde21eaf9573899a" }
 gcloud-auth = { git = "https://github.com/yoshidan/google-cloud-rust", rev = "e0e790b9d4de1fbd7085dc98fde21eaf9573899a" }
 gcloud-metadata = { git = "https://github.com/yoshidan/google-cloud-rust", rev = "e0e790b9d4de1fbd7085dc98fde21eaf9573899a" }
+# #15 (keepalive stall-grace): hyper fork with Option 2b GRACE_DURATION=5s.
+# Branch: stall-grace-1.8.1. rev= pinned per security-reviewer finding.
+# cache.example.com gitforge serves SSH only (no HTTPS listener); cargo build env needs the gitforge key.
+hyper = { git = "ssh://git@git.example.com/user/hyper.git", rev = "4894b08027eff62647f907cbeaf19e21dd68c41c" }
