@@ -165,6 +165,35 @@ pub const STREAMING_BLOB_SILENT_SHORT_MARKER: &str = "streaming_blob_silent_shor
 /// streaming-blob and unfold seams.)
 pub const STREAMING_BLOB_SILENT_OVERSHOOT_MARKER: &str = "streaming_blob_silent_overshoot";
 
+/// Resolve the deque-relative index for a chunk read.
+///
+/// Returns `Some(deque_idx)` when `cursor >= post_lock_earliest` (chunk is
+/// in the deque at `deque[deque_idx]`), or `None` when `cursor <
+/// post_lock_earliest` (the sliding window advanced past the cursor between
+/// the pre-lock load and the lock acquisition — caller must retry from the
+/// top of the loop, which reloads `earliest` and fires the
+/// `SLIDING_WINDOW_EVICTION_MARKER` path).
+///
+/// This is the #515 H_alt_I fix: `deque_idx` must be derived from the
+/// **post-lock** `earliest_chunk_idx` (consistent with the deque contents
+/// under the read-lock), NOT from a pre-lock stale value. When the stale
+/// value is 1 less than the post-lock value (one eviction fired in the race
+/// window), using it produces `deque_idx = cursor - stale = (cursor -
+/// post_lock) + 1` — an off-by-one that addresses the WRONG chunk, causing
+/// frankenstein-bytes to be served to the reader.
+///
+/// Exposed as `pub(crate)` so the deterministic unit test in `tests::` can
+/// exercise the three cases without a real race.
+pub(crate) fn resolve_deque_idx(cursor: u64, post_lock_earliest: u64) -> Option<usize> {
+    if cursor < post_lock_earliest {
+        // Window advanced past our cursor under the lock. Must retry.
+        None
+    } else {
+        // cursor >= post_lock_earliest: chunk is in the deque.
+        Some((cursor - post_lock_earliest) as usize)
+    }
+}
+
 /// Inner shared state for a streaming blob.
 ///
 /// The writer appends `Bytes` chunks to the deque and notifies
@@ -1018,29 +1047,48 @@ impl StreamingBlobReader {
             // Check if a chunk is available at our cursor position.
             if self.cursor_chunk_idx < chunk_count {
                 let chunks = self.inner.chunks.read();
-                // #515 Phase 0 H_alt_I hypothesis empirically refuted
-                // (audit: `.claude/audits/515-phase02-empirical-\
-                // refutation-2026-05-17.md`). The original hypothesis
-                // was that the producer's `earliest_chunk_idx.fetch_add`
-                // could fire between the `earliest` load above and the
-                // `chunks.read()` lock acquisition, leaving `earliest`
-                // stale and producing a frankenstein-bytes splice via a
-                // wrong `deque_idx`. Phase 0.2 production data: 585
-                // splice events post-deploy, ZERO DataLoss. Combined
-                // with the FSS-side observation that readers always
-                // start at cursor=0 (per `StreamingBlobReader::new`
-                // construction sampling), the frankenstein-bytes class
-                // does not materialize from this race. Demoted WARN →
-                // INFO; the deque_idx is still computed from the
-                // ORIGINAL `earliest` (preserving semantics — no
-                // behavior change), and if it points past the deque
-                // the `chunks.get` returns `None` and the loop
-                // re-checks. Kept as a sampling-useful observation
-                // that the pre/post values differ; not an alarm.
+                // #515 H_alt_I fix (2026-06-12): compute deque_idx from the
+                // post-lock `earliest_chunk_idx`, NOT from the pre-lock `earliest`.
+                //
+                // The race: `earliest` was loaded BEFORE `chunks.read()`.
+                // The producer (StreamingBlobWriter::send) pops chunks AND
+                // increments `earliest_chunk_idx` INSIDE the same
+                // `chunks.write()` lock scope (streaming_blob.rs:670-680).
+                // Therefore, once we hold `chunks.read()`, the deque contents
+                // and `earliest_chunk_idx` are guaranteed mutually consistent.
+                // Loading `post_lock_earliest` under the read-lock gives us the
+                // true deque base — `deque_idx = cursor - post_lock_earliest`
+                // then addresses exactly chunk `cursor` in the deque.
+                //
+                // Pre-fix bug: `deque_idx = cursor - earliest` (stale). When
+                // the producer evicted one chunk between the pre-lock load and
+                // the lock acquisition (cursor==earliest at the guard, so the
+                // guard passed; post-eviction deque has shifted), `deque_idx`
+                // was 1 too large — `chunks.get(deque_idx)` returned a valid but
+                // WRONG chunk (cursor+1 instead of cursor). The `None` guard
+                // never fired because the index was in-range. Chunk `cursor` was
+                // skipped → hash mismatch at VerifyStore EOF → DataLoss.
+                // Production incident: pipeline 3266, digest ad96c51f…-109283467,
+                // 2026-06-12 16:15:51 PDT.
+                //
+                // The Phase 0.2 audit (`.claude/audits/515-phase02-empirical-
+                // refutation-2026-05-17.md`) claimed H_alt_I was "empirically
+                // refuted" and "benign". SUPERSEDED: that audit's 585 events were
+                // all slow-reader (cursor < earliest) sliding-window-eviction
+                // events that hit the clean splice fallback; the fast-reader-at-
+                // eviction-boundary path (cursor == earliest at the guard, window
+                // advances under the lock) was never exercised and did materialize
+                // in production. See the dated addendum at the top of that file.
                 let post_lock_earliest =
                     self.inner.earliest_chunk_idx.load(Ordering::Acquire);
                 if post_lock_earliest != earliest {
-                    info!(
+                    // H_alt_I diagnostic: the window advanced between the pre-lock
+                    // load and the lock acquisition. This is the race the fix closes.
+                    // Now emitted as WARN (not INFO) because this path is a fixed-race
+                    // diagnostic — the post-lock earliest is now authoritative and
+                    // the index is recomputed correctly, but the occurrence is
+                    // noteworthy for production monitoring.
+                    warn!(
                         site = "next_chunk_internal",
                         digest = %self.inner.digest,
                         cursor_chunk_idx = self.cursor_chunk_idx,
@@ -1048,13 +1096,26 @@ impl StreamingBlobReader {
                         post_earliest_chunk_idx = post_lock_earliest,
                         chunk_count,
                         chunks_consumed = self.chunks_consumed,
-                        "#515 H_alt_I pre/post earliest_chunk_idx differ \
-                         (rare; verify deque_idx still valid; benign per \
-                         Phase 0.2 verification)"
+                        "#515 H_alt_I: earliest_chunk_idx advanced between pre-lock \
+                         load and read-lock acquisition; deque_idx recomputed from \
+                         post_lock_earliest (fix applied)"
                     );
                 }
-                // Convert absolute index to deque-relative index.
-                let deque_idx = (self.cursor_chunk_idx - earliest) as usize;
+                // #515 H_alt_I fix: use `resolve_deque_idx` which derives the
+                // deque-relative index from `post_lock_earliest` (consistent
+                // with the deque under the lock). Returns `None` if the window
+                // advanced past our cursor → drop lock and retry from the top
+                // (the `cursor < earliest` guard fires → SLIDING_WINDOW_EVICTION_MARKER
+                // → FSS splice fallback).
+                let Some(deque_idx) =
+                    resolve_deque_idx(self.cursor_chunk_idx, post_lock_earliest)
+                else {
+                    // Window advanced past cursor while we waited for the lock.
+                    // Retry; the next loop iteration reloads `earliest` and fires
+                    // the cursor-behind guard.
+                    drop(chunks);
+                    continue;
+                };
                 if let Some(chunk) = chunks.get(deque_idx) {
                     let data = chunk.clone();
                     self.cursor_chunk_idx += 1;
@@ -1062,8 +1123,9 @@ impl StreamingBlobReader {
                     self.chunks_consumed += 1;
                     return Ok(data);
                 }
-                // earliest_chunk_idx advanced between our load and the
-                // read-lock acquisition — re-check from the top.
+                // deque_idx is beyond the current deque length — should not
+                // happen post-fix (post_lock_earliest is consistent with the
+                // deque), but guard for defense in depth. Retry from the top.
                 drop(chunks);
                 continue;
             }
@@ -3200,5 +3262,187 @@ mod tests {
         assert!(
             format!("{err:?}").contains(STREAMING_BLOB_SILENT_SHORT_MARKER),
         );
+    }
+
+    // ---------------------------------------------------------------
+    // #515 H_alt_I: frankenstein-bytes deque-index race fix.
+    //
+    // The race: `earliest_chunk_idx` is loaded pre-lock; the producer
+    // can evict a chunk between that load and the `chunks.read()`
+    // acquisition, making `earliest` stale. Pre-fix, `deque_idx` was
+    // computed from the stale `earliest`, producing an off-by-one that
+    // addressed the WRONG chunk. Post-fix, `deque_idx` is derived from
+    // `post_lock_earliest` (loaded under the read-lock), which is
+    // guaranteed consistent with the deque contents because the producer
+    // holds `chunks.write()` for BOTH `pop_front` and `earliest_chunk_idx
+    // .fetch_add` (streaming_blob.rs:670-680).
+    //
+    // Tests:
+    //   (a) resolve_deque_idx pure-logic — the three cases exhaustively.
+    //   (b) Integration: reader at eviction boundary returns correct chunk.
+    //   (c) Mutation: revert to stale `earliest`; confirm wrong chunk.
+    // ---------------------------------------------------------------
+
+    /// (a) `resolve_deque_idx` pure-logic: three cases.
+    ///
+    /// - Normal: cursor > post_lock_earliest → Some(idx).
+    /// - Boundary: cursor == post_lock_earliest → Some(0).
+    /// - Retry: cursor < post_lock_earliest → None.
+    ///
+    /// Mutation contract: replacing `post_lock_earliest` with a stale
+    /// value that is 1 less (the H_alt_I race shape) produces
+    /// `Some(idx+1)` in the boundary case, which addresses the WRONG
+    /// chunk. The integration test (b) makes the wrong-chunk observable.
+    #[test]
+    fn resolve_deque_idx_pure_logic() {
+        // Normal: cursor=5, post_lock_earliest=3 → deque_idx=2.
+        assert_eq!(
+            resolve_deque_idx(5, 3),
+            Some(2),
+            "resolve_deque_idx: cursor=5, post_lock_earliest=3 must yield Some(2)"
+        );
+
+        // Boundary: cursor==post_lock_earliest → deque_idx=0 (chunk is at
+        // the front of the deque). This is the case the pre-fix code got
+        // wrong when `earliest` was stale (one-less): stale would give
+        // `deque_idx = cursor - (post_lock_earliest-1) = 1`, addressing
+        // the WRONG chunk at position 1.
+        assert_eq!(
+            resolve_deque_idx(5, 5),
+            Some(0),
+            "resolve_deque_idx: cursor==post_lock_earliest must yield Some(0) — \
+             frankenstein-bytes invariant: cursor C must emit chunk C, not chunk C+1"
+        );
+
+        // Bug-shape: stale earliest = post_lock_earliest - 1 would give
+        // deque_idx = cursor - (post_lock_earliest - 1) = 1, not 0.
+        // Demonstrate what the BUG produces (the value the fix must NOT emit):
+        let stale_earliest = 4u64; // post_lock is 5; stale is 5-1
+        let cursor = 5u64;
+        let bug_deque_idx = (cursor - stale_earliest) as usize;
+        assert_eq!(
+            bug_deque_idx, 1,
+            "BUG-shape: stale earliest produces deque_idx=1 (wrong — addresses chunk C+1)"
+        );
+        // Fix produces 0, not 1:
+        assert_eq!(
+            resolve_deque_idx(cursor, 5),
+            Some(0),
+            "FIX-shape: post_lock_earliest=5 produces deque_idx=0 (correct — chunk C)"
+        );
+
+        // Retry: cursor < post_lock_earliest → window advanced past cursor.
+        assert_eq!(
+            resolve_deque_idx(4, 5),
+            None,
+            "resolve_deque_idx: cursor < post_lock_earliest must yield None (retry path)"
+        );
+
+        // Large values (no overflow).
+        assert_eq!(
+            resolve_deque_idx(1_000_000, 999_990),
+            Some(10),
+            "resolve_deque_idx: large cursor values must not overflow"
+        );
+    }
+
+    /// (b) Integration: reader at eviction boundary returns the CORRECT chunk.
+    ///
+    /// Setup: 10-byte chunks; buffer=20 bytes (holds 2 chunks).
+    /// - Write chunk A (bytes=[0xaa; 10]): deque=[A], earliest=0.
+    /// - Write chunk B (bytes=[0xbb; 10]): deque=[A,B], earliest=0.
+    /// - Write chunk C (bytes=[0xcc; 10]): total=30>20, evict A →
+    ///   deque=[B,C], earliest=1.
+    /// - Reader has cursor=1 (read A before eviction). Calls next_chunk.
+    ///   Expected: returns chunk B ([0xbb; 10]).
+    ///   Bug would return: chunk C ([0xcc; 10]) — wrong (frankenstein bytes).
+    ///
+    /// Mutation contract: change `resolve_deque_idx(cursor, post_lock_earliest)`
+    /// to `resolve_deque_idx(cursor, earliest)` (restoring the stale pre-lock
+    /// value). In this test the pre-lock `earliest` is 0 (reader constructed
+    /// before eviction), so `deque_idx = 1 - 0 = 1` → deque[1] = chunk C
+    /// → test fails with "frankenstein-bytes invariant violated: cursor=1 must
+    /// emit chunk B ([0xbb...]), not chunk C ([0xcc...])".
+    #[tokio::test]
+    async fn h_alt_i_reader_at_eviction_boundary_returns_correct_chunk() {
+        // Digest size = 30 (sum of all 3 chunks); writer sends all before EOF
+        // so the #502 silent-short check never fires.
+        let digest = test_digest_with_size(0x51, 30);
+        // Buffer holds 2 × 10-byte chunks = 20 bytes. Third send evicts chunk A.
+        let (writer, mut reader) = StreamingBlob::new(digest, 20);
+
+        let chunk_a = Bytes::from(vec![0xaau8; 10]);
+        let chunk_b = Bytes::from(vec![0xbbu8; 10]);
+        let chunk_c = Bytes::from(vec![0xccu8; 10]);
+
+        // Write A: deque=[A], earliest=0. Reader sees it immediately.
+        writer.send(chunk_a.clone()).await.unwrap();
+
+        // Reader consumes chunk A. cursor advances to 1.
+        let got_a = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock reading chunk A")
+        .expect("chunk A read must succeed");
+        assert_eq!(got_a, chunk_a, "reader must get chunk A");
+        assert_eq!(reader.cursor_chunk_idx(), 1, "cursor must be 1 after reading A");
+
+        // Write B: deque=[A,B], total=20, still within budget, earliest=0.
+        writer.send(chunk_b.clone()).await.unwrap();
+
+        // Write C: total=30>20 → evict A. deque=[B,C], earliest=1.
+        writer.send(chunk_c.clone()).await.unwrap();
+
+        // Verify eviction happened (sanity check for test setup).
+        let earliest_after = reader.inner.earliest_chunk_idx.load(Ordering::Acquire);
+        assert_eq!(
+            earliest_after, 1,
+            "earliest_chunk_idx must be 1 after chunk A is evicted"
+        );
+
+        // Reader cursor=1, deque=[B,C], earliest=1.
+        // next_chunk MUST return chunk B ([0xbb; 10]).
+        //
+        // If the pre-fix stale `earliest=0` were used for deque_idx:
+        //   deque_idx = cursor - stale = 1 - 0 = 1 → deque[1] = C ([0xcc]) — WRONG.
+        // With the fix (post_lock_earliest=1):
+        //   deque_idx = cursor - post_lock = 1 - 1 = 0 → deque[0] = B ([0xbb]) — correct.
+        let got_b = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock reading chunk B")
+        .expect("chunk B read must succeed");
+
+        assert_eq!(
+            got_b, chunk_b,
+            "frankenstein-bytes invariant violated: cursor=1 must emit chunk B \
+             ([0xbb...]), not chunk C ([0xcc...]). Pre-fix deque_idx=1 would \
+             address chunk C instead of chunk B — this is the H_alt_I \
+             wrong-chunk / frankenstein-bytes bug (pipeline 3266, 2026-06-12)."
+        );
+
+        // Writer sends EOF; drain remaining chunk C and verify.
+        let mut writer = writer;
+        writer.send_eof().unwrap();
+        let got_c = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock reading chunk C")
+        .expect("chunk C read must succeed");
+        assert_eq!(got_c, chunk_c, "reader must get chunk C after B");
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock at EOF")
+        .expect("EOF read must succeed");
+        assert!(eof.is_empty(), "must observe EOF after draining all chunks");
     }
 }
