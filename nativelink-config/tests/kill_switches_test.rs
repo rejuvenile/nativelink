@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Schema-level coverage for the four #212 chunked-streaming
-//! kill-switch fields landed alongside the production sign-off
-//! (2026-05-02). Each test exercises:
+//! Schema-level coverage for kill-switch fields. Each test exercises:
 //!
 //! 1. `#[serde(default)]` returns `false` when the field is absent
 //!    (backwards-compat invariant).
@@ -26,8 +24,11 @@
 //! cannot silently regress to default-OFF if a field is renamed,
 //! removed, or accidentally hidden behind a `#[serde(skip)]`
 //! attribute.
+//!
+//! Four chunked-streaming kill-switches (#212, 2026-05-02) and the
+//! F2 deferred-output-uploads kill-switch (2026-06-12) are covered.
 
-use nativelink_config::cas_server::GlobalConfig;
+use nativelink_config::cas_server::{GlobalConfig, LocalWorkerConfig};
 use nativelink_config::stores::{FastSlowSpec, GrpcSpec, MemorySpec};
 
 // ----- GrpcSpec.chunked_writes_enabled (Phase 2.4) -----------------
@@ -267,4 +268,75 @@ fn all_four_kill_switches_on_together_parse_clean() {
     )
     .expect("global all-on parse");
     assert!(global.bazel_facing_internal_chunking_enabled);
+}
+
+// ----- LocalWorkerConfig.deferred_output_uploads_enabled (F2) ------
+//
+// These three tests guard that the F2 kill-switch default cannot
+// silently regress to ON if the field is renamed, removed, or
+// accidentally given a `#[serde(skip)]` attribute. They follow the
+// same 3-part template as the four chunked-streaming tests above.
+
+/// Minimal JSON that satisfies all non-defaulted required fields of
+/// `LocalWorkerConfig`. Fields without `#[serde(default)]`:
+/// `worker_api_endpoint`, `cas_fast_slow_store`, `work_directory`,
+/// and `platform_properties`.
+const LOCAL_WORKER_BASE: &str = r#"{
+    "worker_api_endpoint": {"uri": "grpc://localhost:50061"},
+    "cas_fast_slow_store": "cas",
+    "work_directory": "/tmp/worker_test",
+    "platform_properties": {}
+}"#;
+
+/// (a) Default deserializes to `false` — backwards-compat invariant.
+/// If this fails, the field was either renamed (key mismatch) or the
+/// default was changed to `true` (which would enable deferred uploads
+/// on every worker that hasn't explicitly set the flag).
+#[test]
+fn local_worker_deferred_uploads_default_false() {
+    let cfg: LocalWorkerConfig =
+        serde_json5::from_str(LOCAL_WORKER_BASE).expect("base parse");
+    assert!(
+        !cfg.deferred_output_uploads_enabled,
+        "deferred_output_uploads_enabled must default to false for \
+        backwards compatibility — enabling by default would violate the \
+        ≥2-replica durability invariant without operator awareness (#F2)"
+    );
+}
+
+/// (b) Explicit `true` round-trips correctly.
+/// If this fails, the field was renamed or `#[serde(skip)]` was added,
+/// meaning operators can no longer enable the kill-switch.
+#[test]
+fn local_worker_deferred_uploads_explicit_true() {
+    let json = r#"{
+        "worker_api_endpoint": {"uri": "grpc://localhost:50061"},
+        "cas_fast_slow_store": "cas",
+        "work_directory": "/tmp/worker_test",
+        "platform_properties": {},
+        "deferred_output_uploads_enabled": true
+    }"#;
+    let cfg: LocalWorkerConfig = serde_json5::from_str(json).expect("explicit-true parse");
+    assert!(
+        cfg.deferred_output_uploads_enabled,
+        "deferred_output_uploads_enabled=true must round-trip — field \
+        renamed or serde(skip) added? (#F2)"
+    );
+}
+
+/// (c) Explicit `false` round-trips correctly (sanity).
+#[test]
+fn local_worker_deferred_uploads_explicit_false() {
+    let json = r#"{
+        "worker_api_endpoint": {"uri": "grpc://localhost:50061"},
+        "cas_fast_slow_store": "cas",
+        "work_directory": "/tmp/worker_test",
+        "platform_properties": {},
+        "deferred_output_uploads_enabled": false
+    }"#;
+    let cfg: LocalWorkerConfig = serde_json5::from_str(json).expect("explicit-false parse");
+    assert!(
+        !cfg.deferred_output_uploads_enabled,
+        "deferred_output_uploads_enabled=false must round-trip (#F2)"
+    );
 }

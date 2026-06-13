@@ -35,11 +35,11 @@ mod tests {
     use bytes::Bytes;
     use futures::prelude::*;
     use nativelink_config::cas_server::EnvironmentSource;
-    use nativelink_metric::{
-        MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
-    };
     use nativelink_config::stores::{
         FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
+    };
+    use nativelink_metric::{
+        MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
     };
     use nativelink_error::{Code, Error, ResultExt, make_input_err};
     use nativelink_macro::nativelink_test;
@@ -6358,7 +6358,7 @@ exit 1
             monotonic_clock(&CLOCK)
         }
 
-        let (_fast_store, slow_store, cas_store, ac_store) =
+        let (fast_store, slow_store, cas_store, ac_store) =
             setup_stores_with_blocking_slow().await?;
         let root_action_directory = make_temp_path("root_action_directory_deferred_disabled");
         fs::create_dir_all(&root_action_directory).await?;
@@ -6408,15 +6408,20 @@ exit 1
             }],
             ..Default::default()
         };
+        // Write setup protos to the fast store directly (FilesystemStore) to
+        // avoid spawning background FSS slow-write tasks that would increment
+        // update_attempts_count() before before_count is captured, adding
+        // noise to the baseline. Workers read command/action protos from the
+        // fast store; no slow-store write is needed for setup. (distsys F3)
         let command_digest = serialize_and_upload_message(
             &command,
-            cas_store.as_pin(),
+            fast_store.as_pin(),
             &mut DigestHasherFunc::Sha256.hasher(),
         )
         .await?;
         let input_root_digest = serialize_and_upload_message(
             &Directory::default(),
-            cas_store.as_pin(),
+            fast_store.as_pin(),
             &mut DigestHasherFunc::Sha256.hasher(),
         )
         .await?;
@@ -6427,7 +6432,7 @@ exit 1
         };
         let action_digest = serialize_and_upload_message(
             &action,
-            cas_store.as_pin(),
+            fast_store.as_pin(),
             &mut DigestHasherFunc::Sha256.hasher(),
         )
         .await?;

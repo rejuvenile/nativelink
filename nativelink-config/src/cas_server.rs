@@ -1089,17 +1089,43 @@ pub struct LocalWorkerConfig {
     /// fast store (`FilesystemStore`) only. The remote CAS upload is deferred to
     /// `spawn_upload_to_remote`, which runs AFTER `execution_complete` frees the
     /// worker slot. Completion is gated only on the local disk write (~1ms),
-    /// reducing action completion latency by p50≈152ms / p99≈720ms.
+    /// reducing action completion latency by p50≈152ms / p99≈720ms (n=140
+    /// actions, worker-01 + worker-02, 2026-06-12; raw data
+    /// `/tmp/workerlifecycle-phase-timing.log`).
     ///
-    /// Safety: outputs are pinned in the local FilesystemStore immediately after
-    /// write (preventing LRU eviction until BIS-ack). The server's locality map is
-    /// populated via `BlobsAvailable` (sent before `execution_response`) so Bazel
-    /// can read outputs via `WorkerProxyStore` peer-fetch. The H4 pending-registry
-    /// (#12) rescues CCS completeness checks during the upload window.
+    /// DURABILITY REGRESSION: enabling this flag regresses the ≥2-replica
+    /// durability invariant to ≥1-replica (worker fast store only) for the
+    /// window between `execution_response` and `spawn_upload_to_remote`
+    /// completion (p50≈152ms, p99≈720ms). Worst case: permanently single-copy
+    /// on the worker if background upload exhausts retries (max 4 retries × up
+    /// to 30s backoff ≈ 120s) until `UploadMissingBlobs` recovers. This
+    /// tradeoff is intentional and operator-authorized.
     ///
-    /// Prerequisite machinery: #129 BlobsAvailable ordering, #549/#551 pin budget,
-    /// `spawn_upload_to_remote` with retries, `UploadMissingBlobs` backfill, and
-    /// #12 H4 pending-output-locality-registry must all be live before enabling.
+    /// HARD PREREQUISITE: `cas_server_port` MUST be set. Without it,
+    /// `BlobsAvailable` is never sent, the server locality map stays empty, and
+    /// deferred outputs are unroutable during the upload window (reopens the
+    /// 2013977a hole). Worker startup REJECTS the combination
+    /// `deferred_output_uploads_enabled = true` + `cas_server_port = None` with
+    /// a loud error.
+    ///
+    /// CLIENT REQUIREMENT: Bazel clients MUST have `--remote_retries ≥ 1` to
+    /// recover from the narrow crash-window miss (worker crashes between
+    /// `execution_response` and worker reconnect, ~2-10s). Without retries, a
+    /// crash in this window causes a client-visible cache miss (action re-runs;
+    /// no permanent data loss).
+    ///
+    /// Safety mechanisms: outputs are pinned in the local FilesystemStore
+    /// immediately after write (preventing LRU eviction until BIS-ack, via
+    /// `filesystem_store.pin_digest` — the real anti-eviction pin held across
+    /// the upload window). The server's locality map is populated via
+    /// `BlobsAvailable` (sent before `execution_response`) so Bazel can read
+    /// outputs via `WorkerProxyStore` peer-fetch. The H4 pending-registry (#12)
+    /// rescues CCS completeness checks during the upload window.
+    ///
+    /// Prerequisite machinery: #129 BlobsAvailable ordering, #549/#551 pin
+    /// budget, `spawn_upload_to_remote` with retries, `UploadMissingBlobs`
+    /// backfill, and #12 H4 pending-output-locality-registry must all be live
+    /// before enabling.
     ///
     /// See `.claude/audits/f2-deferred-output-uploads-design-2026-06-12.md` for
     /// the full durability analysis and rollout plan.

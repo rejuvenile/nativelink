@@ -2329,3 +2329,123 @@ async fn phase6_probe_p_worker_boundary_fires_on_tonic_ok() -> Result<(), Error>
 
     Ok(())
 }
+
+// ----- F2 startup guard tests ------------------------------------------
+//
+// Guard that the combination deferred_output_uploads_enabled=true with
+// cas_server_port=None is rejected at startup with a clear error.
+// Without cas_server_port, BlobsAvailable is never sent, so deferred
+// outputs are unroutable during the upload window (#F2).
+
+/// (a) deferred_output_uploads_enabled=true + cas_server_port=None MUST fail
+/// at startup with a message naming both fields.
+#[nativelink_test]
+async fn deferred_uploads_without_cas_server_port_is_rejected() -> Result<(), Error> {
+    let cas_store = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        Store::new(
+            <FilesystemStore>::new(&FilesystemSpec {
+                content_path: make_temp_path("content_path_guard_fail"),
+                temp_path: make_temp_path("temp_path_guard_fail"),
+                ..Default::default()
+            })
+            .await?,
+        ),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let ac_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let work_directory = make_temp_path("work_dir_guard_fail");
+    let result = new_local_worker(
+        Arc::new(LocalWorkerConfig {
+            work_directory,
+            // cas_server_port is None (the default) — no CAS endpoint.
+            cas_server_port: None,
+            // Deferred uploads ON without a CAS port: invalid combination.
+            deferred_output_uploads_enabled: true,
+            ..Default::default()
+        }),
+        cas_store.clone(),
+        Some(ac_store),
+        None,
+        cas_store,
+    )
+    .await;
+
+    let err = result.expect_err(
+        "F2 startup guard: deferred_output_uploads_enabled=true + \
+        cas_server_port=None must be rejected at startup — guard missing or \
+        condition check is wrong (#F2)",
+    );
+    assert!(
+        err.to_string().contains("deferred_output_uploads_enabled"),
+        "F2 startup guard error must name 'deferred_output_uploads_enabled' \
+        so operators know which field to fix; got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("cas_server_port"),
+        "F2 startup guard error must name 'cas_server_port' so operators \
+        know the prerequisite; got: {err:?}"
+    );
+    Ok(())
+}
+
+/// (b) deferred_output_uploads_enabled=true + cas_server_port=Some(N) MUST
+/// succeed past the startup guard (the guard must not over-reject valid configs).
+#[nativelink_test]
+async fn deferred_uploads_with_cas_server_port_passes_guard() -> Result<(), Error> {
+    let cas_store = Store::new(FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        Store::new(
+            <FilesystemStore>::new(&FilesystemSpec {
+                content_path: make_temp_path("content_path_guard_pass"),
+                temp_path: make_temp_path("temp_path_guard_pass"),
+                ..Default::default()
+            })
+            .await?,
+        ),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    ));
+    let ac_store = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let work_directory = make_temp_path("work_dir_guard_pass");
+    // new_local_worker may fail AFTER the guard for other reasons (e.g. port
+    // already in use) — we only care that the guard itself does not fire. So
+    // we check that, IF it fails, the error does NOT contain the guard message.
+    let result = new_local_worker(
+        Arc::new(LocalWorkerConfig {
+            work_directory,
+            // cas_server_port is set — the guard should pass.
+            cas_server_port: Some(0),
+            deferred_output_uploads_enabled: true,
+            ..Default::default()
+        }),
+        cas_store.clone(),
+        Some(ac_store),
+        None,
+        cas_store,
+    )
+    .await;
+
+    if let Err(ref err) = result {
+        assert!(
+            !err.to_string().contains("deferred_output_uploads_enabled"),
+            "F2 startup guard must NOT fire when cas_server_port is set; \
+            guard over-rejected a valid config: {err:?}"
+        );
+    }
+    // Success (Ok or non-guard error) is both acceptable here.
+    Ok(())
+}

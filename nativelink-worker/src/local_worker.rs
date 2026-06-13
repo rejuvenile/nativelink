@@ -3471,6 +3471,20 @@ pub async fn new_local_worker(
     // macOS-only; no-op on Linux (server doesn't need it).
     ::nativelink_util::o11_probes::spawn_system_metrics_sampler();
 
+    // F2 startup guard: deferred_output_uploads_enabled requires cas_server_port.
+    // Without a CAS endpoint, BlobsAvailable is never sent
+    // (local_worker.rs gating condition: `!cas_endpoint_for_notify.is_empty()`),
+    // so the server locality map stays empty. During the deferred window a Bazel
+    // FindMissingBlobs/Read returns NotFound with no client-visible error —
+    // reopening the 2013977a hole in this config combination (#F2).
+    if config.deferred_output_uploads_enabled && config.cas_server_port.is_none() {
+        return Err(make_input_err!(
+            "deferred_output_uploads_enabled requires cas_server_port to be set — \
+            without a CAS endpoint, BlobsAvailable is never sent and deferred \
+            outputs are unroutable during the upload window (#F2)"
+        ));
+    }
+
     let fast_slow_store = cas_store
         .downcast_ref::<FastSlowStore>(None)
         .err_tip(|| "Expected store for LocalWorker's store to be a FastSlowStore")?

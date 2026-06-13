@@ -3432,7 +3432,8 @@ impl RunningActionImpl {
         // slow-store upload is deferred to spawn_upload_to_remote, which runs
         // AFTER execution_complete frees the worker slot.  Completion is then
         // gated only on the local disk write (~1 ms) instead of the remote RPC
-        // (p50 ≈ 152 ms, p99 ≈ 720 ms).
+        // (p50 ≈ 152 ms, p99 ≈ 720 ms; n=140 actions, worker-01 + worker-02,
+        // 2026-06-12; raw data /tmp/workerlifecycle-phase-timing.log).
         //
         // When false (default): upload through the full FastSlowStore so the
         // has() check in upload_file queries the slow store (remote CAS).
@@ -3444,7 +3445,14 @@ impl RunningActionImpl {
         //   (P1) Outputs written to on-disk FilesystemStore (crash-survivable).
         //   (P2) Outputs pinned immediately below (running_actions_manager.rs:3851).
         //   (P3) BlobsAvailable sent before execution_response (#129 ordering).
-        //   (P4) H4 pending-registry pre-registered (#12).
+        //        Primary read path (ByteStream::Read) is protected by the
+        //        BlobLocalityMap populated from BlobsAvailable.
+        //   (P4) H4 pending-output-locality-registry (#12) is populated
+        //        ASYNCHRONOUSLY via the detached AC write task (ac_server.rs:222,
+        //        called after execution_complete), NOT before execution_response.
+        //        P4 covers CCS completeness checks that arrive after the AC write
+        //        lands. Narrow race between execution_response and AC write landing
+        //        is covered by Bazel --remote_retries.
         // See .claude/audits/f2-deferred-output-uploads-design-2026-06-12.md.
         //
         // `cas_store_owned` holds the `Store` that lives for the scope of this
