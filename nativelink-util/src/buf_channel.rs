@@ -709,6 +709,10 @@ impl DropCloserReadHalf {
                 // and are normal backpressure under load. Demote to debug for
                 // the common case; keep warn only when the wait or gap is
                 // ≥60s (genuinely stuck producer).
+                // NOTE: 60s threshold is provisional — all prior gap data was
+                // measured with the broken post-recv snapshot (d8270881 fix),
+                // so the real gap distribution is unobserved. Re-tune after
+                // one day of corrected data.
                 let gap_secs = gap_since_last_send_ms.unwrap_or(0) / 1000;
                 let is_severe = recv_elapsed.as_secs() >= 60 || gap_secs >= 60;
                 if is_severe {
@@ -996,7 +1000,7 @@ impl Drop for DropCloserReadHalf {
         // Mid-stream drop. Snapshot diag state so the operator can
         // attribute the failure to a specific producer task.
         let snap = self.diag.snapshot();
-        debug!(
+        warn!(
             target: "buf_channel::receiver_dropped_mid_stream",
             bytes_received = self.bytes_received,
             bytes_queued_locally = self.queued_data.len(),

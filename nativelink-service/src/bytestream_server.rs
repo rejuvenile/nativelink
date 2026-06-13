@@ -603,7 +603,7 @@ impl LoggingReadStream {
         // affected download.
         let slow_completion = elapsed_ms > 5000 && effective_rate_kbps < 1000 && status == "ok";
         if slow_completion {
-            debug!(
+            warn!(
                 target: "nativelink_service::bytestream",
                 label = self.label,
                 digest = %self.digest,
@@ -3083,7 +3083,8 @@ impl ByteStreamServer {
             // bytes transferred and #59 logs (Ok, Err) on a digest the
             // server short-circuited here, that maps to a producer
             // that never got its EOF acknowledged.
-            debug!(
+            // TODO(#59/#62): demote to debug once 6fc05054 is shipped and verified healthy ≥1 day
+            info!(
                 %digest,
                 committed_size = expected_size as i64,
                 expected_size,

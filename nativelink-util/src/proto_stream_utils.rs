@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 use pin_project_lite::pin_project;
 use tokio::time::Sleep;
 use tonic::{Status, Streaming};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::resource_info::ResourceInfo;
 
@@ -79,7 +79,7 @@ static SLOW_CHUNK_WARN_STATE: parking_lot::Mutex<Option<(std::time::Instant, u64
 /// awaiting the inner stream after this returns.
 fn record_grpc_write_slow_chunk_and_maybe_warn(instance_name: &str, progress_timeout_s: u64) {
     let new_total = GRPC_WRITE_SLOW_CHUNK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-    debug!(
+    warn!(
         target: "nativelink_util::proto_stream",
         instance_name,
         progress_timeout_s,
@@ -174,7 +174,7 @@ static READ_SLOW_CHUNK_WARN_STATE: parking_lot::Mutex<Option<(std::time::Instant
 /// always [`GRPC_READ_SLOW_CHUNK_THRESHOLD`] in production callers.
 fn record_grpc_read_slow_chunk_and_maybe_warn(label: &str, threshold_s: u64) {
     let new_total = GRPC_READ_SLOW_CHUNK_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
-    debug!(
+    warn!(
         target: "nativelink_util::proto_stream",
         label,
         threshold_s,

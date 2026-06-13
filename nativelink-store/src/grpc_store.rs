@@ -1436,7 +1436,8 @@ impl GrpcStore {
         // unobservable at info! level — we don't know whether
         // GrpcStore::write even entered, nor which retrier branch fired.
         // Observability-only; no behavior change.
-        debug!(
+        // TODO(#59/#62): demote to debug once 6fc05054 is shipped and verified healthy ≥1 day
+        info!(
             instance_name = %instance_name,
             progress_timeout_s = rpc_timeout.as_secs(),
             is_mirror,
@@ -1666,7 +1667,8 @@ impl GrpcStore {
                             // normal success path (producer sent EOF,
                             // unfold returned None). This is the ONLY
                             // non-AlreadyExists Ok-returning path.
-                            debug!(
+                            // TODO(#59/#62): demote to debug once 6fc05054 is shipped and verified healthy ≥1 day
+                            info!(
                                 instance_name = %instance_name,
                                 attempt,
                                 arm_name = "rpc_ok",
@@ -1770,7 +1772,8 @@ impl GrpcStore {
         let total_elapsed_ms = u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX);
         // #59 instrumentation: total elapsed surfaces the 1-46 ms fast-
         // fail vs full-RPC durations called out in #56 RCA §6 M3.
-        debug!(
+        // TODO(#59/#62): demote to debug once 6fc05054 is shipped and verified healthy ≥1 day
+        info!(
             instance_name = %self.instance_name,
             total_elapsed_ms,
             arm_name = "completed",
@@ -1782,7 +1785,7 @@ impl GrpcStore {
         // so we can still detect "the transport is healthy but extremely
         // slow" — e.g. WAN clients streaming large blobs.
         if total_elapsed > Duration::from_secs(60) {
-            debug!(
+            warn!(
                 instance_name = %self.instance_name,
                 total_elapsed_ms,
                 "GrpcStore::write succeeded but took > 60s; chunks were progressing but transport is slow",

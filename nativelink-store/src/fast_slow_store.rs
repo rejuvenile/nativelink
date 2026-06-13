@@ -4759,7 +4759,7 @@ impl StoreDriver for FastSlowStore {
                 let in_flight = self.in_flight_slow_writes.lock();
                 let lock_acquire_ms = lock_start.elapsed().as_millis();
                 if lock_acquire_ms > 5 {
-                    debug!(
+                    warn!(
                         lock_name = "in_flight_slow_writes",
                         lock_acquire_ms,
                         key_count,
@@ -4785,7 +4785,7 @@ impl StoreDriver for FastSlowStore {
                 let chunked = self.chunked_in_flight_digests.lock();
                 let lock_acquire_ms = lock_start.elapsed().as_millis();
                 if lock_acquire_ms > 5 {
-                    debug!(
+                    warn!(
                         lock_name = "chunked_in_flight_digests",
                         lock_acquire_ms,
                         key_count,
@@ -4809,7 +4809,7 @@ impl StoreDriver for FastSlowStore {
                 let mirror = self.mirror_blobs.read();
                 let lock_acquire_ms = lock_start.elapsed().as_millis();
                 if lock_acquire_ms > 5 {
-                    debug!(
+                    warn!(
                         lock_name = "mirror_blobs",
                         lock_acquire_ms,
                         key_count,
@@ -4844,7 +4844,7 @@ impl StoreDriver for FastSlowStore {
             let in_flight = self.in_flight_slow_writes.lock();
             let lock_acquire_ms = lock_start.elapsed().as_millis();
             if lock_acquire_ms > 5 {
-                debug!(
+                warn!(
                     lock_name = "in_flight_slow_writes",
                     lock_acquire_ms,
                     key_count,
@@ -4881,7 +4881,7 @@ impl StoreDriver for FastSlowStore {
             let chunked = self.chunked_in_flight_digests.lock();
             let lock_acquire_ms = lock_start.elapsed().as_millis();
             if lock_acquire_ms > 5 {
-                debug!(
+                warn!(
                     lock_name = "chunked_in_flight_digests",
                     lock_acquire_ms,
                     key_count,
@@ -4911,7 +4911,7 @@ impl StoreDriver for FastSlowStore {
             let mirror = self.mirror_blobs.read();
             let lock_acquire_ms = lock_start.elapsed().as_millis();
             if lock_acquire_ms > 5 {
-                debug!(
+                warn!(
                     lock_name = "mirror_blobs",
                     lock_acquire_ms,
                     key_count,

@@ -3113,7 +3113,7 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     // quiet log is ambiguous: probe disarmed, threshold never crossed,
     // or this code path not reached at all? `info!` (not `debug!`)
     // because the production deployment runs at info level.
-    debug!(
+    info!(
         target: "nativelink_service::chunked_write_handler",
         ?digest,
         "producer-arrival probe armed (#394/#413 Phase 1)",
