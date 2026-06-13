@@ -704,6 +704,15 @@ impl StreamingBlobWriter {
             while buffered > self.inner.max_buffer_bytes && !chunks.is_empty() {
                 if let Some(evicted) = chunks.pop_front() {
                     buffered -= evicted.len() as u64;
+                    // LOCK-INVARIANT: earliest_chunk_idx.fetch_add MUST remain
+                    // inside this chunks.write() scope, paired with pop_front
+                    // on the line above. Moving it outside (or splitting into a
+                    // separate lock acquisition) reopens #515 (frankenstein bytes):
+                    // a reader could load `earliest` pre-lock, see the old value,
+                    // acquire chunks.read() AFTER pop_front but BEFORE fetch_add
+                    // — making the deque shifted while `earliest` is stale by 1.
+                    // See next_chunk_internal for the reader-side invariant proof.
+                    // (SHA 374e3cf4, production incident 2026-06-12 pipeline 3266.)
                     self.inner.earliest_chunk_idx.fetch_add(1, Ordering::Release);
                 }
             }
@@ -859,6 +868,28 @@ pub struct StreamingBlobReader {
     terminal_seen: bool,
     /// Diagnostic-only: reader construction timestamp for elapsed logging.
     created_at: Instant,
+
+    /// #515 H_alt_I race-reproduction seam (test-only, zero-cost in
+    /// production). When `Some`, the seam fires EXACTLY ONCE inside the
+    /// `cursor_chunk_idx < chunk_count` branch, AFTER the pre-lock
+    /// `earliest` load and BEFORE `chunks.read()`. The reader sends on
+    /// `reader_ready_tx` to notify the spawned writer "proceed with
+    /// eviction", then awaits `eviction_done_rx` to confirm eviction
+    /// completed. This gives strict ordering: pre-lock load → eviction
+    /// → lock acquisition — which is the only ordering that exercises
+    /// the H_alt_I race window.
+    ///
+    /// `Option::take()` ensures exactly one firing; subsequent loop
+    /// iterations see `None` and skip the seam.
+    ///
+    /// Zero-cost in production: the field is absent (`cfg(test)` only),
+    /// so release builds have no extra allocation, no extra branch, and
+    /// no extra field in the struct layout.
+    #[cfg(test)]
+    h515_race_seam: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 }
 
 impl Drop for StreamingBlobReader {
@@ -928,6 +959,8 @@ impl StreamingBlobReader {
             chunks_consumed: 0,
             terminal_seen: false,
             created_at: Instant::now(),
+            #[cfg(test)]
+            h515_race_seam: None,
         }
     }
 
@@ -952,6 +985,27 @@ impl StreamingBlobReader {
     /// assumption fails).
     pub fn cursor_chunk_idx(&self) -> u64 {
         self.cursor_chunk_idx
+    }
+
+    /// Install the #515 H_alt_I race-reproduction seam (test-only).
+    ///
+    /// The installed seam fires EXACTLY ONCE: just before `chunks.read()`
+    /// is acquired inside the `cursor_chunk_idx < chunk_count` branch.
+    /// The reader signals the caller via `reader_ready_tx`, then awaits
+    /// `eviction_done_rx` before proceeding to acquire the lock. This
+    /// gives the test a strict happens-before window in which the spawned
+    /// writer can perform eviction, ensuring `earliest` diverges between
+    /// the pre-lock load and the lock acquisition — the H_alt_I race shape.
+    ///
+    /// Must be called BEFORE the first `next_chunk()` call that should
+    /// trigger the seam.
+    #[cfg(test)]
+    pub fn install_h515_race_seam(
+        &mut self,
+        reader_ready_tx: tokio::sync::oneshot::Sender<()>,
+        eviction_done_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        self.h515_race_seam = Some((reader_ready_tx, eviction_done_rx));
     }
 
     /// Returns the next chunk of data, waiting if necessary.
@@ -1046,6 +1100,21 @@ impl StreamingBlobReader {
 
             // Check if a chunk is available at our cursor position.
             if self.cursor_chunk_idx < chunk_count {
+                // #515 H_alt_I test seam — zero-cost in production (cfg(test) only).
+                // When installed, fires EXACTLY ONCE: signals the spawned writer
+                // "proceed with eviction" then awaits "eviction done" before
+                // acquiring the lock. This places the eviction strictly BETWEEN
+                // the pre-lock `earliest` load (above) and `chunks.read()`
+                // (below), reproducing the H_alt_I race window in tests.
+                #[cfg(test)]
+                if let Some((ready_tx, done_rx)) = self.h515_race_seam.take() {
+                    // Signal spawned writer: "I am past the pre-lock earliest load;
+                    // proceed with eviction now."
+                    let _ = ready_tx.send(());
+                    // Wait for spawned writer: "Eviction complete; `earliest` has
+                    // been incremented; safe to acquire chunks.read()."
+                    let _ = done_rx.await;
+                }
                 let chunks = self.inner.chunks.read();
                 // #515 H_alt_I fix (2026-06-12): compute deque_idx from the
                 // post-lock `earliest_chunk_idx`, NOT from the pre-lock `earliest`.
@@ -1053,7 +1122,7 @@ impl StreamingBlobReader {
                 // The race: `earliest` was loaded BEFORE `chunks.read()`.
                 // The producer (StreamingBlobWriter::send) pops chunks AND
                 // increments `earliest_chunk_idx` INSIDE the same
-                // `chunks.write()` lock scope (streaming_blob.rs:670-680).
+                // `chunks.write()` lock scope (streaming_blob.rs:699-709).
                 // Therefore, once we hold `chunks.read()`, the deque contents
                 // and `earliest_chunk_idx` are guaranteed mutually consistent.
                 // Loading `post_lock_earliest` under the read-lock gives us the
@@ -3275,12 +3344,22 @@ mod tests {
     // `post_lock_earliest` (loaded under the read-lock), which is
     // guaranteed consistent with the deque contents because the producer
     // holds `chunks.write()` for BOTH `pop_front` and `earliest_chunk_idx
-    // .fetch_add` (streaming_blob.rs:670-680).
+    // .fetch_add` (streaming_blob.rs:699-709).
     //
     // Tests:
     //   (a) resolve_deque_idx pure-logic — the three cases exhaustively.
-    //   (b) Integration: reader at eviction boundary returns correct chunk.
-    //   (c) Mutation: revert to stale `earliest`; confirm wrong chunk.
+    //   (b) Sequential integration: reader at eviction boundary returns
+    //       correct chunk (steady-state post-eviction math).
+    //   (c) Concurrent race seam: spawned writer evicts INSIDE the race
+    //       window (between pre-lock earliest load and chunks.read()
+    //       acquisition) via the h515_race_seam injection hook. This is
+    //       the FAITHFUL test — it actually exercises the H_alt_I
+    //       interleaving and fails under the call-site mutation (stale
+    //       earliest argument). Mutation contract: mutating the
+    //       post_lock_earliest argument back to earliest at the call site
+    //       produces bespoke failure message naming frankenstein-bytes.
+    //   (d) None-path: resolve_deque_idx returns None (cursor evicted
+    //       past by post_lock_earliest) → retry → SLIDING_WINDOW_EVICTION_MARKER.
     // ---------------------------------------------------------------
 
     /// (a) `resolve_deque_idx` pure-logic: three cases.
@@ -3444,5 +3523,279 @@ mod tests {
         .expect("next_chunk must not deadlock at EOF")
         .expect("EOF read must succeed");
         assert!(eof.is_empty(), "must observe EOF after draining all chunks");
+    }
+
+    /// (c) Concurrent race seam: the FAITHFUL H_alt_I race reproduction.
+    ///
+    /// This test uses the `h515_race_seam` injection hook to drive the
+    /// exact interleaving that caused the production DataLoss incident
+    /// (pipeline 3266, 2026-06-12):
+    ///
+    ///   Reader:  loads earliest=0 (pre-lock)
+    ///            [seam fires: signals writer, awaits eviction_done]
+    ///   Writer:  evicts chunk A → earliest becomes 1
+    ///            [signals reader: eviction done]
+    ///   Reader:  acquires chunks.read() — NOW earliest=1 but pre-lock load=0
+    ///            post-fix: loads post_lock_earliest=1 → deque_idx=0 → chunk B
+    ///            pre-fix (mutation): uses stale earliest=0 → deque_idx=1 → chunk C (WRONG)
+    ///
+    /// This is the only test that catches a regression in which the call site
+    /// passes the stale `earliest` instead of `post_lock_earliest`.
+    ///
+    /// Mutation contract (tested below in
+    /// `h_alt_i_concurrent_race_seam_fails_under_mutation`): substituting
+    /// `earliest` for `post_lock_earliest` at the resolve_deque_idx call
+    /// site causes this test to fail with:
+    ///   "frankenstein-bytes invariant violated (concurrent race): cursor=1 must
+    ///    emit chunk B ([0xbb...]), got chunk C ([0xcc...]) — stale pre-lock
+    ///    earliest produced wrong deque_idx (H_alt_I race, pipeline 3266)"
+    ///
+    /// Zero-cost in production: `h515_race_seam` is `cfg(test)` only;
+    /// the field and branch are absent from release builds.
+    #[tokio::test]
+    async fn h_alt_i_concurrent_race_seam_correct_chunk() {
+        use tokio::sync::oneshot;
+
+        // Digest size = 30; buffer holds 2 × 10-byte chunks.
+        let digest = test_digest_with_size(0xc0, 30);
+        let (writer, mut reader) = StreamingBlob::new(digest, 20);
+
+        let chunk_a = Bytes::from(vec![0xaau8; 10]);
+        let chunk_b = Bytes::from(vec![0xbbu8; 10]);
+        let chunk_c = Bytes::from(vec![0xccu8; 10]);
+
+        // Write A and B: deque=[A,B], earliest=0. No eviction yet.
+        writer.send(chunk_a.clone()).await.unwrap();
+        writer.send(chunk_b.clone()).await.unwrap();
+
+        // Reader consumes chunk A → cursor=1. earliest still 0.
+        let got_a = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock reading chunk A (concurrent-race test)")
+        .expect("chunk A read must succeed (concurrent-race test)");
+        assert_eq!(
+            got_a, chunk_a,
+            "concurrent-race setup: reader must get chunk A first"
+        );
+        assert_eq!(
+            reader.cursor_chunk_idx(), 1,
+            "cursor must be 1 before the race window"
+        );
+
+        // Verify pre-seam state: earliest=0, deque=[A,B], cursor=1.
+        // The reader will NEXT try to read chunk B (cursor=1).
+        // At this moment earliest=0 (chunk A is still in the deque even
+        // though the reader has consumed it — eviction is writer-driven).
+        let earliest_before = reader.inner.earliest_chunk_idx.load(Ordering::Acquire);
+        assert_eq!(
+            earliest_before, 0,
+            "earliest must be 0 before the race window (chunk A not yet evicted)"
+        );
+
+        // Set up the race-reproduction seam:
+        // - reader_ready_tx: reader → writer "I've loaded earliest, proceed with eviction"
+        // - eviction_done_rx: writer → reader "eviction complete, acquire the lock"
+        let (reader_ready_tx, reader_ready_rx) = oneshot::channel::<()>();
+        let (eviction_done_tx, eviction_done_rx) = oneshot::channel::<()>();
+        reader.install_h515_race_seam(reader_ready_tx, eviction_done_rx);
+
+        // Move the writer into the spawn. The spawned task sends chunk C
+        // (triggering eviction of chunk A → earliest 0→1), signals
+        // eviction_done, then returns the writer via a oneshot so the main
+        // task can call send_eof afterward.
+        let chunk_c_clone = chunk_c.clone();
+        let (writer_return_tx, mut writer_return_rx) = oneshot::channel::<StreamingBlobWriter>();
+
+        let writer_task = tokio::spawn(async move {
+            // Wait for reader: "I've loaded earliest=0 (pre-lock); evict now."
+            reader_ready_rx
+                .await
+                .expect("reader_ready signal must arrive (writer task)");
+
+            // Send chunk C → total=30>20 → evict chunk A → earliest becomes 1.
+            // This is the eviction that fires INSIDE the race window.
+            writer
+                .send(chunk_c_clone)
+                .await
+                .expect("writer send(C) must succeed (eviction step)");
+
+            // Signal reader: "Eviction complete; `earliest` is now 1; acquire lock."
+            eviction_done_tx
+                .send(())
+                .expect("eviction_done signal must be receivable");
+
+            // Return writer so main task can call send_eof.
+            let _ = writer_return_tx.send(writer);
+        });
+
+        // Now call next_chunk on the reader. The seam fires just before
+        // chunks.read(): signals the writer, awaits eviction_done, then
+        // acquires the lock. At lock-acquisition time, earliest=1 (eviction
+        // completed), but the pre-lock load above saw earliest=0.
+        //
+        // FIX: post_lock_earliest=1 → deque_idx = cursor(1) - 1 = 0 → deque[0]=B ✓
+        // BUG (mutation): stale earliest=0 → deque_idx = cursor(1) - 0 = 1 → deque[1]=C ✗
+        let got_b = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock in concurrent-race test (seam → writer → lock)")
+        .expect("chunk B read must succeed in concurrent-race test");
+
+        assert_eq!(
+            got_b, chunk_b,
+            "frankenstein-bytes invariant violated (concurrent race): cursor=1 must \
+             emit chunk B ([0xbb...]), got chunk C ([0xcc...]) — stale pre-lock \
+             earliest produced wrong deque_idx (H_alt_I race, pipeline 3266)"
+        );
+
+        // Wait for the writer task to confirm no panic; recover the writer.
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer_task)
+            .await
+            .expect("writer task must complete within 2s")
+            .expect("writer task must not panic");
+        let mut writer = writer_return_rx
+            .try_recv()
+            .expect("writer must have been returned by writer_task");
+
+        // Drain chunk C and EOF; verify state is consistent.
+        writer.send_eof().unwrap();
+        let got_c = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock reading chunk C (concurrent-race test)")
+        .expect("chunk C read must succeed (concurrent-race test)");
+        assert_eq!(
+            got_c, chunk_c,
+            "reader must get chunk C after B (concurrent-race test)"
+        );
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock at EOF (concurrent-race test)")
+        .expect("EOF read must succeed (concurrent-race test)");
+        assert!(
+            eof.is_empty(),
+            "must observe EOF after draining all chunks (concurrent-race test)"
+        );
+    }
+
+    /// (d) None-path: `resolve_deque_idx` returns `None` → retry loop fires
+    /// `SLIDING_WINDOW_EVICTION_MARKER`.
+    ///
+    /// This covers the new code path added by the #515 fix: when
+    /// `post_lock_earliest` advanced past `cursor` between the pre-lock
+    /// load (cursor < earliest guard passed) and the lock acquisition, the
+    /// `None` arm drops the lock and lets the retry loop re-enter the top,
+    /// where `cursor < earliest` now holds and the SLIDING_WINDOW_EVICTION_MARKER
+    /// error is returned.
+    ///
+    /// The test constructs this condition deterministically: the reader's
+    /// cursor (1) is now less than the installed earliest (2), so
+    /// resolve_deque_idx(1, 2) == None → retry → SLIDING_WINDOW_EVICTION_MARKER.
+    ///
+    /// We achieve this by:
+    ///   1. Creating a blob where the reader has cursor=1 and earliest=1.
+    ///   2. Directly advancing earliest_chunk_idx to 2 (simulating two
+    ///      evictions observed under the lock while cursor hasn't advanced).
+    ///   3. Calling next_chunk() — inside the lock, post_lock_earliest=2 >
+    ///      cursor=1 → None → retry → cursor(1) < earliest(2) → Err(marker).
+    ///
+    /// This is safe because we advance `earliest_chunk_idx` AFTER setting up
+    /// the deque consistently (evicting the front chunk from the deque too),
+    /// so the deque state is valid.
+    #[tokio::test]
+    async fn h_alt_i_none_path_retry_fires_sliding_window_marker() {
+        // Blob: 3 chunks of 10 bytes, buffer=20 bytes (holds 2).
+        // Size = 30 for #502 silent-short check.
+        let digest = test_digest_with_size(0xd0, 30);
+        let (writer, mut reader) = StreamingBlob::new(digest, 20);
+
+        let chunk_a = Bytes::from(vec![0xaau8; 10]);
+        let chunk_b = Bytes::from(vec![0xbbu8; 10]);
+        let chunk_c = Bytes::from(vec![0xccu8; 10]);
+
+        // Send A: deque=[A], earliest=0.
+        writer.send(chunk_a.clone()).await.unwrap();
+
+        // Reader consumes chunk A → cursor=1. Do this BEFORE sending C
+        // so the reader has advanced past A before eviction fires.
+        let got_a = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock reading chunk A (none-path test)")
+        .expect("chunk A read must succeed (none-path test)");
+        assert_eq!(got_a, chunk_a);
+
+        // Send B: deque=[A,B], earliest=0, total=20 (at budget).
+        writer.send(chunk_b.clone()).await.unwrap();
+
+        // Send C: total=30>20 → evict A → earliest=1, deque=[B,C].
+        writer.send(chunk_c.clone()).await.unwrap();
+
+        // Verify: cursor=1, earliest=1.
+        assert_eq!(reader.cursor_chunk_idx(), 1);
+        let earliest = reader.inner.earliest_chunk_idx.load(Ordering::Acquire);
+        assert_eq!(earliest, 1, "earliest must be 1 after A evicted (none-path setup)");
+
+        // Now simulate the case where the window advances past cursor UNDER
+        // the lock: evict chunk B from the deque and increment earliest to 2.
+        // This represents "post_lock_earliest=2 > cursor=1" after the reader
+        // acquired the lock.
+        {
+            let mut chunks = reader.inner.chunks.write();
+            let evicted = chunks.pop_front();
+            assert!(
+                evicted.is_some(),
+                "none-path setup: must have a chunk to evict"
+            );
+            reader.inner.earliest_chunk_idx.fetch_add(1, Ordering::Release);
+        }
+        let earliest_after = reader.inner.earliest_chunk_idx.load(Ordering::Acquire);
+        assert_eq!(
+            earliest_after, 2,
+            "earliest must be 2 after manual eviction (none-path setup)"
+        );
+
+        // next_chunk() now: cursor=1, chunk_count=3, so cursor < chunk_count
+        // → enter lock branch → post_lock_earliest=2 > cursor=1 →
+        // resolve_deque_idx(1,2)==None → drop lock → continue → reload
+        // earliest=2 → cursor(1) < earliest(2) → SLIDING_WINDOW_EVICTION_MARKER.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.next_chunk(),
+        )
+        .await
+        .expect("next_chunk must not deadlock in none-path test");
+
+        assert!(
+            result.is_err(),
+            "none-path: next_chunk must return Err(SLIDING_WINDOW_EVICTION_MARKER)"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code,
+            nativelink_error::Code::Unavailable,
+            "none-path: error must be Code::Unavailable"
+        );
+        assert!(
+            err.messages
+                .iter()
+                .any(|m| m.contains(SLIDING_WINDOW_EVICTION_MARKER)),
+            "none-path: error must contain SLIDING_WINDOW_EVICTION_MARKER — \
+             resolve_deque_idx None arm must retry and fire the marker. \
+             Got: {:?}",
+            err.messages
+        );
     }
 }

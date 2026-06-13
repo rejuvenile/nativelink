@@ -6989,31 +6989,26 @@ impl StoreDriver for FastSlowStore {
                             let bytes_already_sent = guard.get_bytes_written();
                             let new_offset = offset + bytes_already_sent;
                             let new_length = length.map(|l| l.saturating_sub(bytes_already_sent));
-                            // #515 Phase 0/0.2 empirically refuted
-                            // (audit: `.claude/audits/515-phase02-\
-                            // empirical-refutation-2026-05-17.md`):
-                            // 585 splice events post Phase 0.2 deploy,
-                            // ALL with `original_offset = 0,
-                            // original_length = None` (consumer asked
-                            // for the whole blob) and varied
-                            // `cursor_chunk_idx`, and ZERO DataLoss
-                            // events. The original frankenstein-hash
-                            // hypothesis assumed readers could be
-                            // CONSTRUCTED at cursor > 0 due to an H1
-                            // TOCTOU race; the per-reader construction
-                            // sample shows `starting_chunk_idx = 0`
-                            // for 100% of samples, so the splice
-                            // arithmetic `new_offset = offset +
-                            // bytes_already_sent` is correct — the
-                            // reader starts at cursor=0, advances as
-                            // it forwards bytes, splice continues at
-                            // the correct absolute offset. Demoted
-                            // WARN → INFO; this is benign graceful
-                            // degradation (slow reader resumes from
-                            // slow tier when it falls behind the
-                            // sliding window). Fields retained as the
-                            // baseline diagnostic; the redundant
-                            // follow-up info! has been folded in.
+                            // #515 splice: reader fell behind the sliding window
+                            // (slow-reader path: cursor < earliest at the pre-lock
+                            // guard). This path IS benign graceful degradation —
+                            // the reader fell behind eviction, FSS resumes from
+                            // the slow tier at the correct absolute offset.
+                            //
+                            // NOTE: the H_alt_I variant (reader at the eviction
+                            // BOUNDARY: cursor == earliest at the guard, eviction
+                            // fires UNDER the lock) was a real DataLoss source —
+                            // NOT benign. Production incident 2026-06-12, pipeline
+                            // 3266, digest ad96c51f. Fixed in streaming_blob.rs
+                            // (SHA 374e3cf4) by loading `post_lock_earliest` under
+                            // `chunks.read()` instead of using the pre-lock stale
+                            // `earliest`. The splice this comment annotates is the
+                            // SLOW-READER recovery path that follows H_alt_I's
+                            // `None` → retry → SLIDING_WINDOW_EVICTION_MARKER
+                            // sequence; it is still arithmetically correct because
+                            // `cursor_chunk_idx` was NOT advanced in the None arm.
+                            // See audit `.claude/audits/515-phase02-empirical-\
+                            // refutation-2026-05-17.md` (updated addendum 2026-06-12).
                             let starting_chunk_idx = reader.cursor_chunk_idx();
                             let original_offset = offset;
                             let original_length = length;
@@ -7110,17 +7105,17 @@ impl StoreDriver for FastSlowStore {
                             .iter()
                             .any(|m| m.contains(SLIDING_WINDOW_EVICTION_MARKER));
                     if is_sliding_window_eviction {
-                        // #515 Phase 0/0.2 empirically refuted (see
-                        // populator-caller branch above + audit
-                        // `.claude/audits/515-phase02-empirical-\
-                        // refutation-2026-05-17.md`). Waiter shares
-                        // the same `reader` as the populator-caller,
-                        // so its starting cursor is identical (0 per
-                        // construction-time sampling). Demoted WARN →
-                        // INFO; benign graceful degradation. Site
-                        // field retained so log analysis can
-                        // distinguish waiter vs populator-caller
-                        // splice paths.
+                        // #515 splice (waiter path): same slow-reader recovery
+                        // as the populator-caller branch above — benign graceful
+                        // degradation for the SLOW-READER case. The waiter shares
+                        // the same `reader` as the populator-caller (cursor not
+                        // advanced in the None arm), so splice arithmetic is
+                        // correct. Site field retained for log analysis.
+                        //
+                        // H_alt_I (fast-reader-at-boundary DataLoss) is FIXED in
+                        // streaming_blob.rs:374e3cf4 — this splice path is the
+                        // recovery leg AFTER that fix's retry, not a DataLoss
+                        // source. See populator-caller comment above for detail.
                         let starting_chunk_idx = reader.cursor_chunk_idx();
                         let original_offset = offset;
                         let original_length = length;
