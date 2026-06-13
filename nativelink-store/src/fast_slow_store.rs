@@ -4465,164 +4465,7 @@ impl FastSlowStore {
         ))
     }
 
-    /// Stream a file's contents to a store via a buf_channel, reading from
-    /// an independently opened file descriptor. Used by the parallel
-    /// `update_with_whole_file` path to feed data to the store that does
-    /// NOT receive the file handle (the other store gets the file for its
-    /// move/hardlink optimization). Unlike the previous `read_file_to_vec`
-    /// approach, this streams chunks directly without buffering the entire
-    /// file in memory.
-    ///
-    /// The `path` must point to the file to read. A new fd is opened from
-    /// the path to avoid sharing seek position with the original FileSlot
-    /// (try_clone shares the kernel file description, causing races).
-    async fn stream_path_to_store(
-        path: std::path::PathBuf,
-        store: &Store,
-        key: StoreKey<'_>,
-        upload_size: UploadSizeInfo,
-    ) -> Result<(), Error> {
-        let (mut tx, rx) = make_buf_channel_pair_with_size(128);
-        let write_fut = store.update(key.borrow(), rx, upload_size);
-
-        // Read in 256 KiB chunks — true streaming via an mpsc bridge.
-        // The blocking reader sends one chunk at a time through the bridge
-        // channel; blocking_send() applies backpressure so only a few
-        // chunks are in memory at once (channel capacity = 4).
-        const CHUNK_SIZE: usize = 256 * 1024;
-        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<Result<Bytes, Error>>(4);
-
-        let read_handle = tokio::task::spawn_blocking(move || {
-            use std::io::Read;
-            let mut file = match std::fs::File::open(&path) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    let _ = bridge_tx.blocking_send(Err(make_err!(
-                        Code::Internal,
-                        "Failed to open file for streaming: {:?}",
-                        e
-                    )));
-                    return;
-                }
-            };
-            loop {
-                let mut buf = vec![0u8; CHUNK_SIZE];
-                let mut filled = 0;
-                // Fill the buffer completely (or until EOF) to avoid
-                // sending many tiny trailing chunks.
-                while filled < CHUNK_SIZE {
-                    match file.read(&mut buf[filled..]) {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => {
-                            let err = make_err!(
-                                Code::Internal,
-                                "Failed to read file in stream_path_to_store: {:?}",
-                                e
-                            );
-                            // Best-effort send of error; receiver may be gone.
-                            let _ = bridge_tx.blocking_send(Err(err));
-                            return;
-                        }
-                    }
-                }
-                if filled == 0 {
-                    break; // EOF — drop bridge_tx to signal completion
-                }
-                buf.truncate(filled);
-                // blocking_send applies backpressure — blocks if the
-                // channel is full, keeping memory bounded.
-                if bridge_tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
-                    // Receiver dropped (e.g. store write failed); stop reading.
-                    return;
-                }
-            }
-            // bridge_tx is dropped here, closing the channel.
-        });
-
-        let forward_fut = async move {
-            // Run the chunk-forwarding loop, capturing any error.
-            let result = async {
-                while let Some(result) = bridge_rx.recv().await {
-                    let chunk = result?;
-                    tx.send(chunk).await.map_err(|e| {
-                        make_err!(
-                            Code::Internal,
-                            "Failed to send chunk in stream_path_to_store: {:?}",
-                            e
-                        )
-                    })?;
-                }
-                tx.send_eof()
-                    .err_tip(|| "Failed to send EOF in stream_path_to_store")?;
-                Result::<(), Error>::Ok(())
-            }
-            .await;
-            // #476 producer-IO masking fix: route any producer-side
-            // error through tx.send_error so the consumer's recv()
-            // reads the REAL, typed Error (file IO err, bridge err,
-            // chunk-send err) verbatim via terminal_error
-            // (`buf_channel.rs:614-620`). Without this, dropping tx
-            // on early-return makes the consumer's next recv()
-            // surface the synthesized `"Sender dropped before sending
-            // EOF"` Internal (`buf_channel.rs:623`) — a buf-channel
-            // symptom that masks the real producer-side root cause
-            // even after the post-#476 dual-err policy prefers
-            // write_res.
-            if let Err(ref e) = result {
-                tx.send_error(e.clone());
-            }
-            result
-        };
-
-        let (write_res, forward_res) = join!(write_fut, forward_fut);
-        // Join the blocking task to propagate panics.
-        read_handle
-            .await
-            .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
-        // #476 observability: on any dual-err (or consumer-err), prefer
-        // the consumer's error (`write_res`) — it carries the
-        // authoritative root cause (h2 reset, slow-store reject,
-        // admission, etc.). The producer's "receiver disconnected" in
-        // `forward_res` is the mechanically derived downstream symptom
-        // of the consumer dropping `rx`; surfacing it in place of the
-        // cause destroys observability (operators see the same
-        // buf-channel symptom regardless of root cause). When
-        // forward_res is Err but write_res Ok, the producer-side error
-        // is authoritative (likely a read/IO error from the
-        // spawn_blocking reader). When BOTH are Err, Option A's
-        // `tx.send_error(err.clone())` routing in `forward_fut` above
-        // has already mirrored the producer's typed err into the
-        // consumer side, so `write_res` IS authoritative — preferring
-        // it surfaces the producer root cause, not a buf-channel
-        // symptom.
-        //
-        // Why `_forward_err` is discarded on dual-err (#476 fixup v3,
-        // Option 3): under Option A's reality, the consumer's
-        // `write_res` ALREADY carries the authoritative error
-        // (producer's IO err is routed via `tx.send_error(err.clone())`
-        // → consumer's `terminal_error`). Appending `forward_err` as a
-        // diagnostic tail (the prior fixup-v1/v2 behavior) was
-        // calibrated for a pre-Option-A world where `write_res` could
-        // carry only the synthesized "Sender dropped" symptom — that
-        // world no longer exists. The fixup-v2 equality guard tried to
-        // suppress the now-misleading append, but red-team verified the
-        // guard is structurally dead in production (every leaf store's
-        // `update` chains `err_tip(...)` onto the recv result, which
-        // pushes a message to `Error.messages` and breaks the derived
-        // `PartialEq`). The clean policy: always return `write_err`,
-        // bind `forward_err` to `_` to document we observed it but
-        // intentionally drop it (it is redundant with `write_err`).
-        match (write_res, forward_res) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(write_err), Ok(())) => Err(write_err),
-            (Ok(()), Err(forward_err)) => Err(forward_err),
-            (Err(write_err), Err(_forward_err)) => Err(write_err),
-        }
-    }
-
-    /// Like [`stream_path_to_store`], but accepts an already-opened
+    /// Accepts an already-opened
     /// [`std::fs::File`] instead of a path. Use this when the caller must
     /// guarantee the fd is opened before a concurrent rename can move the
     /// file (e.g. `FilesystemStore::emplace_file` background rename).
@@ -4709,11 +4552,10 @@ impl FastSlowStore {
                 Result::<(), Error>::Ok(())
             }
             .await;
-            // #476 producer-IO masking fix: see sibling at
-            // `stream_path_to_store::forward_fut`. Route any
-            // producer-side error through tx.send_error so the
-            // consumer's recv() reads the real typed Error instead of
-            // a synthesized "Sender dropped before sending EOF".
+            // #476 producer-IO masking fix: route any producer-side
+            // error through tx.send_error so the consumer's recv()
+            // reads the real typed Error instead of a synthesized
+            // "Sender dropped before sending EOF".
             if let Err(ref e) = result {
                 tx.send_error(e.clone());
             }
@@ -4724,13 +4566,13 @@ impl FastSlowStore {
         read_handle
             .await
             .map_err(|e| make_err!(Code::Internal, "spawn_blocking join error: {:?}", e))?;
-        // #476 observability: see sibling at `stream_path_to_store` —
-        // prefer consumer (`write_res`) over producer symptom on
-        // dual-err. fixup-v3 (Option 3) drops the diagnostic append
-        // entirely: Option A's `tx.send_error` routing already mirrors
-        // the producer's typed err into `write_res`, so `forward_err`
-        // is redundant and the append text was calibrated for a
-        // pre-Option-A world. `_forward_err` documents the observation
+        // #476 observability: prefer consumer (`write_res`) over
+        // producer symptom on dual-err. fixup-v3 (Option 3) drops the
+        // diagnostic append entirely: Option A's `tx.send_error`
+        // routing already mirrors the producer's typed err into
+        // `write_res`, so `forward_err` is redundant and the append
+        // text was calibrated for a pre-Option-A world.
+        // `_forward_err` documents the observation
         // while marking the intentional discard.
         //
         // #59 instrumentation: per #56 RCA §8 rec 3, log which match-arm
@@ -5432,13 +5274,29 @@ impl StoreDriver for FastSlowStore {
             // diagnosis destroys observability for shutdown-flush
             // failures, which are exactly the cases an operator needs
             // to triage (was it the server rejecting? a transport
-            // reset? an admission gate?). Producer-side errors (channel
-            // send/eof from `send_fut`) are authoritative only when the
-            // consumer reported Ok.
+            // reset? an admission gate?).
+            //
+            // #56/#62 (Ok, Err) fix: when the consumer returns Ok, the
+            // blob is committed (or already present via AlreadyExists).
+            // A producer-side stream error after consumer Ok is a benign
+            // symptom of the receiver being dropped after the commit —
+            // NOT a failure. Routing (Ok, Err) to Err (the #512 original)
+            // caused false action failures during shutdown drain when the
+            // server already had the blob. Consumer Ok is authoritative;
+            // the producer error is swallowed and logged at info level.
             return match (write_result, send_result) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(write_err), Ok(())) => Err(write_err),
-                (Ok(()), Err(send_err)) => Err(send_err),
+                (Ok(()), Err(send_err)) => {
+                    info!(
+                        ?key,
+                        ?send_err,
+                        arm = "shutdown_flush_ok_err_swallowed",
+                        "#56/#62 FastSlowStore::update shutdown-flush: consumer Ok \
+                         — producer Err swallowed (blob already committed)",
+                    );
+                    Ok(())
+                }
                 (Err(write_err), Err(send_err)) => Err(write_err.append(format!(
                     "FastSlowStore::update shutdown-flush: consumer error \
                      preferred over producer 'receiver disconnected' symptom \
@@ -5613,12 +5471,33 @@ impl StoreDriver for FastSlowStore {
             // the surfaced error string controls whether the operator
             // sees "h2 reset" / "server rejected" / "admission denied"
             // vs. the always-same "Failed to send chunk … receiver
-            // disconnected" symptom. Producer-side errors are
-            // authoritative only when the consumer reported Ok.
+            // disconnected" symptom.
+            //
+            // #56/#62 (Ok, Err) fix: when the consumer returns Ok, the
+            // blob is committed (or already present via AlreadyExists).
+            // A producer-side stream error after consumer Ok is a benign
+            // symptom of the receiver being dropped after the commit —
+            // NOT a failure. Routing (Ok, Err) to Err (the #512 original)
+            // caused the Err-arm side-effects to fire on a committed blob:
+            //   - failed_slow_writes insert (spurious re-upload churn)
+            //   - fast_store re-pin (spurious pin-budget burn)
+            //   - error! log ("background slow write FAILED")
+            //   - slow_tier_async_fail metric increment (false metric)
+            // Consumer Ok is authoritative; the producer error is swallowed
+            // and logged at info level so it remains observable.
             let mut result = match (write_result, send_result) {
                 (Ok(()), Ok(())) => Ok(()),
                 (Err(write_err), Ok(())) => Err(write_err),
-                (Ok(()), Err(send_err)) => Err(send_err),
+                (Ok(()), Err(send_err)) => {
+                    info!(
+                        key = ?key_for_bg,
+                        ?send_err,
+                        arm = "bg_slow_write_ok_err_swallowed",
+                        "#56/#62 FastSlowStore::update background-slow-write: \
+                         consumer Ok — producer Err swallowed (blob already committed)",
+                    );
+                    Ok(())
+                }
                 (Err(write_err), Err(send_err)) => Err(write_err.append(format!(
                     "FastSlowStore::update background-slow-write: consumer \
                      error preferred over producer 'receiver disconnected' \
