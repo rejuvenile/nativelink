@@ -97,6 +97,25 @@ struct ChannelDiagSnapshot {
     sends_total: u64,
 }
 
+/// Compute the gap between the last producer send and `now_ms`, using a
+/// pre-await snapshot of `last_send_at_epoch_ms`.
+///
+/// Returns `None` when `last_send_at_epoch_ms == 0` (channel never sent),
+/// which lets callers distinguish "always-empty" from "was-active-then-silent".
+///
+/// This is a free function (not a method) so the slow-recv warn path can take
+/// a snapshot BEFORE `rx.recv().await` and compute the gap AFTER it returns —
+/// ensuring the reported gap spans the whole silent window, not the ≈0 delta
+/// measured from the send that just unblocked the recv.
+#[inline]
+fn compute_gap_since_last_send_ms(last_send_at_epoch_ms: u64, now_ms: u64) -> Option<u64> {
+    if last_send_at_epoch_ms == 0 {
+        None
+    } else {
+        Some(now_ms.saturating_sub(last_send_at_epoch_ms))
+    }
+}
+
 /// Create a channel pair that can be used to transport buffer objects around to
 /// different components. This wrapper is used because the streams give some
 /// utility like managing EOF in a more friendly way, ensure if no EOF is received
@@ -652,6 +671,14 @@ impl DropCloserReadHalf {
         } else {
             // `None` here indicates EOF, which we represent as Zero data
             let recv_start = Instant::now();
+            // Snapshot diag state BEFORE awaiting so `last_send_at_epoch_ms`
+            // reflects the last send at the moment we started blocking.
+            // If we snapshot AFTER recv() returns, the send that unblocked us
+            // has already updated the timestamp and the computed gap is ≈0
+            // regardless of how long the channel was silent (production p50=0
+            // over 39,424 events with the post-await snapshot).
+            let pre_await_last_send_ms = self.diag.last_send_at_epoch_ms.load(Ordering::Relaxed);
+            let pre_await_sends_total = self.diag.sends_total.load(Ordering::Relaxed);
             let data = self.rx.recv().await.unwrap_or(ZERO_DATA);
             let recv_elapsed = recv_start.elapsed();
             if recv_elapsed.as_secs() >= 5 {
@@ -660,14 +687,10 @@ impl DropCloserReadHalf {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or_default();
-                let gap_since_last_send_ms = if snap.last_send_at_epoch_ms == 0 {
-                    // No send ever happened on this channel — distinguish
-                    // "channel was always empty" from "channel went silent
-                    // after producing N chunks".
-                    None
-                } else {
-                    Some(now_ms.saturating_sub(snap.last_send_at_epoch_ms))
-                };
+                // Use the pre-await snapshot to report how long the channel
+                // was actually silent before the send arrived.
+                let gap_since_last_send_ms =
+                    compute_gap_since_last_send_ms(pre_await_last_send_ms, now_ms);
                 // Per-flow attribution (#94): #84 investigation found 98% of
                 // slow_producer events on workers are mirror-intake
                 // (buildcache→worker), not upload-outbound. Read the
@@ -685,7 +708,7 @@ impl DropCloserReadHalf {
                 warn!(
                     recv_ms = recv_elapsed.as_millis() as u64,
                     producer_task_id = %snap.producer_task_id.as_deref().unwrap_or("<none>"),
-                    sends_total = snap.sends_total,
+                    sends_total = pre_await_sends_total,
                     gap_since_last_send_ms = ?gap_since_last_send_ms,
                     bytes_received = self.bytes_received,
                     is_mirror_request,
@@ -1142,6 +1165,75 @@ mod diag_tests {
             observed,
             "IS_MIRROR_REQUEST.try_with inside scope(true) MUST yield true — \
              slow-producer warn cannot attribute mirror-intake without it"
+        );
+    }
+
+    /// Spec: `gap_since_last_send_ms` in the slow-producer warn MUST reflect
+    /// the producer's actual send gap as observed at the *start* of the blocked
+    /// recv, not ≈0 (the post-send delta).
+    ///
+    /// The bug (pre-fix): `snapshot()` is called AFTER `rx.recv().await`
+    /// returns; the send that unblocked recv already wrote the current
+    /// timestamp into `last_send_at_epoch_ms`, so `now_ms –
+    /// last_send_at_epoch_ms` ≈ 0 regardless of how long the channel was
+    /// silent.
+    ///
+    /// The fix: snapshot BEFORE awaiting; pass the pre-await
+    /// `last_send_at_epoch_ms` to `compute_gap_since_last_send_ms` so the
+    /// computed gap spans the whole silent window.
+    ///
+    /// This test exercises the helper directly (wall-clock path;
+    /// `tokio::time::pause` does not freeze `std::time::SystemTime`).
+    #[test]
+    fn gap_field_reflects_pre_await_snapshot_not_post_send() {
+        // Simulate: a channel that last sent at T=1000 ms (epoch).
+        let pre_send_at_ms: u64 = 1_000;
+        // "now" at the point the recv was unblocked: 6000 ms — 5 s later.
+        let now_ms_at_recv_return: u64 = 6_000;
+
+        // PRE-await snapshot (correct): gap = 6000 – 1000 = 5000 ms.
+        let gap_pre = compute_gap_since_last_send_ms(pre_send_at_ms, now_ms_at_recv_return);
+        assert_eq!(
+            gap_pre,
+            Some(5_000),
+            "gap computed from PRE-await snapshot MUST reflect the full silent window — \
+             got {gap_pre:?}, want Some(5000)"
+        );
+
+        // POST-await snapshot (buggy): after recv returns, the sender has just
+        // written `now_ms_at_recv_return` into `last_send_at_epoch_ms`.
+        // Computing with `last_send_at_epoch_ms == now_ms` yields ≈0.
+        let post_send_at_ms: u64 = now_ms_at_recv_return; // what the bug does
+        let gap_post = compute_gap_since_last_send_ms(post_send_at_ms, now_ms_at_recv_return);
+        assert_eq!(
+            gap_post,
+            Some(0),
+            "gap computed from POST-await snapshot (the pre-fix bug) yields ≈0 — \
+             got {gap_post:?}, want Some(0) to confirm we're testing the right scenario"
+        );
+
+        // The core invariant: pre-await gap MUST be > post-await gap
+        // (5000 ms gap visible only when snapshot is taken before recv).
+        assert!(
+            gap_pre.unwrap() > gap_post.unwrap(),
+            "pre-await gap ({:?}) MUST exceed post-await gap ({:?}) — \
+             snapshot ordering is the entire fix; if equal, the pre-await \
+             snapshot is not being used",
+            gap_pre,
+            gap_post,
+        );
+    }
+
+    /// Spec: `compute_gap_since_last_send_ms` returns `None` when
+    /// `last_send_at_epoch_ms == 0` (channel never sent) to distinguish
+    /// "always-empty" from "was-active-then-went-silent".
+    #[test]
+    fn gap_field_none_when_no_send_ever_happened() {
+        let gap = compute_gap_since_last_send_ms(0, 99_999);
+        assert_eq!(
+            gap, None,
+            "gap MUST be None when last_send_at_epoch_ms is 0 (channel never sent) — \
+             got {gap:?}"
         );
     }
 
