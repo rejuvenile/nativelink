@@ -97,10 +97,13 @@
 //! Coverage matrix:
 //!   * `(Ok, Ok)` — covered by other crate tests; trivial passthrough.
 //!   * `(Err, Ok)` consumer-post-EOF — `surfaces_consumer_abort_when_producer_succeeded`.
-//!   * `(Ok, Err)` producer-IO routed via Option A — collapses to
-//!     `(Err, Err)` in production (because `tx.send_error` routes the
-//!     err to `write_res`); pure `(Ok, Err)` (consumer Ok despite
-//!     producer Err) is unreachable under Option A.
+//!   * `(Ok, Err)` consumer Ok, producer Err — fixed by #56/#62; covered
+//!     by `stream_file_consumer_ok_producer_err_test.rs`. Note: this arm
+//!     IS reachable in production even under Option A's `tx.send_error`
+//!     routing, because when `tx.send(chunk)` fails due to rx drop,
+//!     `self.tx` is set to None and `tx.send_error(e.clone())` is a no-op
+//!     — the consumer has already completed. GrpcStore AlreadyExists → Ok
+//!     is the production trigger (two incidents 2026-06-12).
 //!   * `(Err, Err)` distinct halves (slow tier aborts mid-stream,
 //!     producer hits channel-closed) — `surfaces_consumer_error_over_symptom_dual_err`.
 //!   * `(Err, Err)` same payload (producer-IO routed via Option A) —

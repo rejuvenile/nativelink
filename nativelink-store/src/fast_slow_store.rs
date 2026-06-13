@@ -4768,16 +4768,23 @@ impl FastSlowStore {
                 Err(write_err)
             }
             (Ok(()), Err(forward_err)) => {
-                // #56 candidate arm — the UNIDENTIFIED mechanism that
-                // produces the production "receiver disconnected" surface.
+                // #56/#62 fix: consumer Ok is the authoritative commit
+                // signal — the blob is durable (or already present) in
+                // the store. The producer's error is a benign symptom of
+                // the receiver being dropped after the consumer completed
+                // (e.g. GrpcStore AlreadyExists → Ok, then rx drop causes
+                // "receiver disconnected" on the producer's next send).
+                // Log at info so the event stays observable in journal
+                // queries (digest + forward_err context), but return Ok.
                 info!(
                     ?key,
                     ?forward_err,
                     entry_to_join_completion_ms,
-                    arm_name = "join_ok_err",
-                    "#59 stream_file_to_store: consumer Ok but producer Err (#56 candidate)",
+                    arm_name = "join_ok_err_swallowed",
+                    "#56/#62 stream_file_to_store: consumer Ok — \
+                     producer Err swallowed (blob already committed)",
                 );
-                Err(forward_err)
+                Ok(())
             }
             (Err(write_err), Err(_forward_err)) => {
                 info!(
