@@ -293,7 +293,7 @@ impl StallGuard {
                 } = classify_stall(last_progress_nanos, now_nanos, threshold)
                 {
                     let since_progress_ms = since_progress_nanos / 1_000_000;
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "nativelink_util::stall_detector",
                         op_name = label,
                         elapsed_ms = threshold.as_millis() as u64,

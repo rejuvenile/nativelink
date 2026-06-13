@@ -564,7 +564,7 @@ async fn read_file_to_channel_std(
                 Ok(n) => {
                     let read_ms = read_start.elapsed().as_millis();
                     if read_ms > 100 {
-                        warn!(
+                        trace!(
                             read_ms,
                             bytes_read = n,
                             current_offset,

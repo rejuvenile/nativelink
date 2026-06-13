@@ -1821,7 +1821,7 @@ impl FastSlowStore {
                 let chunk_send_ms = t_chunk_send.elapsed().as_millis() as u64;
                 let max_phase_ms = recv_ms.max(fast_send_ms).max(chunk_send_ms);
                 if u128::from(max_phase_ms) >= STEP_LOG_THRESHOLD_MS {
-                    info!(
+                    debug!(
                         key = %key_dbg_for_step,
                         recv_ms,
                         fast_send_ms,
@@ -1847,7 +1847,7 @@ impl FastSlowStore {
         // pair of logs lets operators compute `commit_elapsed_ms =
         // total_elapsed_ms - admission_elapsed_ms`.
         let admission_elapsed = update_start.elapsed();
-        info!(
+        debug!(
             ?key,
             admission_elapsed_ms = admission_elapsed.as_millis() as u64,
             size_bytes = digest.size_bytes(),
@@ -2083,7 +2083,7 @@ impl FastSlowStore {
         } else {
             0
         };
-        info!(
+        debug!(
             ?key,
             elapsed_ms = data_elapsed_ms,
             admission_elapsed_ms = admission_elapsed.as_millis() as u64,
@@ -4759,7 +4759,7 @@ impl StoreDriver for FastSlowStore {
                 let in_flight = self.in_flight_slow_writes.lock();
                 let lock_acquire_ms = lock_start.elapsed().as_millis();
                 if lock_acquire_ms > 5 {
-                    warn!(
+                    debug!(
                         lock_name = "in_flight_slow_writes",
                         lock_acquire_ms,
                         key_count,
@@ -4785,7 +4785,7 @@ impl StoreDriver for FastSlowStore {
                 let chunked = self.chunked_in_flight_digests.lock();
                 let lock_acquire_ms = lock_start.elapsed().as_millis();
                 if lock_acquire_ms > 5 {
-                    warn!(
+                    debug!(
                         lock_name = "chunked_in_flight_digests",
                         lock_acquire_ms,
                         key_count,
@@ -4809,7 +4809,7 @@ impl StoreDriver for FastSlowStore {
                 let mirror = self.mirror_blobs.read();
                 let lock_acquire_ms = lock_start.elapsed().as_millis();
                 if lock_acquire_ms > 5 {
-                    warn!(
+                    debug!(
                         lock_name = "mirror_blobs",
                         lock_acquire_ms,
                         key_count,
@@ -4844,7 +4844,7 @@ impl StoreDriver for FastSlowStore {
             let in_flight = self.in_flight_slow_writes.lock();
             let lock_acquire_ms = lock_start.elapsed().as_millis();
             if lock_acquire_ms > 5 {
-                warn!(
+                debug!(
                     lock_name = "in_flight_slow_writes",
                     lock_acquire_ms,
                     key_count,
@@ -4881,7 +4881,7 @@ impl StoreDriver for FastSlowStore {
             let chunked = self.chunked_in_flight_digests.lock();
             let lock_acquire_ms = lock_start.elapsed().as_millis();
             if lock_acquire_ms > 5 {
-                warn!(
+                debug!(
                     lock_name = "chunked_in_flight_digests",
                     lock_acquire_ms,
                     key_count,
@@ -4911,7 +4911,7 @@ impl StoreDriver for FastSlowStore {
             let mirror = self.mirror_blobs.read();
             let lock_acquire_ms = lock_start.elapsed().as_millis();
             if lock_acquire_ms > 5 {
-                warn!(
+                debug!(
                     lock_name = "mirror_blobs",
                     lock_acquire_ms,
                     key_count,
@@ -5382,7 +5382,7 @@ impl StoreDriver for FastSlowStore {
         tokio::spawn(async move {
             let schedule_delay_ms = spawn_instant.elapsed().as_millis();
             if schedule_delay_ms > 100 {
-                warn!(
+                debug!(
                     key = ?key_for_bg,
                     schedule_delay_ms,
                     bytes_sent,
@@ -5753,7 +5753,7 @@ impl StoreDriver for FastSlowStore {
         tokio::spawn(async move {
             let schedule_delay_ms = spawn_instant.elapsed().as_millis();
             if schedule_delay_ms > 100 {
-                warn!(
+                debug!(
                     key = ?key_for_bg,
                     schedule_delay_ms,
                     data_len,

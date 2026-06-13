@@ -1486,7 +1486,7 @@ impl WorkerConnection {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_micros() as u64)
                     .unwrap_or(0);
-                info!(
+                debug!(
                     tag = "phase6_scheduler_complete_recv",
                     op_id_n = %operation_id,
                     recv_at_us = phase6_recv_at_us,

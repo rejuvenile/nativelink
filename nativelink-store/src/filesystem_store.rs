@@ -1226,7 +1226,7 @@ impl<Fe: FileEntry> FilesystemStore<Fe> {
 
         let total_ms = write_ms + emplace_ms;
         if total_ms > 100 {
-            warn!(
+            debug!(
                 key = %final_key.as_str(),
                 total_ms,
                 write_ms,
@@ -2154,7 +2154,7 @@ impl<Fe: FileEntry> StoreDriver for FilesystemStore<Fe> {
 
         let total_ms = update_total_start.elapsed().as_millis();
         if total_ms > 100 {
-            warn!(
+            debug!(
                 key = %key.as_str(),
                 total_ms,
                 temp_create_ms,

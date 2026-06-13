@@ -222,7 +222,7 @@ impl DropCloserWriteHalf {
         let result = tx.send(buf).await;
         let send_elapsed = send_start.elapsed();
         if send_elapsed.as_secs() >= 1 {
-            warn!(
+            debug!(
                 send_ms = send_elapsed.as_millis() as u64,
                 buf_len = buf_len,
                 "buf_channel::send: channel backpressure (>1s wait)",
@@ -705,17 +705,37 @@ impl DropCloserReadHalf {
                     crate::store_trait::IS_WORKER_REQUEST.try_with(|m| *m).unwrap_or(false);
                 let is_ac_peer_fetch =
                     crate::store_trait::IS_AC_PEER_FETCH.try_with(|m| *m).unwrap_or(false);
-                warn!(
-                    recv_ms = recv_elapsed.as_millis() as u64,
-                    producer_task_id = %snap.producer_task_id.as_deref().unwrap_or("<none>"),
-                    sends_total = pre_await_sends_total,
-                    gap_since_last_send_ms = ?gap_since_last_send_ms,
-                    bytes_received = self.bytes_received,
-                    is_mirror_request,
-                    is_worker_request,
-                    is_ac_peer_fetch,
-                    "buf_channel::recv: slow producer (>5s wait)",
-                );
+                // 39,424 slow-producer events/12h were all >5s but <60s
+                // and are normal backpressure under load. Demote to debug for
+                // the common case; keep warn only when the wait or gap is
+                // ≥60s (genuinely stuck producer).
+                let gap_secs = gap_since_last_send_ms.unwrap_or(0) / 1000;
+                let is_severe = recv_elapsed.as_secs() >= 60 || gap_secs >= 60;
+                if is_severe {
+                    warn!(
+                        recv_ms = recv_elapsed.as_millis() as u64,
+                        producer_task_id = %snap.producer_task_id.as_deref().unwrap_or("<none>"),
+                        sends_total = pre_await_sends_total,
+                        gap_since_last_send_ms = ?gap_since_last_send_ms,
+                        bytes_received = self.bytes_received,
+                        is_mirror_request,
+                        is_worker_request,
+                        is_ac_peer_fetch,
+                        "buf_channel::recv: slow producer (>5s wait)",
+                    );
+                } else {
+                    debug!(
+                        recv_ms = recv_elapsed.as_millis() as u64,
+                        producer_task_id = %snap.producer_task_id.as_deref().unwrap_or("<none>"),
+                        sends_total = pre_await_sends_total,
+                        gap_since_last_send_ms = ?gap_since_last_send_ms,
+                        bytes_received = self.bytes_received,
+                        is_mirror_request,
+                        is_worker_request,
+                        is_ac_peer_fetch,
+                        "buf_channel::recv: slow producer (>5s wait)",
+                    );
+                }
             }
             self.recv_inner(data)
         }
@@ -976,7 +996,7 @@ impl Drop for DropCloserReadHalf {
         // Mid-stream drop. Snapshot diag state so the operator can
         // attribute the failure to a specific producer task.
         let snap = self.diag.snapshot();
-        warn!(
+        debug!(
             target: "buf_channel::receiver_dropped_mid_stream",
             bytes_received = self.bytes_received,
             bytes_queued_locally = self.queued_data.len(),

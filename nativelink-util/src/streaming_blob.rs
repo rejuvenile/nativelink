@@ -1451,7 +1451,7 @@ impl StreamingBlobReader {
                 self.inner
                     .notify_waits_over_5s
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(
+                debug!(
                     digest = %self.inner.digest,
                     wait_ms = wait_elapsed.as_millis() as u64,
                     terminal_present,

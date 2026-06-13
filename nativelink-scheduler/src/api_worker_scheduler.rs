@@ -1255,7 +1255,7 @@ impl ApiWorkerSchedulerImpl {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
-        info!(
+        debug!(
             tag = "phase6_scheduler_dispatch",
             op_id_n_plus_1 = %operation_id,
             worker_id = ?worker_id,
@@ -1924,7 +1924,7 @@ impl ApiWorkerScheduler {
         // endpoints) and HashMap<Arc<str>, ...> that previously consumed
         // ~61% of scheduler CPU during active builds.
         let input_root_digest = action_info.inner.input_root_digest;
-        info!(
+        debug!(
             has_tree = resolved_tree.is_some(),
             has_locality_map = self.locality_map.is_some(),
             %input_root_digest,
@@ -2376,7 +2376,7 @@ impl ApiWorkerScheduler {
                 // resolution_guard fires here, releasing the in-progress flag.
                 drop(resolution_guard);
                 let entry_bytes = resolved.estimated_heap_bytes();
-                info!(
+                debug!(
                     %input_root_digest,
                     file_count = resolved.file_digests.len(),
                     dir_count = resolved.dir_digests.len(),
@@ -2389,7 +2389,7 @@ impl ApiWorkerScheduler {
                 cache.put(input_root_digest, Arc::clone(&arc));
                 let evicted = before_count.saturating_sub(cache.len().saturating_sub(1));
                 if evicted > 0 {
-                    info!(
+                    debug!(
                         evicted,
                         cache_entries = cache.len(),
                         cache_bytes = cache.total_bytes(),
@@ -2635,7 +2635,7 @@ impl ApiWorkerScheduler {
             .prefetch_tasks_spawned
             .fetch_add(1, Ordering::Relaxed);
 
-        info!(
+        debug!(
             %operation_id,
             worker_endpoint = %endpoint_str,
             blob_count,
@@ -2814,7 +2814,7 @@ impl ApiWorkerScheduler {
                 .fetch_add(batches_sent, Ordering::Relaxed);
 
             let elapsed = start.elapsed();
-            info!(
+            debug!(
                 %operation_id,
                 worker_endpoint = %endpoint_str,
                 blob_count,
@@ -3748,7 +3748,7 @@ async fn resolve_tree_from_cas(
                         });
                     let fetch_elapsed = fetch_start.elapsed();
                     if fetch_elapsed >= SLOW_DIR_FETCH_THRESHOLD {
-                        warn!(
+                        debug!(
                             target: "nativelink::tree_resolution",
                             %dir_digest,
                             elapsed_ms = fetch_elapsed.as_millis() as u64,

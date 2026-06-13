@@ -843,7 +843,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         if self.log_not_found_at_info {
             if let Err(ref err) = result {
                 if err.code == Code::NotFound {
-                    info!(
+                    debug!(
                         ?digest,
                         "ExistenceCacheStore::get_part: returning NotFound to caller",
                     );

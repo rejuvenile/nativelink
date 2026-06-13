@@ -1008,7 +1008,7 @@ impl CasServer {
             );
 
             if level_elapsed_ms > 100 {
-                warn!(
+                debug!(
                     ?root_digest,
                     bfs_level,
                     dirs_in_level = level.len(),
@@ -1055,7 +1055,7 @@ impl CasServer {
                 "GetTree: resolved directory tree (partial — some directories missing)",
             );
         } else {
-            info!(
+            debug!(
                 ?root_digest,
                 dir_count = directories.len(),
                 total_bytes,

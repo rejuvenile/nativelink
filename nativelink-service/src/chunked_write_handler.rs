@@ -1005,7 +1005,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         let peer_addr = request
             .remote_addr()
             .map_or_else(|| "unknown".to_string(), |a| a.to_string());
-        info!(
+        debug!(
             target: "nativelink_service::chunked_write_handler",
             writer_path = "server_v1_rpc",
             wire_shape = "v1",
@@ -1308,7 +1308,7 @@ impl<Fe: FileEntry> ChunkedWriteHandler<Fe> {
         // to Option C reader-waits as a result). Tag with
         // `registry = "handler_local_in_flight"` so a journal scan
         // distinguishes the two registries.
-        info!(
+        debug!(
             target: "nativelink_service::chunked_write_handler",
             writer_path = "server_v1_handler_local",
             registry = "handler_local_in_flight",
@@ -2894,7 +2894,7 @@ pub async fn run_async_commit_reaper<Fe: FileEntry>(
             metrics
                 .chunks_committed_total
                 .fetch_add(1, Ordering::Relaxed);
-            info!(
+            debug!(
                 ?stream_digest,
                 committed_size = r.committed_size,
                 mode = mode_label,
@@ -3063,7 +3063,7 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     // handler-local map (NOT the FSS-level chunked_in_flight_digests).
     // Caller identity is logged separately at the dispatcher entry; this
     // event flags the shared-fn insertion that follows.
-    info!(
+    debug!(
         target: "nativelink_service::chunked_write_handler",
         writer_path = "shared_dispatch_chunks_to_driver",
         registry = "handler_local_in_flight",
@@ -3113,7 +3113,7 @@ pub async fn dispatch_chunks_to_driver<Fe: FileEntry>(
     // quiet log is ambiguous: probe disarmed, threshold never crossed,
     // or this code path not reached at all? `info!` (not `debug!`)
     // because the production deployment runs at info level.
-    info!(
+    debug!(
         target: "nativelink_service::chunked_write_handler",
         ?digest,
         "producer-arrival probe armed (#394/#413 Phase 1)",
@@ -3817,7 +3817,7 @@ impl InFlightChunkedGuard {
         // Fires at chunked-blob admission cadence (~1142/h in production
         // at the time of writing); safely below the 1073-lines/sec OOM
         // threshold flagged in #253.
-        info!(
+        debug!(
             target: "nativelink_service::chunked_write_handler",
             writer_path = caller,
             registry = "fss_chunked_in_flight_digests",
@@ -3874,7 +3874,7 @@ impl Drop for InFlightChunkedGuard {
             // confirm the hand-off occurred (paired with the
             // `chunked_in_flight registered` info!). `outcome="disarm"`
             // distinguishes from refcount-drop removals.
-            info!(
+            debug!(
                 target: "nativelink_service::chunked_write_handler",
                 writer_path = self.caller,
                 registry = "fss_chunked_in_flight_digests",
@@ -3931,7 +3931,7 @@ impl Drop for InFlightChunkedGuard {
         // Search marker: `chunked_in_flight removed`. `outcome` field
         // distinguishes refcount-drop from disarm; `duration_ms`
         // bounds how long this writer kept the digest in the FSS set.
-        info!(
+        debug!(
             target: "nativelink_service::chunked_write_handler",
             writer_path = self.caller,
             registry = "fss_chunked_in_flight_digests",

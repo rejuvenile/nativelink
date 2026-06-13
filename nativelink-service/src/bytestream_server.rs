@@ -603,7 +603,7 @@ impl LoggingReadStream {
         // affected download.
         let slow_completion = elapsed_ms > 5000 && effective_rate_kbps < 1000 && status == "ok";
         if slow_completion {
-            warn!(
+            debug!(
                 target: "nativelink_service::bytestream",
                 label = self.label,
                 digest = %self.digest,
@@ -645,7 +645,7 @@ impl LoggingReadStream {
                  mismatch (see #500)",
             );
         }
-        info!(
+        debug!(
             target: "nativelink_service::bytestream",
             label = self.label,
             digest = %self.digest,
@@ -2145,7 +2145,7 @@ impl ByteStreamServer {
                             }
                             Err(TrySendError::Closed(_)) => {
                                 // Worker disconnected mid-stream; stop mirroring.
-                                warn!("mirror channel closed, dropping mirror");
+                                debug!("mirror channel closed, dropping mirror");
                                 *mirror_tx = None;
                             }
                         }
@@ -3083,7 +3083,7 @@ impl ByteStreamServer {
             // bytes transferred and #59 logs (Ok, Err) on a digest the
             // server short-circuited here, that maps to a producer
             // that never got its EOF acknowledged.
-            info!(
+            debug!(
                 %digest,
                 committed_size = expected_size as i64,
                 expected_size,
