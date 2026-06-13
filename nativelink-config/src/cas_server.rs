@@ -1077,6 +1077,36 @@ pub struct LocalWorkerConfig {
     /// Default: 0 (uses built-in default of 60s).
     #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
     pub bis_ack_timeout_secs: u64,
+
+    /// F2 kill-switch: defer worker output-blob uploads off the action-completion
+    /// critical path.
+    ///
+    /// When `false` (default): `inner_upload_results` writes outputs through the
+    /// full `FastSlowStore` (fast + slow / remote CAS) synchronously before
+    /// `execution_response` is sent. This is the current behavior.
+    ///
+    /// When `true`: `inner_upload_results` writes outputs to the worker's local
+    /// fast store (`FilesystemStore`) only. The remote CAS upload is deferred to
+    /// `spawn_upload_to_remote`, which runs AFTER `execution_complete` frees the
+    /// worker slot. Completion is gated only on the local disk write (~1ms),
+    /// reducing action completion latency by p50≈152ms / p99≈720ms.
+    ///
+    /// Safety: outputs are pinned in the local FilesystemStore immediately after
+    /// write (preventing LRU eviction until BIS-ack). The server's locality map is
+    /// populated via `BlobsAvailable` (sent before `execution_response`) so Bazel
+    /// can read outputs via `WorkerProxyStore` peer-fetch. The H4 pending-registry
+    /// (#12) rescues CCS completeness checks during the upload window.
+    ///
+    /// Prerequisite machinery: #129 BlobsAvailable ordering, #549/#551 pin budget,
+    /// `spawn_upload_to_remote` with retries, `UploadMissingBlobs` backfill, and
+    /// #12 H4 pending-output-locality-registry must all be live before enabling.
+    ///
+    /// See `.claude/audits/f2-deferred-output-uploads-design-2026-06-12.md` for
+    /// the full durability analysis and rollout plan.
+    ///
+    /// Default: false (synchronous behavior; default-OFF kill-switch).
+    #[serde(default)]
+    pub deferred_output_uploads_enabled: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

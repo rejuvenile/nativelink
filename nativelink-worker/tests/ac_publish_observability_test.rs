@@ -164,6 +164,7 @@ async fn build_manager() -> (
         bis_ack_timeout: Duration::from_secs(60),
         metrics: Some(metrics.clone()),
         cas_endpoint: String::new(),
+        deferred_output_uploads_enabled: false,
     };
     let manager = Arc::new(RunningActionsManagerImpl::new(args).expect("manager build"));
     (manager, metrics, mirror_target)
@@ -620,6 +621,7 @@ async fn build_manager_with_ac_fss(
         bis_ack_timeout: Duration::from_secs(60),
         metrics: Some(metrics.clone()),
         cas_endpoint: String::new(),
+        deferred_output_uploads_enabled: false,
     };
     let manager = Arc::new(RunningActionsManagerImpl::new(args).expect("manager build"));
     (manager, mirror_target)
@@ -856,6 +858,7 @@ async fn t7_cas_endpoint_stored_in_upload_action_results() -> Result<(), Box<dyn
         bis_ack_timeout: Duration::from_secs(60),
         metrics: Some(metrics.clone()),
         cas_endpoint: TEST_ENDPOINT.to_string(),
+        deferred_output_uploads_enabled: false,
     };
     let manager = RunningActionsManagerImpl::new(args).expect("manager build");
 

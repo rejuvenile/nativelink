@@ -16,8 +16,9 @@ use serial_test::serial;
 
 #[serial]
 mod tests {
+    use core::pin::Pin;
     use core::str::from_utf8;
-    use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
     #[cfg(target_family = "unix")]
     use core::task::Poll;
     use core::time::Duration;
@@ -30,9 +31,13 @@ mod tests {
     use std::sync::{Arc, LazyLock, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+    use async_trait::async_trait;
     use bytes::Bytes;
     use futures::prelude::*;
     use nativelink_config::cas_server::EnvironmentSource;
+    use nativelink_metric::{
+        MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+    };
     use nativelink_config::stores::{
         FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
     };
@@ -60,9 +65,14 @@ mod tests {
     use nativelink_util::action_messages::{
         ActionResult, ExecutionMetadata, FileInfo, NameOrPath, OperationId,
     };
+    use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
     use nativelink_util::common::{DigestInfo, fs};
     use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc};
-    use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
+    use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
+    use nativelink_util::store_trait::{
+        ItemCallback, MarkStableDelegation, PinDelegation, StableDigestDelegation, Store,
+        StoreDriver, StoreKey, StoreLike, StoreOptimizations, UploadSizeInfo,
+    };
     use nativelink_worker::local_worker::AcMirrorTarget;
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, RunningAction, RunningActionImpl, RunningActionsManager,
@@ -71,7 +81,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use prost::Message;
     use rand::Rng;
-    use tokio::sync::oneshot;
+    use tokio::sync::{Notify, oneshot};
 
     const DEFAULT_MAX_UPLOAD_TIMEOUT: u64 = 600;
 
@@ -991,6 +1001,7 @@ mod tests {
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1122,6 +1133,7 @@ mod tests {
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1255,6 +1267,7 @@ mod tests {
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1444,6 +1457,7 @@ mod tests {
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1634,6 +1648,7 @@ mod tests {
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1850,6 +1865,7 @@ mod tests {
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -1993,6 +2009,7 @@ mod tests {
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         #[cfg(target_family = "unix")]
@@ -2204,6 +2221,7 @@ exit 0
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2388,6 +2406,7 @@ exit 0
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
         #[cfg(target_family = "unix")]
         let arguments = vec!["printf".to_string(), EXPECTED_STDOUT.to_string()];
@@ -2566,6 +2585,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
         let arguments = vec!["true".to_string()];
         let command = Command {
@@ -2658,6 +2678,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2738,6 +2759,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2824,6 +2846,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2931,6 +2954,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -2982,6 +3006,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3055,6 +3080,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         let action_digest = DigestInfo::new([2u8; 32], 32);
@@ -3179,6 +3205,7 @@ exit 1
                     bis_ack_timeout: Duration::from_secs(60),
                     metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3274,6 +3301,7 @@ exit 1
                     bis_ack_timeout: Duration::from_secs(60),
                     metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3369,6 +3397,7 @@ exit 1
                     bis_ack_timeout: Duration::from_secs(60),
                     metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
                 },
                 Callbacks {
                     now_fn: test_monotonic_clock,
@@ -3461,6 +3490,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3623,6 +3653,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3808,6 +3839,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -3913,6 +3945,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
         let queued_timestamp = make_system_time(1000);
 
@@ -4035,6 +4068,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4223,6 +4257,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -4351,6 +4386,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         // Create a simple action
@@ -4500,6 +4536,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         // Create a simple action
@@ -5385,6 +5422,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             },
             Callbacks {
                 now_fn: test_monotonic_clock,
@@ -5582,6 +5620,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         let action_digest = DigestInfo::new([0xACu8; 32], 32);
@@ -5748,6 +5787,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         const N_TREES: usize = 5;
@@ -5832,6 +5872,7 @@ exit 1
                 bis_ack_timeout: Duration::from_secs(60),
                 metrics: None,
                 cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
             })?);
 
         // Use larger trees so each decode has a measurable cost. 64
@@ -5911,6 +5952,565 @@ exit 1
              FuturesUnordered concurrency contract violated. \
              parallel_median={parallel_median:?} sequential_total={sequential_total:?}",
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // F2: deferred_output_uploads_enabled kill-switch tests
+    //
+    // These two tests exercise both states of the kill-switch introduced by
+    // commit worktree-agent-af6887b4d19344d5e (F2 task).
+    //
+    // `BlockingFakeSlowStore` — a `StoreDriver` whose `update()` and
+    // `update_with_whole_file()` park indefinitely until `release()` is
+    // called.  This makes it possible to assert that `upload_results`
+    // either completes without waiting (deferred=true) or blocks until the
+    // slow tier is released (deferred=false).
+    // -----------------------------------------------------------------------
+
+    struct BlockingFakeSlowStore {
+        inner: Arc<MemoryStore>,
+        /// Notified (permit-1) each time `update()` is entered and starts
+        /// blocking. Used in tests to confirm the slow store is actually
+        /// being awaited before asserting `task.is_finished() == false`.
+        entered: Notify,
+        gate: Notify,
+        block_updates: AtomicBool,
+        update_attempts: AtomicUsize,
+    }
+
+    impl BlockingFakeSlowStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryStore::new(&Default::default()),
+                entered: Notify::new(),
+                gate: Notify::new(),
+                block_updates: AtomicBool::new(true),
+                update_attempts: AtomicUsize::new(0),
+            })
+        }
+
+        fn release(&self) {
+            self.block_updates.store(false, Ordering::SeqCst);
+            // notify_waiters wakes ALL currently parked waiters in one
+            // call (versus notify_one which would require N calls for N
+            // waiters and risks deadlock if call ordering varies).
+            self.gate.notify_waiters();
+        }
+
+        fn update_attempts_count(&self) -> usize {
+            self.update_attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MetricsComponent for BlockingFakeSlowStore {
+        fn publish(
+            &self,
+            _kind: MetricKind,
+            _field_metadata: MetricFieldData,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[async_trait]
+    impl StoreDriver for BlockingFakeSlowStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            keys: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .has_with_results(keys, results)
+                .await
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            reader: DropCloserReadHalf,
+            size_info: UploadSizeInfo,
+        ) -> Result<(), Error> {
+            self.update_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.block_updates.load(Ordering::SeqCst) {
+                // Signal the test that we have been entered and are about
+                // to block. This allows the test to confirm the slow store
+                // is actually being awaited without relying on time-based
+                // polling (which suffers from timer-starvation in tokio's
+                // current-thread runtime under tight yield loops).
+                self.entered.notify_one();
+                // Park indefinitely — this is the hook that proves whether
+                // upload_results waits on the slow store or not.
+                self.gate.notified().await;
+            }
+            Pin::new(self.inner.as_ref())
+                .update(key, reader, size_info)
+                .await
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            writer: &mut DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .get_part(key, writer, offset, length)
+                .await
+        }
+
+        fn inner_store(&self, _key: Option<StoreKey<'_>>) -> &dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+
+        fn optimized_for(&self, _optimization: StoreOptimizations) -> bool {
+            false
+        }
+    }
+
+    default_health_status_indicator!(BlockingFakeSlowStore);
+
+    /// Build a real `FastSlowStore` (FilesystemStore fast + BlockingFakeSlowStore
+    /// slow) so we can control when the slow tier becomes available.
+    async fn setup_stores_with_blocking_slow() -> Result<
+        (
+            Arc<FilesystemStore>,
+            Arc<BlockingFakeSlowStore>,
+            Arc<FastSlowStore>,
+            Arc<MemoryStore>,
+        ),
+        Error,
+    > {
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("content_path_blocking"),
+            temp_path: make_temp_path("temp_path_blocking"),
+            eviction_policy: None,
+            ..Default::default()
+        };
+        let fast_store = FilesystemStore::new(&fast_config).await?;
+        let slow_store = BlockingFakeSlowStore::new();
+        let ac_store = MemoryStore::new(&Default::default());
+        let cas_store = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(Default::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+                // BlockingFakeSlowStore.requires_in_flight_buffer_cap() == false
+                // (default), so 0 is valid here.
+                slow_writes_in_flight_max_bytes: 0,
+            },
+            Store::new(fast_store.clone()),
+            Store::new(slow_store.clone()),
+        );
+        Ok((fast_store, slow_store, cas_store, ac_store))
+    }
+
+    /// F2 kill-switch ENABLED: `upload_results` must complete without
+    /// waiting for the remote slow store.
+    ///
+    /// The slow store blocks all `update()` calls until `release()`.
+    /// Under `deferred_output_uploads_enabled = true`, `upload_results`
+    /// writes to the fast store only and returns immediately — the slow
+    /// store gate is never reached.
+    ///
+    /// Mutation-verify: set `deferred_output_uploads_enabled: true` →
+    /// `false` in the manager constructor. `upload_results` now goes
+    /// through `FastSlowStore::update_with_whole_file` which calls
+    /// `join!(slow_fut, fast_fut)`, parking on the still-blocked
+    /// `BlockingFakeSlowStore`. The outer `tokio::time::timeout(FAST_DEADLINE)`
+    /// fires with "F2 kill-switch ENABLED: upload_results must not block on
+    /// the remote slow store — deferred contract violated".
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn deferred_upload_enabled_completes_before_slow_store()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "deferred_enabled_worker";
+        // Generous enough to not flap in CI, tight enough to catch a
+        // regression where upload_results waits on the blocked slow store.
+        const FAST_DEADLINE: Duration = Duration::from_secs(10);
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (fast_store, slow_store, cas_store, ac_store) =
+            setup_stores_with_blocking_slow().await?;
+        let root_action_directory = make_temp_path("root_action_directory_deferred_enabled");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        // Slow store starts blocked — release() is never called in this
+        // test; if upload_results waits for it, the outer timeout fires.
+        assert!(
+            slow_store.block_updates.load(Ordering::SeqCst),
+            "fixture invariant: slow store must start blocked"
+        );
+
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+                RunningActionsManagerArgs {
+                    root_action_directory,
+                    execution_configuration: ExecutionConfiguration::default(),
+                    cas_store: cas_store.clone(),
+                    ac_store: Some(Store::new(ac_store.clone())),
+                    ac_mirror_target: None,
+                    historical_store: Store::new(cas_store.clone()),
+                    upload_action_result_config:
+                        &nativelink_config::cas_server::UploadActionResultConfig {
+                            upload_ac_results_strategy:
+                                nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                            ..Default::default()
+                        },
+                    max_action_timeout: Duration::MAX,
+                    max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                    timeout_handled_externally: false,
+                    directory_cache: None,
+                    bis_ack_timeout: Duration::from_secs(60),
+                    metrics: None,
+                    cas_endpoint: String::new(),
+                    // F2 kill-switch ON: deferred path — write fast store
+                    // only, do not wait for slow store.
+                    deferred_output_uploads_enabled: true,
+                },
+                Callbacks {
+                    now_fn: test_monotonic_clock,
+                    sleep_fn: |_duration| Box::pin(future::pending()),
+                },
+            )?);
+
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'deferred-content' > ./out.txt".to_string(),
+            ],
+            output_paths: vec!["out.txt".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        // Drive the action through prepare + execute + upload_results.
+        // The outer timeout IS the test assertion — if upload_results
+        // blocks on the slow store (regression), it fires first with the
+        // bespoke "deferred contract violated" message.
+        let action_result = tokio::time::timeout(FAST_DEADLINE, async {
+            running_action_impl
+                .clone()
+                .prepare_action()
+                .await?
+                .execute()
+                .await?
+                .upload_results()
+                .await?
+                .get_finished_result()
+                .await
+        })
+        .await
+        .expect(
+            "F2 kill-switch ENABLED: upload_results must not block on the \
+             remote slow store — deferred contract violated",
+        )?;
+
+        // Verify the output blob landed in the fast store (FilesystemStore).
+        // This proves that deferred mode actually wrote something locally,
+        // not that it silently skipped the upload entirely.
+        assert_eq!(
+            action_result.output_files.len(),
+            1,
+            "expected exactly one output file"
+        );
+        let output_digest = action_result.output_files[0].digest;
+        let key: StoreKey<'_> = output_digest.into();
+        let has_in_fast = tokio::time::timeout(
+            Duration::from_secs(5),
+            fast_store.as_ref().has(key),
+        )
+        .await
+        .expect("fast-store has() must not hang — FilesystemStore index contract violated")?;
+        assert!(
+            has_in_fast.is_some(),
+            "F2 deferred path: output blob must be present in the fast store \
+             (FilesystemStore) immediately after upload_results — \
+             fast-write skipped or indexed incorrectly"
+        );
+
+        running_action_impl.cleanup().await?;
+        Ok(())
+    }
+
+    /// F2 kill-switch DISABLED: `upload_results` must block on the slow
+    /// store (via `FastSlowStore::update_with_whole_file`'s `join!`) and
+    /// not complete until the slow tier is released.
+    ///
+    /// This guards against accidental default change: if someone sets
+    /// `deferred_output_uploads_enabled` to `true` by default, the slow
+    /// store is bypassed and `upload_results` completes before the slow
+    /// store is entered — the `update_attempts_count() > 0` timeout fires
+    /// with the bespoke "slow store was never entered" message, proving the
+    /// synchronous path was skipped.
+    ///
+    /// The test spawns `upload_results()` in a background task so the
+    /// main test can detect blocking without consuming the `executed` Arc:
+    /// 1. Capture baseline `before_count = update_attempts_count()`.
+    /// 2. Spawn task → task parks on `BlockingFakeSlowStore.gate.notified()`.
+    /// 3. Wait until `update_attempts_count() > before_count` (using
+    ///    `tokio::time::sleep(1ms)` between checks to avoid timer starvation).
+    ///    Then assert `task.is_finished() == false`.
+    /// 4. Release slow store → task unblocks and completes.
+    ///
+    /// Mutation-verify: set `deferred_output_uploads_enabled: false` →
+    /// `true` in the manager constructor. In deferred mode, `upload_results`
+    /// writes the fast store only and returns immediately — the slow store's
+    /// `update()` is never called by the task, so `update_attempts_count()`
+    /// stays at `before_count`. The `tokio::time::timeout(SHORT_DEADLINE, ...)`
+    /// fires with bespoke message "F2 kill-switch DISABLED: slow store was
+    /// never entered within SHORT_DEADLINE — synchronous upload path not
+    /// reached; default changed to deferred?".
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn deferred_upload_disabled_blocks_on_slow_store()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "deferred_disabled_worker";
+        // Short deadline: if upload_results completes before this, the
+        // synchronous invariant is violated.
+        const SHORT_DEADLINE: Duration = Duration::from_millis(500);
+        // Long deadline for the release path: after releasing the slow
+        // store, upload_results must complete within this.
+        const LONG_DEADLINE: Duration = Duration::from_secs(15);
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_fast_store, slow_store, cas_store, ac_store) =
+            setup_stores_with_blocking_slow().await?;
+        let root_action_directory = make_temp_path("root_action_directory_deferred_disabled");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+                RunningActionsManagerArgs {
+                    root_action_directory,
+                    execution_configuration: ExecutionConfiguration::default(),
+                    cas_store: cas_store.clone(),
+                    ac_store: Some(Store::new(ac_store.clone())),
+                    ac_mirror_target: None,
+                    historical_store: Store::new(cas_store.clone()),
+                    upload_action_result_config:
+                        &nativelink_config::cas_server::UploadActionResultConfig {
+                            upload_ac_results_strategy:
+                                nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                            ..Default::default()
+                        },
+                    max_action_timeout: Duration::MAX,
+                    max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                    timeout_handled_externally: false,
+                    directory_cache: None,
+                    bis_ack_timeout: Duration::from_secs(60),
+                    metrics: None,
+                    cas_endpoint: String::new(),
+                    // F2 kill-switch OFF: synchronous path — upload_results
+                    // blocks until the slow store accepts the write.
+                    deferred_output_uploads_enabled: false,
+                },
+                Callbacks {
+                    now_fn: test_monotonic_clock,
+                    sleep_fn: |_duration| Box::pin(future::pending()),
+                },
+            )?);
+
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'sync-content' > ./out.txt".to_string(),
+            ],
+            output_paths: vec!["out.txt".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        let prepared = running_action_impl.clone().prepare_action().await?;
+        let executed = prepared.execute().await?;
+
+        // Capture how many times the slow store has already been called
+        // by the FSS background writes from the test setup (uploading
+        // command/action protos). The task assertion waits for the count
+        // to EXCEED this baseline, proving `upload_results` itself entered
+        // the slow store.
+        let before_count = slow_store.update_attempts_count();
+
+        // Spawn upload_results into a background task so we can race it
+        // against the blocking slow store without consuming `executed`.
+        // The blocking store's `gate.notified()` parks this task until
+        // `release()` is called.
+        let task = tokio::spawn(async move { executed.upload_results().await });
+
+        // --- Phase 1: assert blocking ---
+        // Wait until the slow store has been entered by `upload_results`
+        // (count > before_count). Use `tokio::time::sleep` (a real timer
+        // sleep) between checks to avoid timer starvation in tokio's
+        // current-thread runtime — unlike `yield_now()`, `sleep(1ms)`
+        // actually advances the timer wheel.
+        //
+        // In the mutation case (deferred=true), `upload_results` writes the
+        // fast store only — `update()` is never called by the task — so
+        // the count stays at `before_count`. The `tokio::time::timeout`
+        // fires and the `.expect(...)` panics with the bespoke message.
+        tokio::time::timeout(SHORT_DEADLINE, async {
+            loop {
+                if slow_store.update_attempts_count() > before_count {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect(
+            "F2 kill-switch DISABLED: slow store was never entered within \
+             SHORT_DEADLINE — synchronous upload path not reached; \
+             default changed to deferred?",
+        );
+        assert!(
+            !task.is_finished(),
+            "F2 kill-switch DISABLED: upload_results must NOT complete while \
+             slow store is still blocked — synchronous contract violated; \
+             default changed to deferred?"
+        );
+
+        // --- Phase 2: release and verify completion ---
+        // Unblock the slow store; upload_results must now complete.
+        slow_store.release();
+        tokio::time::timeout(LONG_DEADLINE, task)
+            .await
+            .expect(
+                "F2 kill-switch DISABLED: upload_results must complete after \
+                 slow store is released — wedged or deadlocked after release",
+            )
+            .expect("task join error")?;
+
+        running_action_impl.cleanup().await?;
         Ok(())
     }
 }

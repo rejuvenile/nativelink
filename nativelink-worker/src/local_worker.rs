@@ -2897,9 +2897,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                         // debug builds.
                                         Box::pin(action.clone().prepare_action())
                                             .and_then(|a| Box::pin(RunningAction::execute(a)))
-                                            // upload_results now only uploads to the local fast store
-                                            // (FilesystemStore). The remote CAS upload is deferred to
-                                            // the background after the result is reported.
+                                            // upload_results uploads outputs synchronously by default
+                                            // (full FastSlowStore, both fast and slow stores). When the
+                                            // F2 deferred_output_uploads_enabled kill-switch is ON, it
+                                            // writes to the local fast store only; the remote slow-store
+                                            // upload is handled by spawn_upload_to_remote after
+                                            // execution_complete frees the worker slot.
                                             .and_then(|a| Box::pin(RunningAction::upload_results(a)))
                                             .and_then(|a| Box::pin(RunningAction::get_finished_result(a)))
                                             .then(|result| async move {
@@ -2980,9 +2983,14 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                                             // tree-internal file digest in the race window
                                             // (between ExecuteResult delivery and
                                             // BlobsAvailable processing) hit NotFound:
-                                            // the slow-tier upload is fire-and-forget
-                                            // (step 5) and may not have completed, AND
-                                            // the locality_map has no peer registered.
+                                            // When F2 deferred_output_uploads_enabled is ON,
+                                            // the slow-tier upload is fire-and-forget (step 5)
+                                            // and may not have completed; AND the locality_map
+                                            // has no peer registered if this message is skipped.
+                                            // When F2 is OFF (default), the slow-tier upload
+                                            // completed synchronously in upload_results, but
+                                            // the locality_map must still be populated so that
+                                            // tree-internal file digests are routable.
                                             //
                                             // 1. Tree expansion + BlobsAvailable on the
                                             //    critical path. Tree expansion reads Tree
@@ -3821,6 +3829,7 @@ pub async fn new_local_worker(
             bis_ack_timeout,
             metrics: Some(ac_publish_metrics.clone()),
             cas_endpoint: running_actions_cas_endpoint,
+            deferred_output_uploads_enabled: config.deferred_output_uploads_enabled,
         })?);
 
     // Set up BlobsAvailable reporting with drain-then-fire semantics.

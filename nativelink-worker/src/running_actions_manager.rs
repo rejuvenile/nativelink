@@ -3427,12 +3427,38 @@ impl RunningActionImpl {
                 state.execution_metadata.clone(),
             )
         };
-        // Upload outputs through the FastSlowStore so the has() check in
-        // upload_file queries the slow store (remote CAS). This prevents
-        // skipping uploads for blobs that exist locally but were never
-        // persisted to the remote (e.g., prior background upload failed).
+        // F2 kill-switch: when deferred_output_uploads_enabled is true, write
+        // outputs to the local fast store (FilesystemStore) only.  The remote
+        // slow-store upload is deferred to spawn_upload_to_remote, which runs
+        // AFTER execution_complete frees the worker slot.  Completion is then
+        // gated only on the local disk write (~1 ms) instead of the remote RPC
+        // (p50 ≈ 152 ms, p99 ≈ 720 ms).
+        //
+        // When false (default): upload through the full FastSlowStore so the
+        // has() check in upload_file queries the slow store (remote CAS).
+        // This prevents skipping uploads for blobs that exist locally but were
+        // never persisted to the remote (e.g. prior background upload failed).
         // FastSlowStore::update_with_whole_file writes to both stores.
-        let cas_store = &*self.running_actions_manager.cas_store;
+        //
+        // Safety preconditions for deferred mode (all verified live):
+        //   (P1) Outputs written to on-disk FilesystemStore (crash-survivable).
+        //   (P2) Outputs pinned immediately below (running_actions_manager.rs:3851).
+        //   (P3) BlobsAvailable sent before execution_response (#129 ordering).
+        //   (P4) H4 pending-registry pre-registered (#12).
+        // See .claude/audits/f2-deferred-output-uploads-design-2026-06-12.md.
+        //
+        // `cas_store_owned` holds the `Store` that lives for the scope of this
+        // function; `cas_store` borrows it so the async closures below can capture
+        // a single uniform `&Store` reference regardless of which branch is taken.
+        let cas_store_owned: Store =
+            if self.running_actions_manager.deferred_output_uploads_enabled {
+                // Deferred: write to fast store (local FilesystemStore) only.
+                self.running_actions_manager.cas_store.fast_store().clone()
+            } else {
+                // Synchronous (default): write through the full FastSlowStore.
+                Store::new(self.running_actions_manager.cas_store.clone())
+            };
+        let cas_store = &cas_store_owned;
         let hasher = self.action_info.unique_qualifier.digest_function();
 
         let mut output_path_futures = FuturesUnordered::new();
@@ -4872,6 +4898,13 @@ pub struct RunningActionsManagerArgs<'a> {
     /// `cas_server_port` is not configured (peer-blob sharing
     /// disabled); the server skips registration on empty.
     pub cas_endpoint: String,
+    /// F2 kill-switch: when `true`, `inner_upload_results` writes outputs
+    /// to the local fast store only; the remote slow-store upload is
+    /// deferred to `spawn_upload_to_remote` after `execution_complete`.
+    /// Default: `false` (synchronous path, current behavior).
+    /// See `LocalWorkerConfig::deferred_output_uploads_enabled` and
+    /// `.claude/audits/f2-deferred-output-uploads-design-2026-06-12.md`.
+    pub deferred_output_uploads_enabled: bool,
 }
 
 struct CleanupGuard {
@@ -4919,6 +4952,10 @@ pub struct RunningActionsManagerImpl {
     /// Optional directory cache for improving performance by caching reconstructed
     /// input directories and using hardlinks.
     directory_cache: Option<Arc<crate::directory_cache::DirectoryCache>>,
+    /// F2 kill-switch: when `true`, `inner_upload_results` writes outputs to the
+    /// local fast store only and defers the remote slow-store upload to
+    /// `spawn_upload_to_remote`.  `false` = current synchronous behavior.
+    deferred_output_uploads_enabled: bool,
 }
 
 impl RunningActionsManagerImpl {
@@ -4984,6 +5021,7 @@ impl RunningActionsManagerImpl {
             cleaning_up_operations: Mutex::new(HashSet::new()),
             cleanup_complete_notify: Arc::new(Notify::new()),
             directory_cache: args.directory_cache,
+            deferred_output_uploads_enabled: args.deferred_output_uploads_enabled,
         })
     }
 

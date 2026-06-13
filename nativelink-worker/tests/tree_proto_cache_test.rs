@@ -161,6 +161,7 @@ async fn setup_manager() -> Result<(Arc<RunningActionsManagerImpl>, Arc<FastSlow
         bis_ack_timeout: Duration::from_secs(60),
         metrics: None,
         cas_endpoint: String::new(),
+        deferred_output_uploads_enabled: false,
     })?;
     Ok((Arc::new(manager), cas_store))
 }

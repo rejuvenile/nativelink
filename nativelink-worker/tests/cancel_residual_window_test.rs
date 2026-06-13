@@ -124,6 +124,7 @@ async fn setup_manager_and_action(
             bis_ack_timeout: Duration::from_secs(60),
             metrics: None,
             cas_endpoint: String::new(),
+            deferred_output_uploads_enabled: false,
         })?);
 
     let command = Command {
@@ -348,7 +349,8 @@ async fn cancel_then_cleanup_race_does_not_poison_ac() -> Result<(), Error> {
         directory_cache: None,
         bis_ack_timeout: Duration::from_secs(60),
         metrics: None,
-            cas_endpoint: String::new(),
+        cas_endpoint: String::new(),
+        deferred_output_uploads_enabled: false,
     })?);
 
     let command = Command {
