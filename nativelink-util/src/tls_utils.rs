@@ -214,20 +214,23 @@ pub fn endpoint(endpoint_config: &GrpcEndpoint) -> Result<tonic::transport::Endp
     Ok(endpoint)
 }
 
-/// Target QUIC UDP socket buffer size: 8 MiB.
+/// Target QUIC UDP socket buffer size: 32 MiB.
 ///
 /// Quinn does NOT raise the kernel default UDP buffer (typically 208 KiB on
 /// stock Linux) on its own — the underlying tokio/quinn `UdpSocket` inherits
 /// `net.core.{rmem,wmem}_default`. Without tuning, sustained QUIC ingress
 /// drops packets and tail latency spikes under load.
 ///
-/// 8 MiB is well above the 2 MiB minimum needed for a single 10 GbE BDP burst
-/// at LAN RTT and matches what every Quinn endpoint in this repo (server,
-/// client pool, worker peer-CAS) requests. The kernel may silently cap
-/// requests above `net.core.{rmem,wmem}_max` — see `tune_quic_udp_buffers`
-/// for read-back logging that surfaces the cap in production logs.
+/// 32 MiB covers 10 GbE BDP bursts with substantial headroom and eliminates
+/// `UdpRcvbufErrors` observed in production at exactly the 8 MiB previous
+/// limit (104,379 events). Raised from 8 MiB because host rmem_max/wmem_max
+/// are being raised to 64 MiB via sysctl (`net.core.rmem_max=67108864`,
+/// `net.core.wmem_max=67108864`) — the `setsockopt` will succeed only after
+/// those sysctl values are applied. The kernel may silently cap requests above
+/// `net.core.{rmem,wmem}_max` — see `tune_quic_udp_buffers` for read-back
+/// logging that surfaces the cap in production logs.
 #[cfg(feature = "quic")]
-pub const QUIC_UDP_BUF_BYTES: usize = 8 * 1024 * 1024;
+pub const QUIC_UDP_BUF_BYTES: usize = 32 * 1024 * 1024;
 
 /// Minimum acceptable post-set UDP buffer size before we warn the operator.
 ///

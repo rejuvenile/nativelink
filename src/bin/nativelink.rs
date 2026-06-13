@@ -2084,10 +2084,12 @@ async fn inner_main(
                                     );
                                 }
                                 // Set large socket buffers for 10 GbE throughput.
-                                // BDP = 1.25 GB/s × 0.5ms RTT = 625 KB; 4 MiB
-                                // provides headroom for bursts. Linux doubles the
-                                // value internally for bookkeeping.
-                                const SOCKET_BUF_SIZE: usize = 8 * 1024 * 1024;
+                                // 32 MiB matches QUIC_UDP_BUF_BYTES in tls_utils.rs;
+                                // raised from 8 MiB (which generated 104,379
+                                // UdpRcvbufErrors at exactly rmem_max). Requires
+                                // net.core.{rmem,wmem}_max ≥ 67108864 (64 MiB).
+                                // Linux doubles the value internally for bookkeeping.
+                                const SOCKET_BUF_SIZE: usize = 32 * 1024 * 1024;
                                 if let Err(err) = sock_ref.set_send_buffer_size(SOCKET_BUF_SIZE) {
                                     error!(
                                         target: "nativelink::services",
