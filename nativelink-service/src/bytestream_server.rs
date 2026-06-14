@@ -3082,9 +3082,9 @@ impl ByteStreamServer {
             // worker actually streaming. If a worker sees Ok with no
             // bytes transferred and #59 logs (Ok, Err) on a digest the
             // server short-circuited here, that maps to a producer
-            // that never got its EOF acknowledged.
-            // TODO(#59/#62): demote to debug once 6fc05054 is shipped and verified healthy ≥1 day
-            info!(
+            // that never got its EOF acknowledged. Demoted to debug after the
+            // #56/#62 fix (6fc05054) was verified healthy in production.
+            debug!(
                 %digest,
                 committed_size = expected_size as i64,
                 expected_size,

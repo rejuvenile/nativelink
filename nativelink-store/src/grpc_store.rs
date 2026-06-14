@@ -1435,9 +1435,9 @@ impl GrpcStore {
         // observed on `receiver disconnected` events is currently
         // unobservable at info! level — we don't know whether
         // GrpcStore::write even entered, nor which retrier branch fired.
-        // Observability-only; no behavior change.
-        // TODO(#59/#62): demote to debug once 6fc05054 is shipped and verified healthy ≥1 day
-        info!(
+        // Observability-only; no behavior change. Demoted to debug after the
+        // #56/#62 fix (6fc05054) was verified healthy in production.
+        debug!(
             instance_name = %instance_name,
             progress_timeout_s = rpc_timeout.as_secs(),
             is_mirror,
@@ -1666,9 +1666,9 @@ impl GrpcStore {
                             // #59 instrumentation: per #56 RCA §4 O1 —
                             // normal success path (producer sent EOF,
                             // unfold returned None). This is the ONLY
-                            // non-AlreadyExists Ok-returning path.
-                            // TODO(#59/#62): demote to debug once 6fc05054 is shipped and verified healthy ≥1 day
-                            info!(
+                            // non-AlreadyExists Ok-returning path. Demoted to
+                            // debug after the #56/#62 fix was verified healthy.
+                            debug!(
                                 instance_name = %instance_name,
                                 attempt,
                                 arm_name = "rpc_ok",
@@ -1771,9 +1771,9 @@ impl GrpcStore {
         let total_elapsed = write_start.elapsed();
         let total_elapsed_ms = u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX);
         // #59 instrumentation: total elapsed surfaces the 1-46 ms fast-
-        // fail vs full-RPC durations called out in #56 RCA §6 M3.
-        // TODO(#59/#62): demote to debug once 6fc05054 is shipped and verified healthy ≥1 day
-        info!(
+        // fail vs full-RPC durations called out in #56 RCA §6 M3. Demoted to
+        // debug after the #56/#62 fix was verified healthy in production.
+        debug!(
             instance_name = %self.instance_name,
             total_elapsed_ms,
             arm_name = "completed",
