@@ -4465,7 +4465,7 @@ impl FastSlowStore {
         ))
     }
 
-    /// Accepts an already-opened
+    /// Streams a file to the store from an already-opened
     /// [`std::fs::File`] instead of a path. Use this when the caller must
     /// guarantee the fd is opened before a concurrent rename can move the
     /// file (e.g. `FilesystemStore::emplace_file` background rename).

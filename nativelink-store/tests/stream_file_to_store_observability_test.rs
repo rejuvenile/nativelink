@@ -23,7 +23,7 @@
 //! error.
 //!
 //! **Mechanism that violates it (pre-fix):** `forward_res?; write_res`
-//! in `stream_path_to_store` / `stream_file_to_store` short-circuited on
+//! in `stream_file_to_store` short-circuited on
 //! `forward_res?`, discarding `write_res`.
 //!
 //! **Mechanism that re-establishes it (post-fix, v3 / Option 3):**

@@ -1122,7 +1122,7 @@ impl StreamingBlobReader {
                 // The race: `earliest` was loaded BEFORE `chunks.read()`.
                 // The producer (StreamingBlobWriter::send) pops chunks AND
                 // increments `earliest_chunk_idx` INSIDE the same
-                // `chunks.write()` lock scope (streaming_blob.rs:699-709).
+                // `chunks.write()` lock scope (streaming_blob.rs:699-718).
                 // Therefore, once we hold `chunks.read()`, the deque contents
                 // and `earliest_chunk_idx` are guaranteed mutually consistent.
                 // Loading `post_lock_earliest` under the read-lock gives us the
@@ -3344,7 +3344,7 @@ mod tests {
     // `post_lock_earliest` (loaded under the read-lock), which is
     // guaranteed consistent with the deque contents because the producer
     // holds `chunks.write()` for BOTH `pop_front` and `earliest_chunk_idx
-    // .fetch_add` (streaming_blob.rs:699-709).
+    // .fetch_add` (streaming_blob.rs:699-718).
     //
     // Tests:
     //   (a) resolve_deque_idx pure-logic — the three cases exhaustively.
@@ -3704,14 +3704,18 @@ mod tests {
     ///
     /// We achieve this by:
     ///   1. Creating a blob where the reader has cursor=1 and earliest=1.
-    ///   2. Directly advancing earliest_chunk_idx to 2 (simulating two
-    ///      evictions observed under the lock while cursor hasn't advanced).
-    ///   3. Calling next_chunk() — inside the lock, post_lock_earliest=2 >
-    ///      cursor=1 → None → retry → cursor(1) < earliest(2) → Err(marker).
+    ///   2. Directly advancing earliest_chunk_idx to 2 (cursor now lags the
+    ///      window after two evictions).
+    ///   3. Calling next_chunk() — the PRE-lock guard (`cursor < earliest`)
+    ///      at the top of the loop fires first: cursor(1) < earliest(2) →
+    ///      `Err(SLIDING_WINDOW_EVICTION_MARKER)`, the FSS splice-fallback
+    ///      signal. This asserts the observable recovery outcome.
     ///
-    /// This is safe because we advance `earliest_chunk_idx` AFTER setting up
-    /// the deque consistently (evicting the front chunk from the deque too),
-    /// so the deque state is valid.
+    /// NOTE: this exercises the pre-lock eviction guard, NOT the in-lock
+    /// `resolve_deque_idx` → None → retry arm (the reader returns before
+    /// acquiring the read-lock). That None arm is covered at the unit level
+    /// by `resolve_deque_idx_pure_logic`; a faithful integration test for the
+    /// in-lock None path is tracked as a follow-up.
     #[tokio::test]
     async fn h_alt_i_none_path_retry_fires_sliding_window_marker() {
         // Blob: 3 chunks of 10 bytes, buffer=20 bytes (holds 2).
