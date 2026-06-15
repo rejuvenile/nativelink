@@ -1992,6 +1992,17 @@ pub async fn prepare_output_directory(
     }
 
     // Slow path: serialize to avoid concurrent symlink replacement races.
+    //
+    // CONTRACT (O5 invariant): this path is only expected to fire in
+    // direct-use mode, where the directory cache materialises entries as
+    // read-only symlinks. In normal mode, `download_to_directory` creates
+    // the work directory as a real writable directory, so
+    // `dir_writable == true` above and this branch is unreachable.
+    //
+    // PRE-MORTEM: if a future change makes normal-mode dirs read-only, this
+    // branch WILL fire — `fs::remove_file` on a real directory fails with
+    // EISDIR and surfaces as "Failed to remove symlink: …", pointing nowhere
+    // near the true cause. Name this invariant now so that change is caught.
     let _guard = lock.lock().await;
     // #86: every acquire (denominator for slow-path rate). Routed to the
     // process-global singleton registered with MetricsRegistry so this
@@ -2994,6 +3005,8 @@ impl RunningActionImpl {
         // New shape (normal mode !is_direct_use):
         //   [A] alone → [B1] alone → try_join([B2], [C])
         //   [C] overlaps with the bulk of input download, saving ~2-10ms.
+        //   TODO(bench): 2-10ms is an unmeasured design estimate; add a
+        //   data_plane_bench action-prep cell before citing as a baseline.
         //
         // Safety: the O5 prereq (commit 1) makes [B2]'s BFS mkdir tolerate
         // AlreadyExists when the entry is already a directory — so [C]
@@ -3125,9 +3138,16 @@ impl RunningActionImpl {
             let symlink_fix_lock = Arc::new(tokio::sync::Mutex::new(()));
             // #86: O14 counters via process-global symlink_fix_counters().
             let working_directory_for_output = cmd.working_directory.clone();
+            // UNBOUNDED-OK: action-scoped path strings, freed after try_join;
+            // bounded by the REAPI Command proto size limit.
             let output_files_for_c: Vec<String> = cmd.output_files.clone();
+            // UNBOUNDED-OK: action-scoped path strings, freed after try_join;
+            // bounded by the REAPI Command proto size limit.
             let output_paths_for_c: Vec<String> = cmd.output_paths.clone();
             let lock_c = symlink_fix_lock.clone();
+            // Clone metrics arc so it can be moved into the async block without
+            // borrowing self (which is already partially moved into [B2] scope).
+            let metrics_for_c = self.metrics().clone();
             let output_dirs_fut = async move {
                 let prepare_output = |output_file: String| {
                     let work_dir = work_dir_for_output.clone();
@@ -3143,9 +3163,17 @@ impl RunningActionImpl {
                         .await
                     }
                 };
-                try_join_all(output_files_for_c.into_iter().map(prepare_output.clone()))
+                metrics_for_c
+                    .prepare_output_files
+                    .wrap(try_join_all(
+                        output_files_for_c.into_iter().map(prepare_output.clone()),
+                    ))
                     .await?;
-                try_join_all(output_paths_for_c.into_iter().map(prepare_output))
+                metrics_for_c
+                    .prepare_output_paths
+                    .wrap(try_join_all(
+                        output_paths_for_c.into_iter().map(prepare_output),
+                    ))
                     .await?;
                 Ok::<(), Error>(())
             };

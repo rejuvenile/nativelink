@@ -5956,6 +5956,40 @@ exit 1
     }
 
     // -----------------------------------------------------------------------
+    // O5: output-dir overlap concurrency coverage note
+    //
+    // The O5 change wires `try_join([B2], [C])` so that output-directory
+    // prep ([C]) runs concurrently with input download ([B2]).  The SAFETY
+    // contract — [C]'s create_dir_all tolerating AlreadyExists when [B2]'s
+    // BFS mkdir pre-created the same path — is exercised by the existing
+    // action-execution tests (e.g. `simple_worker_executes_action`), which
+    // pass an input root that shares parent paths with declared outputs.
+    //
+    // The CONCURRENCY contract — that [C] makes forward progress while [B2]
+    // is blocked — is STRUCTURALLY UNTESTED AS CONCURRENCY.  The seam
+    // required to prove it faithfully is too invasive to build cleanly:
+    //
+    //   `prepare_action_inputs` takes `&FastSlowStore` (a concrete type, not
+    //   a trait object), and `download_to_directory`'s fetcher dispatches
+    //   missing-blob fetches through `batch_read_small_blobs`, which
+    //   downcasts the slow store to `GrpcStore` — a fake blocking store never
+    //   matches, so the fetcher completes immediately with 0 blobs fetched
+    //   and the producer would wait on a `Notify` that never fires rather
+    //   than blocking on `get_part`.  Intercepting at the `get_part` level
+    //   would require wrapping `FastSlowStore` in a trait-object gate that
+    //   the production path does not expose.
+    //
+    // Mutation guard: reverting the `try_join(inputs_fut, output_dirs_fut)`
+    // at `running_actions_manager.rs` ~line 3190 to sequential
+    // (`inputs_fut.await?; output_dirs_fut.await?;`) does NOT red-fail any
+    // existing test, confirming the concurrency is safety-only tested here.
+    //
+    // A faithful happens-before test should be added when a blocking-seam
+    // abstraction over `prepare_action_inputs` is introduced (e.g. replacing
+    // `&FastSlowStore` with a trait object for the download path).
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
     // F2: deferred_output_uploads_enabled kill-switch tests
     //
     // These two tests exercise both states of the kill-switch introduced by
