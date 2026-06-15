@@ -593,6 +593,18 @@ where
     {
         // Find the slot that owns this uuid. Linear scan is fine — pool size
         // is in the dozens at most.
+        //
+        // NOTE: the write-guard is held across the TCP dial
+        // `(self.connect_func)().await?` and the `configure()` call (SCRIPT
+        // LOAD, and for the subscriber slot also CONFIG SET + PSUBSCRIBE). All
+        // concurrent `get_connection()` callers that hash to this slot stall
+        // behind this write-guard for the duration — up to `connection_timeout_ms`.
+        // With FU-10 adding 10 error-path callers, the blast radius is larger:
+        // if `n` slots all timeout simultaneously every `get_connection()` waits
+        // up to `n × connection_timeout_ms` in the worst case.
+        // TODO(FU-13): build the new connection OUTSIDE the lock and swap under
+        // it — eliminates this stall window entirely. See
+        // `.claude/audits/followups-2026-06-13-batch.md`.
         for (slot_idx, slot) in self.connections.iter().enumerate() {
             let mut guard = slot.write().await;
             if guard.1 != uuid {
@@ -863,6 +875,53 @@ impl<C: ConnectionLike + Clone> ClientWithPermit<C> {
     async fn reconnect<M: RedisManager<C> + Sync>(&mut self, manager: &M) -> Result<(), Error> {
         (self.connection_manager, self.uuid) = manager.reconnect(self.uuid).await?;
         Ok(())
+    }
+
+    /// Best-effort reconnect on the inner-`response_timeout` error path.
+    /// Logs the outcome so an operator can distinguish "timeout+reconnect-ok"
+    /// from "timeout+reconnect-failed" in production logs (FU-10 S1).
+    async fn reconnect_on_timeout<M: RedisManager<C> + Sync>(
+        &mut self,
+        manager: &M,
+        context: &'static str,
+    ) {
+        match self.reconnect(manager).await {
+            Ok(()) => {
+                debug!(context, "redis slot reconnect succeeded after inner response_timeout");
+            }
+            Err(ref e) => {
+                warn!(
+                    context,
+                    err = ?e,
+                    "redis slot reconnect failed after inner response_timeout \
+                     — slot remains desynced until next reconnect attempt"
+                );
+            }
+        }
+    }
+}
+
+/// Best-effort reconnect by `uuid` on the inner-`response_timeout` error path for
+/// call sites that hold a raw connection manager rather than a `ClientWithPermit`.
+/// Logs the outcome so an operator can distinguish "timeout+reconnect-ok" from
+/// "timeout+reconnect-failed" (FU-10 S1).
+async fn reconnect_on_timeout_by_uuid<C, M>(manager: &M, uuid: Uuid, context: &'static str)
+where
+    C: ConnectionLike + Clone,
+    M: RedisManager<C> + Sync,
+{
+    match manager.reconnect(uuid).await {
+        Ok(_) => {
+            debug!(context, "redis slot reconnect succeeded after inner response_timeout");
+        }
+        Err(ref e) => {
+            warn!(
+                context,
+                err = ?e,
+                "redis slot reconnect failed after inner response_timeout \
+                 — slot remains desynced until next reconnect attempt"
+            );
+        }
     }
 }
 
@@ -1813,7 +1872,7 @@ where
                         nl_err.messages.push(
                             "In RedisStore::has_with_results_per_key".to_string(),
                         );
-                        drop(client.reconnect(&self.connection_manager).await);
+                        client.reconnect_on_timeout(&self.connection_manager, "has_with_results_per_key").await;
                         return Err(nl_err);
                     }
                     Ok(result) => result
@@ -1952,9 +2011,13 @@ where
                     // the error so the caller can retry without desync risk.
                     // Best-effort: if reconnect itself fails, the error is
                     // silently dropped and the original timeout error returned.
-                    let redis_err = err.clone();
-                    drop(client.reconnect(&self.connection_manager).await);
-                    return Err(redis_err.into());
+                    let mut nl_err: Error = err.clone().into();
+                    nl_err.messages.push(
+                        "In RedisStore::has_with_results pipelined query (timeout reconnect)"
+                            .to_string(),
+                    );
+                    client.reconnect_on_timeout(&self.connection_manager, "has_with_results").await;
+                    return Err(nl_err);
                 }
                 Ok(result) => result
                     .err_tip(|| "In RedisStore::has_with_results pipelined query")?,
@@ -2197,7 +2260,11 @@ where
                             // reconnect before returning. (FU-10: 2026-06-15
                             // incident: desynced SETRANGE responses caused 154
                             // "Data length mismatch" errors in RedisStore::update.)
-                            drop(self.connection_manager.reconnect(connect_id).await);
+                            reconnect_on_timeout_by_uuid(
+                                &self.connection_manager,
+                                connect_id,
+                                "update::setrange",
+                            ).await;
                             let mut error: Error = err.into();
                             error
                                 .messages
@@ -2304,7 +2371,7 @@ where
                 nl_err.messages.push(format!(
                     "In RedisStore::update strlen check for {temp_key}"
                 ));
-                drop(client.reconnect(&self.connection_manager).await);
+                client.reconnect_on_timeout(&self.connection_manager, "update::strlen").await;
                 return Err(nl_err);
             }
             Ok(result) => result
@@ -2357,7 +2424,7 @@ where
                     nl_err.messages.push(
                         "While pipelining RENAME+PUBLISH in RedisStore::update()".to_string(),
                     );
-                    drop(client.reconnect(&self.connection_manager).await);
+                    client.reconnect_on_timeout(&self.connection_manager, "update::rename_publish").await;
                     return Err(nl_err);
                 }
                 Ok(result) => result
@@ -2393,7 +2460,7 @@ where
                 nl_err.messages.push(
                     "While queueing key rename in RedisStore::update()".to_string(),
                 );
-                drop(client.reconnect(&self.connection_manager).await);
+                client.reconnect_on_timeout(&self.connection_manager, "update::rename").await;
                 return Err(nl_err);
             }
             Ok(result) => result
@@ -2496,7 +2563,7 @@ where
                         nl_err.messages.push(
                             "In RedisStore::get_part::getrange".to_string(),
                         );
-                        drop(client.reconnect(&self.connection_manager).await);
+                        client.reconnect_on_timeout(&self.connection_manager, "get_part::getrange").await;
                         return Err(nl_err);
                     }
                     Ok(result) => result
@@ -2561,7 +2628,7 @@ where
                         nl_err.messages.push(
                             "In RedisStore::get_part::zero_exists".to_string(),
                         );
-                        drop(client.reconnect(&self.connection_manager).await);
+                        client.reconnect_on_timeout(&self.connection_manager, "get_part::zero_exists").await;
                         return Err(nl_err);
                     }
                     Ok(result) => result
@@ -2725,7 +2792,7 @@ where
                 }
                 Ok(Err(ref e)) if e.is_timeout() => {
                     // Inner response_timeout — desynced slot. (FU-10.)
-                    drop(client.reconnect(&self.connection_manager).await);
+                    client.reconnect_on_timeout(&self.connection_manager, "batch_get_part_unchunked").await;
                     for &idx in chunk_indices {
                         results[idx] = Err(make_err!(
                             Code::Unavailable,
@@ -2853,7 +2920,7 @@ where
                 // Inner response_timeout — desynced slot. (FU-10.)
                 let mut nl_err: Error = err.clone().into();
                 nl_err.messages.push(format!("RedisStore::remove DEL failed for key {encoded}"));
-                drop(client.reconnect(&self.connection_manager).await);
+                client.reconnect_on_timeout(&self.connection_manager, "remove::del").await;
                 return Err(nl_err);
             }
             Ok(result) => result
@@ -3420,6 +3487,19 @@ where
                         .await
                         .err_tip(|| format!("(after reconnect) In RedisStore::update_data::versioned for {key:?}"))?
                 }
+                Err(err) if err.is_timeout() => {
+                    // Inner response_timeout — desynced slot, reconnect before
+                    // returning so the scheduler's next Lua invocation on this
+                    // slot does not read an orphaned frame. (FU-10: same desync
+                    // mechanism as the CAS SETRANGE path; scheduler state
+                    // desync is equally damaging to AC desync.)
+                    let mut error: Error = err.into();
+                    error
+                        .messages
+                        .push(format!("In RedisStore::update_data::versioned (timeout) for {key:?}"));
+                    client.reconnect_on_timeout(&self.connection_manager, "update_data::versioned").await;
+                    return Err(error);
+                }
                 Err(err) => {
                     let mut error: Error = err.into();
                     error
@@ -3488,6 +3568,18 @@ where
                         .hset_multiple::<_, _, _, ()>(redis_key.as_ref(), &fields)
                         .await
                         .err_tip(|| format!("(after reconnect) In RedisStore::update_data::noversion for {redis_key}"))?;
+                }
+                Err(err) if err.is_timeout() => {
+                    // Inner response_timeout — desynced slot. (FU-10: scheduler
+                    // hset desync is not lower-risk than CAS desync — the next
+                    // hset on this slot reads the orphaned HSET response frame
+                    // as data, corrupting the scheduler index entry.)
+                    let mut error: Error = err.into();
+                    error.messages.push(format!(
+                        "In RedisStore::update_data::noversion (timeout) for {redis_key}"
+                    ));
+                    client.reconnect_on_timeout(&self.connection_manager, "update_data::noversion").await;
+                    return Err(error);
                 }
                 Err(err) => {
                     let mut error: Error = err.into();

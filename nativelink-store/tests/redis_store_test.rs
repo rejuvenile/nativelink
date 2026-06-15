@@ -15,8 +15,7 @@
 use core::ops::RangeBounds;
 use core::time::Duration;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
@@ -25,8 +24,8 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_redis_tester::{
     ReadOnlyRedis, add_lua_script, add_to_response_raw, fake_redis_sentinel_master_stream,
-    fake_redis_sentinel_stream, fake_redis_stream, make_fake_redis_counting_with_multiple_responses,
-    make_fake_redis_with_responses,
+    fake_redis_sentinel_stream, fake_redis_stream, make_fake_redis_counting_connections,
+    make_fake_redis_counting_with_multiple_responses, make_fake_redis_with_responses,
 };
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
 use nativelink_store::redis_store::{
@@ -2531,6 +2530,378 @@ async fn reconnect_fired_after_has_with_results_timeout() -> Result<(), Error> {
         "reconnect-on-timeout must establish new TCP connection — connection count \
          was {conn_count} after has_with_results timeout, expected ≥2 \
          (slot was not replaced)"
+    );
+
+    Ok(())
+}
+
+/// End-to-end desync-prevention test (T2): verifies that after a `has_with_results`
+/// inner-response_timeout the reconnected slot is CLEAN — a subsequent `has()` on
+/// the same store returns the correct answer without a parse/mismatch error.
+///
+/// This is the load-bearing claim of FU-10: it is not enough to prove reconnect was
+/// ATTEMPTED (connection count ≥2). We must prove the desync is GONE — the next
+/// command reads the correct frame from the new connection, not an orphaned one.
+///
+/// Mechanism: after the timeout on connection 1, `reconnect_on_timeout` replaces the
+/// slot with connection 2. The second `store.has()` uses connection 2's slot, sends
+/// STRLEN+EXISTS, and gets `:0\r\n:0\r\n` (key absent) → `Ok(None)`.
+///
+/// Mutation: comment out `reconnect_on_timeout` in `has_with_results`.
+/// The slot is NOT replaced; the second `has()` reads the orphaned STRLEN+EXISTS
+/// response from connection 1's buffer (or hangs until the inner timeout fires again),
+/// either returning a spurious `Err` or wrong value instead of `Ok(None)`.
+/// The assertion "second has must return Ok(None) — desync prevention failed" fails.
+#[nativelink_test]
+async fn desync_prevented_second_has_returns_correct_after_timeout() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(VALID_HASH1, 2)?;
+    let encoded_key = format!("{digest}");
+
+    // Connection 1: handshake only. STRLEN+EXISTS goes unanswered → inner timeout.
+    let handler1 = add_lua_version_script(fake_redis_stream());
+
+    // Connection 2: handshake + SCRIPT LOAD (reconnect configure) +
+    // STRLEN+EXISTS response (key absent). Used by the second `has()` call.
+    let mut handler2 = add_lua_version_script(fake_redis_stream());
+    add_to_response_raw(
+        &mut handler2,
+        &redis::cmd("STRLEN").arg(encoded_key.as_str()),
+        // Two-value pipeline: STRLEN=0, EXISTS=0 → key absent.
+        ":0\r\n:0\r\n".to_string(),
+    );
+
+    let connection_counter = Arc::new(AtomicUsize::new(0));
+    let port = make_fake_redis_counting_with_multiple_responses(
+        vec![handler1, handler2],
+        Arc::clone(&connection_counter),
+    )
+    .await;
+
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        command_timeout_ms: 100,
+        connection_pool_size: 1,
+        ..Default::default()
+    };
+
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("store construction must not deadlock")
+        .expect("store construction must succeed");
+
+    // First has(): triggers inner timeout on connection 1.
+    let first = timeout(Duration::from_secs(5), store.has(digest))
+        .await
+        .expect("first has must not deadlock");
+    assert!(
+        first.is_err(),
+        "first has must return Err after inner response_timeout; got Ok"
+    );
+    assert_eq!(
+        first.unwrap_err().code,
+        Code::DeadlineExceeded,
+        "first has must propagate as Code::DeadlineExceeded"
+    );
+
+    // Assert reconnect happened — slot was replaced with connection 2.
+    let conn_count = connection_counter.load(Ordering::SeqCst);
+    assert!(
+        conn_count >= 2,
+        "reconnect must have established a new TCP connection — count was {conn_count}, expected ≥2"
+    );
+
+    // Second has(): uses the reconnected slot (connection 2). Must return Ok(None)
+    // — NOT an error, NOT a parse failure. This proves the desync is gone.
+    let second = timeout(Duration::from_secs(5), store.has(digest))
+        .await
+        .expect("second has must not deadlock — desync prevention must not cause a hang");
+    assert_eq!(
+        second.expect("second has must return Ok after reconnect — desync prevention failed"),
+        None,
+        "second has must return Ok(None) — key is absent, desync-clean connection confirmed"
+    );
+
+    Ok(())
+}
+
+/// Verifies that when the inner `response_timeout` fires during `update() SETRANGE`
+/// (the primary incident cause: 154 "Data length mismatch" errors on 2026-06-15),
+/// `RedisStore` reconnects the desynced slot before returning the timeout error.
+///
+/// Background: the SETRANGE path calls `connection_manager.get_connection()` per
+/// chunk in a concurrent stream. When the inner `response_timeout` fires on a
+/// SETRANGE, `reconnect_on_timeout_by_uuid` replaces the slot so the next command
+/// does not read the orphaned SETRANGE response frame (which would corrupt a
+/// subsequent STRLEN/RENAME → "Data length mismatch").
+///
+/// Mutation: comment out `reconnect_on_timeout_by_uuid` in the SETRANGE arm.
+/// Test fails with:
+/// "reconnect-on-timeout::update-setrange must establish new TCP connection — \
+///  connection count was 1, expected ≥2 (SETRANGE slot was not replaced)"
+#[nativelink_test]
+async fn reconnect_fired_after_update_setrange_timeout() -> Result<(), Error> {
+    let data = Bytes::from_static(b"x");
+    let digest = DigestInfo::try_new(VALID_HASH1, 1)?;
+
+    // Connection 1: handshake + SCRIPT LOAD (initial configure).
+    // Does NOT respond to SETRANGE → inner response_timeout fires.
+    let handler1 = add_lua_version_script(fake_redis_stream());
+
+    // Connection 2: handshake + SCRIPT LOAD (reconnect configure).
+    // No further commands needed — update() returns the error immediately.
+    let handler2 = add_lua_version_script(fake_redis_stream());
+
+    let connection_counter = Arc::new(AtomicUsize::new(0));
+    let port = make_fake_redis_counting_with_multiple_responses(
+        vec![handler1, handler2],
+        Arc::clone(&connection_counter),
+    )
+    .await;
+
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        command_timeout_ms: 100,
+        connection_pool_size: 1,
+        ..Default::default()
+    };
+
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("store construction must not deadlock")
+        .expect("store construction must succeed");
+
+    let (mut tx, rx) = make_buf_channel_pair();
+    let send_fut = async move {
+        tx.send(data).await.expect("send must succeed");
+        tx.send_eof().expect("send_eof must succeed");
+    };
+    let update_fut = store.update(digest, rx, UploadSizeInfo::ExactSize(1));
+
+    let ((), update_result) = timeout(
+        Duration::from_secs(5),
+        async move { tokio::join!(send_fut, update_fut) },
+    )
+    .await
+    .expect("update must not deadlock");
+
+    assert!(
+        update_result.is_err(),
+        "update must return Err after SETRANGE inner response_timeout; got Ok"
+    );
+
+    // Reconnect must have established a new TCP connection.
+    let conn_count = connection_counter.load(Ordering::SeqCst);
+    assert!(
+        conn_count >= 2,
+        "reconnect-on-timeout::update-setrange must establish new TCP connection — \
+         connection count was {conn_count}, expected ≥2 (SETRANGE slot was not replaced)"
+    );
+
+    Ok(())
+}
+
+/// Verifies that when the inner `response_timeout` fires during `get_part() GETRANGE`
+/// (the most data-integrity-critical read path), `RedisStore` reconnects the desynced
+/// slot before returning the timeout error.
+///
+/// Mutation: comment out `reconnect_on_timeout` in the GETRANGE arm.
+/// Test fails with:
+/// "reconnect-on-timeout::get-part-getrange must establish new TCP connection — \
+///  connection count was 1, expected ≥2 (GETRANGE slot was not replaced)"
+#[nativelink_test]
+async fn reconnect_fired_after_get_part_getrange_timeout() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(VALID_HASH1, 2)?;
+
+    // Connection 1: handshake + SCRIPT LOAD. Does NOT respond to GETRANGE.
+    let handler1 = add_lua_version_script(fake_redis_stream());
+
+    // Connection 2: handshake + SCRIPT LOAD (reconnect configure).
+    let handler2 = add_lua_version_script(fake_redis_stream());
+
+    let connection_counter = Arc::new(AtomicUsize::new(0));
+    let port = make_fake_redis_counting_with_multiple_responses(
+        vec![handler1, handler2],
+        Arc::clone(&connection_counter),
+    )
+    .await;
+
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        command_timeout_ms: 100,
+        connection_pool_size: 1,
+        ..Default::default()
+    };
+
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("store construction must not deadlock")
+        .expect("store construction must succeed");
+
+    // get_part routes through GETRANGE. The fake redis doesn't respond to GETRANGE
+    // → inner response_timeout fires → is_timeout() arm → reconnect.
+    let result = timeout(
+        Duration::from_secs(5),
+        store.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect("get_part must not deadlock");
+
+    assert!(
+        result.is_err(),
+        "get_part must return Err after GETRANGE inner response_timeout; got Ok: {:?}",
+        result.ok()
+    );
+
+    let conn_count = connection_counter.load(Ordering::SeqCst);
+    assert!(
+        conn_count >= 2,
+        "reconnect-on-timeout::get-part-getrange must establish new TCP connection — \
+         connection count was {conn_count}, expected ≥2 (GETRANGE slot was not replaced)"
+    );
+
+    Ok(())
+}
+
+/// Verifies that when the inner `response_timeout` fires during
+/// `batch_get_part_unchunked()` (pipelined GETRANGE+EXISTS), `RedisStore`
+/// reconnects the desynced slot before returning the timeout errors.
+///
+/// `batch_get_part_unchunked` is called for bulk small-blob reads (directory
+/// protos, action results). A desynced slot here silently feeds the wrong
+/// frame into any subsequent pipeline.
+///
+/// Mutation: comment out `reconnect_on_timeout` in the batch GETRANGE+EXISTS arm.
+/// Test fails with:
+/// "reconnect-on-timeout::batch-get-part must establish new TCP connection — \
+///  connection count was 1, expected ≥2 (batch GETRANGE+EXISTS slot was not replaced)"
+#[nativelink_test]
+async fn reconnect_fired_after_batch_get_part_unchunked_timeout() -> Result<(), Error> {
+
+    let digest = DigestInfo::try_new(VALID_HASH1, 2)?;
+
+    // Connection 1: handshake + SCRIPT LOAD. Does NOT respond to GETRANGE pipeline.
+    let handler1 = add_lua_version_script(fake_redis_stream());
+
+    // Connection 2: handshake + SCRIPT LOAD (reconnect configure).
+    let handler2 = add_lua_version_script(fake_redis_stream());
+
+    let connection_counter = Arc::new(AtomicUsize::new(0));
+    let port = make_fake_redis_counting_with_multiple_responses(
+        vec![handler1, handler2],
+        Arc::clone(&connection_counter),
+    )
+    .await;
+
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        command_timeout_ms: 100,
+        connection_pool_size: 1,
+        ..Default::default()
+    };
+
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("store construction must not deadlock")
+        .expect("store construction must succeed");
+
+    let keys = vec![StoreKey::from(digest)];
+    let results = timeout(
+        Duration::from_secs(5),
+        store.batch_get_part_unchunked(keys, Some(1024)),
+    )
+    .await
+    .expect("batch_get_part_unchunked must not deadlock");
+
+    assert_eq!(results.len(), 1, "must get one result for one key");
+    assert!(
+        results[0].is_err(),
+        "batch result must be Err after inner response_timeout; got Ok"
+    );
+
+    let conn_count = connection_counter.load(Ordering::SeqCst);
+    assert!(
+        conn_count >= 2,
+        "reconnect-on-timeout::batch-get-part must establish new TCP connection — \
+         connection count was {conn_count}, expected ≥2 \
+         (batch GETRANGE+EXISTS slot was not replaced)"
+    );
+
+    Ok(())
+}
+
+/// Verifies that when the inner `response_timeout` fires during
+/// `update_data()` (scheduler Lua script path), `RedisStore` reconnects the
+/// desynced slot before returning the timeout error.
+///
+/// Scheduler-state desync is not lower-risk than CAS desync: the next Lua
+/// invocation on a desynced slot reads the orphaned EVALSHA response as a
+/// version number, corrupting the scheduler optimistic-lock state.
+///
+/// Uses `make_fake_redis_counting_connections` (single handler for all
+/// connections) because both connection 1 and connection 2 get the same
+/// HELLO+SCRIPT LOAD responses; only the Lua EVALSHA goes unanswered on
+/// connection 1.
+///
+/// Mutation: comment out `reconnect_on_timeout` in `update_data::versioned`.
+/// Test fails with:
+/// "reconnect-on-timeout::update-data must establish new TCP connection — \
+///  connection count was 1, expected ≥2 (update_data scheduler slot was not replaced)"
+#[nativelink_test]
+async fn reconnect_fired_after_update_data_versioned_timeout() -> Result<(), Error> {
+    // Handler for all connections: answers HELLO+SCRIPT LOAD but NOT EVALSHA.
+    // Connection 1 → EVALSHA goes unanswered → inner timeout → reconnect → connection 2.
+    // Connection 2 also uses this handler (reconnect configure only; no EVALSHA after err).
+    let handler = add_lua_version_script(fake_redis_stream());
+
+    let connection_counter = Arc::new(AtomicUsize::new(0));
+    // Use make_fake_redis_counting_connections since both connections share the same handler.
+    let port = make_fake_redis_counting_connections(
+        handler,
+        Arc::clone(&connection_counter),
+    )
+    .await;
+
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        command_timeout_ms: 100,
+        connection_pool_size: 1,
+        ..Default::default()
+    };
+
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("store construction must not deadlock")
+        .expect("store construction must succeed");
+
+    // Scheduler versioned update (Lua EVALSHA path).
+    // Reuse the module-level TestSchedulerDataVersioned which implements all
+    // required scheduler traits (SchedulerStoreKeyProvider<Versioned=TrueValue>,
+    // SchedulerCurrentVersionProvider, SchedulerStoreDataProvider).
+    let data = TestSchedulerDataVersioned {
+        key: "test-scheduler-key".to_string(),
+        content: "test-data".to_string(),
+        version: 0,
+    };
+
+    let result = timeout(
+        Duration::from_secs(5),
+        store.update_data(data),
+    )
+    .await
+    .expect("update_data must not deadlock");
+
+    assert!(
+        result.is_err(),
+        "update_data must return Err after EVALSHA inner response_timeout; got Ok: {:?}",
+        result.ok()
+    );
+
+    let conn_count = connection_counter.load(Ordering::SeqCst);
+    assert!(
+        conn_count >= 2,
+        "reconnect-on-timeout::update-data must establish new TCP connection — \
+         connection count was {conn_count}, expected ≥2 \
+         (update_data scheduler slot was not replaced)"
     );
 
     Ok(())

@@ -15,8 +15,7 @@
 use core::fmt::Write;
 use core::hash::BuildHasher;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 use nativelink_util::background_spawn;
 use redis::Value;
@@ -304,7 +303,8 @@ pub async fn make_fake_redis_counting_with_multiple_responses<
     info!("Using port {port} (counting+multi-response fake redis)");
 
     let counter = connection_counter;
-    let mut func_iter = funcs.into_iter().cycle();
+    let max_connections = funcs.len();
+    let mut func_iter = funcs.into_iter();
     // Eagerly collect into closures we can move into the background task.
     // We must move the iterator into the spawned task.
     background_spawn!("counting-multi-listener", async move {
@@ -315,7 +315,16 @@ pub async fn make_fake_redis_counting_with_multiple_responses<
             };
             let conn_idx = counter.fetch_add(1, Ordering::SeqCst) + 1;
             info!("Counting+multi fake redis: accepted connection #{conn_idx}");
-            let handler = func_iter.next().unwrap();
+            // Fail-fast: if more connections arrive than handlers were registered,
+            // the test is flaky (cycle wrap-around) — panic with a bespoke message
+            // rather than silently reusing handler[0] (which is the no-response
+            // handler and would cause a spurious second timeout).
+            let handler = func_iter.next().unwrap_or_else(|| panic!(
+                "make_fake_redis_counting_with_multiple_responses: \
+                 connection #{conn_idx} arrived but only {max_connections} \
+                 handler(s) were registered — test registered too few handlers \
+                 or redis-rs opened an unexpected extra connection"
+            ));
             background_spawn!("counting-multi-handler", async move {
                 loop {
                     let mut buf = vec![0; 8192];
