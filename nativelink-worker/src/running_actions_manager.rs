@@ -1282,9 +1282,29 @@ pub fn download_to_directory<'a>(
                     try_join_all(next_level.iter().map(|(_, path)| {
                         let path = path.clone();
                         async move {
-                            fs::create_dir(&path)
-                                .await
-                                .err_tip(|| format!("Could not create directory {path}"))
+                            // O5 prereq: tolerate AlreadyExists when the existing
+                            // entry is a directory (pre-created by a concurrent
+                            // prepare_output_directory [C]). An existing *file* at
+                            // a directory path is still a genuine conflict.
+                            match fs::create_dir(&path).await {
+                                Ok(()) => Ok(()),
+                                Err(e) if e.code == Code::AlreadyExists => {
+                                    let m = fs::metadata(&path).await.err_tip(|| {
+                                        format!("Could not create directory {path}: already exists but could not stat")
+                                    })?;
+                                    if m.is_dir() {
+                                        Ok(())
+                                    } else {
+                                        Err(make_err!(
+                                            Code::AlreadyExists,
+                                            "Could not create directory {path}: a non-directory entry already exists"
+                                        ))
+                                    }
+                                }
+                                Err(e) => {
+                                    Err(e).err_tip(|| format!("Could not create directory {path}"))
+                                }
+                            }
                         }
                     }))
                     .await?;
