@@ -2000,13 +2000,7 @@ impl FastSlowStore {
             // the worker's own upload. Demote to debug! so operators
             // are not alarmed by noise. Genuine failures (disk error,
             // producer crash — any other code or message) keep error!.
-            if err.code == Code::Aborted
-                && err.messages.iter().any(|m| {
-                    m.contains(
-                        crate::worker_proxy_store::CACHE_FANOUT_ABANDONED_MARKER,
-                    )
-                })
-            {
+            if crate::worker_proxy_store::is_cache_fanout_abandonment(&err) {
                 debug!(
                     ?key,
                     elapsed_ms = data_elapsed.as_millis() as u64,
@@ -5225,13 +5219,7 @@ impl StoreDriver for FastSlowStore {
                 // the worker's own upload. Demote to debug! so operators
                 // are not alarmed by noise. Genuine failures (disk error,
                 // producer crash — any other code or message) keep error!.
-                if err.code == Code::Aborted
-                    && err.messages.iter().any(|m| {
-                        m.contains(
-                            crate::worker_proxy_store::CACHE_FANOUT_ABANDONED_MARKER,
-                        )
-                    })
-                {
+                if crate::worker_proxy_store::is_cache_fanout_abandonment(&err) {
                     debug!(
                         ?key,
                         elapsed_ms = update_start.elapsed().as_millis() as u64,

@@ -282,10 +282,39 @@ const CDN_TEE_CACHE_MPSC_CAP: usize = 4;
 /// error log from `error!` to `debug!` — the Bazel read already
 /// succeeded and the blob is durable via the worker's own upload.
 ///
-/// Inner-store demotion check: `err.code == Code::Aborted &&
-/// err.messages.iter().any(|m| m.contains(CACHE_FANOUT_ABANDONED_MARKER))`.
-pub const CACHE_FANOUT_ABANDONED_MARKER: &str =
+/// Inner-store demotion check: call
+/// [`is_cache_fanout_abandonment`] which tests `err.code ==
+/// Code::Aborted && err.messages.iter().any(|m|
+/// m.contains(CACHE_FANOUT_ABANDONED_MARKER))`.
+///
+/// LOAD-BEARING INVARIANT: this relies on `err_tip` (via
+/// `err_tip_with_code`) preserving `err.code` and the marker
+/// substring across every store-layer hop between this producer
+/// and the classifier.  If a future layer rewraps the error with
+/// a fresh `Code` (e.g. `make_err!(Code::Internal, "… {e}")`)
+/// the discriminator silently breaks — see the FU-7 follow-up
+/// (typed proto-detail) for the robust future fix.  The
+/// FSS-seam tests guard this invariant: a future layer absorbing
+/// `Code::Aborted` would red-fail those tests.
+pub(crate) const CACHE_FANOUT_ABANDONED_MARKER: &str =
     "WorkerProxyStore: cache fan-out abandoned (best-effort)";
+
+/// Returns `true` iff `err` is an intentional best-effort
+/// cache fan-out abandonment, signalled by
+/// `Code::Aborted + CACHE_FANOUT_ABANDONED_MARKER`.
+///
+/// Called at every inner-store demotion site (`fast_slow_store`
+/// chunked ~2003, non-chunked ~5228, `existence_cache_store`
+/// ~616) to keep the predicate in one place and the error in
+/// one place — a future change to the abandonment code or marker
+/// only needs to be made here.
+pub(crate) fn is_cache_fanout_abandonment(err: &nativelink_error::Error) -> bool {
+    err.code == nativelink_error::Code::Aborted
+        && err
+            .messages
+            .iter()
+            .any(|m| m.contains(CACHE_FANOUT_ABANDONED_MARKER))
+}
 
 /// Wall-clock cap on the CDN-tee spawned cache task (#230). The task runs
 /// `inner.update(cache_rx, ExactSize(digest.size_bytes()))`, which is
@@ -2199,12 +2228,28 @@ impl WorkerProxyStore {
                     Ok(())
                 }
                 Ok(Err(e)) => {
-                    warn!(
-                        %digest,
-                        size_bytes = digest.size_bytes(),
-                        ?e,
-                        "proxy_cache: failed to cache proxied blob in inner store"
-                    );
+                    // FU-6: best-effort cache fan-out abandonments are
+                    // benign — the Bazel read already succeeded and the
+                    // blob is durable via the worker's own upload.  Demote
+                    // to debug! so operators are not alarmed.  Genuine
+                    // cache-write failures (disk error, OOM, connection
+                    // drop) keep warn! so the signal is not lost.
+                    if is_cache_fanout_abandonment(&e) {
+                        debug!(
+                            %digest,
+                            size_bytes = digest.size_bytes(),
+                            ?e,
+                            "proxy_cache: cache fan-out abandoned (best-effort, \
+                             not a genuine failure — FU-6)",
+                        );
+                    } else {
+                        warn!(
+                            %digest,
+                            size_bytes = digest.size_bytes(),
+                            ?e,
+                            "proxy_cache: failed to cache proxied blob in inner store"
+                        );
+                    }
                     Err(e)
                 }
                 Err(_elapsed) => {

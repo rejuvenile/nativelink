@@ -613,13 +613,7 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
             // The Bazel read already succeeded; the blob is durable. Demote
             // to debug! to avoid misleading error!. Genuine inner-store
             // write failures (disk error, any other code/message) keep error!.
-            let is_cache_fanout_abandonment = err.code == Code::Aborted
-                && err.messages.iter().any(|m| {
-                    m.contains(
-                        crate::worker_proxy_store::CACHE_FANOUT_ABANDONED_MARKER,
-                    )
-                });
-            if is_cache_fanout_abandonment {
+            if crate::worker_proxy_store::is_cache_fanout_abandonment(err) {
                 debug!(
                     ?digest,
                     elapsed_ms,

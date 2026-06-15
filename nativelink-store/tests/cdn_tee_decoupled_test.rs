@@ -41,11 +41,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use nativelink_config::stores::{EvictionPolicy, ExistenceCacheSpec, FilesystemSpec, MemorySpec, NoopSpec, StoreSpec};
+use nativelink_config::stores::{
+    EvictionPolicy, ExistenceCacheSpec, FastSlowSpec, FilesystemSpec, MemorySpec, NoopSpec,
+    StoreDirection, StoreSpec,
+};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
 use nativelink_store::existence_cache_store::ExistenceCacheStore;
+use nativelink_store::fast_slow_store::FastSlowStore;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
@@ -1173,9 +1177,20 @@ async fn cdn_tee_happy_path_huge_chunk_count_caches_all_bytes()
 // `debug!` instead of `error!`.
 //
 // Production composition: real WPS + ExistenceCacheStore wrapping
-// SlowUpdateInnerStore (matches the existence-cache layer in the
-// production CAS chain). Slow update ensures the 4-slot mpsc fills
-// and the Full-abandon path fires.
+// DelayedReadInnerStore (matches the existence-cache layer in the
+// production CAS chain — see production seam list below). Delayed
+// read ensures the 4-slot mpsc fills and the Full-abandon path fires.
+//
+// Production seam list (ordered producer → classifier):
+//   1. WorkerProxyStore (producer: send_error on Full-abandon)
+//   2. VerifyStore — analytically verified to preserve Code::Aborted
+//      and the CACHE_FANOUT_ABANDONED_MARKER string via err_tip_with_code
+//      (preserves code); marker is in messages[0] and survives the chain.
+//      Not a test seam here; see distsys review NIT acknowledgement.
+//   3. ExistenceCacheStore (classifier: this test's seam — covered)
+//   The two FastSlowStore classifier seams are covered by
+//   cdn_tee_fss_nc_abandonment_does_not_emit_error_log (non-chunked)
+//   and cdn_tee_fss_chunked_abandonment_does_not_emit_error_log (chunked).
 //
 // Test uses `#[nativelink_test]` (= `#[traced_test]`); `logs_contain`
 // checks all captured log events regardless of level.
@@ -1296,12 +1311,12 @@ async fn cdn_tee_abandonment_does_not_emit_error_log() -> Result<(), Error> {
          bypasses the demotion check and restores the error! path (FU-6 regression)",
     );
 
-    assert!(
-        !logs_contain("data stream failed"),
-        "FU-6 Test A: cache fan-out abandonment MUST NOT log 'data stream \
-         failed' at any level — that is the FastSlowStore error! message which \
-         should be demoted to debug! on abandonment. Same mutation as above.",
-    );
+    // NOTE: we do NOT assert !logs_contain("data stream failed") here
+    // because FastSlowStore is not in this test's composition — the
+    // assertion would be vacuously true and create false seam-coverage
+    // confidence (testing-czar finding T3).  That string is guarded
+    // meaningfully by cdn_tee_fss_nc_abandonment_does_not_emit_error_log
+    // and cdn_tee_fss_chunked_abandonment_does_not_emit_error_log.
 
     // Sanity: the debug-level abandonment log MUST be present (proves the
     // demotion path fired, not that we silently swallowed the error).
@@ -1394,6 +1409,408 @@ async fn genuine_update_failure_still_logs_error_level() -> Result<(), Error> {
          Mutation check: changing the demotion condition in \
          existence_cache_store::update to always-true would silence the error! \
          and cause this assertion to fail — FU-6 over-demotion guard",
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Test 11 (FU-6 Test A-FSS-NC): FastSlowStore non-chunked demotion seam
+// ---------------------------------------------------------------------
+//
+// Invariant: a best-effort background cache fan-out abandonment MUST NOT
+// produce `error!` "FastSlowStore::update: data stream failed" from the
+// non-chunked update path (fast_slow_store.rs:~5247).
+//
+// Mechanism: WPS sends Code::Aborted+CACHE_FANOUT_ABANDONED_MARKER via
+// send_error; FSS's data_stream_fut reads it from cache_rx via
+// reader.recv().err_tip(...)?; the outer `if let Err(err) = data_res`
+// check at ~5228 calls is_cache_fanout_abandonment and demotes to debug!.
+//
+// Production composition: WPS → FastSlowStore{fast: SlowUpdateInnerStore,
+// slow: MemoryStore}.  SlowUpdateInnerStore sleeps 3s before draining
+// fast_rx so fast_tx (128-slot) fills after ~128 × 64 KiB = 8 MiB of
+// forwarding, causing data_stream_fut to block on fast_guard.send(buffer)
+// → cache_rx is not drained → 4-slot WPS cache mpsc fills → Full-abandon
+// fires → send_error → data_stream_fut's reader.recv() returns Err(Aborted)
+// → FSS non-chunked error check at ~5228 classifies correctly.
+//
+// Mutation verification: comment out the
+// `is_cache_fanout_abandonment(&err)` check in fast_slow_store.rs at the
+// non-chunked site (force the `else` branch always). The `error!` fires.
+// This test fails with: "FU-6 Test A-FSS-NC: FSS non-chunked seam MUST
+// NOT log 'data stream failed' on abandonment".
+#[nativelink_test]
+async fn cdn_tee_fss_nc_abandonment_does_not_emit_error_log() -> Result<(), Error> {
+    // 16 MiB blob with 64 KiB chunks → 256 iterations.
+    // fast_tx has 128 slots; after 128 sends SlowUpdateInnerStore is still
+    // sleeping (has not yet drained fast_rx), so fast_guard.send(buffer)
+    // blocks on the 129th chunk.  cache_rx stalls → WPS 4-slot mpsc fills
+    // → Full-abandon fires → send_error(Aborted+MARKER).
+    let value = test_value(16 * 1024 * 1024);
+    let digest = digest_for_size(value.len() as u64);
+
+    // FSS fast store: SlowUpdateInnerStore sleeps 3s before draining
+    // fast_rx. This backs up fast_tx (128-slot), which backs up
+    // cache_rx (4-slot WPS mpsc) → Full-abandon → send_error(Aborted+MARKER).
+    let slow_fast = Store::new(Arc::new(SlowUpdateInnerStore {
+        sleep: Duration::from_secs(3),
+        update_calls: AtomicU64::new(0),
+    }));
+    // FSS slow store: MemoryStore — succeeds instantly for the slow-write
+    // background spawn (only reached after data_stream_fut completes,
+    // which in the error path it doesn't — the test just exercises the
+    // data_stream_fut error path).
+    let fss_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss_arc = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        slow_fast,
+        fss_slow,
+    );
+    let fss = Store::new(fss_arc);
+
+    // Peer: serves the blob in 64 KiB chunks at full speed so that the
+    // Bazel-side fetch completes before the slow cache side.
+    let peer_inner = Store::new(Arc::new(ChunkedPeerStore {
+        payload: Bytes::from(value.clone()),
+        chunk_size: 64 * 1024,
+        inter_chunk_sleep_ms: AtomicU64::new(0),
+    }));
+
+    let (proxy_arc, _locality) = build_proxy_with_peer(
+        fss,
+        peer_inner,
+        digest,
+        "grpc://cdn-tee-fu6-fss-nc-peer:50082",
+    );
+    let proxy = Store::new(proxy_arc.clone());
+
+    // Drive the Bazel-side fetch. MUST complete even though the cache
+    // (FSS fast store) is slow.
+    let bytes = tokio::time::timeout(
+        TEST_TIMEOUT,
+        proxy.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — Bazel-side fetch must complete within 10s \
+         despite slow FSS fast store (FU-6 Test A-FSS-NC: decoupling violated \
+         if this times out)",
+    )?;
+    assert_eq!(
+        bytes.len(),
+        value.len(),
+        "Bazel must receive every byte even when FSS cache abandons",
+    );
+
+    // Full-abandon MUST have fired (proves the tested path ran).
+    let (attempts, _completed, full, _eof) = proxy_arc.cdn_tee_counters_snapshot();
+    assert_eq!(attempts, 1, "exactly one cache attempt (FU-6 Test A-FSS-NC)");
+    assert!(
+        full >= 1,
+        "abandon-on-full MUST fire with 16 MiB blob and slow FSS fast store \
+         (fast_tx fills after 128 × 64 KiB = 8 MiB, blocking data_stream_fut, \
+         backing up the 4-slot WPS mpsc); observed full={full} — FSS \
+         non-chunked demotion path was not exercised (FU-6 Test A-FSS-NC)",
+    );
+
+    // Poll until the FSS non-chunked demotion debug! fires.
+    // FSS's data_stream_fut sees Err(Aborted+MARKER) from cache_rx
+    // after the 3s SlowUpdateInnerStore sleep + WPS send_error.
+    let cache_task_deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    loop {
+        if logs_contain("cache fan-out abandoned") {
+            break;
+        }
+        if std::time::Instant::now() >= cache_task_deadline {
+            panic!(
+                "must not deadlock — FSS non-chunked demotion path must fire \
+                 within {:?} (FU-6 Test A-FSS-NC: is_cache_fanout_abandonment \
+                 check at fast_slow_store.rs non-chunked site must have fired)",
+                TEST_TIMEOUT,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // CRITICAL: FSS non-chunked error! MUST be absent.
+    assert!(
+        !logs_contain("data stream failed"),
+        "FU-6 Test A-FSS-NC: cache fan-out abandonment MUST NOT log \
+         'data stream failed' — that is the FastSlowStore::update error! \
+         message (non-chunked site, fast_slow_store.rs:~5247). \
+         Mutation check: comment out the is_cache_fanout_abandonment branch \
+         at the non-chunked FSS site — the else-branch fires error! and this \
+         assertion fails (FU-6 FSS non-chunked seam regression)",
+    );
+
+    // Sanity: demotion debug! must be present.
+    assert!(
+        logs_contain("cache fan-out abandoned"),
+        "FU-6 Test A-FSS-NC: debug! demotion log MUST fire (proves the \
+         FSS non-chunked demotion path ran, not that the error was swallowed)",
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Test 12 (FU-6 Test A-FSS chunked): FastSlowStore chunked demotion seam
+// ---------------------------------------------------------------------
+//
+// Invariant: same as Test A-FSS-NC but for the chunked dispatch path
+// (fast_slow_store.rs:~2014).  The chunked site fires when a chunked
+// dispatcher is installed AND the kill-switch is ON AND the blob ≥ the
+// size threshold.
+//
+// Mechanism: the chunked data_stream_fut tees to fast_tx AND chunk_tx.
+// When the upstream cache_rx delivers Err(Aborted+MARKER), data_stream_fut
+// propagates it via `?`. The outer `if let Err(err) = data_res` at ~2003
+// calls is_cache_fanout_abandonment and logs debug! instead of error!.
+//
+// Production composition: WPS → FastSlowStore{fast: SlowUpdateInnerStore,
+// slow: MemoryStore} with a draining BazelChunkedDispatcher and
+// set_chunked_size_threshold_for_test(1) so the threshold is always met.
+//
+// Mutation verification: comment out the is_cache_fanout_abandonment branch
+// at the chunked FSS site (fast_slow_store.rs:~2003). The `else` branch
+// fires error!. This test fails with: "FU-6 Test A-FSS-chunked: FSS
+// chunked seam MUST NOT log 'data stream failed' on abandonment".
+#[cfg(all(feature = "chunked_fast_slow", feature = "test-utils"))]
+#[nativelink_test]
+async fn cdn_tee_fss_chunked_abandonment_does_not_emit_error_log() -> Result<(), Error> {
+    use std::sync::OnceLock;
+
+    use nativelink_store::chunked::{
+        BazelChunkedDispatcher, BazelChunkedDispatcherArc, disable_bazel_facing_internal_chunking,
+        enable_bazel_facing_internal_chunking,
+    };
+    use nativelink_util::buf_channel::DropCloserReadHalf as ChunkedReadHalf;
+
+    // Process-wide kill-switch is global state; serialize with a
+    // per-process Mutex so sibling tests in the same binary don't race.
+    static CHUNK_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let _kill_guard = CHUNK_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    // Draining dispatcher: absorbs all chunks from chunk_rx quickly so
+    // the data_stream_fut isn't blocked on chunk_tx backpressure.
+    // Returns Ok as soon as the reader hits EOF or error.
+    #[derive(Debug)]
+    struct DrainingDispatcher;
+    #[async_trait::async_trait]
+    impl BazelChunkedDispatcher for DrainingDispatcher {
+        async fn dispatch(
+            &self,
+            digest: DigestInfo,
+            mut reader: ChunkedReadHalf,
+        ) -> Result<u64, nativelink_error::Error> {
+            loop {
+                let buf = reader.recv().await?;
+                if buf.is_empty() {
+                    break;
+                }
+            }
+            Ok(digest.size_bytes())
+        }
+    }
+
+    // 16 MiB blob (same sizing rationale as A-FSS-NC; fast_tx fills after
+    // 128 × 64 KiB = 8 MiB of forwarding → data_stream_fut blocks →
+    // cache_rx backs up → Full-abandon fires).
+    let value = test_value(16 * 1024 * 1024);
+    let digest = digest_for_size(value.len() as u64);
+
+    // FSS fast store: SlowUpdateInnerStore (same role as A-FSS-NC: backs
+    // up fast_tx → backs up cache_rx → Full-abandon → send_error).
+    let slow_fast = Store::new(Arc::new(SlowUpdateInnerStore {
+        sleep: Duration::from_secs(3),
+        update_calls: AtomicU64::new(0),
+    }));
+    let fss_slow = Store::new(MemoryStore::new(&MemorySpec::default()));
+    let fss_arc = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        slow_fast,
+        fss_slow,
+    );
+    // Wire the dispatcher + lower size threshold to 1 byte so this
+    // blob always takes the chunked path.
+    let dispatcher: BazelChunkedDispatcherArc = Arc::new(DrainingDispatcher);
+    fss_arc.set_bazel_chunked_dispatcher(dispatcher);
+    fss_arc.set_chunked_size_threshold_for_test(1);
+    enable_bazel_facing_internal_chunking();
+
+    let fss = Store::new(fss_arc);
+
+    let peer_inner = Store::new(Arc::new(ChunkedPeerStore {
+        payload: Bytes::from(value.clone()),
+        chunk_size: 64 * 1024,
+        inter_chunk_sleep_ms: AtomicU64::new(0),
+    }));
+
+    let (proxy_arc, _locality) = build_proxy_with_peer(
+        fss,
+        peer_inner,
+        digest,
+        "grpc://cdn-tee-fu6-fss-chunked-peer:50083",
+    );
+    let proxy = Store::new(proxy_arc.clone());
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        proxy.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — Bazel-side fetch must complete within 10s \
+         (FU-6 Test A-FSS-chunked: decoupling violated if this times out)",
+    );
+    // Restore kill-switch before any assertion can panic.
+    disable_bazel_facing_internal_chunking();
+
+    result.map_err(|e| {
+        make_err!(
+            Code::Internal,
+            "FU-6 Test A-FSS-chunked: Bazel fetch failed: {e:?}"
+        )
+    })?;
+
+    let (attempts, _completed, full, _eof) = proxy_arc.cdn_tee_counters_snapshot();
+    assert_eq!(
+        attempts, 1,
+        "exactly one cache attempt (FU-6 Test A-FSS-chunked)"
+    );
+    assert!(
+        full >= 1,
+        "abandon-on-full MUST fire with 16 MiB blob and slow FSS fast store; \
+         observed full={full} — FSS chunked demotion path was not exercised \
+         (FU-6 Test A-FSS-chunked)",
+    );
+
+    let cache_task_deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    loop {
+        if logs_contain("cache fan-out abandoned") {
+            break;
+        }
+        if std::time::Instant::now() >= cache_task_deadline {
+            panic!(
+                "must not deadlock — FSS chunked demotion path must fire \
+                 within {:?} (FU-6 Test A-FSS-chunked: is_cache_fanout_abandonment \
+                 check at fast_slow_store.rs chunked site must have fired)",
+                TEST_TIMEOUT,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        !logs_contain("data stream failed"),
+        "FU-6 Test A-FSS-chunked: cache fan-out abandonment MUST NOT log \
+         'data stream failed' — that is the FastSlowStore::update (chunked) \
+         error! message (fast_slow_store.rs:~2022). \
+         Mutation check: comment out the is_cache_fanout_abandonment branch \
+         at the chunked FSS site — the else-branch fires error! and this \
+         assertion fails (FU-6 FSS chunked seam regression)",
+    );
+
+    assert!(
+        logs_contain("cache fan-out abandoned"),
+        "FU-6 Test A-FSS-chunked: debug! demotion log MUST fire (proves the \
+         FSS chunked demotion path ran)",
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Test 13 (FU-6 Test B-FSS): FSS genuine failure still logs error!
+// ---------------------------------------------------------------------
+//
+// Invariant: a GENUINE data-stream failure through FastSlowStore MUST
+// still produce `error!` "FastSlowStore::update: data stream failed".
+// This is the over-demotion guard for the FSS non-chunked site: it
+// proves is_cache_fanout_abandonment is scoped and does NOT blanket-demote
+// all update failures.
+//
+// Mechanism: inject a Code::Internal error directly into the reader
+// passed to FSS::update.  The error does NOT contain
+// CACHE_FANOUT_ABANDONED_MARKER, so is_cache_fanout_abandonment returns
+// false and the `else` branch fires error!.
+//
+// Mutation verification: in fast_slow_store.rs at the non-chunked site,
+// change `is_cache_fanout_abandonment(&err)` to `true` (always demote).
+// The error! disappears.  This test fails with: "FU-6 Test B-FSS: a
+// genuine FSS data-stream failure MUST log 'data stream failed'".
+#[nativelink_test]
+async fn fss_genuine_update_failure_still_logs_error_level() -> Result<(), Error> {
+    // Build a FastSlowStore with MemoryStore on both tiers. We only care
+    // about the data_stream_fut error path; neither store is reached before
+    // the error fires.
+    let fss_arc = FastSlowStore::new(
+        &FastSlowSpec {
+            fast: StoreSpec::Memory(MemorySpec::default()),
+            slow: StoreSpec::Memory(MemorySpec::default()),
+            fast_direction: StoreDirection::default(),
+            slow_direction: StoreDirection::default(),
+            chunked_reads_enabled: false,
+            slow_writes_in_flight_max_bytes: 0,
+        },
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+        Store::new(MemoryStore::new(&MemorySpec::default())),
+    );
+    let fss = Store::new(fss_arc);
+
+    // Inject a genuine Code::Internal error that does NOT carry
+    // CACHE_FANOUT_ABANDONED_MARKER.  FSS's data_stream_fut sees
+    // reader.recv() return this error; is_cache_fanout_abandonment returns
+    // false; the else-branch fires error!.
+    let (mut tx, rx) = make_buf_channel_pair();
+    tx.send_error(make_err!(
+        Code::Internal,
+        "genuine disk failure — not a cache fan-out abandonment"
+    ));
+
+    let digest = DigestInfo::try_new(VALID_HASH1, 4)?;
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        fss.update(StoreKey::from(digest), rx, UploadSizeInfo::ExactSize(4)),
+    )
+    .await
+    .expect(
+        "must not deadlock — FastSlowStore::update must complete within 10s \
+         on reader error (FU-6 Test B-FSS: genuine update failure guard)",
+    );
+
+    assert!(
+        result.is_err(),
+        "genuine data-stream failure must propagate as Err (FU-6 Test B-FSS)",
+    );
+
+    // The ERROR log MUST fire for genuine failures.
+    assert!(
+        logs_contain("data stream failed"),
+        "FU-6 Test B-FSS: a genuine data-stream failure (Code::Internal, \
+         no CACHE_FANOUT_ABANDONED_MARKER) MUST log 'data stream failed' \
+         (the error! message in FastSlowStore::update non-chunked). \
+         Mutation check: changing is_cache_fanout_abandonment to always-true \
+         at the FSS non-chunked site would silence the error! and cause this \
+         assertion to fail — FU-6 FSS over-demotion guard",
     );
 
     Ok(())
