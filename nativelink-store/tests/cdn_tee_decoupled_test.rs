@@ -41,17 +41,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use nativelink_config::stores::{EvictionPolicy, FilesystemSpec, MemorySpec};
+use nativelink_config::stores::{EvictionPolicy, ExistenceCacheSpec, FilesystemSpec, MemorySpec, NoopSpec, StoreSpec};
 use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_metric::MetricsComponent;
+use nativelink_store::existence_cache_store::ExistenceCacheStore;
 use nativelink_store::filesystem_store::{FileEntryImpl, FilesystemStore};
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_store::worker_proxy_store::WorkerProxyStore;
 use nativelink_util::blob_locality_map::{
     SharedBlobLocalityMap, new_shared_blob_locality_map,
 };
-use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
+use nativelink_util::buf_channel::{
+    DropCloserReadHalf, DropCloserWriteHalf, make_buf_channel_pair,
+};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::health_utils::{HealthStatusIndicator, default_health_status_indicator};
 use nativelink_util::store_trait::{
@@ -1149,6 +1152,253 @@ async fn cdn_tee_happy_path_huge_chunk_count_caches_all_bytes()
     Ok(())
 }
 
+// ---------------------------------------------------------------------
+// Test 9 (FU-6 Test A): cache fan-out abandonment must NOT emit error!
+// ---------------------------------------------------------------------
+//
+// Invariant: a best-effort background cache fan-out abandonment
+// (downloader outraced the cache mpsc — Bazel read already succeeded,
+// blob durable via the worker's own upload) MUST NOT produce an
+// `error!`-level log from the inner store's `update()` site.
+//
+// Mechanism violation (pre-fix): `WorkerProxyStore` dropped `cache_tx`
+// without signalling the abandonment; inner stores saw a generic
+// "Sender dropped before sending EOF" (`Code::Internal`) and logged
+// `error!`. This is benign but operationally misleading.
+//
+// Mechanism re-establishing (the fix): `WorkerProxyStore` calls
+// `cache_tx.send_error(make_err!(Code::Aborted, CACHE_FANOUT_ABANDONED_MARKER))`
+// before dropping on every intentional-abandon path. Inner stores
+// detect `Code::Aborted + CACHE_FANOUT_ABANDONED_MARKER` and log
+// `debug!` instead of `error!`.
+//
+// Production composition: real WPS + ExistenceCacheStore wrapping
+// SlowUpdateInnerStore (matches the existence-cache layer in the
+// production CAS chain). Slow update ensures the 4-slot mpsc fills
+// and the Full-abandon path fires.
+//
+// Test uses `#[nativelink_test]` (= `#[traced_test]`); `logs_contain`
+// checks all captured log events regardless of level.
+//
+// Mutation verification: comment out the `tx.send_error(...)` call in
+// the `TrySendError::Full` arm of `get_part_and_cache_inner`. The inner
+// stores receive `Code::Internal "Sender dropped before sending EOF"`,
+// which does NOT match `CACHE_FANOUT_ABANDONED_MARKER`, so `error!`
+// fires. The assertion `!logs_contain("ERROR") || !logs_contain("inner \
+// store write failed")` fails with the bespoke message naming the
+// mutation.
+#[nativelink_test]
+async fn cdn_tee_abandonment_does_not_emit_error_log() -> Result<(), Error> {
+    // 8 MiB blob with 64 KiB chunks → ~128 iterations → mpsc fills fast
+    // with a 5s-sleeping inner store.
+    let value = test_value(8 * 1024 * 1024);
+    let digest = digest_for_size(value.len() as u64);
+
+    // Production-composition inner: ExistenceCacheStore wrapping
+    // DelayedReadInnerStore. The existence cache layer IS the one that
+    // fires "ExistenceCacheStore::update: inner store write failed" in
+    // the production error log (FU-6 finding). DelayedReadInnerStore
+    // sleeps before reading so the 4-slot mpsc fills (Full-abandon fires),
+    // then reads from the reader and propagates the Aborted error.
+    let delayed_inner = Store::new(Arc::new(DelayedReadInnerStore {
+        sleep: Duration::from_secs(3),
+    }));
+    let ec_inner = Store::new(ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Noop(NoopSpec::default()),
+            eviction_policy: None,
+            log_not_found_at_info: false,
+        },
+        delayed_inner,
+    ));
+
+    let peer_inner = Store::new(Arc::new(ChunkedPeerStore {
+        payload: Bytes::from(value.clone()),
+        chunk_size: 64 * 1024,
+        inter_chunk_sleep_ms: AtomicU64::new(0),
+    }));
+
+    let (proxy_arc, _locality) = build_proxy_with_peer(
+        ec_inner.clone(),
+        peer_inner,
+        digest,
+        "grpc://cdn-tee-fu6-test-a-peer:50081",
+    );
+    let proxy = Store::new(proxy_arc.clone());
+
+    // Drive the fetch. Bazel must receive all bytes even with the slow cache.
+    let bytes = tokio::time::timeout(
+        TEST_TIMEOUT,
+        proxy.get_part_unchunked(digest, 0, None),
+    )
+    .await
+    .expect(
+        "must not deadlock — Bazel-side fetch must complete within 10s \
+         with slow inner; coupling violation if this times out (FU-6 Test A)",
+    )?;
+    assert_eq!(
+        bytes.len(),
+        value.len(),
+        "Bazel must receive every byte even when cache abandons",
+    );
+
+    // The abandon-on-full counter MUST have fired (proving the tested path ran).
+    let (attempts, _completed, full, _eof) = proxy_arc.cdn_tee_counters_snapshot();
+    assert_eq!(attempts, 1, "exactly one cache attempt");
+    assert!(
+        full >= 1,
+        "abandon-on-full MUST fire with 5s-sleeping inner and 8 MiB blob; \
+         observed full={full} — the log-demotion path was never exercised \
+         if this fires (FU-6 Test A)",
+    );
+
+    // Wait for the cache task to complete: it sleeps 3s in
+    // DelayedReadInnerStore then reads from cache_rx and gets the Aborted
+    // signal. Poll until "cache fan-out abandoned" fires in THIS TEST's
+    // log (the ExistenceCacheStore debug! demotion message), or
+    // TEST_TIMEOUT expires. `logs_contain` is test-local (per-test
+    // capture from #[traced_test]); it is safe to call in a polling loop.
+    let cache_task_deadline = std::time::Instant::now() + TEST_TIMEOUT;
+    loop {
+        if logs_contain("cache fan-out abandoned") {
+            break;
+        }
+        if std::time::Instant::now() >= cache_task_deadline {
+            panic!(
+                "must not deadlock — cache task must complete within {:?} \
+                 and log 'cache fan-out abandoned' (FU-6 Test A: demotion \
+                 path must fire within the test timeout)",
+                TEST_TIMEOUT
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // CRITICAL assertion: the inner-store write-failure ERROR message
+    // must NOT appear in this test's log. Pre-fix, the abandonment
+    // surfaced as "ExistenceCacheStore::update: inner store write failed".
+    // Post-fix, the demotion path logs "cache fan-out abandoned (best-effort)"
+    // at DEBUG instead. The original "inner store write failed" message is
+    // entirely absent from the demoted path.
+    //
+    // `logs_contain` is test-local (injected by #[traced_test] via
+    // #[nativelink_test]) and checks all captured events regardless of level.
+    // We assert the old error message does NOT appear (it has been replaced
+    // by the new debug message).
+    assert!(
+        !logs_contain("inner store write failed"),
+        "FU-6 Test A: cache fan-out abandonment MUST NOT log 'inner store \
+         write failed' at any level — that message is from the error! path \
+         which should have been demoted to debug! with 'cache fan-out \
+         abandoned'. Mutation check: the `tx.send_error(...)` in the \
+         Full-abandon arm of get_part_and_cache_inner must be in place; \
+         removing it causes Code::Internal (not Code::Aborted+MARKER) which \
+         bypasses the demotion check and restores the error! path (FU-6 regression)",
+    );
+
+    assert!(
+        !logs_contain("data stream failed"),
+        "FU-6 Test A: cache fan-out abandonment MUST NOT log 'data stream \
+         failed' at any level — that is the FastSlowStore error! message which \
+         should be demoted to debug! on abandonment. Same mutation as above.",
+    );
+
+    // Sanity: the debug-level abandonment log MUST be present (proves the
+    // demotion path fired, not that we silently swallowed the error).
+    assert!(
+        logs_contain("cache fan-out abandoned"),
+        "FU-6 Test A: the debug! demotion log MUST fire when abandonment is \
+         detected — absence means the demotion check did not run at all",
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Test 10 (FU-6 Test B): genuine update failure still logs error!
+// ---------------------------------------------------------------------
+//
+// Invariant: a GENUINE inner-store write failure (not a best-effort
+// cache fan-out abandonment) MUST still produce an `error!`-level log
+// from `ExistenceCacheStore::update`. This is the over-demotion guard:
+// it proves the `CACHE_FANOUT_ABANDONED_MARKER` check is scoped and
+// does NOT blanket-demote all update failures.
+//
+// Test composition: ExistenceCacheStore wrapping a FailingInnerStore
+// that returns `Code::Internal, "genuine disk failure"` on every
+// `update()`. The error code is Internal (not Aborted) and the message
+// does NOT contain CACHE_FANOUT_ABANDONED_MARKER, so the demotion
+// check evaluates to false and `error!` fires.
+//
+// Mutation verification: in `existence_cache_store::update`, change the
+// demotion condition to `true` (always demote). The `error!` disappears
+// and this test fails with the bespoke "ERROR must still appear"
+// message.
+#[nativelink_test]
+async fn genuine_update_failure_still_logs_error_level() -> Result<(), Error> {
+    // FailingInnerStore: always returns Code::Internal on update().
+    // Message deliberately does NOT contain CACHE_FANOUT_ABANDONED_MARKER.
+    let failing = Store::new(Arc::new(FailingUpdateInnerStore {
+        err_code: Code::Internal,
+        err_msg: "genuine disk failure — not a cache fan-out abandonment",
+    }));
+    let ec_store = Store::new(ExistenceCacheStore::new(
+        &ExistenceCacheSpec {
+            backend: StoreSpec::Noop(NoopSpec::default()),
+            eviction_policy: None,
+            log_not_found_at_info: false,
+        },
+        failing,
+    ));
+
+    let digest = DigestInfo::try_new(VALID_HASH1, 4)?;
+    // Write a short payload via a channel that sends 4 bytes then EOF.
+    let (mut tx, rx) = make_buf_channel_pair();
+    tx.send(Bytes::from_static(b"data")).await.map_err(|e| {
+        make_err!(Code::Internal, "test: tx.send failed: {e:?}")
+    })?;
+    tx.send_eof().map_err(|e| {
+        make_err!(Code::Internal, "test: tx.send_eof failed: {e:?}")
+    })?;
+
+    let result = tokio::time::timeout(
+        TEST_TIMEOUT,
+        ec_store.update(StoreKey::from(digest), rx, UploadSizeInfo::ExactSize(4)),
+    )
+    .await
+    .expect(
+        "must not deadlock — ExistenceCacheStore::update must complete within 10s \
+         even on inner failure (FU-6 Test B: genuine update failure guard)",
+    );
+
+    assert!(
+        result.is_err(),
+        "genuine inner-store failure must propagate as Err (FU-6 Test B)",
+    );
+    assert_eq!(
+        result.unwrap_err().code,
+        Code::Internal,
+        "genuine failure code must be preserved through ExistenceCacheStore (FU-6 Test B)",
+    );
+
+    // The ERROR log MUST fire — genuine failures must not be silently demoted.
+    // `logs_contain` is test-local and covers all captured levels; the
+    // exact "inner store write failed" string comes from the `error!` macro
+    // in ExistenceCacheStore::update (unchanged by the FU-6 fix for
+    // non-abandonment errors).
+    assert!(
+        logs_contain("inner store write failed"),
+        "FU-6 Test B: a genuine inner-store write failure (Code::Internal, \
+         no CACHE_FANOUT_ABANDONED_MARKER) MUST log 'inner store write failed' \
+         (the error! message in ExistenceCacheStore::update). \
+         Mutation check: changing the demotion condition in \
+         existence_cache_store::update to always-true would silence the error! \
+         and cause this assertion to fail — FU-6 over-demotion guard",
+    );
+
+    Ok(())
+}
+
 // =====================================================================
 // Test fixtures (slow / throttled inner stores; on-disk file probe)
 // =====================================================================
@@ -1279,6 +1529,177 @@ impl StoreDriver for ThrottledFirstChunkInnerStore {
         length: Option<u64>,
     ) -> Result<(), Error> {
         self.delegate.get_part(key, writer, offset, length).await
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+/// Inner store that always returns a specified error on `update()`.
+/// Used by Test 10 (FU-6 Test B) to verify that genuine failures (those
+/// NOT carrying `CACHE_FANOUT_ABANDONED_MARKER`) still produce `error!`
+/// from `ExistenceCacheStore::update`.
+#[derive(Debug, MetricsComponent)]
+struct FailingUpdateInnerStore {
+    err_code: Code,
+    err_msg: &'static str,
+}
+
+default_health_status_indicator!(FailingUpdateInnerStore);
+
+#[async_trait]
+impl StoreDriver for FailingUpdateInnerStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        for slot in results.iter_mut().take(digests.len()) {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Drain the reader so the producer doesn't wedge, then fail.
+        let _ = reader.drain().await;
+        Err(make_err!(self.err_code, "{}", self.err_msg))
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(Code::NotFound, "FailingUpdateInnerStore: not found"))
+    }
+
+    fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {
+        self
+    }
+
+    fn as_any<'a>(&'a self) -> &'a (dyn core::any::Any + Sync + Send + 'static) {
+        self
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+        self
+    }
+
+    fn register_item_callback(
+        self: Arc<Self>,
+        _callback: Arc<dyn ItemCallback>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+        StableDigestDelegation::Leaf
+    }
+
+    fn pin_delegation(&self) -> PinDelegation<'_> {
+        PinDelegation::Leaf
+    }
+
+    fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+        MarkStableDelegation::Leaf
+    }
+}
+
+/// Inner store that sleeps `sleep` before reading from the reader, then
+/// propagates any read error. Used by Test 9 (FU-6 Test A) to simulate
+/// the production scenario where the inner store is slow to drain
+/// `cache_rx` (causing the mpsc to fill and the Full-abandon path to
+/// fire), then attempts to read and receives the `Code::Aborted`
+/// abandonment signal via `send_error`.
+///
+/// Unlike `SlowUpdateInnerStore` (which ignores read errors), this
+/// store propagates them so `ExistenceCacheStore::update` sees the
+/// `Code::Aborted + CACHE_FANOUT_ABANDONED_MARKER` error and can
+/// exercise its demotion path.
+#[derive(Debug, MetricsComponent)]
+struct DelayedReadInnerStore {
+    sleep: Duration,
+}
+
+default_health_status_indicator!(DelayedReadInnerStore);
+
+#[async_trait]
+impl StoreDriver for DelayedReadInnerStore {
+    async fn has_with_results(
+        self: Pin<&Self>,
+        digests: &[StoreKey<'_>],
+        results: &mut [Option<u64>],
+    ) -> Result<(), Error> {
+        for slot in results.iter_mut().take(digests.len()) {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    async fn update(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        mut reader: DropCloserReadHalf,
+        _upload_size: UploadSizeInfo,
+    ) -> Result<(), Error> {
+        // Sleep before reading, giving the forward loop time to fill
+        // the 4-slot mpsc and trigger the Full-abandon + send_error path.
+        tokio::time::sleep(self.sleep).await;
+        // Read and propagate errors (unlike SlowUpdateInnerStore which
+        // uses `let _drained = reader.drain().await` to discard errors).
+        // After the Full-abandon, reader.recv() returns Err(Code::Aborted)
+        // with the CACHE_FANOUT_ABANDONED_MARKER, which is propagated to
+        // the ExistenceCacheStore::update error-check site.
+        reader.drain().await.err_tip(|| {
+            "DelayedReadInnerStore: reader.drain() failed (expected \
+             Aborted on abandonment path)"
+        })
+    }
+
+    async fn get_part(
+        self: Pin<&Self>,
+        _key: StoreKey<'_>,
+        _writer: &mut DropCloserWriteHalf,
+        _offset: u64,
+        _length: Option<u64>,
+    ) -> Result<(), Error> {
+        Err(make_err!(Code::NotFound, "DelayedReadInnerStore: not found"))
     }
 
     fn inner_store(&self, _key: Option<StoreKey>) -> &dyn StoreDriver {

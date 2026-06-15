@@ -275,6 +275,18 @@ const MIRROR_PERMITS_PER_WORKER: usize = 16;
 /// orphaned fetch indefinitely.
 const CDN_TEE_CACHE_MPSC_CAP: usize = 4;
 
+/// Typed signal written into `cache_tx` via `send_error` on every
+/// intentional best-effort cache fan-out abandonment (mpsc full or
+/// Bazel consumer disconnected). Inner stores (`fast_slow_store`,
+/// `existence_cache_store`) detect this marker to demote the resulting
+/// error log from `error!` to `debug!` — the Bazel read already
+/// succeeded and the blob is durable via the worker's own upload.
+///
+/// Inner-store demotion check: `err.code == Code::Aborted &&
+/// err.messages.iter().any(|m| m.contains(CACHE_FANOUT_ABANDONED_MARKER))`.
+pub const CACHE_FANOUT_ABANDONED_MARKER: &str =
+    "WorkerProxyStore: cache fan-out abandoned (best-effort)";
+
 /// Wall-clock cap on the CDN-tee spawned cache task (#230). The task runs
 /// `inner.update(cache_rx, ExactSize(digest.size_bytes()))`, which is
 /// bounded only by the cache mpsc and the inner store's own internals.
@@ -2253,6 +2265,18 @@ impl WorkerProxyStore {
                         .await
                         .err_tip(|| "get_part_and_cache: forwarding chunk")
                     {
+                        if let Some(ref mut tx) = cache_tx {
+                            // Signal intentional abandonment before dropping
+                            // so inner stores demote update-failure from
+                            // error! to debug! (FU-6). Consumer disconnect
+                            // is benign — Bazel is gone, blob will be
+                            // re-fetched by the next reader.
+                            tx.send_error(make_err!(
+                                Code::Aborted,
+                                "{CACHE_FANOUT_ABANDONED_MARKER}: \
+                                 bazel consumer disconnected at {total_bytes}B"
+                            ));
+                        }
                         if cache_tx.take().is_some() {
                             self.cdn_tee_cache_abandoned_consumer_eof_total
                                 .fetch_add(1, Ordering::Relaxed);
@@ -2287,6 +2311,26 @@ impl WorkerProxyStore {
                                      abandoning cache fan-out (Bazel reader \
                                      unaffected; next reader will re-fetch)"
                                 );
+                                // Signal the cache task that this is an
+                                // intentional abandonment (mpsc full, not a
+                                // producer crash). Inner stores
+                                // (`fast_slow_store`, `existence_cache_store`)
+                                // detect CACHE_FANOUT_ABANDONED_MARKER and
+                                // demote their update-failure log from
+                                // `error!` to `debug!`. Without this signal
+                                // they see a generic "Sender dropped before
+                                // sending EOF" (Code::Internal) and log
+                                // error! — benign but operationally
+                                // misleading (FU-6).
+                                if let Some(ref mut tx) = cache_tx {
+                                    tx.send_error(make_err!(
+                                        Code::Aborted,
+                                        "{CACHE_FANOUT_ABANDONED_MARKER}: \
+                                         cache mpsc full at {}/{} slots",
+                                        total_bytes,
+                                        CDN_TEE_CACHE_MPSC_CAP
+                                    ));
+                                }
                                 cache_tx.take();
                             }
                             Err(TrySendError::Closed(_)) => {

@@ -607,13 +607,36 @@ impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
         let result = self.inner_store.update(digest, reader, size_info).await;
         let elapsed_ms = update_start.elapsed().as_millis() as u64;
         if let Err(ref err) = result {
-            error!(
-                ?digest,
-                elapsed_ms,
-                existence_cache_inner_has_elapsed_us,
-                ?err,
-                "ExistenceCacheStore::update: inner store write failed",
-            );
+            // FU-6: intentional best-effort cache fan-out abandonments
+            // (WorkerProxyStore mpsc full or Bazel consumer disconnected)
+            // arrive as Code::Aborted with CACHE_FANOUT_ABANDONED_MARKER.
+            // The Bazel read already succeeded; the blob is durable. Demote
+            // to debug! to avoid misleading error!. Genuine inner-store
+            // write failures (disk error, any other code/message) keep error!.
+            let is_cache_fanout_abandonment = err.code == Code::Aborted
+                && err.messages.iter().any(|m| {
+                    m.contains(
+                        crate::worker_proxy_store::CACHE_FANOUT_ABANDONED_MARKER,
+                    )
+                });
+            if is_cache_fanout_abandonment {
+                debug!(
+                    ?digest,
+                    elapsed_ms,
+                    existence_cache_inner_has_elapsed_us,
+                    ?err,
+                    "ExistenceCacheStore::update: cache fan-out abandoned \
+                     (best-effort, not a genuine failure — FU-6)",
+                );
+            } else {
+                error!(
+                    ?digest,
+                    elapsed_ms,
+                    existence_cache_inner_has_elapsed_us,
+                    ?err,
+                    "ExistenceCacheStore::update: inner store write failed",
+                );
+            }
         } else if elapsed_ms > 100 {
             info!(
                 ?digest,

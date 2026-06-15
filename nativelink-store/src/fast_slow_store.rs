@@ -1994,12 +1994,34 @@ impl FastSlowStore {
             // "recent_chunked_cascade" in its failure log and confirm
             // whether this cascade plausibly perturbed shared state.
             cascade_diag::record_chunked_cascade(&format!("{digest}"));
-            error!(
-                ?key,
-                elapsed_ms = data_elapsed.as_millis() as u64,
-                ?err,
-                "FastSlowStore::update (chunked): data stream failed",
-            );
+            // FU-6: intentional best-effort cache fan-out abandonments
+            // arrive as Code::Aborted with CACHE_FANOUT_ABANDONED_MARKER.
+            // The Bazel read already succeeded; the blob is durable via
+            // the worker's own upload. Demote to debug! so operators
+            // are not alarmed by noise. Genuine failures (disk error,
+            // producer crash — any other code or message) keep error!.
+            if err.code == Code::Aborted
+                && err.messages.iter().any(|m| {
+                    m.contains(
+                        crate::worker_proxy_store::CACHE_FANOUT_ABANDONED_MARKER,
+                    )
+                })
+            {
+                debug!(
+                    ?key,
+                    elapsed_ms = data_elapsed.as_millis() as u64,
+                    ?err,
+                    "FastSlowStore::update (chunked): cache fan-out abandoned \
+                     (best-effort, not a genuine failure — FU-6)",
+                );
+            } else {
+                error!(
+                    ?key,
+                    elapsed_ms = data_elapsed.as_millis() as u64,
+                    ?err,
+                    "FastSlowStore::update (chunked): data stream failed",
+                );
+            }
             return Err(err);
         }
         if let Err(err) = &fast_res {
@@ -5197,12 +5219,34 @@ impl StoreDriver for FastSlowStore {
                     StoreKey::Str(s) => s.to_string(),
                 };
                 cascade_diag::record_stream_cascade(&digest_hash);
-                error!(
-                    ?key,
-                    elapsed_ms = update_start.elapsed().as_millis() as u64,
-                    ?err,
-                    "FastSlowStore::update: data stream failed",
-                );
+                // FU-6: intentional best-effort cache fan-out abandonments
+                // arrive as Code::Aborted with CACHE_FANOUT_ABANDONED_MARKER.
+                // The Bazel read already succeeded; the blob is durable via
+                // the worker's own upload. Demote to debug! so operators
+                // are not alarmed by noise. Genuine failures (disk error,
+                // producer crash — any other code or message) keep error!.
+                if err.code == Code::Aborted
+                    && err.messages.iter().any(|m| {
+                        m.contains(
+                            crate::worker_proxy_store::CACHE_FANOUT_ABANDONED_MARKER,
+                        )
+                    })
+                {
+                    debug!(
+                        ?key,
+                        elapsed_ms = update_start.elapsed().as_millis() as u64,
+                        ?err,
+                        "FastSlowStore::update: cache fan-out abandoned (best-effort, \
+                         not a genuine failure — FU-6)",
+                    );
+                } else {
+                    error!(
+                        ?key,
+                        elapsed_ms = update_start.elapsed().as_millis() as u64,
+                        ?err,
+                        "FastSlowStore::update: data stream failed",
+                    );
+                }
                 return Err(err);
             }
         };
