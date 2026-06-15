@@ -2978,11 +2978,105 @@ impl RunningActionImpl {
             state.execution_metadata.input_fetch_start_timestamp =
                 (self.running_actions_manager.callbacks.now_fn)();
         }
-        let command = {
-            let command_digest = self.action_info.command_digest;
+        // O5: Overlap output-directory prep [C] with input download [B2].
+        //
+        // The dependency graph is:
+        //   [A] = fetch Command proto (small blob, fast, ~1-5ms)
+        //   [B1] = create work_directory (one mkdir, microseconds)
+        //   [B2] = prepare_action_inputs — resolves input tree, downloads missing
+        //          blobs, hardlinks files into work_directory (~5-100ms on cache hit)
+        //   [C]  = prepare_output_directories — creates parent dirs for declared
+        //          outputs (O(output_paths) * mkdir, ~0.1-2ms total, zero dependency
+        //          on [B2] result — only needs command.{output_files,output_paths,
+        //          working_directory} from [A])
+        //
+        // Old shape: try_join([A],[B1]+[B2]) → [C]   (C waits on all of B)
+        // New shape (normal mode !is_direct_use):
+        //   [A] alone → [B1] alone → try_join([B2], [C])
+        //   [C] overlaps with the bulk of input download, saving ~2-10ms.
+        //
+        // Safety: the O5 prereq (commit 1) makes [B2]'s BFS mkdir tolerate
+        // AlreadyExists when the entry is already a directory — so [C]
+        // pre-creating a shared parent dir no longer causes a spurious failure.
+        //
+        // Direct-use mode guard: [C]'s create_dir_all MUST NOT create
+        // work_directory as a real directory before get_or_create_direct creates
+        // it as a symlink. Guard: in direct-use mode keep the original
+        // try_join([A],[B]) → [C] sequential structure (no overlap applied).
+        //
+        // Behavior change: in !is_direct_use mode, [C] now runs concurrently
+        // with [B2] instead of sequentially after it. Total latency reduction
+        // is the fraction of [C]'s duration that previously waited on [B2].
+        // Unmeasured (data_plane_bench has zero action-prep cells); design
+        // estimate 2-10ms on the critical path.
+        let command_digest = self.action_info.command_digest;
+        let is_direct_use = self.running_actions_manager.directory_cache
+            .as_ref()
+            .map_or(false, |c| c.is_direct_use_mode());
+
+        // [A]: Fetch the Command proto. In normal mode we need it before
+        // launching [C] and [B2] separately; in direct-use mode we put it
+        // back in a try_join with [B] (unchanged pre-O5 shape).
+        let command;
+        let direct_use_pin;
+
+        if is_direct_use {
+            // Direct-use mode: original shape — try_join([A],[B]) → [C].
+            // [C] runs after the join so get_or_create_direct has already
+            // established work_directory as a symlink before [C]'s
+            // create_dir_all runs. Do NOT apply the overlap here.
             let op_id_for_cmd = operation_id.clone();
-            // Download and build out our input files/folders. Also fetch and decode our Command.
             let command_fut = self.metrics().get_proto_command_from_store.wrap(async {
+                info!(%op_id_for_cmd, ?command_digest, "inner_prepare_action: command_fut entered (direct-use)");
+                let res = get_and_decode_digest::<ProtoCommand>(
+                    self.running_actions_manager.cas_store.as_ref(),
+                    command_digest.into(),
+                )
+                .await
+                .err_tip(|| "Converting command_digest to Command")
+                .map_err(|mut e| {
+                    if e.code == Code::NotFound {
+                        e.details.push(make_precondition_failure_any(command_digest));
+                    }
+                    e
+                });
+                info!(%op_id_for_cmd, ?command_digest, ok = res.is_ok(), "inner_prepare_action: command_fut complete (direct-use)");
+                res
+            });
+            let filesystem_store_pin =
+                Pin::new(self.running_actions_manager.filesystem_store.as_ref());
+            let pre_resolved_tree = self.pre_resolved_tree.lock().take();
+            let server_missing_digests = self.server_missing_digests.lock().take();
+            let op_id_for_inputs = operation_id.clone();
+            info!(%operation_id, "inner_prepare_action: try_join(command_fut, prepare_action_inputs) [direct-use, no overlap]");
+            let (cmd, pin) = try_join(command_fut, async {
+                info!(%op_id_for_inputs, "inner_prepare_action: prepare_action_inputs branch entered (direct-use)");
+                // Direct-use: work_directory is created as a symlink by
+                // get_or_create_direct; did_cleanup is set after.
+                self.did_cleanup.store(false, Ordering::Release);
+                let res = self.metrics()
+                    .download_to_directory
+                    .wrap(prepare_action_inputs(
+                        &self.running_actions_manager.directory_cache,
+                        &self.running_actions_manager.cas_store,
+                        filesystem_store_pin,
+                        &self.action_info.input_root_digest,
+                        &self.work_directory,
+                        pre_resolved_tree,
+                        server_missing_digests,
+                    ))
+                    .await;
+                info!(%op_id_for_inputs, ok = res.is_ok(), "inner_prepare_action: prepare_action_inputs branch complete (direct-use)");
+                res
+            })
+            .await?;
+            command = cmd;
+            direct_use_pin = pin;
+        } else {
+            // Normal mode: O5 overlap — [A] first, then [B1], then [C]∥[B2].
+            let op_id_for_cmd = operation_id.clone();
+            info!(%operation_id, "inner_prepare_action: fetching command [A] alone (O5 overlap, normal mode)");
+            let cmd: ProtoCommand = self.metrics().get_proto_command_from_store.wrap(async {
                 info!(%op_id_for_cmd, ?command_digest, "inner_prepare_action: command_fut entered");
                 let res = get_and_decode_digest::<ProtoCommand>(
                     self.running_actions_manager.cas_store.as_ref(),
@@ -3001,44 +3095,64 @@ impl RunningActionImpl {
                     }
                     e
                 });
-                info!(
-                    %op_id_for_cmd,
-                    ?command_digest,
-                    ok = res.is_ok(),
-                    "inner_prepare_action: command_fut complete"
-                );
+                info!(%op_id_for_cmd, ?command_digest, ok = res.is_ok(), "inner_prepare_action: command_fut complete");
                 res
-            });
+            })
+            .await?;
+
+            // [B1]: Create work_directory before launching [B2]∥[C].
+            // This ensures work_directory exists before [C]'s create_dir_all
+            // descends into it (avoiding [C] pre-creating work_directory, which
+            // would cause [B1]'s create_dir to fail with AlreadyExists in the
+            // original pre-O5 shape — avoided by sequencing [B1] before [C]).
+            info!(%operation_id, "inner_prepare_action: creating work_directory [B1]");
+            fs::create_dir(&self.work_directory)
+                .await
+                .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
+            // Mark cleanup needed once the directory exists.
+            self.did_cleanup.store(false, Ordering::Release);
+
+            // [C]∥[B2]: Output-dir prep concurrently with input download.
             let filesystem_store_pin =
                 Pin::new(self.running_actions_manager.filesystem_store.as_ref());
-            let is_direct_use = self.running_actions_manager.directory_cache
-                .as_ref()
-                .map_or(false, |c| c.is_direct_use_mode());
-            // Take the pre-resolved tree (if any) — consumed once during input fetch.
             let pre_resolved_tree = self.pre_resolved_tree.lock().take();
-            // Take the server-provided missing digest hints (if any).
             let server_missing_digests = self.server_missing_digests.lock().take();
             let op_id_for_inputs = operation_id.clone();
-            info!(%operation_id, "inner_prepare_action: about to try_join(command_fut, prepare_action_inputs)");
-            let (command, direct_use_pin) = try_join(command_fut, async {
-                info!(%op_id_for_inputs, "inner_prepare_action: prepare_action_inputs branch entered");
-                if !is_direct_use {
-                    // Normal mode: create work directory first, then populate it.
-                    fs::create_dir(&self.work_directory)
+
+            // [C] future: create parent directories for declared outputs.
+            // Clones of command fields needed since cmd is moved into [B2] scope.
+            let work_dir_for_output = self.work_directory.clone();
+            let symlink_fix_lock = Arc::new(tokio::sync::Mutex::new(()));
+            // #86: O14 counters via process-global symlink_fix_counters().
+            let working_directory_for_output = cmd.working_directory.clone();
+            let output_files_for_c: Vec<String> = cmd.output_files.clone();
+            let output_paths_for_c: Vec<String> = cmd.output_paths.clone();
+            let lock_c = symlink_fix_lock.clone();
+            let output_dirs_fut = async move {
+                let prepare_output = |output_file: String| {
+                    let work_dir = work_dir_for_output.clone();
+                    let lock = lock_c.clone();
+                    let working_directory = working_directory_for_output.clone();
+                    async move {
+                        prepare_output_directory(
+                            &work_dir,
+                            &working_directory,
+                            &output_file,
+                            &lock,
+                        )
                         .await
-                        .err_tip(|| format!("Error creating work directory {}", self.work_directory))?;
-                }
-                // Now the work directory has been created (or will be via symlink).
-                self.did_cleanup.store(false, Ordering::Release);
-                // The 60s outer timeout that previously wrapped this call
-                // (commit `49bf70fb`) was a symptom mitigation for waiters
-                // wedged on a stalled `directory_cache::construction_lock`
-                // when the leader's upstream read truncated. The
-                // construction_lock has since been migrated to
-                // `nativelink_util::coalesce::with_construction_lock`,
-                // which fans the leader's error (or a 120s leader
-                // `DeadlineExceeded`) to all waiters via a watch channel —
-                // making the outer timeout redundant.
+                    }
+                };
+                try_join_all(output_files_for_c.into_iter().map(prepare_output.clone()))
+                    .await?;
+                try_join_all(output_paths_for_c.into_iter().map(prepare_output))
+                    .await?;
+                Ok::<(), Error>(())
+            };
+
+            // [B2] future: download/materialise input tree.
+            let inputs_fut = async {
+                info!(%op_id_for_inputs, "inner_prepare_action: prepare_action_inputs [B2] entered (O5 overlap)");
                 let res = self.metrics()
                     .download_to_directory
                     .wrap(prepare_action_inputs(
@@ -3051,30 +3165,33 @@ impl RunningActionImpl {
                         server_missing_digests,
                     ))
                     .await;
-                info!(
-                    %op_id_for_inputs,
-                    ok = res.is_ok(),
-                    "inner_prepare_action: prepare_action_inputs branch complete"
-                );
+                info!(%op_id_for_inputs, ok = res.is_ok(), "inner_prepare_action: prepare_action_inputs [B2] complete");
                 res
-            })
-            .await?;
-            info!(%operation_id, "inner_prepare_action: try_join complete");
-            // Hand-off seam (#57 §4): the guard moves from this async stack
-            // into `state.direct_use_pin`. There is no `.await` between
-            // `direct_use_pin` (the local) going out of scope and the
-            // assignment, so the ARMED guard is transferred atomically from
-            // any cancellation point. If `try_join` returned Err, the local
-            // never bound — the guard was dropped on the unwinding stack
-            // inside the `try_join` future, firing fetch_sub.
-            if let Some((digest, pin_guard)) = direct_use_pin {
-                let mut state = self.state.lock();
-                state.direct_use_pin = Some((digest, pin_guard));
-            }
-            command
-        };
-        {
-            // Create all directories needed for our output paths. This is required by the bazel spec.
+            };
+
+            info!(%operation_id, "inner_prepare_action: try_join([B2], [C]) starting (O5 overlap)");
+            let (pin, ()) = try_join(inputs_fut, output_dirs_fut).await?;
+            info!(%operation_id, "inner_prepare_action: try_join([B2],[C]) complete (O5 overlap)");
+
+            command = cmd;
+            direct_use_pin = pin;
+        }
+
+        // Hand-off seam (#57 §4): the guard moves from this async stack
+        // into `state.direct_use_pin`. There is no `.await` between
+        // `direct_use_pin` (the local) going out of scope and the
+        // assignment, so the ARMED guard is transferred atomically from
+        // any cancellation point. If `try_join` returned Err, the local
+        // never bound — the guard was dropped on the unwinding stack
+        // inside the `try_join` future, firing fetch_sub.
+        if let Some((digest, pin_guard)) = direct_use_pin {
+            let mut state = self.state.lock();
+            state.direct_use_pin = Some((digest, pin_guard));
+        }
+        // In normal mode (O5 overlap), output dirs were already created by [C].
+        // In direct-use mode, create them now (sequential, post-join).
+        if is_direct_use {
+            // Create all directories needed for our output paths.
             let work_dir_for_output = self.work_directory.clone();
             // Mutex serializes the slow-path symlink replacement to avoid
             // concurrent tasks racing on the same symlink (EEXIST / ENOENT).
