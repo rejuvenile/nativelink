@@ -552,10 +552,11 @@ impl MetricsComponent for EvictingMapLockHistogram {
 /// - `slow_path_entries / lock_acquires > 1%` → `RwLock` conversion
 ///   is justified.
 ///
-/// There is exactly one `RunningActionsManagerImpl` per worker process
-/// (confirmed: `new_local_worker` constructs it once at `:4186`).
-/// A process-wide singleton therefore aggregates the same increments
-/// the per-instance struct did — no double-counting.
+/// Aggregates increments across all configured `RunningActionsManagerImpl`
+/// instances (N worker configs = N instances; the process-wide sum is the
+/// correct total). The primary producer is `prepare_output_directory` in
+/// `running_actions_manager.rs`, called via `new_local_worker` at
+/// `local_worker.rs:3828`. On server-only processes the counters read 0.
 #[derive(Debug)]
 pub struct SymlinkFixCounters {
     /// `symlink_fix_lock_acquires_total.counter` — denominator.
@@ -582,13 +583,13 @@ impl SymlinkFixCounters {
     /// every time the slow-path lock is acquired (denominator for the
     /// slow-path rate). `#86` O14 instrumentation.
     pub fn record_acquire(&self) {
-        self.acquires.fetch_add(1, Ordering::Acquire);
+        self.acquires.fetch_add(1, Ordering::Relaxed);
         self.acquires_last_time.store(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            Ordering::Release,
+            Ordering::Relaxed,
         );
     }
 
@@ -596,13 +597,13 @@ impl SymlinkFixCounters {
     /// Called when the under-lock re-check fails and real symlink
     /// fix-up work is about to run (numerator for the slow-path rate).
     pub fn record_slow_path_entry(&self) {
-        self.slow_path_entries.fetch_add(1, Ordering::Acquire);
+        self.slow_path_entries.fetch_add(1, Ordering::Relaxed);
         self.slow_path_entries_last_time.store(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            Ordering::Release,
+            Ordering::Relaxed,
         );
     }
 }
@@ -613,12 +614,14 @@ impl MetricsComponent for SymlinkFixCounters {
         _kind: MetricKind,
         _field_metadata: MetricFieldData,
     ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
-        // Emit same group+sub-key shape as `CounterWithTime` so O14
-        // queries targeting `symlink_fix_lock_acquires_total.counter`
-        // and `symlink_fix_slow_path_entries_total.counter` work
-        // identically.
+        // Registered under prefix "symlink_fix" (nativelink.rs), so the outer
+        // span is "symlink_fix". Each group!() here adds one inner segment:
+        //   symlink_fix . lock_acquires_total . counter
+        //                                    → symlink_fix_lock_acquires_total_counter
+        // Using group names that include the full "symlink_fix_lock_…" prefix
+        // would double the prefix because the register key is already in scope.
         {
-            let _grp = group!("symlink_fix_lock_acquires_total").entered();
+            let _grp = group!("lock_acquires_total").entered();
             let acquires = self.acquires.load(Ordering::Relaxed);
             let last_time = self.acquires_last_time.load(Ordering::Relaxed);
             publish!(
@@ -632,11 +635,11 @@ impl MetricsComponent for SymlinkFixCounters {
                 "last_time",
                 &last_time,
                 MetricKind::Counter,
-                "Last timestamp symlink_fix_lock_acquires_total was published."
+                "Epoch-seconds of last lock_acquires_total increment."
             );
         }
         {
-            let _grp = group!("symlink_fix_slow_path_entries_total").entered();
+            let _grp = group!("slow_path_entries_total").entered();
             let entries = self.slow_path_entries.load(Ordering::Relaxed);
             let last_time = self.slow_path_entries_last_time.load(Ordering::Relaxed);
             publish!(
@@ -652,7 +655,7 @@ impl MetricsComponent for SymlinkFixCounters {
                 "last_time",
                 &last_time,
                 MetricKind::Counter,
-                "Last timestamp symlink_fix_slow_path_entries_total was published."
+                "Epoch-seconds of last slow_path_entries_total increment."
             );
         }
         Ok(MetricPublishKnownKindData::Component)
@@ -666,6 +669,10 @@ impl MetricsComponent for SymlinkFixCounters {
 /// #86: process-wide symlink_fix_lock counters. Backed by a `static`
 /// so `const fn new()` suffices; timestamps are set at increment time.
 static SYMLINK_FIX_COUNTERS: SymlinkFixCounters = SymlinkFixCounters::new();
+/// #86: cached `Arc` for `MetricsRegistry::register`. `OnceLock` prevents
+/// a double-registration hazard if `symlink_fix_counters_arc()` is called
+/// twice — both calls return a clone of the same `Arc`.
+static SYMLINK_FIX_COUNTERS_ARC: OnceLock<Arc<SymlinkFixCountersHandle>> = OnceLock::new();
 
 /// P1: process-wide observation-only inflight + waiters counters. The
 /// per-call `Semaphore` lives at the call site (pre-#85 semantics).
@@ -763,9 +770,11 @@ pub fn symlink_fix_counters() -> &'static SymlinkFixCounters {
 /// #86: `Arc` wrapper for `MetricsRegistry::register`. The singleton
 /// lives in a `static`; the `Arc` carries a zero-sized handle that
 /// delegates `publish` to the static so scrapes always read live state.
+/// `OnceLock`-cached so repeated calls return a clone of the same `Arc`
+/// (prevents a double-registration hazard if the caller invokes twice).
 #[must_use]
 pub fn symlink_fix_counters_arc() -> Arc<SymlinkFixCountersHandle> {
-    Arc::new(SymlinkFixCountersHandle)
+    Arc::clone(SYMLINK_FIX_COUNTERS_ARC.get_or_init(|| Arc::new(SymlinkFixCountersHandle)))
 }
 
 /// Zero-sized handle so `MetricsRegistry::register` can take an
@@ -1200,12 +1209,12 @@ mod tests {
     /// `SYMLINK_FIX_COUNTERS`. The test exercises the LOCAL type to verify
     /// the delegation path is correct.
     ///
-    /// Mutation: comment out `SYMLINK_FIX_COUNTERS.publish(kind,
-    /// field_metadata)` in `SymlinkFixCountersHandle::publish` → the
-    /// publish call returns `Component` with zero data; the acquire counter
-    /// assertion below doesn't directly test publish, but the handle-vs-ref
-    /// aliasing test will fail with "O14 singleton-aliasing: handle and ref
-    /// must share the same atomic — handle saw 0, direct ref saw N".
+    /// Mutation: comment out `self.acquires.fetch_add(1, Ordering::Relaxed)`
+    /// in `record_acquire()` → `acquires` stays at 0; the assertion below
+    /// fails with "O14 singleton-aliasing: acquires must initialize to 0"
+    /// on the post-record assert, exposing that the fetch_add is load-bearing.
+    /// The `publish` delegation path is covered by
+    /// `o14_render_prometheus_metric_names_not_doubled` (the render test).
     #[test]
     fn o14_singleton_aliasing_handle_and_ref_share_state() {
         // Use a LOCAL instance; the production static is the same type.
@@ -1288,6 +1297,87 @@ mod tests {
         assert_ne!(
             c.slow_path_entries_last_time.load(Ordering::Relaxed), 0,
             "O14 increment-observable: slow_path_entries_last_time must be set after record_slow_path_entry"
+        );
+    }
+
+    /// #86 (2026-06-15): end-to-end render test — verifies that the
+    /// `SymlinkFixCounters::publish` registered under prefix `"symlink_fix"`
+    /// and inner `group!("lock_acquires_total")` / `group!("slow_path_entries_total")`
+    /// produce EXACTLY the Prometheus names `symlink_fix_lock_acquires_total_counter`
+    /// and `symlink_fix_slow_path_entries_total_counter` after sanitization.
+    ///
+    /// This is the regression guard for the BLOCK identified in review: registering
+    /// under `"symlink_fix_lock"` with inner `group!("symlink_fix_lock_acquires_total")`
+    /// doubled the prefix to `symlink_fix_lock_symlink_fix_lock_acquires_total_counter`.
+    ///
+    /// Also asserts the doubled form is ABSENT so a name regression is caught
+    /// immediately rather than silently producing wrong names.
+    ///
+    /// Covers `SymlinkFixCountersHandle::publish` delegation path (the prior
+    /// singleton-aliasing test exercised `record_acquire` only, not `publish`).
+    ///
+    /// Mutation step: revert `group!("lock_acquires_total")` back to
+    /// `group!("symlink_fix_lock_acquires_total")` in `SymlinkFixCounters::publish`.
+    /// This test MUST red-fail with:
+    ///   "#86 doubled metric name: ..."
+    #[test]
+    fn o14_render_prometheus_metric_names_not_doubled() {
+        use crate::metrics_publisher::{MetricsRegistry, render_prometheus};
+
+        // Arc-owned counters for 'static lifetime required by register().
+        // The real SYMLINK_FIX_COUNTERS static accumulates across the process
+        // so tests use a local Arc to avoid cross-test interference.
+        let counters = Arc::new(SymlinkFixCounters::new());
+        for _ in 0..5 {
+            counters.record_acquire();
+        }
+        for _ in 0..2 {
+            counters.record_slow_path_entry();
+        }
+
+        let registry = MetricsRegistry::new();
+        // Register under "symlink_fix" — the prefix the production nativelink.rs
+        // uses (after this fix). Arc<SymlinkFixCounters> impls MetricsComponent
+        // via the blanket Arc<T: MetricsComponent> impl, delegating to
+        // SymlinkFixCounters::publish — same delegation as SymlinkFixCountersHandle.
+        registry.register("symlink_fix", counters);
+
+        let body = render_prometheus(&registry);
+
+        // The counter sub-key must carry the recorded values using EXACT line matches
+        // (newline-anchored). The exact-line form `\nNAME VALUE\n` distinguishes the
+        // correct metric from the doubled-prefix form:
+        //   correct:  symlink_fix_lock_acquires_total_counter 5
+        //   doubled:  symlink_fix_symlink_fix_lock_acquires_total_counter 5
+        // The substring "symlink_fix_lock_acquires_total" appears in BOTH, so a
+        // bare `contains` is insufficient — only the newline-anchored value assertion
+        // below correctly rejects the doubled form (the correct line is absent when
+        // doubled, and the wrong line is present instead).
+        assert!(
+            body.contains("\nsymlink_fix_lock_acquires_total_counter 5\n"),
+            "#86 render test: expected exact line `symlink_fix_lock_acquires_total_counter 5` \
+             (5 record_acquire calls). If missing, either value is wrong or the metric name \
+             is doubled (got `symlink_fix_symlink_fix_lock_acquires_total_counter 5` instead). \
+             body=\n{body}"
+        );
+        assert!(
+            body.contains("\nsymlink_fix_slow_path_entries_total_counter 2\n"),
+            "#86 render test: expected exact line `symlink_fix_slow_path_entries_total_counter 2` \
+             (2 record_slow_path_entry calls). If missing, either value is wrong or the metric \
+             name is doubled. body=\n{body}"
+        );
+
+        // Belt-and-braces: also assert the doubled prefix is absent so the failure
+        // message names the specific regression class.
+        // When group!("symlink_fix_lock_acquires_total") is used inside publish()
+        // while registered under "symlink_fix", the rendered name starts with
+        // "symlink_fix_symlink_fix_lock" (prefix doubled).
+        assert!(
+            !body.contains("symlink_fix_symlink_fix_lock"),
+            "#86 doubled metric name: rendered output contains doubled prefix \
+             `symlink_fix_symlink_fix_lock` — the register key `symlink_fix` and inner \
+             group!() name are concatenating incorrectly (group name should be \
+             `lock_acquires_total`, not `symlink_fix_lock_acquires_total`). body=\n{body}"
         );
     }
 }

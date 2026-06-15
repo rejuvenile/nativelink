@@ -683,18 +683,19 @@ async fn inner_main(
         nativelink_util::o11_probes::evicting_map_lock_histogram_arc(),
     );
 
-    // #86 (2026-06-15): register the symlink_fix_lock counters singleton so
+    // #86 (2026-06-15): register the symlink_fix counters singleton so
     // `symlink_fix_lock_acquires_total` and
     // `symlink_fix_slow_path_entries_total` appear on the /metrics endpoint.
     // These counters drive the #83 O14 Mutex→RwLock decision and were
     // previously incremented in RunningActionsManagerImpl::Metrics (which is
     // never registered with MetricsRegistry — a dead-observability bug).
-    // The singleton is backed by a `static` in o11_probes.rs; registered
-    // unconditionally because the binary serves both worker and server roles
-    // and the producer (worker's prepare_output_directory) may be active in
-    // either role.
+    // Prefix is "symlink_fix" (not "symlink_fix_lock") so the inner
+    // group!("lock_acquires_total") renders to `symlink_fix_lock_acquires_total`
+    // without doubling. Registered unconditionally to match the #85 o11 sibling
+    // pattern; `prepare_output_directory` is WORKER-ONLY so the counters read
+    // 0 on server-only processes.
     metrics_registry.register(
-        "symlink_fix_lock",
+        "symlink_fix",
         nativelink_util::o11_probes::symlink_fix_counters_arc(),
     );
 
