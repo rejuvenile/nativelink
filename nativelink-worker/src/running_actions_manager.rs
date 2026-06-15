@@ -69,6 +69,7 @@ use nativelink_util::action_messages::{
 use nativelink_util::common::{DigestInfo, fs, make_precondition_failure_any};
 use nativelink_util::digest_hasher::{DigestHasher, DigestHasherFunc, default_digest_hasher_func};
 use nativelink_util::metrics_utils::{AsyncCounterWrapper, CounterWithTime};
+use nativelink_util::o11_probes::symlink_fix_counters;
 use nativelink_util::phase0_metrics::worker_phase0_metrics;
 use nativelink_util::buf_channel::make_buf_channel_pair;
 use nativelink_util::store_trait::{
@@ -1926,10 +1927,11 @@ pub fn download_to_directory<'a>(
 /// `lock` serializes the slow-path symlink replacement to avoid concurrent
 /// tasks racing on the same symlink (EEXIST / ENOENT).
 ///
-/// `metrics` is updated on every lock acquire (denominator) and on every
-/// slow-path entry (numerator); #86 instrumentation driving the #83 O14
-/// (`Mutex` → `RwLock`) decision. Both counters are `pub` so integration
-/// tests can read `.counter.load(Ordering::Acquire)`.
+/// Increments to the `#86` O14 counters are now routed to the
+/// process-global `nativelink_util::o11_probes::SYMLINK_FIX_COUNTERS`
+/// singleton registered with the `MetricsRegistry`, so they appear on the
+/// `/metrics` endpoint. The per-instance `Metrics` struct no longer carries
+/// these two fields.
 ///
 /// **Contract (asymmetric):**
 /// - Under-action: increment MUST fire on slow-path entry. Verified by
@@ -1943,7 +1945,6 @@ pub async fn prepare_output_directory(
     working_directory: &str,
     output_file: &str,
     lock: &tokio::sync::Mutex<()>,
-    metrics: &Metrics,
 ) -> Result<(), Error> {
     let full_output_path = if working_directory.is_empty() {
         format!("{work_dir}/{output_file}")
@@ -1972,8 +1973,10 @@ pub async fn prepare_output_directory(
 
     // Slow path: serialize to avoid concurrent symlink replacement races.
     let _guard = lock.lock().await;
-    // #86: every acquire (denominator for slow-path rate).
-    metrics.symlink_fix_lock_acquires_total.inc();
+    // #86: every acquire (denominator for slow-path rate). Routed to the
+    // process-global singleton registered with MetricsRegistry so this
+    // counter appears on the /metrics endpoint.
+    symlink_fix_counters().record_acquire();
 
     // Re-check under lock — another task may have already fixed it.
     if fs::create_dir_all(full_parent_path).await.is_ok() {
@@ -1988,7 +1991,7 @@ pub async fn prepare_output_directory(
     }
     // #86: numerator — true slow-path entry (under-lock fast-path
     // re-check failed, real symlink fix-up work is about to run).
-    metrics.symlink_fix_slow_path_entries_total.inc();
+    symlink_fix_counters().record_slow_path_entry();
 
     // Walk the path and replace blocking symlinks with writable
     // shallow-copy directories that preserve access to all
@@ -3056,16 +3059,14 @@ impl RunningActionImpl {
             // Mutex serializes the slow-path symlink replacement to avoid
             // concurrent tasks racing on the same symlink (EEXIST / ENOENT).
             let symlink_fix_lock = Arc::new(tokio::sync::Mutex::new(()));
-            // #86: observability for #83 O14 (Mutex→RwLock) decision. Counts
-            // every lock acquire (denominator) and every slow-path entry
-            // (numerator). Operator computes slow_path_entries / lock_acquires
-            // to decide whether RwLock conversion is justified.
-            let metrics_for_output = self.metrics().clone();
+            // #86: O14 counters are now routed to the process-global
+            // symlink_fix_counters() singleton in nativelink_util::o11_probes,
+            // registered with MetricsRegistry — no per-instance metrics clone
+            // needed.
             let working_directory_for_output = command.working_directory.clone();
             let prepare_output_directories = |output_file: &String| {
                 let work_dir = work_dir_for_output.clone();
                 let lock = symlink_fix_lock.clone();
-                let metrics = metrics_for_output.clone();
                 let working_directory = working_directory_for_output.clone();
                 let output_file = output_file.clone();
                 async move {
@@ -3074,7 +3075,6 @@ impl RunningActionImpl {
                         &working_directory,
                         &output_file,
                         &lock,
-                        &metrics,
                     )
                     .await
                 }
@@ -6294,18 +6294,12 @@ pub struct Metrics {
     pub worker_slow_tier_async_fail_cas: CounterWithTime,
     #[metric(help = "Worker slow-tier async write fail — unknown store class.")]
     pub worker_slow_tier_async_fail_unknown: CounterWithTime,
-    // #86: observability for #83 O14 (symlink_fix_lock Mutex→RwLock) decision.
-    // `pub` so integration tests can read `.counter.load(Ordering::Acquire)`
-    // to verify the increment fires on slow-path entry but NOT on fast-path
-    // early-return.
-    #[metric(
-        help = "Count of symlink_fix_lock acquires (fast-path skips this; every slow-path entry bumps it). Denominator for slow-path rate."
-    )]
-    pub symlink_fix_lock_acquires_total: CounterWithTime,
-    #[metric(
-        help = "Count of symlink_fix_lock slow-path entries (where output-dir prep needs to remove+recreate a symlink). Drives #83 O14 RwLock conversion decision: if <0.1% of output_files-action rate, revert to Mutex; if >1%, RwLock is justified."
-    )]
-    pub symlink_fix_slow_path_entries_total: CounterWithTime,
+    // #86 NOTE: `symlink_fix_lock_acquires_total` and
+    // `symlink_fix_slow_path_entries_total` were removed from this struct.
+    // They are now a process-global singleton in
+    // `nativelink_util::o11_probes::SYMLINK_FIX_COUNTERS`, registered with
+    // `MetricsRegistry` and visible on `/metrics`. Increments route through
+    // `symlink_fix_counters()` in `prepare_output_directory`.
 }
 
 impl Metrics {

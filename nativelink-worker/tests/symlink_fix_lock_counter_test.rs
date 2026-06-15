@@ -17,13 +17,22 @@
 //! empirical slow-path-rate data, the conversion may be unjustified
 //! overhead.
 //!
-//! Asymmetric contract on `Metrics::symlink_fix_slow_path_entries_total`:
+//! The counters now live in the process-global
+//! `nativelink_util::o11_probes::SYMLINK_FIX_COUNTERS` singleton
+//! (registered with `MetricsRegistry` so they appear on `/metrics`), not
+//! in the per-instance `RunningActionsManagerImpl::Metrics` struct.
+//!
+//! Tests read a DELTA (before − after) because the static accumulates
+//! across all tests in the same process. Each test snapshots the counter
+//! before calling `prepare_output_directory`, then asserts the delta.
+//!
+//! Asymmetric contract on `symlink_fix_slow_path_entries_total`:
 //! - **Under-action (T1):** when the under-lock fast-path re-check fails
 //!   and the closure proceeds to walk the symlink tree, the counter MUST
 //!   increment exactly once. Verified by
 //!   `symlink_fix_slow_path_increments_on_slow_path_entry`.
 //! - **Over-action (T2):** when the fast-path early-return succeeds (no
-//!   lock acquired), the counter MUST stay at zero. Verified by
+//!   lock acquired), the counter MUST stay unchanged. Verified by
 //!   `symlink_fix_slow_path_does_not_increment_on_fast_path`.
 //!
 //! Both tests invoke the same `prepare_output_directory` helper that the
@@ -38,7 +47,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use nativelink_macro::nativelink_test;
 use nativelink_util::common::fs;
-use nativelink_worker::running_actions_manager::{Metrics, prepare_output_directory};
+use nativelink_util::o11_probes::symlink_fix_counters;
+use nativelink_worker::running_actions_manager::prepare_output_directory;
 use pretty_assertions::assert_eq;
 use rand::Rng;
 
@@ -57,11 +67,13 @@ fn make_temp_path(data: &str) -> String {
 /// `dir_writable=false` — we fall into the slow path. Counter MUST
 /// increment exactly once (one output file = one slow-path entry).
 ///
-/// Mutation 2026-06-07: comment out
-/// `metrics.symlink_fix_slow_path_entries_total.inc()` in
-/// `running_actions_manager.rs::prepare_output_directory` → this test
+/// Reads a DELTA from the process-global singleton because the static
+/// accumulates across tests.
+///
+/// Mutation 2026-06-15: comment out `symlink_fix_counters().record_slow_path_entry()`
+/// in `running_actions_manager.rs::prepare_output_directory` → this test
 /// MUST red-fail with bespoke "symlink_fix_slow_path_entries counter did
-/// NOT increment on slow-path entry".
+/// NOT increment on slow-path entry (delta=0, expected 1)".
 #[nativelink_test]
 async fn symlink_fix_slow_path_increments_on_slow_path_entry()
 -> Result<(), Box<dyn core::error::Error>> {
@@ -78,8 +90,15 @@ async fn symlink_fix_slow_path_increments_on_slow_path_entry()
     let perms = std::fs::Permissions::from_mode(0o555);
     fs::set_permissions(&parent_dir, perms).await?;
 
-    let metrics = Metrics::default();
     let lock = tokio::sync::Mutex::new(());
+
+    // Snapshot singleton counters BEFORE the call (delta baseline).
+    let entries_before = symlink_fix_counters()
+        .slow_path_entries
+        .load(Ordering::Acquire);
+    let acquires_before = symlink_fix_counters()
+        .acquires
+        .load(Ordering::Acquire);
 
     // Production composition: same helper called by RunningActionImpl
     // for every output file.
@@ -90,7 +109,6 @@ async fn symlink_fix_slow_path_increments_on_slow_path_entry()
             "",
             "readonly_parent/out.txt",
             &lock,
-            &metrics,
         ),
     )
     .await
@@ -102,22 +120,22 @@ async fn symlink_fix_slow_path_increments_on_slow_path_entry()
     // The slow-path walk should have chmod'd readonly_parent back to
     // writable (0o200 | 0o555 = 0o755), so the operation succeeds AND
     // the counter increments.
-    let slow_entries = metrics
-        .symlink_fix_slow_path_entries_total
-        .counter
-        .load(Ordering::Acquire);
+    let slow_delta = symlink_fix_counters()
+        .slow_path_entries
+        .load(Ordering::Acquire)
+        .wrapping_sub(entries_before);
     assert_eq!(
-        slow_entries, 1,
-        "symlink_fix_slow_path_entries counter did NOT increment on slow-path entry (got {slow_entries}, expected 1)",
+        slow_delta, 1,
+        "symlink_fix_slow_path_entries counter did NOT increment on slow-path entry (delta={slow_delta}, expected 1)",
     );
     // Denominator: lock was acquired exactly once.
-    let acquires = metrics
-        .symlink_fix_lock_acquires_total
-        .counter
-        .load(Ordering::Acquire);
+    let acquire_delta = symlink_fix_counters()
+        .acquires
+        .load(Ordering::Acquire)
+        .wrapping_sub(acquires_before);
     assert_eq!(
-        acquires, 1,
-        "symlink_fix_lock_acquires counter did NOT increment on lock acquire (got {acquires}, expected 1)",
+        acquire_delta, 1,
+        "symlink_fix_lock_acquires counter did NOT increment on lock acquire (delta={acquire_delta}, expected 1)",
     );
     Ok::<(), Box<dyn core::error::Error>>(())
 }
@@ -125,23 +143,29 @@ async fn symlink_fix_slow_path_increments_on_slow_path_entry()
 /// T2 (over-action): when the output file's parent does NOT pre-exist
 /// (or is normally writable), the fast-path `create_dir_all` succeeds
 /// and the writability check passes — the closure returns immediately
-/// without acquiring the lock. Counter MUST stay at zero.
+/// without acquiring the lock. Counter MUST stay unchanged (delta == 0).
 ///
-/// Mutation 2026-06-07: move
-/// `metrics.symlink_fix_slow_path_entries_total.inc()` from the
-/// post-re-check slow-path entry point to fire on every acquire (e.g.
-/// place it next to `symlink_fix_lock_acquires_total.inc()`), or remove
-/// the `if dir_writable { return Ok(()); }` fast-path early-return →
+/// Mutation 2026-06-15: move `symlink_fix_counters().record_slow_path_entry()`
+/// from the post-re-check slow-path entry point to fire on every acquire
+/// (e.g. place it next to `record_acquire()`), or remove the
+/// `if dir_writable { return Ok(()); }` fast-path early-return →
 /// this test MUST red-fail with bespoke "fast-path early-return
-/// spuriously incremented slow-path counter".
+/// spuriously incremented slow-path counter (delta=1, expected 0)".
 #[nativelink_test]
 async fn symlink_fix_slow_path_does_not_increment_on_fast_path()
 -> Result<(), Box<dyn core::error::Error>> {
     let work_dir = make_temp_path("work_dir_t2");
     fs::create_dir_all(&work_dir).await?;
 
-    let metrics = Metrics::default();
     let lock = tokio::sync::Mutex::new(());
+
+    // Snapshot singleton counters BEFORE the call (delta baseline).
+    let entries_before = symlink_fix_counters()
+        .slow_path_entries
+        .load(Ordering::Acquire);
+    let acquires_before = symlink_fix_counters()
+        .acquires
+        .load(Ordering::Acquire);
 
     // Fast path: parent doesn't exist yet, `create_dir_all` creates it
     // (writable by default), the closure returns Ok before the lock is
@@ -153,7 +177,6 @@ async fn symlink_fix_slow_path_does_not_increment_on_fast_path()
             "",
             "fresh_parent/out.txt",
             &lock,
-            &metrics,
         ),
     )
     .await
@@ -168,25 +191,24 @@ async fn symlink_fix_slow_path_does_not_increment_on_fast_path()
         "fast-path create_dir_all did not create fresh_parent",
     );
 
-    // Slow-path counter MUST stay at zero.
-    let slow_entries = metrics
-        .symlink_fix_slow_path_entries_total
-        .counter
-        .load(Ordering::Acquire);
+    // Slow-path counter MUST be unchanged (delta == 0).
+    let slow_delta = symlink_fix_counters()
+        .slow_path_entries
+        .load(Ordering::Acquire)
+        .wrapping_sub(entries_before);
     assert_eq!(
-        slow_entries, 0,
-        "fast-path early-return spuriously incremented slow-path counter (got {slow_entries}, expected 0)",
+        slow_delta, 0,
+        "fast-path early-return spuriously incremented slow-path counter (delta={slow_delta}, expected 0)",
     );
-    // Lock-acquire counter MUST also stay at zero (fast path never
+    // Lock-acquire counter MUST also be unchanged (fast path never
     // acquires the lock).
-    let acquires = metrics
-        .symlink_fix_lock_acquires_total
-        .counter
-        .load(Ordering::Acquire);
+    let acquire_delta = symlink_fix_counters()
+        .acquires
+        .load(Ordering::Acquire)
+        .wrapping_sub(acquires_before);
     assert_eq!(
-        acquires, 0,
-        "fast-path early-return spuriously incremented lock-acquires counter (got {acquires}, expected 0)",
+        acquire_delta, 0,
+        "fast-path early-return spuriously incremented lock-acquires counter (delta={acquire_delta}, expected 0)",
     );
     Ok::<(), Box<dyn core::error::Error>>(())
 }
-
