@@ -15,6 +15,8 @@
 use core::fmt::Write;
 use core::hash::BuildHasher;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nativelink_util::background_spawn;
 use redis::Value;
@@ -265,8 +267,133 @@ pub async fn make_fake_redis_with_multiple_responses<
     port
 }
 
+/// Like [`make_fake_redis_with_multiple_responses`] but also increments
+/// `connection_counter` on each new TCP connection accept. The responses
+/// cycle through `responses` handlers one per connection. Useful for tests
+/// that need both per-connection response differentiation AND a reconnect
+/// assertion (counter 1 → 2 after reconnect).
+pub async fn make_fake_redis_counting_with_multiple_responses<
+    B: BuildHasher + Clone + Send + 'static + Sync,
+>(
+    responses: Vec<HashMap<String, String, B>>,
+    connection_counter: Arc<AtomicUsize>,
+) -> u16 {
+    let funcs: Vec<_> = responses
+        .iter()
+        .map(|r| {
+            let values = r.clone();
+            move |buf: &[u8]| -> String {
+                let str_buf = String::from_utf8_lossy(buf).into_owned();
+                for (key, value) in &values {
+                    if str_buf.starts_with(key) {
+                        info!("Responding to {}", str_buf.replace("\r\n", "\\r\\n"));
+                        return value.clone();
+                    }
+                }
+                warn!(
+                    "Unknown command: {}",
+                    str_buf.chars().take(1000).collect::<String>()
+                );
+                String::new()
+            }
+        })
+        .collect();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    info!("Using port {port} (counting+multi-response fake redis)");
+
+    let counter = connection_counter;
+    let mut func_iter = funcs.into_iter().cycle();
+    // Eagerly collect into closures we can move into the background task.
+    // We must move the iterator into the spawned task.
+    background_spawn!("counting-multi-listener", async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                error!("accept error on counting+multi fake redis");
+                panic!("error");
+            };
+            let conn_idx = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            info!("Counting+multi fake redis: accepted connection #{conn_idx}");
+            let handler = func_iter.next().unwrap();
+            background_spawn!("counting-multi-handler", async move {
+                loop {
+                    let mut buf = vec![0; 8192];
+                    let res = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let output = handler(&buf[..res]);
+                    if !output.is_empty() {
+                        if let Err(e) = stream.write_all(output.as_bytes()).await {
+                            warn!("Counting+multi fake redis: write error: {e}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    port
+}
+
 pub async fn make_fake_redis_with_responses<B: BuildHasher + Clone + Send + 'static + Sync>(
     responses: HashMap<String, String, B>,
 ) -> u16 {
     make_fake_redis_with_multiple_responses(vec![responses]).await
+}
+
+/// Like [`make_fake_redis_with_responses`] but increments `connection_counter` on every new TCP
+/// connection accept. Useful for asserting that a reconnect happened (counter goes from 1 → 2)
+/// after a command timeout.
+pub async fn make_fake_redis_counting_connections<B: BuildHasher + Clone + Send + 'static + Sync>(
+    responses: HashMap<String, String, B>,
+    connection_counter: Arc<AtomicUsize>,
+) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    info!("Using port {port} (connection-counting fake redis)");
+
+    let values = responses;
+    background_spawn!("counting-listener", async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                error!("accept error on counting fake redis");
+                panic!("error");
+            };
+            let count = connection_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            info!("Counting fake redis: accepted connection #{count}");
+            let values_clone = values.clone();
+            background_spawn!("counting-handler", async move {
+                loop {
+                    let mut buf = vec![0; 8192];
+                    let res = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let str_buf = String::from_utf8_lossy(&buf[..res]).into_owned();
+                    let mut output = String::new();
+                    for (key, value) in &values_clone {
+                        if str_buf.starts_with(key) {
+                            info!("Counting redis responding to {}", str_buf.replace("\r\n", "\\r\\n"));
+                            output = value.clone();
+                            break;
+                        }
+                    }
+                    if output.is_empty() {
+                        warn!(
+                            "Counting fake redis: unknown command: {}",
+                            str_buf.chars().take(500).collect::<String>()
+                        );
+                    } else if let Err(e) = stream.write_all(output.as_bytes()).await {
+                        warn!("Counting fake redis: write error: {e}");
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    port
 }

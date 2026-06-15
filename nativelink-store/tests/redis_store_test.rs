@@ -16,6 +16,7 @@ use core::ops::RangeBounds;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
@@ -24,7 +25,8 @@ use nativelink_error::{Code, Error, ResultExt, make_err};
 use nativelink_macro::nativelink_test;
 use nativelink_redis_tester::{
     ReadOnlyRedis, add_lua_script, add_to_response_raw, fake_redis_sentinel_master_stream,
-    fake_redis_sentinel_stream, fake_redis_stream, make_fake_redis_with_responses,
+    fake_redis_sentinel_stream, fake_redis_stream, make_fake_redis_counting_with_multiple_responses,
+    make_fake_redis_with_responses,
 };
 use nativelink_store::cas_utils::ZERO_BYTE_DIGESTS;
 use nativelink_store::redis_store::{
@@ -2420,6 +2422,116 @@ async fn remove_existing_key_issues_del_and_returns_ok() -> Result<(), Error> {
         .remove(digest)
         .await
         .expect("remove of existing key must return Ok(()) — DEL issued and key deleted");
+
+    Ok(())
+}
+
+// ─── FU-10: reconnect-after-timeout ──────────────────────────────────────────
+
+/// Verifies that when the inner `response_timeout` on a `ConnectionManager`
+/// fires during `has_with_results` (pipelined STRLEN+EXISTS), `RedisStore`
+/// reconnects the desynced slot before returning the timeout error.
+///
+/// Background: `ConnectionManager` uses a single multiplexed TCP connection per
+/// slot. When `response_timeout` fires, the server's response for the abandoned
+/// command stays in the TCP receive buffer. The next command on that slot reads
+/// the orphaned frame → desync ("Data length mismatch" or parse errors). The
+/// fix detects `err.is_timeout()` in the `Ok(Err(...))` arm and calls
+/// `client.reconnect(&self.connection_manager)` to replace the slot with a
+/// fresh, aligned TCP connection before returning the error.
+///
+/// Test mechanism:
+/// - Connection 1 handler: responds to the HELLO handshake (connection setup)
+///   but NOT to STRLEN+EXISTS pipeline → inner `response_timeout` fires.
+/// - Connection 2 handler: responds to handshake + SCRIPT LOAD (reconnect
+///   setup) + STRLEN+EXISTS → key not found.
+/// - `connection_pool_size: 1` isolates to one slot for determinism.
+/// - `command_timeout_ms: 100` (inner response_timeout = 100ms; outer = 200ms)
+///   so the inner timeout fires quickly.
+/// - After `store.has()` returns the timeout error (`Code::DeadlineExceeded`),
+///   asserts that the TCP connection counter is ≥2, proving a reconnect
+///   created a new connection.
+///
+/// Mutation: comment out the `reconnect` call in `has_with_results`.
+/// Test fails with:
+/// "reconnect-on-timeout must establish new TCP connection — connection count
+/// was 1 after has_with_results timeout, expected ≥2 (slot was not replaced)"
+#[nativelink_test]
+async fn reconnect_fired_after_has_with_results_timeout() -> Result<(), Error> {
+    let digest = DigestInfo::try_new(VALID_HASH1, 2)?;
+    let encoded_key = format!("{digest}");
+
+    // Connection 1: handshake only. The STRLEN+EXISTS pipeline goes unanswered
+    // → inner response_timeout (100ms) fires → is_timeout() error.
+    let handler1 = add_lua_version_script(fake_redis_stream());
+
+    // Connection 2: handshake + SCRIPT LOAD (from reconnect configure step)
+    // + STRLEN+EXISTS pipeline → key not found (STRLEN=0, EXISTS=0).
+    // Note: DigestInfo formats as "{hash}-{size}" (dash separator), so the
+    // encoded key for VALID_HASH1/size=2 is "<hash>-2".
+    let mut handler2 = add_lua_version_script(fake_redis_stream());
+    add_to_response_raw(
+        &mut handler2,
+        &redis::cmd("STRLEN").arg(encoded_key.as_str()),
+        // Two-command pipeline response (STRLEN=0, EXISTS=0): key absent.
+        ":0\r\n:0\r\n".to_string(),
+    );
+
+    let connection_counter = Arc::new(AtomicUsize::new(0));
+    let port = make_fake_redis_counting_with_multiple_responses(
+        vec![handler1, handler2],
+        Arc::clone(&connection_counter),
+    )
+    .await;
+
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        // Inner response_timeout = command_timeout_ms (100ms).
+        // Outer safety-net = command_timeout_ms * 2 (200ms).
+        // Inner fires first; that's the path the fix is on.
+        command_timeout_ms: 100,
+        connection_pool_size: 1,
+        ..Default::default()
+    };
+
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("store construction must not deadlock")
+        .expect("store construction must succeed");
+
+    // `has` routes to `has_with_results` → pipelined STRLEN+EXISTS.
+    // Connection 1 doesn't respond → inner response_timeout fires →
+    // Ok(Err(TimedOut)) returned. Fix: reconnect slot before returning error.
+    let result = timeout(
+        Duration::from_secs(5),
+        store.has(digest),
+    )
+    .await
+    .expect("has must not deadlock — if this fires the fix caused a hang");
+
+    // The timeout error from the inner response_timeout propagates as
+    // Code::DeadlineExceeded (io::TimedOut → Code::DeadlineExceeded in
+    // nativelink-error's From impl). An Ok(None) would mean the key was not
+    // found on the first connection (which shouldn't happen — it doesn't respond).
+    let err = result.expect_err(
+        "has must return Err after inner response_timeout; \
+         got Ok — the fake redis incorrectly responded to STRLEN+EXISTS on connection 1"
+    );
+    assert_eq!(
+        err.code,
+        Code::DeadlineExceeded,
+        "timeout error must propagate as Code::DeadlineExceeded; got: {err:?}"
+    );
+
+    // The reconnect must have established a new TCP connection to the fake
+    // redis. Counter ≥ 2 proves the slot was replaced.
+    let conn_count = connection_counter.load(Ordering::SeqCst);
+    assert!(
+        conn_count >= 2,
+        "reconnect-on-timeout must establish new TCP connection — connection count \
+         was {conn_count} after has_with_results timeout, expected ≥2 \
+         (slot was not replaced)"
+    );
 
     Ok(())
 }

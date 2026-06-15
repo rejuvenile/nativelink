@@ -1784,7 +1784,7 @@ where
                 let mut client = self.get_client().await?;
 
                 let cmd_start = Instant::now();
-                let (blob_len, exists) = instrument_redis_call(
+                let pipeline_result = instrument_redis_call(
                     "STRLEN+EXISTS",
                     encoded_key,
                     timeout(
@@ -1795,16 +1795,30 @@ where
                             .query_async::<(u64, bool)>(&mut client.connection_manager),
                     ),
                 )
-                .await
-                .map_err(|_| {
-                    let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
-                    error!(cmd = "STRLEN+EXISTS", key = %encoded_key, elapsed_ms, "redis command timed out");
-                    make_err!(
-                        Code::Unavailable,
-                        "Redis STRLEN+EXISTS timed out after {elapsed_ms}ms for key {encoded_key}"
-                    )
-                })?
-                .err_tip(|| "In RedisStore::has_with_results_per_key")?;
+                .await;
+                let (blob_len, exists) = match pipeline_result {
+                    Err(_) => {
+                        let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
+                        error!(cmd = "STRLEN+EXISTS", key = %encoded_key, elapsed_ms, "redis command timed out");
+                        return Err(make_err!(
+                            Code::Unavailable,
+                            "Redis STRLEN+EXISTS timed out after {elapsed_ms}ms for key {encoded_key}"
+                        ));
+                    }
+                    Ok(Err(ref err)) if err.is_timeout() => {
+                        // Inner response_timeout fired — desynced slot, reconnect
+                        // before returning so the next caller gets a clean pipeline.
+                        // (FU-10: same desync mechanism as has_with_results.)
+                        let mut nl_err: Error = err.clone().into();
+                        nl_err.messages.push(
+                            "In RedisStore::has_with_results_per_key".to_string(),
+                        );
+                        drop(client.reconnect(&self.connection_manager).await);
+                        return Err(nl_err);
+                    }
+                    Ok(result) => result
+                        .err_tip(|| "In RedisStore::has_with_results_per_key")?,
+                };
                 let elapsed = cmd_start.elapsed();
                 if elapsed.as_secs() >= 5 {
                     error!(cmd = "STRLEN+EXISTS", key = %encoded_key, elapsed_ms = elapsed.as_millis() as u64, "redis command slow (>5s)");
@@ -1925,6 +1939,22 @@ where
                             results,
                         )
                         .await;
+                }
+                Ok(Err(ref err)) if err.is_timeout() => {
+                    // The ConnectionManager's inner response_timeout fired.
+                    // The multiplexed TCP connection now has an orphaned
+                    // in-flight response in the pipeline buffer — the next
+                    // command on this slot would read the wrong frame and
+                    // cause "Data length mismatch" or parse errors (FU-10,
+                    // 2026-06-15 incident: 154 mismatch errors from desynced
+                    // SETRANGE responses on the AC Valkey connection).
+                    // Replace the slot with a fresh connection before returning
+                    // the error so the caller can retry without desync risk.
+                    // Best-effort: if reconnect itself fails, the error is
+                    // silently dropped and the original timeout error returned.
+                    let redis_err = err.clone();
+                    drop(client.reconnect(&self.connection_manager).await);
+                    return Err(redis_err.into());
                 }
                 Ok(result) => result
                     .err_tip(|| "In RedisStore::has_with_results pipelined query")?,
@@ -2162,6 +2192,18 @@ where
                                 || format!("(after reconnect) while appending to temp key ({temp_key_ref}) in RedisStore::update. offset = {offset}. end_pos = {end_pos}"),
                             )?;
                         }
+                        Err(err) if err.is_timeout() => {
+                            // Inner response_timeout fired — desynced slot,
+                            // reconnect before returning. (FU-10: 2026-06-15
+                            // incident: desynced SETRANGE responses caused 154
+                            // "Data length mismatch" errors in RedisStore::update.)
+                            drop(self.connection_manager.reconnect(connect_id).await);
+                            let mut error: Error = err.into();
+                            error
+                                .messages
+                                .push(format!("While appending to temp key ({temp_key_ref}) in RedisStore::update. offset = {offset}. end_pos = {end_pos}"));
+                            return Err(error);
+                        }
                         Err(err) => {
                             let mut error: Error = err.into();
                             error
@@ -2241,20 +2283,33 @@ where
         }
 
         let cmd_start = Instant::now();
-        let blob_len: usize = timeout(
+        let strlen_result = timeout(
             self.command_timeout,
             client.connection_manager.strlen(&temp_key),
         )
-        .await
-        .map_err(|_| {
-            let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
-            error!(cmd = "STRLEN", key = %final_key, elapsed_ms, "redis command timed out");
-            make_err!(
-                Code::Unavailable,
-                "Redis STRLEN timed out after {elapsed_ms}ms for key {final_key}"
-            )
-        })?
-        .err_tip(|| format!("In RedisStore::update strlen check for {temp_key}"))?;
+        .await;
+        let blob_len: usize = match strlen_result {
+            Err(_) => {
+                let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
+                error!(cmd = "STRLEN", key = %final_key, elapsed_ms, "redis command timed out");
+                return Err(make_err!(
+                    Code::Unavailable,
+                    "Redis STRLEN timed out after {elapsed_ms}ms for key {final_key}"
+                ));
+            }
+            Ok(Err(ref err)) if err.is_timeout() => {
+                // Inner response_timeout fired — reconnect before returning.
+                // (FU-10: desynced slot would corrupt next STRLEN/RENAME.)
+                let mut nl_err: Error = err.clone().into();
+                nl_err.messages.push(format!(
+                    "In RedisStore::update strlen check for {temp_key}"
+                ));
+                drop(client.reconnect(&self.connection_manager).await);
+                return Err(nl_err);
+            }
+            Ok(result) => result
+                .err_tip(|| format!("In RedisStore::update strlen check for {temp_key}"))?,
+        };
         let elapsed = cmd_start.elapsed();
         if elapsed.as_secs() >= 5 {
             error!(cmd = "STRLEN", key = %final_key, elapsed_ms = elapsed.as_millis() as u64, "redis command slow (>5s)");
@@ -2279,23 +2334,35 @@ where
         let cmd_start = Instant::now();
         if let Some(pub_sub_channel) = &self.pub_sub_channel {
             // RENAME + PUBLISH in one pipeline round-trip.
-            let result = timeout(
+            let rename_publish_result = timeout(
                 self.command_timeout,
                 pipe()
                     .rename(&temp_key, final_key.as_ref())
                     .publish(pub_sub_channel, final_key.as_ref())
                     .query_async::<((), ())>(&mut client.connection_manager),
             )
-            .await
-            .map_err(|_| {
-                let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
-                error!(cmd = "RENAME+PUBLISH", key = %final_key, elapsed_ms, "redis pipeline timed out");
-                make_err!(
-                    Code::Unavailable,
-                    "Redis RENAME+PUBLISH timed out after {elapsed_ms}ms for key {final_key}"
-                )
-            })?
-            .err_tip(|| "While pipelining RENAME+PUBLISH in RedisStore::update()")?;
+            .await;
+            let result = match rename_publish_result {
+                Err(_) => {
+                    let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
+                    error!(cmd = "RENAME+PUBLISH", key = %final_key, elapsed_ms, "redis pipeline timed out");
+                    return Err(make_err!(
+                        Code::Unavailable,
+                        "Redis RENAME+PUBLISH timed out after {elapsed_ms}ms for key {final_key}"
+                    ));
+                }
+                Ok(Err(ref err)) if err.is_timeout() => {
+                    // Inner response_timeout — desynced slot. (FU-10.)
+                    let mut nl_err: Error = err.clone().into();
+                    nl_err.messages.push(
+                        "While pipelining RENAME+PUBLISH in RedisStore::update()".to_string(),
+                    );
+                    drop(client.reconnect(&self.connection_manager).await);
+                    return Err(nl_err);
+                }
+                Ok(result) => result
+                    .err_tip(|| "While pipelining RENAME+PUBLISH in RedisStore::update()")?,
+            };
             let elapsed = cmd_start.elapsed();
             if elapsed.as_secs() >= 5 {
                 error!(cmd = "RENAME+PUBLISH", key = %final_key, elapsed_ms = elapsed.as_millis() as u64, size_bytes = blob_len, "redis pipeline slow (>5s)");
@@ -2306,20 +2373,32 @@ where
         }
 
         // No pub_sub — just RENAME.
-        timeout(
+        let rename_result = timeout(
             self.command_timeout,
             client.connection_manager.rename::<_, _, ()>(&temp_key, final_key.as_ref()),
         )
-        .await
-        .map_err(|_| {
-            let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
-            error!(cmd = "RENAME", key = %final_key, elapsed_ms, "redis command timed out");
-            make_err!(
-                Code::Unavailable,
-                "Redis RENAME timed out after {elapsed_ms}ms for key {final_key}"
-            )
-        })?
-        .err_tip(|| "While queueing key rename in RedisStore::update()")?;
+        .await;
+        match rename_result {
+            Err(_) => {
+                let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
+                error!(cmd = "RENAME", key = %final_key, elapsed_ms, "redis command timed out");
+                return Err(make_err!(
+                    Code::Unavailable,
+                    "Redis RENAME timed out after {elapsed_ms}ms for key {final_key}"
+                ));
+            }
+            Ok(Err(ref err)) if err.is_timeout() => {
+                // Inner response_timeout — desynced slot. (FU-10.)
+                let mut nl_err: Error = err.clone().into();
+                nl_err.messages.push(
+                    "While queueing key rename in RedisStore::update()".to_string(),
+                );
+                drop(client.reconnect(&self.connection_manager).await);
+                return Err(nl_err);
+            }
+            Ok(result) => result
+                .err_tip(|| "While queueing key rename in RedisStore::update()")?,
+        };
         let elapsed = cmd_start.elapsed();
         if elapsed.as_secs() >= 5 {
             error!(cmd = "RENAME", key = %final_key, elapsed_ms = elapsed.as_millis() as u64, size_bytes = blob_len, "redis command slow (>5s)");
@@ -2397,20 +2476,32 @@ where
 
             loop {
                 let cmd_start = Instant::now();
-                let chunk: Bytes = timeout(
+                let getrange_result = timeout(
                     self.command_timeout,
                     client.connection_manager.getrange(encoded_key, chunk_start, chunk_end),
                 )
-                .await
-                .map_err(|_| {
-                    let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
-                    error!(cmd = "GETRANGE", key = %encoded_key, elapsed_ms, "redis command timed out");
-                    make_err!(
-                        Code::Unavailable,
-                        "Redis GETRANGE timed out after {elapsed_ms}ms for key {encoded_key}"
-                    )
-                })?
-                .err_tip(|| "In RedisStore::get_part::getrange")?;
+                .await;
+                let chunk: Bytes = match getrange_result {
+                    Err(_) => {
+                        let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
+                        error!(cmd = "GETRANGE", key = %encoded_key, elapsed_ms, "redis command timed out");
+                        return Err(make_err!(
+                            Code::Unavailable,
+                            "Redis GETRANGE timed out after {elapsed_ms}ms for key {encoded_key}"
+                        ));
+                    }
+                    Ok(Err(ref err)) if err.is_timeout() => {
+                        // Inner response_timeout — desynced slot. (FU-10.)
+                        let mut nl_err: Error = err.clone().into();
+                        nl_err.messages.push(
+                            "In RedisStore::get_part::getrange".to_string(),
+                        );
+                        drop(client.reconnect(&self.connection_manager).await);
+                        return Err(nl_err);
+                    }
+                    Ok(result) => result
+                        .err_tip(|| "In RedisStore::get_part::getrange")?,
+                };
                 let elapsed = cmd_start.elapsed();
                 if elapsed.as_secs() >= 5 {
                     error!(cmd = "GETRANGE", key = %encoded_key, elapsed_ms = elapsed.as_millis() as u64, size_bytes = chunk.len(), "redis command slow (>5s)");
@@ -2450,20 +2541,32 @@ where
             // return a NotFound error. This is required by spec.
             if writer.get_bytes_written() == 0 {
                 let cmd_start = Instant::now();
-                let exists: bool = timeout(
+                let exists_result = timeout(
                     self.command_timeout,
                     client.connection_manager.exists(encoded_key),
                 )
-                .await
-                .map_err(|_| {
-                    let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
-                    error!(cmd = "EXISTS", key = %encoded_key, elapsed_ms, "redis command timed out");
-                    make_err!(
-                        Code::Unavailable,
-                        "Redis EXISTS timed out after {elapsed_ms}ms for key {encoded_key}"
-                    )
-                })?
-                .err_tip(|| "In RedisStore::get_part::zero_exists")?;
+                .await;
+                let exists: bool = match exists_result {
+                    Err(_) => {
+                        let elapsed_ms = cmd_start.elapsed().as_millis() as u64;
+                        error!(cmd = "EXISTS", key = %encoded_key, elapsed_ms, "redis command timed out");
+                        return Err(make_err!(
+                            Code::Unavailable,
+                            "Redis EXISTS timed out after {elapsed_ms}ms for key {encoded_key}"
+                        ));
+                    }
+                    Ok(Err(ref err)) if err.is_timeout() => {
+                        // Inner response_timeout — desynced slot. (FU-10.)
+                        let mut nl_err: Error = err.clone().into();
+                        nl_err.messages.push(
+                            "In RedisStore::get_part::zero_exists".to_string(),
+                        );
+                        drop(client.reconnect(&self.connection_manager).await);
+                        return Err(nl_err);
+                    }
+                    Ok(result) => result
+                        .err_tip(|| "In RedisStore::get_part::zero_exists")?,
+                };
                 let elapsed = cmd_start.elapsed();
                 if elapsed.as_secs() >= 5 {
                     error!(cmd = "EXISTS", key = %encoded_key, elapsed_ms = elapsed.as_millis() as u64, "redis command slow (>5s)");
@@ -2554,7 +2657,7 @@ where
                 pipeline.exists(encoded_key.as_str());
             }
 
-            let client = match self.get_client().await {
+            let mut client = match self.get_client().await {
                 Ok(c) => c,
                 Err(e) => {
                     for &idx in chunk_indices {
@@ -2619,6 +2722,17 @@ where
                         fallback_results[idx] = result;
                     }
                     return fallback_results;
+                }
+                Ok(Err(ref e)) if e.is_timeout() => {
+                    // Inner response_timeout — desynced slot. (FU-10.)
+                    drop(client.reconnect(&self.connection_manager).await);
+                    for &idx in chunk_indices {
+                        results[idx] = Err(make_err!(
+                            Code::Unavailable,
+                            "redis batch GETRANGE+EXISTS timed out (inner response_timeout)"
+                        ));
+                    }
+                    return results;
                 }
                 Ok(Err(e)) => {
                     for &idx in chunk_indices {
@@ -2722,19 +2836,29 @@ where
             .get_client()
             .await
             .err_tip(|| "RedisStore::remove get_client")?;
-        let deleted: u64 = timeout(
+        let del_result = timeout(
             self.command_timeout,
             client.connection_manager.del::<_, u64>(encoded.as_ref()),
         )
-        .await
-        .map_err(|_| {
-            make_err!(
-                Code::Unavailable,
-                "RedisStore::remove DEL timed out for key {}",
-                encoded,
-            )
-        })?
-        .err_tip(|| format!("RedisStore::remove DEL failed for key {encoded}"))?;
+        .await;
+        let deleted: u64 = match del_result {
+            Err(_) => {
+                return Err(make_err!(
+                    Code::Unavailable,
+                    "RedisStore::remove DEL timed out for key {}",
+                    encoded,
+                ));
+            }
+            Ok(Err(ref err)) if err.is_timeout() => {
+                // Inner response_timeout — desynced slot. (FU-10.)
+                let mut nl_err: Error = err.clone().into();
+                nl_err.messages.push(format!("RedisStore::remove DEL failed for key {encoded}"));
+                drop(client.reconnect(&self.connection_manager).await);
+                return Err(nl_err);
+            }
+            Ok(result) => result
+                .err_tip(|| format!("RedisStore::remove DEL failed for key {encoded}"))?,
+        };
         if deleted == 0 {
             return Err(make_err!(
                 Code::NotFound,
