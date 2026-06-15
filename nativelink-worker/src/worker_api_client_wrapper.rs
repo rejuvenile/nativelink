@@ -27,6 +27,21 @@ use tonic::codec::Streaming;
 use tonic::transport::Channel;
 use tonic::{Code, Response, Status};
 
+/// Capacity of the mpsc channel that carries all control-plane writes
+/// (execution_response, execution_complete, blobs_available, bis_ack,
+/// chunked_message) from the publish closure to the single UpdateForWorker
+/// loop consumer.
+///
+/// CAPPED AT 16: Each action completion emits at most 3 messages
+/// (blobs_available + execution_response + execution_complete). Not all
+/// concurrent actions complete in the same scheduler tick, so 16 slots
+/// cover approximately 5 simultaneous completions before backpressure
+/// reaches the publisher. Beyond that, the (N+1)th sender `.await`s
+/// until the consumer drains a slot — standard mpsc backpressure that is
+/// correct and safe. The consumer is the single bidirectional gRPC stream
+/// loop; FIFO order is preserved regardless of capacity.
+pub const WORKER_API_CHANNEL_CAPACITY: usize = 16;
+
 /// This is used in order to allow unit tests to intercept these calls. This should always match
 /// the API of `WorkerApiClient` defined in the `worker_api.proto` file.
 pub trait WorkerApiClientTrait: Clone + Sync + Send + Sized + Unpin {
@@ -98,6 +113,8 @@ impl WorkerApiTransport {
 #[derive(Debug, Clone)]
 pub struct WorkerApiClientWrapper {
     inner: WorkerApiTransport,
+    // CAPPED AT WORKER_API_CHANNEL_CAPACITY: control-plane Sender; over-cap =
+    // producer backpressure at slot N. See constant doc above.
     channel: Option<Sender<Update>>,
 }
 
@@ -146,7 +163,9 @@ impl WorkerApiClientTrait for WorkerApiClientWrapper {
         request: ConnectWorkerRequest,
     ) -> Result<Response<Streaming<UpdateForWorker>>, Status> {
         drop(self.channel.take());
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // CAPPED AT WORKER_API_CHANNEL_CAPACITY: see constant doc. Over-cap
+        // behavior: publisher awaits until consumer drains a slot.
+        let (tx, rx) = tokio::sync::mpsc::channel(WORKER_API_CHANNEL_CAPACITY);
         if tx
             .send(Update::ConnectWorkerRequest(request))
             .await

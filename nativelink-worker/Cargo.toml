@@ -145,3 +145,9 @@ required-features = ["test-utils"]
 # behind `test-utils` like the other utils-using tests above.
 name = "ac_write_detach_test"
 required-features = ["test-utils"]
+
+[[test]]
+# (O2) Control-plane channel capacity tests: constant-value guard,
+# concurrency-without-serialization proof, and FIFO ordering verification.
+# No test-utils required — uses the real WorkerApiClientWrapper directly.
+name = "o2_channel_capacity_test"
