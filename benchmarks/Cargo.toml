@@ -38,6 +38,10 @@ bench-trace = [
 ]
 
 [dependencies]
+# U1 worker-upload cells implement `StoreDriver` (a `#[async_trait]` trait)
+# for the `LatencyInjectingStore` wrapper. Version pinned to match
+# nativelink-util and nativelink-store which both declare `0.1.88`.
+async-trait = { version = "0.1.88", default-features = false }
 # `async-lock::Mutex` is the type production wraps the
 # `HealthRegistryBuilder` in (`src/bin/nativelink.rs::inner_main`); bench
 # passes the same wrapper into `build_store_manager` so the signature
@@ -66,10 +70,21 @@ hostname = { version = "0.4.0", default-features = false }
 mimalloc = { version = "0.1.44", default-features = false, features = ["override", "v3"] }
 nativelink-config = { path = "../nativelink-config" }
 nativelink-error = { path = "../nativelink-error" }
+# U1 `LatencyInjectingStore` implements `StoreDriver` which requires
+# `MetricsComponent` from `nativelink-metric`.  The trait is re-exported via
+# `nativelink-util` but the crate name must be declared here so the macro
+# `nativelink_metric::Error` path resolves correctly.
+nativelink-metric = { path = "../nativelink-metric" }
 nativelink-proto = { path = "../nativelink-proto" }
 nativelink-service = { path = "../nativelink-service" }
 nativelink-store = { path = "../nativelink-store" }
 nativelink-util = { path = "../nativelink-util" }
+# U1 worker-upload cells drive `RunningActionsManagerImpl::new_with_callbacks`
+# + `create_and_add_action` + `upload_results` directly — the same seam used
+# by `nativelink-worker/tests/running_actions_manager_test.rs`. No test-utils
+# feature required: `new_with_callbacks` is always-public; the `test-utils`
+# gate only covers `BatchReadTestGate` + mock infrastructure.
+nativelink-worker = { path = "../nativelink-worker" }
 # #541: the W3 / W3f cells construct the three production durability
 # sinks (stable_digests pusher, failed_writes inserter, chunked_in_flight
 # refcount map) inline so the chunked-v2 commit path pays the same

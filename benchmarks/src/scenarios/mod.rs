@@ -23,6 +23,7 @@ pub mod find_missing;
 pub mod legacy_read;
 pub mod legacy_write;
 pub mod prodlike;
+pub mod worker_upload;
 
 use core::future::Future;
 use std::time::Instant;

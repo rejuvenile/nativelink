@@ -84,7 +84,7 @@ use nativelink_benchmarks::output::{BaselineFile, BenchmarkResult, RunMetadata, 
 use nativelink_benchmarks::preflight::{Verdict, run_preflight};
 use nativelink_benchmarks::scenarios::{
     MIN_ITERS, RunOpts, ac_micro, chunked_v2, existence_cache_micro, find_missing, legacy_read,
-    legacy_write, prodlike,
+    legacy_write, prodlike, worker_upload,
 };
 use nativelink_util::digest_hasher::{DigestHasherFunc, set_default_digest_hasher_func};
 
@@ -137,8 +137,9 @@ struct Cli {
     /// real-disk dataset on pool `fast` and is intended for
     /// dedicated #537 chunked-vs-non-chunked-on-disk comparisons).
     /// Valid values: `w1`, `r1`, `f1`, `w3`, `r5`, `c1`, `a1`,
-    /// `a2`, `prodlike`. Empty string is rejected.
-    #[arg(long, default_value = "w1,r1,f1,w3,r5,c1,a1,a2", value_parser = parse_scenarios)]
+    /// `a2`, `u1`, `prodlike`. Empty string is rejected.
+    /// `u1` = worker output-upload path (`inner_upload_results`).
+    #[arg(long, default_value = "w1,r1,f1,w3,r5,c1,a1,a2,u1", value_parser = parse_scenarios)]
     scenarios: String,
 
     /// Scratch root for the #537 `prodlike` cells (W1f / W3f). Defaults
@@ -310,6 +311,15 @@ async fn run_main() -> ExitCode {
     if want.iter().any(|s| s == "a1" || s == "a2") {
         eprintln!("[bench] A1 + A2 (ActionCache get / update — FilesystemStore leaf)");
         all_results.extend(ac_micro::run(&opts, temp_dir_opt.as_ref()).await);
+    }
+
+    // U1: worker output-upload path (`inner_upload_results`).
+    // Enabled by default (included in the default --scenarios list) because
+    // it is a new cell family with no prior baseline; two back-to-back runs
+    // establish the noise floor.
+    if want.iter().any(|s| s == "u1") {
+        eprintln!("[bench] U1 (worker upload_results — Phase-1 hash+has, Phase-2 upload)");
+        all_results.extend(worker_upload::run(&opts, temp_dir_opt.as_ref()).await);
     }
 
     // #537 prodlike: opt-in cell family that pins the FilesystemStore
