@@ -33,9 +33,16 @@
 //! spawns the slow-tier write DETACHED (not awaited by `upload_results`); the
 //! drain prevents those 3 ms-sleep tasks from bleeding into the NEXT sample's
 //! window.  `measure()` has no out-of-window teardown slot, so the drain sits
-//! at the body head, but in the common case the map is already empty (the
-//! detached writes finished during the prior, longer upload) so the drain is
-//! a near-zero, bounded settle — not part of the measured upload cost.
+//! at the body head.  For the larger cells (20/100-file) the long foreground
+//! upload lets the prior iteration's detached writes finish in-window, so the
+//! drain finds an empty map and is a near-zero settle.  For the small cells
+//! (5-file, dir) the detached stdout/stderr/Tree writes can spawn microseconds
+//! before `upload_results` returns, so the next body-head drain may absorb up
+//! to one ~3 ms tail INSIDE the timed window — bounded, per-sample-symmetric,
+//! and deadline-guarded; it shifts a small cell's absolute p50 by ≤3 ms but
+//! not the cross-cell comparison the cells exist for.  This per-cell drain-head
+//! cost is asserted by reasoning, not yet measured — the baseline pass should
+//! confirm it is sub-noise.
 //!
 //! This cell does NOT decompose the Phase-1/Phase-2 sequential gap or count
 //! individual `has()` calls.  An earlier revision tried to, via a slow-store
@@ -554,11 +561,13 @@ async fn drain_slow_writes(cas_store: &FastSlowStore, deadline: Duration) -> usi
 }
 
 /// Bound for [`drain_slow_writes`] inside the timed body.  The injected
-/// latency is 3 ms and the detached writes start during the (longer) upload,
-/// so in the common case the map is ALREADY empty when the next body begins
-/// and the drain returns immediately.  5 s is orders of magnitude above any
-/// legitimate 3 ms tail; reaching it means a hang, which the cell surfaces
-/// as a residual-count panic rather than a silently inflated sample.
+/// latency is 3 ms; for the larger cells the detached writes finish during the
+/// (longer) upload, so the map is ALREADY empty when the next body begins and
+/// the drain returns immediately.  For the small cells (5-file, dir) the drain
+/// may absorb up to one ~3 ms tail in-window (see the module-level note).  5 s
+/// is orders of magnitude above any legitimate 3 ms tail; reaching it means a
+/// hang, which the cell surfaces as a residual-count panic rather than a
+/// silently inflated sample.
 const SLOW_WRITE_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Monotonic bench clock: advances by 1 second per call so action metadata
@@ -907,9 +916,10 @@ async fn run_cell(
                     // quiescence before the measured upload, so this sample is
                     // self-contained (no cross-iteration bleed).  `measure()`
                     // has no out-of-window teardown slot, so the drain sits at
-                    // the head of the timed body; in the common case the map is
-                    // already empty (the 3 ms detached writes finished during
-                    // the prior, longer upload) and this returns immediately.
+                    // the head of the timed body: empty (near-zero) for the
+                    // larger cells, but may absorb <=1 ~3 ms tail in-window for
+                    // the small cells — bounded + per-sample-symmetric (see the
+                    // module-level note).
                     let residual = drain_slow_writes(&drain_store, SLOW_WRITE_DRAIN_DEADLINE).await;
                     assert_eq!(
                         residual, 0,
