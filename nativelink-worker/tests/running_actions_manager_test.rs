@@ -6816,4 +6816,342 @@ exit 1
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // N2: output_directories prehash batch tests
+    //
+    // These tests verify that Phase 1 of `inner_upload_results` walks
+    // declared `output_directories` trees and includes their file digests in
+    // the single batch `has_with_results()` call, eliminating one individual
+    // `has()` RPC per directory-interior file.
+    //
+    // `HasCountingStore` wraps a `MemoryStore` and counts:
+    //   - `single_has_count`: `has_with_results` invocations where `keys.len() == 1`
+    //     (these are individual `has()` calls from `upload_file`'s fallback path).
+    //   - `batch_has_key_count`: total keys submitted across all multi-key
+    //     `has_with_results` invocations (these are the Phase 1 batch calls).
+    // -----------------------------------------------------------------------
+
+    struct HasCountingStore {
+        inner: Arc<MemoryStore>,
+        /// Count of `has_with_results` calls that arrived with exactly one key —
+        /// these are individual per-file `has()` RPCs from the upload_file
+        /// fallback path at running_actions_manager.rs (upload_file: `has()`).
+        single_has_count: AtomicUsize,
+        /// Total keys submitted across all multi-key `has_with_results` calls —
+        /// these are the Phase 1 batch calls.
+        batch_has_key_count: AtomicUsize,
+    }
+
+    impl HasCountingStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryStore::new(&Default::default()),
+                single_has_count: AtomicUsize::new(0),
+                batch_has_key_count: AtomicUsize::new(0),
+            })
+        }
+
+        fn single_has_count(&self) -> usize {
+            self.single_has_count.load(Ordering::SeqCst)
+        }
+
+        fn batch_has_key_count(&self) -> usize {
+            self.batch_has_key_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MetricsComponent for HasCountingStore {
+        fn publish(
+            &self,
+            _kind: MetricKind,
+            _field_metadata: MetricFieldData,
+        ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+            Ok(MetricPublishKnownKindData::Component)
+        }
+    }
+
+    #[async_trait]
+    impl StoreDriver for HasCountingStore {
+        async fn has_with_results(
+            self: Pin<&Self>,
+            keys: &[StoreKey<'_>],
+            results: &mut [Option<u64>],
+        ) -> Result<(), Error> {
+            if keys.len() == 1 {
+                self.single_has_count.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.batch_has_key_count
+                    .fetch_add(keys.len(), Ordering::SeqCst);
+            }
+            Pin::new(self.inner.as_ref())
+                .has_with_results(keys, results)
+                .await
+        }
+
+        async fn update(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            reader: DropCloserReadHalf,
+            size_info: UploadSizeInfo,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .update(key, reader, size_info)
+                .await
+        }
+
+        async fn get_part(
+            self: Pin<&Self>,
+            key: StoreKey<'_>,
+            writer: &mut DropCloserWriteHalf,
+            offset: u64,
+            length: Option<u64>,
+        ) -> Result<(), Error> {
+            Pin::new(self.inner.as_ref())
+                .get_part(key, writer, offset, length)
+                .await
+        }
+
+        fn inner_store(&self, _key: Option<StoreKey<'_>>) -> &dyn StoreDriver {
+            self
+        }
+
+        fn as_any(&self) -> &(dyn core::any::Any + Sync + Send + 'static) {
+            self
+        }
+
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Sync + Send + 'static> {
+            self
+        }
+
+        fn register_item_callback(
+            self: Arc<Self>,
+            _callback: Arc<dyn ItemCallback>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn stable_delegation(&self) -> StableDigestDelegation<'_> {
+            StableDigestDelegation::Leaf
+        }
+
+        fn pin_delegation(&self) -> PinDelegation<'_> {
+            PinDelegation::Leaf
+        }
+
+        fn mark_stable_delegation(&self) -> MarkStableDelegation<'_> {
+            MarkStableDelegation::Leaf
+        }
+
+        fn optimized_for(&self, _optimization: StoreOptimizations) -> bool {
+            false
+        }
+    }
+
+    default_health_status_indicator!(HasCountingStore);
+
+    /// Build a `FastSlowStore` with `HasCountingStore` as the slow tier.
+    async fn setup_stores_with_counting_slow() -> Result<
+        (
+            Arc<FilesystemStore>,
+            Arc<HasCountingStore>,
+            Arc<FastSlowStore>,
+            Arc<MemoryStore>,
+        ),
+        Error,
+    > {
+        let fast_config = FilesystemSpec {
+            content_path: make_temp_path("content_path_counting"),
+            temp_path: make_temp_path("temp_path_counting"),
+            eviction_policy: None,
+            ..Default::default()
+        };
+        let fast_store = FilesystemStore::new(&fast_config).await?;
+        let slow_store = HasCountingStore::new();
+        let ac_store = MemoryStore::new(&Default::default());
+        let cas_store = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_config),
+                slow: StoreSpec::Memory(Default::default()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+                slow_writes_in_flight_max_bytes: 0,
+            },
+            Store::new(fast_store.clone()),
+            Store::new(slow_store.clone()),
+        );
+        Ok((fast_store, slow_store, cas_store, ac_store))
+    }
+
+    /// N2: files inside output_directories must be batched into Phase 1
+    /// `has_with_results()`, not checked via individual `has()` RPCs.
+    ///
+    /// Action creates 3 files inside `output_dir/`. Before the fix, each
+    /// file triggers one single-key `has_with_results` call (individual
+    /// `has()` from upload_file fallback). After the fix, all 3 digests
+    /// are included in the Phase 1 batch `has_with_results` call and no
+    /// individual `has()` call fires for them.
+    ///
+    /// The `HasCountingStore` sitting at the slow tier counts:
+    ///   - `single_has_count` — individual per-file `has()` calls
+    ///   - `batch_has_key_count` — keys submitted in the single batch call
+    ///
+    /// Mutation-verify: remove the directory-walk from Phase 1 (revert to
+    /// top-level-only prehash) → `single_has_count` climbs to 3 and
+    /// `batch_has_key_count` drops to 0 for directory-interior files.
+    /// The test fails with
+    /// "N2 invariant violated: directory-interior files produced N
+    ///  individual has() RPC calls; expected 0 (must be covered by batch)"
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn n2_output_dir_files_use_batch_has_not_individual()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "n2_test_worker";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, counting_store, cas_store, ac_store) =
+            setup_stores_with_counting_slow().await?;
+
+        let root_action_directory = make_temp_path("root_action_directory_n2");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+                cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Action: create 3 files inside output_dir/ — no top-level output
+        // files so all file digests MUST come from the directory walk.
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p output_dir && \
+                 printf 'alpha' > output_dir/a.txt && \
+                 printf 'bravo' > output_dir/b.txt && \
+                 printf 'charlie' > output_dir/c.txt"
+                    .to_string(),
+            ],
+            // Use output_directories only; no output_files.
+            output_directories: vec!["output_dir".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Blake3.into(),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id,
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        // Snapshot the store's has() counts before upload so we can
+        // measure only what upload_results() itself triggered.
+        let prepared = running_action_impl.clone().prepare_action().await?;
+        let executed = prepared.execute().await?;
+
+        let single_before = counting_store.single_has_count();
+        let batch_before = counting_store.batch_has_key_count();
+
+        executed.upload_results().await?;
+
+        let single_after = counting_store.single_has_count();
+        let batch_after = counting_store.batch_has_key_count();
+
+        let new_single = single_after - single_before;
+        let new_batch_keys = batch_after - batch_before;
+
+        // The 3 directory-interior files must appear in the batch call.
+        // (The batch call also covers any directory-proto blobs, but the
+        // minimum is the 3 file digests.)
+        assert!(
+            new_batch_keys >= 3,
+            "N2 invariant violated: expected ≥3 file digests in the Phase 1 \
+             batch has_with_results call; got {new_batch_keys} batch keys — \
+             directory-interior files are not being walked in Phase 1",
+        );
+
+        // No individual single-key has() for the directory files.
+        // After the fix, the batch covered them — no fallback individual RPC.
+        assert_eq!(
+            new_single, 0,
+            "N2 invariant violated: directory-interior files produced {new_single} \
+             individual has() RPC calls; expected 0 (must be covered by batch)",
+        );
+
+        running_action_impl.cleanup().await?;
+        Ok(())
+    }
+
 }
