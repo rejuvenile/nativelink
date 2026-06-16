@@ -169,6 +169,17 @@ pub fn force_dump_thread_stacks(label: &str) -> bool {
     eprintln!(
         "FORCE THREAD DUMP: {label} — dumping thread stacks (rate-limit bypassed)"
     );
+    // Emit a structured tracing event alongside the eprintln so
+    // journalctl-based monitoring (keyed on nativelink_util::stall_detector)
+    // catches force-dumps. The eprintln is kept as the pre-tracing-init
+    // safety net — force_dump_thread_stacks is callable before the tracing
+    // subscriber is registered (e.g. spawn_external_dump_listener is set up
+    // before the main runtime is fully initialised).
+    tracing::warn!(
+        target: "nativelink_util::stall_detector",
+        label,
+        "force dump triggered — dumping thread stacks (streaming_blob_deadline or external trigger)"
+    );
     dump_thread_stacks(label);
     true
 }
@@ -2075,10 +2086,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        DEFAULT_STALL_THRESHOLD, LAST_DUMP_EPOCH, MIN_DUMP_INTERVAL_SECS,
-        MIN_FORCE_DUMP_INTERVAL_SECS, StallGuard, StallVerdict, TEST_DUMPS_FIRED,
-        TEST_RATE_LIMITED_HITS, bump_progress_handle, classify_stall,
-        force_dump_should_proceed, rearm_loop_dump_should_proceed,
+        DEFAULT_STALL_THRESHOLD, LAST_DUMP_EPOCH, LAST_FORCE_DUMP_EPOCH,
+        MIN_DUMP_INTERVAL_SECS, MIN_FORCE_DUMP_INTERVAL_SECS, StallGuard, StallVerdict,
+        TEST_DUMPS_FIRED, TEST_RATE_LIMITED_HITS, bump_progress_handle, classify_stall,
+        force_dump_should_proceed, force_dump_thread_stacks, rearm_loop_dump_should_proceed,
     };
 
     /// Serialize tests that read or assert on the process-global
@@ -2093,12 +2104,15 @@ mod tests {
     /// Reset the dump-fire-related process-global state so a test can
     /// observe counters from a known zero. Called under
     /// [`TEST_DUMP_LOCK`] to ensure serialized access. Resets both
-    /// counters AND `LAST_DUMP_EPOCH` so the strict-`>` rate-limit gate
+    /// counters AND the rate-limit epochs so the strict-`>` gate
     /// can be exercised from cold-start in each test.
     fn reset_dump_state() {
         TEST_DUMPS_FIRED.store(0, Ordering::SeqCst);
         TEST_RATE_LIMITED_HITS.store(0, Ordering::SeqCst);
         LAST_DUMP_EPOCH.store(0, Ordering::SeqCst);
+        // Also reset the force-dump epoch so tests exercising
+        // force_dump_thread_stacks start from a cold rate-limit gate.
+        LAST_FORCE_DUMP_EPOCH.store(0, Ordering::SeqCst);
     }
 
     /// Spec: when the wrapped operation never calls `bump_progress`
@@ -3180,5 +3194,68 @@ mod tests {
             (after.sa_flags & libc::SA_SIGINFO) != 0,
             "SIGRTMIN+1 sigaction missing SA_SIGINFO flag; not our handler",
         );
+    }
+
+    /// Spec (FU-11): `force_dump_thread_stacks` MUST emit a `tracing::warn!`
+    /// event on the proceeding path (dump actually triggered) with:
+    /// - `target = "nativelink_util::stall_detector"` so journalctl filters
+    ///   keyed on that target capture force-dumps alongside StallGuard warns.
+    /// - `label` field set to the caller-supplied label string.
+    /// - level WARN so it survives `release_max_level_info`.
+    ///
+    /// Chesterton's Fence: the `eprintln!` is the pre-tracing-init safety
+    /// net (force_dump can be called before a subscriber is registered) —
+    /// it is KEPT alongside the new `warn!`. The `warn!` is the structured
+    /// monitoring path; the `eprintln!` is the fallback for early-startup.
+    ///
+    /// Mutation step: comment out the `tracing::warn!` in
+    /// `force_dump_thread_stacks` — this test MUST red-fail with the
+    /// bespoke "force_dump_thread_stacks did not emit tracing WARN event
+    /// — FU-11 regression" message because `logs_assert` finds zero
+    /// matching warn lines.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn force_dump_emits_tracing_warn_event() {
+        // Serialize with sibling tests that read LAST_DUMP_EPOCH and the
+        // TEST_DUMPS_FIRED / TEST_RATE_LIMITED_HITS counters.
+        // force_dump_thread_stacks bumps LAST_DUMP_EPOCH on success, which
+        // would race with any parallel test checking that counter.
+        let _lock = TEST_DUMP_LOCK.lock().unwrap();
+        reset_dump_state(); // zeros LAST_DUMP_EPOCH + LAST_FORCE_DUMP_EPOCH
+
+        let label = "streaming_blob_deadline";
+        let fired = force_dump_thread_stacks(label);
+
+        assert!(
+            fired,
+            "force_dump_thread_stacks must return true on the proceeding \
+             path (cold epoch); rate-limit gate should have admitted the call"
+        );
+
+        // `tracing_test::traced_test` installs a subscriber and captures
+        // all log lines for the test. `logs_assert` receives them as
+        // `&[&str]` where each line includes the level prefix and message.
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(" WARN ")
+                        && l.contains("nativelink_util::stall_detector")
+                        && l.contains("force dump triggered")
+                        && l.contains(label)
+                })
+                .count();
+            if n >= 1 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "force_dump_thread_stacks did not emit tracing WARN event \
+                     — FU-11 regression. Searched for WARN lines containing \
+                     'nativelink_util::stall_detector', 'force dump triggered', \
+                     and label '{label}'. Captured {} line(s): {lines:?}",
+                    lines.len()
+                ))
+            }
+        });
     }
 }
