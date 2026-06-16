@@ -88,13 +88,42 @@ fn collect_tree_ops_recursive(
             // Create directory immediately — DFS walk guarantees parent
             // already exists. This avoids collecting dirs and doing
             // separate depth-sorted batch creation.
-            std::fs::create_dir(&dst_path).map_err(|e| {
-                make_err!(
-                    nativelink_error::Code::Internal,
-                    "Failed to create directory {}: {e}",
-                    dst_path.display()
-                )
-            })?;
+            //
+            // O5 concurrency: [C] (prepare_output_directory) may pre-create
+            // subdirectories (e.g. `bazel-out/`) in the work_dir before [B2]'s
+            // hardlink_directory_tree reaches them. Tolerate AlreadyExists when
+            // the existing entry is a directory — a non-directory at a directory
+            // path is still a genuine conflict. Mirrors the pattern in
+            // download_to_directory's BFS mkdir at running_actions_manager.rs:1354.
+            match std::fs::create_dir(&dst_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Verify it's a directory, not a file/symlink that
+                    // happens to have the same name.
+                    let m = std::fs::symlink_metadata(&dst_path).map_err(|me| {
+                        make_err!(
+                            nativelink_error::Code::Internal,
+                            "Failed to create directory {}: already exists but could not stat: {me}",
+                            dst_path.display()
+                        )
+                    })?;
+                    if !m.is_dir() {
+                        return Err(make_err!(
+                            nativelink_error::Code::AlreadyExists,
+                            "Failed to create directory {}: a non-directory entry already exists",
+                            dst_path.display()
+                        ));
+                    }
+                    // Pre-created by concurrent [C] — treat as Ok(()).
+                }
+                Err(e) => {
+                    return Err(make_err!(
+                        nativelink_error::Code::Internal,
+                        "Failed to create directory {}: {e}",
+                        dst_path.display()
+                    ));
+                }
+            }
             collect_tree_ops_recursive(&entry.path(), &dst_path, ops)?;
         } else if ft.is_file() {
             ops.files.push((entry.path(), dst_path));
@@ -331,15 +360,35 @@ fn try_clonefile(src: &Path, dst: &Path) -> Result<(), Error> {
     })?;
 
     // clonefile(2) requires the destination to not exist.
-    // The work directory may have been pre-created — remove it first.
+    // The work directory may have been pre-created (by [B1]) — remove it if empty.
+    //
+    // O5 concurrency: [C] may have already populated dst (e.g. created
+    // `dst/bazel-out/`), making remove_dir fail with ENOTEMPTY. Do NOT
+    // attempt to remove a non-empty dst — that would destroy work [C] did.
+    // Instead return Err here to trigger the hardlink fallback in the caller.
+    // Post-[B1] the work_dir always exists, so clonefile into a genuinely-
+    // absent dst is only valid when dst is truly empty.
     if dst.exists() {
-        std::fs::remove_dir(dst).map_err(|e| {
-            make_err!(
-                nativelink_error::Code::Internal,
-                "Failed to remove existing dst for clonefile {}: {e}",
-                dst.display()
-            )
-        })?;
+        match std::fs::remove_dir(dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                // dst already has content from concurrent [C]; clonefile
+                // cannot proceed. Signal the caller to use the hardlink path.
+                return Err(make_err!(
+                    nativelink_error::Code::Internal,
+                    "clonefile {} → {}: dst non-empty (concurrent [C] pre-populated); falling back to hardlink",
+                    src.display(),
+                    dst.display()
+                ));
+            }
+            Err(e) => {
+                return Err(make_err!(
+                    nativelink_error::Code::Internal,
+                    "Failed to remove existing dst for clonefile {}: {e}",
+                    dst.display()
+                ));
+            }
+        }
     }
 
     // SAFETY: src_c and dst_c are valid CStrings with nul terminators.
@@ -705,6 +754,74 @@ mod tests {
 
         let result = hardlink_directory_tree(&src, &dst).await;
         assert!(result.is_err());
+    }
+
+    /// Regression test for the DirectoryCache EEXIST regression introduced by O5
+    /// (commit 333ce15e). In `!is_direct_use` mode, output-dir prep [C] runs
+    /// concurrently with hardlink [B2]. [C] calls `prepare_output_directory` which
+    /// creates `work_dir/bazel-out/...` BEFORE `hardlink_directory_tree`'s
+    /// `collect_tree_ops_recursive` reaches the same directory. Without tolerance the
+    /// bare `create_dir` fails with AlreadyExists → cache hit becomes a miss.
+    ///
+    /// The existing `test_hardlink_into_existing_destination` pre-creates only the
+    /// *root* dst dir (not a subdirectory), so `collect_tree_ops_recursive` never
+    /// races with a pre-existing sub-dir — it would NOT catch this bug.
+    #[nativelink_test("crate")]
+    async fn test_hardlink_into_dst_with_pre_existing_subdir() -> Result<(), Error> {
+        let temp_dir = TempDir::new().err_tip(|| "Failed to create temp dir")?;
+
+        // Build a src tree that contains a `bazel-out/` subdirectory with a file —
+        // this simulates a cached action tree.
+        let src_dir = temp_dir.path().join("cache_src");
+        std::fs::create_dir(&src_dir).err_tip(|| "create cache_src")?;
+        let bazel_out = src_dir.join("bazel-out");
+        std::fs::create_dir(&bazel_out).err_tip(|| "create bazel-out in src")?;
+        {
+            let mut f = std::fs::File::create(bazel_out.join("artifact.txt"))
+                .err_tip(|| "create artifact.txt")?;
+            std::io::Write::write_all(&mut f, b"build artifact")
+                .err_tip(|| "write artifact.txt")?;
+        }
+
+        // Pre-create the dst root AND the dst/bazel-out subdirectory — simulating
+        // [C] (prepare_output_directory) winning the race against [B2]'s hardlink.
+        let dst_dir = temp_dir.path().join("work_dir");
+        std::fs::create_dir(&dst_dir).err_tip(|| "create work_dir")?;
+        // [C] pre-creates the output subdir:
+        std::fs::create_dir(dst_dir.join("bazel-out"))
+            .err_tip(|| "pre-create bazel-out in dst (simulates [C])")?;
+
+        // Must succeed — EEXIST on a pre-existing directory must be tolerated.
+        hardlink_directory_tree(&src_dir, &dst_dir).await.err_tip(|| {
+            "hardlink into dst with a pre-existing bazel-out subdir must tolerate EEXIST (concurrent [C] race)"
+        })?;
+
+        // Verify the file was materialized correctly.
+        assert!(
+            dst_dir.join("bazel-out").is_dir(),
+            "bazel-out must be a directory"
+        );
+        let content = tokio::fs::read_to_string(dst_dir.join("bazel-out/artifact.txt"))
+            .await
+            .err_tip(|| "read artifact.txt in dst")?;
+        assert_eq!(content, "build artifact", "artifact content mismatch");
+
+        // Verify hardlink (same inode on Unix).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let src_meta = std::fs::metadata(src_dir.join("bazel-out/artifact.txt"))
+                .err_tip(|| "stat src artifact")?;
+            let dst_meta = std::fs::metadata(dst_dir.join("bazel-out/artifact.txt"))
+                .err_tip(|| "stat dst artifact")?;
+            assert_eq!(
+                src_meta.ino(),
+                dst_meta.ino(),
+                "artifact.txt must be hardlinked (same inode)"
+            );
+        }
+
+        Ok(())
     }
 
     #[nativelink_test("crate")]
