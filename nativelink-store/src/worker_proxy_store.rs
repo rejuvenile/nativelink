@@ -159,16 +159,36 @@ pub struct WorkerProxyStore {
     /// (CCS-drop §3.3 / §8 Q4) Replacement for `ccs_incomplete_entries_counter`
     /// when `disable_completeness_check = true` removes CCS's stale-AC signal.
     ///
-    /// Incremented in `get_part_sequential` when BOTH the inner store AND all
-    /// worker peers return NotFound — the stale-AC symptom: Bazel received a
-    /// cache-hit AC entry but the referenced blob is gone from both server CAS
-    /// and every known worker. Each increment is one Bazel-visible NotFound
-    /// that will trigger an eviction-retry re-execution.
+    /// Incremented in `get_part_sequential` when BOTH the inner store AND ALL
+    /// worker peers return NotFound — the **eviction-retry-trigger rate**: the
+    /// blob is unreachable from the server's perspective, so Bazel will receive
+    /// a NotFound and trigger `--remote_cache_eviction_retries`.
     ///
-    /// **Non-zero rate → stale AC entries accumulating.** Sustained rate
-    /// growth → AC TTL / cap needs adjustment (§8 Q1). Zero for hours after
-    /// enabling `disable_completeness_check` → CCS removal is safe from a
-    /// stale-AC perspective (no new accumulation).
+    /// **Known increment sources (design §3.3):**
+    /// 1. Stale-AC entries — DOMINANT sub-case; AC hit references an evicted
+    ///    blob absent from both server CAS and all known workers.
+    /// 2. Stale-locality — blob evicted from the worker between
+    ///    `BlobsAvailable` registration and this fetch (12 of 19 no-peers
+    ///    events in the 24h production data). Indistinguishable from case 1.
+    /// 3. First-time misses — blob not yet uploaded by any worker; rare on
+    ///    the server-side AC path.
+    ///
+    /// **Necessary-but-not-sufficient for stale-AC accumulation.** A non-zero
+    /// rate indicates blobs are unreachable but does NOT isolate the stale-AC
+    /// sub-case from stale-locality or first-time misses. Do NOT add an AC
+    /// TTL based on this counter alone. Cross-reference with
+    /// `worker_proxy_peer_fetch_notfound_total` (which fires when at least one
+    /// peer was consulted but returned NotFound) to distinguish stale-locality
+    /// (peers found, blob gone) from no-peers (stale-AC or first-time miss).
+    ///
+    /// **Triage guide:**
+    /// - Compare with `worker_proxy_peer_fetch_notfound_total`. If that counter
+    ///   is zero while this one is non-zero, no peers were in locality_map for
+    ///   the digest — stale-AC or first-time miss (not stale-locality).
+    /// - Sustained growth after enabling `disable_completeness_check` with no
+    ///   increase in `peer_fetch_notfound` → stale-AC accumulation likely.
+    /// - Zero for hours after enabling → CCS removal is safe from a stale-AC
+    ///   perspective.
     ///
     /// Published under: `<store_key>_wps_cas_and_peer_notfound_total_counter`.
     wps_cas_and_peer_notfound_total: CounterWithTime,
@@ -457,11 +477,13 @@ impl MetricsComponent for WorkerProxyStore {
             "wps_cas_and_peer_notfound_total",
             &self.wps_cas_and_peer_notfound_total,
             MetricKind::Counter,
-            "CCS-drop §3.3 stale-AC signal: incremented in get_part_sequential when \
-             BOTH the inner CAS store AND all worker peers return NotFound — the \
-             stale-AC symptom (Bazel received a cache-hit AC entry but the blob is \
-             gone from server CAS and all known workers). Non-zero rate → stale AC \
-             entries accumulating; sustained growth → AC TTL/cap needs adjustment."
+            "CCS-drop §3.3 eviction-retry-trigger rate: incremented in \
+             get_part_sequential when BOTH the inner CAS store AND all worker peers \
+             return NotFound. Fires for stale-AC entries (dominant), stale-locality \
+             evictions, and first-time misses. Necessary-but-not-sufficient for \
+             stale-AC accumulation — do NOT add an AC TTL on this counter alone. \
+             Cross-reference worker_proxy_peer_fetch_notfound_total to distinguish \
+             sub-cases. See field doc-comment for triage guide."
         );
 
         // Snapshot per-endpoint state under a brief read lock, then publish

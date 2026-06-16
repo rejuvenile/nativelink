@@ -21,7 +21,7 @@
 //!
 //! ## Test A — worker-fetch goal (§7, the goal test)
 //!
-//! Production-composition chain WITHOUT the completeness check:
+//! Simplified composition (does NOT include VerifyStore — worker-fetch goal only):
 //!   `AC_STORE (MemoryStore) → CompletenessCheckingStore(disable=true) [AC side]`
 //!   `WorkerProxyStore(MemoryStore inner) → CAS [CAS side]`
 //!
@@ -50,6 +50,15 @@
 //! ... and the disabled case (true) also fails because CCS now does the check:
 //! "flag-skip mutation: disable flag ignored — completeness check fired when flag=true"
 //!
+//! ## Test B2 — has_with_results skip-gate (testing-czar T-1 BLOCK fix)
+//!
+//! CCS with `disable=true`; AC entry present; CAS blob ABSENT →
+//! `has_with_results` must return `Some(size)` (ac_store pass-through, no check).
+//!
+//! Mutation: comment out `:819–821` → completeness check fires → `results[0] == None`
+//! → assertion fails: "has_with_results skip-gate mutation: completeness check
+//! fired when disable=true"
+//!
 //! ## Test C — observability: `wps_cas_and_peer_notfound_total` render-test
 //!
 //! Pins the emitted metric name via `render_prometheus`. Mutation: comment out
@@ -73,7 +82,7 @@ use nativelink_util::blob_locality_map::{SharedBlobLocalityMap, new_shared_blob_
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
 use nativelink_util::metrics_publisher::{MetricsRegistry, render_prometheus};
-use nativelink_util::store_trait::{Store, StoreLike};
+use nativelink_util::store_trait::{Store, StoreKey, StoreLike};
 
 // (No fixed-constant digests needed — each test constructs its own.)
 
@@ -83,7 +92,8 @@ use nativelink_util::store_trait::{Store, StoreLike};
 
 /// # Test A — worker-fetch goal (§7 from the design doc)
 ///
-/// Production-composition shape (CCS disabled):
+/// Simplified composition (CCS disabled; does NOT include VerifyStore or FastSlowStore
+/// — see T-2 note from testing-czar review):
 ///   AC chain: bare MemoryStore → CCS(disable=true)  [AC-side, transparent]
 ///   CAS chain: WorkerProxyStore(empty MemoryStore inner) + peer worker store
 ///
@@ -101,7 +111,7 @@ async fn worker_fetch_goal_peer_fetch_succeeds_when_ccs_disabled() -> Result<(),
     let inner_cas = Store::new(MemoryStore::new(&nativelink_config::stores::MemorySpec::default()));
     let locality_map: SharedBlobLocalityMap = new_shared_blob_locality_map();
     let wps_arc = WorkerProxyStore::new(inner_cas.clone(), locality_map.clone());
-    let _cas_store = Store::new(wps_arc.clone());
+    let cas_store = Store::new(wps_arc.clone());
 
     // Peer store populated with the blob.
     let peer_store = Store::new(MemoryStore::new(&nativelink_config::stores::MemorySpec::default()));
@@ -124,7 +134,7 @@ async fn worker_fetch_goal_peer_fetch_succeeds_when_ccs_disabled() -> Result<(),
     // Inner CAS is empty; the only path is via locality_map → try_read_from_worker.
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        _cas_store.get_part_unchunked(blob_digest, 0, None),
+        cas_store.get_part_unchunked(blob_digest, 0, None),
     )
     .await
     .expect(
@@ -277,6 +287,71 @@ async fn ccs_disable_flag_controls_completeness_check() -> Result<(), Error> {
             "flag=false: CCS must return NotFound for incomplete entry; got: {err:?}"
         );
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Test B2: has_with_results skip-gate (the testing-czar T-1 BLOCK)
+// ---------------------------------------------------------------------------
+
+/// # Test B2 — `has_with_results` skip-gate with `disable=true`
+///
+/// Variant of Test B focused on the EXISTENCE path (`has_with_results`) rather
+/// than the data-fetch path (`get_part`). The testing-czar mutation-4 proved
+/// that commenting out the gate at `completeness_checking_store.rs:819–821`
+/// causes all three prior tests to PASS — the gate was mutation-invisible.
+///
+/// Setup:
+///   - CCS constructed with `disable=true`.
+///   - AC entry IS present in `ac_store` (referencing a CAS blob).
+///   - CAS blob is ABSENT from `cas_store`.
+///
+/// Expected: `has_with_results` returns `Some(size)` — the pass-through answer
+/// from `ac_store`, no completeness check performed.
+///
+/// Mutation (comment out `completeness_checking_store.rs:819–821`):
+///   → CCS runs `inner_has_with_results` → checks CAS → blob absent →
+///   `results[0]` is `None` → assertion fails with:
+///   `"has_with_results skip-gate mutation: completeness check fired when disable=true"`
+#[nativelink_test]
+async fn ccs_has_with_results_skip_gate_disable_true() -> Result<(), Error> {
+    let ac_backend = Store::new(MemoryStore::new(&nativelink_config::stores::MemorySpec::default()));
+    // CAS store — deliberately empty so completeness check would fail.
+    let empty_cas = Store::new(MemoryStore::new(&nativelink_config::stores::MemorySpec::default()));
+
+    // Upload an AC entry referencing a CAS-absent blob.
+    let cas_blob_digest = DigestInfo::try_new(
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        6,
+    )?;
+    let ac_digest = upload_ac_with_blob_digest(&ac_backend, cas_blob_digest).await?;
+
+    // CCS with disable=true → transparent pass-through on has_with_results.
+    let ccs = CompletenessCheckingStore::new_with_disable_flag(
+        ac_backend,
+        empty_cas,
+        true, // disable_completeness_check = true
+    );
+    let ccs_store = Store::new(ccs);
+
+    // has_with_results must return Some(size) — delegated to ac_store, no CAS check.
+    let mut results = [None];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ccs_store.has_with_results(&[StoreKey::from(ac_digest)], &mut results),
+    )
+    .await
+    .expect(
+        "has_with_results skip-gate test must not deadlock — \
+         CCS.has_with_results should complete within 5s",
+    )?;
+
+    assert!(
+        results[0].is_some(),
+        "has_with_results skip-gate mutation: completeness check fired when disable=true; \
+         expected Some(size) from ac_store pass-through, got None (CAS absence caused rejection)"
+    );
 
     Ok(())
 }

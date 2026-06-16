@@ -212,7 +212,7 @@ impl CompletenessCheckingStore {
     /// `get_part` / `has_with_results` / `remove` delegate straight to
     /// `ac_store` without decoding any AC entry or querying `cas_store`.
     ///
-    /// When `disable = false` this is equivalent to calling `Self::new`.
+    /// When `disable = false` this produces an equivalent store to `Self::new`.
     pub fn new_with_disable_flag(
         ac_store: Store,
         cas_store: Store,
