@@ -747,6 +747,70 @@ const CONNECTION_RETRY_DELAY_S: f32 = 0.5;
 /// `cas_server.rs` must also be updated.
 const DEFAULT_ENDPOINT_TIMEOUT_S: f32 = 5.;
 
+/// TCP keepalive for the worker→scheduler WorkerApi control-plane
+/// connection. Mirrors the data-channel default in `tls_utils::endpoint`
+/// (which uses `Duration::from_secs(30)` when `tcp_keepalive_s` is unset,
+/// `tls_utils.rs:171-175`). Without this the control plane was built via
+/// `tls_utils::endpoint_from`, which sets only `tcp_nodelay` — so a
+/// silently half-open scheduler connection (no GOAWAY / no RST) lets an
+/// `execution_response` / `complete` / `blobs_available` send hang
+/// indefinitely and the bidi stream never errors, so `inner.run` never
+/// returns and the reconnect loop (`run`, `:~4450`) never fires.
+pub const WORKER_API_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// HTTP/2 keepalive ping interval for the WorkerApi control-plane
+/// connection. Mirrors the data-channel default in `tls_utils::endpoint`
+/// (`http2_keepalive_interval` falls back to `Duration::from_secs(30)`,
+/// `tls_utils.rs:176-180`). The HTTP/2 ping detects a half-open
+/// connection at the stream layer even when TCP keepalive has not yet
+/// fired.
+const WORKER_API_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// HTTP/2 keepalive ping timeout for the WorkerApi control-plane
+/// connection. Mirrors the data-channel default in `tls_utils::endpoint`
+/// (`http2_keepalive_timeout` falls back to `Duration::from_secs(20)`,
+/// `tls_utils.rs:181-185`). If a keepalive ping is unacked within this
+/// window the connection is declared dead and the bidi stream errors.
+const WORKER_API_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Build the worker→scheduler WorkerApi control-plane (TCP/HTTP2) endpoint
+/// WITH connection keepalive.
+///
+/// The WorkerApi endpoint historically went through `tls_utils::endpoint_from`
+/// (the low-level URI-string builder), which sets only `tcp_nodelay` — NO
+/// keepalive. The DATA channel goes through `tls_utils::endpoint`, which
+/// adds `tcp_keepalive` + the HTTP/2 keepalive trio (added in #2152 "detect
+/// dead connections"). The control plane never grew keepalive because it
+/// uses a slimmer config type (`EndpointConfig`) that lacks the keepalive
+/// fields `GrpcEndpoint` carries — drift, not intent. This helper closes
+/// that gap by mirroring the data-channel defaults
+/// (`WORKER_API_TCP_KEEPALIVE` / `_HTTP2_KEEPALIVE_INTERVAL` / `_TIMEOUT`).
+///
+/// Liveness here is connection KEEPALIVE (dead-connection propagation), NOT
+/// a per-RPC deadline — consistent with the "no per-RPC timeouts" operator
+/// directive. The pre-existing `connect_timeout`/`timeout` are preserved
+/// unchanged (they predate this change).
+///
+/// Extracted from the connection-factory closure so the keepalive is
+/// independently testable via `Endpoint::get_tcp_keepalive`.
+pub fn build_worker_api_tcp_endpoint(
+    uri: &str,
+    tls_config: Option<tonic::transport::ClientTlsConfig>,
+    timeout_duration: Duration,
+) -> Result<tonic::transport::Endpoint, Error> {
+    Ok(tls_utils::endpoint_from(uri, tls_config)
+        .map_err(|e| make_input_err!("Invalid URI for worker endpoint : {e:?}"))?
+        .connect_timeout(timeout_duration)
+        .timeout(timeout_duration)
+        // Keepalive so a half-open scheduler connection (no GOAWAY / no RST)
+        // surfaces as a stream error within a keepalive cycle, letting the
+        // bidi stream error -> `inner.run` return -> reconnect.
+        .tcp_keepalive(Some(WORKER_API_TCP_KEEPALIVE))
+        .http2_keep_alive_interval(WORKER_API_HTTP2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(WORKER_API_HTTP2_KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true))
+}
+
 /// Maximum decoded message size for the scheduler→worker `WorkerApi` stream.
 ///
 /// Tonic's generated client default is 4 MiB. The worker receives the
@@ -4222,11 +4286,11 @@ pub async fn new_local_worker(
                 let tls_config =
                     tls_utils::load_client_config(&config.worker_api_endpoint.tls_config)
                         .err_tip(|| "Parsing local worker TLS configuration")?;
-                let endpoint =
-                    tls_utils::endpoint_from(&config.worker_api_endpoint.uri, tls_config)
-                        .map_err(|e| make_input_err!("Invalid URI for worker endpoint : {e:?}"))?
-                        .connect_timeout(timeout_duration)
-                        .timeout(timeout_duration);
+                let endpoint = build_worker_api_tcp_endpoint(
+                    &config.worker_api_endpoint.uri,
+                    tls_config,
+                    timeout_duration,
+                )?;
 
                 let transport = endpoint.connect().await.map_err(|e| {
                     make_err!(

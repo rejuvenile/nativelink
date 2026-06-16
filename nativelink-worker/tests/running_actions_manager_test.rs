@@ -6817,6 +6817,220 @@ exit 1
     }
 
     // -----------------------------------------------------------------------
+    // Gap 2: a kill that arrives DURING the upload tail must preempt the
+    // in-flight upload so the action reaches cleanup.
+    //
+    // Before the fix `inner_upload_results` / `upload_results` had no kill
+    // arm in its `select!` (`running_actions_manager.rs:~4592`): the
+    // `kill_channel_rx` is consumed by `inner_execute`, so once the child
+    // has exited the only kill signal is the `cancelled` AtomicBool — which
+    // nothing in the upload path awaits. A 600s upload therefore ignored a
+    // kill that arrived after the child exited, wedging the action until the
+    // `max_upload_timeout` (600s) fired.
+    //
+    // This test wires the production composition `FastSlowStore { fast:
+    // FilesystemStore, slow: BlockingFakeSlowStore }` with the slow tier
+    // parked indefinitely (deferred OFF → synchronous upload blocks on the
+    // slow tier's `update`). It drives a real action through
+    // prepare → execute, spawns the REAL `upload_results` (which parks
+    // in-flight on the blocked slow store), confirms it is genuinely
+    // in-flight, then fires `kill_operation` — WITHOUT ever releasing the
+    // slow store. The kill must preempt the in-flight upload and the task
+    // must return `Code::Aborted` within a tight bound.
+    //
+    // Mutation-verify: comment out the `kill_fut` arm in `upload_results`
+    // (`running_actions_manager.rs`). The kill notify is then ignored, the
+    // upload stays parked on the never-released slow store, and the
+    // `tokio::time::timeout(ABORT_DEADLINE, task)` fires with the bespoke
+    // "kill during upload tail must preempt the in-flight upload" message.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn kill_during_upload_tail_aborts_in_flight_upload()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "kill_upload_tail_worker";
+        // Time to confirm the upload is genuinely parked on the slow store.
+        const ENTERED_DEADLINE: Duration = Duration::from_secs(5);
+        // After the kill, the in-flight upload must abort within this bound.
+        // It is FAR below the 600s max_upload_timeout: a regression (no kill
+        // arm) keeps the task parked on the never-released slow store and
+        // only the 600s upload-timeout would eventually fire, so this short
+        // deadline cleanly separates "kill preempted" from "kill ignored".
+        const ABORT_DEADLINE: Duration = Duration::from_secs(5);
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_fast_store, slow_store, cas_store, ac_store) =
+            setup_stores_with_blocking_slow().await?;
+        let root_action_directory = make_temp_path("root_action_directory_kill_upload_tail");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        assert!(
+            slow_store.block_updates.load(Ordering::SeqCst),
+            "fixture invariant: slow store must start blocked"
+        );
+
+        let running_actions_manager =
+            Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+                RunningActionsManagerArgs {
+                    root_action_directory,
+                    execution_configuration: ExecutionConfiguration::default(),
+                    cas_store: cas_store.clone(),
+                    ac_store: Some(Store::new(ac_store.clone())),
+                    ac_mirror_target: None,
+                    historical_store: Store::new(cas_store.clone()),
+                    upload_action_result_config:
+                        &nativelink_config::cas_server::UploadActionResultConfig {
+                            upload_ac_results_strategy:
+                                nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                            ..Default::default()
+                        },
+                    max_action_timeout: Duration::MAX,
+                    // Full production default. The point of the test is that
+                    // the kill aborts FAR sooner than this would.
+                    max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                    timeout_handled_externally: false,
+                    directory_cache: None,
+                    bis_ack_timeout: Duration::from_secs(60),
+                    metrics: None,
+                    cas_endpoint: String::new(),
+                    // Synchronous upload path: upload_results blocks on the
+                    // slow store via FastSlowStore::update_with_whole_file.
+                    deferred_output_uploads_enabled: false,
+                },
+                Callbacks {
+                    now_fn: test_monotonic_clock,
+                    sleep_fn: |_duration| Box::pin(future::pending()),
+                },
+            )?);
+
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'kill-tail-content' > ./out.txt".to_string(),
+            ],
+            output_paths: vec!["out.txt".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+        // Write setup protos to the fast store directly so the FSS background
+        // slow-write tasks don't park on the blocked slow tier during setup.
+        let command_digest = serialize_and_upload_message(
+            &command,
+            _fast_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            _fast_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            _fast_store.as_pin(),
+            &mut DigestHasherFunc::Sha256.hasher(),
+        )
+        .await?;
+
+        let running_action_impl = running_actions_manager
+            .clone()
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(ExecuteRequest {
+                        action_digest: Some(action_digest.into()),
+                        ..Default::default()
+                    }),
+                    operation_id: OperationId::default().to_string(),
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        // Operation id used to fire the per-action kill below.
+        let operation_id = running_action_impl.get_operation_id().clone();
+
+        let prepared = running_action_impl.clone().prepare_action().await?;
+        let executed = prepared.execute().await?;
+
+        let before_count = slow_store.update_attempts_count();
+
+        // Spawn the REAL upload_results into a background task. It parks
+        // in-flight on the blocked slow store (deferred OFF).
+        let task = tokio::spawn(async move { executed.upload_results().await });
+
+        // Confirm the upload is genuinely in-flight: the slow store's
+        // `update` was entered (count exceeds the setup baseline) and the
+        // task has not finished. Real-timer sleep between checks avoids
+        // current-thread timer starvation.
+        tokio::time::timeout(ENTERED_DEADLINE, async {
+            loop {
+                if slow_store.update_attempts_count() > before_count {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect(
+            "fixture invariant: upload_results must enter the slow store \
+             before the kill — synchronous upload path not reached",
+        );
+        assert!(
+            !task.is_finished(),
+            "fixture invariant: upload_results must be parked in-flight on \
+             the blocked slow store before the kill is fired"
+        );
+
+        // Fire the kill DURING the in-flight upload. The slow store is NEVER
+        // released, so the only way the task can complete is the kill arm
+        // preempting the upload.
+        running_actions_manager
+            .kill_operation(&operation_id)
+            .await?;
+
+        let upload_outcome = tokio::time::timeout(ABORT_DEADLINE, task)
+            .await
+            .expect(
+                "Gap 2: kill during the upload tail must preempt the in-flight \
+                 upload — task still parked on the never-released slow store \
+                 after the kill, so the kill arm is missing from upload_results",
+            )
+            .expect("upload_results task join error");
+
+        let err = upload_outcome.expect_err(
+            "Gap 2: a killed upload must return an error, not Ok — the kill \
+             arm must abort the in-flight upload",
+        );
+        assert_eq!(
+            err.code,
+            Code::Aborted,
+            "Gap 2: a kill during the upload tail must abort with Code::Aborted \
+             (got {err:?})",
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // N2: output_directories prehash batch tests
     //
     // These tests verify that Phase 1 of `inner_upload_results` walks

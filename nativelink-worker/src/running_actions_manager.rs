@@ -3066,6 +3066,23 @@ pub struct RunningActionImpl {
     /// in v3-final design) so cleanup removing the `running_actions`
     /// map entry cannot race with the read.
     pub(crate) cancelled: AtomicBool,
+    /// Awaitable companion to `cancelled` for the upload tail.
+    ///
+    /// `kill_channel_tx`/`kill_channel_rx` (the oneshot) is consumed by
+    /// `inner_execute` to preempt the child-process wait. Once the child
+    /// has exited that receiver is gone, so a kill arriving DURING the
+    /// upload tail has no awaitable signal — only the `cancelled`
+    /// AtomicBool, which nothing in the upload path polls. Without this a
+    /// kill that lands after child-exit was ignored for the full
+    /// `max_upload_timeout` (600s).
+    ///
+    /// `kill_operation` calls `notify_one()` here (storing a permit if no
+    /// waiter is parked yet), so `upload_results`'s `select!` kill arm
+    /// fires whether the kill arrives before the arm subscribes or while
+    /// the upload is in-flight. Composes with `cancelled`: the flag is the
+    /// durable record (read by the AC-poisoning publish guard), this is
+    /// the wakeup edge for the upload tail.
+    kill_notify: Notify,
     /// Pre-resolved directory tree from the scheduler (if provided in
     /// StartExecute). Used once during prepare_action to skip the GetTree
     /// RPC, then taken (dropped) to free memory.
@@ -3128,6 +3145,9 @@ impl RunningActionImpl {
             did_cleanup: AtomicBool::new(true),
             // AC-poisoning fix: residual-window guard, set by kill_operation.
             cancelled: AtomicBool::new(false),
+            // Wakeup edge for the upload-tail kill arm (Gap 2). Notified by
+            // kill_operation alongside `cancelled`.
+            kill_notify: Notify::new(),
             pre_resolved_tree: Mutex::new(pre_resolved_tree),
             server_missing_digests: Mutex::new(server_missing_digests),
             // #O3/O13 per-action Tree-proto cache: lifetime = this action.
@@ -4565,9 +4585,35 @@ impl RunningAction for RunningActionImpl {
             "upload_results: starting with timeout",
         );
         let metrics = self.metrics().clone();
+        // Gap 2: capture an Arc clone BEFORE `self` is moved into
+        // `inner_upload_results` so the kill arm can await the action's
+        // `kill_notify` / read `cancelled` while the upload is in-flight.
+        let kill_action = Arc::clone(&self);
         let upload_fut = metrics
             .upload_results
             .wrap(Self::inner_upload_results(self));
+
+        // Gap 2: preempt an in-flight upload if a kill arrives DURING the
+        // upload tail. The oneshot `kill_channel` is already consumed by
+        // `inner_execute`, so once the child has exited the only kill
+        // signal is `cancelled` (+ its `kill_notify` wakeup edge), which
+        // this arm awaits. Returns `Aborted` so the action propagates to
+        // cleanup instead of hanging until `max_upload_timeout`.
+        let kill_fut = async move {
+            // Fast path: a kill that landed before this future is first
+            // polled (e.g. during execute) already set `cancelled`. Without
+            // this check we would rely solely on the stored `notify_one`
+            // permit; checking the durable flag too makes the preemption
+            // robust to permit accounting.
+            if !kill_action.cancelled.load(Ordering::Acquire) {
+                kill_action.kill_notify.notified().await;
+            }
+            make_err!(
+                Code::Aborted,
+                "upload_results aborted by kill for operation {:?}",
+                kill_action.operation_id,
+            )
+        };
 
         let stall_warned = AtomicBool::new(false);
         let stall_warn_fut = async {
@@ -4589,8 +4635,19 @@ impl RunningAction for RunningActionImpl {
         let res = tokio::time::timeout(upload_timeout, async {
             tokio::pin!(upload_fut);
             tokio::pin!(stall_warn_fut);
+            tokio::pin!(kill_fut);
             tokio::select! {
+                // `biased`: poll the upload FIRST every wakeup. The kill arm
+                // therefore wins ONLY when the upload is still Pending
+                // (genuinely in-flight) — a kill that races a near-complete
+                // upload lets the upload finish, preserving the established
+                // kill-during-execute shape (`Ok(ActionResult{error: Aborted})`
+                // produced by the normal pipeline; #1899). This makes the kill
+                // arm a preemption of a STALLED/slow upload, not a result-shape
+                // change for the fast path.
+                biased;
                 result = &mut upload_fut => result,
+                killed = &mut kill_fut => Err(killed),
                 () = &mut stall_warn_fut => unreachable!(),
             }
         })
@@ -6395,6 +6452,13 @@ impl RunningActionsManagerImpl {
         // during child-process wait); this flag covers the gap
         // after that arm has returned.
         action.cancelled.store(true, Ordering::Release);
+        // Gap 2: wake the upload-tail kill arm. The oneshot below only
+        // covers the child-process wait in `inner_execute` (its receiver is
+        // gone once the child has exited); this notify is the awaitable
+        // signal for a kill that lands DURING the upload tail. `notify_one`
+        // stores a permit if no waiter is parked yet, so a kill that races
+        // ahead of `upload_results` subscribing is not lost.
+        action.kill_notify.notify_one();
         let kill_channel_tx = {
             let mut action_state = action.state.lock();
             action_state.kill_channel_tx.take()
