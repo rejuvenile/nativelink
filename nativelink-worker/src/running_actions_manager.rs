@@ -6359,10 +6359,20 @@ impl RunningActionsManagerImpl {
     }
 
     fn cleanup_action(&self, operation_id: &OperationId) -> Result<(), Error> {
-        let mut running_actions = self.running_actions.lock();
-        let result = running_actions.remove(operation_id).err_tip(|| {
-            format!("Expected operation id '{operation_id}' to exist in RunningActionsManagerImpl")
-        });
+        // Drop the `running_actions` Mutex guard BEFORE `send_modify`. Holding
+        // it across the watch-WRITE that `send_modify` takes formed a lock-order
+        // cycle with `kill_all`, whose `wait_for` predicate takes
+        // `running_actions.lock()` WHILE holding the watch-READ (Mutex ->
+        // watch-write here vs. watch-read -> Mutex there). See the regression
+        // test `cleanup_action_kill_all_lock_order_tests`.
+        let result = {
+            let mut running_actions = self.running_actions.lock();
+            running_actions.remove(operation_id).err_tip(|| {
+                format!(
+                    "Expected operation id '{operation_id}' to exist in RunningActionsManagerImpl"
+                )
+            })
+        }; // guard dropped here — nothing is held across send_modify.
         // No need to copy anything, we just are telling the receivers an event happened.
         self.action_done_tx.send_modify(|()| {});
         result.map(|_| ())
@@ -7194,5 +7204,406 @@ mod fetched_notify_subscribe_before_predicate_tests {
                 "lost-wakeup race — must subscribe before predicate (#92): \
                  notify_waiters() fired during the snapshot window was lost",
             );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_action_kill_all_lock_order_tests {
+    //! Regression test for the `cleanup_action` <-> `kill_all` lock-order
+    //! inversion deadlock that wedged worker `isotope` for ~1.5h.
+    //!
+    //! Two real primitives are involved (verified against the production
+    //! struct `RunningActionsManagerImpl`):
+    //!   - `running_actions: parking_lot::Mutex<HashMap<OperationId, ..>>`
+    //!   - `action_done_tx: tokio::sync::watch::Sender<()>`
+    //!
+    //! `watch::Sender::send_modify` takes the watch channel's INTERNAL
+    //! `parking_lot::RwLock` for WRITE (verified in tokio 1.49.0
+    //! `watch.rs::send_if_modified`: `self.shared.value.write()`).
+    //! `watch::Receiver::wait_for` takes that same internal RwLock for READ
+    //! and evaluates the predicate WHILE HOLDING IT (verified in tokio 1.49.0
+    //! `watch.rs::wait_for_inner`: `let inner = self.shared.value.read();`
+    //! then `f(&inner)` inside the same block).
+    //!
+    //! The two production lock orders:
+    //!   - `cleanup_action`: `running_actions.lock()` held, THEN
+    //!     `action_done_tx.send_modify()` => Mutex -> watch-WRITE.
+    //!   - `kill_all`: `wait_for(|()| running_actions.lock().is_empty())`
+    //!     => watch-READ held across the predicate, THEN Mutex inside it
+    //!     => watch-READ -> Mutex.
+    //!
+    //! Inverted order across the two real locks => a true cycle. The fix
+    //! drops the `running_actions` guard in `cleanup_action` BEFORE calling
+    //! `send_modify`, so the Mutex is never held across the watch-write and
+    //! the cycle is broken.
+    //!
+    //! Test discipline (CLAUDE.md): no sleep-as-synchronization. The
+    //! predicate-window happens-before is established with an `mpsc` channel
+    //! the predicate sends on (while holding the watch-READ lock) immediately
+    //! BEFORE it blocks acquiring the Mutex; the cleanup side waits on that
+    //! channel before taking the watch-WRITE. A `tokio::time::timeout`
+    //! wraps the whole interleave purely as a DEADLOCK DETECTOR (real wall
+    //! clock), never as synchronization.
+    //!
+    //! Why a minimal struct rather than the real `RunningActionsManagerImpl`:
+    //! `RunningActionsManagerImpl::new_with_callbacks` mandatorily downcasts
+    //! `cas_store.fast_store()` to a concrete `FilesystemStore` (constructor
+    //! `?`-errors otherwise), so building one requires a temp-dir filesystem
+    //! fixture AND gives no hook to align the inversion window inside the
+    //! opaque bodies of `cleanup_action`/`kill_all`. The deadlock is a
+    //! property of `parking_lot::Mutex` x tokio `watch`'s internal RwLock,
+    //! NOT of the manager's other fields, so this harness holds the SAME two
+    //! real primitives and replicates the two real lock sequences verbatim.
+    //! The functional `cleanup_action` contract (remove + wake) is covered
+    //! against the REAL method in
+    //! `cleanup_action_real_method_remove_and_wake_tests`.
+    use core::time::Duration;
+    use std::collections::HashMap;
+    use std::sync::mpsc as std_mpsc;
+    use std::sync::Arc;
+    use std::thread;
+
+    use parking_lot::Mutex;
+    use tokio::sync::watch;
+
+    /// Minimal mirror of the two production fields. Holds the SAME two real
+    /// primitives as `RunningActionsManagerImpl`.
+    struct LockPair {
+        running_actions: Mutex<HashMap<u64, ()>>,
+        action_done_tx: watch::Sender<()>,
+    }
+
+    /// Faithful shadow of the production `cleanup_action` LOCK SEQUENCE, kept in
+    /// lock-order parity with `RunningActionsManagerImpl::cleanup_action`.
+    ///
+    /// The `read_held_rx` handshake makes the inversion window DETERMINISTIC:
+    /// after taking the Mutex this side blocks (synchronously) until the
+    /// kill_all side reports it holds the watch-READ lock. Only THEN does it
+    /// reach `send_modify` (watch-WRITE). This forces the exact overlap the
+    /// production deadlock needs.
+    ///
+    /// FIXED order (current production after the fix): the Mutex guard is
+    /// dropped BEFORE the handshake + `send_modify`, so the watch-WRITE is
+    /// never attempted while the Mutex is held — no cycle.
+    ///
+    /// MUTATION for the deadlock proof: move the `drop(running_actions)` to
+    /// AFTER `send_modify` (i.e. hold the guard across the handshake +
+    /// send_modify, the pre-fix order). With the guard held,
+    /// `interleaved_with_kill_all_does_not_deadlock` surfaces a clean FAILED
+    /// with the bespoke message because the two real locks form a cycle.
+    fn cleanup_action_lock_sequence(
+        pair: &LockPair,
+        op: u64,
+        mutex_held_tx: &std_mpsc::Sender<()>,
+        read_held_rx: &std_mpsc::Receiver<()>,
+    ) {
+        let mut running_actions = pair.running_actions.lock();
+        running_actions.remove(&op);
+        // Tell the driver the Mutex is held so it can release the kill_all
+        // side; kill_all's predicate will then attempt this same Mutex.
+        mutex_held_tx
+            .send(())
+            .expect("driver must receive mutex_held");
+        // FIXED: release the Mutex BEFORE the watch-WRITE. (Mutation: delete
+        // this `drop` line and add `drop(running_actions);` AFTER send_modify
+        // — i.e. hold the guard across the watch-WRITE, the pre-fix order.)
+        drop(running_actions);
+        // Wait until kill_all holds the watch-READ before taking the
+        // watch-WRITE, so the test deterministically drives the inversion
+        // window rather than relying on timing. (In the FIXED order the Mutex
+        // is already released here, so kill_all's pending lock() succeeds and
+        // no cycle forms; in the buggy order the guard above is still held and
+        // send_modify below blocks on the watch-WRITE behind kill_all's READ.)
+        let _ = read_held_rx.recv();
+        // No need to copy anything, we just are telling the receivers an event
+        // happened (mirror of the production comment + call).
+        pair.action_done_tx.send_modify(|()| {});
+    }
+
+    /// Drives `kill_all`'s lock sequence: `wait_for` holds the watch-READ lock
+    /// across the predicate, which acquires the Mutex. From inside the predicate
+    /// (watch-READ held) it signals `read_held_tx` EXACTLY ONCE immediately
+    /// before attempting `running_actions.lock()` — the cleanup side blocks on
+    /// that signal, so the watch-WRITE is only attempted while this watch-READ
+    /// is live.
+    async fn kill_all_lock_sequence(
+        pair: Arc<LockPair>,
+        read_held_tx: std_mpsc::Sender<()>,
+    ) {
+        let mut rx = pair.action_done_tx.subscribe();
+        let mut signalled = false;
+        drop(
+            rx.wait_for(move |()| {
+                // Inside wait_for_inner: the watch-READ lock is held here.
+                if !signalled {
+                    signalled = true;
+                    // Tell the cleanup side the watch-READ is held; it will now
+                    // proceed toward the watch-WRITE.
+                    let _ = read_held_tx.send(());
+                }
+                // watch-READ held -> acquire the Mutex (kill_all order). `pair`
+                // is moved into this closure (last use), so no `Arc::clone` is
+                // needed.
+                pair.running_actions.lock().is_empty()
+            })
+            .await,
+        );
+    }
+
+    /// Shared interleave driver. Drives the FIXED `cleanup_action` lock order
+    /// against `kill_all`'s order, forcing the inversion window with the
+    /// two-signal handshake. Returns `Ok(())` if both sides finish within the
+    /// deadlock-detector window, `Err(())` if they deadlock.
+    ///
+    /// DIAGNOSABILITY (why dedicated `std::thread`s, not tokio workers): under
+    /// the buggy mutation both lock sequences wedge forever — the cleanup side
+    /// holds the parking_lot Mutex blocked on the watch-WRITE, and the kill
+    /// side blocks SYNCHRONOUSLY on `running_actions.lock()` inside `wait_for`'s
+    /// predicate. If those sat on the test's own tokio runtime (a wedged worker
+    /// via `spawn`/`spawn_blocking`), the runtime could never reclaim them at
+    /// test teardown and the binary would HANG past the panic — no
+    /// `test result: FAILED`, no bespoke message in default capture, only an
+    /// outer-wrapper `timeout` KILL. By confining each blocking sequence to a
+    /// detached `std::thread` (the kill side drives its async `wait_for` on its
+    /// OWN current-thread runtime), the deadlock leaves only plain OS threads
+    /// wedged. The driver detects the deadlock via a bounded `recv_timeout` on a
+    /// result channel and returns `Err`; the caller's `.expect` then panics on
+    /// the MAIN test thread, printing the bespoke message and a clean `FAILED`.
+    /// Detached non-daemon threads do not block process exit — the harness
+    /// `exit()`s without joining them — so the binary terminates promptly.
+    fn run_interleave() -> Result<(), ()> {
+        let (tx, _rx_keepalive) = watch::channel(());
+        let pair = Arc::new(LockPair {
+            running_actions: Mutex::new(HashMap::from([(1_u64, ())])),
+            action_done_tx: tx,
+        });
+
+        // C -> driver: "I hold the Mutex; start the kill_all side now."
+        let (mutex_held_tx, mutex_held_rx) = std_mpsc::channel();
+        // K -> C: "I hold the watch-READ; proceed toward the watch-WRITE."
+        let (read_held_tx, read_held_rx) = std_mpsc::channel();
+        // Each side -> driver: "I finished my lock sequence." Two completions
+        // expected; absence within the window == deadlock.
+        let (done_tx, done_rx) = std_mpsc::channel();
+
+        // Cleanup side: a plain blocking sequence on a dedicated OS thread. In
+        // the buggy order it holds a synchronous parking_lot Mutex across a sync
+        // recv + watch-WRITE; on a detached std::thread that wedge cannot park
+        // the test's tokio runtime.
+        let cleanup_pair = Arc::clone(&pair);
+        let cleanup_done = done_tx.clone();
+        thread::Builder::new()
+            .name("cleanup_lock_seq".into())
+            .spawn(move || {
+                cleanup_action_lock_sequence(&cleanup_pair, 1, &mutex_held_tx, &read_held_rx);
+                let _ = cleanup_done.send(());
+            })
+            .expect("spawn cleanup thread");
+
+        // Wait until cleanup holds the Mutex (signal sent from inside the
+        // critical section), THEN start kill_all so its predicate contends for
+        // that same Mutex.
+        mutex_held_rx
+            .recv()
+            .expect("cleanup side must signal mutex_held before kill_all starts");
+
+        // Kill side: its lock sequence is async (`wait_for().await`), so it runs
+        // on its OWN current-thread runtime confined to a dedicated OS thread.
+        // A wedge here parks only this thread + this private runtime, never the
+        // test's runtime.
+        let kill_done = done_tx;
+        thread::Builder::new()
+            .name("kill_all_lock_seq".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build kill_all current-thread runtime");
+                rt.block_on(kill_all_lock_sequence(pair, read_held_tx));
+                let _ = kill_done.send(());
+            })
+            .expect("spawn kill_all thread");
+
+        // Bounded deadlock detector (real wall clock, NOT synchronization): both
+        // sides must report completion within the window. `recv_timeout` returns
+        // `Err` on the first missing completion => deadlock. The wedged OS
+        // threads are intentionally left detached (joining them would hang);
+        // they do not block process exit.
+        let deadline = Duration::from_secs(5);
+        for _ in 0..2 {
+            if done_rx.recv_timeout(deadline).is_err() {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Load-bearing regression: with the FIXED `cleanup_action` lock order
+    /// (Mutex guard dropped before `send_modify`), interleaving it with
+    /// `kill_all`'s watch-READ -> Mutex order completes well under the
+    /// deadlock-detector window.
+    ///
+    /// MUTATION: in `cleanup_action_lock_sequence`, move the
+    /// `drop(running_actions)` to AFTER `send_modify` (hold the guard across the
+    /// watch-WRITE — the pre-fix order). `run_interleave` then returns `Err`,
+    /// this `.expect` panics on the MAIN test thread, and the test reports a
+    /// clean `FAILED` with the bespoke message below in DEFAULT capture mode
+    /// (no `--nocapture`) within the detector window — NOT an opaque hang.
+    /// (Verified: the buggy order surfaces FAILED + this message in default
+    /// capture; the fixed order returns immediately and reports `ok`.)
+    #[test]
+    fn interleaved_with_kill_all_does_not_deadlock() {
+        run_interleave().expect(
+            "cleanup_action/kill_all lock-order DEADLOCK: cleanup_action held the \
+             running_actions Mutex across action_done_tx.send_modify (watch-WRITE) while \
+             kill_all held the watch-READ across running_actions.lock() — the guard MUST be \
+             dropped before send_modify to break the cycle",
+        );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_action_real_method_remove_and_wake_tests {
+    //! Functional regression for the REAL
+    //! `RunningActionsManagerImpl::cleanup_action`. The deadlock fix narrows
+    //! the `running_actions` critical section so the Mutex is no longer held
+    //! across `action_done_tx.send_modify`. This test pins BOTH halves of the
+    //! method's contract against the actual production method so the fix
+    //! cannot regress either:
+    //!   (a) the operation is REMOVED from `running_actions`, and
+    //!   (b) `action_done_tx` waiters are WOKEN (the watch version is bumped).
+    //!
+    //! It drives the real private method on a real `RunningActionsManagerImpl`
+    //! (an in-crate test can reach private items). The manager is built with a
+    //! temp-dir `FilesystemStore` fast tier + `MemoryStore` slow tier because
+    //! `new_with_callbacks` mandatorily downcasts `cas_store.fast_store()` to a
+    //! concrete `FilesystemStore`.
+    //!
+    //! MUTATION (wake half): delete the `self.action_done_tx.send_modify(...)`
+    //! line in `cleanup_action`; the `wait_for` below never observes a change
+    //! and the `tokio::time::timeout` fires the bespoke message.
+    //! MUTATION (remove half): delete the `running_actions.remove(...)` line;
+    //! the post-condition `assert!(... is_none())` fails with its message.
+    use core::time::Duration;
+    use std::sync::{Arc, Weak};
+
+    use nativelink_config::cas_server::{
+        UploadActionResultConfig, UploadCacheResultsStrategy,
+    };
+    use nativelink_config::stores::{
+        FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
+    };
+    use nativelink_store::fast_slow_store::FastSlowStore;
+    use nativelink_store::filesystem_store::FilesystemStore;
+    use nativelink_store::memory_store::MemoryStore;
+    use nativelink_util::action_messages::OperationId;
+    use nativelink_util::store_trait::Store;
+
+    use super::{
+        ExecutionConfiguration, RunningActionsManagerArgs, RunningActionsManagerImpl,
+    };
+
+    /// Build a minimal-but-REAL `RunningActionsManagerImpl`. The fast tier is a
+    /// `FilesystemStore` rooted in a fresh `tempfile::TempDir` (returned so it
+    /// outlives the manager), the slow tier is an in-memory store.
+    async fn make_real_manager() -> (Arc<RunningActionsManagerImpl>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content_path = tmp.path().join("content");
+        let temp_path = tmp.path().join("temp");
+        std::fs::create_dir_all(&content_path).expect("mk content_path");
+        std::fs::create_dir_all(&temp_path).expect("mk temp_path");
+
+        let fast_spec = FilesystemSpec {
+            content_path: content_path.to_string_lossy().into_owned(),
+            temp_path: temp_path.to_string_lossy().into_owned(),
+            eviction_policy: None,
+            ..Default::default()
+        };
+        let slow_spec = MemorySpec::default();
+        let fast_store: Arc<FilesystemStore> = FilesystemStore::new(&fast_spec)
+            .await
+            .expect("FilesystemStore::new");
+        let slow_store = MemoryStore::new(&slow_spec);
+        let cas_store = FastSlowStore::new(
+            &FastSlowSpec {
+                fast: StoreSpec::Filesystem(fast_spec),
+                slow: StoreSpec::Memory(slow_spec.clone()),
+                fast_direction: StoreDirection::default(),
+                slow_direction: StoreDirection::default(),
+                chunked_reads_enabled: false,
+                slow_writes_in_flight_max_bytes: 0,
+            },
+            Store::new(fast_store),
+            Store::new(slow_store),
+        );
+
+        let upload_cfg = UploadActionResultConfig {
+            upload_ac_results_strategy: UploadCacheResultsStrategy::Never,
+            ..Default::default()
+        };
+        let manager = RunningActionsManagerImpl::new(RunningActionsManagerArgs {
+            root_action_directory: tmp.path().join("root").to_string_lossy().into_owned(),
+            execution_configuration: ExecutionConfiguration::default(),
+            cas_store: cas_store.clone(),
+            ac_store: None,
+            ac_mirror_target: None,
+            historical_store: Store::new(cas_store),
+            upload_action_result_config: &upload_cfg,
+            max_action_timeout: Duration::MAX,
+            max_upload_timeout: Duration::MAX,
+            timeout_handled_externally: false,
+            directory_cache: None,
+            bis_ack_timeout: Duration::from_secs(60),
+            metrics: None,
+            cas_endpoint: String::new(),
+            deferred_output_uploads_enabled: false,
+        })
+        .expect("RunningActionsManagerImpl::new");
+        (Arc::new(manager), tmp)
+    }
+
+    /// REAL `cleanup_action` must (a) remove the operation from
+    /// `running_actions` and (b) wake `action_done_tx` waiters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_action_removes_entry_and_wakes_waiters() {
+        let (manager, _tmp) = make_real_manager().await;
+        let operation_id = OperationId::default();
+
+        // Seed the running_actions map. A dangling Weak is sufficient:
+        // cleanup_action only `.remove()`s the key; it never upgrades the Weak.
+        manager
+            .running_actions
+            .lock()
+            .insert(operation_id.clone(), Weak::new());
+        assert!(
+            manager.running_actions.lock().contains_key(&operation_id),
+            "precondition: seeded entry must be present before cleanup_action",
+        );
+
+        // (b) Subscribe a watch receiver BEFORE cleanup so we can observe the
+        // wake. wait_for resolves only when the version is bumped by
+        // send_modify (its closure is `|()| true` so a single change suffices).
+        let mut rx = manager.action_done_tx.subscribe();
+
+        manager
+            .cleanup_action(&operation_id)
+            .expect("cleanup_action must succeed for a present operation id");
+
+        // (a) entry removed.
+        assert!(
+            manager.running_actions.lock().remove(&operation_id).is_none(),
+            "cleanup_action must REMOVE the operation from running_actions",
+        );
+
+        // (b) waiter woken: changed() returns Ok within the deadlock-detector
+        // window. The timeout is a DEADLOCK DETECTOR, not synchronization.
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect(
+                "cleanup_action wake DEADLOCK/LOST: action_done_tx.send_modify must bump the \
+                 watch version so kill_all's wait_for observes the completion — the notify \
+                 was not delivered",
+            )
+            .expect("watch sender must still be alive after cleanup_action");
     }
 }
