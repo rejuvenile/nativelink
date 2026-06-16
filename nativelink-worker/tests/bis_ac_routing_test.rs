@@ -49,6 +49,7 @@
 //!     NOT drop AC pin under non-matching store_id" — over-action of
 //!     unguarded routing).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -66,6 +67,7 @@ use nativelink_worker::local_worker::{
     AcMirrorTarget, BlobsAvailableState, BlobsAvailableTestArgs,
     handle_blobs_in_stable_storage_for_store,
 };
+use nativelink_worker::running_actions_manager::Metrics;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -134,6 +136,14 @@ fn ac_target_for(fss: Arc<FastSlowStore>) -> AcMirrorTarget {
     AcMirrorTarget {
         fss,
         store_id: Arc::from(AC_STORE_NAME),
+        // #37 Phase 2 (Q5): fresh empty map — no pending acks at test start.
+        ac_publish_pending_acks: Arc::new(parking_lot::Mutex::new(
+            HashMap::<DigestInfo, tokio::time::Instant>::new(),
+        )),
+        // #37 Phase 2 (Q5): default Metrics instance — routing tests do not
+        // assert counter values; a zero-valued default is the correct
+        // test-only value.
+        metrics: Arc::new(Metrics::default()),
     }
 }
 
