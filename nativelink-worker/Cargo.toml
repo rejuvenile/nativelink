@@ -147,6 +147,15 @@ name = "ac_write_detach_test"
 required-features = ["test-utils"]
 
 [[test]]
+# (FU-8) O5 concurrency contract: `o5_overlap_c_runs_while_b2_blocked` calls
+# `install_batch_read_test_gate()` which is gated behind `test-utils`.
+# The default `cargo test -p nativelink-worker` build (no features) would
+# fail with E0425 on the missing symbol; this stanza ensures the test is
+# only compiled and run when the feature is present.
+name = "running_actions_manager_test"
+required-features = ["test-utils"]
+
+[[test]]
 # (O2) Control-plane channel capacity tests: constant-value guard,
 # concurrency-without-serialization proof, and FIFO ordering verification.
 # No test-utils required — uses the real WorkerApiClientWrapper directly.

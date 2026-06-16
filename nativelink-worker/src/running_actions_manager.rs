@@ -91,6 +91,58 @@ use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
+// FU-8: injection seam for the O5 concurrency happens-before test.
+//
+// The seam injects a controllable gate at the entry of `batch_read_small_blobs`
+// so the test can:
+//   1. Block [B2] at the gate.
+//   2. Wait until [B2] has entered the gate (via `entered` Notify).
+//   3. Wait for [C] (output-dir prep) to complete while [B2] is frozen.
+//   4. Release the gate and await task completion.
+//
+// Gated behind `#[cfg(feature = "test-utils")]`: the static, struct, and
+// install function are compiled only when the test-utils feature is active.
+// The gate-check inside `batch_read_small_blobs` is guarded by the same cfg.
+// Integration tests that use this seam declare `required-features = ["test-utils"]`
+// in Cargo.toml. The default (production) build sees zero overhead — the
+// Mutex, LazyLock, and gate-check branch are absent from the binary.
+// See `.claude/audits/fu8-action-prep-bench-seam-design-2026-06-15.md`.
+#[cfg(feature = "test-utils")]
+pub struct BatchReadTestGate {
+    /// Notified once when `batch_read_small_blobs` has entered and is about
+    /// to block.  Test waits on this before asserting [C]'s output dirs.
+    pub entered: Notify,
+    /// Notified by the test to release `batch_read_small_blobs` so [B2]
+    /// can complete and the action can proceed.
+    pub release: Notify,
+}
+
+// UNBOUNDED-OK: single Arc<BatchReadTestGate> slot; bounded to one per process
+// in test; absent from production builds (cfg-gated).
+#[cfg(feature = "test-utils")]
+static BATCH_READ_TEST_GATE: std::sync::LazyLock<
+    parking_lot::Mutex<Option<std::sync::Arc<BatchReadTestGate>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
+
+/// Install a `BatchReadTestGate` so the next call to `batch_read_small_blobs`
+/// (in any task running in this process) will block until `gate.release` is
+/// notified. Returns the installed gate.
+///
+/// The gate is removed after each use inside `batch_read_small_blobs` so it
+/// does not affect subsequent calls. Safe to call from multiple sequential
+/// tests (serial_test serialises the whole module).
+///
+/// Only available when the `test-utils` feature is enabled.
+#[cfg(feature = "test-utils")]
+pub fn install_batch_read_test_gate() -> std::sync::Arc<BatchReadTestGate> {
+    let gate = std::sync::Arc::new(BatchReadTestGate {
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    *BATCH_READ_TEST_GATE.lock() = Some(gate.clone());
+    gate
+}
+
 /// For simplicity we use a fixed exit code for cases when our program is terminated
 /// due to a signal.
 const EXIT_CODE_FOR_SIGNAL: i32 = 9;
@@ -741,6 +793,19 @@ async fn batch_read_small_blobs(
     cas_store: &FastSlowStore,
     small_digests: &[DigestInfo],
 ) -> Result<HashSet<DigestInfo>, Error> {
+    // FU-8 O5 concurrency seam: if a test has installed a gate, signal
+    // "entered" (so the test knows [B2] is blocked) and then park until
+    // the test calls gate.release.notify_one(). The gate is taken out of
+    // the static so it fires exactly once per install; subsequent calls
+    // (from the same action or a later test) are unaffected.
+    // Only compiled when the `test-utils` feature is active; zero production
+    // overhead in default builds.
+    #[cfg(feature = "test-utils")]
+    if let Some(gate) = BATCH_READ_TEST_GATE.lock().take() {
+        gate.entered.notify_one();
+        gate.release.notified().await;
+    }
+
     let slow_store = cas_store.slow_store();
 
     // Try locality-aware routing through WorkerProxyStore.
@@ -3005,8 +3070,16 @@ impl RunningActionImpl {
         // New shape (normal mode !is_direct_use):
         //   [A] alone → [B1] alone → try_join([B2], [C])
         //   [C] overlaps with the bulk of input download, saving ~2-10ms.
-        //   TODO(bench): 2-10ms is an unmeasured design estimate; add a
-        //   data_plane_bench action-prep cell before citing as a baseline.
+        //   TODO(bench): 2-10ms is an unmeasured design estimate; the overlap
+        //   win has not been isolated in production. The in-process timing
+        //   measurement (FU-8) was confounded by spawn_blocking thread pool
+        //   contention between [B2]'s fast-store write phase and [C]'s mkdir
+        //   phase — a harness artefact absent in production where [B2]'s
+        //   dominant latency is network RTT. The exact production win requires
+        //   a production deployment trace (tracked as FU-12).
+        //   See .claude/audits/fu8-action-prep-bench-seam-design-2026-06-15.md.
+        //   The concurrency contract ([C] runs while [B2] is blocked) is
+        //   tested by o5_overlap_c_runs_while_b2_blocked (FU-8).
         //
         // Safety: the O5 prereq (commit 1) makes [B2]'s BFS mkdir tolerate
         // AlreadyExists when the entry is already a directory — so [C]
