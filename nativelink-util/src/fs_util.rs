@@ -95,6 +95,14 @@ fn collect_tree_ops_recursive(
             // the existing entry is a directory — a non-directory at a directory
             // path is still a genuine conflict. Mirrors the pattern in
             // download_to_directory's BFS mkdir at running_actions_manager.rs:1354.
+            //
+            // INVARIANT (O5, 333ce15e): concurrent writers to the paths this walk
+            // touches — i.e. `[C]` = prepare_output_directory
+            // (running_actions_manager.rs:2046) — MUST create only DIRECTORIES, never
+            // files or symlinks. A non-dir at a directory path trips the is_dir() check
+            // below into a `Code::AlreadyExists` error; a future `[C]` that placed a file
+            // or symlink at an output path would surface as an opaque AlreadyExists with
+            // no hint of this `[B2]`/`[C]` timing dependency.
             match std::fs::create_dir(&dst_path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -820,6 +828,55 @@ mod tests {
                 "artifact.txt must be hardlinked (same inode)"
             );
         }
+
+        Ok(())
+    }
+
+    /// Coverage for the non-directory-conflict branch: if `[C]` (or stale debris)
+    /// leaves a FILE where the cached tree expects a DIRECTORY, the EEXIST tolerance
+    /// must NOT silently proceed — it must reject with `Code::AlreadyExists`. Guards
+    /// the `!m.is_dir()` branch in `collect_tree_ops_recursive` (a future accidental
+    /// removal of that guard would otherwise go undetected).
+    #[nativelink_test("crate")]
+    async fn test_hardlink_fails_when_dst_has_file_where_dir_expected() -> Result<(), Error> {
+        let temp_dir = TempDir::new().err_tip(|| "Failed to create temp dir")?;
+
+        // src tree: `bazel-out/` is a DIRECTORY (with a file inside).
+        let src_dir = temp_dir.path().join("cache_src");
+        std::fs::create_dir(&src_dir).err_tip(|| "create cache_src")?;
+        let bazel_out = src_dir.join("bazel-out");
+        std::fs::create_dir(&bazel_out).err_tip(|| "create bazel-out in src")?;
+        {
+            let mut f = std::fs::File::create(bazel_out.join("artifact.txt"))
+                .err_tip(|| "create artifact.txt")?;
+            std::io::Write::write_all(&mut f, b"build artifact").err_tip(|| "write artifact.txt")?;
+        }
+
+        // dst: a FILE named `bazel-out` where the cached tree expects a directory —
+        // debris from a prior failed action, or a hypothetical future [C] mistake.
+        let dst_dir = temp_dir.path().join("work_dir");
+        std::fs::create_dir(&dst_dir).err_tip(|| "create work_dir")?;
+        {
+            let mut f = std::fs::File::create(dst_dir.join("bazel-out"))
+                .err_tip(|| "create file at dst/bazel-out")?;
+            std::io::Write::write_all(&mut f, b"not a dir").err_tip(|| "write dst/bazel-out file")?;
+        }
+
+        // Must FAIL: a non-directory at a directory path is a genuine conflict, NOT a
+        // tolerable concurrent-[C] pre-create.
+        let err = hardlink_directory_tree(&src_dir, &dst_dir).await.expect_err(
+            "hardlink into a dst with a FILE where a directory is expected must error, \
+             not silently proceed (the !is_dir() guard must fire)",
+        );
+        assert_eq!(
+            err.code,
+            nativelink_error::Code::AlreadyExists,
+            "non-directory conflict must surface as Code::AlreadyExists (the !is_dir() guard); got: {err:?}"
+        );
+        assert!(
+            format!("{err:?}").contains("non-directory"),
+            "error must name the non-directory conflict; got: {err:?}"
+        );
 
         Ok(())
     }
