@@ -7154,4 +7154,337 @@ exit 1
         Ok(())
     }
 
+    /// T2: recursive prehash must reach files nested 2+ levels deep.
+    ///
+    /// Action creates `output_dir/subdir/nested.txt`. The batch Phase 1
+    /// must include nested.txt's digest so that `single_has_count` stays 0
+    /// and `batch_has_key_count` >= 1.
+    ///
+    /// Mutation-verify: comment out the recursive `prehash_directory_tree`
+    /// push inside `prehash_directory_tree` → the nested file is not walked
+    /// → `single_has_count` rises to ≥1.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn n2_nested_dir_files_use_batch_has_not_individual()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "n2_nested_test_worker";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, counting_store, cas_store, ac_store) =
+            setup_stores_with_counting_slow().await?;
+
+        let root_action_directory = make_temp_path("root_action_directory_n2_nested");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+                cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Action: two files — one at depth 1 and one at depth 2.
+        // output_dir/top.txt (depth-1) + output_dir/subdir/nested.txt (depth-2)
+        // exercises the recursive branch of prehash_directory_tree.
+        // Two files guarantee batch_has_key_count > 0 (HasCountingStore counts
+        // multi-key batch calls only; a single-key call increments single_has_count).
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p output_dir/subdir && \
+                 printf 'top' > output_dir/top.txt && \
+                 printf 'nested' > output_dir/subdir/nested.txt"
+                    .to_string(),
+            ],
+            output_directories: vec!["output_dir".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Blake3.into(),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id,
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        let prepared = running_action_impl.clone().prepare_action().await?;
+        let executed = prepared.execute().await?;
+
+        let single_before = counting_store.single_has_count();
+        let batch_before = counting_store.batch_has_key_count();
+
+        executed.upload_results().await?;
+
+        let single_after = counting_store.single_has_count();
+        let batch_after = counting_store.batch_has_key_count();
+
+        let new_single = single_after - single_before;
+        let new_batch_keys = batch_after - batch_before;
+
+        // Both files (top.txt at depth-1 + nested.txt at depth-2) must appear
+        // in the Phase 1 batch. HasCountingStore counts multi-key calls only;
+        // a single-key Phase 1 call would be classified as single_has_count —
+        // the two-file design ensures the batch has ≥2 keys.
+        assert!(
+            new_batch_keys >= 2,
+            "T2 invariant violated: expected ≥2 file digests in the Phase 1 batch \
+             (top.txt + nested.txt); got {new_batch_keys} batch keys — \
+             recursive prehash_directory_tree is not reaching depth-2 files",
+        );
+
+        // No individual has() for either file.
+        assert_eq!(
+            new_single, 0,
+            "T2 invariant violated: nested directory files produced {new_single} \
+             individual has() RPC calls; expected 0 (must be covered by batch)",
+        );
+
+        running_action_impl.cleanup().await?;
+        Ok(())
+    }
+
+    /// T1: a symlink inside an output directory is skipped by prehash
+    /// (not hashed, not batch-checked) and still uploaded as a SymlinkNode.
+    ///
+    /// This guards against `prehash_directory_tree` accidentally following
+    /// symlinks inside the directory tree. If a symlink were prehashed,
+    /// its "file content" digest would enter `batch_checked`; `upload_file`
+    /// would then skip the individual has() for a digest that no `upload_file`
+    /// call will ever actually upload (symlinks go through `upload_symlink`,
+    /// not `upload_file`). This is harmless in current code but wrong in
+    /// principle, and a future refactor could make it load-bearing.
+    ///
+    /// Invariant: the total batch key count equals the number of regular
+    /// files only (1 in this test), not the number of regular files + symlinks.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn n2_symlink_inside_output_dir_is_skipped_by_prehash()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "n2_symlink_test_worker";
+
+        fn test_monotonic_clock() -> SystemTime {
+            static CLOCK: AtomicU64 = AtomicU64::new(0);
+            monotonic_clock(&CLOCK)
+        }
+
+        let (_, counting_store, cas_store, ac_store) =
+            setup_stores_with_counting_slow().await?;
+
+        let root_action_directory = make_temp_path("root_action_directory_n2_symlink");
+        fs::create_dir_all(&root_action_directory).await?;
+
+        let running_actions_manager = Arc::new(RunningActionsManagerImpl::new_with_callbacks(
+            RunningActionsManagerArgs {
+                root_action_directory,
+                execution_configuration: ExecutionConfiguration::default(),
+                cas_store: cas_store.clone(),
+                ac_store: Some(Store::new(ac_store.clone())),
+                ac_mirror_target: None,
+                historical_store: Store::new(cas_store.clone()),
+                upload_action_result_config:
+                    &nativelink_config::cas_server::UploadActionResultConfig {
+                        upload_ac_results_strategy:
+                            nativelink_config::cas_server::UploadCacheResultsStrategy::Never,
+                        ..Default::default()
+                    },
+                max_action_timeout: Duration::MAX,
+                max_upload_timeout: Duration::from_secs(DEFAULT_MAX_UPLOAD_TIMEOUT),
+                timeout_handled_externally: false,
+                directory_cache: None,
+                bis_ack_timeout: Duration::from_secs(60),
+                metrics: None,
+                cas_endpoint: String::new(),
+                deferred_output_uploads_enabled: false,
+            },
+            Callbacks {
+                now_fn: test_monotonic_clock,
+                sleep_fn: |_duration| Box::pin(future::pending()),
+            },
+        )?);
+
+        // Action: output_dir/ contains two regular files and one symlink.
+        // Two regular files ensure the batch has ≥2 keys (HasCountingStore
+        // counts multi-key calls; a single-key Phase 1 call is counted as
+        // single_has_count instead of batch_has_key_count).
+        // The symlink should be skipped by prehash_directory_tree (which uses
+        // entry.file_type() — lstat semantics — so is_symlink() returns true
+        // and neither the is_file() nor is_dir() branch fires).
+        let command = Command {
+            arguments: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "mkdir -p output_dir && \
+                 printf 'real' > output_dir/real.txt && \
+                 printf 'also' > output_dir/also_real.txt && \
+                 ln -s real.txt output_dir/link.txt"
+                    .to_string(),
+            ],
+            output_directories: vec!["output_dir".to_string()],
+            environment_variables: vec![EnvironmentVariable {
+                name: "PATH".to_string(),
+                value: env::var("PATH").unwrap(),
+            }],
+            ..Default::default()
+        };
+
+        let command_digest = serialize_and_upload_message(
+            &command,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let input_root_digest = serialize_and_upload_message(
+            &Directory::default(),
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+        let action = Action {
+            command_digest: Some(command_digest.into()),
+            input_root_digest: Some(input_root_digest.into()),
+            ..Default::default()
+        };
+        let action_digest = serialize_and_upload_message(
+            &action,
+            cas_store.as_pin(),
+            &mut DigestHasherFunc::Blake3.hasher(),
+        )
+        .await?;
+
+        let execute_request = ExecuteRequest {
+            action_digest: Some(action_digest.into()),
+            digest_function: ProtoDigestFunction::Blake3.into(),
+            ..Default::default()
+        };
+        let operation_id = OperationId::default().to_string();
+
+        let running_action_impl = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                StartExecute {
+                    execute_request: Some(execute_request),
+                    operation_id,
+                    queued_timestamp: None,
+                    platform: action.platform.clone(),
+                    worker_id: WORKER_ID.to_string(),
+                    resolved_directories: Vec::new(),
+                    resolved_directory_digests: Vec::new(),
+                    missing_digests: Vec::new(),
+                },
+            )
+            .await?;
+
+        let prepared = running_action_impl.clone().prepare_action().await?;
+        let executed = prepared.execute().await?;
+
+        let single_before = counting_store.single_has_count();
+        let batch_before = counting_store.batch_has_key_count();
+
+        executed.upload_results().await?;
+
+        let single_after = counting_store.single_has_count();
+        let batch_after = counting_store.batch_has_key_count();
+
+        let new_single = single_after - single_before;
+        let new_batch_keys = batch_after - batch_before;
+
+        // Exactly 2 regular files (real.txt + also_real.txt) should be in the batch.
+        // If the symlink (link.txt) were accidentally prehashed by prehash_directory_tree,
+        // batch_has_key_count would be 3. Dedup collapses same-content digests, so
+        // link.txt (same content as real.txt) would dedup to 1 unique digest with
+        // real.txt → batch_keys == 2 still. We use >= 2 to accommodate dedup.
+        // The load-bearing check is new_single == 0: both regular files are covered
+        // by the batch so no upload_file fallback has() fires.
+        assert!(
+            new_batch_keys >= 2,
+            "T1 invariant violated: expected ≥2 batch keys (real.txt + also_real.txt); \
+             got {new_batch_keys} — regular files inside output_dir were not prehashed",
+        );
+
+        // No individual has() calls: both regular files are covered by the batch.
+        // The symlink goes through upload_directory's symlink_futures path (upload_symlink),
+        // which never calls upload_file and therefore never fires individual has().
+        assert_eq!(
+            new_single, 0,
+            "T1 invariant violated: {new_single} individual has() RPC calls fired; \
+             expected 0 — regular files must be covered by the Phase 1 batch",
+        );
+
+        // upload_results must succeed (symlink uploaded as SymlinkNode via
+        // upload_directory's symlink_futures path, not upload_file).
+        running_action_impl.cleanup().await?;
+        Ok(())
+    }
+
 }

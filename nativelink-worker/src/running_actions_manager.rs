@@ -2355,10 +2355,20 @@ async fn prehash_single_file(
 /// Recursively walk a directory tree and pre-hash every regular file,
 /// returning all `(absolute_path, digest)` pairs in a `Vec`.
 ///
-/// Errors on individual files are silently swallowed — they will be
-/// caught again in Phase 2 when `upload_file` hashes them. The walk
-/// mirrors `upload_directory`'s structure (read_dir → files + subdirs)
-/// but is hash-only (no uploading).
+/// All internal error branches return `Ok(Vec::new())` — a missing or
+/// unreadable directory is silently treated as empty so Phase 1 degrades
+/// gracefully (Phase 2 `upload_file` will catch the real error).
+/// The function CAN return `Err` in theory (the type admits it) but in
+/// practice all error paths are converted to empty-Ok before propagating.
+///
+/// The walk structure (readdir → push file/dir futures) mirrors
+/// `upload_directory`, but the concurrency regime differs:
+/// `file_futures` is drained to completion before `dir_futures` begins
+/// polling (sequential-phase drain), whereas `upload_directory` uses
+/// `try_join3` for true simultaneous polling of all three future sets.
+/// For deep trees this means depth-N files do not start hashing until
+/// depths 1..N-1 have finished; the latency penalty is O(tree_depth)
+/// serial phases but I/O within each phase is concurrent.
 fn prehash_directory_tree(
     dir_path: OsString,
     hasher: DigestHasherFunc,
@@ -2481,7 +2491,7 @@ async fn upload_file(
             let store_key: StoreKey<'_> = digest.into();
 
             // For digests NOT covered by the Phase 1 batch (e.g. directory
-            // Tree protos created during upload), do the individual has()
+            // tree protos created during upload), do the individual has()
             // before attempting the upload.
             if !batch_checked.contains(&digest) {
                 let has_start = std::time::Instant::now();
@@ -3849,12 +3859,6 @@ impl RunningActionImpl {
 
         let mut output_path_futures = FuturesUnordered::new();
         let mut output_paths = command_proto.output_paths;
-        if output_paths.is_empty() {
-            output_paths
-                .reserve(command_proto.output_files.len() + command_proto.output_directories.len());
-            output_paths.append(&mut command_proto.output_files);
-            output_paths.append(&mut command_proto.output_directories);
-        }
         // Phase 1: Hash all output files — top-level AND files inside
         // declared output_directories — in parallel, then do a single
         // batch has_with_results() call covering all of them.
@@ -3881,23 +3885,67 @@ impl RunningActionImpl {
                 BoxFuture<'static, Result<Vec<(OsString, DigestInfo)>, Error>>,
             > = FuturesUnordered::new();
 
-            for entry in &output_paths {
-                let full_path = OsString::from(if command_proto.working_directory.is_empty() {
-                    format!("{}/{}", self.work_directory, entry)
+            // Build a full path from a relative entry name.
+            // Capture work_directory + working_directory by value to avoid
+            // borrowing command_proto across the subsequent mutable appends.
+            let work_dir = self.work_directory.clone();
+            let sub_dir = command_proto.working_directory.clone();
+            let make_full_path = |entry: &str| -> OsString {
+                OsString::from(if sub_dir.is_empty() {
+                    format!("{work_dir}/{entry}")
                 } else {
-                    format!(
-                        "{}/{}/{}",
-                        self.work_directory, command_proto.working_directory, entry
-                    )
-                });
-                // prehash_single_file skips directories; prehash_directory_tree
-                // skips non-directories. Running both for every entry is safe:
-                // exactly one will produce results.
-                file_hash_futures.push(prehash_single_file(full_path.clone(), hasher).boxed());
-                dir_hash_futures.push(prehash_directory_tree(full_path, hasher).boxed());
+                    format!("{work_dir}/{sub_dir}/{entry}")
+                })
+            };
+
+            if output_paths.is_empty() {
+                // REAPI split available: route without any extra stat syscall.
+                // output_files → prehash_single_file (hash-as-file, no dir walk).
+                // output_directories → prehash_directory_tree (recursive walk).
+                for entry in &command_proto.output_files {
+                    file_hash_futures
+                        .push(prehash_single_file(make_full_path(entry), hasher).boxed());
+                }
+                for entry in &command_proto.output_directories {
+                    dir_hash_futures
+                        .push(prehash_directory_tree(make_full_path(entry), hasher).boxed());
+                }
+                // Merge for Phase 2 iteration (must happen after Phase 1 routing).
+                output_paths
+                    .reserve(command_proto.output_files.len() + command_proto.output_directories.len());
+                output_paths.append(&mut command_proto.output_files);
+                output_paths.append(&mut command_proto.output_directories);
+            } else {
+                // Legacy REAPI: output_paths is a merged list with no type info.
+                // One symlink_metadata per entry to decide file vs directory.
+                for entry in &output_paths {
+                    let full_path = make_full_path(entry);
+                    let is_dir = match fs::symlink_metadata(&full_path).await {
+                        Ok(m) => m.is_dir(),
+                        Err(_) => {
+                            // Missing or unreadable path: skip prehash; Phase 2
+                            // will surface the real error or treat it as absent.
+                            continue;
+                        }
+                    };
+                    if is_dir {
+                        dir_hash_futures
+                            .push(prehash_directory_tree(full_path, hasher).boxed());
+                    } else {
+                        file_hash_futures
+                            .push(prehash_single_file(full_path, hasher).boxed());
+                    }
+                }
             }
 
+            // UNBOUNDED-OK: action-scoped digest metadata; freed after inner_upload_results
+            // returns. Bounded by the action's output file count, which is itself bounded
+            // by the REAPI Command proto size limit (~4 MiB max proto; typical actions
+            // have O(10)–O(10_000) output files; DigestInfo is 40 bytes + OsString ~64
+            // bytes per path → well under any practical memory limit per action).
             let mut all_digests = Vec::new();
+            // UNBOUNDED-OK: same bound as all_digests above. path → digest map lets
+            // upload_file reuse the Phase 1 hash, avoiding a second full-file read.
             let mut path_digests: HashMap<OsString, DigestInfo> = HashMap::new();
 
             // Drain single-file results.
@@ -3923,6 +3971,8 @@ impl RunningActionImpl {
             all_digests.dedup();
 
             let mut existing = HashSet::new();
+            // UNBOUNDED-OK: same bound as all_digests/path_digests above;
+            // contains one DigestInfo (40 bytes) per unique output file in the action.
             let mut checked: HashSet<DigestInfo> = HashSet::new();
             if !all_digests.is_empty() {
                 let store_keys: Vec<StoreKey<'_>> = all_digests.iter()
