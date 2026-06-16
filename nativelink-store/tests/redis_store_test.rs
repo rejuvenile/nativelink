@@ -2907,6 +2907,89 @@ async fn reconnect_fired_after_update_data_versioned_timeout() -> Result<(), Err
     Ok(())
 }
 
+/// Reconnect fires when the **noversion** (`hset_multiple`/HSET) arm of
+/// `update_data` observes an inner `response_timeout`.
+///
+/// The noversion branch (`Versioned = FalseValue`) writes scheduler data via a
+/// bare HSET pipeline.  A timeout there leaves the connection slot desynced —
+/// the next HSET on that slot would read the orphaned response frame as data,
+/// corrupting the scheduler index entry.  `reconnect_on_timeout` must replace
+/// the slot before returning.
+///
+/// Uses `make_fake_redis_counting_connections` (single handler for all
+/// connections) because both connection 1 and connection 2 get the same
+/// HELLO/SETINFO responses; only the HSET goes unanswered on connection 1.
+/// Unlike the versioned test, no Lua SCRIPT LOAD is needed — the noversion
+/// path skips the EVALSHA entirely.
+///
+/// Mutation: comment out `reconnect_on_timeout` in `update_data::noversion`.
+/// Test fails with:
+/// "reconnect-on-timeout::update-data-noversion must establish new TCP \
+///  connection — connection count was 1, expected ≥2 \
+///  (update_data noversion/HSET slot was not replaced)"
+#[nativelink_test]
+async fn reconnect_fired_after_update_data_noversion_timeout() -> Result<(), Error> {
+    // Handler for all connections: answers HELLO+SCRIPT LOAD but NOT HSET.
+    // Connection 1 → HSET goes unanswered → inner response_timeout → reconnect → connection 2.
+    // Connection 2 also uses this handler (reconnect configure only; no HSET after err).
+    // SCRIPT LOAD is needed because the store loads the Lua version-update script
+    // at construction time for every slot, even though the noversion path never uses it.
+    let handler = add_lua_version_script(fake_redis_stream());
+
+    let connection_counter = Arc::new(AtomicUsize::new(0));
+    // Single-handler counting: both the original connection and the reconnected
+    // connection share the same HELLO/SETINFO responses.
+    let port = make_fake_redis_counting_connections(
+        handler,
+        Arc::clone(&connection_counter),
+    )
+    .await;
+
+    let spec = RedisSpec {
+        addresses: vec![format!("redis://127.0.0.1:{port}/")],
+        command_timeout_ms: 100,
+        connection_pool_size: 1,
+        ..Default::default()
+    };
+
+    let store = timeout(Duration::from_secs(5), RedisStore::new_standard(spec))
+        .await
+        .expect("store construction must not deadlock")
+        .expect("store construction must succeed");
+
+    // Scheduler noversion update (bare HSET path).
+    // TestSchedulerDataUnversioned has `type Versioned = FalseValue`, so
+    // update_data takes the hset_multiple branch, NOT the EVALSHA branch.
+    let data = TestSchedulerDataUnversioned {
+        key: "test-noversion-key".to_string(),
+        content: "test-noversion-data".to_string(),
+        version: 0,
+    };
+
+    let result = timeout(
+        Duration::from_secs(5),
+        store.update_data(data),
+    )
+    .await
+    .expect("update_data must not deadlock");
+
+    assert!(
+        result.is_err(),
+        "update_data must return Err after HSET inner response_timeout; got Ok: {:?}",
+        result.ok()
+    );
+
+    let conn_count = connection_counter.load(Ordering::SeqCst);
+    assert!(
+        conn_count >= 2,
+        "reconnect-on-timeout::update-data-noversion must establish new TCP connection — \
+         connection count was {conn_count}, expected ≥2 \
+         (update_data noversion/HSET slot was not replaced)"
+    );
+
+    Ok(())
+}
+
 /// `remove` when the key is absent (DEL returns 0) returns `Code::NotFound`.
 ///
 /// Mutation: returning `Ok(())` unconditionally instead of checking the
